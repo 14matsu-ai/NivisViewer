@@ -1,0 +1,223 @@
+from __future__ import annotations
+
+from collections import OrderedDict
+from dataclasses import dataclass
+
+from PIL import Image, ImageEnhance
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
+from PySide6.QtGui import QImage
+
+from .image_source import ImageSource
+
+
+PRELOAD_RADIUS = 3
+
+
+@dataclass(frozen=True)
+class CachedImage:
+    page_index: int
+    image_id: str
+    qimage: QImage | None
+    original_size: tuple[int, int] | None
+    error: str | None
+    generation: int
+
+
+class _ImageLoadSignals(QObject):
+    loaded = Signal(object)
+
+
+class _ImageLoadTask(QRunnable):
+    def __init__(
+        self,
+        source: ImageSource,
+        page_index: int,
+        image_id: str,
+        generation: int,
+        adjustments: tuple[float, float, float],
+    ) -> None:
+        super().__init__()
+        self.source = source
+        self.page_index = page_index
+        self.image_id = image_id
+        self.generation = generation
+        self.adjustments = adjustments
+        self.signals = _ImageLoadSignals()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            image = self.source.open_image(self.image_id)
+            adjusted: Image.Image | None = None
+            try:
+                adjusted = self._apply_adjustments(image)
+                qimage = self._pil_to_qimage(adjusted)
+                original_size = adjusted.size
+            finally:
+                if adjusted is not None and adjusted is not image:
+                    adjusted.close()
+                image.close()
+            result = CachedImage(
+                page_index=self.page_index,
+                image_id=self.image_id,
+                qimage=qimage,
+                original_size=original_size,
+                error=None,
+                generation=self.generation,
+            )
+        except Exception as exc:
+            result = CachedImage(
+                page_index=self.page_index,
+                image_id=self.image_id,
+                qimage=None,
+                original_size=None,
+                error=str(exc),
+                generation=self.generation,
+            )
+        self.signals.loaded.emit(result)
+
+    @staticmethod
+    def _pil_to_qimage(image: Image.Image) -> QImage:
+        rgba = image.convert("RGBA")
+        data = rgba.tobytes("raw", "RGBA")
+        return QImage(data, rgba.width, rgba.height, QImage.Format.Format_RGBA8888).copy()
+
+    def _apply_adjustments(self, image: Image.Image) -> Image.Image:
+        brightness, contrast, gamma = self.adjustments
+        adjusted = image.convert("RGBA")
+        if brightness != 1.0:
+            adjusted = ImageEnhance.Brightness(adjusted).enhance(brightness)
+        if contrast != 1.0:
+            adjusted = ImageEnhance.Contrast(adjusted).enhance(contrast)
+        if gamma != 1.0:
+            inverse_gamma = 1.0 / gamma
+            lut = [min(255, max(0, int(((value / 255.0) ** inverse_gamma) * 255.0 + 0.5))) for value in range(256)]
+            red, green, blue, alpha = adjusted.split()
+            adjusted = Image.merge("RGBA", (red.point(lut), green.point(lut), blue.point(lut), alpha))
+        return adjusted
+
+
+class ImageCache(QObject):
+    pageLoaded = Signal(object)
+
+    def __init__(self, cache_size: int = 10, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.cache_size = max(1, int(cache_size))
+        self.generation = 0
+        self.source: ImageSource | None = None
+        self.image_ids: list[str] = []
+        self._cache: OrderedDict[int, CachedImage] = OrderedDict()
+        self._in_flight: set[tuple[int, int]] = set()
+        self._wanted_indexes: set[int] = set()
+        self._protected_indexes: set[int] = set()
+        self._thread_pool = QThreadPool.globalInstance()
+        self._adjustments = (1.0, 1.0, 1.0)
+
+    def set_cache_size(self, cache_size: int) -> None:
+        self.cache_size = max(1, int(cache_size))
+        self._enforce_limit()
+
+    def set_adjustments(self, *, brightness: float, contrast: float, gamma: float) -> None:
+        adjustments = (
+            max(0.1, min(3.0, float(brightness))),
+            max(0.1, min(3.0, float(contrast))),
+            max(0.1, min(5.0, float(gamma))),
+        )
+        if adjustments == self._adjustments:
+            return
+        self._adjustments = adjustments
+        self.generation += 1
+        self._cache.clear()
+        self._in_flight.clear()
+
+    def set_source(self, source: ImageSource | None, image_ids: list[str]) -> None:
+        self.generation += 1
+        self.source = source
+        self.image_ids = list(image_ids)
+        self._cache.clear()
+        self._in_flight.clear()
+        self._wanted_indexes.clear()
+        self._protected_indexes.clear()
+
+    def clear(self) -> None:
+        self.generation += 1
+        self.source = None
+        self.image_ids = []
+        self._cache.clear()
+        self._in_flight.clear()
+        self._wanted_indexes.clear()
+        self._protected_indexes.clear()
+
+    def get(self, page_index: int) -> CachedImage | None:
+        cached = self._cache.get(page_index)
+        if cached is not None:
+            self._cache.move_to_end(page_index)
+        return cached
+
+    def preload_around(
+        self,
+        center_index: int,
+        *,
+        radius: int = PRELOAD_RADIUS,
+        visible_indexes: tuple[int, ...] = tuple(),
+    ) -> None:
+        if not self.image_ids:
+            return
+
+        start = max(0, center_index - radius)
+        end = min(len(self.image_ids) - 1, center_index + radius)
+        wanted = set(range(start, end + 1))
+        wanted.update(index for index in visible_indexes if 0 <= index < len(self.image_ids))
+        self._wanted_indexes = wanted
+        self._protected_indexes = set(visible_indexes)
+
+        for index in list(self._cache):
+            if index not in wanted:
+                del self._cache[index]
+
+        for index in visible_indexes:
+            self.ensure_loaded(index)
+        for index in range(start, end + 1):
+            self.ensure_loaded(index)
+
+        self._enforce_limit()
+
+    def ensure_loaded(self, page_index: int) -> None:
+        if self.source is None or not (0 <= page_index < len(self.image_ids)):
+            return
+        in_flight_key = (self.generation, page_index)
+        if page_index in self._cache or in_flight_key in self._in_flight:
+            return
+
+        self._in_flight.add(in_flight_key)
+        task = _ImageLoadTask(self.source, page_index, self.image_ids[page_index], self.generation, self._adjustments)
+        task.signals.loaded.connect(self._on_loaded)
+        self._thread_pool.start(task)
+
+    @Slot(object)
+    def _on_loaded(self, cached: CachedImage) -> None:
+        self._in_flight.discard((cached.generation, cached.page_index))
+        if cached.generation != self.generation:
+            return
+        if not (0 <= cached.page_index < len(self.image_ids)):
+            return
+        if self.image_ids[cached.page_index] != cached.image_id:
+            return
+        if self._wanted_indexes and cached.page_index not in self._wanted_indexes:
+            return
+
+        self._cache[cached.page_index] = cached
+        self._cache.move_to_end(cached.page_index)
+        self._enforce_limit()
+        self.pageLoaded.emit(cached)
+
+    def _enforce_limit(self) -> None:
+        while len(self._cache) > self.cache_size:
+            evicted = False
+            for index in list(self._cache):
+                if index not in self._protected_indexes:
+                    del self._cache[index]
+                    evicted = True
+                    break
+            if not evicted:
+                break

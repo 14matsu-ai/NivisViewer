@@ -1,0 +1,1 @@
+"""NivisViewer application package."""

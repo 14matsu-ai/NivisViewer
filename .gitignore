@@ -1,0 +1,26 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+
+# Application data
+config.json
+data/
+cache/
+logs/
+*.log
+
+# Build output
+build/
+dist/
+*.spec
+
+# IDE / Windows
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
