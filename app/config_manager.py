@@ -22,7 +22,11 @@ class ConfigManager:
         "hide_ui_in_fullscreen": False,
         "hide_cursor_in_fullscreen": False,
         "show_page_list": False,
-        "thumbnail_size": 96,
+        "thumbnail_size": 180,
+        "last_browser_path": "",
+        "browser_sidebar_visible": True,
+        "browser_sidebar_width": 280,
+        "browser_window_geometry": "",
         "auto_open_adjacent_book": False,
         "open_viewer_behavior": "reuse_or_create",
         "loop_book_navigation": False,
@@ -68,7 +72,7 @@ class ConfigManager:
         if isinstance(loaded, dict):
             merged = defaults
             merged.update(loaded)
-            self.data = merged
+            self.data = self._normalize(merged)
         else:
             self.data = defaults
         return self.data
@@ -86,3 +90,34 @@ class ConfigManager:
 
     def set(self, key: str, value: Any) -> None:
         self.data[key] = value
+
+    @classmethod
+    def _normalize(cls, values: dict[str, Any]) -> dict[str, Any]:
+        normalized = values
+        if not isinstance(normalized.get("last_browser_path"), str):
+            normalized["last_browser_path"] = cls.DEFAULTS["last_browser_path"]
+        if not isinstance(normalized.get("browser_sidebar_visible"), bool):
+            normalized["browser_sidebar_visible"] = cls.DEFAULTS["browser_sidebar_visible"]
+        if not isinstance(normalized.get("browser_window_geometry"), str):
+            normalized["browser_window_geometry"] = cls.DEFAULTS["browser_window_geometry"]
+        normalized["browser_sidebar_width"] = cls._clamped_int(
+            normalized.get("browser_sidebar_width"),
+            default=int(cls.DEFAULTS["browser_sidebar_width"]),
+            minimum=120,
+            maximum=1200,
+        )
+        normalized["thumbnail_size"] = cls._clamped_int(
+            normalized.get("thumbnail_size"),
+            default=int(cls.DEFAULTS["thumbnail_size"]),
+            minimum=80,
+            maximum=500,
+        )
+        return normalized
+
+    @staticmethod
+    def _clamped_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            number = default
+        return max(minimum, min(maximum, number))
