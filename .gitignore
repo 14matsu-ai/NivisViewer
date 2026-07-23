@@ -1,5 +1,7 @@
 ﻿# Python
 __pycache__/
+**/__pycache__/
+.pytest_cache/
 *.py[cod]
 *.pyo
 
@@ -13,10 +15,12 @@ data/
 cache/
 logs/
 *.log
+*.tmp
 
 # Build output
 build/
 dist/
+out/
 *.spec
 
 # IDE / Windows

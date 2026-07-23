@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -46,22 +47,27 @@ class ConfigManager:
     def __init__(self, path: str | Path | None = None) -> None:
         base_dir = Path(__file__).resolve().parents[1]
         self.path = Path(path) if path else base_dir / "config.json"
-        self.data: dict[str, Any] = dict(self.DEFAULTS)
+        self.data: dict[str, Any] = deepcopy(self.DEFAULTS)
 
     def load(self) -> dict[str, Any]:
+        defaults = deepcopy(self.DEFAULTS)
         if not self.path.exists():
+            self.data = defaults
             return self.data
 
         try:
             with self.path.open("r", encoding="utf-8") as file:
                 loaded = json.load(file)
         except (OSError, json.JSONDecodeError):
+            self.data = defaults
             return self.data
 
         if isinstance(loaded, dict):
-            merged = dict(self.DEFAULTS)
+            merged = defaults
             merged.update(loaded)
             self.data = merged
+        else:
+            self.data = defaults
         return self.data
 
     def save(self, updates: dict[str, Any] | None = None) -> None:

@@ -150,7 +150,11 @@ class PageModel:
         start = self.current_index if start_index is None else start_index
         start = max(0, min(start, self.total_pages - 1))
 
-        if self.is_single_at(start) or start + 1 >= self.total_pages:
+        if (
+            self.is_single_at(start)
+            or start + 1 >= self.total_pages
+            or self.is_wide_image(start + 1)
+        ):
             image_id = self.image_ids[start]
             return DisplaySpread(start, (PageSlot(image_id, start),), True)
 
@@ -168,7 +172,10 @@ class PageModel:
         if not spread.slots:
             return 0
         max_index = max(slot.page_index for slot in spread.slots)
-        return min(max_index + 1, self.total_pages - 1)
+        next_index = max_index + 1
+        if next_index >= self.total_pages:
+            return spread.start_index
+        return next_index
 
     def previous_index_from(self, start_index: int) -> int:
         if self.total_pages == 0:
