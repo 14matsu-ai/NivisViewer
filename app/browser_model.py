@@ -187,6 +187,17 @@ class BrowserItemModel(QAbstractListModel):
         self.dataChanged.emit(index, index, [int(Qt.ItemDataRole.DecorationRole)])
         return True
 
+    def clear_thumbnails(self) -> None:
+        if not self._icons:
+            return
+        self._icons.clear()
+        if self._items:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(self._items) - 1, 0),
+                [int(Qt.ItemDataRole.DecorationRole)],
+            )
+
     def item_at(self, index_or_row: QModelIndex | int) -> BrowserItem | None:
         row = index_or_row.row() if isinstance(index_or_row, QModelIndex) else index_or_row
         if 0 <= row < len(self._items):

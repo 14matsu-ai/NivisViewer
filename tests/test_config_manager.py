@@ -17,6 +17,10 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
     assert manager.data["browser_sidebar_visible"] is True
     assert manager.data["browser_sidebar_width"] == 280
     assert manager.data["thumbnail_size"] == 180
+    assert manager.data["join_spread_pages"] is False
+    assert manager.data["thumbnail_disk_cache_enabled"] is True
+    assert manager.data["thumbnail_cache_limit_mb"] == 512
+    assert manager.data["gap"] == 12
 
 
 def test_partial_config_is_merged_with_defaults(tmp_path: Path) -> None:
@@ -69,3 +73,25 @@ def test_invalid_browser_settings_are_normalized_and_clamped(tmp_path: Path) -> 
     assert restored["browser_sidebar_visible"] is True
     assert restored["browser_sidebar_width"] == 120
     assert restored["thumbnail_size"] == 500
+
+
+def test_sprint4_settings_are_normalized_and_changes_are_emitted(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        '{"open_viewer_behavior": "bad", "gap": -20, '
+        '"thumbnail_cache_limit_mb": 99999, "join_spread_pages": "yes"}',
+        encoding="utf-8",
+    )
+    manager = ConfigManager(path)
+    restored = manager.load()
+    changes: list[dict[str, object]] = []
+    manager.settings_changed.connect(changes.append)
+
+    assert restored["open_viewer_behavior"] == "reuse_or_create"
+    assert restored["gap"] == 0
+    assert restored["thumbnail_cache_limit_mb"] == 4096
+    assert restored["join_spread_pages"] is False
+
+    manager.apply({"gap": 25, "join_spread_pages": True})
+
+    assert changes == [{"gap": 25, "join_spread_pages": True}]
