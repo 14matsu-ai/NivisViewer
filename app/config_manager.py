@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QObject, Signal
+
+from .viewer_commands import normalize_viewer_command
 
 
 class ConfigManager(QObject):
@@ -35,6 +38,15 @@ class ConfigManager(QObject):
         "open_viewer_behavior": "reuse_or_create",
         "loop_book_navigation": False,
         "bring_viewer_to_front_on_open": True,
+        "mouse_gestures_enabled": True,
+        "mouse_gesture_show_trail": True,
+        "mouse_gesture_min_distance": 36,
+        "mouse_gesture_bindings": {
+            "D": "close_viewer",
+            "U": "toggle_fullscreen",
+        },
+        "mouse_back_button_action": "previous_book",
+        "mouse_forward_button_action": "next_book",
         "join_spread_pages": False,
         "thumbnail_disk_cache_enabled": True,
         "thumbnail_cache_limit_mb": 512,
@@ -150,6 +162,8 @@ class ConfigManager(QObject):
         for key in (
             "bring_viewer_to_front_on_open",
             "loop_book_navigation",
+            "mouse_gestures_enabled",
+            "mouse_gesture_show_trail",
             "join_spread_pages",
             "single_first_page",
             "treat_wide_image_as_single",
@@ -157,6 +171,26 @@ class ConfigManager(QObject):
         ):
             if not isinstance(normalized.get(key), bool):
                 normalized[key] = cls.DEFAULTS[key]
+        normalized["mouse_gesture_min_distance"] = cls._clamped_int(
+            normalized.get("mouse_gesture_min_distance"),
+            default=int(cls.DEFAULTS["mouse_gesture_min_distance"]),
+            minimum=12,
+            maximum=200,
+        )
+        raw_bindings = normalized.get("mouse_gesture_bindings")
+        bindings: dict[str, str] = {}
+        if isinstance(raw_bindings, dict):
+            for raw_pattern, raw_command in raw_bindings.items():
+                if (
+                    isinstance(raw_pattern, str)
+                    and re.fullmatch(r"[UDLR]{1,8}", raw_pattern)
+                ):
+                    command = normalize_viewer_command(raw_command)
+                    if command:
+                        bindings[raw_pattern] = command
+        normalized["mouse_gesture_bindings"] = bindings
+        for key in ("mouse_back_button_action", "mouse_forward_button_action"):
+            normalized[key] = normalize_viewer_command(normalized.get(key))
         normalized["gap"] = cls._clamped_int(
             normalized.get("gap"),
             default=int(cls.DEFAULTS["gap"]),

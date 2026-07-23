@@ -400,6 +400,66 @@ def test_loop_book_navigation_setting_wraps_to_first_book(
     close_controller(controller, qapp)
 
 
+def test_book_navigation_stops_at_edge_when_loop_is_disabled(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    first = tmp_path / "books" / "1" / "1.jpg"
+    last = tmp_path / "books" / "2" / "1.jpg"
+    write_image(first)
+    write_image(last)
+    controller = make_controller(tmp_path, qapp)
+    viewer = controller.open_path(first)
+
+    result = controller.open_adjacent_book(viewer, -1)
+
+    assert result == "boundary"
+    assert viewer.book_session.current_path == first
+    close_controller(controller, qapp)
+
+
+def test_book_candidates_use_natural_order_and_adjacent_open_stays_in_background(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    first = tmp_path / "books" / "book1" / "1.jpg"
+    write_image(first)
+    (tmp_path / "books" / "book2.zip").write_bytes(b"not-opened-by-this-test")
+    (tmp_path / "books" / "book10.cbz").write_bytes(b"not-opened-by-this-test")
+    controller = make_controller(tmp_path, qapp)
+    viewer = controller.open_path(first)
+    opened: list[tuple[Path, bool | None]] = []
+
+    def capture_open(_window, path, *, bring_to_front=None):
+        opened.append((Path(path), bring_to_front))
+        return True
+
+    monkeypatch.setattr(controller, "_open_path_in_viewer", capture_open)
+
+    names = [path.name for path in controller._book_candidates(viewer)]
+    result = controller.open_adjacent_book(viewer, 1)
+
+    assert names == ["book1", "book2.zip", "book10.cbz"]
+    assert result == "opened"
+    assert opened == [(tmp_path / "books" / "book2.zip", False)]
+    close_controller(controller, qapp)
+
+
+def test_missing_current_book_is_unavailable_without_exception(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    first = tmp_path / "books" / "book1" / "1.jpg"
+    write_image(first)
+    controller = make_controller(tmp_path, qapp)
+    viewer = controller.open_path(first)
+    viewer.book_session.current_path = tmp_path / "books" / "missing.zip"
+
+    assert controller.open_adjacent_book(viewer, 1) == "unavailable"
+    close_controller(controller, qapp)
+
+
 def test_settings_changes_apply_to_existing_browser_and_viewer(
     tmp_path: Path,
     qapp: QApplication,

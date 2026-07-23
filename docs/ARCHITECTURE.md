@@ -2,7 +2,7 @@
 
 ## 現在の実装
 
-Sprint 3では本を探す`BrowserWindow`を追加しました。BrowserWindowとViewerWindowは同じ`QApplication`・同じプロセス内で動く別ウィンドウで、ApplicationControllerが寿命と選択状態を連動させます。
+Sprint 5では本を探す`BrowserWindow`と独立した`ViewerWindow`群に、共通Viewerコマンド、マウス追加ボタンによる書庫移動、右クリックドラッグジェスチャーを追加しました。BrowserWindowとViewerWindowは同じ`QApplication`・同じプロセス内で動く別ウィンドウで、ApplicationControllerが寿命と選択状態を連動させます。
 
 ```text
 ApplicationController
@@ -17,7 +17,9 @@ ApplicationController
    │  ├─ ImageSource
    │  ├─ PageModel
    │  └─ ImageCache
+   ├─ Viewer command dispatcher
    └─ ViewerWidget
+      └─ MouseGestureRecognizer
 ```
 
 - `main.py`: `QApplication`を生成し、起動引数を`ApplicationController`へ渡すエントリーポイント
@@ -27,14 +29,15 @@ ApplicationController
 - `BrowserItemModel`: BrowserItemの表示名、絶対パス、種類、更新日時と表示アイコンをQt Model/Viewへ公開
 - `BrowserThumbnailProvider`: 最大2スレッドの専用`QThreadPool`で画像、画像フォルダ、ZIP/CBZのサムネイルを生成し、メモリLRUキャッシュを管理
 - `ThumbnailDiskCache`: SQLiteインデックスとWebPまたはPNGファイルによるポータブルな永続サムネイルキャッシュ
-- `SettingsDialog`: Viewerの開き方、見開き表示、Browserのサムネイルとディスクキャッシュ設定を編集
-- `ViewerWindow`: 閲覧メニュー、ダイアログ、入力、ViewerWidgetへの描画、ページ移動、全画面などウィンドウ固有UIを管理
+- `SettingsDialog`: Viewerの開き方、見開き表示、Browserのサムネイルとディスクキャッシュ、マウス操作割り当てを編集
+- `ViewerWindow`: 閲覧メニュー、ダイアログ、入力、ViewerWidgetへの描画、ページ移動、全画面などウィンドウ固有UIを管理し、キー・メニュー・マウス入力を共通コマンドへdispatch
 - `BookSession`: 現在のパス、ImageSource、PageModel、ImageCache、読み込み世代、ソース切替と終了を管理
 - `ConfigManager`: リポジトリ直下の`config.json`を読み書きするポータブル設定管理
 - `ImageSource`: フォルダ、単体画像の親フォルダ、ZIP/CBZを共通化する画像供給層
 - `PageModel`: 論理ページ順と単ページ／見開きの表示単位を管理する非GUIモデル
 - `ImageCache`: セッション専用`QThreadPool`で画像を非同期デコードし、LRU形式で保持するキャッシュ
-- `ViewerWidget`: 渡された画像の描画、拡大縮小、パン、クリックやホイール入力を担当
+- `ViewerWidget`: 渡された画像の描画、拡大縮小、パン、クリックやホイール入力、追加ボタン検出、ジェスチャー軌跡オーバーレイを担当
+- `MouseGestureRecognizer`: QtやGUI状態に依存せず、移動量をU/D/L/Rへ量子化して連続方向を圧縮
 - `PageThumbnailProvider`: QImageからQtアイコンへの変換を担当し、ViewerWindowのページ一覧とBrowserWindowの一覧で利用
 
 BrowserWindowのフォルダツリーはQt標準の`QFileSystemModel`と`QTreeView`を使い、フォルダだけを表示します。モデルの空ルートからWindowsのドライブへアクセスでき、フォルダ選択は短いタイマーでまとめてから一覧を更新します。右側は`QListView`と`BrowserItemModel`によるModel/View構成です。
@@ -84,6 +87,18 @@ BrowserWindowから本を開いたときは、ApplicationControllerが`open_view
 
 `open_viewer_behavior`、前面表示、書庫移動ループはSettingsDialogから変更できます。通常の「開く」はこの設定に従い、BrowserWindowの「新しいViewerWindowで開く」は設定に関係なく新規ウィンドウを作成します。
 
+### Viewerコマンドとマウス入力
+
+`app/viewer_commands.py`がページ移動、書庫移動、全画面、Viewer終了、表示切替、フィット、ズームの安定したコマンド識別子を定義します。`ViewerWindow.dispatch_command()`だけが識別子と実処理を対応付け、キー、メニュー、マウス追加ボタン、マウスジェスチャーは可能な範囲でこの経路を共有します。未知の識別子は実行しません。
+
+ViewerWidgetは`BackButton / XButton1`と`ForwardButton / XButton2`を押下時だけ通知し、解放時には再通知しません。既定では前／次の本へ移動します。ApplicationControllerは現在の本と同じ親フォルダから、対応画像を含む直下フォルダ、ZIP/CBZ、対応画像のまとまりを重複排除して自然順で列挙します。形式判定は`BOOK_FILE_EXTENSIONS`へ集約し、移動時は`loop_book_navigation`を尊重します。移動先Viewerを前面へ出し直しません。
+
+右ボタン押下後、`MouseGestureRecognizer`は設定された最小距離以上の移動を主軸方向のU/D/L/Rへ量子化します。同じ方向の連続入力を圧縮し、最大8方向で打ち切ります。右ボタン解放時に方向列があれば対応コマンドを一度だけ実行し、方向列がなければ通常のコンテキストメニューを開きます。未割り当て方向列と未知コマンドは何も行いません。Esc、ウィンドウ非アクティブ化、Viewer終了では認識状態と軌跡を破棄します。Qtのマウスグラブによりウィンドウ外の解放も通常は同じrelease経路へ戻ります。
+
+軌跡はViewerWidgetの最終オーバーレイとして半透明の線を描くだけで、表示完了またはキャンセル時に消去します。画像、ImageCache、PageModelには書き込みません。ジェスチャー有効化、軌跡、最小距離、XButton、D/Uの割り当てはSettingsDialogから変更でき、ConfigManagerの変更通知により既存ViewerWindowへ即時反映されます。
+
+書庫移動後の`book_changed`は既存の同期経路を通ります。操作対象が最後にアクティブだったViewerWindowの場合だけBrowserWindowの選択が追従するため、別の非アクティブViewerWindowからの変更でBrowser選択を奪いません。`D → close_viewer`も対象ViewerWindowの通常のclose経路だけを通り、アプリ終了の判定はApplicationControllerに残します。
+
 ### 見開き密着表示
 
 ViewerWidgetの描画矩形は`calculate_spread_layout()`で計算します。2ページの論理見開きで`join_spread_pages`が有効な場合だけ実効gapを0にし、1枚目の右端と2枚目の左端を同じ中央境界へ配置します。
@@ -100,7 +115,7 @@ ViewerWidgetの描画矩形は`calculate_spread_layout()`で計算します。2�
 
 共有設定はApplicationControllerが所有するConfigManagerへ変更時に反映します。ConfigManagerは変更キーを`settings_changed`シグナルで配信し、開いているBrowserWindowとViewerWindowが必要な項目だけを即時反映します。ViewerWindowを閉じる際にローカルな設定スナップショットを一括保存しないため、古い状態のウィンドウを後から閉じても共有設定は巻き戻りません。
 
-共有設定には表示モード、綴じ方向、フィットモード、余白、表紙・横長画像の扱い、背景色、`open_viewer_behavior`、書庫移動ループ、前面表示設定などが含まれます。
+共有設定には表示モード、綴じ方向、フィットモード、余白、表紙・横長画像の扱い、背景色、`open_viewer_behavior`、書庫移動ループ、前面表示設定、マウスジェスチャーと追加ボタンの割り当てなどが含まれます。
 
 ジオメトリ、ウィンドウ状態、全画面、回転角度はウィンドウ固有です。複数ウィンドウの完全な復元はまだ行わず、最後にアクティブだったViewerWindowの値を次回作成時の標準状態として保存します。現在の本、ページ、ズーム、パン、スライドショーの実行状態は各ViewerWindow内で独立し、ウィンドウ群としての復元対象にはしていません。
 
@@ -115,7 +130,7 @@ BrowserWindowは`last_browser_path`、`browser_sidebar_visible`、`browser_sideb
 
 ## 次の構成
 
-Sprint 5以降はBrowserWindowのサイドバーへブックマークと履歴のタブを追加します。BrowserWindowの明示的な選択、Controllerからの追従選択、履歴からの選択を区別した現在の接続点を維持します。
+将来はBrowserWindowのサイドバーへブックマークと履歴のタブを追加します。BrowserWindowの明示的な選択、Controllerからの追従選択、履歴からの選択を区別した現在の接続点を維持します。Viewerコマンド識別子とApplicationControllerの選択同期を、ブックマーク／履歴から本を開く操作の共通接続点として利用します。
 
 `ApplicationController`は引き続きアプリ全体の寿命、共有設定、ウィンドウ群、ウィンドウ間イベントを管理します。`BrowserWindow`は本を探して選ぶ責務、`ViewerWindow`はBookSessionとViewerWidgetを接続して読む責務を持ちます。PageModelはGUIに依存しない状態を保ちます。
 
@@ -128,7 +143,7 @@ Sprint 5以降はBrowserWindowのサイドバーへブックマークと履歴�
 - `ViewerWindow`を再利用するか新規作成するかは設定可能にする。
 - マウスの戻る／進むボタンで前／次の書庫へ移動する。
 - 最後の書庫から先頭へ戻るループは設定可能にする。
-- 右クリックドラッグのマウスジェスチャーを将来実装する。
+- 右クリックドラッグのマウスジェスチャーは、通常の右クリックと排他的に判定し、操作割り当てを設定可能にする。
 - サムネイルサイズは設定画面から変更する。
 - 設定、履歴、ブックマーク、キャッシュはポータブル配置を基本とする。
 - 将来PDF、RAR、7z、CBR、CB7へ対応する。

@@ -127,3 +127,51 @@ def test_cache_clear_request_reaches_disk_cache(
     assert provider.disk_cache_usage_bytes() == 0
     provider.close()
     dialog.reject()
+
+
+def test_mouse_settings_are_shown_applied_and_disableable(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    config = make_config(tmp_path)
+    dialog = SettingsDialog(config)
+
+    assert dialog.mouse_gestures_checkbox.isChecked()
+    assert dialog.mouse_gesture_trail_checkbox.isChecked()
+    assert dialog.mouse_gesture_distance_spin.value() == 36
+    assert dialog.gesture_down_combo.currentData() == "close_viewer"
+    assert dialog.gesture_up_combo.currentData() == "toggle_fullscreen"
+    assert dialog.mouse_back_action_combo.currentData() == "previous_book"
+    assert dialog.mouse_forward_action_combo.currentData() == "next_book"
+
+    dialog.mouse_gestures_checkbox.setChecked(False)
+    dialog.mouse_gesture_distance_spin.setValue(88)
+    dialog.gesture_down_combo.setCurrentIndex(
+        dialog.gesture_down_combo.findData("next_page")
+    )
+    dialog.mouse_back_action_combo.setCurrentIndex(0)
+    changed = dialog.apply_settings()
+
+    assert changed["mouse_gestures_enabled"] is False
+    assert changed["mouse_gesture_min_distance"] == 88
+    assert changed["mouse_gesture_bindings"]["D"] == "next_page"
+    assert changed["mouse_back_button_action"] == ""
+    assert not dialog.gesture_down_combo.isEnabled()
+    restored = ConfigManager(config.path).load()
+    assert restored["mouse_gesture_bindings"]["D"] == "next_page"
+    dialog.reject()
+
+
+def test_cancel_does_not_save_mouse_settings(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    config = make_config(tmp_path)
+    dialog = SettingsDialog(config)
+    dialog.mouse_gestures_checkbox.setChecked(False)
+    dialog.mouse_gesture_distance_spin.setValue(120)
+
+    dialog.reject()
+
+    assert config.get("mouse_gestures_enabled") is True
+    assert config.get("mouse_gesture_min_distance") == 36

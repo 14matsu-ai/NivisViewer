@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QApplication
 from app.application_controller import ApplicationController
 from app.book_session import BookSession
 from app.config_manager import ConfigManager
+from app import viewer_commands as commands
 from app.viewer_window import ViewerWindow
 
 
@@ -110,5 +111,115 @@ def test_short_offscreen_show_and_close(tmp_path: Path, qapp: QApplication) -> N
     qapp.processEvents()
     assert window.isVisible()
 
+    window.close()
+    qapp.processEvents()
+
+
+def test_dispatcher_routes_commands_and_rejects_unknown(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    window = ViewerWindow(config_manager=make_config(tmp_path))
+    calls: list[str] = []
+    monkeypatch.setattr(window, "next_page", lambda: calls.append("next"))
+    monkeypatch.setattr(window, "open_previous_book", lambda: calls.append("book"))
+    monkeypatch.setattr(window, "toggle_view_mode", lambda: calls.append("spread"))
+
+    assert window.dispatch_command(commands.NEXT_PAGE)
+    assert window.dispatch_command(commands.PREVIOUS_BOOK)
+    assert window.dispatch_command(commands.TOGGLE_SPREAD)
+    assert not window.dispatch_command("unknown")
+    assert calls == ["next", "book", "spread"]
+    window.close()
+    qapp.processEvents()
+
+
+def test_extra_buttons_use_book_commands_once(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    directions: list[int] = []
+
+    def adjacent_handler(_window: object, direction: int) -> str:
+        directions.append(direction)
+        return "opened"
+
+    window = ViewerWindow(
+        config_manager=make_config(tmp_path),
+        adjacent_book_handler=adjacent_handler,
+    )
+
+    window.viewer.extraMouseButtonPressed.emit("back")
+    window.viewer.extraMouseButtonPressed.emit("forward")
+
+    assert directions == [-1, 1]
+    window.close()
+    qapp.processEvents()
+
+
+def test_default_down_gesture_closes_only_target_viewer(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    config = make_config(tmp_path)
+    target = ViewerWindow(config_manager=config)
+    other = ViewerWindow(config_manager=config)
+    closed: list[object] = []
+    target.closing.connect(closed.append)
+
+    target.viewer.gestureRecognized.emit("D")
+
+    assert closed == [target]
+    assert not other._shutdown_prepared
+    other.close()
+    qapp.processEvents()
+
+
+def test_up_gesture_toggles_fullscreen_once_and_unassigned_does_nothing(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    window = ViewerWindow(config_manager=make_config(tmp_path))
+    calls: list[str] = []
+    monkeypatch.setattr(
+        window,
+        "toggle_fullscreen",
+        lambda: calls.append("fullscreen"),
+    )
+
+    window.viewer.gestureRecognized.emit("U")
+    window.viewer.gestureRecognized.emit("L")
+
+    assert calls == ["fullscreen"]
+    window.close()
+    qapp.processEvents()
+
+
+def test_mouse_settings_apply_to_existing_viewer_immediately(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    config = make_config(tmp_path)
+    window = ViewerWindow(config_manager=config)
+
+    config.apply(
+        {
+            "mouse_gestures_enabled": False,
+            "mouse_gesture_show_trail": False,
+            "mouse_gesture_min_distance": 72,
+            "mouse_gesture_bindings": {"U": "next_page"},
+            "mouse_back_button_action": "",
+            "mouse_forward_button_action": "first_page",
+        }
+    )
+
+    assert not window.viewer.mouse_gestures_enabled
+    assert not window.viewer.mouse_gesture_show_trail
+    assert window.viewer.mouse_gesture_min_distance == 72
+    assert window.mouse_gesture_bindings == {"U": "next_page"}
+    assert window.mouse_back_button_action == ""
+    assert window.mouse_forward_button_action == "first_page"
     window.close()
     qapp.processEvents()

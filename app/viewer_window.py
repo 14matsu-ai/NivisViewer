@@ -37,6 +37,7 @@ from .config_manager import ConfigManager
 from .image_cache import CachedImage, PRELOAD_RADIUS
 from .image_source import ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS, ImageSourceError
 from .thumbnail_provider import PageThumbnailProvider
+from . import viewer_commands as commands
 from .viewer_widget import ViewerImage, ViewerWidget
 
 
@@ -104,6 +105,23 @@ class ViewerWindow(QMainWindow):
         self.magnifier_zoom = float(self.settings.get("magnifier_zoom", 2.0))
         self.magnifier_size = int(self.settings.get("magnifier_size", 220))
         self.background_color = str(self.settings["background_color"])
+        self.mouse_gestures_enabled = bool(
+            self.settings.get("mouse_gestures_enabled", True)
+        )
+        self.mouse_gesture_show_trail = bool(
+            self.settings.get("mouse_gesture_show_trail", True)
+        )
+        self.mouse_gesture_min_distance = int(
+            self.settings.get("mouse_gesture_min_distance", 36)
+        )
+        bindings = self.settings.get("mouse_gesture_bindings", {})
+        self.mouse_gesture_bindings = dict(bindings) if isinstance(bindings, dict) else {}
+        self.mouse_back_button_action = commands.normalize_viewer_command(
+            self.settings.get("mouse_back_button_action")
+        )
+        self.mouse_forward_button_action = commands.normalize_viewer_command(
+            self.settings.get("mouse_forward_button_action")
+        )
         self.slideshow_timer = QTimer(self)
         self.slideshow_timer.setInterval(max(500, self.slideshow_interval_ms))
         self.slideshow_timer.timeout.connect(self._advance_slideshow)
@@ -155,12 +173,12 @@ class ViewerWindow(QMainWindow):
         handled = super().event(event)
         if event.type() == QEvent.Type.WindowActivate:
             self.activated.emit(self)
+        elif event.type() == QEvent.Type.WindowDeactivate and hasattr(self, "viewer"):
+            self.viewer.cancel_mouse_gesture()
         return handled
 
     def _build_ui(self) -> None:
         self.viewer = ViewerWidget(self)
-        self.viewer.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.viewer.customContextMenuRequested.connect(self._show_viewer_context_menu)
         self.slider = QSlider(Qt.Orientation.Horizontal, self)
         self.slider.setMinimum(1)
         self.slider.setMaximum(1)
@@ -203,9 +221,14 @@ class ViewerWindow(QMainWindow):
 
         self.viewer.nextRequested.connect(self.next_page_or_scroll)
         self.viewer.previousRequested.connect(self.previous_page_or_scroll)
-        self.viewer.fullscreenToggleRequested.connect(self.toggle_fullscreen)
+        self.viewer.fullscreenToggleRequested.connect(
+            lambda: self.dispatch_command(commands.TOGGLE_FULLSCREEN)
+        )
         self.viewer.leftSideClicked.connect(self._on_left_side_clicked)
         self.viewer.rightSideClicked.connect(self._on_right_side_clicked)
+        self.viewer.contextMenuRequested.connect(self._show_viewer_context_menu)
+        self.viewer.gestureRecognized.connect(self._on_mouse_gesture)
+        self.viewer.extraMouseButtonPressed.connect(self._on_extra_mouse_button)
         self.viewer.zoomChanged.connect(self._on_zoom_changed)
         self.slider.valueChanged.connect(self._on_slider_changed)
 
@@ -237,7 +260,9 @@ class ViewerWindow(QMainWindow):
         open_location_action.triggered.connect(self.open_current_location)
         exit_action = QAction("終了", self)
         exit_action.setShortcut(QKeySequence.StandardKey.Quit)
-        exit_action.triggered.connect(self.close)
+        exit_action.triggered.connect(
+            lambda _checked=False: self.dispatch_command(commands.CLOSE_VIEWER)
+        )
         file_menu.addAction(open_action)
         file_menu.addAction(reload_action)
         file_menu.addAction(export_view_action)
@@ -349,7 +374,9 @@ class ViewerWindow(QMainWindow):
 
         fullscreen_action = QAction("全画面", self)
         fullscreen_action.setShortcut("F")
-        fullscreen_action.triggered.connect(self.toggle_fullscreen)
+        fullscreen_action.triggered.connect(
+            lambda _checked=False: self.dispatch_command(commands.TOGGLE_FULLSCREEN)
+        )
         view_menu.addAction(fullscreen_action)
         self.hide_ui_fullscreen_action = QAction("全画面時にUIを隠す", self, checkable=True)
         self.hide_ui_fullscreen_action.triggered.connect(self.set_hide_ui_in_fullscreen)
@@ -431,10 +458,14 @@ class ViewerWindow(QMainWindow):
         self.history_forward_action.triggered.connect(self.go_forward_in_page_history)
         next_action = QAction("次ページ", self)
         next_action.setShortcut(Qt.Key.Key_Right)
-        next_action.triggered.connect(self.next_page)
+        next_action.triggered.connect(
+            lambda _checked=False: self.dispatch_command(commands.NEXT_PAGE)
+        )
         previous_action = QAction("前ページ", self)
         previous_action.setShortcut(Qt.Key.Key_Left)
-        previous_action.triggered.connect(self.previous_page)
+        previous_action.triggered.connect(
+            lambda _checked=False: self.dispatch_command(commands.PREVIOUS_PAGE)
+        )
         next_one_page_action = QAction("1ページ進む", self)
         next_one_page_action.setShortcut("Shift+Right")
         next_one_page_action.triggered.connect(self.next_one_page)
@@ -443,19 +474,27 @@ class ViewerWindow(QMainWindow):
         previous_one_page_action.triggered.connect(self.previous_one_page)
         next_book_action = QAction("次の本", self)
         next_book_action.setShortcut("Ctrl+PgDown")
-        next_book_action.triggered.connect(self.open_next_book)
+        next_book_action.triggered.connect(
+            lambda _checked=False: self.dispatch_command(commands.NEXT_BOOK)
+        )
         previous_book_action = QAction("前の本", self)
         previous_book_action.setShortcut("Ctrl+PgUp")
-        previous_book_action.triggered.connect(self.open_previous_book)
+        previous_book_action.triggered.connect(
+            lambda _checked=False: self.dispatch_command(commands.PREVIOUS_BOOK)
+        )
         go_to_page_action = QAction("ページ指定", self)
         go_to_page_action.setShortcut("G")
         go_to_page_action.triggered.connect(self.go_to_page_dialog)
         first_action = QAction("先頭", self)
         first_action.setShortcut(Qt.Key.Key_Home)
-        first_action.triggered.connect(self.first_page)
+        first_action.triggered.connect(
+            lambda _checked=False: self.dispatch_command(commands.FIRST_PAGE)
+        )
         last_action = QAction("最後", self)
         last_action.setShortcut(Qt.Key.Key_End)
-        last_action.triggered.connect(self.last_page)
+        last_action.triggered.connect(
+            lambda _checked=False: self.dispatch_command(commands.LAST_PAGE)
+        )
         move_menu.addAction(self.history_back_action)
         move_menu.addAction(self.history_forward_action)
         move_menu.addSeparator()
@@ -482,13 +521,13 @@ class ViewerWindow(QMainWindow):
             ("Backspace", self.previous_page_or_scroll),
             ("PgDown", self.next_page_or_scroll),
             ("PgUp", self.previous_page_or_scroll),
-            ("+", self.zoom_in),
-            ("=", self.zoom_in),
-            ("-", self.zoom_out),
-            ("0", lambda: self.set_fit_mode("fit_window")),
-            ("Esc", self.exit_fullscreen),
-            ("D", self.toggle_view_mode),
-            ("R", self.toggle_reading_direction),
+            ("+", lambda: self.dispatch_command(commands.ZOOM_IN)),
+            ("=", lambda: self.dispatch_command(commands.ZOOM_IN)),
+            ("-", lambda: self.dispatch_command(commands.ZOOM_OUT)),
+            ("0", lambda: self.dispatch_command(commands.FIT_WINDOW)),
+            ("Esc", self._handle_escape),
+            ("D", lambda: self.dispatch_command(commands.TOGGLE_SPREAD)),
+            ("R", lambda: self.dispatch_command(commands.TOGGLE_READING_DIRECTION)),
             ("B", self.toggle_current_bookmark),
             ("Ctrl+B", self.toggle_current_bookmark),
         ]
@@ -522,6 +561,11 @@ class ViewerWindow(QMainWindow):
         self.viewer.set_magnifier_options(zoom=self.magnifier_zoom, size=self.magnifier_size)
         self.viewer.set_magnifier_enabled(self.magnifier_enabled)
         self.viewer.set_fit_mode(self.fit_mode)
+        self.viewer.set_mouse_gesture_options(
+            enabled=self.mouse_gestures_enabled,
+            show_trail=self.mouse_gesture_show_trail,
+            min_distance=self.mouse_gesture_min_distance,
+        )
         self.model.update_options(
             view_mode=self.view_mode,
             reading_direction=self.reading_direction,
@@ -564,6 +608,37 @@ class ViewerWindow(QMainWindow):
                 cached = self.image_cache.get(index)
                 if cached is not None:
                     self._update_page_list_thumbnail(cached)
+        gesture_options_changed = False
+        if "mouse_gestures_enabled" in changed:
+            self.mouse_gestures_enabled = bool(changed["mouse_gestures_enabled"])
+            gesture_options_changed = True
+        if "mouse_gesture_show_trail" in changed:
+            self.mouse_gesture_show_trail = bool(changed["mouse_gesture_show_trail"])
+            gesture_options_changed = True
+        if "mouse_gesture_min_distance" in changed:
+            self.mouse_gesture_min_distance = max(
+                12, min(200, int(changed["mouse_gesture_min_distance"]))
+            )
+            gesture_options_changed = True
+        if "mouse_gesture_bindings" in changed:
+            raw_bindings = changed["mouse_gesture_bindings"]
+            self.mouse_gesture_bindings = (
+                dict(raw_bindings) if isinstance(raw_bindings, dict) else {}
+            )
+        if "mouse_back_button_action" in changed:
+            self.mouse_back_button_action = commands.normalize_viewer_command(
+                changed["mouse_back_button_action"]
+            )
+        if "mouse_forward_button_action" in changed:
+            self.mouse_forward_button_action = commands.normalize_viewer_command(
+                changed["mouse_forward_button_action"]
+            )
+        if gesture_options_changed:
+            self.viewer.set_mouse_gesture_options(
+                enabled=self.mouse_gestures_enabled,
+                show_trail=self.mouse_gesture_show_trail,
+                min_distance=self.mouse_gesture_min_distance,
+            )
         self._sync_actions()
         if refresh and self.model.total_pages:
             self._refresh_view()
@@ -1301,6 +1376,44 @@ class ViewerWindow(QMainWindow):
         else:
             self.next_page()
 
+    def dispatch_command(self, command: str) -> bool:
+        normalized = commands.normalize_viewer_command(command)
+        handlers: dict[str, Callable[[], None]] = {
+            commands.PREVIOUS_PAGE: self.previous_page,
+            commands.NEXT_PAGE: self.next_page,
+            commands.FIRST_PAGE: self.first_page,
+            commands.LAST_PAGE: self.last_page,
+            commands.PREVIOUS_BOOK: self.open_previous_book,
+            commands.NEXT_BOOK: self.open_next_book,
+            commands.TOGGLE_FULLSCREEN: self.toggle_fullscreen,
+            commands.CLOSE_VIEWER: self.close,
+            commands.TOGGLE_SPREAD: self.toggle_view_mode,
+            commands.TOGGLE_READING_DIRECTION: self.toggle_reading_direction,
+            commands.FIT_WINDOW: lambda: self.set_fit_mode("fit_window"),
+            commands.ZOOM_IN: self.zoom_in,
+            commands.ZOOM_OUT: self.zoom_out,
+        }
+        handler = handlers.get(normalized)
+        if handler is None:
+            return False
+        handler()
+        return True
+
+    def _on_mouse_gesture(self, pattern: str) -> None:
+        command = self.mouse_gesture_bindings.get(pattern, "")
+        self.dispatch_command(command)
+
+    def _on_extra_mouse_button(self, button: str) -> None:
+        if button == "back":
+            self.dispatch_command(self.mouse_back_button_action)
+        elif button == "forward":
+            self.dispatch_command(self.mouse_forward_button_action)
+
+    def _handle_escape(self) -> None:
+        if self.viewer.cancel_mouse_gesture():
+            return
+        self.exit_fullscreen()
+
     def _show_viewer_context_menu(self, position) -> None:
         menu = QMenu(self)
         back_history_action = menu.addAction("表示履歴を戻る")
@@ -1342,7 +1455,7 @@ class ViewerWindow(QMainWindow):
         elif selected == open_location_action:
             self.open_current_location()
         elif selected == fullscreen_action:
-            self.toggle_fullscreen()
+            self.dispatch_command(commands.TOGGLE_FULLSCREEN)
 
     def show_shortcuts_help(self) -> None:
         QMessageBox.information(
@@ -1653,6 +1766,7 @@ class ViewerWindow(QMainWindow):
         if self._shutdown_prepared:
             return
         self._shutdown_prepared = True
+        self.viewer.cancel_mouse_gesture()
         self.slideshow_timer.stop()
         self._save_current_reading_position()
         self.book_session.shutdown()

@@ -13,6 +13,7 @@ from PIL import Image, ImageOps
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".ico"}
 ARCHIVE_EXTENSIONS = {".zip", ".cbz"}
+BOOK_FILE_EXTENSIONS = frozenset(ARCHIVE_EXTENSIONS | SUPPORTED_EXTENSIONS)
 
 
 class ImageSourceError(RuntimeError):
