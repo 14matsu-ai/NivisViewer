@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication
 
 from app.browser_model import BrowserItem, BrowserItemKind
 from app.thumbnail_provider import BrowserThumbnailProvider
+from app.thumbnail_disk_cache import ThumbnailDiskCache
 
 
 def write_image(path: Path, *, color: str = "white") -> None:
@@ -98,4 +99,161 @@ def test_duplicate_requests_are_suppressed_and_old_generation_is_discarded(
     qapp.processEvents()
 
     assert delivered == []
+    provider.close()
+
+
+def test_memory_cache_is_checked_before_decoder(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    image_path = tmp_path / "page.jpg"
+    write_image(image_path)
+    item = make_item(image_path, BrowserItemKind.IMAGE)
+    decoder_calls: list[bool] = []
+
+    def loader(_item: BrowserItem, _size: int) -> QImage:
+        decoder_calls.append(True)
+        return QImage(12, 12, QImage.Format.Format_RGBA8888)
+
+    provider = BrowserThumbnailProvider(loader=loader)
+    generation = provider.begin_generation()
+    assert provider.request(item, 120, generation=generation)
+    assert provider.wait_for_done(2000)
+    qapp.processEvents()
+
+    assert not provider.request(item, 120, generation=generation)
+    qapp.processEvents()
+    assert decoder_calls == [True]
+    provider.close()
+
+
+def test_disk_hit_skips_decoder_and_miss_is_persisted(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    image_path = tmp_path / "日本語.jpg"
+    write_image(image_path)
+    item = make_item(image_path, BrowserItemKind.IMAGE)
+    cache_path = tmp_path / "cache"
+    disk_cache = ThumbnailDiskCache(cache_path)
+    assert disk_cache.put(
+        item,
+        120,
+        QImage(12, 12, QImage.Format.Format_RGBA8888),
+    )
+    disk_cache.close()
+    decoder_calls: list[bool] = []
+
+    def loader(_item: BrowserItem, _size: int) -> QImage:
+        decoder_calls.append(True)
+        return QImage(8, 8, QImage.Format.Format_RGBA8888)
+
+    provider = BrowserThumbnailProvider(
+        loader=loader,
+        disk_cache=ThumbnailDiskCache(cache_path, enabled=False),
+        disk_cache_enabled=True,
+    )
+    delivered: list[QImage] = []
+    provider.thumbnail_ready.connect(
+        lambda _path, _generation, image: delivered.append(image)
+    )
+    generation = provider.begin_generation()
+    assert provider.request(item, 120, generation=generation)
+    assert provider.wait_for_done(2000)
+    qapp.processEvents()
+
+    assert decoder_calls == []
+    assert delivered and not delivered[0].isNull()
+    provider.close()
+
+    other_size_calls: list[bool] = []
+
+    def other_loader(_item: BrowserItem, _size: int) -> QImage:
+        other_size_calls.append(True)
+        return QImage(10, 10, QImage.Format.Format_RGBA8888)
+
+    miss_provider = BrowserThumbnailProvider(
+        loader=other_loader,
+        disk_cache=ThumbnailDiskCache(cache_path, enabled=False),
+        disk_cache_enabled=True,
+    )
+    generation = miss_provider.begin_generation()
+    assert miss_provider.request(item, 160, generation=generation)
+    assert miss_provider.wait_for_done(2000)
+    qapp.processEvents()
+    assert other_size_calls == [True]
+    miss_provider.close()
+
+    persisted = ThumbnailDiskCache(cache_path)
+    assert persisted.get(item, 160) is not None
+    persisted.close()
+
+
+def test_disabled_disk_cache_is_not_accessed(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    image_path = tmp_path / "page.jpg"
+    write_image(image_path)
+    item = make_item(image_path, BrowserItemKind.IMAGE)
+
+    class FakeDiskCache:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def set_enabled(self, _enabled: bool) -> None:
+            self.calls.append("set_enabled")
+
+        def get(self, _item, _size):
+            self.calls.append("get")
+            return None
+
+        def put(self, _item, _size, _image, **_kwargs):
+            self.calls.append("put")
+            return True
+
+        def close(self) -> None:
+            pass
+
+    fake = FakeDiskCache()
+    provider = BrowserThumbnailProvider(
+        loader=lambda _item, _size: QImage(
+            8, 8, QImage.Format.Format_RGBA8888
+        ),
+        disk_cache=fake,  # type: ignore[arg-type]
+        disk_cache_enabled=False,
+    )
+    generation = provider.begin_generation()
+    assert provider.request(item, 100, generation=generation)
+    assert provider.wait_for_done(2000)
+    qapp.processEvents()
+
+    assert fake.calls == []
+    provider.close()
+
+
+def test_failed_thumbnail_is_not_retried_each_generation(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    image_path = tmp_path / "broken.jpg"
+    image_path.write_bytes(b"broken")
+    item = make_item(image_path, BrowserItemKind.IMAGE)
+    calls: list[bool] = []
+
+    def failing_loader(_item: BrowserItem, _size: int):
+        calls.append(True)
+        return None
+
+    provider = BrowserThumbnailProvider(loader=failing_loader)
+    first = provider.begin_generation()
+    assert provider.request(item, 100, generation=first)
+    assert provider.wait_for_done(2000)
+    qapp.processEvents()
+    second = provider.begin_generation()
+    assert provider.request(item, 100, generation=second)
+    assert provider.wait_for_done(2000)
+    qapp.processEvents()
+
+    assert calls == [True]
     provider.close()

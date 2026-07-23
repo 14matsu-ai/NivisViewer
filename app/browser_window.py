@@ -35,7 +35,9 @@ from .browser_model import (
     BrowserItemModel,
 )
 from .config_manager import ConfigManager
+from .settings_dialog import SettingsDialog
 from .thumbnail_provider import BrowserThumbnailProvider, PageThumbnailProvider
+from .thumbnail_disk_cache import ThumbnailDiskCache
 
 
 BrowserOpenHandler = Callable[[str, bool], object]
@@ -62,7 +64,20 @@ class BrowserWindow(QMainWindow):
         self.settings = config_manager.data
         self._open_path_handler = open_path_handler
         self.discovery = discovery or BrowserItemDiscovery()
-        self.thumbnail_provider = thumbnail_provider or BrowserThumbnailProvider(self)
+        if thumbnail_provider is None:
+            disk_cache = ThumbnailDiskCache(
+                self.config.thumbnail_cache_dir,
+                enabled=False,
+                limit_mb=int(self.settings.get("thumbnail_cache_limit_mb", 512)),
+            )
+            thumbnail_provider = BrowserThumbnailProvider(
+                self,
+                disk_cache=disk_cache,
+                disk_cache_enabled=bool(
+                    self.settings.get("thumbnail_disk_cache_enabled", True)
+                ),
+            )
+        self.thumbnail_provider = thumbnail_provider
         self.thumbnail_provider.thumbnail_ready.connect(self._on_thumbnail_ready)
         self.current_path: Path | None = None
         self._generation = self.thumbnail_provider.generation
@@ -82,6 +97,7 @@ class BrowserWindow(QMainWindow):
         self._folder_change_timer.timeout.connect(self._apply_pending_tree_path)
 
         self._build_ui()
+        self.config.settings_changed.connect(self.apply_settings)
         self._restore_window_state()
         self._restore_initial_folder()
 
@@ -165,6 +181,37 @@ class BrowserWindow(QMainWindow):
         self._save_window_state()
         self.thumbnail_provider.close()
 
+    def apply_settings(self, changed: dict[str, object]) -> None:
+        if "thumbnail_size" in changed:
+            self.thumbnail_size = self._safe_thumbnail_size(changed["thumbnail_size"])
+            self.list_view.setIconSize(QSize(self.thumbnail_size, self.thumbnail_size))
+            self.list_view.setGridSize(
+                QSize(self.thumbnail_size + 44, self.thumbnail_size + 58)
+            )
+            self.item_model.clear_thumbnails()
+            self._generation = self.thumbnail_provider.begin_generation()
+            QTimer.singleShot(0, self._request_visible_thumbnails)
+        if "thumbnail_disk_cache_enabled" in changed:
+            self.thumbnail_provider.set_disk_cache_enabled(
+                bool(changed["thumbnail_disk_cache_enabled"])
+            )
+        if "thumbnail_cache_limit_mb" in changed:
+            self.thumbnail_provider.set_disk_cache_limit_mb(
+                int(changed["thumbnail_cache_limit_mb"])
+            )
+
+    def open_settings_dialog(self) -> None:
+        dialog = SettingsDialog(
+            self.config,
+            self,
+            cache_usage_getter=self.thumbnail_provider.disk_cache_usage_bytes,
+        )
+        dialog.cache_clear_requested.connect(
+            self.thumbnail_provider.clear_all_caches_async
+        )
+        self.thumbnail_provider.cache_cleared.connect(dialog.refresh_cache_usage)
+        dialog.exec()
+
     def event(self, event: QEvent) -> bool:  # type: ignore[override]
         handled = super().event(event)
         if event.type() == QEvent.Type.WindowActivate:
@@ -247,6 +294,11 @@ class BrowserWindow(QMainWindow):
         )
         self.sidebar_action.toggled.connect(self.set_sidebar_visible)
         view_menu.addAction(self.sidebar_action)
+
+        settings_menu = self.menuBar().addMenu("設定")
+        settings_action = QAction("環境設定...", self)
+        settings_action.triggered.connect(self.open_settings_dialog)
+        settings_menu.addAction(settings_action)
 
         self.statusBar().showMessage("フォルダを選択してください。")
         self.splitter.setSizes([self._sidebar_width, max(1, self.width() - self._sidebar_width)])

@@ -80,6 +80,7 @@ class ViewerWindow(QMainWindow):
         self.reading_direction = str(self.settings["reading_direction"])
         self.fit_mode = str(self.settings["fit_mode"])
         self.gap = int(self.settings["gap"])
+        self.join_spread_pages = bool(self.settings.get("join_spread_pages", False))
         self.single_first_page = bool(self.settings["single_first_page"])
         self.treat_wide_image_as_single = bool(self.settings["treat_wide_image_as_single"])
         self.split_wide_image = bool(self.settings.get("split_wide_image", False))
@@ -112,6 +113,7 @@ class ViewerWindow(QMainWindow):
         self._connect_shortcuts()
         self._restore_window_state()
         self._apply_settings_to_widgets()
+        self.config.settings_changed.connect(self.apply_settings)
 
         self._start_fullscreen = bool(self.settings.get("fullscreen"))
 
@@ -513,6 +515,7 @@ class ViewerWindow(QMainWindow):
     def _apply_settings_to_widgets(self) -> None:
         self.viewer.set_background_color(self.background_color)
         self.viewer.set_gap(self.gap)
+        self.viewer.set_join_spread_pages(self.join_spread_pages)
         self.viewer.set_rotation_angle(self.rotation_angle)
         self.viewer.set_smooth_scaling(self.smooth_scaling)
         self.viewer.set_horizontal_alignment(self.horizontal_alignment)
@@ -527,6 +530,43 @@ class ViewerWindow(QMainWindow):
         )
         self._sync_actions()
         self._update_status()
+
+    def apply_settings(self, changed: dict[str, object]) -> None:
+        refresh = False
+        if "gap" in changed:
+            self.gap = max(0, min(100, int(changed["gap"])))
+            self.viewer.set_gap(self.gap)
+            refresh = True
+        if "join_spread_pages" in changed:
+            self.join_spread_pages = bool(changed["join_spread_pages"])
+            self.viewer.set_join_spread_pages(self.join_spread_pages)
+            refresh = True
+        model_updates: dict[str, object] = {}
+        if "single_first_page" in changed:
+            self.single_first_page = bool(changed["single_first_page"])
+            model_updates["single_first_page"] = self.single_first_page
+        if "treat_wide_image_as_single" in changed:
+            self.treat_wide_image_as_single = bool(
+                changed["treat_wide_image_as_single"]
+            )
+            model_updates["treat_wide_image_as_single"] = (
+                self.treat_wide_image_as_single
+            )
+        if model_updates:
+            self.model.update_options(**model_updates)
+            refresh = True
+        if "thumbnail_size" in changed:
+            self.thumbnail_size = max(80, min(500, int(changed["thumbnail_size"])))
+            self.page_list.setIconSize(
+                QSize(self.thumbnail_size, self.thumbnail_size)
+            )
+            for index in range(self.model.total_pages):
+                cached = self.image_cache.get(index)
+                if cached is not None:
+                    self._update_page_list_thumbnail(cached)
+        self._sync_actions()
+        if refresh and self.model.total_pages:
+            self._refresh_view()
 
     def _sync_actions(self) -> None:
         self.single_action.setChecked(self.view_mode == "single")
@@ -880,7 +920,7 @@ class ViewerWindow(QMainWindow):
             self._sync_actions()
 
     def set_gap_dialog(self) -> None:
-        gap, accepted = QInputDialog.getInt(self, "画像間の余白", "ピクセル:", self.gap, 0, 200, 1)
+        gap, accepted = QInputDialog.getInt(self, "画像間の余白", "ピクセル:", self.gap, 0, 100, 1)
         if not accepted:
             return
         self.gap = gap
@@ -920,8 +960,8 @@ class ViewerWindow(QMainWindow):
             "サムネイルサイズ",
             "ピクセル:",
             self.thumbnail_size,
-            48,
-            256,
+            80,
+            500,
             8,
         )
         if not accepted:

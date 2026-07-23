@@ -19,6 +19,85 @@ class ViewerImage:
     loading: bool = False
 
 
+@dataclass(frozen=True)
+class SpreadLayout:
+    scale: float
+    content_size: QSize
+    rects: tuple[QRect, ...]
+    effective_gap: int
+
+
+def calculate_spread_layout(
+    image_sizes: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+    viewport_size: tuple[int, int],
+    *,
+    fit_mode: str = "fit_window",
+    manual_zoom: float = 1.0,
+    gap: int = 0,
+    join_spread_pages: bool = False,
+    spread_is_single: bool = False,
+    horizontal_alignment: str = "center",
+    pan: tuple[int, int] = (0, 0),
+) -> SpreadLayout:
+    """Calculate a shared-scale spread layout without requiring a QWidget."""
+    if not image_sizes:
+        return SpreadLayout(1.0, QSize(0, 0), (), 0)
+
+    widths = [max(1, int(width)) for width, _height in image_sizes]
+    heights = [max(1, int(height)) for _width, height in image_sizes]
+    viewport_width = max(1, int(viewport_size[0]))
+    viewport_height = max(1, int(viewport_size[1]))
+    effective_gap = (
+        0
+        if join_spread_pages and len(image_sizes) == 2 and not spread_is_single
+        else max(0, int(gap)) if len(image_sizes) > 1 else 0
+    )
+    width_for_images = max(1, viewport_width - effective_gap * (len(widths) - 1))
+    total_width = sum(widths)
+    max_height = max(heights)
+    fit_width_scale = max(0.01, width_for_images / total_width)
+    fit_height_scale = max(0.01, viewport_height / max_height)
+
+    if fit_mode == "actual_size":
+        scale = 1.0
+    elif fit_mode == "manual_zoom":
+        scale = min(8.0, max(0.05, float(manual_zoom)))
+    elif fit_mode == "fit_no_upscale":
+        scale = min(1.0, fit_width_scale, fit_height_scale)
+    elif fit_mode == "fit_width":
+        scale = fit_width_scale
+    elif fit_mode == "fit_height":
+        scale = fit_height_scale
+    else:
+        scale = min(fit_width_scale, fit_height_scale)
+
+    target_widths = [max(1, round(width * scale)) for width in widths]
+    target_heights = [max(1, round(height * scale)) for height in heights]
+    content_width = sum(target_widths) + effective_gap * (len(target_widths) - 1)
+    content_height = max(target_heights)
+    pan_x, pan_y = int(pan[0]), int(pan[1])
+    if horizontal_alignment == "left":
+        origin_x = pan_x
+    elif horizontal_alignment == "right":
+        origin_x = viewport_width - content_width + pan_x
+    else:
+        origin_x = (viewport_width - content_width) // 2 + pan_x
+    origin_y = (viewport_height - content_height) // 2 + pan_y
+
+    rects: list[QRect] = []
+    x = origin_x
+    for width, height in zip(target_widths, target_heights):
+        y = origin_y + (content_height - height) // 2
+        rects.append(QRect(x, y, width, height))
+        x += width + effective_gap
+    return SpreadLayout(
+        scale=scale,
+        content_size=QSize(content_width, content_height),
+        rects=tuple(rects),
+        effective_gap=effective_gap,
+    )
+
+
 class ViewerWidget(QWidget):
     nextRequested = Signal()
     previousRequested = Signal()
@@ -36,6 +115,7 @@ class ViewerWidget(QWidget):
         self.fit_mode = "fit_window"
         self.manual_zoom = 1.0
         self.gap = 24
+        self.join_spread_pages = False
         self.rotation_angle = 0
         self.smooth_scaling = True
         self.horizontal_alignment = "center"
@@ -63,6 +143,10 @@ class ViewerWidget(QWidget):
 
     def set_gap(self, gap: int) -> None:
         self.gap = max(0, int(gap))
+        self.update()
+
+    def set_join_spread_pages(self, enabled: bool) -> None:
+        self.join_spread_pages = bool(enabled)
         self.update()
 
     def set_smooth_scaling(self, enabled: bool) -> None:
@@ -176,29 +260,15 @@ class ViewerWidget(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "画像を開いてください")
             return
 
-        scale = self._scale_for_current_mode()
-        content_size = self._content_size(scale)
-        if self.horizontal_alignment == "left":
-            origin_x = self._pan.x()
-        elif self.horizontal_alignment == "right":
-            origin_x = self.width() - content_size.width() + self._pan.x()
-        else:
-            origin_x = (self.width() - content_size.width()) // 2 + self._pan.x()
-        origin_y = (self.height() - content_size.height()) // 2 + self._pan.y()
-
-        x = origin_x
+        layout = self._layout_for_current_images()
         self._last_draw_layout = []
-        for image in self._images:
+        for image, rect in zip(self._images, layout.rects):
             pixmap = self._display_pixmap(image)
-            base = pixmap.size() if pixmap is not None else self._base_size(image)
-            target = QSize(max(1, round(base.width() * scale)), max(1, round(base.height() * scale)))
-            rect = QRect(x, origin_y + (content_size.height() - target.height()) // 2, target.width(), target.height())
             if pixmap is not None:
                 painter.drawPixmap(rect, pixmap)
                 self._last_draw_layout.append((rect, pixmap))
             else:
                 self._draw_placeholder(painter, rect, image)
-            x += target.width() + self.gap
         self._draw_magnifier(painter)
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
@@ -296,15 +366,13 @@ class ViewerWidget(QWidget):
         super().mouseDoubleClickEvent(event)
 
     def _can_pan(self) -> bool:
-        scale = self._scale_for_current_mode()
-        content_size = self._content_size(scale)
+        content_size = self._layout_for_current_images().content_size
         return content_size.width() > self.width() or content_size.height() > self.height()
 
     def _scroll_vertical(self, direction: int) -> bool:
         if not self._images:
             return False
-        scale = self._scale_for_current_mode()
-        content_size = self._content_size(scale)
+        content_size = self._layout_for_current_images().content_size
         overflow = content_size.height() - self.height()
         if overflow <= 4:
             return False
@@ -322,36 +390,7 @@ class ViewerWidget(QWidget):
         return True
 
     def _scale_for_current_mode(self) -> float:
-        if not self._images:
-            return 1.0
-        if self.fit_mode == "actual_size":
-            return 1.0
-        if self.fit_mode == "manual_zoom":
-            return self.manual_zoom
-        if self.fit_mode == "fit_no_upscale":
-            return min(1.0, self._fit_window_scale())
-        if self.fit_mode == "fit_width":
-            return self._fit_width_scale()
-        if self.fit_mode == "fit_height":
-            return self._fit_height_scale()
-        return self._fit_window_scale()
-
-    def _fit_window_scale(self) -> float:
-        return min(self._fit_width_scale(), self._fit_height_scale())
-
-    def _fit_width_scale(self) -> float:
-        content_width = sum(self._base_size(image).width() for image in self._images)
-        if len(self._images) > 1:
-            content_width += self.gap * (len(self._images) - 1)
-        if content_width <= 0:
-            return 1.0
-        return max(0.01, self.width() / content_width)
-
-    def _fit_height_scale(self) -> float:
-        content_height = max(self._base_size(image).height() for image in self._images)
-        if content_height <= 0:
-            return 1.0
-        return max(0.01, self.height() / content_height)
+        return self._layout_for_current_images().scale
 
     def _content_size(self, scale: float) -> QSize:
         if not self._images:
@@ -359,9 +398,35 @@ class ViewerWidget(QWidget):
 
         width = sum(max(1, round(self._base_size(image).width() * scale)) for image in self._images)
         if len(self._images) > 1:
-            width += self.gap * (len(self._images) - 1)
+            width += self._effective_gap() * (len(self._images) - 1)
         height = max(max(1, round(self._base_size(image).height() * scale)) for image in self._images)
         return QSize(width, height)
+
+    def _layout_for_current_images(self) -> SpreadLayout:
+        sizes = [
+            (self._base_size(image).width(), self._base_size(image).height())
+            for image in self._images
+        ]
+        return calculate_spread_layout(
+            sizes,
+            (self.width(), self.height()),
+            fit_mode=self.fit_mode,
+            manual_zoom=self.manual_zoom,
+            gap=self.gap,
+            join_spread_pages=self.join_spread_pages,
+            spread_is_single=self._spread.is_single,
+            horizontal_alignment=self.horizontal_alignment,
+            pan=(self._pan.x(), self._pan.y()),
+        )
+
+    def _effective_gap(self) -> int:
+        if (
+            self.join_spread_pages
+            and len(self._images) == 2
+            and not self._spread.is_single
+        ):
+            return 0
+        return self.gap if len(self._images) > 1 else 0
 
     def _base_size(self, image: ViewerImage) -> QSize:
         if image.pixmap is not None:

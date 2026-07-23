@@ -5,8 +5,12 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from PySide6.QtCore import QObject, Signal
 
-class ConfigManager:
+
+class ConfigManager(QObject):
+    settings_changed = Signal(object)
+
     DEFAULTS: dict[str, Any] = {
         "last_open_path": "",
         "recent_paths": [],
@@ -31,10 +35,13 @@ class ConfigManager:
         "open_viewer_behavior": "reuse_or_create",
         "loop_book_navigation": False,
         "bring_viewer_to_front_on_open": True,
+        "join_spread_pages": False,
+        "thumbnail_disk_cache_enabled": True,
+        "thumbnail_cache_limit_mb": 512,
         "magnifier_enabled": False,
         "magnifier_zoom": 2.0,
         "magnifier_size": 220,
-        "gap": 24,
+        "gap": 12,
         "single_first_page": True,
         "treat_wide_image_as_single": True,
         "split_wide_image": False,
@@ -52,34 +59,43 @@ class ConfigManager:
     }
 
     def __init__(self, path: str | Path | None = None) -> None:
+        super().__init__()
         base_dir = Path(__file__).resolve().parents[1]
         self.path = Path(path) if path else base_dir / "config.json"
         self.data: dict[str, Any] = deepcopy(self.DEFAULTS)
 
+    @property
+    def base_dir(self) -> Path:
+        return self.path.parent.resolve()
+
+    @property
+    def thumbnail_cache_dir(self) -> Path:
+        return self.base_dir / "data" / "thumbnail_cache"
+
     def load(self) -> dict[str, Any]:
         defaults = deepcopy(self.DEFAULTS)
         if not self.path.exists():
-            self.data = defaults
+            self._replace_data(defaults)
             return self.data
 
         try:
             with self.path.open("r", encoding="utf-8") as file:
                 loaded = json.load(file)
         except (OSError, json.JSONDecodeError):
-            self.data = defaults
+            self._replace_data(defaults)
             return self.data
 
         if isinstance(loaded, dict):
             merged = defaults
             merged.update(loaded)
-            self.data = self._normalize(merged)
+            self._replace_data(self._normalize(merged))
         else:
-            self.data = defaults
+            self._replace_data(defaults)
         return self.data
 
     def save(self, updates: dict[str, Any] | None = None) -> None:
         if updates:
-            self.data.update(updates)
+            self.apply(updates)
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("w", encoding="utf-8") as file:
@@ -89,7 +105,23 @@ class ConfigManager:
         return self.data.get(key, default)
 
     def set(self, key: str, value: Any) -> None:
-        self.data[key] = value
+        self.apply({key: value})
+
+    def apply(self, updates: dict[str, Any], *, save: bool = False) -> dict[str, Any]:
+        merged = deepcopy(self.data)
+        merged.update(updates)
+        normalized = self._normalize(merged)
+        changed = {
+            key: value
+            for key, value in normalized.items()
+            if key not in self.data or self.data[key] != value
+        }
+        if changed:
+            self.data.update(changed)
+            self.settings_changed.emit(changed)
+        if save:
+            self.save()
+        return changed
 
     @classmethod
     def _normalize(cls, values: dict[str, Any]) -> dict[str, Any]:
@@ -112,7 +144,36 @@ class ConfigManager:
             minimum=80,
             maximum=500,
         )
+        behavior = normalized.get("open_viewer_behavior")
+        if behavior not in {"reuse_active", "always_new", "reuse_or_create"}:
+            normalized["open_viewer_behavior"] = "reuse_or_create"
+        for key in (
+            "bring_viewer_to_front_on_open",
+            "loop_book_navigation",
+            "join_spread_pages",
+            "single_first_page",
+            "treat_wide_image_as_single",
+            "thumbnail_disk_cache_enabled",
+        ):
+            if not isinstance(normalized.get(key), bool):
+                normalized[key] = cls.DEFAULTS[key]
+        normalized["gap"] = cls._clamped_int(
+            normalized.get("gap"),
+            default=int(cls.DEFAULTS["gap"]),
+            minimum=0,
+            maximum=100,
+        )
+        normalized["thumbnail_cache_limit_mb"] = cls._clamped_int(
+            normalized.get("thumbnail_cache_limit_mb"),
+            default=int(cls.DEFAULTS["thumbnail_cache_limit_mb"]),
+            minimum=128,
+            maximum=4096,
+        )
         return normalized
+
+    def _replace_data(self, values: dict[str, Any]) -> None:
+        self.data.clear()
+        self.data.update(values)
 
     @staticmethod
     def _clamped_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:

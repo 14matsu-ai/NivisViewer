@@ -340,6 +340,91 @@ def test_bring_to_front_does_not_enable_always_on_top(
     controller.shutdown()
 
 
+def test_bring_to_front_setting_can_disable_front_operation(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    image = tmp_path / "page.jpg"
+    write_image(image)
+    controller = make_controller(tmp_path, qapp)
+    controller.config.apply({"bring_viewer_to_front_on_open": False})
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        controller,
+        "bring_window_to_front_once",
+        lambda _window: calls.append(True),
+    )
+
+    controller.open_path(image)
+
+    assert calls == []
+    close_controller(controller, qapp)
+
+
+def test_browser_explicit_new_always_creates_new_viewer(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    first = tmp_path / "first" / "1.jpg"
+    second = tmp_path / "second" / "1.jpg"
+    write_image(first)
+    write_image(second)
+    controller = make_controller(tmp_path, qapp)
+    controller.config.apply({"open_viewer_behavior": "reuse_active"})
+
+    first_viewer = controller._handle_browser_open_request(str(first), True)
+    second_viewer = controller._handle_browser_open_request(str(second), True)
+
+    assert first_viewer is not second_viewer
+    assert len(controller.viewer_windows) == 2
+    close_controller(controller, qapp)
+
+
+def test_loop_book_navigation_setting_wraps_to_first_book(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    first = tmp_path / "books" / "1" / "1.jpg"
+    last = tmp_path / "books" / "2" / "1.jpg"
+    write_image(first)
+    write_image(last)
+    controller = make_controller(tmp_path, qapp)
+    controller.config.apply({"loop_book_navigation": True})
+    viewer = controller.open_path(last)
+
+    result = controller.open_adjacent_book(viewer, 1)
+
+    assert result == "opened"
+    assert viewer.book_session.current_path == first.parent
+    close_controller(controller, qapp)
+
+
+def test_settings_changes_apply_to_existing_browser_and_viewer(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    controller = make_controller(tmp_path, qapp)
+    browser = controller.create_browser_window()
+    viewer = controller.create_viewer_window()
+
+    controller.config.apply(
+        {
+            "join_spread_pages": True,
+            "gap": 37,
+            "thumbnail_size": 230,
+        }
+    )
+    qapp.processEvents()
+
+    assert viewer.join_spread_pages is True
+    assert viewer.viewer.join_spread_pages is True
+    assert viewer.gap == 37
+    assert browser.thumbnail_size == 230
+    assert browser.list_view.iconSize().width() == 230
+    close_controller(controller, qapp)
+
+
 def test_shutdown_is_idempotent(tmp_path: Path, qapp: QApplication) -> None:
     controller = make_controller(tmp_path, qapp)
     controller.start()
