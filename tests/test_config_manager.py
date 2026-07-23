@@ -13,6 +13,9 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
     assert manager.data["open_viewer_behavior"] == "reuse_or_create"
     assert manager.data["loop_book_navigation"] is False
     assert manager.data["bring_viewer_to_front_on_open"] is True
+    assert manager.data["restore_last_reading_position"] is True
+    assert manager.data["metadata_migration_v1_completed"] is False
+    assert manager.metadata_database_path == tmp_path / "data" / "metadata.sqlite3"
     assert manager.data["last_browser_path"] == ""
     assert manager.data["browser_sidebar_visible"] is True
     assert manager.data["browser_sidebar_width"] == 280

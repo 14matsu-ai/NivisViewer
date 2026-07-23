@@ -11,9 +11,11 @@ from natsort import natsorted
 from .browser_window import BrowserWindow
 from .config_manager import ConfigManager
 from .image_source import (
+    ARCHIVE_EXTENSIONS,
     BOOK_FILE_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
 )
+from .metadata_store import MetadataStore
 from .viewer_window import ViewerWindow
 
 
@@ -35,6 +37,7 @@ class ApplicationController(QObject):
         parent: QObject | None = None,
         *,
         config_manager: ConfigManager | None = None,
+        metadata_store: MetadataStore | None = None,
         window_factory: WindowFactory = ViewerWindow,
         browser_window_factory: BrowserWindowFactory = BrowserWindow,
     ) -> None:
@@ -42,6 +45,11 @@ class ApplicationController(QObject):
         self.application = application
         self.config = config_manager or ConfigManager()
         self.settings = self.config.load()
+        self.metadata_store = metadata_store or MetadataStore(
+            self.config.metadata_database_path,
+            self,
+        )
+        self._migrate_legacy_metadata()
         self._window_factory = window_factory
         self._browser_window_factory = browser_window_factory
         self._viewer_windows: list[ViewerWindow] = []
@@ -81,6 +89,7 @@ class ApplicationController(QObject):
             return existing
         window = self._browser_window_factory(
             config_manager=self.config,
+            metadata_store=self.metadata_store,
             open_path_handler=self._handle_browser_open_request,
         )
         self._browser_window = window
@@ -109,6 +118,7 @@ class ApplicationController(QObject):
     def create_viewer_window(self) -> ViewerWindow:
         window = self._window_factory(
             config_manager=self.config,
+            metadata_store=self.metadata_store,
             open_path_handler=self._handle_viewer_open_request,
             adjacent_book_handler=self.open_adjacent_book,
         )
@@ -200,6 +210,8 @@ class ApplicationController(QObject):
         if browser is not None:
             browser.prepare_shutdown()
         self.config.save()
+        self.metadata_store.flush()
+        self.metadata_store.close()
 
     def _select_viewer_for_open(self, open_in_new_window: bool | None) -> ViewerWindow:
         if open_in_new_window is True:
@@ -331,6 +343,76 @@ class ApplicationController(QObject):
 
     def _save_standard_window_state(self, window: ViewerWindow) -> None:
         self.config.data.update(window.window_state_snapshot())
+
+    def _migrate_legacy_metadata(self) -> None:
+        if bool(self.settings.get("metadata_migration_v1_completed", False)):
+            return
+        if not self.metadata_store.enabled:
+            return
+
+        recent = self.settings.get("recent_paths", [])
+        positions = self.settings.get("reading_positions", {})
+        recent_paths = (
+            [path for path in recent if isinstance(path, str) and path]
+            if isinstance(recent, list)
+            else []
+        )
+        position_items = (
+            [
+                (path, page)
+                for path, page in positions.items()
+                if isinstance(path, str) and path
+            ]
+            if isinstance(positions, dict)
+            else []
+        )
+        position_by_key: dict[str, int] = {}
+        for path, raw_page in position_items:
+            try:
+                position_by_key[MetadataStore.normalize_path(path)] = max(
+                    0, int(raw_page)
+                )
+            except (TypeError, ValueError):
+                continue
+
+        migrated: set[str] = set()
+        ordered_paths = list(reversed(recent_paths))
+        ordered_paths.extend(path for path, _page in position_items)
+        for raw_path in ordered_paths:
+            canonical, item_type = self._legacy_book_target(raw_path)
+            key = MetadataStore.normalize_path(canonical)
+            if key in migrated:
+                continue
+            migrated.add(key)
+            start_page = position_by_key.get(
+                key,
+                position_by_key.get(MetadataStore.normalize_path(raw_path), 0),
+            )
+            self.metadata_store.record_book_opened(
+                str(canonical),
+                item_type=item_type,
+                start_page_index=start_page,
+                total_pages=None,
+            )
+            if not self.metadata_store.enabled:
+                return
+
+        self.metadata_store.flush()
+        if self.metadata_store.enabled:
+            self.config.apply(
+                {"metadata_migration_v1_completed": True},
+                save=True,
+            )
+
+    @staticmethod
+    def _legacy_book_target(path: str) -> tuple[Path, str]:
+        target = Path(path)
+        suffix = target.suffix.lower()
+        if suffix in SUPPORTED_EXTENSIONS:
+            return target.parent, "folder"
+        if suffix in ARCHIVE_EXTENSIONS:
+            return target, "archive"
+        return target, "folder" if target.is_dir() else "unknown"
 
     @staticmethod
     def _book_navigation_path(window: ViewerWindow) -> Path | None:

@@ -1,0 +1,791 @@
+from __future__ import annotations
+
+import os
+import sqlite3
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable
+
+from PySide6.QtCore import QObject, Signal
+
+from .image_source import ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS
+
+
+METADATA_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class ReadingProgress:
+    path: str
+    page_index: int
+    total_pages: int | None
+
+
+@dataclass(frozen=True)
+class HistoryEntry:
+    path: str
+    item_type: str
+    last_opened_at: float
+    page_index: int
+    total_pages: int | None
+    open_count: int
+
+    @property
+    def display_name(self) -> str:
+        return Path(self.path).name or self.path
+
+    @property
+    def exists(self) -> bool:
+        return Path(self.path).exists()
+
+
+@dataclass(frozen=True)
+class BrowserBookmark:
+    path: str
+    label: str
+    item_type: str
+    sort_order: int
+    created_at: float
+
+    @property
+    def display_name(self) -> str:
+        return self.label or Path(self.path).name or self.path
+
+    @property
+    def exists(self) -> bool:
+        return Path(self.path).exists()
+
+
+@dataclass(frozen=True)
+class _PendingProgress:
+    display_path: str
+    page_index: int
+    total_pages: int | None
+
+
+class MetadataStore(QObject):
+    history_changed = Signal()
+    bookmarks_changed = Signal()
+    metadata_changed = Signal(str)
+
+    def __init__(
+        self,
+        database_path: str | Path,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.database_path = Path(database_path)
+        self.enabled = False
+        self.last_error: str | None = None
+        self.corrupt_backup_path: Path | None = None
+        self._connection: sqlite3.Connection | None = None
+        self._lock = threading.RLock()
+        self._pending_progress: dict[str, _PendingProgress] = {}
+        self._closed = False
+        self._initialize()
+
+    @property
+    def schema_version(self) -> int:
+        with self._lock:
+            if self._connection is None:
+                return 0
+            try:
+                return int(
+                    self._connection.execute("PRAGMA user_version").fetchone()[0]
+                )
+            except sqlite3.DatabaseError:
+                return 0
+
+    @staticmethod
+    def normalize_path(path: str | Path) -> str:
+        expanded = os.path.expanduser(os.fspath(path))
+        absolute = os.path.abspath(os.path.normpath(expanded))
+        return os.path.normcase(absolute).casefold()
+
+    @staticmethod
+    def display_path(path: str | Path) -> str:
+        expanded = os.path.expanduser(os.fspath(path))
+        return os.path.abspath(os.path.normpath(expanded))
+
+    def record_book_opened(
+        self,
+        path: str,
+        *,
+        item_type: str,
+        start_page_index: int,
+        total_pages: int | None,
+    ) -> None:
+        changed = False
+        with self._lock:
+            if not self._available:
+                return
+            try:
+                self._flush_pending_locked()
+                item_id = self._ensure_library_item(path, item_type=item_type)
+                now = time.time()
+                page_index = self._clamp_page(start_page_index, total_pages)
+                self._connection.execute(
+                    """
+                    INSERT INTO reading_history (
+                        library_item_id, last_opened_at, last_page_index,
+                        total_pages, open_count
+                    ) VALUES (?, ?, ?, ?, 1)
+                    ON CONFLICT(library_item_id) DO UPDATE SET
+                        last_opened_at = excluded.last_opened_at,
+                        last_page_index = excluded.last_page_index,
+                        total_pages = excluded.total_pages,
+                        open_count = reading_history.open_count + 1
+                    """,
+                    (item_id, now, page_index, self._safe_total(total_pages)),
+                )
+                self._connection.commit()
+                changed = True
+            except (OSError, sqlite3.DatabaseError, ValueError) as exc:
+                self._disable(exc)
+        if changed:
+            self.history_changed.emit()
+
+    def update_reading_progress(
+        self,
+        path: str,
+        *,
+        page_index: int,
+        total_pages: int | None,
+    ) -> None:
+        with self._lock:
+            if not self._available:
+                return
+            display = self.display_path(path)
+            self._pending_progress[self.normalize_path(display)] = _PendingProgress(
+                display_path=display,
+                page_index=self._clamp_page(page_index, total_pages),
+                total_pages=self._safe_total(total_pages),
+            )
+
+    def get_reading_progress(self, path: str) -> ReadingProgress | None:
+        normalized = self.normalize_path(path)
+        with self._lock:
+            pending = self._pending_progress.get(normalized)
+            if pending is not None:
+                return ReadingProgress(
+                    pending.display_path,
+                    pending.page_index,
+                    pending.total_pages,
+                )
+            if not self._available:
+                return None
+            try:
+                row = self._connection.execute(
+                    """
+                    SELECT item.display_path, history.last_page_index,
+                           history.total_pages
+                      FROM reading_history AS history
+                      JOIN library_items AS item
+                        ON item.id = history.library_item_id
+                     WHERE item.normalized_path = ?
+                    """,
+                    (normalized,),
+                ).fetchone()
+            except sqlite3.DatabaseError as exc:
+                self._disable(exc)
+                return None
+        if row is None:
+            return None
+        return ReadingProgress(str(row[0]), int(row[1]), self._optional_int(row[2]))
+
+    def list_history(self, *, limit: int = 500) -> list[HistoryEntry]:
+        with self._lock:
+            if not self._available:
+                return []
+            try:
+                rows = self._connection.execute(
+                    """
+                    SELECT item.display_path, item.item_type,
+                           history.last_opened_at, history.last_page_index,
+                           history.total_pages, history.open_count
+                      FROM reading_history AS history
+                      JOIN library_items AS item
+                        ON item.id = history.library_item_id
+                     ORDER BY history.last_opened_at DESC, item.id DESC
+                     LIMIT ?
+                    """,
+                    (max(1, min(5000, int(limit))),),
+                ).fetchall()
+            except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
+                self._disable(exc)
+                return []
+        return [
+            HistoryEntry(
+                path=str(row[0]),
+                item_type=str(row[1]),
+                last_opened_at=float(row[2]),
+                page_index=int(row[3]),
+                total_pages=self._optional_int(row[4]),
+                open_count=int(row[5]),
+            )
+            for row in rows
+        ]
+
+    def remove_history(self, path: str) -> None:
+        normalized = self.normalize_path(path)
+        changed = False
+        with self._lock:
+            self._pending_progress.pop(normalized, None)
+            if not self._available:
+                return
+            try:
+                cursor = self._connection.execute(
+                    """
+                    DELETE FROM reading_history
+                     WHERE library_item_id = (
+                        SELECT id FROM library_items WHERE normalized_path = ?
+                     )
+                    """,
+                    (normalized,),
+                )
+                self._connection.commit()
+                changed = cursor.rowcount > 0
+            except sqlite3.DatabaseError as exc:
+                self._disable(exc)
+        if changed:
+            self.history_changed.emit()
+
+    def clear_history(self) -> None:
+        changed = False
+        with self._lock:
+            self._pending_progress.clear()
+            if not self._available:
+                return
+            try:
+                cursor = self._connection.execute("DELETE FROM reading_history")
+                self._connection.commit()
+                changed = cursor.rowcount > 0
+            except sqlite3.DatabaseError as exc:
+                self._disable(exc)
+        if changed:
+            self.history_changed.emit()
+
+    def add_browser_bookmark(
+        self,
+        path: str,
+        *,
+        label: str | None = None,
+        item_type: str | None = None,
+    ) -> None:
+        changed = False
+        with self._lock:
+            if not self._available:
+                return
+            try:
+                actual_type = item_type or self._infer_item_type(path)
+                item_id = self._ensure_library_item(path, item_type=actual_type)
+                display = self.display_path(path)
+                bookmark_label = (label or "").strip() or Path(display).name or display
+                next_order = int(
+                    self._connection.execute(
+                        "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM browser_bookmarks"
+                    ).fetchone()[0]
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO browser_bookmarks (
+                        library_item_id, label, item_type, sort_order, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(library_item_id) DO UPDATE SET
+                        label = excluded.label,
+                        item_type = excluded.item_type
+                    """,
+                    (item_id, bookmark_label, actual_type, next_order, time.time()),
+                )
+                self._connection.commit()
+                changed = True
+            except (OSError, sqlite3.DatabaseError, ValueError) as exc:
+                self._disable(exc)
+        if changed:
+            self.bookmarks_changed.emit()
+
+    def remove_browser_bookmark(self, path: str) -> None:
+        changed = False
+        with self._lock:
+            if not self._available:
+                return
+            try:
+                cursor = self._connection.execute(
+                    """
+                    DELETE FROM browser_bookmarks
+                     WHERE library_item_id = (
+                        SELECT id FROM library_items WHERE normalized_path = ?
+                     )
+                    """,
+                    (self.normalize_path(path),),
+                )
+                self._connection.commit()
+                changed = cursor.rowcount > 0
+            except sqlite3.DatabaseError as exc:
+                self._disable(exc)
+        if changed:
+            self.bookmarks_changed.emit()
+
+    def is_browser_bookmarked(self, path: str) -> bool:
+        with self._lock:
+            if not self._available:
+                return False
+            try:
+                row = self._connection.execute(
+                    """
+                    SELECT 1
+                      FROM browser_bookmarks AS bookmark
+                      JOIN library_items AS item
+                        ON item.id = bookmark.library_item_id
+                     WHERE item.normalized_path = ?
+                    """,
+                    (self.normalize_path(path),),
+                ).fetchone()
+                return row is not None
+            except sqlite3.DatabaseError as exc:
+                self._disable(exc)
+                return False
+
+    def list_browser_bookmarks(self) -> list[BrowserBookmark]:
+        with self._lock:
+            if not self._available:
+                return []
+            try:
+                rows = self._connection.execute(
+                    """
+                    SELECT item.display_path, bookmark.label, bookmark.item_type,
+                           bookmark.sort_order, bookmark.created_at
+                      FROM browser_bookmarks AS bookmark
+                      JOIN library_items AS item
+                        ON item.id = bookmark.library_item_id
+                     ORDER BY bookmark.sort_order, bookmark.created_at
+                    """
+                ).fetchall()
+            except sqlite3.DatabaseError as exc:
+                self._disable(exc)
+                return []
+        return [
+            BrowserBookmark(
+                path=str(row[0]),
+                label=str(row[1]),
+                item_type=str(row[2]),
+                sort_order=int(row[3]),
+                created_at=float(row[4]),
+            )
+            for row in rows
+        ]
+
+    def set_rating(self, path: str, rating: int | None) -> None:
+        if rating is not None and not 0 <= int(rating) <= 5:
+            raise ValueError("rating must be between 0 and 5")
+        with self._lock:
+            if not self._available:
+                return
+            try:
+                item_id = self._ensure_library_item(
+                    path,
+                    item_type=self._infer_item_type(path),
+                )
+                self._connection.execute(
+                    """
+                    UPDATE library_items
+                       SET rating = ?, metadata_updated_at = ?
+                     WHERE id = ?
+                    """,
+                    (None if rating is None else int(rating), time.time(), item_id),
+                )
+                self._connection.commit()
+            except (OSError, sqlite3.DatabaseError, ValueError) as exc:
+                self._disable(exc)
+                return
+        self.metadata_changed.emit(self.display_path(path))
+
+    def get_rating(self, path: str) -> int | None:
+        value = self._library_value(path, "rating")
+        return None if value is None else int(value)
+
+    def set_tags(self, path: str, tags: list[str]) -> None:
+        normalized_tags = self._normalize_tags(tags)
+        with self._lock:
+            if not self._available:
+                return
+            try:
+                item_id = self._ensure_library_item(
+                    path,
+                    item_type=self._infer_item_type(path),
+                )
+                self._connection.execute(
+                    "DELETE FROM item_tags WHERE library_item_id = ?",
+                    (item_id,),
+                )
+                for normalized_name, display_name in normalized_tags:
+                    self._connection.execute(
+                        """
+                        INSERT INTO tags (normalized_name, display_name)
+                        VALUES (?, ?)
+                        ON CONFLICT(normalized_name) DO UPDATE SET
+                            display_name = excluded.display_name
+                        """,
+                        (normalized_name, display_name),
+                    )
+                    tag_id = int(
+                        self._connection.execute(
+                            "SELECT id FROM tags WHERE normalized_name = ?",
+                            (normalized_name,),
+                        ).fetchone()[0]
+                    )
+                    self._connection.execute(
+                        """
+                        INSERT OR IGNORE INTO item_tags (library_item_id, tag_id)
+                        VALUES (?, ?)
+                        """,
+                        (item_id, tag_id),
+                    )
+                self._connection.execute(
+                    """
+                    UPDATE library_items
+                       SET metadata_updated_at = ?
+                     WHERE id = ?
+                    """,
+                    (time.time(), item_id),
+                )
+                self._connection.commit()
+            except (OSError, sqlite3.DatabaseError, ValueError) as exc:
+                self._disable(exc)
+                return
+        self.metadata_changed.emit(self.display_path(path))
+
+    def get_tags(self, path: str) -> list[str]:
+        with self._lock:
+            if not self._available:
+                return []
+            try:
+                rows = self._connection.execute(
+                    """
+                    SELECT tag.display_name
+                      FROM tags AS tag
+                      JOIN item_tags AS link ON link.tag_id = tag.id
+                      JOIN library_items AS item
+                        ON item.id = link.library_item_id
+                     WHERE item.normalized_path = ?
+                     ORDER BY tag.normalized_name
+                    """,
+                    (self.normalize_path(path),),
+                ).fetchall()
+            except sqlite3.DatabaseError as exc:
+                self._disable(exc)
+                return []
+        return [str(row[0]) for row in rows]
+
+    def flush(self) -> None:
+        changed = False
+        with self._lock:
+            if not self._available:
+                return
+            try:
+                changed = self._flush_pending_locked()
+                self._connection.commit()
+            except (OSError, sqlite3.DatabaseError, ValueError) as exc:
+                self._disable(exc)
+        if changed:
+            self.history_changed.emit()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+        self.flush()
+        with self._lock:
+            connection = self._connection
+            self._connection = None
+            self.enabled = False
+            self._closed = True
+            if connection is not None:
+                try:
+                    connection.close()
+                except sqlite3.DatabaseError:
+                    pass
+
+    @property
+    def _available(self) -> bool:
+        return self.enabled and not self._closed and self._connection is not None
+
+    def _initialize(self) -> None:
+        with self._lock:
+            try:
+                self.database_path.parent.mkdir(parents=True, exist_ok=True)
+                self._open_connection()
+                self._migrate_schema()
+                self.enabled = True
+            except sqlite3.OperationalError as exc:
+                self.last_error = str(exc)
+                self._close_connection()
+                self.enabled = False
+            except (OSError, sqlite3.DatabaseError) as exc:
+                self.last_error = str(exc)
+                if not self._recover_corrupt_database():
+                    self.enabled = False
+
+    def _open_connection(self) -> None:
+        self._connection = sqlite3.connect(
+            self.database_path,
+            check_same_thread=False,
+        )
+        self._connection.execute("PRAGMA foreign_keys=ON")
+        self._connection.execute("PRAGMA journal_mode=WAL")
+        self._connection.execute("PRAGMA synchronous=NORMAL")
+
+    def _migrate_schema(self) -> None:
+        assert self._connection is not None
+        version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+        if version not in (0, METADATA_SCHEMA_VERSION):
+            raise sqlite3.DatabaseError(
+                f"unsupported metadata schema version: {version}"
+            )
+        self._connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS library_items (
+                id INTEGER PRIMARY KEY,
+                normalized_path TEXT NOT NULL UNIQUE,
+                display_path TEXT NOT NULL,
+                item_type TEXT NOT NULL,
+                file_size INTEGER,
+                source_mtime_ns INTEGER,
+                identity_hint TEXT,
+                rating INTEGER,
+                comment TEXT NOT NULL DEFAULT '',
+                metadata_updated_at REAL NOT NULL,
+                created_at REAL NOT NULL,
+                last_verified_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS reading_history (
+                library_item_id INTEGER PRIMARY KEY
+                    REFERENCES library_items(id) ON DELETE CASCADE,
+                last_opened_at REAL NOT NULL,
+                last_page_index INTEGER NOT NULL,
+                total_pages INTEGER,
+                open_count INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS browser_bookmarks (
+                library_item_id INTEGER PRIMARY KEY
+                    REFERENCES library_items(id) ON DELETE CASCADE,
+                label TEXT NOT NULL,
+                item_type TEXT NOT NULL,
+                sort_order INTEGER NOT NULL,
+                created_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS tags (
+                id INTEGER PRIMARY KEY,
+                normalized_name TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS item_tags (
+                library_item_id INTEGER NOT NULL
+                    REFERENCES library_items(id) ON DELETE CASCADE,
+                tag_id INTEGER NOT NULL
+                    REFERENCES tags(id) ON DELETE CASCADE,
+                PRIMARY KEY (library_item_id, tag_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS history_recent
+                ON reading_history(last_opened_at DESC);
+            CREATE INDEX IF NOT EXISTS bookmark_order
+                ON browser_bookmarks(sort_order);
+            """
+        )
+        self._connection.execute(
+            f"PRAGMA user_version={METADATA_SCHEMA_VERSION}"
+        )
+        self._connection.commit()
+
+    def _recover_corrupt_database(self) -> bool:
+        self._close_connection()
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        try:
+            if self.database_path.exists():
+                backup = self.database_path.with_name(
+                    f"{self.database_path.name}.corrupt-{timestamp}"
+                )
+                counter = 1
+                while backup.exists():
+                    backup = self.database_path.with_name(
+                        f"{self.database_path.name}.corrupt-{timestamp}-{counter}"
+                    )
+                    counter += 1
+                self.database_path.replace(backup)
+                self.corrupt_backup_path = backup
+            for suffix in ("-wal", "-shm", "-journal"):
+                auxiliary = Path(f"{self.database_path}{suffix}")
+                if auxiliary.exists():
+                    auxiliary.replace(
+                        auxiliary.with_name(f"{auxiliary.name}.corrupt-{timestamp}")
+                    )
+            self._open_connection()
+            self._migrate_schema()
+            self.enabled = True
+            return True
+        except (OSError, sqlite3.DatabaseError) as exc:
+            self.last_error = str(exc)
+            self._close_connection()
+            return False
+
+    def _ensure_library_item(self, path: str, *, item_type: str) -> int:
+        assert self._connection is not None
+        display = self.display_path(path)
+        normalized = self.normalize_path(display)
+        now = time.time()
+        file_size, source_mtime_ns = self._stat_source(display)
+        self._connection.execute(
+            """
+            INSERT INTO library_items (
+                normalized_path, display_path, item_type, file_size,
+                source_mtime_ns, identity_hint, rating, comment,
+                metadata_updated_at, created_at, last_verified_at
+            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, '', ?, ?, ?)
+            ON CONFLICT(normalized_path) DO UPDATE SET
+                display_path = excluded.display_path,
+                item_type = excluded.item_type,
+                file_size = excluded.file_size,
+                source_mtime_ns = excluded.source_mtime_ns,
+                last_verified_at = excluded.last_verified_at
+            """,
+            (
+                normalized,
+                display,
+                item_type,
+                file_size,
+                source_mtime_ns,
+                now,
+                now,
+                now,
+            ),
+        )
+        row = self._connection.execute(
+            "SELECT id FROM library_items WHERE normalized_path = ?",
+            (normalized,),
+        ).fetchone()
+        if row is None:
+            raise sqlite3.DatabaseError("library item was not created")
+        return int(row[0])
+
+    def _flush_pending_locked(self) -> bool:
+        assert self._connection is not None
+        if not self._pending_progress:
+            return False
+        pending = tuple(self._pending_progress.values())
+        self._pending_progress.clear()
+        now = time.time()
+        for progress in pending:
+            item_id = self._ensure_library_item(
+                progress.display_path,
+                item_type=self._infer_item_type(progress.display_path),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO reading_history (
+                    library_item_id, last_opened_at, last_page_index,
+                    total_pages, open_count
+                ) VALUES (?, ?, ?, ?, 0)
+                ON CONFLICT(library_item_id) DO UPDATE SET
+                    last_page_index = excluded.last_page_index,
+                    total_pages = excluded.total_pages
+                """,
+                (
+                    item_id,
+                    now,
+                    progress.page_index,
+                    progress.total_pages,
+                ),
+            )
+        return True
+
+    def _library_value(self, path: str, column: str):
+        if column not in {"rating"}:
+            raise ValueError("unsupported library value")
+        with self._lock:
+            if not self._available:
+                return None
+            try:
+                row = self._connection.execute(
+                    f"SELECT {column} FROM library_items WHERE normalized_path = ?",
+                    (self.normalize_path(path),),
+                ).fetchone()
+            except sqlite3.DatabaseError as exc:
+                self._disable(exc)
+                return None
+        return None if row is None else row[0]
+
+    def _disable(self, error: BaseException) -> None:
+        self.last_error = str(error)
+        self.enabled = False
+        self._pending_progress.clear()
+        self._close_connection()
+
+    def _close_connection(self) -> None:
+        connection = self._connection
+        self._connection = None
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.DatabaseError:
+                pass
+
+    @staticmethod
+    def _stat_source(path: str) -> tuple[int | None, int | None]:
+        try:
+            stat_result = Path(path).stat()
+            return int(stat_result.st_size), int(stat_result.st_mtime_ns)
+        except OSError:
+            return None, None
+
+    @staticmethod
+    def _safe_total(total_pages: int | None) -> int | None:
+        if total_pages is None:
+            return None
+        return max(0, int(total_pages))
+
+    @classmethod
+    def _clamp_page(cls, page_index: int, total_pages: int | None) -> int:
+        index = max(0, int(page_index))
+        total = cls._safe_total(total_pages)
+        if total is not None and total > 0:
+            return min(index, total - 1)
+        return index
+
+    @staticmethod
+    def _optional_int(value: object) -> int | None:
+        return None if value is None else int(value)
+
+    @staticmethod
+    def _infer_item_type(path: str) -> str:
+        target = Path(path)
+        if target.is_dir():
+            return "folder"
+        suffix = target.suffix.lower()
+        if suffix in ARCHIVE_EXTENSIONS:
+            return "archive"
+        if suffix in SUPPORTED_EXTENSIONS:
+            return "image"
+        return "unknown"
+
+    @staticmethod
+    def _normalize_tags(tags: Iterable[str]) -> list[tuple[str, str]]:
+        result: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for raw_tag in tags:
+            display = str(raw_tag).strip()
+            if not display:
+                continue
+            normalized = display.casefold()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append((normalized, display))
+        return result

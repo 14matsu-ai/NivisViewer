@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QListView,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QSplitter,
     QStyle,
     QTabWidget,
@@ -34,7 +35,10 @@ from .browser_model import (
     BrowserItemKind,
     BrowserItemModel,
 )
+from .bookmark_model import BookmarkModel
 from .config_manager import ConfigManager
+from .history_model import HistoryModel
+from .metadata_store import MetadataStore
 from .settings_dialog import SettingsDialog
 from .thumbnail_provider import BrowserThumbnailProvider, PageThumbnailProvider
 from .thumbnail_disk_cache import ThumbnailDiskCache
@@ -54,6 +58,7 @@ class BrowserWindow(QMainWindow):
         open_path_handler: BrowserOpenHandler | None = None,
         discovery: BrowserItemDiscovery | None = None,
         thumbnail_provider: BrowserThumbnailProvider | None = None,
+        metadata_store: MetadataStore | None = None,
     ) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -62,6 +67,7 @@ class BrowserWindow(QMainWindow):
 
         self.config = config_manager
         self.settings = config_manager.data
+        self.metadata_store = metadata_store
         self._open_path_handler = open_path_handler
         self.discovery = discovery or BrowserItemDiscovery()
         if thumbnail_provider is None:
@@ -159,6 +165,83 @@ class BrowserWindow(QMainWindow):
         if self._open_path_handler is not None:
             self._open_path_handler(str(item.path), open_in_new_window)
 
+    def add_browser_bookmark(
+        self,
+        path: str | Path,
+        *,
+        item_type: str,
+        label: str | None = None,
+    ) -> None:
+        if self.metadata_store is None:
+            return
+        self.metadata_store.add_browser_bookmark(
+            str(path),
+            item_type=item_type,
+            label=label,
+        )
+
+    def remove_browser_bookmark(self, path: str | Path) -> None:
+        if self.metadata_store is not None:
+            self.metadata_store.remove_browser_bookmark(str(path))
+
+    def add_current_folder_bookmark(self) -> None:
+        if self.current_path is not None:
+            self.add_browser_bookmark(self.current_path, item_type="folder")
+
+    def open_bookmark(
+        self,
+        index: QModelIndex,
+        *,
+        open_in_new_window: bool = False,
+    ) -> None:
+        entry = self.bookmark_model.entry_at(index)
+        if entry is None:
+            return
+        if not entry.exists:
+            self.statusBar().showMessage("ブックマーク先が見つかりません", 3000)
+            return
+        if entry.item_type == "folder":
+            self.set_current_folder(entry.path)
+            return
+        if self._open_path_handler is not None:
+            self._open_path_handler(entry.path, open_in_new_window)
+
+    def open_history(
+        self,
+        index: QModelIndex,
+        *,
+        open_in_new_window: bool = False,
+    ) -> None:
+        entry = self.history_model.entry_at(index)
+        if entry is None:
+            return
+        if not entry.exists:
+            self.statusBar().showMessage("履歴の項目が見つかりません", 3000)
+            return
+        if self._open_path_handler is not None:
+            self._open_path_handler(entry.path, open_in_new_window)
+
+    def remove_history_entry(self, index: QModelIndex) -> None:
+        entry = self.history_model.entry_at(index)
+        if entry is not None and self.metadata_store is not None:
+            self.metadata_store.remove_history(entry.path)
+
+    def clear_history(self, *, confirm: bool = True) -> bool:
+        if self.metadata_store is None:
+            return False
+        if confirm:
+            answer = QMessageBox.question(
+                self,
+                "閲覧履歴を消去",
+                "閲覧履歴をすべて消去しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+        self.metadata_store.clear_history()
+        return True
+
     def set_sidebar_visible(self, visible: bool) -> None:
         if not visible and self.sidebar.isVisible():
             sizes = self.splitter.sizes()
@@ -246,6 +329,30 @@ class BrowserWindow(QMainWindow):
         self.sidebar = QTabWidget(self)
         self.sidebar.addTab(self.folder_tree, "フォルダ")
 
+        self.bookmark_model = BookmarkModel(self.metadata_store, self)
+        self.bookmark_view = QListView(self)
+        self.bookmark_view.setModel(self.bookmark_model)
+        self.bookmark_view.activated.connect(self.open_bookmark)
+        self.bookmark_view.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.bookmark_view.customContextMenuRequested.connect(
+            self._show_bookmark_context_menu
+        )
+        self.sidebar.addTab(self.bookmark_view, "ブックマーク")
+
+        self.history_model = HistoryModel(self.metadata_store, self)
+        self.history_view = QListView(self)
+        self.history_view.setModel(self.history_model)
+        self.history_view.activated.connect(self.open_history)
+        self.history_view.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.history_view.customContextMenuRequested.connect(
+            self._show_history_context_menu
+        )
+        self.sidebar.addTab(self.history_view, "履歴")
+
         self.item_model = BrowserItemModel(self)
         style = self.style()
         self.item_model.set_fallback_icons(
@@ -294,6 +401,18 @@ class BrowserWindow(QMainWindow):
         )
         self.sidebar_action.toggled.connect(self.set_sidebar_visible)
         view_menu.addAction(self.sidebar_action)
+
+        bookmark_menu = self.menuBar().addMenu("ブックマーク")
+        add_folder_bookmark_action = QAction("現在のフォルダを追加", self)
+        add_folder_bookmark_action.triggered.connect(self.add_current_folder_bookmark)
+        bookmark_menu.addAction(add_folder_bookmark_action)
+
+        history_menu = self.menuBar().addMenu("履歴")
+        clear_history_action = QAction("閲覧履歴をすべて消去...", self)
+        clear_history_action.triggered.connect(
+            lambda _checked=False: self.clear_history()
+        )
+        history_menu.addAction(clear_history_action)
 
         settings_menu = self.menuBar().addMenu("設定")
         settings_action = QAction("環境設定...", self)
@@ -429,6 +548,13 @@ class BrowserWindow(QMainWindow):
         open_action = menu.addAction("開く")
         new_action = menu.addAction("新しいViewerWindowで開く")
         location_action = menu.addAction("エクスプローラーで場所を開く")
+        bookmark_action = None
+        if self.metadata_store is not None:
+            menu.addSeparator()
+            if self.metadata_store.is_browser_bookmarked(str(item.path)):
+                bookmark_action = menu.addAction("ブックマークから削除")
+            else:
+                bookmark_action = menu.addAction("ブックマークに追加")
         if item.kind == BrowserItemKind.FOLDER:
             new_action.setEnabled(False)
         selected = menu.exec(self.list_view.viewport().mapToGlobal(position))
@@ -439,6 +565,66 @@ class BrowserWindow(QMainWindow):
         elif selected == location_action:
             target = item.path if item.kind == BrowserItemKind.FOLDER else item.path.parent
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+        elif bookmark_action is not None and selected == bookmark_action:
+            if self.metadata_store is None:
+                return
+            if self.metadata_store.is_browser_bookmarked(str(item.path)):
+                self.remove_browser_bookmark(item.path)
+            else:
+                self.add_browser_bookmark(
+                    item.path,
+                    item_type=self._bookmark_item_type(item),
+                    label=item.display_name,
+                )
+
+    def _show_bookmark_context_menu(self, position: QPoint) -> None:
+        index = self.bookmark_view.indexAt(position)
+        entry = self.bookmark_model.entry_at(index)
+        if entry is None:
+            return
+        menu = QMenu(self)
+        open_action = menu.addAction("開く")
+        new_action = menu.addAction("新しいViewerWindowで開く")
+        if entry.item_type == "folder":
+            new_action.setEnabled(False)
+        menu.addSeparator()
+        remove_action = menu.addAction("ブックマークから削除")
+        selected = menu.exec(self.bookmark_view.viewport().mapToGlobal(position))
+        if selected == open_action:
+            self.open_bookmark(index)
+        elif selected == new_action:
+            self.open_bookmark(index, open_in_new_window=True)
+        elif selected == remove_action:
+            self.remove_browser_bookmark(entry.path)
+
+    def _show_history_context_menu(self, position: QPoint) -> None:
+        index = self.history_view.indexAt(position)
+        entry = self.history_model.entry_at(index)
+        if entry is None:
+            return
+        menu = QMenu(self)
+        open_action = menu.addAction("開く")
+        new_action = menu.addAction("新しいViewerWindowで開く")
+        menu.addSeparator()
+        remove_action = menu.addAction("この履歴を削除")
+        clear_action = menu.addAction("閲覧履歴をすべて消去...")
+        selected = menu.exec(self.history_view.viewport().mapToGlobal(position))
+        if selected == open_action:
+            self.open_history(index)
+        elif selected == new_action:
+            self.open_history(index, open_in_new_window=True)
+        elif selected == remove_action:
+            self.remove_history_entry(index)
+        elif selected == clear_action:
+            self.clear_history()
+
+    @staticmethod
+    def _bookmark_item_type(item: BrowserItem) -> str:
+        if item.kind == BrowserItemKind.FOLDER:
+            return "folder"
+        if item.kind == BrowserItemKind.ARCHIVE:
+            return "archive"
+        return "image"
 
     @staticmethod
     def _safe_thumbnail_size(value: object) -> int:
