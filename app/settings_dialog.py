@@ -20,6 +20,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .browser_sort import (
+    BROWSER_DISPLAY_DENSITY_LABELS,
+    BROWSER_SORT_KEY_LABELS,
+    BROWSER_SORT_ORDER_LABELS,
+    BrowserDisplayDensity,
+    BrowserSortKey,
+    BrowserSortOrder,
+)
 from .config_manager import ConfigManager
 from .viewer_commands import COMMAND_CHOICES
 
@@ -124,11 +132,35 @@ class SettingsDialog(QDialog):
     def _build_browser_tab(self) -> QWidget:
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
+
+        list_group = QGroupBox("一覧表示", tab)
+        list_form = QFormLayout(list_group)
+        self.browser_display_density_combo = QComboBox(list_group)
+        for value, label in BROWSER_DISPLAY_DENSITY_LABELS.items():
+            self.browser_display_density_combo.addItem(label, value.value)
+        list_form.addRow("表示密度:", self.browser_display_density_combo)
+
+        self.browser_sort_key_combo = QComboBox(list_group)
+        for value, label in BROWSER_SORT_KEY_LABELS.items():
+            self.browser_sort_key_combo.addItem(label, value.value)
+        list_form.addRow("並び替え:", self.browser_sort_key_combo)
+
+        self.browser_sort_order_combo = QComboBox(list_group)
+        for value, label in BROWSER_SORT_ORDER_LABELS.items():
+            self.browser_sort_order_combo.addItem(label, value.value)
+        list_form.addRow("順序:", self.browser_sort_order_combo)
+
+        self.browser_folders_first_checkbox = QCheckBox(
+            "フォルダを常に先頭へ表示",
+            list_group,
+        )
+        list_form.addRow(self.browser_folders_first_checkbox)
+
         cache_group = QGroupBox("サムネイル", tab)
         form = QFormLayout(cache_group)
 
         self.thumbnail_size_spin = QSpinBox(cache_group)
-        self.thumbnail_size_spin.setRange(80, 500)
+        self.thumbnail_size_spin.setRange(96, 384)
         self.thumbnail_size_spin.setSuffix(" px")
         form.addRow("サムネイルサイズ:", self.thumbnail_size_spin)
 
@@ -153,6 +185,7 @@ class SettingsDialog(QDialog):
         usage_layout.addWidget(self.clear_cache_button)
         form.addRow("現在の使用量:", usage_row)
 
+        layout.addWidget(list_group)
         layout.addWidget(cache_group)
         layout.addStretch(1)
         return tab
@@ -216,6 +249,27 @@ class SettingsDialog(QDialog):
             bool(self.config.get("treat_wide_image_as_single", True))
         )
         self.thumbnail_size_spin.setValue(int(self.config.get("thumbnail_size", 180)))
+        self._select_data(
+            self.browser_display_density_combo,
+            self.config.get(
+                "browser_display_density",
+                BrowserDisplayDensity.STANDARD.value,
+            ),
+        )
+        self._select_data(
+            self.browser_sort_key_combo,
+            self.config.get("browser_sort_key", BrowserSortKey.NAME.value),
+        )
+        self._select_data(
+            self.browser_sort_order_combo,
+            self.config.get(
+                "browser_sort_order",
+                BrowserSortOrder.ASCENDING.value,
+            ),
+        )
+        self.browser_folders_first_checkbox.setChecked(
+            bool(self.config.get("browser_folders_first", True))
+        )
         self.disk_cache_checkbox.setChecked(
             bool(self.config.get("thumbnail_disk_cache_enabled", True))
         )
@@ -275,6 +329,16 @@ class SettingsDialog(QDialog):
             "single_first_page": self.single_first_checkbox.isChecked(),
             "treat_wide_image_as_single": self.wide_single_checkbox.isChecked(),
             "thumbnail_size": self.thumbnail_size_spin.value(),
+            "browser_display_density": str(
+                self.browser_display_density_combo.currentData()
+            ),
+            "browser_sort_key": str(self.browser_sort_key_combo.currentData()),
+            "browser_sort_order": str(
+                self.browser_sort_order_combo.currentData()
+            ),
+            "browser_folders_first": (
+                self.browser_folders_first_checkbox.isChecked()
+            ),
             "thumbnail_disk_cache_enabled": self.disk_cache_checkbox.isChecked(),
             "thumbnail_cache_limit_mb": self.cache_limit_spin.value(),
             "mouse_gestures_enabled": self.mouse_gestures_checkbox.isChecked(),
@@ -344,6 +408,11 @@ class SettingsDialog(QDialog):
     @staticmethod
     def _select_command(combo: QComboBox, command: object) -> None:
         index = combo.findData(command)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+
+    @staticmethod
+    def _select_data(combo: QComboBox, value: object) -> None:
+        index = combo.findData(value)
         combo.setCurrentIndex(index if index >= 0 else 0)
 
     @staticmethod
