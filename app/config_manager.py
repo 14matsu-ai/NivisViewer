@@ -38,6 +38,8 @@ class ConfigManager(QObject):
         "open_viewer_behavior": "reuse_or_create",
         "loop_book_navigation": False,
         "bring_viewer_to_front_on_open": True,
+        "restore_last_reading_position": True,
+        "metadata_migration_v1_completed": False,
         "mouse_gestures_enabled": True,
         "mouse_gesture_show_trail": True,
         "mouse_gesture_min_distance": 36,
@@ -83,6 +85,10 @@ class ConfigManager(QObject):
     @property
     def thumbnail_cache_dir(self) -> Path:
         return self.base_dir / "data" / "thumbnail_cache"
+
+    @property
+    def metadata_database_path(self) -> Path:
+        return self.base_dir / "data" / "metadata.sqlite3"
 
     def load(self) -> dict[str, Any]:
         defaults = deepcopy(self.DEFAULTS)
@@ -162,6 +168,8 @@ class ConfigManager(QObject):
         for key in (
             "bring_viewer_to_front_on_open",
             "loop_book_navigation",
+            "restore_last_reading_position",
+            "metadata_migration_v1_completed",
             "mouse_gestures_enabled",
             "mouse_gesture_show_trail",
             "join_spread_pages",

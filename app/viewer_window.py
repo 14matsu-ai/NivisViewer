@@ -36,6 +36,7 @@ from .book_session import BookSession
 from .config_manager import ConfigManager
 from .image_cache import CachedImage, PRELOAD_RADIUS
 from .image_source import ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS, ImageSourceError
+from .metadata_store import MetadataStore
 from .thumbnail_provider import PageThumbnailProvider
 from . import viewer_commands as commands
 from .viewer_widget import ViewerImage, ViewerWidget
@@ -50,6 +51,7 @@ class ViewerWindow(QMainWindow):
         self,
         *,
         config_manager: ConfigManager,
+        metadata_store: MetadataStore | None = None,
         book_session: BookSession | None = None,
         open_path_handler: Callable[[str, bool | None, object], object] | None = None,
         adjacent_book_handler: Callable[[object, int], str] | None = None,
@@ -61,6 +63,7 @@ class ViewerWindow(QMainWindow):
 
         self.config = config_manager
         self.settings = self.config.data
+        self.metadata_store = metadata_store
         self.book_session = book_session or BookSession(
             int(self.settings.get("cache_size", 10)),
             self,
@@ -68,6 +71,7 @@ class ViewerWindow(QMainWindow):
         self.model = self.book_session.model
         self.image_cache = self.book_session.image_cache
         self.image_cache.pageLoaded.connect(self._on_cache_page_loaded)
+        self.book_session.page_changed.connect(self._queue_metadata_progress)
         self._open_path_handler = open_path_handler
         self._adjacent_book_handler = adjacent_book_handler
         self._shutdown_prepared = False
@@ -75,6 +79,7 @@ class ViewerWindow(QMainWindow):
         self._visible_page_indexes: tuple[int, ...] = tuple()
         self._page_history_back: list[int] = []
         self._page_history_forward: list[int] = []
+        self._metadata_book_path = ""
         self.setAcceptDrops(True)
 
         self.view_mode = str(self.settings["view_mode"])
@@ -704,6 +709,7 @@ class ViewerWindow(QMainWindow):
         if self.model.total_pages == 0:
             QMessageBox.warning(self, "画像なし", "対応画像が見つかりませんでした。")
             self.book_session.close_book()
+            self._metadata_book_path = ""
             self.viewer.clear()
             self._clear_page_history()
             self._rebuild_page_list()
@@ -711,8 +717,17 @@ class ViewerWindow(QMainWindow):
             self._update_status()
             return False
 
+        self._metadata_book_path = str(opened.source_path)
         if opened.selected_image is None:
-            self._restore_reading_position(self._current_book_key)
+            self._restore_reading_position(self._metadata_book_path)
+
+        if self.metadata_store is not None:
+            self.metadata_store.record_book_opened(
+                self._metadata_book_path,
+                item_type=self._metadata_item_type(opened.source_path),
+                start_page_index=self.model.current_index,
+                total_pages=self.model.total_pages,
+            )
 
         opened_path = str(opened.requested_path)
         self.settings["last_open_path"] = opened_path
@@ -725,6 +740,15 @@ class ViewerWindow(QMainWindow):
         return True
 
     def _restore_reading_position(self, book_key: str) -> None:
+        if not bool(self.settings.get("restore_last_reading_position", True)):
+            return
+        if self.metadata_store is not None:
+            progress = self.metadata_store.get_reading_progress(book_key)
+            if progress is not None:
+                self.model.go_to_index(
+                    max(0, min(progress.page_index, self.model.total_pages - 1))
+                )
+                return
         positions = self.settings.get("reading_positions", {})
         if not isinstance(positions, dict):
             return
@@ -746,6 +770,29 @@ class ViewerWindow(QMainWindow):
             oldest_key = next(iter(positions))
             del positions[oldest_key]
         self.settings["reading_positions"] = positions
+        if self.metadata_store is not None:
+            self.metadata_store.flush()
+
+    def _queue_metadata_progress(self) -> None:
+        if (
+            self.metadata_store is None
+            or not self._metadata_book_path
+            or self.model.total_pages <= 0
+        ):
+            return
+        self.metadata_store.update_reading_progress(
+            self._metadata_book_path,
+            page_index=self.model.current_index,
+            total_pages=self.model.total_pages,
+        )
+
+    @staticmethod
+    def _metadata_item_type(path: Path) -> str:
+        if path.is_dir():
+            return "folder"
+        if path.suffix.lower() in ARCHIVE_EXTENSIONS:
+            return "archive"
+        return "image"
 
     def _clear_page_history(self) -> None:
         self._page_history_back.clear()
