@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from PIL import Image
 from PySide6.QtWidgets import QApplication
 
@@ -155,6 +156,84 @@ def test_extra_buttons_use_book_commands_once(
 
     assert directions == [-1, 1]
     window.close()
+    qapp.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("direction", "result", "expected"),
+    [
+        (-1, "boundary", "前の書庫はありません"),
+        (1, "boundary", "次の書庫はありません"),
+        (1, "unavailable", "移動できる書庫がありません"),
+    ],
+)
+def test_adjacent_book_failure_uses_non_modal_status_notification(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+    direction: int,
+    result: str,
+    expected: str,
+) -> None:
+    modal_calls: list[bool] = []
+    monkeypatch.setattr(
+        "app.viewer_window.QMessageBox.information",
+        lambda *_args, **_kwargs: modal_calls.append(True),
+    )
+    window = ViewerWindow(
+        config_manager=make_config(tmp_path),
+        adjacent_book_handler=lambda _window, _direction: result,
+    )
+    messages: list[str] = []
+    window.status.messageChanged.connect(messages.append)
+
+    window._open_adjacent_book(direction)
+
+    assert modal_calls == []
+    assert messages == [expected]
+    assert window.status.currentMessage() == expected
+    window.close()
+    qapp.processEvents()
+
+
+def test_successful_adjacent_book_move_does_not_show_status_notification(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    window = ViewerWindow(
+        config_manager=make_config(tmp_path),
+        adjacent_book_handler=lambda _window, _direction: "opened",
+    )
+    messages: list[str] = []
+    window.status.messageChanged.connect(messages.append)
+    initial_message = window.status.currentMessage()
+
+    window.open_next_book()
+
+    assert messages == []
+    assert window.status.currentMessage() == initial_message
+    window.close()
+    qapp.processEvents()
+
+
+def test_adjacent_book_notification_is_limited_to_target_viewer(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    config = make_config(tmp_path)
+    target = ViewerWindow(
+        config_manager=config,
+        adjacent_book_handler=lambda _window, _direction: "unavailable",
+    )
+    other = ViewerWindow(config_manager=config)
+    other_initial_message = other.status.currentMessage()
+
+    target.open_previous_book()
+
+    assert target.status.currentMessage() == "移動できる書庫がありません"
+    assert other.status.currentMessage() == other_initial_message
+    target.close()
+    other.close()
     qapp.processEvents()
 
 
