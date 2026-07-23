@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from io import BytesIO
+import os
 from pathlib import Path
 from threading import Lock
 from typing import Callable
@@ -18,6 +19,7 @@ from .browser_model import (
     BrowserItem,
     BrowserItemKind,
 )
+from .browser_thumbnail_scheduler import ThumbnailPriority
 from .thumbnail_disk_cache import ThumbnailDiskCache
 
 
@@ -37,6 +39,12 @@ class PageThumbnailProvider:
 class ThumbnailLoadResult:
     image: QImage | None
     cover_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class _PendingThumbnail:
+    worker: _ThumbnailWorker
+    priority: ThumbnailPriority
 
 
 class _ThumbnailWorkerSignals(QObject):
@@ -89,7 +97,7 @@ class BrowserThumbnailProvider(QObject):
         self._pool.setMaxThreadCount(max(1, min(2, max_workers)))
         self._cache_capacity = max(1, cache_capacity)
         self._cache: OrderedDict[tuple[str, int, float | None], QImage] = OrderedDict()
-        self._pending: set[tuple[str, int, int]] = set()
+        self._pending: dict[tuple[str, int, int], _PendingThumbnail] = {}
         self._pending_lock = Lock()
         self._failure_lock = Lock()
         self._generation = 0
@@ -112,7 +120,14 @@ class BrowserThumbnailProvider(QObject):
         self._pool.clear()
         return self._generation
 
-    def request(self, item: BrowserItem, size: int, *, generation: int | None = None) -> bool:
+    def request(
+        self,
+        item: BrowserItem,
+        size: int,
+        *,
+        generation: int | None = None,
+        priority: ThumbnailPriority = ThumbnailPriority.VISIBLE,
+    ) -> bool:
         if self._closed:
             return False
         requested_generation = self._generation if generation is None else generation
@@ -137,20 +152,64 @@ class BrowserThumbnailProvider(QObject):
             return False
 
         pending_key = (path_key, normalized_size, requested_generation)
+        normalized_priority = ThumbnailPriority(priority)
         with self._pending_lock:
-            if pending_key in self._pending:
+            existing = self._pending.get(pending_key)
+            if existing is not None:
+                if (
+                    normalized_priority > existing.priority
+                    and self._try_take(existing.worker)
+                ):
+                    self._pending[pending_key] = _PendingThumbnail(
+                        existing.worker,
+                        normalized_priority,
+                    )
+                    self._pool.start(existing.worker, int(normalized_priority))
                 return False
-            self._pending.add(pending_key)
 
-        worker = _ThumbnailWorker(
-            item,
-            normalized_size,
-            requested_generation,
-            self._loader,
-        )
-        worker.signals.finished.connect(self._on_finished)
-        self._pool.start(worker)
+            worker = _ThumbnailWorker(
+                item,
+                normalized_size,
+                requested_generation,
+                self._loader,
+            )
+            worker.signals.finished.connect(self._on_finished)
+            self._pending[pending_key] = _PendingThumbnail(
+                worker,
+                normalized_priority,
+            )
+        self._pool.start(worker, int(normalized_priority))
         return True
+
+    def cancel_prefetch_except(
+        self,
+        paths: set[str],
+        *,
+        size: int,
+        generation: int,
+    ) -> int:
+        keep = {self._path_key(Path(path)) for path in paths}
+        cancelled = 0
+        with self._pending_lock:
+            candidates = tuple(self._pending.items())
+            for key, pending in candidates:
+                path_key, pending_size, pending_generation = key
+                if (
+                    pending_generation != generation
+                    or pending_size != int(size)
+                    or pending.priority is not ThumbnailPriority.PREFETCH
+                    or path_key in keep
+                ):
+                    continue
+                if self._try_take(pending.worker):
+                    self._pending.pop(key, None)
+                    cancelled += 1
+        return cancelled
+
+    @property
+    def pending_count(self) -> int:
+        with self._pending_lock:
+            return len(self._pending)
 
     def wait_for_done(self, msecs: int = 5000) -> bool:
         return self._pool.waitForDone(msecs)
@@ -317,7 +376,7 @@ class BrowserThumbnailProvider(QObject):
         pending_key = (path_key, size, generation)
         cache_key = (path_key, size, modified_at)
         with self._pending_lock:
-            self._pending.discard(pending_key)
+            self._pending.pop(pending_key, None)
         if self._closed or generation != self._generation or image is None or image.isNull():
             return
         self._cache[cache_key] = image.copy()
@@ -411,8 +470,14 @@ class BrowserThumbnailProvider(QObject):
 
     @staticmethod
     def _path_key(path: Path) -> str:
+        return os.path.normcase(
+            os.path.abspath(os.path.normpath(os.fspath(path)))
+        ).casefold()
+
+    def _try_take(self, worker: _ThumbnailWorker) -> bool:
         try:
-            resolved = path.resolve()
-        except OSError:
-            resolved = path.absolute()
-        return str(resolved).casefold()
+            return self._pool.tryTake(worker)
+        except RuntimeError:
+            # The worker completed and Qt auto-deleted its QRunnable before
+            # the queued finished signal removed the Python pending record.
+            return False

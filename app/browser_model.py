@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import stat
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -16,6 +15,7 @@ from .browser_sort import (
     normalize_browser_sort_key,
     normalize_browser_sort_order,
 )
+from .browser_scanner import BrowserScanEntry, scan_entry_from_dir_entry
 from .image_source import ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS
 
 
@@ -51,10 +51,7 @@ class BrowserItemDiscovery:
 
     def discover(self, folder: str | Path) -> BrowserDiscoveryResult:
         target = Path(folder).expanduser()
-        try:
-            target = target.resolve()
-        except OSError:
-            target = target.absolute()
+        target = Path(os.path.abspath(os.path.normpath(os.fspath(target))))
 
         items: list[BrowserItem] = []
         try:
@@ -75,54 +72,29 @@ class BrowserItemDiscovery:
 
     @staticmethod
     def _item_from_entry(entry: os.DirEntry[str]) -> BrowserItem | None:
-        name = entry.name
-        if BrowserItemDiscovery._is_hidden_or_temporary(entry, name):
+        scanned = scan_entry_from_dir_entry(entry)
+        if scanned is None:
+            return None
+        try:
+            return browser_item_from_scan_entry(scanned)
+        except ValueError:
             return None
 
-        try:
-            if entry.is_dir(follow_symlinks=False):
-                kind = BrowserItemKind.FOLDER
-            elif entry.is_file(follow_symlinks=False):
-                suffix = Path(name).suffix.lower()
-                if suffix in BROWSER_ARCHIVE_EXTENSIONS:
-                    kind = BrowserItemKind.ARCHIVE
-                elif suffix in BROWSER_IMAGE_EXTENSIONS:
-                    kind = BrowserItemKind.IMAGE
-                else:
-                    return None
-            else:
-                return None
-        except OSError:
-            return None
 
-        try:
-            entry_stat = entry.stat(follow_symlinks=False)
-            modified_at = entry_stat.st_mtime
-            modified_time_ns = entry_stat.st_mtime_ns
-            file_size = None if kind is BrowserItemKind.FOLDER else entry_stat.st_size
-        except OSError:
-            modified_at = None
-            modified_time_ns = None
-            file_size = None
-        return BrowserItem(
-            display_name=name,
-            path=Path(entry.path).absolute(),
-            kind=kind,
-            modified_at=modified_at,
-            file_size=file_size,
-            modified_time_ns=modified_time_ns,
-        )
-
-    @staticmethod
-    def _is_hidden_or_temporary(entry: os.DirEntry[str], name: str) -> bool:
-        if name.startswith((".", "~$")) or name.endswith((".tmp", ".part", ".crdownload")):
-            return True
-        try:
-            attributes = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
-        except OSError:
-            return False
-        hidden_attribute = getattr(stat, "FILE_ATTRIBUTE_HIDDEN", 0x2)
-        return bool(attributes & hidden_attribute)
+def browser_item_from_scan_entry(entry: BrowserScanEntry) -> BrowserItem:
+    modified_at = (
+        entry.modified_time_ns / 1_000_000_000
+        if entry.modified_time_ns is not None
+        else None
+    )
+    return BrowserItem(
+        display_name=entry.display_name,
+        path=Path(entry.path).absolute(),
+        kind=BrowserItemKind(entry.item_kind),
+        modified_at=modified_at,
+        file_size=entry.file_size,
+        modified_time_ns=entry.modified_time_ns,
+    )
 
 
 class BrowserItemModel(QAbstractListModel):
@@ -143,6 +115,8 @@ class BrowserItemModel(QAbstractListModel):
         self._source_items: list[BrowserItem] = []
         self._items: list[BrowserItem] = []
         self._sort_policy = BrowserSortPolicy()
+        self._scan_generation: int | None = None
+        self._source_keys: set[str] = set()
         self._icons: dict[str, QIcon] = {}
         self._fallback_icons: dict[BrowserItemKind, QIcon] = {}
 
@@ -178,9 +152,58 @@ class BrowserItemModel(QAbstractListModel):
     def set_items(self, items: tuple[BrowserItem, ...] | list[BrowserItem]) -> None:
         self.beginResetModel()
         self._source_items = list(items)
+        self._source_keys = {self._key(item.path) for item in self._source_items}
         self._items = self._sort_policy.sorted_items(self._source_items)
         self._icons.clear()
+        self._scan_generation = None
         self.endResetModel()
+
+    def begin_directory_scan(self, *, generation: int) -> None:
+        self.beginResetModel()
+        self._source_items = []
+        self._source_keys.clear()
+        self._items = []
+        self._icons.clear()
+        self._scan_generation = int(generation)
+        self.endResetModel()
+
+    def append_scan_batch(
+        self,
+        entries: tuple[BrowserItem, ...] | list[BrowserItem],
+        *,
+        generation: int,
+    ) -> int:
+        if generation != self._scan_generation:
+            return 0
+        additions: list[BrowserItem] = []
+        for entry in entries:
+            key = self._key(entry.path)
+            if key in self._source_keys:
+                continue
+            self._source_keys.add(key)
+            additions.append(entry)
+        if not additions:
+            return 0
+        self.beginResetModel()
+        self._source_items.extend(additions)
+        self._items = self._sort_policy.sorted_items(self._source_items)
+        self.endResetModel()
+        return len(additions)
+
+    def finish_directory_scan(self, *, generation: int) -> bool:
+        if generation != self._scan_generation:
+            return False
+        self.beginResetModel()
+        self._items = self._sort_policy.sorted_items(self._source_items)
+        self._scan_generation = None
+        self.endResetModel()
+        return True
+
+    def cancel_directory_scan(self, *, generation: int) -> bool:
+        if generation != self._scan_generation:
+            return False
+        self._scan_generation = None
+        return True
 
     def configure_sort(
         self,
@@ -246,8 +269,6 @@ class BrowserItemModel(QAbstractListModel):
 
     @staticmethod
     def _key(path: Path) -> str:
-        try:
-            resolved = path.resolve()
-        except OSError:
-            resolved = path.absolute()
-        return str(resolved).casefold()
+        return os.path.normcase(
+            os.path.abspath(os.path.normpath(os.fspath(path)))
+        ).casefold()

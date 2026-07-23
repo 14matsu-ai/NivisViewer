@@ -240,6 +240,7 @@ def test_browser_item_open_delegates_to_controller_open_path(
     controller = make_controller(tmp_path, qapp)
     browser = controller.create_browser_window()
     browser.set_current_folder(tmp_path)
+    assert browser.wait_for_scan()
     opened: list[tuple[str, bool | None]] = []
 
     def record_open(path, *, open_in_new_window=None):
@@ -341,14 +342,18 @@ def test_viewer_sync_same_parent_does_not_add_browser_history_but_new_parent_doe
     config.save()
     controller = ApplicationController(qapp, config_manager=ConfigManager(config.path))
     browser = controller.create_browser_window()
+    assert browser.wait_for_scan()
     viewer = controller.open_path(first)
+    assert browser.wait_for_scan()
     after_first = len(browser.navigation_history)
 
     assert viewer.open_path(same_parent)
+    assert browser.wait_for_scan()
     assert len(browser.navigation_history) == after_first
     assert browser.current_path == first.parent.absolute()
 
     assert viewer.open_path(different)
+    assert browser.wait_for_scan()
     assert len(browser.navigation_history) == after_first + 1
     assert browser.current_path == different.parent.absolute()
     close_controller(controller, qapp)
