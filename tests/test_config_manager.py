@@ -10,6 +10,9 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
 
     assert manager.load() == ConfigManager.DEFAULTS
     assert manager.data is not ConfigManager.DEFAULTS
+    assert manager.data["open_viewer_behavior"] == "reuse_or_create"
+    assert manager.data["loop_book_navigation"] is False
+    assert manager.data["bring_viewer_to_front_on_open"] is True
 
 
 def test_partial_config_is_merged_with_defaults(tmp_path: Path) -> None:

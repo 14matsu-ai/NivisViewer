@@ -23,6 +23,12 @@ class CachedImage:
     generation: int
 
 
+@dataclass(frozen=True)
+class _ImageLoadResult:
+    cached: CachedImage
+    source: ImageSource
+
+
 class _ImageLoadSignals(QObject):
     loaded = Signal(object)
 
@@ -74,7 +80,7 @@ class _ImageLoadTask(QRunnable):
                 error=str(exc),
                 generation=self.generation,
             )
-        self.signals.loaded.emit(result)
+        self.signals.loaded.emit(_ImageLoadResult(result, self.source))
 
     @staticmethod
     def _pil_to_qimage(image: Image.Image) -> QImage:
@@ -99,6 +105,7 @@ class _ImageLoadTask(QRunnable):
 
 class ImageCache(QObject):
     pageLoaded = Signal(object)
+    sourceIdle = Signal(object)
 
     def __init__(self, cache_size: int = 10, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -107,10 +114,10 @@ class ImageCache(QObject):
         self.source: ImageSource | None = None
         self.image_ids: list[str] = []
         self._cache: OrderedDict[int, CachedImage] = OrderedDict()
-        self._in_flight: set[tuple[int, int]] = set()
+        self._in_flight: dict[tuple[int, int], ImageSource] = {}
         self._wanted_indexes: set[int] = set()
         self._protected_indexes: set[int] = set()
-        self._thread_pool = QThreadPool.globalInstance()
+        self._thread_pool = QThreadPool(self)
         self._adjustments = (1.0, 1.0, 1.0)
 
     def set_cache_size(self, cache_size: int) -> None:
@@ -128,14 +135,12 @@ class ImageCache(QObject):
         self._adjustments = adjustments
         self.generation += 1
         self._cache.clear()
-        self._in_flight.clear()
 
     def set_source(self, source: ImageSource | None, image_ids: list[str]) -> None:
         self.generation += 1
         self.source = source
         self.image_ids = list(image_ids)
         self._cache.clear()
-        self._in_flight.clear()
         self._wanted_indexes.clear()
         self._protected_indexes.clear()
 
@@ -144,9 +149,14 @@ class ImageCache(QObject):
         self.source = None
         self.image_ids = []
         self._cache.clear()
-        self._in_flight.clear()
         self._wanted_indexes.clear()
         self._protected_indexes.clear()
+
+    def has_in_flight_for_source(self, source: ImageSource) -> bool:
+        return any(active_source is source for active_source in self._in_flight.values())
+
+    def wait_for_done(self, msecs: int = 5000) -> bool:
+        return self._thread_pool.waitForDone(msecs)
 
     def get(self, page_index: int) -> CachedImage | None:
         cached = self._cache.get(page_index)
@@ -189,14 +199,17 @@ class ImageCache(QObject):
         if page_index in self._cache or in_flight_key in self._in_flight:
             return
 
-        self._in_flight.add(in_flight_key)
+        self._in_flight[in_flight_key] = self.source
         task = _ImageLoadTask(self.source, page_index, self.image_ids[page_index], self.generation, self._adjustments)
         task.signals.loaded.connect(self._on_loaded)
         self._thread_pool.start(task)
 
     @Slot(object)
-    def _on_loaded(self, cached: CachedImage) -> None:
-        self._in_flight.discard((cached.generation, cached.page_index))
+    def _on_loaded(self, result: _ImageLoadResult) -> None:
+        cached = result.cached
+        self._in_flight.pop((cached.generation, cached.page_index), None)
+        if not self.has_in_flight_for_source(result.source):
+            self.sourceIdle.emit(result.source)
         if cached.generation != self.generation:
             return
         if not (0 <= cached.page_index < len(self.image_ids)):

@@ -36,11 +36,9 @@ class PageModel:
         return len(self.image_ids)
 
     def set_source(self, source: ImageSource, selected_image: str | None = None) -> None:
-        if self.source is not None:
-            self.source.close()
-
+        image_ids = source.list_images()
         self.source = source
-        self.image_ids = source.list_images()
+        self.image_ids = image_ids
         self._size_cache.clear()
 
         if not self.image_ids:
@@ -52,6 +50,12 @@ class PageModel:
         else:
             self.current_index = 0
         self.current_index = self.spread_start_for_index(self.current_index)
+
+    def clear_source(self) -> None:
+        self.source = None
+        self.image_ids = []
+        self.current_index = 0
+        self._size_cache.clear()
 
     def update_options(
         self,

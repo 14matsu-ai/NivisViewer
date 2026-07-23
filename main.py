@@ -4,7 +4,7 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
-from app.main_window import MainWindow
+from app.application_controller import ApplicationController
 
 
 def main() -> int:
@@ -12,14 +12,12 @@ def main() -> int:
     app.setApplicationName("NivisViewer")
     app.setOrganizationName("NivisViewer")
 
-    window = MainWindow()
-    window.show_initial()
-    if len(sys.argv) > 1:
-        window.open_path(sys.argv[1])
-    else:
-        window.open_startup_book()
-
-    return app.exec()
+    controller = ApplicationController(app)
+    initial_path = sys.argv[1] if len(sys.argv) > 1 else None
+    controller.start(initial_path)
+    exit_code = app.exec()
+    controller.shutdown()
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import QByteArray, QEvent, QSize, QTimer, Qt, QUrl
 from PySide6.QtGui import (
@@ -33,28 +34,38 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .book_session import BookSession
 from .config_manager import ConfigManager
-from .image_cache import CachedImage, ImageCache, PRELOAD_RADIUS
-from .image_source import ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS, ImageSourceError, create_image_source
-from .page_model import PageModel
+from .image_cache import CachedImage, PRELOAD_RADIUS
+from .image_source import ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS, ImageSourceError
 from .viewer_widget import ViewerImage, ViewerWidget
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        config_manager: ConfigManager | None = None,
+        book_session: BookSession | None = None,
+        open_path_handler: Callable[[str], object] | None = None,
+    ) -> None:
         super().__init__()
         self.setWindowTitle("NivisViewer")
         self.resize(1200, 820)
 
-        self.config = ConfigManager()
-        self.settings = self.config.load()
-        self.model = PageModel()
-        self.image_cache = ImageCache(int(self.settings.get("cache_size", 10)), self)
+        self.config = config_manager or ConfigManager()
+        self.settings = self.config.data if config_manager is not None else self.config.load()
+        self.book_session = book_session or BookSession(
+            int(self.settings.get("cache_size", 10)),
+            self,
+        )
+        self.model = self.book_session.model
+        self.image_cache = self.book_session.image_cache
         self.image_cache.pageLoaded.connect(self._on_cache_page_loaded)
+        self._open_path_handler = open_path_handler
+        self._shutdown_prepared = False
         self._active_request_id = 0
         self._visible_page_indexes: tuple[int, ...] = tuple()
-        self._current_book_key = ""
-        self._opened_path = ""
         self._page_history_back: list[int] = []
         self._page_history_forward: list[int] = []
         self.setAcceptDrops(True)
@@ -82,6 +93,7 @@ class MainWindow(QMainWindow):
         self.show_page_list = bool(self.settings.get("show_page_list", False))
         self.thumbnail_size = int(self.settings.get("thumbnail_size", 96))
         self.auto_open_adjacent_book = bool(self.settings.get("auto_open_adjacent_book", False))
+        self.loop_book_navigation = bool(self.settings.get("loop_book_navigation", False))
         self.magnifier_enabled = bool(self.settings.get("magnifier_enabled", False))
         self.magnifier_zoom = float(self.settings.get("magnifier_zoom", 2.0))
         self.magnifier_size = int(self.settings.get("magnifier_size", 220))
@@ -98,6 +110,16 @@ class MainWindow(QMainWindow):
 
         self._start_fullscreen = bool(self.settings.get("fullscreen"))
 
+    @property
+    def _current_book_key(self) -> str:
+        return self.book_session.book_key
+
+    @property
+    def _opened_path(self) -> str:
+        if self.book_session.current_path is None:
+            return ""
+        return str(self.book_session.current_path)
+
     def show_initial(self) -> None:
         if self._start_fullscreen:
             self.showFullScreen()
@@ -110,7 +132,13 @@ class MainWindow(QMainWindow):
             return
         last_path = self.settings.get("last_open_path", "")
         if last_path and Path(last_path).exists():
-            self.open_path(last_path)
+            self._request_open_path(last_path)
+
+    def _request_open_path(self, path: str | Path) -> None:
+        if self._open_path_handler is not None:
+            self._open_path_handler(str(path))
+            return
+        self.open_path(path)
 
     def _build_ui(self) -> None:
         self.viewer = ViewerWidget(self)
@@ -523,54 +551,47 @@ class MainWindow(QMainWindow):
         image_filter = f"画像/書庫 ({patterns});;すべてのファイル (*.*)"
         path, _ = QFileDialog.getOpenFileName(self, "画像、ZIP/CBZ、またはフォルダを開く", start, image_filter)
         if path:
-            self.open_path(path)
+            self._request_open_path(path)
             return
 
         folder = QFileDialog.getExistingDirectory(self, "フォルダを開く", start)
         if folder:
-            self.open_path(folder)
+            self._request_open_path(folder)
 
-    def open_path(self, path: str | Path) -> None:
+    def open_path(self, path: str | Path) -> bool:
         self._save_current_reading_position()
-        source = None
+        self._active_request_id += 1
         try:
-            source, selected_image = create_image_source(
+            opened = self.book_session.open_book(
                 path,
                 recursive_folder=self.recursive_folder,
                 sort_descending=self.sort_descending,
             )
-            self.image_cache.clear()
-            self.model.set_source(source, selected_image)
         except ImageSourceError as exc:
-            if source is not None:
-                source.close()
             QMessageBox.critical(self, "読み込みエラー", str(exc))
-            return
+            return False
 
         if self.model.total_pages == 0:
             QMessageBox.warning(self, "画像なし", "対応画像が見つかりませんでした。")
+            self.book_session.close_book()
             self.viewer.clear()
-            self.image_cache.clear()
-            self._current_book_key = ""
             self._clear_page_history()
             self._rebuild_page_list()
             self._update_slider()
             self._update_status()
-            return
+            return False
 
-        self._current_book_key = str(self.model.source.source_path) if self.model.source is not None else str(Path(path))
-        if selected_image is None:
+        if opened.selected_image is None:
             self._restore_reading_position(self._current_book_key)
 
-        opened_path = str(Path(path))
-        self._opened_path = opened_path
+        opened_path = str(opened.requested_path)
         self.settings["last_open_path"] = opened_path
         self._add_recent_path(opened_path)
         self.image_cache.set_cache_size(self.cache_size)
-        self.image_cache.set_source(self.model.source, self.model.image_ids)
         self._clear_page_history()
         self._rebuild_page_list()
         self._refresh_view()
+        return True
 
     def _restore_reading_position(self, book_key: str) -> None:
         positions = self.settings.get("reading_positions", {})
@@ -625,6 +646,7 @@ class MainWindow(QMainWindow):
         if self.model.current_index == old:
             return False
         self._record_page_history(old)
+        self.book_session.notify_page_changed()
         self._refresh_view()
         return True
 
@@ -636,6 +658,7 @@ class MainWindow(QMainWindow):
         if self.model.current_index == old:
             return False
         self._record_page_history(old)
+        self.book_session.notify_page_changed()
         self._refresh_view()
         return True
 
@@ -648,6 +671,7 @@ class MainWindow(QMainWindow):
             self._page_history_forward.append(current)
             del self._page_history_forward[:-100]
         self.model.go_to_index(target)
+        self.book_session.notify_page_changed()
         self._refresh_view()
         self._sync_actions()
 
@@ -660,6 +684,7 @@ class MainWindow(QMainWindow):
             self._page_history_back.append(current)
             del self._page_history_back[:-100]
         self.model.go_to_index(target)
+        self.book_session.notify_page_changed()
         self._refresh_view()
         self._sync_actions()
 
@@ -698,7 +723,7 @@ class MainWindow(QMainWindow):
                 self.settings["recent_paths"] = [item for item in recent if item != path]
                 self._rebuild_recent_menu()
             return
-        self.open_path(path)
+        self._request_open_path(path)
 
     def _clear_recent_paths(self) -> None:
         self.settings["recent_paths"] = []
@@ -1001,8 +1026,11 @@ class MainWindow(QMainWindow):
 
         next_index = current_index + direction
         if not (0 <= next_index < len(candidates)):
-            QMessageBox.information(self, "本の移動", "これ以上移動できません。")
-            return
+            if self.loop_book_navigation:
+                next_index %= len(candidates)
+            else:
+                QMessageBox.information(self, "本の移動", "これ以上移動できません。")
+                return
         self.open_path(candidates[next_index])
 
     def _bookmark_pages(self) -> list[int]:
@@ -1342,7 +1370,7 @@ class MainWindow(QMainWindow):
     def dropEvent(self, event: QDropEvent) -> None:  # type: ignore[override]
         path = self._local_path_from_drop(event)
         if path:
-            self.open_path(path)
+            self._request_open_path(path)
             event.acceptProposedAction()
             return
         super().dropEvent(event)
@@ -1594,7 +1622,10 @@ class MainWindow(QMainWindow):
     def _apply_cursor_visibility_policy(self) -> None:
         self.viewer.set_auto_hide_cursor(self.isFullScreen() and self.hide_cursor_in_fullscreen)
 
-    def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
+    def prepare_shutdown(self) -> None:
+        if self._shutdown_prepared:
+            return
+        self._shutdown_prepared = True
         self._save_current_reading_position()
         geometry = bytes(self.saveGeometry().toBase64()).decode("ascii")
         state = bytes(self.saveState().toBase64()).decode("ascii")
@@ -1616,6 +1647,9 @@ class MainWindow(QMainWindow):
                 "show_page_list": self.show_page_list,
                 "thumbnail_size": self.thumbnail_size,
                 "auto_open_adjacent_book": self.auto_open_adjacent_book,
+                "open_viewer_behavior": self.settings.get("open_viewer_behavior", "reuse_or_create"),
+                "loop_book_navigation": self.loop_book_navigation,
+                "bring_viewer_to_front_on_open": self.settings.get("bring_viewer_to_front_on_open", True),
                 "magnifier_enabled": self.magnifier_enabled,
                 "magnifier_zoom": self.magnifier_zoom,
                 "magnifier_size": self.magnifier_size,
@@ -1636,7 +1670,8 @@ class MainWindow(QMainWindow):
                 "window_state": state,
             }
         )
-        self.image_cache.clear()
-        if self.model.source is not None:
-            self.model.source.close()
+        self.book_session.shutdown()
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
+        self.prepare_shutdown()
         super().closeEvent(event)
