@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QByteArray, QEvent, QSize, QTimer, Qt, QUrl
+from PySide6.QtCore import QByteArray, QEvent, QSize, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -11,9 +11,7 @@ from PySide6.QtGui import (
     QDesktopServices,
     QDragEnterEvent,
     QDropEvent,
-    QIcon,
     QKeySequence,
-    QPixmap,
     QShortcut,
 )
 from PySide6.QtWidgets import (
@@ -38,23 +36,29 @@ from .book_session import BookSession
 from .config_manager import ConfigManager
 from .image_cache import CachedImage, PRELOAD_RADIUS
 from .image_source import ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS, ImageSourceError
+from .thumbnail_provider import PageThumbnailProvider
 from .viewer_widget import ViewerImage, ViewerWidget
 
 
-class MainWindow(QMainWindow):
+class ViewerWindow(QMainWindow):
+    activated = Signal(object)
+    closing = Signal(object)
+
     def __init__(
         self,
         *,
-        config_manager: ConfigManager | None = None,
+        config_manager: ConfigManager,
         book_session: BookSession | None = None,
-        open_path_handler: Callable[[str], object] | None = None,
+        open_path_handler: Callable[[str, bool | None, object], object] | None = None,
+        adjacent_book_handler: Callable[[object, int], str] | None = None,
     ) -> None:
         super().__init__()
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle("NivisViewer")
         self.resize(1200, 820)
 
-        self.config = config_manager or ConfigManager()
-        self.settings = self.config.data if config_manager is not None else self.config.load()
+        self.config = config_manager
+        self.settings = self.config.data
         self.book_session = book_session or BookSession(
             int(self.settings.get("cache_size", 10)),
             self,
@@ -63,6 +67,7 @@ class MainWindow(QMainWindow):
         self.image_cache = self.book_session.image_cache
         self.image_cache.pageLoaded.connect(self._on_cache_page_loaded)
         self._open_path_handler = open_path_handler
+        self._adjacent_book_handler = adjacent_book_handler
         self._shutdown_prepared = False
         self._active_request_id = 0
         self._visible_page_indexes: tuple[int, ...] = tuple()
@@ -93,7 +98,6 @@ class MainWindow(QMainWindow):
         self.show_page_list = bool(self.settings.get("show_page_list", False))
         self.thumbnail_size = int(self.settings.get("thumbnail_size", 96))
         self.auto_open_adjacent_book = bool(self.settings.get("auto_open_adjacent_book", False))
-        self.loop_book_navigation = bool(self.settings.get("loop_book_navigation", False))
         self.magnifier_enabled = bool(self.settings.get("magnifier_enabled", False))
         self.magnifier_zoom = float(self.settings.get("magnifier_zoom", 2.0))
         self.magnifier_size = int(self.settings.get("magnifier_size", 220))
@@ -127,18 +131,28 @@ class MainWindow(QMainWindow):
             self.show()
         self._apply_chrome_visibility()
 
-    def open_startup_book(self) -> None:
-        if not self.reopen_last_on_start:
-            return
-        last_path = self.settings.get("last_open_path", "")
-        if last_path and Path(last_path).exists():
-            self._request_open_path(last_path)
-
     def _request_open_path(self, path: str | Path) -> None:
         if self._open_path_handler is not None:
-            self._open_path_handler(str(path))
+            self._open_path_handler(str(path), False, self)
             return
         self.open_path(path)
+
+    def _update_shared_setting(self, key: str, value: object) -> None:
+        self.config.set(key, value)
+
+    def window_state_snapshot(self) -> dict[str, object]:
+        return {
+            "window_geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
+            "window_state": bytes(self.saveState().toBase64()).decode("ascii"),
+            "fullscreen": self.isFullScreen(),
+            "rotation_angle": self.rotation_angle,
+        }
+
+    def event(self, event: QEvent) -> bool:  # type: ignore[override]
+        handled = super().event(event)
+        if event.type() == QEvent.Type.WindowActivate:
+            self.activated.emit(self)
+        return handled
 
     def _build_ui(self) -> None:
         self.viewer = ViewerWidget(self)
@@ -811,39 +825,47 @@ class MainWindow(QMainWindow):
 
     def set_reopen_last_on_start(self, checked: bool) -> None:
         self.reopen_last_on_start = checked
+        self._update_shared_setting("reopen_last_on_start", checked)
         self._sync_actions()
 
     def set_recursive_folder(self, checked: bool) -> None:
         self.recursive_folder = checked
+        self._update_shared_setting("recursive_folder", checked)
         self._sync_actions()
         self.reload_current_book()
 
     def set_sort_descending(self, checked: bool) -> None:
         self.sort_descending = checked
+        self._update_shared_setting("sort_descending", checked)
         self._sync_actions()
         self.reload_current_book()
 
     def set_auto_open_adjacent_book(self, checked: bool) -> None:
         self.auto_open_adjacent_book = checked
+        self._update_shared_setting("auto_open_adjacent_book", checked)
         self._sync_actions()
 
     def set_hide_ui_in_fullscreen(self, checked: bool) -> None:
         self.hide_ui_in_fullscreen = checked
+        self._update_shared_setting("hide_ui_in_fullscreen", checked)
         self._sync_actions()
         self._apply_chrome_visibility()
 
     def set_hide_cursor_in_fullscreen(self, checked: bool) -> None:
         self.hide_cursor_in_fullscreen = checked
+        self._update_shared_setting("hide_cursor_in_fullscreen", checked)
         self._sync_actions()
         self._apply_cursor_visibility_policy()
 
     def set_page_list_visible(self, checked: bool) -> None:
         self.show_page_list = checked
+        self._update_shared_setting("show_page_list", checked)
         self.page_list_dock.setVisible(checked)
         self._sync_actions()
 
     def set_magnifier_enabled(self, checked: bool) -> None:
         self.magnifier_enabled = checked
+        self._update_shared_setting("magnifier_enabled", checked)
         self.viewer.set_magnifier_enabled(checked)
         self._sync_actions()
 
@@ -851,6 +873,7 @@ class MainWindow(QMainWindow):
         if self.isFullScreen() and self.hide_ui_in_fullscreen:
             return
         self.show_page_list = visible
+        self._update_shared_setting("show_page_list", visible)
         if hasattr(self, "page_list_action"):
             self._sync_actions()
 
@@ -859,6 +882,7 @@ class MainWindow(QMainWindow):
         if not accepted:
             return
         self.gap = gap
+        self._update_shared_setting("gap", gap)
         self.viewer.set_gap(gap)
         self._refresh_view()
 
@@ -875,6 +899,7 @@ class MainWindow(QMainWindow):
         if not accepted:
             return
         self.cache_size = cache_size
+        self._update_shared_setting("cache_size", cache_size)
         self.image_cache.set_cache_size(cache_size)
         if self.model.total_pages > 0:
             self._refresh_view()
@@ -884,6 +909,7 @@ class MainWindow(QMainWindow):
         if not color.isValid():
             return
         self.background_color = color.name()
+        self._update_shared_setting("background_color", self.background_color)
         self.viewer.set_background_color(self.background_color)
 
     def set_thumbnail_size_dialog(self) -> None:
@@ -899,6 +925,7 @@ class MainWindow(QMainWindow):
         if not accepted:
             return
         self.thumbnail_size = size
+        self._update_shared_setting("thumbnail_size", size)
         self.page_list.setIconSize(QSize(size, size))
         for index in range(self.model.total_pages):
             cached = self.image_cache.get(index)
@@ -932,10 +959,13 @@ class MainWindow(QMainWindow):
     ) -> None:
         if brightness is not None:
             self.brightness = max(0.1, min(3.0, float(brightness)))
+            self._update_shared_setting("brightness", self.brightness)
         if contrast is not None:
             self.contrast = max(0.1, min(3.0, float(contrast)))
+            self._update_shared_setting("contrast", self.contrast)
         if gamma is not None:
             self.gamma = max(0.1, min(5.0, float(gamma)))
+            self._update_shared_setting("gamma", self.gamma)
         self.image_cache.set_adjustments(brightness=self.brightness, contrast=self.contrast, gamma=self.gamma)
         self.page_list.clear()
         self._rebuild_page_list()
@@ -967,43 +997,9 @@ class MainWindow(QMainWindow):
             return
         self.magnifier_zoom = zoom
         self.magnifier_size = size
+        self._update_shared_setting("magnifier_zoom", zoom)
+        self._update_shared_setting("magnifier_size", size)
         self.viewer.set_magnifier_options(zoom=zoom, size=size)
-
-    def _book_navigation_path(self) -> Path | None:
-        if not self._opened_path:
-            return None
-        opened = Path(self._opened_path)
-        if opened.is_file() and opened.suffix.lower() in SUPPORTED_EXTENSIONS:
-            return opened.parent
-        return opened
-
-    def _book_candidates(self) -> list[Path]:
-        current = self._book_navigation_path()
-        if current is None:
-            return []
-        parent = current.parent
-        if not parent.exists():
-            return []
-
-        candidates: list[Path] = []
-        for path in parent.iterdir():
-            if path.is_dir():
-                try:
-                    has_images = any(
-                        child.is_file() and child.suffix.lower() in SUPPORTED_EXTENSIONS
-                        for child in path.iterdir()
-                    )
-                except OSError:
-                    has_images = False
-                if has_images:
-                    candidates.append(path)
-            elif path.is_file() and path.suffix.lower() in (ARCHIVE_EXTENSIONS | SUPPORTED_EXTENSIONS):
-                candidates.append(path.parent if path.suffix.lower() in SUPPORTED_EXTENSIONS else path)
-
-        unique: dict[str, Path] = {}
-        for path in candidates:
-            unique[str(path.resolve()).casefold()] = path
-        return sorted(unique.values(), key=lambda item: item.name.casefold())
 
     def open_next_book(self) -> None:
         self._open_adjacent_book(1)
@@ -1012,26 +1008,11 @@ class MainWindow(QMainWindow):
         self._open_adjacent_book(-1)
 
     def _open_adjacent_book(self, direction: int) -> None:
-        current = self._book_navigation_path()
-        candidates = self._book_candidates()
-        if current is None or not candidates:
+        if self._adjacent_book_handler is None:
             return
-
-        current_key = str(current.resolve()).casefold()
-        keys = [str(path.resolve()).casefold() for path in candidates]
-        try:
-            current_index = keys.index(current_key)
-        except ValueError:
-            return
-
-        next_index = current_index + direction
-        if not (0 <= next_index < len(candidates)):
-            if self.loop_book_navigation:
-                next_index %= len(candidates)
-            else:
-                QMessageBox.information(self, "本の移動", "これ以上移動できません。")
-                return
-        self.open_path(candidates[next_index])
+        result = self._adjacent_book_handler(self, direction)
+        if result == "boundary":
+            QMessageBox.information(self, "本の移動", "これ以上移動できません。")
 
     def _bookmark_pages(self) -> list[int]:
         if not self._current_book_key:
@@ -1145,13 +1126,7 @@ class MainWindow(QMainWindow):
                 break
         if item is None:
             return
-        thumbnail = cached.qimage.scaled(
-            self.thumbnail_size,
-            self.thumbnail_size,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        item.setIcon(QIcon(QPixmap.fromImage(thumbnail)))
+        item.setIcon(PageThumbnailProvider.create_icon(cached.qimage, self.thumbnail_size))
 
     def _on_page_list_row_changed(self, row: int) -> None:
         if self._updating_page_list or row < 0:
@@ -1426,11 +1401,13 @@ class MainWindow(QMainWindow):
 
     def _on_zoom_changed(self, zoom: float) -> None:
         self.fit_mode = "manual_zoom"
+        self._update_shared_setting("fit_mode", self.fit_mode)
         self._sync_actions()
         self._update_status()
 
     def set_view_mode(self, mode: str) -> None:
         self.view_mode = mode
+        self._update_shared_setting("view_mode", mode)
         self.model.update_options(view_mode=mode)
         self._sync_actions()
         if self.model.total_pages:
@@ -1441,6 +1418,7 @@ class MainWindow(QMainWindow):
 
     def set_reading_direction(self, direction: str) -> None:
         self.reading_direction = direction
+        self._update_shared_setting("reading_direction", direction)
         self.model.update_options(reading_direction=direction)
         self._sync_actions()
         if self.model.total_pages:
@@ -1451,29 +1429,34 @@ class MainWindow(QMainWindow):
 
     def set_single_first_page(self, checked: bool) -> None:
         self.single_first_page = checked
+        self._update_shared_setting("single_first_page", checked)
         self.model.update_options(single_first_page=checked)
         if self.model.total_pages:
             self._refresh_view()
 
     def set_treat_wide_image_as_single(self, checked: bool) -> None:
         self.treat_wide_image_as_single = checked
+        self._update_shared_setting("treat_wide_image_as_single", checked)
         self.model.update_options(treat_wide_image_as_single=checked)
         if self.model.total_pages:
             self._refresh_view()
 
     def set_split_wide_image(self, checked: bool) -> None:
         self.split_wide_image = checked
+        self._update_shared_setting("split_wide_image", checked)
         self._sync_actions()
         if self.model.total_pages:
             self._refresh_view()
 
     def set_smooth_scaling(self, checked: bool) -> None:
         self.smooth_scaling = checked
+        self._update_shared_setting("smooth_scaling", checked)
         self.viewer.set_smooth_scaling(checked)
         self._sync_actions()
 
     def set_horizontal_alignment(self, alignment: str) -> None:
         self.horizontal_alignment = alignment
+        self._update_shared_setting("horizontal_alignment", alignment)
         self.viewer.set_horizontal_alignment(alignment)
         self._sync_actions()
 
@@ -1483,6 +1466,7 @@ class MainWindow(QMainWindow):
         else:
             self.viewer.set_fit_mode(mode)
         self.fit_mode = mode
+        self._update_shared_setting("fit_mode", mode)
         self._sync_actions()
         self._update_status()
 
@@ -1528,6 +1512,7 @@ class MainWindow(QMainWindow):
         if not accepted:
             return
         self.slideshow_interval_ms = int(seconds * 1000)
+        self._update_shared_setting("slideshow_interval_ms", self.slideshow_interval_ms)
         self.slideshow_timer.setInterval(self.slideshow_interval_ms)
 
     def _advance_slideshow(self) -> None:
@@ -1626,52 +1611,11 @@ class MainWindow(QMainWindow):
         if self._shutdown_prepared:
             return
         self._shutdown_prepared = True
+        self.slideshow_timer.stop()
         self._save_current_reading_position()
-        geometry = bytes(self.saveGeometry().toBase64()).decode("ascii")
-        state = bytes(self.saveState().toBase64()).decode("ascii")
-        self.config.save(
-            {
-                "last_open_path": self.settings.get("last_open_path", ""),
-                "recent_paths": self.settings.get("recent_paths", []),
-                "reading_positions": self.settings.get("reading_positions", {}),
-                "bookmarks": self.settings.get("bookmarks", {}),
-                "view_mode": self.view_mode,
-                "reading_direction": self.reading_direction,
-                "fit_mode": self.fit_mode,
-                "fullscreen": self.isFullScreen(),
-                "reopen_last_on_start": self.reopen_last_on_start,
-                "recursive_folder": self.recursive_folder,
-                "sort_descending": self.sort_descending,
-                "hide_ui_in_fullscreen": self.hide_ui_in_fullscreen,
-                "hide_cursor_in_fullscreen": self.hide_cursor_in_fullscreen,
-                "show_page_list": self.show_page_list,
-                "thumbnail_size": self.thumbnail_size,
-                "auto_open_adjacent_book": self.auto_open_adjacent_book,
-                "open_viewer_behavior": self.settings.get("open_viewer_behavior", "reuse_or_create"),
-                "loop_book_navigation": self.loop_book_navigation,
-                "bring_viewer_to_front_on_open": self.settings.get("bring_viewer_to_front_on_open", True),
-                "magnifier_enabled": self.magnifier_enabled,
-                "magnifier_zoom": self.magnifier_zoom,
-                "magnifier_size": self.magnifier_size,
-                "gap": self.gap,
-                "single_first_page": self.single_first_page,
-                "treat_wide_image_as_single": self.treat_wide_image_as_single,
-                "split_wide_image": self.split_wide_image,
-                "smooth_scaling": self.smooth_scaling,
-                "horizontal_alignment": self.horizontal_alignment,
-                "brightness": self.brightness,
-                "contrast": self.contrast,
-                "gamma": self.gamma,
-                "cache_size": self.cache_size,
-                "rotation_angle": self.rotation_angle,
-                "slideshow_interval_ms": self.slideshow_interval_ms,
-                "background_color": self.background_color,
-                "window_geometry": geometry,
-                "window_state": state,
-            }
-        )
         self.book_session.shutdown()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
         self.prepare_shutdown()
+        self.closing.emit(self)
         super().closeEvent(event)
