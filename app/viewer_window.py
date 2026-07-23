@@ -1126,10 +1126,14 @@ class ViewerWindow(QMainWindow):
 
     def _open_adjacent_book(self, direction: int) -> None:
         if self._adjacent_book_handler is None:
+            self.status.showMessage("移動できる書庫がありません", 2500)
             return
         result = self._adjacent_book_handler(self, direction)
         if result == "boundary":
-            QMessageBox.information(self, "本の移動", "これ以上移動できません。")
+            message = "前の書庫はありません" if direction < 0 else "次の書庫はありません"
+            self.status.showMessage(message, 2500)
+        elif result == "unavailable":
+            self.status.showMessage("移動できる書庫がありません", 2500)
 
     def _bookmark_pages(self) -> list[int]:
         if not self._current_book_key:
