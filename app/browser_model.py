@@ -6,10 +6,16 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from natsort import natsorted
 from PySide6.QtCore import QAbstractListModel, QModelIndex, Qt
 from PySide6.QtGui import QIcon
 
+from .browser_sort import (
+    BrowserSortKey,
+    BrowserSortOrder,
+    BrowserSortPolicy,
+    normalize_browser_sort_key,
+    normalize_browser_sort_order,
+)
 from .image_source import ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS
 
 
@@ -29,6 +35,8 @@ class BrowserItem:
     path: Path
     kind: BrowserItemKind
     modified_at: float | None
+    file_size: int | None = None
+    modified_time_ns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -40,12 +48,6 @@ class BrowserDiscoveryResult:
 
 class BrowserItemDiscovery:
     """Lists browser entries without decoding images or opening archives."""
-
-    _KIND_ORDER = {
-        BrowserItemKind.FOLDER: 0,
-        BrowserItemKind.ARCHIVE: 1,
-        BrowserItemKind.IMAGE: 2,
-    }
 
     def discover(self, folder: str | Path) -> BrowserDiscoveryResult:
         target = Path(folder).expanduser()
@@ -68,13 +70,7 @@ class BrowserItemDiscovery:
                 error=f"フォルダを読み込めません: {target} ({exc})",
             )
 
-        ordered = natsorted(
-            items,
-            key=lambda item: (
-                self._KIND_ORDER[item.kind],
-                item.display_name.casefold(),
-            ),
-        )
+        ordered = BrowserSortPolicy().sorted_items(items)
         return BrowserDiscoveryResult(folder=target, items=tuple(ordered))
 
     @staticmethod
@@ -100,14 +96,21 @@ class BrowserItemDiscovery:
             return None
 
         try:
-            modified_at = entry.stat(follow_symlinks=False).st_mtime
+            entry_stat = entry.stat(follow_symlinks=False)
+            modified_at = entry_stat.st_mtime
+            modified_time_ns = entry_stat.st_mtime_ns
+            file_size = None if kind is BrowserItemKind.FOLDER else entry_stat.st_size
         except OSError:
             modified_at = None
+            modified_time_ns = None
+            file_size = None
         return BrowserItem(
             display_name=name,
             path=Path(entry.path).absolute(),
             kind=kind,
             modified_at=modified_at,
+            file_size=file_size,
+            modified_time_ns=modified_time_ns,
         )
 
     @staticmethod
@@ -126,6 +129,8 @@ class BrowserItemModel(QAbstractListModel):
     PathRole = int(Qt.ItemDataRole.UserRole) + 1
     KindRole = PathRole + 1
     ItemRole = PathRole + 2
+    FileSizeRole = PathRole + 3
+    ModifiedTimeRole = PathRole + 4
 
     _KIND_LABELS = {
         BrowserItemKind.FOLDER: "フォルダ",
@@ -135,7 +140,9 @@ class BrowserItemModel(QAbstractListModel):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._source_items: list[BrowserItem] = []
         self._items: list[BrowserItem] = []
+        self._sort_policy = BrowserSortPolicy()
         self._icons: dict[str, QIcon] = {}
         self._fallback_icons: dict[BrowserItemKind, QIcon] = {}
 
@@ -160,15 +167,39 @@ class BrowserItemModel(QAbstractListModel):
             return item.kind.value
         if role == self.ItemRole:
             return item
+        if role == self.FileSizeRole:
+            return item.file_size
+        if role == self.ModifiedTimeRole:
+            return item.modified_time_ns
         if role == int(Qt.ItemDataRole.ToolTipRole):
             return str(item.path)
         return None
 
     def set_items(self, items: tuple[BrowserItem, ...] | list[BrowserItem]) -> None:
         self.beginResetModel()
-        self._items = list(items)
+        self._source_items = list(items)
+        self._items = self._sort_policy.sorted_items(self._source_items)
         self._icons.clear()
         self.endResetModel()
+
+    def configure_sort(
+        self,
+        sort_key: BrowserSortKey | str,
+        sort_order: BrowserSortOrder | str,
+        folders_first: bool,
+    ) -> bool:
+        policy = BrowserSortPolicy(
+            sort_key=normalize_browser_sort_key(sort_key),
+            sort_order=normalize_browser_sort_order(sort_order),
+            folders_first=bool(folders_first),
+        )
+        if policy == self._sort_policy:
+            return False
+        self.beginResetModel()
+        self._sort_policy = policy
+        self._items = policy.sorted_items(self._source_items)
+        self.endResetModel()
+        return True
 
     def set_fallback_icons(self, icons: dict[BrowserItemKind, QIcon]) -> None:
         self._fallback_icons = dict(icons)

@@ -2,7 +2,7 @@
 
 ## 現在の実装
 
-Sprint 7では、BrowserWindowへセッション内フォルダ履歴、ナビゲーションバー、パス入力、選択・スクロール復元を追加しました。BrowserWindowとViewerWindowは同じ`QApplication`・同じプロセス内で動く別ウィンドウで、ApplicationControllerが寿命、選択状態、共有MetadataStoreを管理します。
+Sprint 8では、BrowserWindowへ名前・更新日時・種類・サイズの安定ソート、フォルダ優先、3段階の表示密度、並び替え後の選択・スクロール復元を追加しました。BrowserWindowとViewerWindowは同じ`QApplication`・同じプロセス内で動く別ウィンドウで、ApplicationControllerが寿命、選択状態、共有MetadataStoreを管理します。
 
 ```text
 ApplicationController
@@ -11,10 +11,12 @@ ApplicationController
 │  ├─ BrowserNavigationHistory
 │  ├─ FolderTree (QFileSystemModel / QTreeView)
 │  ├─ NavigationToolbar
+│  ├─ DisplaySettings
 │  ├─ AddressBar
 │  ├─ BookmarkModel
 │  ├─ HistoryModel
 │  ├─ BrowserItemModel
+│  │  └─ BrowserSortPolicy
 │  ├─ BrowserThumbnailProvider
 │  │  └─ ThumbnailDiskCache
 │  └─ SettingsDialog
@@ -34,8 +36,9 @@ ApplicationController
 - `BrowserWindow`: フォルダ履歴、ナビゲーションバー、パス入力、フォルダツリー、ブックマーク／履歴タブ、項目選択、サムネイル一覧、ステータス表示を管理。本のページ移動やBookSession、SQLは持たない
 - `BrowserNavigationHistory`: Qtに依存せず、訪問フォルダ、選択項目、縦横スクロール位置、戻る／進むの分岐をセッション内で管理
 - `BookmarkModel` / `HistoryModel`: MetadataStoreの公開APIと変更通知をQt Model/Viewへ公開し、BrowserWindowからSQLを分離
-- `BrowserItemDiscovery`: サブフォルダ、ZIP/CBZ、対応画像を列挙し、種類ごとの一貫した順序と自然順で返す。画像のデコードや書庫の展開は行わない
-- `BrowserItemModel`: BrowserItemの表示名、絶対パス、種類、更新日時と表示アイコンをQt Model/Viewへ公開
+- `BrowserItemDiscovery`: サブフォルダ、ZIP/CBZ、対応画像を列挙し、列挙時のmtimeとファイルサイズをBrowserItemへ保存する。画像のデコードや書庫の展開は行わない
+- `BrowserItemModel`: BrowserItemの表示名、絶対パス、種類、元項目のmtime、ファイルサイズ、表示アイコンをQt Model/Viewへ公開し、BrowserSortPolicyで保持リストを並べ替える
+- `BrowserSortPolicy`: QtやMetadataStoreに依存せず、自然順、更新日時、種類、サイズ、昇降順、フォルダ優先を一元管理
 - `BrowserThumbnailProvider`: 最大2スレッドの専用`QThreadPool`で画像、画像フォルダ、ZIP/CBZのサムネイルを生成し、メモリLRUキャッシュを管理
 - `ThumbnailDiskCache`: SQLiteインデックスとWebPまたはPNGファイルによるポータブルな永続サムネイルキャッシュ
 - `SettingsDialog`: Viewerの開き方、見開き表示、Browserのサムネイルとディスクキャッシュ、マウス操作割り当てを編集
@@ -64,6 +67,29 @@ BrowserWindowのフォルダツリーはQt標準の`QFileSystemModel`と`QTreeVi
 FolderTreeのユーザー選択は短いタイマー後に通常訪問として記録します。`navigate_to()`からのツリー同期中は専用フラグで`currentChanged`を無視し、履歴の二重追加と無限再帰を防ぎます。ツリーのユーザー移動待ちと、QFileSystemModelの読み込み待ちを別の状態として管理します。
 
 BrowserWindowでは`BackButton / XButton1`をフォルダ履歴の戻る、`ForwardButton / XButton2`を進むとして押下時だけ処理します。サムネイル一覧、ツリー、ブックマーク、履歴などの主要子ウィジェットへevent filterを設定し、解放イベントでは再実行しません。パス欄のBackspaceは通常の文字編集として扱います。ViewerWindowでは従来どおりXButtonを前／次の本へ割り当て、Browserの履歴処理と共有しません。
+
+### BrowserWindowの並び替えと表示密度
+
+```text
+BrowserWindow
+├─ BrowserNavigationHistory
+├─ BrowserItemModel
+│  └─ BrowserSortPolicy
+├─ NavigationToolbar
+└─ DisplaySettings
+```
+
+並び替えキーは`name`、`modified_time`、`item_type`、`file_size`です。名前はnatsortによる大文字小文字を過度に区別しない自然順とし、同一判定時は絶対パスで安定化します。更新日時とサイズが同じ項目、および同じ種類の項目は名前の自然順を二次順序にします。種類はフォルダ、ZIP/CBZ共通の書庫カテゴリ、画像の順です。未対応形式は一覧へ追加しません。
+
+更新日時は列挙時に取得した元ファイルまたは元フォルダ自身の`st_mtime_ns`だけを使います。サイズはファイル自身の`st_size`で、フォルダを再帰走査しません。stat失敗時は`None`として安全な既定値で比較します。MetadataStoreの`metadata_updated_at`、サムネイル生成日時、キャッシュ時刻は並び替えへ混ぜません。更新操作は再列挙するため最新のファイルシステム情報を取得しますが、並び替えだけで`os.stat()`を繰り返しません。
+
+`browser_folders_first`が有効なら昇順・降順やキーにかかわらずフォルダを先頭グループへ固定し、各グループ内部へ現在の並び替え条件を適用します。ZIPとCBZはフォルダ扱いせず、同一の書庫カテゴリです。無効時はすべての項目を選択キーだけで並べます。
+
+表示密度はコンパクト、標準、ゆったりの3段階で、`QListView`の`gridSize`、`spacing`、折り返しだけを変更します。サムネイル画像サイズとは独立しているため、密度変更ではサムネイル世代、メモリキャッシュ、永続キャッシュキーを変更しません。`thumbnail_size`変更時だけ新しい世代を開始し、古い非同期結果を破棄してサイズ別キャッシュを利用します。
+
+並び替え、フォルダ優先、密度、サムネイルサイズの変更前には、主選択、複数選択、表示基準項目、縦横スクロール位置を絶対パスで記録します。モデル更新とQtのレイアウト完了後に存在するパスだけを復元します。この処理はViewerのopen経路もBrowserNavigationHistoryのvisit経路も通りません。非同期サムネイル結果も従来どおりパスで照合するため、行番号が変わっても別項目へ混入しません。
+
+BrowserItemModelが軽量なファイルシステム属性とソート方針を分離して保持する構成は、Sprint 9で列挙結果を非同期・増分追加する際の接続点です。BrowserWindowは設定変更とパス基準の表示状態復元だけを担当します。
 
 サムネイルの完全デコードとZIP内画像の読み出しはGUIスレッドでは行いません。BrowserWindowは現在見えている範囲を優先して要求します。同じ項目の重複要求を抑止し、フォルダ切替ごとに世代番号を更新します。ワーカー結果の世代が現在と異なる場合、またはBrowserWindowが閉じられている場合は結果を破棄します。壊れた画像・書庫は項目種別の標準アイコンのまま表示し、一覧全体を停止しません。
 
@@ -158,7 +184,7 @@ ViewerWidgetの描画矩形は`calculate_spread_layout()`で計算します。2�
 
 ジオメトリ、ウィンドウ状態、全画面、回転角度はウィンドウ固有です。複数ウィンドウの完全な復元はまだ行わず、最後にアクティブだったViewerWindowの値を次回作成時の標準状態として保存します。現在の本、ズーム、パン、スライドショーの実行状態は各ViewerWindow内で独立し、ウィンドウ群としての復元対象にはしていません。読書位置だけは本ごとの履歴としてMetadataStoreへ保存します。
 
-BrowserWindowは`last_browser_path`、`browser_sidebar_visible`、`browser_sidebar_width`、`browser_window_geometry`を保存します。サムネイルサイズは共有の`thumbnail_size`を使用し、80～500ピクセルへ正規化します。ページ間隔は0～100、ディスクキャッシュ容量は128～4096MBへ正規化します。設定とキャッシュをユーザーの画像フォルダへ書き込みません。
+BrowserWindowは`last_browser_path`、`browser_sidebar_visible`、`browser_sidebar_width`、`browser_window_geometry`、並び替えキー・順序、フォルダ優先、表示密度を保存します。サムネイルサイズは共有の`thumbnail_size`を使用し、96～384ピクセルへ正規化します。ページ間隔は0～100、ディスクキャッシュ容量は128～4096MBへ正規化します。設定とキャッシュをユーザーの画像フォルダへ書き込みません。
 
 ### ウィンドウの寿命
 
@@ -169,7 +195,7 @@ BrowserWindowは`last_browser_path`、`browser_sidebar_visible`、`browser_sideb
 
 ## 次の構成
 
-次段階ではBrowserWindowの表示密度、並び替え、大量項目の非同期・増分列挙、安全なファイル操作を優先します。基本操作の安定後にMetadataStoreのレート／タグAPIへ編集UI、検索、絞り込み、サムネイル上の表示を接続します。ZipPlaの`{zpi$...}`は明示的な読み取り互換から始め、元ファイルへ自動的に書き戻さない境界を維持します。
+次段階ではBrowserWindowの大量項目の非同期・増分列挙、可視範囲優先のサムネイル要求、先読み、高速スクロール中の生成抑制、安全なファイル操作を優先します。基本操作の安定後にMetadataStoreのレート／タグAPIへ編集UI、検索、絞り込み、サムネイル上の表示を接続します。ZipPlaの`{zpi$...}`は明示的な読み取り互換から始め、元ファイルへ自動的に書き戻さない境界を維持します。
 
 `ApplicationController`は引き続きアプリ全体の寿命、共有設定、単一MetadataStore、ウィンドウ群、ウィンドウ間イベントを管理します。`BrowserWindow`は本を探して選ぶ責務、`ViewerWindow`はBookSessionとViewerWidgetを接続して読む責務を持ちます。PageModelはGUIに依存しない状態を保ちます。
 

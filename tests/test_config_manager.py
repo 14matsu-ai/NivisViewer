@@ -20,6 +20,10 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
     assert manager.data["browser_sidebar_visible"] is True
     assert manager.data["browser_sidebar_width"] == 280
     assert manager.data["thumbnail_size"] == 180
+    assert manager.data["browser_sort_key"] == "name"
+    assert manager.data["browser_sort_order"] == "ascending"
+    assert manager.data["browser_folders_first"] is True
+    assert manager.data["browser_display_density"] == "standard"
     assert manager.data["join_spread_pages"] is False
     assert manager.data["thumbnail_disk_cache_enabled"] is True
     assert manager.data["thumbnail_cache_limit_mb"] == 512
@@ -75,7 +79,9 @@ def test_invalid_browser_settings_are_normalized_and_clamped(tmp_path: Path) -> 
     path = tmp_path / "config.json"
     path.write_text(
         '{"last_browser_path": 12, "browser_sidebar_visible": "yes", '
-        '"browser_sidebar_width": -5, "thumbnail_size": 9999}',
+        '"browser_sidebar_width": -5, "thumbnail_size": 9999, '
+        '"browser_sort_key": "invalid", "browser_sort_order": "sideways", '
+        '"browser_folders_first": "yes", "browser_display_density": "tiny"}',
         encoding="utf-8",
     )
 
@@ -84,7 +90,39 @@ def test_invalid_browser_settings_are_normalized_and_clamped(tmp_path: Path) -> 
     assert restored["last_browser_path"] == ""
     assert restored["browser_sidebar_visible"] is True
     assert restored["browser_sidebar_width"] == 120
-    assert restored["thumbnail_size"] == 500
+    assert restored["thumbnail_size"] == 384
+    assert restored["browser_sort_key"] == "name"
+    assert restored["browser_sort_order"] == "ascending"
+    assert restored["browser_folders_first"] is True
+    assert restored["browser_display_density"] == "standard"
+
+
+def test_thumbnail_size_has_safe_lower_bound(tmp_path: Path) -> None:
+    manager = ConfigManager(tmp_path / "config.json")
+    manager.load()
+
+    manager.apply({"thumbnail_size": -20})
+
+    assert manager.get("thumbnail_size") == 96
+
+
+def test_browser_setting_values_are_not_shared_between_instances(
+    tmp_path: Path,
+) -> None:
+    first = ConfigManager(tmp_path / "first.json")
+    second = ConfigManager(tmp_path / "second.json")
+    first.load()
+    second.load()
+
+    first.apply(
+        {
+            "browser_sort_key": "file_size",
+            "browser_display_density": "compact",
+        }
+    )
+
+    assert second.get("browser_sort_key") == "name"
+    assert second.get("browser_display_density") == "standard"
 
 
 def test_sprint4_settings_are_normalized_and_changes_are_emitted(tmp_path: Path) -> None:

@@ -30,6 +30,10 @@ class ConfigManager(QObject):
         "hide_cursor_in_fullscreen": False,
         "show_page_list": False,
         "thumbnail_size": 180,
+        "browser_sort_key": "name",
+        "browser_sort_order": "ascending",
+        "browser_folders_first": True,
+        "browser_display_density": "standard",
         "last_browser_path": "",
         "browser_sidebar_visible": True,
         "browser_sidebar_width": 280,
@@ -159,9 +163,28 @@ class ConfigManager(QObject):
         normalized["thumbnail_size"] = cls._clamped_int(
             normalized.get("thumbnail_size"),
             default=int(cls.DEFAULTS["thumbnail_size"]),
-            minimum=80,
-            maximum=500,
+            minimum=96,
+            maximum=384,
         )
+        if normalized.get("browser_sort_key") not in {
+            "name",
+            "modified_time",
+            "item_type",
+            "file_size",
+        }:
+            normalized["browser_sort_key"] = cls.DEFAULTS["browser_sort_key"]
+        if normalized.get("browser_sort_order") not in {"ascending", "descending"}:
+            normalized["browser_sort_order"] = cls.DEFAULTS["browser_sort_order"]
+        if not isinstance(normalized.get("browser_folders_first"), bool):
+            normalized["browser_folders_first"] = cls.DEFAULTS["browser_folders_first"]
+        if normalized.get("browser_display_density") not in {
+            "compact",
+            "standard",
+            "comfortable",
+        }:
+            normalized["browser_display_density"] = cls.DEFAULTS[
+                "browser_display_density"
+            ]
         behavior = normalized.get("open_viewer_behavior")
         if behavior not in {"reuse_active", "always_new", "reuse_or_create"}:
             normalized["open_viewer_behavior"] = "reuse_or_create"

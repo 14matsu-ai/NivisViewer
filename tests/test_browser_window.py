@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import zipfile
+import os
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QSize
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtCore import QItemSelectionModel, QSize
+from PySide6.QtWidgets import QApplication, QListView, QMessageBox
 
 from app.browser_model import BrowserItemKind
 from app.browser_window import BrowserWindow
@@ -125,6 +126,243 @@ def test_controller_selection_sync_does_not_reopen_item(
     assert opened == []
     window.close()
     qapp.processEvents()
+
+
+def test_sort_controls_apply_without_opening_viewer_or_changing_history(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "並び替え"
+    first = folder / "book2.jpg"
+    second = folder / "book10.jpg"
+    write_image(first)
+    write_image(second)
+    os.utime(first, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(second, ns=(2_000_000_000, 2_000_000_000))
+    opened: list[str] = []
+    window = BrowserWindow(
+        config_manager=make_config(tmp_path, folder),
+        open_path_handler=lambda path, _new: opened.append(path),
+    )
+    initial_history_length = len(window.navigation_history)
+    initial_generation = window.thumbnail_provider.generation
+
+    window.browser_sort_key_combo.setCurrentIndex(
+        window.browser_sort_key_combo.findData("modified_time")
+    )
+    window.browser_sort_order_combo.setCurrentIndex(
+        window.browser_sort_order_combo.findData("descending")
+    )
+    qapp.processEvents()
+
+    assert [entry.display_name for entry in window.items] == [
+        "book10.jpg",
+        "book2.jpg",
+    ]
+    assert window.config.get("browser_sort_key") == "modified_time"
+    assert window.config.get("browser_sort_order") == "descending"
+    assert len(window.navigation_history) == initial_history_length
+    assert window.thumbnail_provider.generation == initial_generation
+    assert opened == []
+    assert "更新日時・降順" in window.statusBar().currentMessage()
+    window.close()
+    qapp.processEvents()
+
+
+def test_sort_and_density_preserve_multiple_selection_and_thumbnail_cache(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "複数選択"
+    for index in range(1, 13):
+        write_image(folder / f"book{index}.jpg")
+    window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    selection_model = window.list_view.selectionModel()
+    selected_names = {"book2.jpg", "book10.jpg"}
+    for name in selected_names:
+        row = next(
+            row
+            for row, entry in enumerate(window.items)
+            if entry.display_name == name
+        )
+        index = window.item_model.index(row, 0)
+        selection_model.select(index, QItemSelectionModel.SelectionFlag.Select)
+        if name == "book10.jpg":
+            selection_model.setCurrentIndex(
+                index,
+                QItemSelectionModel.SelectionFlag.NoUpdate,
+            )
+    initial_generation = window.thumbnail_provider.generation
+    initial_history_length = len(window.navigation_history)
+
+    window.config.apply(
+        {
+            "browser_sort_order": "descending",
+            "browser_display_density": "comfortable",
+        }
+    )
+    qapp.processEvents()
+
+    restored_names = {
+        window.item_model.item_at(index).display_name
+        for index in window.list_view.selectionModel().selectedIndexes()
+    }
+    current = window.item_model.item_at(window.list_view.currentIndex())
+    assert restored_names == selected_names
+    assert current is not None and current.display_name == "book10.jpg"
+    assert window.list_view.gridSize() == QSize(252, 268)
+    assert window.thumbnail_provider.generation == initial_generation
+    assert len(window.navigation_history) == initial_history_length
+    window.close()
+    qapp.processEvents()
+
+
+def test_thumbnail_size_change_preserves_selection_and_uses_new_generation(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "サイズ変更"
+    image = folder / "選択.jpg"
+    write_image(image)
+    window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    window.select_path(image)
+    initial_generation = window.thumbnail_provider.generation
+
+    window.config.apply({"thumbnail_size": 260})
+    qapp.processEvents()
+
+    selected = window.item_model.item_at(window.list_view.currentIndex())
+    assert selected is not None and selected.path == image.absolute()
+    assert window.list_view.iconSize() == QSize(260, 260)
+    assert window.thumbnail_provider.generation == initial_generation + 1
+
+    window.config.apply({"thumbnail_size": 260})
+    qapp.processEvents()
+    assert window.thumbnail_provider.generation == initial_generation + 1
+    window.close()
+    qapp.processEvents()
+
+
+def test_display_density_changes_layout_without_changing_thumbnail_size(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "密度"
+    write_image(folder / "1.jpg")
+    window = BrowserWindow(
+        config_manager=make_config(tmp_path, folder, thumbnail_size=180)
+    )
+
+    expectations = {
+        "compact": QSize(200, 212),
+        "standard": QSize(224, 238),
+        "comfortable": QSize(252, 268),
+    }
+    for density, grid_size in expectations.items():
+        window.browser_display_density_combo.setCurrentIndex(
+            window.browser_display_density_combo.findData(density)
+        )
+        qapp.processEvents()
+        assert window.list_view.gridSize() == grid_size
+        assert window.list_view.iconSize() == QSize(180, 180)
+
+    window.close()
+    qapp.processEvents()
+
+
+def test_folders_first_control_keeps_folder_group_at_front(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "フォルダ優先"
+    write_image(folder / "a.jpg")
+    (folder / "z-folder").mkdir()
+    window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+
+    assert [entry.display_name for entry in window.items] == [
+        "z-folder",
+        "a.jpg",
+    ]
+    window.browser_folders_first_checkbox.setChecked(False)
+    qapp.processEvents()
+
+    assert [entry.display_name for entry in window.items] == [
+        "a.jpg",
+        "z-folder",
+    ]
+    assert window.config.get("browser_folders_first") is False
+    window.close()
+    qapp.processEvents()
+
+
+def test_sort_keeps_visible_anchor_item_on_screen(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "スクロール"
+    for index in range(1, 61):
+        write_image(folder / f"book{index}.jpg")
+    window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    window.resize(640, 420)
+    window.show()
+    qapp.processEvents()
+    anchor_row = window.item_model.row_for_path(folder / "book40.jpg")
+    anchor = window.item_model.index(anchor_row, 0)
+    window.list_view.scrollTo(anchor, QListView.ScrollHint.PositionAtCenter)
+    qapp.processEvents()
+    visible_anchor = window.item_model.item_at(window._visible_anchor_index())
+    assert visible_anchor is not None
+
+    window.browser_sort_order_combo.setCurrentIndex(
+        window.browser_sort_order_combo.findData("descending")
+    )
+    qapp.processEvents()
+
+    restored_row = window.item_model.row_for_path(visible_anchor.path)
+    restored = window.item_model.index(restored_row, 0)
+    assert window.list_view.visualRect(restored).intersects(
+        window.list_view.viewport().rect()
+    )
+    window.close()
+    qapp.processEvents()
+
+
+def test_metadata_update_does_not_change_filesystem_mtime_sort(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "メタデータ分離"
+    older = folder / "older.jpg"
+    newer = folder / "newer.jpg"
+    write_image(older)
+    write_image(newer)
+    os.utime(older, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(newer, ns=(2_000_000_000, 2_000_000_000))
+    source_mtimes = (older.stat().st_mtime_ns, newer.stat().st_mtime_ns)
+    store = MetadataStore(tmp_path / "metadata.sqlite3")
+    window = BrowserWindow(
+        config_manager=make_config(tmp_path, folder),
+        metadata_store=store,
+    )
+    window.config.apply(
+        {
+            "browser_sort_key": "modified_time",
+            "browser_sort_order": "descending",
+        }
+    )
+    before = [entry.display_name for entry in window.items]
+
+    store.set_rating(str(older), 5)
+    qapp.processEvents()
+
+    assert [entry.display_name for entry in window.items] == before == [
+        "newer.jpg",
+        "older.jpg",
+    ]
+    assert (older.stat().st_mtime_ns, newer.stat().st_mtime_ns) == source_mtimes
+    window.close()
+    qapp.processEvents()
+    store.close()
 
 
 def test_sidebar_has_folder_bookmark_and_history_tabs(

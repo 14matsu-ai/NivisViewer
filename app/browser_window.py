@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -9,6 +10,7 @@ from PySide6.QtCore import (
     QByteArray,
     QDir,
     QEvent,
+    QItemSelectionModel,
     QModelIndex,
     QPoint,
     QSize,
@@ -28,6 +30,8 @@ from PySide6.QtGui import (
     QShortcut,
 )
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
     QFileSystemModel,
     QLineEdit,
     QListView,
@@ -51,6 +55,17 @@ from .browser_model import (
     BrowserItemModel,
 )
 from .browser_navigation import BrowserLocation, BrowserNavigationHistory
+from .browser_sort import (
+    BROWSER_DISPLAY_DENSITY_LABELS,
+    BROWSER_SORT_KEY_LABELS,
+    BROWSER_SORT_ORDER_LABELS,
+    BrowserDisplayDensity,
+    BrowserSortKey,
+    BrowserSortOrder,
+    normalize_browser_display_density,
+    normalize_browser_sort_key,
+    normalize_browser_sort_order,
+)
 from .bookmark_model import BookmarkModel
 from .config_manager import ConfigManager
 from .history_model import HistoryModel
@@ -61,6 +76,15 @@ from .thumbnail_disk_cache import ThumbnailDiskCache
 
 
 BrowserOpenHandler = Callable[[str, bool], object]
+
+
+@dataclass(frozen=True)
+class _ListViewState:
+    selected_paths: tuple[str, ...]
+    current_path: str | None
+    anchor_path: str | None
+    vertical_scroll: int
+    horizontal_scroll: int
 
 
 class BrowserWindow(QMainWindow):
@@ -108,6 +132,7 @@ class BrowserWindow(QMainWindow):
         self._pending_tree_navigation_path: Path | None = None
         self._pending_tree_sync_path: Path | None = None
         self._location_restore_token = 0
+        self._list_view_restore_token = 0
         self._status_message_token = 0
         self._pressed_extra_buttons: set[Qt.MouseButton] = set()
         self._shutdown_prepared = False
@@ -116,6 +141,24 @@ class BrowserWindow(QMainWindow):
         )
         self.thumbnail_size = self._safe_thumbnail_size(
             self.settings.get("thumbnail_size", 180)
+        )
+        self.browser_sort_key = normalize_browser_sort_key(
+            self.settings.get("browser_sort_key", BrowserSortKey.NAME.value)
+        )
+        self.browser_sort_order = normalize_browser_sort_order(
+            self.settings.get(
+                "browser_sort_order",
+                BrowserSortOrder.ASCENDING.value,
+            )
+        )
+        self.browser_folders_first = bool(
+            self.settings.get("browser_folders_first", True)
+        )
+        self.browser_display_density = normalize_browser_display_density(
+            self.settings.get(
+                "browser_display_density",
+                BrowserDisplayDensity.STANDARD.value,
+            )
         )
 
         self._folder_change_timer = QTimer(self)
@@ -399,14 +442,54 @@ class BrowserWindow(QMainWindow):
         self.thumbnail_provider.close()
 
     def apply_settings(self, changed: dict[str, object]) -> None:
-        if "thumbnail_size" in changed:
-            self.thumbnail_size = self._safe_thumbnail_size(changed["thumbnail_size"])
-            self.list_view.setIconSize(QSize(self.thumbnail_size, self.thumbnail_size))
-            self.list_view.setGridSize(
-                QSize(self.thumbnail_size + 44, self.thumbnail_size + 58)
+        list_keys = {
+            "thumbnail_size",
+            "browser_sort_key",
+            "browser_sort_order",
+            "browser_folders_first",
+            "browser_display_density",
+        }
+        list_changed = bool(list_keys.intersection(changed))
+        view_state = self._capture_list_view_state() if list_changed else None
+
+        if "browser_sort_key" in changed:
+            self.browser_sort_key = normalize_browser_sort_key(
+                changed["browser_sort_key"]
             )
+        if "browser_sort_order" in changed:
+            self.browser_sort_order = normalize_browser_sort_order(
+                changed["browser_sort_order"]
+            )
+        if "browser_folders_first" in changed:
+            self.browser_folders_first = bool(changed["browser_folders_first"])
+        if "browser_display_density" in changed:
+            self.browser_display_density = normalize_browser_display_density(
+                changed["browser_display_density"]
+            )
+        if {
+            "browser_sort_key",
+            "browser_sort_order",
+            "browser_folders_first",
+        }.intersection(changed):
+            self.item_model.configure_sort(
+                self.browser_sort_key,
+                self.browser_sort_order,
+                self.browser_folders_first,
+            )
+
+        thumbnail_changed = "thumbnail_size" in changed
+        if thumbnail_changed:
+            self.thumbnail_size = self._safe_thumbnail_size(changed["thumbnail_size"])
             self.item_model.clear_thumbnails()
             self._generation = self.thumbnail_provider.begin_generation()
+        if thumbnail_changed or "browser_display_density" in changed:
+            self._apply_list_view_geometry()
+
+        if list_changed:
+            self._sync_browser_controls()
+            if view_state is not None:
+                self._schedule_list_view_state_restore(view_state)
+            self._update_status()
             QTimer.singleShot(0, self._request_visible_thumbnails)
         if "thumbnail_disk_cache_enabled" in changed:
             self.thumbnail_provider.set_disk_cache_enabled(
@@ -416,6 +499,72 @@ class BrowserWindow(QMainWindow):
             self.thumbnail_provider.set_disk_cache_limit_mb(
                 int(changed["thumbnail_cache_limit_mb"])
             )
+
+    def _apply_browser_controls(self, *_args: object) -> None:
+        self.config.apply(
+            {
+                "browser_sort_key": str(
+                    self.browser_sort_key_combo.currentData()
+                ),
+                "browser_sort_order": str(
+                    self.browser_sort_order_combo.currentData()
+                ),
+                "browser_folders_first": (
+                    self.browser_folders_first_checkbox.isChecked()
+                ),
+                "browser_display_density": str(
+                    self.browser_display_density_combo.currentData()
+                ),
+            },
+            save=True,
+        )
+
+    def _sync_browser_controls(self) -> None:
+        controls = (
+            self.browser_sort_key_combo,
+            self.browser_sort_order_combo,
+            self.browser_folders_first_checkbox,
+            self.browser_display_density_combo,
+        )
+        for control in controls:
+            control.blockSignals(True)
+        try:
+            self._select_combo_data(
+                self.browser_sort_key_combo,
+                self.browser_sort_key.value,
+            )
+            self._select_combo_data(
+                self.browser_sort_order_combo,
+                self.browser_sort_order.value,
+            )
+            self.browser_folders_first_checkbox.setChecked(
+                self.browser_folders_first
+            )
+            self._select_combo_data(
+                self.browser_display_density_combo,
+                self.browser_display_density.value,
+            )
+        finally:
+            for control in controls:
+                control.blockSignals(False)
+
+    def _apply_list_view_geometry(self) -> None:
+        density = self.browser_display_density
+        if density is BrowserDisplayDensity.COMPACT:
+            horizontal_margin, vertical_margin, spacing, word_wrap = 20, 32, 2, False
+        elif density is BrowserDisplayDensity.COMFORTABLE:
+            horizontal_margin, vertical_margin, spacing, word_wrap = 72, 88, 12, True
+        else:
+            horizontal_margin, vertical_margin, spacing, word_wrap = 44, 58, 6, True
+        self.list_view.setIconSize(QSize(self.thumbnail_size, self.thumbnail_size))
+        self.list_view.setGridSize(
+            QSize(
+                self.thumbnail_size + horizontal_margin,
+                self.thumbnail_size + vertical_margin,
+            )
+        )
+        self.list_view.setSpacing(spacing)
+        self.list_view.setWordWrap(word_wrap)
 
     def open_settings_dialog(self) -> None:
         dialog = SettingsDialog(
@@ -555,6 +704,11 @@ class BrowserWindow(QMainWindow):
         self.sidebar.addTab(self.history_view, "履歴")
 
         self.item_model = BrowserItemModel(self)
+        self.item_model.configure_sort(
+            self.browser_sort_key,
+            self.browser_sort_order,
+            self.browser_folders_first,
+        )
         style = self.style()
         self.item_model.set_fallback_icons(
             {
@@ -571,14 +725,16 @@ class BrowserWindow(QMainWindow):
         self.list_view.setViewMode(QListView.ViewMode.IconMode)
         self.list_view.setResizeMode(QListView.ResizeMode.Adjust)
         self.list_view.setMovement(QListView.Movement.Static)
-        self.list_view.setSelectionMode(QListView.SelectionMode.SingleSelection)
+        self.list_view.setSelectionMode(QListView.SelectionMode.ExtendedSelection)
         self.list_view.setUniformItemSizes(True)
-        self.list_view.setWordWrap(True)
-        self.list_view.setIconSize(QSize(self.thumbnail_size, self.thumbnail_size))
-        self.list_view.setGridSize(QSize(self.thumbnail_size + 44, self.thumbnail_size + 58))
+        self.list_view.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self._apply_list_view_geometry()
         self.list_view.activated.connect(self.open_item)
         self.list_view.selectionModel().currentChanged.connect(
             lambda _current, _previous: self._update_status()
+        )
+        self.list_view.selectionModel().selectionChanged.connect(
+            lambda _selected, _deselected: self._update_status()
         )
         self.list_view.verticalScrollBar().valueChanged.connect(
             lambda _value: self._request_visible_thumbnails()
@@ -653,6 +809,52 @@ class BrowserWindow(QMainWindow):
         self.address_bar.returnPressed.connect(self._navigate_from_address_bar)
         self.address_bar.installEventFilter(self)
         self.navigation_toolbar.addWidget(self.address_bar)
+        self.navigation_toolbar.addSeparator()
+
+        self.browser_sort_key_combo = QComboBox(self)
+        self.browser_sort_key_combo.setObjectName("browser_sort_key_combo")
+        self.browser_sort_key_combo.setToolTip("一覧の並び替え基準")
+        for value, label in BROWSER_SORT_KEY_LABELS.items():
+            self.browser_sort_key_combo.addItem(label, value.value)
+        self.navigation_toolbar.addWidget(self.browser_sort_key_combo)
+
+        self.browser_sort_order_combo = QComboBox(self)
+        self.browser_sort_order_combo.setObjectName("browser_sort_order_combo")
+        self.browser_sort_order_combo.setToolTip("一覧の並び順")
+        for value, label in BROWSER_SORT_ORDER_LABELS.items():
+            self.browser_sort_order_combo.addItem(label, value.value)
+        self.navigation_toolbar.addWidget(self.browser_sort_order_combo)
+
+        self.browser_folders_first_checkbox = QCheckBox("フォルダ先頭", self)
+        self.browser_folders_first_checkbox.setObjectName(
+            "browser_folders_first_checkbox"
+        )
+        self.browser_folders_first_checkbox.setToolTip(
+            "昇順・降順にかかわらずフォルダを先頭へ表示"
+        )
+        self.navigation_toolbar.addWidget(self.browser_folders_first_checkbox)
+
+        self.browser_display_density_combo = QComboBox(self)
+        self.browser_display_density_combo.setObjectName(
+            "browser_display_density_combo"
+        )
+        self.browser_display_density_combo.setToolTip("一覧の表示密度")
+        for value, label in BROWSER_DISPLAY_DENSITY_LABELS.items():
+            self.browser_display_density_combo.addItem(label, value.value)
+        self.navigation_toolbar.addWidget(self.browser_display_density_combo)
+        self._sync_browser_controls()
+        self.browser_sort_key_combo.currentIndexChanged.connect(
+            self._apply_browser_controls
+        )
+        self.browser_sort_order_combo.currentIndexChanged.connect(
+            self._apply_browser_controls
+        )
+        self.browser_folders_first_checkbox.toggled.connect(
+            self._apply_browser_controls
+        )
+        self.browser_display_density_combo.currentIndexChanged.connect(
+            self._apply_browser_controls
+        )
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.navigation_toolbar)
 
         self.focus_address_shortcut = QShortcut(QKeySequence("Ctrl+L"), self)
@@ -817,9 +1019,14 @@ class BrowserWindow(QMainWindow):
         count = len(self.items)
         selected = self.item_model.item_at(self.list_view.currentIndex())
         folder = str(self.current_path) if self.current_path is not None else ""
-        message = f"{folder} — {count}件"
+        sort_label = BROWSER_SORT_KEY_LABELS[self.browser_sort_key]
+        order_label = BROWSER_SORT_ORDER_LABELS[self.browser_sort_order]
+        message = f"{folder} — {count}件 — {sort_label}・{order_label}"
         if selected is not None:
             message += f" — 選択: {selected.display_name}"
+            selected_count = len(self.list_view.selectionModel().selectedIndexes())
+            if selected_count > 1:
+                message += f" ほか{selected_count - 1}件"
         self.statusBar().showMessage(message)
 
     def _show_temporary_status(self, message: str, timeout_ms: int = 3000) -> None:
@@ -902,6 +1109,82 @@ class BrowserWindow(QMainWindow):
             vertical_scroll=self.list_view.verticalScrollBar().value(),
             horizontal_scroll=self.list_view.horizontalScrollBar().value(),
         )
+
+    def _capture_list_view_state(self) -> _ListViewState:
+        selected_paths: list[str] = []
+        selection_model = self.list_view.selectionModel()
+        if selection_model is not None:
+            for index in selection_model.selectedIndexes():
+                item = self.item_model.item_at(index)
+                if item is not None:
+                    selected_paths.append(str(item.path))
+        current_item = self.item_model.item_at(self.list_view.currentIndex())
+        anchor_item = self.item_model.item_at(self._visible_anchor_index())
+        return _ListViewState(
+            selected_paths=tuple(selected_paths),
+            current_path=str(current_item.path) if current_item is not None else None,
+            anchor_path=str(anchor_item.path) if anchor_item is not None else None,
+            vertical_scroll=self.list_view.verticalScrollBar().value(),
+            horizontal_scroll=self.list_view.horizontalScrollBar().value(),
+        )
+
+    def _visible_anchor_index(self) -> QModelIndex:
+        viewport = self.list_view.viewport()
+        grid_width = max(1, self.list_view.gridSize().width())
+        sample_x = min(max(1, grid_width // 2), max(1, viewport.width() - 1))
+        for y in range(1, max(2, viewport.height()), 4):
+            index = self.list_view.indexAt(QPoint(sample_x, y))
+            if index.isValid():
+                return index
+        return self.list_view.currentIndex()
+
+    def _schedule_list_view_state_restore(self, state: _ListViewState) -> None:
+        self._list_view_restore_token += 1
+        token = self._list_view_restore_token
+        self._restore_list_view_state(state)
+
+        def restore_after_layout() -> None:
+            if token != self._list_view_restore_token:
+                return
+            self._restore_list_view_state(state)
+            self._request_visible_thumbnails()
+
+        QTimer.singleShot(0, restore_after_layout)
+
+    def _restore_list_view_state(self, state: _ListViewState) -> None:
+        selection_model = self.list_view.selectionModel()
+        if selection_model is None:
+            return
+        selection_model.clearSelection()
+        for path in state.selected_paths:
+            row = self.item_model.row_for_path(path)
+            if row >= 0:
+                selection_model.select(
+                    self.item_model.index(row, 0),
+                    QItemSelectionModel.SelectionFlag.Select,
+                )
+
+        current = QModelIndex()
+        if state.current_path:
+            row = self.item_model.row_for_path(state.current_path)
+            if row >= 0:
+                current = self.item_model.index(row, 0)
+        selection_model.setCurrentIndex(
+            current,
+            QItemSelectionModel.SelectionFlag.NoUpdate,
+        )
+
+        anchor = QModelIndex()
+        if state.anchor_path:
+            row = self.item_model.row_for_path(state.anchor_path)
+            if row >= 0:
+                anchor = self.item_model.index(row, 0)
+        if anchor.isValid():
+            self.list_view.scrollTo(anchor, QListView.ScrollHint.PositionAtTop)
+        else:
+            self.list_view.verticalScrollBar().setValue(state.vertical_scroll)
+            self.list_view.horizontalScrollBar().setValue(state.horizontal_scroll)
+        self._update_status()
 
     def _update_current_navigation_state(self) -> None:
         if self.current_path is None:
@@ -1099,7 +1382,12 @@ class BrowserWindow(QMainWindow):
             size = int(value)
         except (TypeError, ValueError):
             size = 180
-        return max(80, min(500, size))
+        return max(96, min(384, size))
+
+    @staticmethod
+    def _select_combo_data(combo: QComboBox, value: object) -> None:
+        index = combo.findData(value)
+        combo.setCurrentIndex(index if index >= 0 else 0)
 
     @staticmethod
     def _safe_sidebar_width(value: object) -> int:

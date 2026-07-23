@@ -30,6 +30,10 @@ def test_current_values_are_shown_and_join_disables_gap(
             "gap": 33,
             "join_spread_pages": True,
             "thumbnail_size": 240,
+            "browser_display_density": "comfortable",
+            "browser_sort_key": "modified_time",
+            "browser_sort_order": "descending",
+            "browser_folders_first": False,
         }
     )
 
@@ -40,6 +44,10 @@ def test_current_values_are_shown_and_join_disables_gap(
     assert dialog.join_spread_checkbox.isChecked()
     assert not dialog.gap_spin.isEnabled()
     assert dialog.thumbnail_size_spin.value() == 240
+    assert dialog.browser_display_density_combo.currentData() == "comfortable"
+    assert dialog.browser_sort_key_combo.currentData() == "modified_time"
+    assert dialog.browser_sort_order_combo.currentData() == "descending"
+    assert not dialog.browser_folders_first_checkbox.isChecked()
     dialog.reject()
 
 
@@ -51,12 +59,26 @@ def test_apply_and_ok_persist_settings(tmp_path: Path, qapp: QApplication) -> No
     )
     dialog.gap_spin.setValue(45)
     dialog.thumbnail_size_spin.setValue(260)
+    dialog.browser_display_density_combo.setCurrentIndex(
+        dialog.browser_display_density_combo.findData("compact")
+    )
+    dialog.browser_sort_key_combo.setCurrentIndex(
+        dialog.browser_sort_key_combo.findData("file_size")
+    )
+    dialog.browser_sort_order_combo.setCurrentIndex(
+        dialog.browser_sort_order_combo.findData("descending")
+    )
+    dialog.browser_folders_first_checkbox.setChecked(False)
 
     changed = dialog.apply_settings()
 
     assert changed["open_viewer_behavior"] == "reuse_active"
     assert changed["gap"] == 45
     assert ConfigManager(config.path).load()["thumbnail_size"] == 260
+    assert changed["browser_display_density"] == "compact"
+    assert changed["browser_sort_key"] == "file_size"
+    assert changed["browser_sort_order"] == "descending"
+    assert changed["browser_folders_first"] is False
 
     dialog.join_spread_checkbox.setChecked(True)
     dialog.accept()
@@ -69,11 +91,35 @@ def test_cancel_does_not_apply_changes(tmp_path: Path, qapp: QApplication) -> No
     original_gap = config.get("gap")
     dialog = SettingsDialog(config)
     dialog.gap_spin.setValue(99)
+    dialog.browser_display_density_combo.setCurrentIndex(
+        dialog.browser_display_density_combo.findData("comfortable")
+    )
 
     dialog.reject()
 
     assert config.get("gap") == original_gap
+    assert config.get("browser_display_density") == "standard"
     assert not config.path.exists()
+
+
+def test_density_apply_does_not_request_cache_clear(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    dialog = SettingsDialog(make_config(tmp_path))
+    cache_clear_requests: list[bool] = []
+    dialog.cache_clear_requested.connect(
+        lambda: cache_clear_requests.append(True)
+    )
+    dialog.browser_display_density_combo.setCurrentIndex(
+        dialog.browser_display_density_combo.findData("comfortable")
+    )
+
+    dialog.apply_settings()
+
+    assert cache_clear_requests == []
+    assert dialog.config.get("browser_display_density") == "comfortable"
+    dialog.reject()
 
 
 def test_cache_clear_button_emits_request(
