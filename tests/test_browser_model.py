@@ -9,9 +9,18 @@ from app.browser_model import BrowserItemDiscovery, BrowserItemKind
 def test_discovery_lists_supported_items_in_stable_natural_order(tmp_path: Path) -> None:
     (tmp_path / "章2").mkdir()
     (tmp_path / "章10").mkdir()
-    for name in ("10.jpg", "2.jpg", "1.png", "日本語.webp", "book10.zip", "book2.cbz"):
+    for name in (
+        "10.jpg",
+        "2.jpg",
+        "1.png",
+        "日本語.webp",
+        "scan.tiff",
+        "icon.ico",
+        "book10.zip",
+        "book2.cbz",
+    ):
         (tmp_path / name).write_bytes(b"test")
-    for name in ("notes.txt", ".hidden.jpg", "download.part", "scan.tiff"):
+    for name in ("notes.txt", ".hidden.jpg", "download.part"):
         (tmp_path / name).write_bytes(b"ignore")
 
     result = BrowserItemDiscovery().discover(tmp_path)
@@ -25,6 +34,8 @@ def test_discovery_lists_supported_items_in_stable_natural_order(tmp_path: Path)
         "1.png",
         "2.jpg",
         "10.jpg",
+        "icon.ico",
+        "scan.tiff",
         "日本語.webp",
     ]
     assert [item.kind for item in result.items] == [
@@ -32,6 +43,8 @@ def test_discovery_lists_supported_items_in_stable_natural_order(tmp_path: Path)
         BrowserItemKind.FOLDER,
         BrowserItemKind.ARCHIVE,
         BrowserItemKind.ARCHIVE,
+        BrowserItemKind.IMAGE,
+        BrowserItemKind.IMAGE,
         BrowserItemKind.IMAGE,
         BrowserItemKind.IMAGE,
         BrowserItemKind.IMAGE,

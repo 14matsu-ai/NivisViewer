@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+from app.browser_navigation import BrowserLocation, BrowserNavigationHistory
+
+
+def location(name: str) -> BrowserLocation:
+    return BrowserLocation(path=name)
+
+
+def test_back_and_forward_follow_visit_order() -> None:
+    history = BrowserNavigationHistory()
+    for name in ("A", "B", "C"):
+        history.visit(location(name))
+
+    assert history.go_back() == location("B")
+    assert history.go_back() == location("A")
+    assert history.go_back() is None
+    assert history.go_forward() == location("B")
+
+
+def test_new_visit_after_back_discards_forward_branch() -> None:
+    history = BrowserNavigationHistory()
+    for name in ("A", "B", "C"):
+        history.visit(location(name))
+    assert history.go_back() == location("B")
+
+    history.visit(location("D"))
+
+    assert history.current() == location("D")
+    assert not history.can_go_forward()
+    assert history.go_back() == location("B")
+
+
+def test_consecutive_duplicate_and_windows_case_variant_are_not_added() -> None:
+    history = BrowserNavigationHistory()
+    history.visit(location(r"C:\漫画\本"))
+    history.visit(location("c:/漫画/本/"))
+
+    assert len(history) == 1
+
+
+def test_history_limit_drops_oldest_entries() -> None:
+    history = BrowserNavigationHistory(max_entries=3)
+    for name in ("A", "B", "C", "D"):
+        history.visit(location(name))
+
+    assert len(history) == 3
+    assert history.go_back() == location("C")
+    assert history.go_back() == location("B")
+    assert history.go_back() is None
+
+
+def test_current_view_state_is_returned_by_navigation() -> None:
+    history = BrowserNavigationHistory()
+    history.visit(location("A"))
+    history.update_current_view_state(
+        selected_path="A/item.jpg",
+        vertical_scroll=42,
+        horizontal_scroll=7,
+    )
+    history.visit(location("B"))
+
+    restored = history.go_back()
+
+    assert restored == BrowserLocation(
+        path="A",
+        selected_path="A/item.jpg",
+        vertical_scroll=42,
+        horizontal_scroll=7,
+    )
+
+
+def test_empty_history_operations_are_safe() -> None:
+    history = BrowserNavigationHistory()
+
+    history.update_current_view_state(
+        selected_path=None,
+        vertical_scroll=10,
+        horizontal_scroll=10,
+    )
+
+    assert history.current() is None
+    assert history.go_back() is None
+    assert history.go_forward() is None
+    assert not history.can_go_back()
+    assert not history.can_go_forward()
