@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import os
-import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from time import monotonic
 from typing import Callable
 
 from PySide6.QtCore import (
     QByteArray,
+    QCoreApplication,
     QDir,
     QEvent,
     QItemSelectionModel,
@@ -53,8 +54,18 @@ from .browser_model import (
     BrowserItemDiscovery,
     BrowserItemKind,
     BrowserItemModel,
+    browser_item_from_scan_entry,
 )
 from .browser_navigation import BrowserLocation, BrowserNavigationHistory
+from .browser_scanner import (
+    BrowserDirectoryScanner,
+    BrowserScanBatch,
+    BrowserScanCompleted,
+    BrowserScanEntry,
+    BrowserScanError,
+    BrowserScanRequest,
+    BrowserScanStatus,
+)
 from .browser_sort import (
     BROWSER_DISPLAY_DENSITY_LABELS,
     BROWSER_SORT_KEY_LABELS,
@@ -65,6 +76,11 @@ from .browser_sort import (
     normalize_browser_display_density,
     normalize_browser_sort_key,
     normalize_browser_sort_order,
+)
+from .browser_thumbnail_scheduler import (
+    ThumbnailPriority,
+    build_thumbnail_request_plan,
+    calculate_grid_visible_range,
 )
 from .bookmark_model import BookmarkModel
 from .config_manager import ConfigManager
@@ -87,6 +103,19 @@ class _ListViewState:
     horizontal_scroll: int
 
 
+@dataclass
+class _PendingDirectoryScan:
+    path: Path
+    generation: int
+    record_history: bool
+    restore_location: BrowserLocation
+    refresh: bool
+    failure_history_revert: str | None = None
+    committed: bool = False
+    refresh_entries: list[BrowserScanEntry] = field(default_factory=list)
+    buffered_entries: list[BrowserScanEntry] = field(default_factory=list)
+
+
 class BrowserWindow(QMainWindow):
     activated = Signal(object)
     closing = Signal(object)
@@ -97,6 +126,7 @@ class BrowserWindow(QMainWindow):
         config_manager: ConfigManager,
         open_path_handler: BrowserOpenHandler | None = None,
         discovery: BrowserItemDiscovery | None = None,
+        scanner: BrowserDirectoryScanner | None = None,
         thumbnail_provider: BrowserThumbnailProvider | None = None,
         metadata_store: MetadataStore | None = None,
     ) -> None:
@@ -110,6 +140,12 @@ class BrowserWindow(QMainWindow):
         self.metadata_store = metadata_store
         self._open_path_handler = open_path_handler
         self.discovery = discovery or BrowserItemDiscovery()
+        # The scanner is intentionally not a QObject child: a running
+        # QThreadPool must not be destroyed synchronously with this window.
+        self.scanner = scanner or BrowserDirectoryScanner()
+        self.scanner.batch_ready.connect(self._on_scan_batch)
+        self.scanner.scan_completed.connect(self._on_scan_completed)
+        self.scanner.scan_failed.connect(self._on_scan_failed)
         if thumbnail_provider is None:
             disk_cache = ThumbnailDiskCache(
                 self.config.thumbnail_cache_dir,
@@ -128,14 +164,20 @@ class BrowserWindow(QMainWindow):
         self.current_path: Path | None = None
         self.navigation_history = BrowserNavigationHistory()
         self._generation = self.thumbnail_provider.generation
+        self._scan_generation = 0
+        self._pending_scan: _PendingDirectoryScan | None = None
         self._syncing_tree = False
         self._pending_tree_navigation_path: Path | None = None
         self._pending_tree_sync_path: Path | None = None
         self._location_restore_token = 0
         self._list_view_restore_token = 0
         self._status_message_token = 0
+        self._temporary_status_message: str | None = None
         self._pressed_extra_buttons: set[Qt.MouseButton] = set()
         self._shutdown_prepared = False
+        self._fast_scrolling = False
+        self._last_scroll_value = 0
+        self._last_scroll_time = 0.0
         self._sidebar_width = self._safe_sidebar_width(
             self.settings.get("browser_sidebar_width", 280)
         )
@@ -166,6 +208,25 @@ class BrowserWindow(QMainWindow):
         self._folder_change_timer.setInterval(120)
         self._folder_change_timer.timeout.connect(self._apply_pending_tree_path)
 
+        self._thumbnail_request_timer = QTimer(self)
+        self._thumbnail_request_timer.setSingleShot(True)
+        self._thumbnail_request_timer.setInterval(30)
+        self._thumbnail_request_timer.timeout.connect(
+            self._request_visible_thumbnails
+        )
+        self._scroll_idle_timer = QTimer(self)
+        self._scroll_idle_timer.setSingleShot(True)
+        self._scroll_idle_timer.setInterval(180)
+        self._scroll_idle_timer.timeout.connect(self._on_scroll_idle)
+        self._scan_status_timer = QTimer(self)
+        self._scan_status_timer.setSingleShot(True)
+        self._scan_status_timer.setInterval(120)
+        self._scan_status_timer.timeout.connect(self._update_status)
+        self._scan_batch_timer = QTimer(self)
+        self._scan_batch_timer.setSingleShot(True)
+        self._scan_batch_timer.setInterval(120)
+        self._scan_batch_timer.timeout.connect(self._flush_pending_scan_batch)
+
         self._build_ui()
         self.config.settings_changed.connect(self.apply_settings)
         self._restore_window_state()
@@ -178,6 +239,15 @@ class BrowserWindow(QMainWindow):
     def show_initial(self) -> None:
         self.show()
 
+    def wait_for_scan(self, msecs: int = 5000) -> bool:
+        """Diagnostic/test helper; normal UI code must not wait for scans."""
+        wait = getattr(self.scanner, "wait_for_done", None)
+        if callable(wait):
+            wait(max(0, int(msecs)))
+        for _ in range(3):
+            QCoreApplication.processEvents()
+        return self._pending_scan is None
+
     def navigate_to(
         self,
         path: str | Path,
@@ -186,22 +256,9 @@ class BrowserWindow(QMainWindow):
         restore_location: BrowserLocation | None = None,
         force_reload: bool = False,
         capture_current: bool = True,
+        failure_history_revert: str | None = None,
     ) -> bool:
         target = self._absolute_browser_path(path)
-        try:
-            target_stat = target.stat()
-        except FileNotFoundError:
-            self._show_temporary_status("フォルダが見つかりません")
-            self._sync_address_bar()
-            return False
-        except OSError:
-            self._show_temporary_status("フォルダへアクセスできません")
-            self._sync_address_bar()
-            return False
-        if not stat.S_ISDIR(target_stat.st_mode):
-            self._show_temporary_status("フォルダが見つかりません")
-            self._sync_address_bar()
-            return False
 
         same_path = self._same_path(self.current_path, target)
         if same_path and not force_reload:
@@ -211,49 +268,262 @@ class BrowserWindow(QMainWindow):
             self._update_navigation_actions()
             return True
 
+        pending = self._pending_scan
+        if (
+            pending is not None
+            and self._same_path(pending.path, target)
+            and not force_reload
+        ):
+            pending.restore_location = (
+                restore_location or pending.restore_location
+            )
+            return True
+
         if capture_current:
             self._update_current_navigation_state()
-        result = self.discovery.discover(target)
-        if result.error is not None:
+        self._cancel_pending_scan(rollback_history=True)
+        self._scan_generation += 1
+        request = BrowserScanRequest(
+            path=str(target),
+            generation=self._scan_generation,
+        )
+        self._pending_scan = _PendingDirectoryScan(
+            path=target,
+            generation=request.generation,
+            record_history=record_history,
+            restore_location=(
+                restore_location or BrowserLocation(str(target))
+            ),
+            refresh=same_path and force_reload,
+            failure_history_revert=failure_history_revert,
+        )
+        if not self.scanner.start(request):
+            self._pending_scan = None
             self._show_temporary_status("フォルダへアクセスできません")
             self._sync_address_bar()
             return False
-
-        self.current_path = result.folder
-        self.config.set("last_browser_path", str(result.folder))
-        self._generation = self.thumbnail_provider.begin_generation()
-        self.item_model.set_items(result.items)
-        self.list_view.clearSelection()
-        self.list_view.setCurrentIndex(QModelIndex())
-        if record_history:
-            self.navigation_history.visit(BrowserLocation(str(result.folder)))
-        self._folder_change_timer.stop()
-        self._pending_tree_navigation_path = None
-        self._sync_tree_to_path(result.folder)
-        self._sync_address_bar()
-        self._update_navigation_actions()
-        self._update_status()
-        self._schedule_location_restore(
-            restore_location or BrowserLocation(str(result.folder))
-        )
-        QTimer.singleShot(0, self._request_visible_thumbnails)
+        self._update_status(force=True)
         return True
 
     def set_current_folder(self, folder: str | Path) -> bool:
         return self.navigate_to(folder)
 
+    def _on_scan_batch(self, batch: BrowserScanBatch) -> None:
+        pending = self._matching_pending_scan(batch.generation, batch.path)
+        if pending is None or self._shutdown_prepared:
+            return
+        if pending.refresh:
+            pending.refresh_entries.extend(batch.entries)
+            self._schedule_scan_status_update()
+            return
+
+        if not pending.committed:
+            self._commit_pending_scan(pending)
+            self._append_scan_entries(pending, batch.entries)
+        else:
+            pending.buffered_entries.extend(batch.entries)
+            if not self._scan_batch_timer.isActive():
+                self._scan_batch_timer.start()
+        self._schedule_scan_status_update()
+        self._schedule_thumbnail_requests()
+
+    def _append_scan_entries(
+        self,
+        pending: _PendingDirectoryScan,
+        entries: tuple[BrowserScanEntry, ...],
+    ) -> None:
+        previous_state = self._capture_list_view_state()
+        items = self._items_from_scan_entries(entries)
+        self.item_model.append_scan_batch(
+            items,
+            generation=pending.generation,
+        )
+        self._restore_list_view_state(previous_state)
+        self._restore_pending_scan_location(pending, final=False)
+
+    def _flush_pending_scan_batch(self) -> None:
+        pending = self._pending_scan
+        if (
+            pending is None
+            or pending.refresh
+            or not pending.committed
+            or not pending.buffered_entries
+        ):
+            return
+        entries = tuple(pending.buffered_entries)
+        pending.buffered_entries.clear()
+        self._append_scan_entries(pending, entries)
+        self._schedule_scan_status_update()
+        self._schedule_thumbnail_requests()
+
+    def _on_scan_completed(self, result: BrowserScanCompleted) -> None:
+        pending = self._matching_pending_scan(result.generation, result.path)
+        if pending is None or self._shutdown_prepared:
+            return
+        if result.cancelled:
+            self._scan_batch_timer.stop()
+            if pending.committed:
+                self.item_model.cancel_directory_scan(
+                    generation=pending.generation
+                )
+            self._pending_scan = None
+            self._update_status()
+            return
+
+        if pending.refresh:
+            state = self._capture_list_view_state()
+            items = self._items_from_scan_entries(
+                tuple(pending.refresh_entries)
+            )
+            self._generation = self.thumbnail_provider.begin_generation()
+            self.item_model.set_items(items)
+            self._schedule_list_view_state_restore(state)
+            self._restore_location(
+                pending.restore_location,
+                update_status=False,
+            )
+        else:
+            if not pending.committed:
+                self._commit_pending_scan(pending)
+            self._scan_batch_timer.stop()
+            self._flush_pending_scan_batch()
+            self.item_model.finish_directory_scan(
+                generation=pending.generation
+            )
+            self._restore_pending_scan_location(pending, final=True)
+
+        self._pending_scan = None
+        self._update_status()
+        self._schedule_thumbnail_requests()
+        if pending.refresh:
+            QTimer.singleShot(
+                0,
+                lambda: (
+                    self._show_temporary_status("フォルダを更新しました")
+                    if not self._shutdown_prepared
+                    else None
+                ),
+            )
+
+    def _on_scan_failed(self, error: BrowserScanError) -> None:
+        pending = self._matching_pending_scan(error.generation, error.path)
+        if pending is None or self._shutdown_prepared:
+            return
+        if pending.committed:
+            self.item_model.cancel_directory_scan(
+                generation=pending.generation
+            )
+        else:
+            self._rollback_pending_history(pending)
+        self._pending_scan = None
+        self._scan_batch_timer.stop()
+        self._sync_address_bar()
+        self._update_navigation_actions()
+        if error.status is BrowserScanStatus.NOT_FOUND:
+            message = "フォルダが見つかりません"
+        elif error.status is BrowserScanStatus.NOT_DIRECTORY:
+            message = "このファイル形式は表示できません"
+        else:
+            message = "フォルダへアクセスできません"
+        self._show_temporary_status(message)
+
+    def _commit_pending_scan(self, pending: _PendingDirectoryScan) -> None:
+        if pending.committed:
+            return
+        pending.committed = True
+        self.current_path = pending.path
+        self.config.set("last_browser_path", str(pending.path))
+        self._generation = self.thumbnail_provider.begin_generation()
+        self.item_model.begin_directory_scan(generation=pending.generation)
+        self.list_view.clearSelection()
+        self.list_view.setCurrentIndex(QModelIndex())
+        if pending.record_history:
+            self.navigation_history.visit(BrowserLocation(str(pending.path)))
+        self._folder_change_timer.stop()
+        self._pending_tree_navigation_path = None
+        self._sync_tree_to_path(pending.path)
+        self._sync_address_bar()
+        self._update_navigation_actions()
+
+    def _cancel_pending_scan(self, *, rollback_history: bool) -> None:
+        pending = self._pending_scan
+        if pending is None:
+            return
+        self.scanner.cancel(pending.generation)
+        self._scan_batch_timer.stop()
+        if pending.committed:
+            self.item_model.cancel_directory_scan(
+                generation=pending.generation
+            )
+        elif rollback_history:
+            self._rollback_pending_history(pending)
+        self._pending_scan = None
+
+    def _rollback_pending_history(self, pending: _PendingDirectoryScan) -> None:
+        if pending.failure_history_revert == "forward":
+            self.navigation_history.go_forward()
+        elif pending.failure_history_revert == "back":
+            self.navigation_history.go_back()
+
+    def _matching_pending_scan(
+        self,
+        generation: int,
+        path: str,
+    ) -> _PendingDirectoryScan | None:
+        pending = self._pending_scan
+        if (
+            pending is None
+            or pending.generation != generation
+            or not self._same_path(pending.path, Path(path))
+        ):
+            return None
+        return pending
+
+    @staticmethod
+    def _items_from_scan_entries(
+        entries: tuple[BrowserScanEntry, ...],
+    ) -> list[BrowserItem]:
+        items: list[BrowserItem] = []
+        for entry in entries:
+            try:
+                items.append(browser_item_from_scan_entry(entry))
+            except ValueError:
+                continue
+        return items
+
+    def _restore_pending_scan_location(
+        self,
+        pending: _PendingDirectoryScan,
+        *,
+        final: bool,
+    ) -> None:
+        selected_path = pending.restore_location.selected_path
+        if (
+            selected_path
+            and self.item_model.row_for_path(selected_path) < 0
+            and not final
+        ):
+            return
+        self._restore_location(
+            pending.restore_location,
+            update_status=False,
+        )
+
+    def _schedule_scan_status_update(self) -> None:
+        if not self._scan_status_timer.isActive():
+            self._scan_status_timer.start()
+
     def select_path(self, path: str | Path) -> None:
         target = self._absolute_browser_path(path)
-        if target.is_file():
+        if target.suffix.lower() in (
+            BROWSER_IMAGE_EXTENSIONS | BROWSER_ARCHIVE_EXTENSIONS
+        ):
             folder = target.parent
             selected = target
-        elif target.is_dir():
+        else:
             parent = target.parent
             folder = parent if parent != target else target
             selected = target
-        else:
-            self.statusBar().showMessage("項目が見つかりません", 3000)
-            return
 
         location = BrowserLocation(str(folder), selected_path=str(selected))
         if not self.navigate_to(folder, restore_location=location):
@@ -271,6 +541,7 @@ class BrowserWindow(QMainWindow):
             record_history=False,
             restore_location=location,
             capture_current=False,
+            failure_history_revert="forward",
         ):
             return True
         self.navigation_history.go_forward()
@@ -288,6 +559,7 @@ class BrowserWindow(QMainWindow):
             record_history=False,
             restore_location=location,
             capture_current=False,
+            failure_history_revert="back",
         ):
             return True
         self.navigation_history.go_back()
@@ -320,7 +592,6 @@ class BrowserWindow(QMainWindow):
             force_reload=True,
         ):
             return False
-        self._show_temporary_status("フォルダを更新しました")
         return True
 
     def focus_address_bar(self) -> None:
@@ -438,6 +709,12 @@ class BrowserWindow(QMainWindow):
         if self._shutdown_prepared:
             return
         self._shutdown_prepared = True
+        self._cancel_pending_scan(rollback_history=False)
+        self.scanner.close()
+        self._thumbnail_request_timer.stop()
+        self._scroll_idle_timer.stop()
+        self._scan_status_timer.stop()
+        self._scan_batch_timer.stop()
         self._save_window_state()
         self.thumbnail_provider.close()
 
@@ -490,7 +767,7 @@ class BrowserWindow(QMainWindow):
             if view_state is not None:
                 self._schedule_list_view_state_restore(view_state)
             self._update_status()
-            QTimer.singleShot(0, self._request_visible_thumbnails)
+            self._schedule_thumbnail_requests()
         if "thumbnail_disk_cache_enabled" in changed:
             self.thumbnail_provider.set_disk_cache_enabled(
                 bool(changed["thumbnail_disk_cache_enabled"])
@@ -658,7 +935,7 @@ class BrowserWindow(QMainWindow):
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
         super().resizeEvent(event)
-        QTimer.singleShot(0, self._request_visible_thumbnails)
+        self._schedule_thumbnail_requests()
 
     def _build_ui(self) -> None:
         self.file_system_model = QFileSystemModel(self)
@@ -725,6 +1002,9 @@ class BrowserWindow(QMainWindow):
         self.list_view.setViewMode(QListView.ViewMode.IconMode)
         self.list_view.setResizeMode(QListView.ResizeMode.Adjust)
         self.list_view.setMovement(QListView.Movement.Static)
+        self.list_view.setVerticalScrollMode(
+            QListView.ScrollMode.ScrollPerPixel
+        )
         self.list_view.setSelectionMode(QListView.SelectionMode.ExtendedSelection)
         self.list_view.setUniformItemSizes(True)
         self.list_view.setTextElideMode(Qt.TextElideMode.ElideRight)
@@ -737,7 +1017,7 @@ class BrowserWindow(QMainWindow):
             lambda _selected, _deselected: self._update_status()
         )
         self.list_view.verticalScrollBar().valueChanged.connect(
-            lambda _value: self._request_visible_thumbnails()
+            self._on_list_scrolled
         )
         self.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_view.customContextMenuRequested.connect(self._show_context_menu)
@@ -910,8 +1190,6 @@ class BrowserWindow(QMainWindow):
     def _restore_initial_folder(self) -> None:
         raw_path = self.settings.get("last_browser_path", "")
         candidate = Path(raw_path) if isinstance(raw_path, str) and raw_path else Path.home()
-        if not candidate.is_dir():
-            candidate = Path.home()
         self.set_current_folder(candidate)
 
     def _restore_window_state(self) -> None:
@@ -943,8 +1221,6 @@ class BrowserWindow(QMainWindow):
         if self._syncing_tree or not current.isValid():
             return
         path = Path(self.file_system_model.filePath(current))
-        if not path.is_dir():
-            return
         self._pending_tree_navigation_path = path
         self._folder_change_timer.start()
 
@@ -980,23 +1256,80 @@ class BrowserWindow(QMainWindow):
     def _request_visible_thumbnails(self) -> None:
         if self._shutdown_prepared or not self.items:
             return
-        first = self.list_view.indexAt(QPoint(1, 1))
-        last = self.list_view.indexAt(
-            QPoint(
-                max(1, self.list_view.viewport().width() - 2),
-                max(1, self.list_view.viewport().height() - 2),
-            )
+        visible_range = self._visible_row_range()
+        if visible_range is None:
+            return
+        selected_rows = tuple(
+            index.row()
+            for index in self.list_view.selectionModel().selectedIndexes()
         )
-        first_row = first.row() if first.isValid() else 0
-        last_row = last.row() if last.isValid() else min(len(self.items) - 1, first_row + 29)
-        if last_row < first_row:
-            last_row = min(len(self.items) - 1, first_row + 29)
-        for row in range(max(0, first_row), min(len(self.items), last_row + 1)):
-            self.thumbnail_provider.request(
-                self.items[row],
-                self.thumbnail_size,
+        plan = build_thumbnail_request_plan(
+            row_count=len(self.items),
+            first_visible=visible_range[0],
+            last_visible=visible_range[1],
+            selected_rows=selected_rows,
+            prefetch_screens=2,
+            fast_scrolling=self._fast_scrolling,
+        )
+        for rows, priority in (
+            (plan.visible_rows, ThumbnailPriority.VISIBLE),
+            (plan.selected_rows, ThumbnailPriority.SELECTED),
+            (plan.prefetch_rows, ThumbnailPriority.PREFETCH),
+        ):
+            for row in rows:
+                self.thumbnail_provider.request(
+                    self.items[row],
+                    self.thumbnail_size,
+                    generation=self._generation,
+                    priority=priority,
+                )
+        if self._fast_scrolling:
+            keep_paths = {
+                str(self.items[row].path)
+                for row in plan.visible_rows + plan.selected_rows
+            }
+            self.thumbnail_provider.cancel_prefetch_except(
+                keep_paths,
+                size=self.thumbnail_size,
                 generation=self._generation,
             )
+
+    def _visible_row_range(self) -> tuple[int, int] | None:
+        viewport = self.list_view.viewport()
+        grid = self.list_view.gridSize()
+        return calculate_grid_visible_range(
+            row_count=len(self.items),
+            viewport_width=viewport.width(),
+            viewport_height=viewport.height(),
+            grid_width=grid.width(),
+            grid_height=grid.height(),
+            vertical_offset=self.list_view.verticalScrollBar().value(),
+        )
+
+    def _schedule_thumbnail_requests(self, delay_ms: int = 30) -> None:
+        if self._shutdown_prepared:
+            return
+        self._thumbnail_request_timer.start(max(0, int(delay_ms)))
+
+    def _on_list_scrolled(self, value: int) -> None:
+        now = monotonic()
+        delta = abs(int(value) - self._last_scroll_value)
+        elapsed = now - self._last_scroll_time
+        threshold = max(
+            self.list_view.gridSize().height(),
+            self.list_view.viewport().height() // 2,
+        )
+        self._fast_scrolling = delta >= threshold or (
+            elapsed < 0.12 and delta > 0
+        )
+        self._last_scroll_value = int(value)
+        self._last_scroll_time = now
+        self._schedule_thumbnail_requests(0)
+        self._scroll_idle_timer.start()
+
+    def _on_scroll_idle(self) -> None:
+        self._fast_scrolling = False
+        self._schedule_thumbnail_requests(0)
 
     def _on_thumbnail_ready(self, path: str, generation: int, qimage) -> None:
         if (
@@ -1011,10 +1344,34 @@ class BrowserWindow(QMainWindow):
             PageThumbnailProvider.create_icon(qimage, self.thumbnail_size),
         )
 
-    def _update_status(self, *, error: str | None = None) -> None:
+    def _update_status(
+        self,
+        *,
+        error: str | None = None,
+        force: bool = False,
+    ) -> None:
+        if self._temporary_status_message is not None and not force:
+            return
+        if force:
+            self._temporary_status_message = None
         self._status_message_token += 1
         if error:
             self.statusBar().showMessage(error)
+            return
+        pending = self._pending_scan
+        if pending is not None:
+            count = (
+                len(pending.refresh_entries)
+                if pending.refresh
+                else (
+                    len(self.items) + len(pending.buffered_entries)
+                    if pending.committed
+                    else 0
+                )
+            )
+            self.statusBar().showMessage(
+                f"{pending.path} — 読み込み中… {count}項目"
+            )
             return
         count = len(self.items)
         selected = self.item_model.item_at(self.list_view.currentIndex())
@@ -1032,11 +1389,13 @@ class BrowserWindow(QMainWindow):
     def _show_temporary_status(self, message: str, timeout_ms: int = 3000) -> None:
         self._status_message_token += 1
         token = self._status_message_token
+        self._temporary_status_message = message
         self.statusBar().showMessage(message)
 
         def restore_status() -> None:
             if token == self._status_message_token:
-                self._update_status()
+                self._temporary_status_message = None
+                self._update_status(force=True)
 
         QTimer.singleShot(timeout_ms, restore_status)
 
@@ -1052,28 +1411,9 @@ class BrowserWindow(QMainWindow):
             return
 
         target = self._absolute_browser_path(raw_path)
-        try:
-            target_stat = target.stat()
-        except FileNotFoundError:
-            self._show_temporary_status("フォルダが見つかりません")
-            self._sync_address_bar()
-            return
-        except OSError:
-            self._show_temporary_status("フォルダへアクセスできません")
-            self._sync_address_bar()
-            return
-        if stat.S_ISDIR(target_stat.st_mode):
-            self.navigate_to(target)
-            return
-        if stat.S_ISREG(target_stat.st_mode):
-            if target.suffix.lower() not in (
-                BROWSER_IMAGE_EXTENSIONS | BROWSER_ARCHIVE_EXTENSIONS
-            ):
-                self._show_temporary_status(
-                    "このファイル形式は表示できません"
-                )
-                self._sync_address_bar()
-                return
+        if target.suffix.lower() in (
+            BROWSER_IMAGE_EXTENSIONS | BROWSER_ARCHIVE_EXTENSIONS
+        ):
             location = BrowserLocation(
                 str(target.parent),
                 selected_path=str(target),
@@ -1081,25 +1421,10 @@ class BrowserWindow(QMainWindow):
             if self.navigate_to(target.parent, restore_location=location):
                 self._restore_location(location)
             return
-        self._show_temporary_status("このファイル形式は表示できません")
-        self._sync_address_bar()
+        self.navigate_to(target)
 
     def _show_path_in_browser(self, path: str | Path) -> None:
-        target = self._absolute_browser_path(path)
-        if target.exists():
-            self.select_path(target)
-            return
-        parent = target.parent
-        if parent.is_dir():
-            self.navigate_to(
-                parent,
-                restore_location=BrowserLocation(
-                    str(parent),
-                    selected_path=str(target),
-                ),
-            )
-            return
-        self._show_temporary_status("フォルダが見つかりません")
+        self.select_path(path)
 
     def _current_location(self) -> BrowserLocation:
         selected = self.item_model.item_at(self.list_view.currentIndex())
@@ -1147,7 +1472,7 @@ class BrowserWindow(QMainWindow):
             if token != self._list_view_restore_token:
                 return
             self._restore_list_view_state(state)
-            self._request_visible_thumbnails()
+            self._schedule_thumbnail_requests()
 
         QTimer.singleShot(0, restore_after_layout)
 
@@ -1269,10 +1594,7 @@ class BrowserWindow(QMainWindow):
         if not target.is_absolute():
             base = self.current_path or Path.cwd()
             target = base / target
-        try:
-            return target.resolve()
-        except OSError:
-            return target.absolute()
+        return Path(os.path.abspath(os.path.normpath(os.fspath(target))))
 
     @staticmethod
     def _same_path(first: Path | None, second: Path | None) -> bool:

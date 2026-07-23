@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import zipfile
 from pathlib import Path
+from threading import Event
 
 from PIL import Image
 from PySide6.QtGui import QImage
@@ -9,6 +10,7 @@ from PySide6.QtWidgets import QApplication
 
 from app.browser_model import BrowserItem, BrowserItemKind
 from app.thumbnail_provider import BrowserThumbnailProvider
+from app.browser_thumbnail_scheduler import ThumbnailPriority
 from app.thumbnail_disk_cache import ThumbnailDiskCache
 
 
@@ -256,4 +258,47 @@ def test_failed_thumbnail_is_not_retried_each_generation(
     qapp.processEvents()
 
     assert calls == [True]
+    provider.close()
+
+
+def test_pending_prefetch_can_be_cancelled_while_visible_work_runs(
+    tmp_path: Path,
+) -> None:
+    visible_path = tmp_path / "visible.jpg"
+    prefetch_path = tmp_path / "prefetch.jpg"
+    write_image(visible_path)
+    write_image(prefetch_path)
+    started = Event()
+    release = Event()
+
+    def loader(item: BrowserItem, _size: int) -> QImage:
+        if item.path == visible_path:
+            started.set()
+            release.wait(2)
+        return QImage(8, 8, QImage.Format.Format_RGBA8888)
+
+    provider = BrowserThumbnailProvider(loader=loader, max_workers=1)
+    generation = provider.begin_generation()
+    assert provider.request(
+        make_item(visible_path, BrowserItemKind.IMAGE),
+        100,
+        generation=generation,
+        priority=ThumbnailPriority.VISIBLE,
+    )
+    assert started.wait(1)
+    assert provider.request(
+        make_item(prefetch_path, BrowserItemKind.IMAGE),
+        100,
+        generation=generation,
+        priority=ThumbnailPriority.PREFETCH,
+    )
+
+    assert provider.cancel_prefetch_except(
+        {str(visible_path)},
+        size=100,
+        generation=generation,
+    ) == 1
+    assert provider.pending_count == 1
+    release.set()
+    assert provider.wait_for_done(2000)
     provider.close()

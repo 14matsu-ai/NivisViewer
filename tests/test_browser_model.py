@@ -3,7 +3,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from app.browser_model import BrowserItemDiscovery, BrowserItemKind
+from app.browser_model import (
+    BrowserItem,
+    BrowserItemDiscovery,
+    BrowserItemKind,
+    BrowserItemModel,
+)
 
 
 def test_discovery_lists_supported_items_in_stable_natural_order(tmp_path: Path) -> None:
@@ -111,3 +116,72 @@ def test_stat_failure_keeps_supported_item_with_safe_metadata(
     assert entry.modified_at is None
     assert entry.modified_time_ns is None
     assert entry.file_size is None
+
+
+def test_incremental_model_merges_batches_deduplicates_and_sorts(
+    tmp_path: Path,
+) -> None:
+    model = BrowserItemModel()
+    model.begin_directory_scan(generation=4)
+    first = BrowserItem(
+        "book10.jpg",
+        tmp_path / "book10.jpg",
+        BrowserItemKind.IMAGE,
+        None,
+    )
+    second = BrowserItem(
+        "book2.jpg",
+        tmp_path / "book2.jpg",
+        BrowserItemKind.IMAGE,
+        None,
+    )
+    folder = BrowserItem(
+        "z-folder",
+        tmp_path / "z-folder",
+        BrowserItemKind.FOLDER,
+        None,
+    )
+
+    assert model.append_scan_batch([first, second], generation=4) == 2
+    assert model.append_scan_batch([first, folder], generation=4) == 1
+    assert [entry.display_name for entry in model.items] == [
+        "z-folder",
+        "book2.jpg",
+        "book10.jpg",
+    ]
+    assert model.finish_directory_scan(generation=4)
+    assert len(model.items) == 3
+
+
+def test_incremental_model_ignores_old_generation_and_accepts_sort_change(
+    tmp_path: Path,
+) -> None:
+    model = BrowserItemModel()
+    model.begin_directory_scan(generation=8)
+    values = [
+        BrowserItem(
+            "small.jpg",
+            tmp_path / "small.jpg",
+            BrowserItemKind.IMAGE,
+            None,
+            file_size=1,
+        ),
+        BrowserItem(
+            "large.jpg",
+            tmp_path / "large.jpg",
+            BrowserItemKind.IMAGE,
+            None,
+            file_size=100,
+        ),
+    ]
+
+    assert model.append_scan_batch(values[:1], generation=7) == 0
+    assert model.append_scan_batch(values[:1], generation=8) == 1
+    model.configure_sort("file_size", "descending", False)
+    assert model.append_scan_batch(values[1:], generation=8) == 1
+
+    assert [entry.display_name for entry in model.items] == [
+        "large.jpg",
+        "small.jpg",
+    ]
+    assert not model.finish_directory_scan(generation=7)

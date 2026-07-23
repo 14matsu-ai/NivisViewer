@@ -28,6 +28,11 @@ def make_config(tmp_path: Path, folder: Path, *, thumbnail_size: int = 180) -> C
     return config
 
 
+def finish_scan(window: BrowserWindow, qapp: QApplication) -> None:
+    assert window.wait_for_scan()
+    qapp.processEvents()
+
+
 def test_show_folder_sidebar_and_settings_round_trip(
     tmp_path: Path,
     qapp: QApplication,
@@ -39,7 +44,7 @@ def test_show_folder_sidebar_and_settings_round_trip(
     window = BrowserWindow(config_manager=config)
 
     window.show_initial()
-    qapp.processEvents()
+    finish_scan(window, qapp)
 
     assert window.isVisible()
     assert window.current_path == folder.resolve()
@@ -80,6 +85,7 @@ def test_item_activation_passes_image_and_archive_but_folder_navigates(
         config_manager=make_config(tmp_path, folder),
         open_path_handler=lambda path, new: opened.append((path, new)),
     )
+    finish_scan(window, qapp)
 
     image_row = next(
         row for row, item in enumerate(window.items) if item.kind == BrowserItemKind.IMAGE
@@ -100,6 +106,7 @@ def test_item_activation_passes_image_and_archive_but_folder_navigates(
 
     window.set_current_folder(folder)
     window.open_item(window.item_model.index(folder_row, 0))
+    finish_scan(window, qapp)
     assert window.current_path == child.resolve()
     assert len(opened) == 2
     window.close()
@@ -118,8 +125,10 @@ def test_controller_selection_sync_does_not_reopen_item(
         config_manager=make_config(tmp_path, folder),
         open_path_handler=lambda path, _new: opened.append(path),
     )
+    finish_scan(window, qapp)
 
     window.select_path(image)
+    finish_scan(window, qapp)
 
     assert window.list_view.currentIndex().isValid()
     assert window.item_model.item_at(window.list_view.currentIndex()).path == image.absolute()
@@ -144,6 +153,7 @@ def test_sort_controls_apply_without_opening_viewer_or_changing_history(
         config_manager=make_config(tmp_path, folder),
         open_path_handler=lambda path, _new: opened.append(path),
     )
+    finish_scan(window, qapp)
     initial_history_length = len(window.navigation_history)
     initial_generation = window.thumbnail_provider.generation
 
@@ -177,6 +187,7 @@ def test_sort_and_density_preserve_multiple_selection_and_thumbnail_cache(
     for index in range(1, 13):
         write_image(folder / f"book{index}.jpg")
     window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    finish_scan(window, qapp)
     selection_model = window.list_view.selectionModel()
     selected_names = {"book2.jpg", "book10.jpg"}
     for name in selected_names:
@@ -225,7 +236,9 @@ def test_thumbnail_size_change_preserves_selection_and_uses_new_generation(
     image = folder / "選択.jpg"
     write_image(image)
     window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    finish_scan(window, qapp)
     window.select_path(image)
+    finish_scan(window, qapp)
     initial_generation = window.thumbnail_provider.generation
 
     window.config.apply({"thumbnail_size": 260})
@@ -252,6 +265,7 @@ def test_display_density_changes_layout_without_changing_thumbnail_size(
     window = BrowserWindow(
         config_manager=make_config(tmp_path, folder, thumbnail_size=180)
     )
+    finish_scan(window, qapp)
 
     expectations = {
         "compact": QSize(200, 212),
@@ -278,6 +292,7 @@ def test_folders_first_control_keeps_folder_group_at_front(
     write_image(folder / "a.jpg")
     (folder / "z-folder").mkdir()
     window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    finish_scan(window, qapp)
 
     assert [entry.display_name for entry in window.items] == [
         "z-folder",
@@ -305,7 +320,7 @@ def test_sort_keeps_visible_anchor_item_on_screen(
     window = BrowserWindow(config_manager=make_config(tmp_path, folder))
     window.resize(640, 420)
     window.show()
-    qapp.processEvents()
+    finish_scan(window, qapp)
     anchor_row = window.item_model.row_for_path(folder / "book40.jpg")
     anchor = window.item_model.index(anchor_row, 0)
     window.list_view.scrollTo(anchor, QListView.ScrollHint.PositionAtCenter)
@@ -344,6 +359,7 @@ def test_metadata_update_does_not_change_filesystem_mtime_sort(
         config_manager=make_config(tmp_path, folder),
         metadata_store=store,
     )
+    finish_scan(window, qapp)
     window.config.apply(
         {
             "browser_sort_key": "modified_time",
@@ -376,6 +392,7 @@ def test_sidebar_has_folder_bookmark_and_history_tabs(
         config_manager=make_config(tmp_path, folder),
         metadata_store=store,
     )
+    finish_scan(window, qapp)
 
     assert [window.sidebar.tabText(index) for index in range(window.sidebar.count())] == [
         "フォルダ",
@@ -403,6 +420,7 @@ def test_bookmark_model_updates_and_bookmarks_can_be_opened_or_removed(
         metadata_store=store,
         open_path_handler=lambda path, new: opened.append((path, new)),
     )
+    finish_scan(window, qapp)
 
     window.add_browser_bookmark(book, item_type="book_folder", label="本")
     window.add_browser_bookmark(archive, item_type="archive")
@@ -435,9 +453,11 @@ def test_folder_bookmark_navigates_browser_without_opening_viewer(
         metadata_store=store,
         open_path_handler=lambda path, _new: opened.append(path),
     )
+    finish_scan(window, qapp)
     window.add_browser_bookmark(target, item_type="folder")
 
     window.open_bookmark(window.bookmark_model.index(0, 0))
+    finish_scan(window, qapp)
 
     assert window.current_path == target.absolute()
     assert opened == []
@@ -457,6 +477,7 @@ def test_current_folder_can_be_added_to_bookmarks(
         config_manager=make_config(tmp_path, folder),
         metadata_store=store,
     )
+    finish_scan(window, qapp)
 
     window.add_current_folder_bookmark()
 
@@ -497,6 +518,7 @@ def test_history_is_recent_first_opens_items_and_selection_does_not(
         metadata_store=store,
         open_path_handler=lambda path, new: opened.append((path, new)),
     )
+    finish_scan(window, qapp)
 
     assert [Path(entry.path) for entry in window.history_model.entries] == [
         second.absolute(),
@@ -537,6 +559,7 @@ def test_missing_metadata_items_are_nonmodal_and_removable(
         metadata_store=store,
         open_path_handler=lambda path, _new: opened.append(path),
     )
+    finish_scan(window, qapp)
 
     window.open_bookmark(window.bookmark_model.index(0, 0))
     assert window.statusBar().currentMessage() == "ブックマーク先が見つかりません"
@@ -571,6 +594,7 @@ def test_clear_history_uses_confirmation_path(
         config_manager=make_config(tmp_path, folder),
         metadata_store=store,
     )
+    finish_scan(window, qapp)
     confirmations: list[bool] = []
 
     def answer_yes(*_args, **_kwargs):
