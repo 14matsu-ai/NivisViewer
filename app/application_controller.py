@@ -7,12 +7,14 @@ from typing import Callable
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication, QWidget
 
+from .browser_window import BrowserWindow
 from .config_manager import ConfigManager
 from .image_source import ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS
 from .viewer_window import ViewerWindow
 
 
 WindowFactory = Callable[..., ViewerWindow]
+BrowserWindowFactory = Callable[..., BrowserWindow]
 VALID_OPEN_BEHAVIORS = {"reuse_active", "always_new", "reuse_or_create"}
 
 
@@ -20,6 +22,8 @@ class ApplicationController(QObject):
     exit_requested = Signal()
     viewer_created = Signal(object)
     viewer_closed = Signal(object)
+    browser_created = Signal(object)
+    browser_closed = Signal(object)
 
     def __init__(
         self,
@@ -28,17 +32,20 @@ class ApplicationController(QObject):
         *,
         config_manager: ConfigManager | None = None,
         window_factory: WindowFactory = ViewerWindow,
+        browser_window_factory: BrowserWindowFactory = BrowserWindow,
     ) -> None:
         super().__init__(parent if parent is not None else application)
         self.application = application
         self.config = config_manager or ConfigManager()
         self.settings = self.config.load()
         self._window_factory = window_factory
+        self._browser_window_factory = browser_window_factory
         self._viewer_windows: list[ViewerWindow] = []
         self._active_viewer: ViewerWindow | None = None
+        self._browser_window: BrowserWindow | None = None
         self._shutdown = False
         self._quit_requested = False
-        self.quit_when_last_viewer_closed = True
+        self.quit_when_last_viewer_closed = False
         self.application.setQuitOnLastWindowClosed(False)
         self.application.aboutToQuit.connect(self.shutdown)
 
@@ -46,15 +53,11 @@ class ApplicationController(QObject):
     def viewer_windows(self) -> tuple[ViewerWindow, ...]:
         return tuple(self._viewer_windows)
 
-    def start(self, initial_path: str | None = None) -> ViewerWindow:
+    def start(self, initial_path: str | None = None) -> BrowserWindow:
         self._shutdown = False
-        window = self.get_active_viewer() or (
-            self._viewer_windows[-1] if self._viewer_windows else self.create_viewer_window()
-        )
-        window.show_initial()
-        if initial_path:
-            self._open_path_in_viewer(window, initial_path)
-        else:
+        browser = self.show_browser_window()
+        path_to_open = initial_path
+        if not path_to_open:
             last_path = self.settings.get("last_open_path", "")
             if (
                 bool(self.settings.get("reopen_last_on_start", False))
@@ -62,8 +65,42 @@ class ApplicationController(QObject):
                 and last_path
                 and Path(last_path).exists()
             ):
-                self._open_path_in_viewer(window, last_path)
+                path_to_open = last_path
+        if path_to_open:
+            self.select_path_in_browser(path_to_open)
+            self.open_path(path_to_open)
+        return browser
+
+    def create_browser_window(self) -> BrowserWindow:
+        existing = self.get_browser_window()
+        if existing is not None:
+            return existing
+        window = self._browser_window_factory(
+            config_manager=self.config,
+            open_path_handler=self._handle_browser_open_request,
+        )
+        self._browser_window = window
+        self._quit_requested = False
+        window.closing.connect(self._on_browser_closing)
+        window.destroyed.connect(
+            lambda _object=None, window_id=id(window): self._on_browser_destroyed(window_id)
+        )
+        self.browser_created.emit(window)
         return window
+
+    def get_browser_window(self) -> BrowserWindow | None:
+        return self._browser_window
+
+    def show_browser_window(self) -> BrowserWindow:
+        window = self.get_browser_window() or self.create_browser_window()
+        if not window.isVisible():
+            window.show_initial()
+        return window
+
+    def select_path_in_browser(self, path: str | Path) -> None:
+        browser = self.get_browser_window()
+        if browser is not None:
+            browser.select_path(path)
 
     def create_viewer_window(self) -> ViewerWindow:
         window = self._window_factory(
@@ -76,6 +113,7 @@ class ApplicationController(QObject):
         self._quit_requested = False
         window.activated.connect(self._on_viewer_activated)
         window.closing.connect(self._on_viewer_closing)
+        window.book_changed.connect(self._on_viewer_book_changed)
         window.destroyed.connect(
             lambda _object=None, window_id=id(window): self._on_viewer_destroyed(window_id)
         )
@@ -154,6 +192,9 @@ class ApplicationController(QObject):
             self._save_standard_window_state(active)
         for window in tuple(self._viewer_windows):
             window.prepare_shutdown()
+        browser = self.get_browser_window()
+        if browser is not None:
+            browser.prepare_shutdown()
         self.config.save()
 
     def _select_viewer_for_open(self, open_in_new_window: bool | None) -> ViewerWindow:
@@ -207,9 +248,22 @@ class ApplicationController(QObject):
             return source_window
         return self.open_path(path, open_in_new_window=False)
 
+    def _handle_browser_open_request(
+        self,
+        path: str,
+        open_in_new_window: bool,
+    ) -> ViewerWindow:
+        return self.open_path(path, open_in_new_window=True if open_in_new_window else None)
+
     def _on_viewer_activated(self, window: object) -> None:
         if isinstance(window, ViewerWindow) and window in self._viewer_windows:
             self._active_viewer = window
+            if window.book_session.current_path is not None:
+                self.select_path_in_browser(window.book_session.current_path)
+
+    def _on_viewer_book_changed(self, window: object, path: str) -> None:
+        if window is self.get_active_viewer():
+            self.select_path_in_browser(path)
 
     def _on_viewer_closing(self, window: object) -> None:
         if isinstance(window, ViewerWindow):
@@ -220,6 +274,15 @@ class ApplicationController(QObject):
             if id(window) == window_id:
                 self._unregister_viewer(window, save_window_state=False)
                 return
+
+    def _on_browser_closing(self, window: object) -> None:
+        if isinstance(window, BrowserWindow) and window is self._browser_window:
+            self._unregister_browser(window)
+
+    def _on_browser_destroyed(self, window_id: int) -> None:
+        browser = self._browser_window
+        if browser is not None and id(browser) == window_id:
+            self._unregister_browser(browser)
 
     def _unregister_viewer(
         self,
@@ -234,9 +297,25 @@ class ApplicationController(QObject):
         self._viewer_windows.remove(window)
         if self._active_viewer is window:
             self._active_viewer = self._viewer_windows[-1] if self._viewer_windows else None
+            if (
+                self._active_viewer is not None
+                and self._active_viewer.book_session.current_path is not None
+            ):
+                self.select_path_in_browser(self._active_viewer.book_session.current_path)
         self.viewer_closed.emit(window)
         self.config.save()
-        if not self._viewer_windows and self.quit_when_last_viewer_closed:
+        self._evaluate_application_exit()
+
+    def _unregister_browser(self, window: BrowserWindow) -> None:
+        if window is not self._browser_window:
+            return
+        self._browser_window = None
+        self.browser_closed.emit(window)
+        self.config.save()
+        self._evaluate_application_exit()
+
+    def _evaluate_application_exit(self) -> None:
+        if self._browser_window is None and not self._viewer_windows:
             self._request_application_exit()
 
     def _request_application_exit(self) -> None:

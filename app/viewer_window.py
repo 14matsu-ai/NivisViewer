@@ -43,6 +43,7 @@ from .viewer_widget import ViewerImage, ViewerWidget
 class ViewerWindow(QMainWindow):
     activated = Signal(object)
     closing = Signal(object)
+    book_changed = Signal(object, str)
 
     def __init__(
         self,
@@ -605,6 +606,7 @@ class ViewerWindow(QMainWindow):
         self._clear_page_history()
         self._rebuild_page_list()
         self._refresh_view()
+        self.book_changed.emit(self, opened_path)
         return True
 
     def _restore_reading_position(self, book_key: str) -> None:
