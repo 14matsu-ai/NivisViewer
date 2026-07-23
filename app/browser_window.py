@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 from typing import Callable
 
@@ -15,9 +17,19 @@ from PySide6.QtCore import (
     QUrl,
     Signal,
 )
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QResizeEvent
+from PySide6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QDesktopServices,
+    QKeyEvent,
+    QKeySequence,
+    QMouseEvent,
+    QResizeEvent,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QFileSystemModel,
+    QLineEdit,
     QListView,
     QMainWindow,
     QMenu,
@@ -25,16 +37,20 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStyle,
     QTabWidget,
+    QToolBar,
     QTreeView,
     QWidget,
 )
 
 from .browser_model import (
+    BROWSER_ARCHIVE_EXTENSIONS,
+    BROWSER_IMAGE_EXTENSIONS,
     BrowserItem,
     BrowserItemDiscovery,
     BrowserItemKind,
     BrowserItemModel,
 )
+from .browser_navigation import BrowserLocation, BrowserNavigationHistory
 from .bookmark_model import BookmarkModel
 from .config_manager import ConfigManager
 from .history_model import HistoryModel
@@ -86,9 +102,14 @@ class BrowserWindow(QMainWindow):
         self.thumbnail_provider = thumbnail_provider
         self.thumbnail_provider.thumbnail_ready.connect(self._on_thumbnail_ready)
         self.current_path: Path | None = None
+        self.navigation_history = BrowserNavigationHistory()
         self._generation = self.thumbnail_provider.generation
         self._syncing_tree = False
-        self._pending_tree_path: Path | None = None
+        self._pending_tree_navigation_path: Path | None = None
+        self._pending_tree_sync_path: Path | None = None
+        self._location_restore_token = 0
+        self._status_message_token = 0
+        self._pressed_extra_buttons: set[Qt.MouseButton] = set()
         self._shutdown_prepared = False
         self._sidebar_width = self._safe_sidebar_width(
             self.settings.get("browser_sidebar_width", 280)
@@ -114,25 +135,72 @@ class BrowserWindow(QMainWindow):
     def show_initial(self) -> None:
         self.show()
 
-    def set_current_folder(self, folder: str | Path) -> bool:
-        target = Path(folder).expanduser()
-        if not target.is_dir():
-            self.statusBar().showMessage(f"フォルダが見つかりません: {target}")
+    def navigate_to(
+        self,
+        path: str | Path,
+        *,
+        record_history: bool = True,
+        restore_location: BrowserLocation | None = None,
+        force_reload: bool = False,
+        capture_current: bool = True,
+    ) -> bool:
+        target = self._absolute_browser_path(path)
+        try:
+            target_stat = target.stat()
+        except FileNotFoundError:
+            self._show_temporary_status("フォルダが見つかりません")
+            self._sync_address_bar()
+            return False
+        except OSError:
+            self._show_temporary_status("フォルダへアクセスできません")
+            self._sync_address_bar()
+            return False
+        if not stat.S_ISDIR(target_stat.st_mode):
+            self._show_temporary_status("フォルダが見つかりません")
+            self._sync_address_bar()
             return False
 
+        same_path = self._same_path(self.current_path, target)
+        if same_path and not force_reload:
+            if restore_location is not None:
+                self._schedule_location_restore(restore_location)
+            self._sync_address_bar()
+            self._update_navigation_actions()
+            return True
+
+        if capture_current:
+            self._update_current_navigation_state()
         result = self.discovery.discover(target)
+        if result.error is not None:
+            self._show_temporary_status("フォルダへアクセスできません")
+            self._sync_address_bar()
+            return False
+
         self.current_path = result.folder
         self.config.set("last_browser_path", str(result.folder))
         self._generation = self.thumbnail_provider.begin_generation()
         self.item_model.set_items(result.items)
         self.list_view.clearSelection()
+        self.list_view.setCurrentIndex(QModelIndex())
+        if record_history:
+            self.navigation_history.visit(BrowserLocation(str(result.folder)))
+        self._folder_change_timer.stop()
+        self._pending_tree_navigation_path = None
         self._sync_tree_to_path(result.folder)
-        self._update_status(error=result.error)
+        self._sync_address_bar()
+        self._update_navigation_actions()
+        self._update_status()
+        self._schedule_location_restore(
+            restore_location or BrowserLocation(str(result.folder))
+        )
         QTimer.singleShot(0, self._request_visible_thumbnails)
-        return result.error is None
+        return True
+
+    def set_current_folder(self, folder: str | Path) -> bool:
+        return self.navigate_to(folder)
 
     def select_path(self, path: str | Path) -> None:
-        target = Path(path).expanduser()
+        target = self._absolute_browser_path(path)
         if target.is_file():
             folder = target.parent
             selected = target
@@ -141,26 +209,92 @@ class BrowserWindow(QMainWindow):
             folder = parent if parent != target else target
             selected = target
         else:
-            self.statusBar().showMessage(f"項目が見つかりません: {target}")
+            self.statusBar().showMessage("項目が見つかりません", 3000)
             return
 
-        if not self.set_current_folder(folder):
+        location = BrowserLocation(str(folder), selected_path=str(selected))
+        if not self.navigate_to(folder, restore_location=location):
             return
-        row = self.item_model.row_for_path(selected)
-        if row < 0 and target.is_dir() and self.set_current_folder(target):
-            return
-        if row >= 0:
-            index = self.item_model.index(row, 0)
-            self.list_view.setCurrentIndex(index)
-            self.list_view.scrollTo(index, QListView.ScrollHint.PositionAtCenter)
-            self._update_status()
+        self._restore_location(location)
+
+    def go_back(self) -> bool:
+        self._update_current_navigation_state()
+        location = self.navigation_history.go_back()
+        if location is None:
+            self._update_navigation_actions()
+            return False
+        if self.navigate_to(
+            location.path,
+            record_history=False,
+            restore_location=location,
+            capture_current=False,
+        ):
+            return True
+        self.navigation_history.go_forward()
+        self._update_navigation_actions()
+        return False
+
+    def go_forward(self) -> bool:
+        self._update_current_navigation_state()
+        location = self.navigation_history.go_forward()
+        if location is None:
+            self._update_navigation_actions()
+            return False
+        if self.navigate_to(
+            location.path,
+            record_history=False,
+            restore_location=location,
+            capture_current=False,
+        ):
+            return True
+        self.navigation_history.go_back()
+        self._update_navigation_actions()
+        return False
+
+    def go_up(self) -> bool:
+        if self.current_path is None:
+            return False
+        parent = self.current_path.parent
+        if self._same_path(parent, self.current_path):
+            self._update_navigation_actions()
+            return False
+        return self.navigate_to(
+            parent,
+            restore_location=BrowserLocation(
+                str(parent),
+                selected_path=str(self.current_path),
+            ),
+        )
+
+    def refresh_current_folder(self) -> bool:
+        if self.current_path is None:
+            return False
+        location = self._current_location()
+        if not self.navigate_to(
+            self.current_path,
+            record_history=False,
+            restore_location=location,
+            force_reload=True,
+        ):
+            return False
+        self._show_temporary_status("フォルダを更新しました")
+        return True
+
+    def focus_address_bar(self) -> None:
+        self.address_bar.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.address_bar.selectAll()
+
+    def show_history_location(self, index: QModelIndex) -> None:
+        entry = self.history_model.entry_at(index)
+        if entry is not None:
+            self._show_path_in_browser(entry.path)
 
     def open_item(self, index: QModelIndex, *, open_in_new_window: bool = False) -> None:
         item = self.item_model.item_at(index)
         if item is None:
             return
         if item.kind == BrowserItemKind.FOLDER:
-            self.set_current_folder(item.path)
+            self.navigate_to(item.path)
             return
         if self._open_path_handler is not None:
             self._open_path_handler(str(item.path), open_in_new_window)
@@ -201,7 +335,7 @@ class BrowserWindow(QMainWindow):
             self.statusBar().showMessage("ブックマーク先が見つかりません", 3000)
             return
         if entry.item_type == "folder":
-            self.set_current_folder(entry.path)
+            self.navigate_to(entry.path)
             return
         if self._open_path_handler is not None:
             self._open_path_handler(entry.path, open_in_new_window)
@@ -301,6 +435,73 @@ class BrowserWindow(QMainWindow):
             self.activated.emit(self)
         return handled
 
+    def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
+        if watched is self.address_bar and event.type() == QEvent.Type.KeyPress:
+            key_event = event
+            if isinstance(key_event, QKeyEvent) and key_event.key() == Qt.Key.Key_Escape:
+                self._sync_address_bar()
+                self.address_bar.selectAll()
+                return True
+        if (
+            watched is self.address_bar
+            and event.type()
+            in (
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.MouseButtonRelease,
+            )
+            and isinstance(event, QMouseEvent)
+            and event.button()
+            in (
+                Qt.MouseButton.BackButton,
+                Qt.MouseButton.ForwardButton,
+            )
+        ):
+            return True
+
+        if watched is not self.address_bar and event.type() in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonRelease,
+        ):
+            mouse_event = event
+            if isinstance(mouse_event, QMouseEvent):
+                button = mouse_event.button()
+                if button in (
+                    Qt.MouseButton.BackButton,
+                    Qt.MouseButton.ForwardButton,
+                ):
+                    if event.type() == QEvent.Type.MouseButtonPress:
+                        if button not in self._pressed_extra_buttons:
+                            self._pressed_extra_buttons.add(button)
+                            if button == Qt.MouseButton.BackButton:
+                                self.go_back()
+                            else:
+                                self.go_forward()
+                    else:
+                        self._pressed_extra_buttons.discard(button)
+                    return True
+
+        if (
+            watched is not self.address_bar
+            and event.type() == QEvent.Type.KeyPress
+            and isinstance(event, QKeyEvent)
+            and event.key() == Qt.Key.Key_Backspace
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+        ):
+            self.go_back()
+            return True
+        return super().eventFilter(watched, event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
+        if (
+            event.key() == Qt.Key.Key_Backspace
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and not self.address_bar.hasFocus()
+        ):
+            self.go_back()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
         self.prepare_shutdown()
         self.closing.emit(self)
@@ -393,6 +594,86 @@ class BrowserWindow(QMainWindow):
         self.splitter.setCollapsible(0, True)
         self.setCentralWidget(self.splitter)
 
+        self.navigation_toolbar = QToolBar("ナビゲーション", self)
+        self.navigation_toolbar.setObjectName("browser_navigation_toolbar")
+        self.navigation_toolbar.setMovable(False)
+        self.navigation_toolbar.setIconSize(QSize(24, 24))
+        self.navigation_toolbar.setMinimumHeight(36)
+
+        self.back_action = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_ArrowBack),
+            "戻る",
+            self,
+        )
+        self.back_action.setToolTip("前に表示していたフォルダへ戻る (Alt+Left)")
+        self.back_action.setShortcuts(
+            [QKeySequence("Alt+Left")]
+        )
+        self.back_action.triggered.connect(self.go_back)
+        self.navigation_toolbar.addAction(self.back_action)
+
+        self.forward_action = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_ArrowForward),
+            "進む",
+            self,
+        )
+        self.forward_action.setToolTip("戻る前のフォルダへ進む (Alt+Right)")
+        self.forward_action.setShortcut(QKeySequence("Alt+Right"))
+        self.forward_action.triggered.connect(self.go_forward)
+        self.navigation_toolbar.addAction(self.forward_action)
+
+        self.up_action = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_ArrowUp),
+            "上へ",
+            self,
+        )
+        self.up_action.setToolTip("ひとつ上の階層へ移動 (Alt+Up)")
+        self.up_action.setShortcut(QKeySequence("Alt+Up"))
+        self.up_action.triggered.connect(self.go_up)
+        self.navigation_toolbar.addAction(self.up_action)
+
+        self.refresh_action = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload),
+            "更新",
+            self,
+        )
+        self.refresh_action.setToolTip("現在のフォルダを更新 (F5)")
+        self.refresh_action.setShortcut(QKeySequence("F5"))
+        self.refresh_action.triggered.connect(self.refresh_current_folder)
+        self.navigation_toolbar.addAction(self.refresh_action)
+        self.navigation_toolbar.addSeparator()
+
+        self.address_bar = QLineEdit(self)
+        self.address_bar.setObjectName("browser_address_bar")
+        self.address_bar.setClearButtonEnabled(True)
+        self.address_bar.setPlaceholderText("フォルダ、画像、ZIP/CBZのパス")
+        self.address_bar.setToolTip(
+            "パスを入力してEnterで移動。相対パスは現在のフォルダ基準です。"
+        )
+        self.address_bar.returnPressed.connect(self._navigate_from_address_bar)
+        self.address_bar.installEventFilter(self)
+        self.navigation_toolbar.addWidget(self.address_bar)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.navigation_toolbar)
+
+        self.focus_address_shortcut = QShortcut(QKeySequence("Ctrl+L"), self)
+        self.focus_address_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.focus_address_shortcut.activated.connect(self.focus_address_bar)
+
+        for target in (
+            self,
+            self.list_view,
+            self.list_view.viewport(),
+            self.folder_tree,
+            self.folder_tree.viewport(),
+            self.bookmark_view,
+            self.bookmark_view.viewport(),
+            self.history_view,
+            self.history_view.viewport(),
+            self.sidebar,
+            self.splitter,
+        ):
+            target.installEventFilter(self)
+
         view_menu = self.menuBar().addMenu("表示")
         self.sidebar_action = QAction("サイドバーを表示", self)
         self.sidebar_action.setCheckable(True)
@@ -422,6 +703,7 @@ class BrowserWindow(QMainWindow):
         self.statusBar().showMessage("フォルダを選択してください。")
         self.splitter.setSizes([self._sidebar_width, max(1, self.width() - self._sidebar_width)])
         self.set_sidebar_visible(self.sidebar_action.isChecked())
+        self._update_navigation_actions()
 
     def _restore_initial_folder(self) -> None:
         raw_path = self.settings.get("last_browser_path", "")
@@ -461,22 +743,22 @@ class BrowserWindow(QMainWindow):
         path = Path(self.file_system_model.filePath(current))
         if not path.is_dir():
             return
-        self._pending_tree_path = path
+        self._pending_tree_navigation_path = path
         self._folder_change_timer.start()
 
     def _apply_pending_tree_path(self) -> None:
-        path = self._pending_tree_path
-        self._pending_tree_path = None
+        path = self._pending_tree_navigation_path
+        self._pending_tree_navigation_path = None
         if path is not None:
-            self.set_current_folder(path)
+            self.navigate_to(path)
 
     def _sync_tree_to_path(self, path: Path) -> None:
         index = self.file_system_model.index(str(path))
         if not index.isValid():
-            self._pending_tree_path = path
+            self._pending_tree_sync_path = path
             return
-        if self._pending_tree_path == path:
-            self._pending_tree_path = None
+        if self._pending_tree_sync_path == path:
+            self._pending_tree_sync_path = None
         self._syncing_tree = True
         try:
             self.folder_tree.setCurrentIndex(index)
@@ -489,7 +771,7 @@ class BrowserWindow(QMainWindow):
             self._syncing_tree = False
 
     def _on_tree_directory_loaded(self, _path: str) -> None:
-        pending = self._pending_tree_path
+        pending = self._pending_tree_sync_path
         if pending is not None:
             self._sync_tree_to_path(pending)
 
@@ -528,6 +810,7 @@ class BrowserWindow(QMainWindow):
         )
 
     def _update_status(self, *, error: str | None = None) -> None:
+        self._status_message_token += 1
         if error:
             self.statusBar().showMessage(error)
             return
@@ -538,6 +821,187 @@ class BrowserWindow(QMainWindow):
         if selected is not None:
             message += f" — 選択: {selected.display_name}"
         self.statusBar().showMessage(message)
+
+    def _show_temporary_status(self, message: str, timeout_ms: int = 3000) -> None:
+        self._status_message_token += 1
+        token = self._status_message_token
+        self.statusBar().showMessage(message)
+
+        def restore_status() -> None:
+            if token == self._status_message_token:
+                self._update_status()
+
+        QTimer.singleShot(timeout_ms, restore_status)
+
+    def _navigate_from_address_bar(self) -> None:
+        raw_path = self.address_bar.text().strip()
+        if len(raw_path) >= 2 and raw_path[0] == raw_path[-1] and raw_path[0] in {
+            '"',
+            "'",
+        }:
+            raw_path = raw_path[1:-1].strip()
+        if not raw_path:
+            self._sync_address_bar()
+            return
+
+        target = self._absolute_browser_path(raw_path)
+        try:
+            target_stat = target.stat()
+        except FileNotFoundError:
+            self._show_temporary_status("フォルダが見つかりません")
+            self._sync_address_bar()
+            return
+        except OSError:
+            self._show_temporary_status("フォルダへアクセスできません")
+            self._sync_address_bar()
+            return
+        if stat.S_ISDIR(target_stat.st_mode):
+            self.navigate_to(target)
+            return
+        if stat.S_ISREG(target_stat.st_mode):
+            if target.suffix.lower() not in (
+                BROWSER_IMAGE_EXTENSIONS | BROWSER_ARCHIVE_EXTENSIONS
+            ):
+                self._show_temporary_status(
+                    "このファイル形式は表示できません"
+                )
+                self._sync_address_bar()
+                return
+            location = BrowserLocation(
+                str(target.parent),
+                selected_path=str(target),
+            )
+            if self.navigate_to(target.parent, restore_location=location):
+                self._restore_location(location)
+            return
+        self._show_temporary_status("このファイル形式は表示できません")
+        self._sync_address_bar()
+
+    def _show_path_in_browser(self, path: str | Path) -> None:
+        target = self._absolute_browser_path(path)
+        if target.exists():
+            self.select_path(target)
+            return
+        parent = target.parent
+        if parent.is_dir():
+            self.navigate_to(
+                parent,
+                restore_location=BrowserLocation(
+                    str(parent),
+                    selected_path=str(target),
+                ),
+            )
+            return
+        self._show_temporary_status("フォルダが見つかりません")
+
+    def _current_location(self) -> BrowserLocation:
+        selected = self.item_model.item_at(self.list_view.currentIndex())
+        return BrowserLocation(
+            path=str(self.current_path or ""),
+            selected_path=str(selected.path) if selected is not None else None,
+            vertical_scroll=self.list_view.verticalScrollBar().value(),
+            horizontal_scroll=self.list_view.horizontalScrollBar().value(),
+        )
+
+    def _update_current_navigation_state(self) -> None:
+        if self.current_path is None:
+            return
+        location = self._current_location()
+        self.navigation_history.update_current_view_state(
+            selected_path=location.selected_path,
+            vertical_scroll=location.vertical_scroll,
+            horizontal_scroll=location.horizontal_scroll,
+        )
+
+    def _schedule_location_restore(self, location: BrowserLocation) -> None:
+        self._location_restore_token += 1
+        token = self._location_restore_token
+        self._restore_location(location)
+
+        def restore_after_layout() -> None:
+            if token != self._location_restore_token:
+                return
+            self._restore_location(location, update_status=False)
+
+        QTimer.singleShot(0, restore_after_layout)
+
+    def _restore_location(
+        self,
+        location: BrowserLocation,
+        *,
+        update_status: bool = True,
+    ) -> None:
+        if not self._same_path(self.current_path, Path(location.path)):
+            return
+        index = QModelIndex()
+        if location.selected_path:
+            row = self.item_model.row_for_path(location.selected_path)
+            if row >= 0:
+                index = self.item_model.index(row, 0)
+        if index.isValid():
+            self.list_view.setCurrentIndex(index)
+            self.list_view.scrollTo(index, QListView.ScrollHint.EnsureVisible)
+        else:
+            self.list_view.clearSelection()
+            self.list_view.setCurrentIndex(QModelIndex())
+
+        vertical = self.list_view.verticalScrollBar()
+        horizontal = self.list_view.horizontalScrollBar()
+        if not index.isValid() or location.vertical_scroll > 0:
+            vertical.setValue(
+                max(
+                    vertical.minimum(),
+                    min(location.vertical_scroll, vertical.maximum()),
+                )
+            )
+        if not index.isValid() or location.horizontal_scroll > 0:
+            horizontal.setValue(
+                max(
+                    horizontal.minimum(),
+                    min(location.horizontal_scroll, horizontal.maximum()),
+                )
+            )
+        if update_status:
+            self._update_status()
+
+    def _sync_address_bar(self) -> None:
+        self.address_bar.setText(
+            str(self.current_path) if self.current_path is not None else ""
+        )
+
+    def _update_navigation_actions(self) -> None:
+        self.back_action.setEnabled(self.navigation_history.can_go_back())
+        self.forward_action.setEnabled(self.navigation_history.can_go_forward())
+        can_go_up = False
+        if self.current_path is not None:
+            can_go_up = not self._same_path(
+                self.current_path,
+                self.current_path.parent,
+            )
+        self.up_action.setEnabled(can_go_up)
+        self.refresh_action.setEnabled(self.current_path is not None)
+
+    def _absolute_browser_path(self, path: str | Path) -> Path:
+        target = Path(path).expanduser()
+        if not target.is_absolute():
+            base = self.current_path or Path.cwd()
+            target = base / target
+        try:
+            return target.resolve()
+        except OSError:
+            return target.absolute()
+
+    @staticmethod
+    def _same_path(first: Path | None, second: Path | None) -> bool:
+        if first is None or second is None:
+            return first is second
+        first_key = os.path.normcase(
+            os.path.abspath(os.path.normpath(os.fspath(first)))
+        ).casefold()
+        second_key = os.path.normcase(
+            os.path.abspath(os.path.normpath(os.fspath(second)))
+        ).casefold()
+        return first_key == second_key
 
     def _show_context_menu(self, position: QPoint) -> None:
         index = self.list_view.indexAt(position)
@@ -605,6 +1069,7 @@ class BrowserWindow(QMainWindow):
         menu = QMenu(self)
         open_action = menu.addAction("開く")
         new_action = menu.addAction("新しいViewerWindowで開く")
+        location_action = menu.addAction("親フォルダを表示")
         menu.addSeparator()
         remove_action = menu.addAction("この履歴を削除")
         clear_action = menu.addAction("閲覧履歴をすべて消去...")
@@ -613,6 +1078,8 @@ class BrowserWindow(QMainWindow):
             self.open_history(index)
         elif selected == new_action:
             self.open_history(index, open_in_new_window=True)
+        elif selected == location_action:
+            self.show_history_location(index)
         elif selected == remove_action:
             self.remove_history_entry(index)
         elif selected == clear_action:

@@ -324,6 +324,36 @@ def test_active_viewer_book_changes_sync_browser_but_inactive_does_not(
     close_controller(controller, qapp)
 
 
+def test_viewer_sync_same_parent_does_not_add_browser_history_but_new_parent_does(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    shelf = tmp_path / "shelf"
+    first = shelf / "first" / "1.jpg"
+    same_parent = shelf / "first" / "2.jpg"
+    different = shelf / "second" / "1.jpg"
+    write_image(first)
+    write_image(same_parent)
+    write_image(different)
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.set("last_browser_path", str(shelf))
+    config.save()
+    controller = ApplicationController(qapp, config_manager=ConfigManager(config.path))
+    browser = controller.create_browser_window()
+    viewer = controller.open_path(first)
+    after_first = len(browser.navigation_history)
+
+    assert viewer.open_path(same_parent)
+    assert len(browser.navigation_history) == after_first
+    assert browser.current_path == first.parent.absolute()
+
+    assert viewer.open_path(different)
+    assert len(browser.navigation_history) == after_first + 1
+    assert browser.current_path == different.parent.absolute()
+    close_controller(controller, qapp)
+
+
 def test_bring_to_front_does_not_enable_always_on_top(
     tmp_path: Path,
     qapp: QApplication,

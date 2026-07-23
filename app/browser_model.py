@@ -10,9 +10,11 @@ from natsort import natsorted
 from PySide6.QtCore import QAbstractListModel, QModelIndex, Qt
 from PySide6.QtGui import QIcon
 
+from .image_source import ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS
 
-BROWSER_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
-BROWSER_ARCHIVE_EXTENSIONS = {".zip", ".cbz"}
+
+BROWSER_IMAGE_EXTENSIONS = set(SUPPORTED_EXTENSIONS)
+BROWSER_ARCHIVE_EXTENSIONS = set(ARCHIVE_EXTENSIONS)
 
 
 class BrowserItemKind(str, Enum):
