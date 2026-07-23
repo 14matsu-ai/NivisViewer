@@ -3,9 +3,22 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from PySide6.QtCore import QPoint, QRect, QSize, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QCursor, QImage, QMouseEvent, QPainter, QPixmap, QResizeEvent, QTransform, QWheelEvent
+from PySide6.QtGui import (
+    QColor,
+    QContextMenuEvent,
+    QCursor,
+    QImage,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+    QResizeEvent,
+    QTransform,
+    QWheelEvent,
+)
 from PySide6.QtWidgets import QWidget
 
+from .mouse_gesture import MouseGestureRecognizer
 from .page_model import DisplaySpread
 
 
@@ -105,6 +118,9 @@ class ViewerWidget(QWidget):
     fullscreenToggleRequested = Signal()
     leftSideClicked = Signal()
     rightSideClicked = Signal()
+    contextMenuRequested = Signal(QPoint)
+    gestureRecognized = Signal(str)
+    extraMouseButtonPressed = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -136,6 +152,15 @@ class ViewerWidget(QWidget):
         self._drag_origin = QPoint(0, 0)
         self._mouse_pos: QPoint | None = None
         self._last_draw_layout: list[tuple[QRect, QPixmap]] = []
+        self.mouse_gestures_enabled = True
+        self.mouse_gesture_show_trail = True
+        self.mouse_gesture_min_distance = 36
+        self._gesture_recognizer = MouseGestureRecognizer(
+            self.mouse_gesture_min_distance
+        )
+        self._gesture_trail: list[QPoint] = []
+        self._right_button_down = False
+        self._suppress_context_until_release = False
 
     def set_background_color(self, color: str) -> None:
         self.background_color = QColor(color)
@@ -178,6 +203,49 @@ class ViewerWidget(QWidget):
             self._cursor_timer.stop()
             self.unsetCursor()
             self._cursor_hidden = False
+
+    def set_mouse_gesture_options(
+        self,
+        *,
+        enabled: bool | None = None,
+        show_trail: bool | None = None,
+        min_distance: int | None = None,
+    ) -> None:
+        if enabled is not None:
+            self.mouse_gestures_enabled = bool(enabled)
+        if show_trail is not None:
+            self.mouse_gesture_show_trail = bool(show_trail)
+        if min_distance is not None:
+            self.mouse_gesture_min_distance = max(12, min(200, int(min_distance)))
+        if self._gesture_recognizer.active:
+            self.cancel_mouse_gesture()
+        self._gesture_recognizer = MouseGestureRecognizer(
+            self.mouse_gesture_min_distance
+        )
+        if not self.mouse_gesture_show_trail:
+            self._gesture_trail.clear()
+            self.update()
+
+    @property
+    def gesture_in_progress(self) -> bool:
+        return self._right_button_down and bool(self._gesture_recognizer.pattern)
+
+    @property
+    def gesture_trail(self) -> tuple[QPoint, ...]:
+        return tuple(self._gesture_trail)
+
+    def cancel_mouse_gesture(self) -> bool:
+        was_active = (
+            self._right_button_down
+            or self._gesture_recognizer.active
+            or bool(self._gesture_trail)
+        )
+        self._gesture_recognizer.cancel()
+        self._gesture_trail.clear()
+        if self._right_button_down:
+            self._suppress_context_until_release = True
+        self.update()
+        return was_active
 
     def set_rotation_angle(self, angle: int) -> None:
         self.rotation_angle = angle % 360
@@ -258,6 +326,7 @@ class ViewerWidget(QWidget):
         if not self._images:
             painter.setPen(QColor("#777777"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "画像を開いてください")
+            self._draw_gesture_trail(painter)
             return
 
         layout = self._layout_for_current_images()
@@ -270,6 +339,7 @@ class ViewerWidget(QWidget):
             else:
                 self._draw_placeholder(painter, rect, image)
         self._draw_magnifier(painter)
+        self._draw_gesture_trail(painter)
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
         if self.fit_mode in {"fit_window", "fit_no_upscale", "fit_width", "fit_height"}:
@@ -293,6 +363,25 @@ class ViewerWidget(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         self._show_cursor_temporarily()
+        if event.button() == Qt.MouseButton.BackButton:
+            self.extraMouseButtonPressed.emit("back")
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.ForwardButton:
+            self.extraMouseButtonPressed.emit("forward")
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.RightButton:
+            self._right_button_down = True
+            self._suppress_context_until_release = False
+            if self.mouse_gestures_enabled:
+                self._gesture_trail = [event.position().toPoint()]
+                point = event.position()
+                self._gesture_recognizer.begin((point.x(), point.y()))
+            else:
+                self._gesture_trail.clear()
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self._press_position = event.position().toPoint()
         if event.button() == Qt.MouseButton.LeftButton and self._can_pan():
@@ -306,6 +395,15 @@ class ViewerWidget(QWidget):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         self._show_cursor_temporarily()
         self._mouse_pos = event.position().toPoint()
+        if self._right_button_down:
+            point = event.position()
+            if self._gesture_recognizer.active:
+                self._gesture_trail.append(point.toPoint())
+                self._gesture_recognizer.update((point.x(), point.y()))
+            if self.mouse_gesture_show_trail:
+                self.update()
+            event.accept()
+            return
         if self._drag_start is not None:
             delta = event.position().toPoint() - self._drag_start
             self._pan = self._drag_origin + delta
@@ -340,6 +438,30 @@ class ViewerWidget(QWidget):
         self._cursor_hidden = True
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if event.button() in {
+            Qt.MouseButton.BackButton,
+            Qt.MouseButton.ForwardButton,
+        }:
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.RightButton:
+            release_position = event.position().toPoint()
+            suppressed = self._suppress_context_until_release
+            pattern = ""
+            if self._gesture_recognizer.active:
+                point = event.position()
+                pattern = self._gesture_recognizer.finish((point.x(), point.y()))
+            self._right_button_down = False
+            self._suppress_context_until_release = False
+            self._gesture_trail.clear()
+            self.update()
+            if not suppressed:
+                if pattern:
+                    self.gestureRecognized.emit(pattern)
+                else:
+                    self.contextMenuRequested.emit(release_position)
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
             self._drag_start = None
             self.unsetCursor()
@@ -364,6 +486,9 @@ class ViewerWidget(QWidget):
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event: QContextMenuEvent) -> None:  # type: ignore[override]
+        event.accept()
 
     def _can_pan(self) -> bool:
         content_size = self._layout_for_current_images().content_size
@@ -487,3 +612,20 @@ class ViewerWidget(QWidget):
             painter.setPen(QColor("#eeeeee"))
             painter.drawRect(target.adjusted(0, 0, -1, -1))
             return
+
+    def _draw_gesture_trail(self, painter: QPainter) -> None:
+        if (
+            not self.mouse_gesture_show_trail
+            or not self.mouse_gestures_enabled
+            or not self._right_button_down
+            or not self._gesture_recognizer.pattern
+            or len(self._gesture_trail) < 2
+        ):
+            return
+        pen = QPen(QColor(120, 205, 255, 150))
+        pen.setWidthF(max(2.0, 3.0 * self.devicePixelRatioF()))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        for start, end in zip(self._gesture_trail, self._gesture_trail[1:]):
+            painter.drawLine(start, end)

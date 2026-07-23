@@ -21,6 +21,15 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
     assert manager.data["thumbnail_disk_cache_enabled"] is True
     assert manager.data["thumbnail_cache_limit_mb"] == 512
     assert manager.data["gap"] == 12
+    assert manager.data["mouse_gestures_enabled"] is True
+    assert manager.data["mouse_gesture_show_trail"] is True
+    assert manager.data["mouse_gesture_min_distance"] == 36
+    assert manager.data["mouse_gesture_bindings"] == {
+        "D": "close_viewer",
+        "U": "toggle_fullscreen",
+    }
+    assert manager.data["mouse_back_button_action"] == "previous_book"
+    assert manager.data["mouse_forward_button_action"] == "next_book"
 
 
 def test_partial_config_is_merged_with_defaults(tmp_path: Path) -> None:
@@ -95,3 +104,40 @@ def test_sprint4_settings_are_normalized_and_changes_are_emitted(tmp_path: Path)
     manager.apply({"gap": 25, "join_spread_pages": True})
 
     assert changes == [{"gap": 25, "join_spread_pages": True}]
+
+
+def test_mouse_settings_are_normalized_and_unknown_commands_are_disabled(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        '{"mouse_gestures_enabled": "yes", '
+        '"mouse_gesture_show_trail": 1, '
+        '"mouse_gesture_min_distance": 999, '
+        '"mouse_gesture_bindings": {'
+        '"D": "close_viewer", "UX": "next_page", "L": "unknown"}, '
+        '"mouse_back_button_action": "unknown", '
+        '"mouse_forward_button_action": "next_book"}',
+        encoding="utf-8",
+    )
+
+    restored = ConfigManager(path).load()
+
+    assert restored["mouse_gestures_enabled"] is True
+    assert restored["mouse_gesture_show_trail"] is True
+    assert restored["mouse_gesture_min_distance"] == 200
+    assert restored["mouse_gesture_bindings"] == {"D": "close_viewer"}
+    assert restored["mouse_back_button_action"] == ""
+    assert restored["mouse_forward_button_action"] == "next_book"
+
+
+def test_mouse_binding_defaults_are_not_shared(tmp_path: Path) -> None:
+    first = ConfigManager(tmp_path / "first.json")
+    second = ConfigManager(tmp_path / "second.json")
+    first.load()
+    second.load()
+
+    first.data["mouse_gesture_bindings"]["D"] = "next_page"
+
+    assert second.data["mouse_gesture_bindings"]["D"] == "close_viewer"
+    assert ConfigManager.DEFAULTS["mouse_gesture_bindings"]["D"] == "close_viewer"

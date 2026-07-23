@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import pytest
+from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtGui import QMouseEvent
+from PySide6.QtWidgets import QApplication
 
-from app.viewer_widget import calculate_spread_layout
+from app.viewer_widget import ViewerWidget, calculate_spread_layout
 
 
 def center_gap(layout) -> int:
@@ -74,3 +77,196 @@ def test_join_setting_does_not_change_single_or_split_single_page() -> None:
     assert single.effective_gap == 0
     assert split_single.effective_gap == 35
     assert center_gap(split_single) == 35
+
+
+def send_mouse_event(
+    widget: ViewerWidget,
+    event_type: QEvent.Type,
+    position: tuple[int, int],
+    button: Qt.MouseButton,
+    buttons: Qt.MouseButton,
+) -> None:
+    point = QPointF(*position)
+    event = QMouseEvent(
+        event_type,
+        point,
+        point,
+        button,
+        buttons,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(widget, event)
+
+
+def test_normal_right_click_requests_context_menu(qapp: QApplication) -> None:
+    widget = ViewerWidget()
+    positions = []
+    gestures = []
+    widget.contextMenuRequested.connect(positions.append)
+    widget.gestureRecognized.connect(gestures.append)
+
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseButtonPress,
+        (20, 20),
+        Qt.MouseButton.RightButton,
+        Qt.MouseButton.RightButton,
+    )
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseButtonRelease,
+        (25, 22),
+        Qt.MouseButton.RightButton,
+        Qt.MouseButton.NoButton,
+    )
+
+    assert len(positions) == 1
+    assert gestures == []
+    widget.close()
+
+
+def test_right_drag_emits_gesture_and_suppresses_context_menu(
+    qapp: QApplication,
+) -> None:
+    widget = ViewerWidget()
+    positions = []
+    gestures = []
+    widget.contextMenuRequested.connect(positions.append)
+    widget.gestureRecognized.connect(gestures.append)
+
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseButtonPress,
+        (50, 20),
+        Qt.MouseButton.RightButton,
+        Qt.MouseButton.RightButton,
+    )
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseMove,
+        (50, 80),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.RightButton,
+    )
+    assert widget.gesture_in_progress
+    assert len(widget.gesture_trail) == 2
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseButtonRelease,
+        (50, 85),
+        Qt.MouseButton.RightButton,
+        Qt.MouseButton.NoButton,
+    )
+
+    assert gestures == ["D"]
+    assert positions == []
+    assert widget.gesture_trail == ()
+    assert not widget.gesture_in_progress
+    widget.close()
+
+
+def test_escape_cancel_clears_trail_and_suppresses_release(
+    qapp: QApplication,
+) -> None:
+    widget = ViewerWidget()
+    positions = []
+    gestures = []
+    widget.contextMenuRequested.connect(positions.append)
+    widget.gestureRecognized.connect(gestures.append)
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseButtonPress,
+        (50, 80),
+        Qt.MouseButton.RightButton,
+        Qt.MouseButton.RightButton,
+    )
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseMove,
+        (50, 20),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.RightButton,
+    )
+
+    assert widget.cancel_mouse_gesture()
+    assert widget.gesture_trail == ()
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseButtonRelease,
+        (50, 20),
+        Qt.MouseButton.RightButton,
+        Qt.MouseButton.NoButton,
+    )
+
+    assert positions == []
+    assert gestures == []
+    widget.close()
+
+
+def test_disabled_gesture_keeps_context_menu(qapp: QApplication) -> None:
+    widget = ViewerWidget()
+    widget.set_mouse_gesture_options(enabled=False)
+    positions = []
+    gestures = []
+    widget.contextMenuRequested.connect(positions.append)
+    widget.gestureRecognized.connect(gestures.append)
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseButtonPress,
+        (10, 10),
+        Qt.MouseButton.RightButton,
+        Qt.MouseButton.RightButton,
+    )
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseMove,
+        (10, 100),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.RightButton,
+    )
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseButtonRelease,
+        (10, 100),
+        Qt.MouseButton.RightButton,
+        Qt.MouseButton.NoButton,
+    )
+
+    assert len(positions) == 1
+    assert gestures == []
+    widget.close()
+
+
+@pytest.mark.parametrize(
+    ("button", "name"),
+    [
+        (Qt.MouseButton.BackButton, "back"),
+        (Qt.MouseButton.ForwardButton, "forward"),
+    ],
+)
+def test_extra_button_fires_once_on_press(
+    qapp: QApplication,
+    button: Qt.MouseButton,
+    name: str,
+) -> None:
+    widget = ViewerWidget()
+    pressed = []
+    widget.extraMouseButtonPressed.connect(pressed.append)
+
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseButtonPress,
+        (20, 20),
+        button,
+        button,
+    )
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseButtonRelease,
+        (20, 20),
+        button,
+        Qt.MouseButton.NoButton,
+    )
+
+    assert pressed == [name]
+    widget.close()

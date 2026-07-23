@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from .config_manager import ConfigManager
+from .viewer_commands import COMMAND_CHOICES
 
 
 class SettingsDialog(QDialog):
@@ -40,6 +41,10 @@ class SettingsDialog(QDialog):
         self.resize(560, 470)
         self.config = config_manager
         self._cache_usage_getter = cache_usage_getter
+        raw_bindings = self.config.get("mouse_gesture_bindings", {})
+        self._gesture_bindings_base = (
+            dict(raw_bindings) if isinstance(raw_bindings, dict) else {}
+        )
 
         self._build_ui()
         self.load_current_values()
@@ -48,6 +53,7 @@ class SettingsDialog(QDialog):
         tabs = QTabWidget(self)
         tabs.addTab(self._build_viewer_tab(), "Viewer")
         tabs.addTab(self._build_browser_tab(), "Browser")
+        tabs.addTab(self._build_mouse_tab(), "Mouse")
 
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -151,6 +157,44 @@ class SettingsDialog(QDialog):
         layout.addStretch(1)
         return tab
 
+    def _build_mouse_tab(self) -> QWidget:
+        tab = QWidget(self)
+        layout = QVBoxLayout(tab)
+
+        gesture_group = QGroupBox("右クリックドラッグジェスチャー", tab)
+        gesture_form = QFormLayout(gesture_group)
+        self.mouse_gestures_checkbox = QCheckBox(
+            "マウスジェスチャーを使用する",
+            gesture_group,
+        )
+        self.mouse_gestures_checkbox.toggled.connect(self._sync_gesture_controls)
+        gesture_form.addRow(self.mouse_gestures_checkbox)
+        self.mouse_gesture_trail_checkbox = QCheckBox(
+            "操作中に軌跡を表示する",
+            gesture_group,
+        )
+        gesture_form.addRow(self.mouse_gesture_trail_checkbox)
+        self.mouse_gesture_distance_spin = QSpinBox(gesture_group)
+        self.mouse_gesture_distance_spin.setRange(12, 200)
+        self.mouse_gesture_distance_spin.setSuffix(" px")
+        gesture_form.addRow("認識最小距離:", self.mouse_gesture_distance_spin)
+        self.gesture_down_combo = self._command_combo(gesture_group)
+        self.gesture_up_combo = self._command_combo(gesture_group)
+        gesture_form.addRow("下へドラッグ (D):", self.gesture_down_combo)
+        gesture_form.addRow("上へドラッグ (U):", self.gesture_up_combo)
+
+        button_group = QGroupBox("マウス追加ボタン", tab)
+        button_form = QFormLayout(button_group)
+        self.mouse_back_action_combo = self._command_combo(button_group)
+        self.mouse_forward_action_combo = self._command_combo(button_group)
+        button_form.addRow("戻る / XButton1:", self.mouse_back_action_combo)
+        button_form.addRow("進む / XButton2:", self.mouse_forward_action_combo)
+
+        layout.addWidget(gesture_group)
+        layout.addWidget(button_group)
+        layout.addStretch(1)
+        return tab
+
     def load_current_values(self) -> None:
         behavior = str(self.config.get("open_viewer_behavior", "reuse_or_create"))
         index = self.open_behavior_combo.findData(behavior)
@@ -178,10 +222,50 @@ class SettingsDialog(QDialog):
         self.cache_limit_spin.setValue(
             int(self.config.get("thumbnail_cache_limit_mb", 512))
         )
+        self.mouse_gestures_checkbox.setChecked(
+            bool(self.config.get("mouse_gestures_enabled", True))
+        )
+        self.mouse_gesture_trail_checkbox.setChecked(
+            bool(self.config.get("mouse_gesture_show_trail", True))
+        )
+        self.mouse_gesture_distance_spin.setValue(
+            int(self.config.get("mouse_gesture_min_distance", 36))
+        )
+        raw_bindings = self.config.get("mouse_gesture_bindings", {})
+        self._gesture_bindings_base = (
+            dict(raw_bindings) if isinstance(raw_bindings, dict) else {}
+        )
+        self._select_command(
+            self.gesture_down_combo,
+            self._gesture_bindings_base.get("D", ""),
+        )
+        self._select_command(
+            self.gesture_up_combo,
+            self._gesture_bindings_base.get("U", ""),
+        )
+        self._select_command(
+            self.mouse_back_action_combo,
+            self.config.get("mouse_back_button_action", ""),
+        )
+        self._select_command(
+            self.mouse_forward_action_combo,
+            self.config.get("mouse_forward_button_action", ""),
+        )
         self._sync_gap_enabled(self.join_spread_checkbox.isChecked())
+        self._sync_gesture_controls(self.mouse_gestures_checkbox.isChecked())
         self.refresh_cache_usage()
 
     def values(self) -> dict[str, object]:
+        bindings = dict(self._gesture_bindings_base)
+        for pattern, combo in (
+            ("D", self.gesture_down_combo),
+            ("U", self.gesture_up_combo),
+        ):
+            command = str(combo.currentData() or "")
+            if command:
+                bindings[pattern] = command
+            else:
+                bindings.pop(pattern, None)
         return {
             "open_viewer_behavior": self.open_behavior_combo.currentData(),
             "bring_viewer_to_front_on_open": self.bring_to_front_checkbox.isChecked(),
@@ -193,6 +277,16 @@ class SettingsDialog(QDialog):
             "thumbnail_size": self.thumbnail_size_spin.value(),
             "thumbnail_disk_cache_enabled": self.disk_cache_checkbox.isChecked(),
             "thumbnail_cache_limit_mb": self.cache_limit_spin.value(),
+            "mouse_gestures_enabled": self.mouse_gestures_checkbox.isChecked(),
+            "mouse_gesture_show_trail": self.mouse_gesture_trail_checkbox.isChecked(),
+            "mouse_gesture_min_distance": self.mouse_gesture_distance_spin.value(),
+            "mouse_gesture_bindings": bindings,
+            "mouse_back_button_action": str(
+                self.mouse_back_action_combo.currentData() or ""
+            ),
+            "mouse_forward_button_action": str(
+                self.mouse_forward_action_combo.currentData() or ""
+            ),
         }
 
     def apply_settings(self) -> dict[str, object]:
@@ -230,6 +324,27 @@ class SettingsDialog(QDialog):
     def _sync_gap_enabled(self, joined: bool) -> None:
         self.gap_spin.setEnabled(not joined)
         self.gap_note.setVisible(joined)
+
+    def _sync_gesture_controls(self, enabled: bool) -> None:
+        for widget in (
+            self.mouse_gesture_trail_checkbox,
+            self.mouse_gesture_distance_spin,
+            self.gesture_down_combo,
+            self.gesture_up_combo,
+        ):
+            widget.setEnabled(enabled)
+
+    @staticmethod
+    def _command_combo(parent: QWidget) -> QComboBox:
+        combo = QComboBox(parent)
+        for label, command in COMMAND_CHOICES:
+            combo.addItem(label, command)
+        return combo
+
+    @staticmethod
+    def _select_command(combo: QComboBox, command: object) -> None:
+        index = combo.findData(command)
+        combo.setCurrentIndex(index if index >= 0 else 0)
 
     @staticmethod
     def _format_bytes(value: int) -> str:

@@ -6,10 +6,14 @@ from typing import Callable
 
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication, QWidget
+from natsort import natsorted
 
 from .browser_window import BrowserWindow
 from .config_manager import ConfigManager
-from .image_source import ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS
+from .image_source import (
+    BOOK_FILE_EXTENSIONS,
+    SUPPORTED_EXTENSIONS,
+)
 from .viewer_window import ViewerWindow
 
 
@@ -346,7 +350,11 @@ class ApplicationController(QObject):
             return []
 
         candidates: list[Path] = []
-        for path in parent.iterdir():
+        try:
+            siblings = tuple(parent.iterdir())
+        except OSError:
+            return []
+        for path in siblings:
             if path.is_dir():
                 try:
                     has_images = any(
@@ -357,10 +365,10 @@ class ApplicationController(QObject):
                     has_images = False
                 if has_images:
                     candidates.append(path)
-            elif path.is_file() and path.suffix.lower() in (ARCHIVE_EXTENSIONS | SUPPORTED_EXTENSIONS):
+            elif path.is_file() and path.suffix.lower() in BOOK_FILE_EXTENSIONS:
                 candidates.append(path.parent if path.suffix.lower() in SUPPORTED_EXTENSIONS else path)
 
         unique: dict[str, Path] = {}
         for path in candidates:
             unique[str(path.resolve()).casefold()] = path
-        return sorted(unique.values(), key=lambda item: item.name.casefold())
+        return natsorted(unique.values(), key=lambda item: item.name.casefold())
