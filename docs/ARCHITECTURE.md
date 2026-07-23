@@ -2,33 +2,41 @@
 
 ## 現在の実装
 
-現在は単一の`MainWindow`がアプリケーションの中心であり、ウィンドウ構築、メニューとショートカット、ファイル選択、本の切替、表示設定、履歴、ブックマーク、ページ一覧、設定保存をまとめて調整しています。
+Sprint 1ではアプリケーション全体と本単位のライフサイクルを、`MainWindow`から分離しました。画面構成は従来どおり単一の`MainWindow`ですが、所有関係は次のとおりです。
 
-- `main.py`: `QApplication`と`MainWindow`を生成するエントリーポイント
+```text
+ApplicationController
+└─ MainWindow
+   ├─ BookSession
+   │  ├─ ImageSource
+   │  ├─ PageModel
+   │  └─ ImageCache
+   └─ ViewerWidget
+```
+
+- `main.py`: `QApplication`を生成し、起動引数を`ApplicationController`へ渡すエントリーポイント
+- `ApplicationController`: 共通の`ConfigManager`、MainWindow群、起動、前面表示、終了処理を管理
+- `MainWindow`: メニュー、ダイアログ、入力、ViewerWidgetへの描画、全画面などウィンドウ固有UIを管理
+- `BookSession`: 現在のパス、ImageSource、PageModel、ImageCache、読み込み世代、ソース切替と終了を管理
 - `ConfigManager`: リポジトリ直下の`config.json`を読み書きするポータブル設定管理
 - `ImageSource`: フォルダ、単体画像の親フォルダ、ZIP/CBZを共通化する画像供給層
 - `PageModel`: 論理ページ順と単ページ／見開きの表示単位を管理する非GUIモデル
-- `ImageCache`: `QThreadPool`で画像を非同期デコードし、LRU形式で保持するキャッシュ
-- `ViewerWidget`: 渡された画像の描画、拡大縮小、パン、クリックやホイール入力を担当するウィジェット
-- `MainWindow`: 上記コンポーネントを接続し、現在の本と表示状態を管理する
+- `ImageCache`: セッション専用`QThreadPool`で画像を非同期デコードし、LRU形式で保持するキャッシュ
+- `ViewerWidget`: 渡された画像の描画、拡大縮小、パン、クリックやホイール入力を担当
 
-非同期画像読み込みでは`ImageCache.generation`で読み込み世代を管理し、ソースや画像調整の変更前に開始された古い結果を破棄します。`MainWindow`側にも表示要求IDがあり、古い描画要求が現在の表示へ混入しないようにしています。
+非同期画像読み込みでは`ImageCache.generation`で古い結果を破棄し、`MainWindow`でも表示要求IDを確認します。本を切り替えた時点でキャッシュ世代を更新し、旧ImageSourceを参照するタスクが残っている場合は、`BookSession`がソースを遅延破棄します。
 
 ## 将来構成
 
 ```text
 ApplicationController
 ├─ BrowserWindow
-│  ├─ フォルダツリー
-│  ├─ ブックマーク
-│  └─ サムネイル一覧
 └─ ViewerWindow
-   ├─ ViewerWidget
-   ├─ PageModel
-   └─ ImageCache
+   ├─ BookSession
+   └─ ViewerWidget
 ```
 
-`ApplicationController`はアプリ全体の寿命、共有設定、選択中の本、ウィンドウ間イベントを管理します。`BrowserWindow`は本を探して選ぶ責務、`ViewerWindow`は選択された本を読む責務を持ちます。画像列挙とデコードはUIスレッドから分離し、`PageModel`はGUIに依存しない状態を保ちます。
+`ApplicationController`はアプリ全体の寿命、共有設定、ウィンドウ群、ウィンドウ間イベントを管理します。`BrowserWindow`は本を探して選ぶ責務、`ViewerWindow`はBookSessionとViewerWidgetを接続して読む責務を持ちます。画像列挙とデコードはUIスレッドから分離し、`PageModel`はGUIに依存しない状態を保ちます。
 
 ## 設計上の決定事項
 
