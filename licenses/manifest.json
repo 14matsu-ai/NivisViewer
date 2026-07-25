@@ -1,0 +1,87 @@
+{
+  "manual_review_required": true,
+  "runtime": [
+    {
+      "name": "PySide6",
+      "version": "6.11.1",
+      "files": [
+        "LicenseRef-Qt-Commercial.txt"
+      ]
+    },
+    {
+      "name": "PySide6_Addons",
+      "version": "6.11.1",
+      "files": [
+        "LicenseRef-Qt-Commercial.txt"
+      ]
+    },
+    {
+      "name": "PySide6_Essentials",
+      "version": "6.11.1",
+      "files": [
+        "LicenseRef-Qt-Commercial.txt"
+      ]
+    },
+    {
+      "name": "shiboken6",
+      "version": "6.11.1",
+      "files": [
+        "LicenseRef-Qt-Commercial.txt"
+      ]
+    },
+    {
+      "name": "Pillow",
+      "version": "12.1.1",
+      "files": [
+        "LICENSE"
+      ]
+    },
+    {
+      "name": "natsort",
+      "version": "8.4.0",
+      "files": [
+        "LICENSE"
+      ]
+    },
+    {
+      "name": "pypdfium2",
+      "version": "5.12.1",
+      "files": [
+        "LICENSES__Apache-2.0.txt",
+        "LICENSES__BSD-3-Clause.txt",
+        "LICENSES__CC-BY-4.0.txt",
+        "data__windows_x64__BUILD_LICENSES__abseil.txt",
+        "data__windows_x64__BUILD_LICENSES__agg23.txt",
+        "data__windows_x64__BUILD_LICENSES__fast_float.txt",
+        "data__windows_x64__BUILD_LICENSES__freetype.txt",
+        "data__windows_x64__BUILD_LICENSES__icu.txt",
+        "data__windows_x64__BUILD_LICENSES__lcms.txt",
+        "data__windows_x64__BUILD_LICENSES__libjpeg_turbo.ijg",
+        "data__windows_x64__BUILD_LICENSES__libjpeg_turbo.md",
+        "data__windows_x64__BUILD_LICENSES__libopenjpeg.txt",
+        "data__windows_x64__BUILD_LICENSES__libpng.txt",
+        "data__windows_x64__BUILD_LICENSES__libtiff.txt",
+        "data__windows_x64__BUILD_LICENSES__llvm-libc.txt",
+        "data__windows_x64__BUILD_LICENSES__pdfium-binaries.txt",
+        "data__windows_x64__BUILD_LICENSES__pdfium.txt",
+        "data__windows_x64__BUILD_LICENSES__simdutf.txt",
+        "data__windows_x64__BUILD_LICENSES__zlib.txt"
+      ]
+    }
+  ],
+  "build_tools": [
+    {
+      "name": "PyInstaller",
+      "version": "6.20.0",
+      "files": [
+        "COPYING.txt"
+      ]
+    }
+  ],
+  "warnings": [
+    "PySide6 6.11.1: only a commercial license reference was present; public-distribution terms require manual collection",
+    "PySide6_Addons 6.11.1: only a commercial license reference was present; public-distribution terms require manual collection",
+    "PySide6_Essentials 6.11.1: only a commercial license reference was present; public-distribution terms require manual collection",
+    "shiboken6 6.11.1: only a commercial license reference was present; public-distribution terms require manual collection"
+  ]
+}

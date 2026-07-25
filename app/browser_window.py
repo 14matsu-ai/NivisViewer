@@ -155,6 +155,8 @@ class BrowserWindow(QMainWindow):
         close_affected_viewers_handler: CloseAffectedViewersHandler | None = None,
         archive_backend_registry=None,
         pdfium_service=None,
+        file_registration_service=None,
+        restore_initial_location: bool = True,
     ) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -180,6 +182,7 @@ class BrowserWindow(QMainWindow):
         else:
             self._owns_pdfium_service = False
         self.pdfium_service = pdfium_service
+        self.file_registration_service = file_registration_service
         self._owns_file_operation_coordinator = file_operation_coordinator is None
         self.file_operation_coordinator = (
             file_operation_coordinator
@@ -211,6 +214,8 @@ class BrowserWindow(QMainWindow):
                 self,
                 disk_cache=disk_cache,
                 disk_cache_enabled=bool(
+                    self.config.writable
+                    and
                     self.settings.get("thumbnail_disk_cache_enabled", True)
                 ),
                 archive_backend_registry=self.archive_backend_registry,
@@ -300,7 +305,8 @@ class BrowserWindow(QMainWindow):
         self._build_ui()
         self.config.settings_changed.connect(self.apply_settings)
         self._restore_window_state()
-        self._restore_initial_folder()
+        if restore_initial_location:
+            self._restore_initial_folder()
 
     @property
     def items(self) -> tuple[BrowserItem, ...]:
@@ -1483,6 +1489,7 @@ class BrowserWindow(QMainWindow):
                 if self.archive_backend_registry is not None
                 else None
             ),
+            file_registration_service=self.file_registration_service,
         )
         dialog.cache_clear_requested.connect(
             self.thumbnail_provider.clear_all_caches_async

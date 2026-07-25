@@ -21,7 +21,7 @@ logs/
 build/
 dist/
 out/
-*.spec
+*.zip.sha256
 
 # IDE / Windows
 .vscode/

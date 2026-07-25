@@ -565,6 +565,27 @@ class ViewerWindow(QMainWindow):
         shortcuts_action = QAction("ショートカット一覧", self)
         shortcuts_action.triggered.connect(self.show_shortcuts_help)
         help_menu.addAction(shortcuts_action)
+        about_action = QAction("NivisViewerについて／診断情報", self)
+        about_action.triggered.connect(self.show_diagnostics)
+        help_menu.addAction(about_action)
+
+    def show_diagnostics(self) -> None:
+        from .diagnostics_dialog import DiagnosticsDialog, diagnostic_text
+
+        pdf_available = None
+        try:
+            pdf_available = self.pdfium_service.is_available
+        except Exception:
+            pdf_available = False
+        dialog = DiagnosticsDialog(
+            self.config.base_dir,
+            self,
+            text=diagnostic_text(
+                self.config.base_dir,
+                pdf_available=pdf_available,
+            ),
+        )
+        dialog.exec()
 
     def _connect_shortcuts(self) -> None:
         shortcuts = [

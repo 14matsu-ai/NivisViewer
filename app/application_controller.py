@@ -25,6 +25,7 @@ from .image_source import (
 )
 from .metadata_store import MetadataStore
 from .pdfium_service import PdfiumService
+from .single_instance import InstanceMessage
 from .viewer_window import ViewerWindow
 
 
@@ -50,6 +51,7 @@ class ApplicationController(QObject):
         window_factory: WindowFactory = ViewerWindow,
         browser_window_factory: BrowserWindowFactory = BrowserWindow,
         pdfium_service: PdfiumService | None = None,
+        file_registration_service=None,
     ) -> None:
         super().__init__(parent if parent is not None else application)
         self.application = application
@@ -63,6 +65,7 @@ class ApplicationController(QObject):
             config_manager=self.config,
         )
         self.pdfium_service = pdfium_service or PdfiumService()
+        self.file_registration_service = file_registration_service
         self.config.settings_changed.connect(self._on_controller_settings_changed)
         self.file_operation_coordinator = FileOperationCoordinator(
             self.metadata_store,
@@ -76,6 +79,7 @@ class ApplicationController(QObject):
         self._browser_window: BrowserWindow | None = None
         self._shutdown = False
         self._quit_requested = False
+        self._restore_on_start = True
         self.quit_when_last_viewer_closed = False
         self.application.setQuitOnLastWindowClosed(False)
         self.application.aboutToQuit.connect(self.shutdown)
@@ -84,11 +88,17 @@ class ApplicationController(QObject):
     def viewer_windows(self) -> tuple[ViewerWindow, ...]:
         return tuple(self._viewer_windows)
 
-    def start(self, initial_path: str | None = None) -> BrowserWindow:
+    def start(
+        self,
+        initial_path: str | None = None,
+        *,
+        restore: bool = True,
+    ) -> BrowserWindow:
         self._shutdown = False
+        self._restore_on_start = restore
         browser = self.show_browser_window()
         path_to_open = initial_path
-        if not path_to_open:
+        if restore and not path_to_open:
             last_path = self.settings.get("last_open_path", "")
             if (
                 bool(self.settings.get("reopen_last_on_start", False))
@@ -101,6 +111,30 @@ class ApplicationController(QObject):
             self.select_path_in_browser(path_to_open)
             self.open_path(path_to_open)
         return browser
+
+    def handle_open_request(self, message: InstanceMessage) -> None:
+        """Apply one startup/IPC request without changing persistent behavior."""
+        self.show_browser_window()
+        unique: dict[str, str] = {}
+        for path in message.paths:
+            unique.setdefault(self._path_key(path), path)
+        paths = tuple(unique.values())
+        if message.browser_only:
+            for path in paths:
+                self.select_path_in_browser(path)
+            return
+        for index, path in enumerate(paths):
+            try:
+                self.select_path_in_browser(path)
+                if message.new_window or index > 0:
+                    open_in_new_window: bool | None = True
+                elif message.reuse:
+                    open_in_new_window = False
+                else:
+                    open_in_new_window = None
+                self.open_path(path, open_in_new_window=open_in_new_window)
+            except (OSError, RuntimeError, ValueError):
+                continue
 
     def create_browser_window(self) -> BrowserWindow:
         existing = self.get_browser_window()
@@ -115,6 +149,8 @@ class ApplicationController(QObject):
             close_affected_viewers_handler=self.close_viewers,
             archive_backend_registry=self.archive_backend_registry,
             pdfium_service=self.pdfium_service,
+            file_registration_service=self.file_registration_service,
+            restore_initial_location=self._restore_on_start,
         )
         self._browser_window = window
         self._quit_requested = False

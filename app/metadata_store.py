@@ -75,6 +75,8 @@ class MetadataStore(QObject):
         self,
         database_path: str | Path,
         parent: QObject | None = None,
+        *,
+        initialize: bool = True,
     ) -> None:
         super().__init__(parent)
         self.database_path = Path(database_path)
@@ -85,7 +87,10 @@ class MetadataStore(QObject):
         self._lock = threading.RLock()
         self._pending_progress: dict[str, _PendingProgress] = {}
         self._closed = False
-        self._initialize()
+        if initialize:
+            self._initialize()
+        else:
+            self.last_error = "プロファイルは読み取り専用です。"
 
     @property
     def schema_version(self) -> int:
