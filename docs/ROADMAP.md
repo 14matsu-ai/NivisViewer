@@ -13,11 +13,13 @@
     - 可視範囲優先のサムネイル要求
     - 先読み範囲
     - 高速スクロール中の生成抑制
-11. Sprint 10：安全なファイル操作
-    - フォルダ列挙のさらなる仮想化・ページング
-    - Viewerの先読みとメモリ制御
-12. Sprint 11：PDF対応
-13. Sprint 12：RAR／7z対応
+11. Sprint 10：安全なファイル操作（完了）
+    - 名前変更、コピー、切り取り、貼り付け、指定先コピー／移動
+    - Windowsごみ箱、新規フォルダ、複数選択
+    - 直列非同期worker、進捗、キャンセル、部分失敗
+    - MetadataStore、BrowserNavigationHistory、Viewer使用中確認
+12. Sprint 11：RAR／7z／CBR／CB7対応
+13. Sprint 12：PDF対応
 14. Sprint 13：レート／タグ編集UIと検索
     - 基本ナビゲーションとファイル操作の安定後に着手
     - ZipPla `{zpi$...}` の明示的な読み取り互換

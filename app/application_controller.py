@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import weakref
 from pathlib import Path
 from typing import Callable
@@ -10,9 +11,11 @@ from natsort import natsorted
 
 from .browser_window import BrowserWindow
 from .config_manager import ConfigManager
+from .file_operation_coordinator import FileOperationCoordinator
 from .image_source import (
     ARCHIVE_EXTENSIONS,
     BOOK_FILE_EXTENSIONS,
+    FolderImageSource,
     SUPPORTED_EXTENSIONS,
 )
 from .metadata_store import MetadataStore
@@ -47,6 +50,10 @@ class ApplicationController(QObject):
         self.settings = self.config.load()
         self.metadata_store = metadata_store or MetadataStore(
             self.config.metadata_database_path,
+            self,
+        )
+        self.file_operation_coordinator = FileOperationCoordinator(
+            self.metadata_store,
             self,
         )
         self._migrate_legacy_metadata()
@@ -91,6 +98,9 @@ class ApplicationController(QObject):
             config_manager=self.config,
             metadata_store=self.metadata_store,
             open_path_handler=self._handle_browser_open_request,
+            file_operation_coordinator=self.file_operation_coordinator,
+            affected_viewers_handler=self.viewers_using_paths,
+            close_affected_viewers_handler=self.close_viewers,
         )
         self._browser_window = window
         self._quit_requested = False
@@ -156,6 +166,39 @@ class ApplicationController(QObject):
         if window in self._viewer_windows:
             window.close()
 
+    def viewers_using_paths(
+        self,
+        paths: tuple[str, ...] | list[str],
+    ) -> tuple[ViewerWindow, ...]:
+        affected: list[ViewerWindow] = []
+        targets = tuple(self._path_key(path) for path in paths)
+        for window in self._viewer_windows:
+            source = window.book_session.source
+            current = window.book_session.current_path
+            if source is None or current is None:
+                continue
+            source_key = self._path_key(source.source_path)
+            current_key = self._path_key(current)
+            for target_key in targets:
+                if self._path_is_within(source_key, target_key):
+                    affected.append(window)
+                    break
+                if self._path_is_within(current_key, target_key):
+                    affected.append(window)
+                    break
+                if (
+                    isinstance(source, FolderImageSource)
+                    and self._path_is_within(target_key, source_key)
+                ):
+                    affected.append(window)
+                    break
+        return tuple(affected)
+
+    def close_viewers(self, viewers: tuple[ViewerWindow, ...]) -> None:
+        for window in tuple(viewers):
+            if window in self._viewer_windows:
+                window.close()
+
     def open_adjacent_book(self, window: object, direction: int) -> str:
         if not isinstance(window, ViewerWindow) or window not in self._viewer_windows:
             return "unavailable"
@@ -209,6 +252,7 @@ class ApplicationController(QObject):
         browser = self.get_browser_window()
         if browser is not None:
             browser.prepare_shutdown()
+        self.file_operation_coordinator.close()
         self.config.save()
         self.metadata_store.flush()
         self.metadata_store.close()
@@ -454,3 +498,18 @@ class ApplicationController(QObject):
         for path in candidates:
             unique[str(path.resolve()).casefold()] = path
         return natsorted(unique.values(), key=lambda item: item.name.casefold())
+
+    @staticmethod
+    def _path_key(path: str | Path) -> str:
+        return os.path.normcase(
+            os.path.abspath(os.path.normpath(os.fspath(path)))
+        ).casefold()
+
+    @staticmethod
+    def _path_is_within(path_key: str, root_key: str) -> bool:
+        if path_key == root_key:
+            return True
+        try:
+            return os.path.commonpath((path_key, root_key)) == root_key
+        except ValueError:
+            return False

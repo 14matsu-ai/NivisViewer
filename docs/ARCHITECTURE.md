@@ -2,10 +2,15 @@
 
 ## 現在の実装
 
-Sprint 9では、BrowserWindowのフォルダ列挙を専用スレッドへ分離し、128件単位の増分表示、scan世代による後着破棄、可視範囲優先サムネイル、限定先読み、高速スクロール抑制を追加しました。BrowserWindowとViewerWindowは同じ`QApplication`・同じプロセス内で動く別ウィンドウで、ApplicationControllerが寿命、選択状態、共有MetadataStoreを管理します。
+Sprint 10では、BrowserWindowへ安全な名前変更、コピー、移動、ごみ箱、新規フォルダ操作を追加しました。ファイルシステム変更は直列の専用workerで実行し、成功結果を受けた後だけMetadataStore、BrowserNavigationHistory、一覧選択を追従させます。BrowserWindowとViewerWindowは同じ`QApplication`・同じプロセス内で動く別ウィンドウで、ApplicationControllerが寿命、選択状態、共有MetadataStore、ファイル操作、Viewer使用中確認を管理します。
 
 ```text
 ApplicationController
+├─ FileOperationCoordinator
+│  ├─ FileOperationService
+│  ├─ FileOperationExecutor
+│  ├─ WindowsRecycleBin
+│  └─ FilenameValidator
 ├─ MetadataStore
 ├─ BrowserWindow
 │  ├─ BrowserNavigationHistory
@@ -33,7 +38,12 @@ ApplicationController
 ```
 
 - `main.py`: `QApplication`を生成し、起動引数を`ApplicationController`へ渡すエントリーポイント
-- `ApplicationController`: 共通の`ConfigManager`と単一`MetadataStore`、単一BrowserWindow、ViewerWindow群、最後にアクティブだったViewerWindow、ウィンドウ選択、隣接書庫探索、前面表示、ウィンドウ間同期、終了判定を管理
+- `ApplicationController`: 共通の`ConfigManager`と単一`MetadataStore`、単一FileOperationCoordinator、単一BrowserWindow、ViewerWindow群、最後にアクティブだったViewerWindow、ウィンドウ選択、隣接書庫探索、前面表示、ウィンドウ間同期、Viewer使用中確認、終了判定を管理
+- `FileOperationCoordinator`: 直列workerへの要求、進捗と完了通知、成功したrename/moveのMetadataStore追従を管理
+- `FileOperationService`: QtとGUIに依存せず、絶対パスの検証、重複・親子選択の整理、名前変更、コピー、移動、ごみ箱、新規フォルダ、項目単位の構造化結果を管理
+- `FileOperationExecutor`: 最大1スレッドの`QThreadPool`でファイル操作を直列実行し、安全な項目境界でキャンセルを確認
+- `WindowsRecycleBin`: `SHFileOperationW`を隔離し、Unicodeパスを確認なしのShellごみ箱操作へ渡す。永久削除へのフォールバックは持たない
+- `FilenameValidator`: Windows禁止文字、制御文字、予約名、末尾空白・ピリオド、長さを純粋関数で検証し、衝突回避名を生成
 - `MetadataStore`: SQLiteスキーマ、パス正規化、閲覧履歴、読書位置、Browserブックマーク、レート、タグを管理
 - `BrowserWindow`: フォルダ履歴、ナビゲーションバー、パス入力、フォルダツリー、ブックマーク／履歴タブ、項目選択、サムネイル一覧、ステータス表示を管理。本のページ移動やBookSession、SQLは持たない
 - `BrowserNavigationHistory`: Qtに依存せず、訪問フォルダ、選択項目、縦横スクロール位置、戻る／進むの分岐をセッション内で管理
@@ -118,6 +128,40 @@ BrowserWindow
 F5更新は安全性を優先し、受信バッチを一時リストへ蓄積して正常完了時だけ一括交換します。アクセス失敗または途中キャンセルでは現在の有効な一覧、選択、履歴を維持します。正常交換時はパス基準の主選択・複数選択・表示基準項目を復元し、未変更mtime・サイズ・thumbnail_sizeのキャッシュを再利用します。
 
 戻る／進む、上へ、パス入力、ブックマーク、Viewer同期からの移動も同じscan入口を通ります。復元対象が最初のバッチにない場合はrestore_locationをscan generationへ紐づけて保持し、対象パスが後続バッチに到着した時点で選択します。完了時に存在しなければ一度だけ選択なしへ確定し、無制限なタイマー再試行は行いません。選択復元はactivated/open経路を通りません。
+
+### 安全なファイル操作
+
+```text
+ApplicationController
+├─ FileOperationCoordinator
+├─ MetadataStore
+├─ BrowserWindow
+└─ ViewerWindow [0..n]
+
+FileOperationCoordinator
+├─ FileOperationService
+├─ FileOperationExecutor
+├─ WindowsRecycleBin
+└─ FilenameValidator
+```
+
+ファイル操作はフォルダタブのサムネイル一覧を対象とします。操作対象はQModelIndexや表示行ではなく、開始時に取得した絶対パスとしてworkerへ渡します。Ctrl／Shiftによる複数選択とCtrl+Aを利用でき、重複パス、および親フォルダとその子が同時に含まれる入力はFileOperationServiceが一度だけ処理します。ブックマークと履歴タブの項目へ直接rename、move、recycleを行うUIはSprint 10では提供しません。
+
+名前変更、コピー、移動、ごみ箱、新規フォルダ作成は最大1スレッドのFileOperationExecutorで直列実行します。workerはQtモデルやWidgetを変更せず、開始、処理済み件数、総件数、項目単位の成否、キャンセル状態をdataclassでGUIスレッドへ返します。単一の巨大ファイルを強制停止せず、ファイル間とディレクトリ項目間の安全な境界でキャンセルを確認します。BrowserWindow終了時は新しい結果を適用せず、実行中workerを無制限にwaitしません。
+
+ファイルコピーは`shutil.copy2()`、フォルダコピーはcopy2を使う再帰コピーにより、対象自身のmtimeを可能な範囲で維持します。コピーは同じ親の一時名へ完了させてからrenameし、キャンセルまたは失敗時はNivisViewerが作成した一時コピーだけを回収します。クロスボリューム移動はコピー完了前に元項目を削除せず、キャンセル時は確定済みコピーをロールバックして元を維持します。子の追加・削除で変化する親フォルダmtimeは通常のOS動作として許容します。MetadataStoreの更新日時を元ファイルmtimeへ書き戻しません。
+
+同名項目は自動上書きしません。Sprint 10のBrowserWindowは複数衝突でダイアログを連続表示せず、既定ですべてスキップして終了時に件数とエラー種別を一度だけ通知します。FileOperationServiceには拡張子を維持した「`book - コピー.zip`」「`book - コピー (2).zip`」形式の別名生成と`FileCollisionPolicy.RENAME`を用意し、将来の衝突選択UIから利用できるようにしています。
+
+通常のDeleteとコンテキストメニューの「ごみ箱へ移動」はWindows Shellの`SHFileOperationW`へ`FOF_ALLOWUNDO`、`FOF_NOCONFIRMATION`、`FOF_NOERRORUI`を指定します。NivisViewerが対象件数または単一名を一度確認するため、OS確認ダイアログを重ねません。Shell API失敗、キャンセル、API利用不能、操作後も元パスが残る場合は失敗として返し、`os.remove()`や`shutil.rmtree()`による永久削除へ切り替えません。Shift+Deleteと完全削除APIは未実装です。
+
+renameとmoveの成功後だけMetadataStoreのパスをSQLiteトランザクションで追従させます。フォルダ操作では配下のlibrary_itemsをprefix置換し、reading_history、browser_bookmarks、rating、tags、commentは同じlibrary_itemとの関連を維持します。新パスに既存項目がある場合は、最新の読書履歴、open_countの合算、タグの和集合、既存側優先のrating/commentという安全な統合を行い、UNIQUE制約を破壊しません。トランザクション失敗時はロールバックします。コピーではメタデータを複製せず、ごみ箱移動では履歴やブックマークを即時削除しません。
+
+BrowserNavigationHistoryもrename/move成功後だけフォルダパスと選択パスをprefix置換し、連続する同一フォルダ履歴を重複させません。操作後の一覧はSprint 9の非同期scannerで、履歴を追加せず再読込します。rename、現在フォルダへのcopy/move、新規フォルダは新パスを選択し、ごみ箱移動は削除位置に近い項目を選択します。scan generationとthumbnail generationを維持するため、旧scan結果や旧パスのサムネイル結果を新項目へ適用しません。旧ディスクキャッシュは即時移管せずLRU回収に任せ、新パスで通常のfingerprint検索を行います。
+
+コピー以外の変更対象が開いているFolderImageSource、単体画像、その親フォルダ、ZIP／CBZ、または操作対象フォルダ配下にある場合、ApplicationControllerが影響するViewerWindowだけを抽出します。BrowserWindowは操作前に一度確認し、ユーザーが続行を選んだ場合だけ対象Viewerを通常のclose経路で解放してからworkerを開始します。キャンセルではViewerを閉じず、無関係なViewerとBrowserWindowは維持します。コピーは元項目を変更しないためViewerを閉じません。
+
+ドラッグ＆ドロップ、永久削除、OS標準の高度なUndo、ZIP／CBZ内部エントリの変更は後続課題です。
 
 ### 可視範囲優先サムネイル
 
@@ -231,7 +275,7 @@ BrowserWindowは`last_browser_path`、`browser_sidebar_visible`、`browser_sideb
 
 ## 次の構成
 
-次段階ではフォルダ列挙のさらなる仮想化・ページング、安全なファイル操作、Viewer側の先読みとメモリ制御を優先します。その後にPDF、RAR／7zへ進み、基本操作の安定後にMetadataStoreのレート／タグAPIへ編集UI、検索、絞り込み、サムネイル上の表示を接続します。ZipPlaの`{zpi$...}`は明示的な読み取り互換から始め、元ファイルへ自動的に書き戻さない境界を維持します。
+次段階ではPageSource抽象化を進め、Sprint 11でRAR／7z／CBR／CB7、Sprint 12でPDFへ対応します。基本操作と対応形式の安定後にMetadataStoreのレート／タグAPIへ編集UI、検索、絞り込み、サムネイル上の表示を接続します。ZipPlaの`{zpi$...}`は明示的な読み取り互換から始め、元ファイルへ自動的に書き戻さない境界を維持します。
 
 `ApplicationController`は引き続きアプリ全体の寿命、共有設定、単一MetadataStore、ウィンドウ群、ウィンドウ間イベントを管理します。`BrowserWindow`は本を探して選ぶ責務、`ViewerWindow`はBookSessionとViewerWidgetを接続して読む責務を持ちます。PageModelはGUIに依存しない状態を保ちます。
 

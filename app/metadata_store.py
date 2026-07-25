@@ -480,6 +480,80 @@ class MetadataStore(QObject):
                 return []
         return [str(row[0]) for row in rows]
 
+    def relocate_item(self, old_path: str, new_path: str) -> bool:
+        return self.relocate_tree(old_path, new_path)
+
+    def relocate_tree(self, old_root: str, new_root: str) -> bool:
+        old_display = self.display_path(old_root)
+        new_display = self.display_path(new_root)
+        old_key = self.normalize_path(old_display)
+        changed_paths: list[str] = []
+        with self._lock:
+            if not self._available:
+                return False
+            assert self._connection is not None
+            try:
+                self._flush_pending_locked()
+                self._connection.commit()
+                rows = self._connection.execute(
+                    """
+                    SELECT id, normalized_path, display_path
+                      FROM library_items
+                     ORDER BY LENGTH(normalized_path)
+                    """
+                ).fetchall()
+                affected = [
+                    (int(row[0]), str(row[1]), str(row[2]))
+                    for row in rows
+                    if self._path_is_within(str(row[1]), old_key)
+                ]
+                if not affected:
+                    return True
+                with self._connection:
+                    for item_id, _normalized, display_path in affected:
+                        relocated = self._replace_path_prefix(
+                            display_path,
+                            old_display,
+                            new_display,
+                        )
+                        relocated_key = self.normalize_path(relocated)
+                        collision = self._connection.execute(
+                            """
+                            SELECT id FROM library_items
+                             WHERE normalized_path = ? AND id != ?
+                            """,
+                            (relocated_key, item_id),
+                        ).fetchone()
+                        if collision is not None:
+                            self._merge_library_items(
+                                source_id=item_id,
+                                destination_id=int(collision[0]),
+                                destination_path=relocated,
+                            )
+                        else:
+                            self._connection.execute(
+                                """
+                                UPDATE library_items
+                                   SET normalized_path = ?, display_path = ?,
+                                       last_verified_at = ?
+                                 WHERE id = ?
+                                """,
+                                (relocated_key, relocated, time.time(), item_id),
+                            )
+                        changed_paths.append(relocated)
+            except (OSError, sqlite3.DatabaseError, ValueError) as exc:
+                self.last_error = str(exc)
+                try:
+                    self._connection.rollback()
+                except sqlite3.DatabaseError:
+                    pass
+                return False
+        self.history_changed.emit()
+        self.bookmarks_changed.emit()
+        for path in changed_paths:
+            self.metadata_changed.emit(path)
+        return True
+
     def flush(self) -> None:
         changed = False
         with self._lock:
@@ -706,6 +780,124 @@ class MetadataStore(QObject):
             )
         return True
 
+    def _merge_library_items(
+        self,
+        *,
+        source_id: int,
+        destination_id: int,
+        destination_path: str,
+    ) -> None:
+        assert self._connection is not None
+        source_history = self._connection.execute(
+            """
+            SELECT last_opened_at, last_page_index, total_pages, open_count
+              FROM reading_history WHERE library_item_id = ?
+            """,
+            (source_id,),
+        ).fetchone()
+        destination_history = self._connection.execute(
+            """
+            SELECT last_opened_at, last_page_index, total_pages, open_count
+              FROM reading_history WHERE library_item_id = ?
+            """,
+            (destination_id,),
+        ).fetchone()
+        if source_history is not None:
+            if destination_history is None:
+                self._connection.execute(
+                    """
+                    INSERT INTO reading_history (
+                        library_item_id, last_opened_at, last_page_index,
+                        total_pages, open_count
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (destination_id, *source_history),
+                )
+            else:
+                newest = (
+                    source_history
+                    if float(source_history[0]) >= float(destination_history[0])
+                    else destination_history
+                )
+                self._connection.execute(
+                    """
+                    UPDATE reading_history
+                       SET last_opened_at = ?, last_page_index = ?,
+                           total_pages = ?, open_count = ?
+                     WHERE library_item_id = ?
+                    """,
+                    (
+                        newest[0],
+                        newest[1],
+                        newest[2],
+                        int(source_history[3]) + int(destination_history[3]),
+                        destination_id,
+                    ),
+                )
+
+        source_bookmark = self._connection.execute(
+            """
+            SELECT label, item_type, sort_order, created_at
+              FROM browser_bookmarks WHERE library_item_id = ?
+            """,
+            (source_id,),
+        ).fetchone()
+        destination_bookmark = self._connection.execute(
+            "SELECT 1 FROM browser_bookmarks WHERE library_item_id = ?",
+            (destination_id,),
+        ).fetchone()
+        if source_bookmark is not None and destination_bookmark is None:
+            self._connection.execute(
+                """
+                INSERT INTO browser_bookmarks (
+                    library_item_id, label, item_type, sort_order, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (destination_id, *source_bookmark),
+            )
+
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO item_tags (library_item_id, tag_id)
+            SELECT ?, tag_id FROM item_tags WHERE library_item_id = ?
+            """,
+            (destination_id, source_id),
+        )
+        source_metadata = self._connection.execute(
+            "SELECT rating, comment FROM library_items WHERE id = ?",
+            (source_id,),
+        ).fetchone()
+        destination_metadata = self._connection.execute(
+            "SELECT rating, comment FROM library_items WHERE id = ?",
+            (destination_id,),
+        ).fetchone()
+        if source_metadata is not None and destination_metadata is not None:
+            rating = (
+                destination_metadata[0]
+                if destination_metadata[0] is not None
+                else source_metadata[0]
+            )
+            comment = str(destination_metadata[1] or source_metadata[1] or "")
+            self._connection.execute(
+                """
+                UPDATE library_items
+                   SET display_path = ?, rating = ?, comment = ?,
+                       metadata_updated_at = ?
+                 WHERE id = ?
+                """,
+                (
+                    destination_path,
+                    rating,
+                    comment,
+                    time.time(),
+                    destination_id,
+                ),
+            )
+        self._connection.execute(
+            "DELETE FROM library_items WHERE id = ?",
+            (source_id,),
+        )
+
     def _library_value(self, path: str, column: str):
         if column not in {"rating"}:
             raise ValueError("unsupported library value")
@@ -721,6 +913,27 @@ class MetadataStore(QObject):
                 self._disable(exc)
                 return None
         return None if row is None else row[0]
+
+    @staticmethod
+    def _path_is_within(path_key: str, root_key: str) -> bool:
+        if path_key == root_key:
+            return True
+        separator = os.sep.casefold()
+        return path_key.startswith(root_key.rstrip("\\/") + separator)
+
+    @classmethod
+    def _replace_path_prefix(
+        cls,
+        path: str,
+        old_root: str,
+        new_root: str,
+    ) -> str:
+        path_key = cls.normalize_path(path)
+        old_key = cls.normalize_path(old_root)
+        if path_key == old_key:
+            return cls.display_path(new_root)
+        relative = os.path.relpath(cls.display_path(path), cls.display_path(old_root))
+        return cls.display_path(os.path.join(new_root, relative))
 
     def _disable(self, error: BaseException) -> None:
         self.last_error = str(error)
