@@ -32,6 +32,8 @@ def test_current_values_are_shown_and_join_disables_gap(
             "thumbnail_size": 240,
             "thumbnail_frame_ratio": "landscape_16_9",
             "thumbnail_crop_mode": "center_crop",
+            "thumbnail_quality_mode": "high",
+            "thumbnail_cache_max_edge": 1536,
             "browser_display_density": "comfortable",
             "browser_sort_key": "modified_time",
             "browser_sort_order": "descending",
@@ -48,6 +50,8 @@ def test_current_values_are_shown_and_join_disables_gap(
     assert dialog.thumbnail_size_spin.value() == 240
     assert dialog.thumbnail_frame_ratio_combo.currentData() == "landscape_16_9"
     assert dialog.thumbnail_crop_mode_combo.currentData() == "center_crop"
+    assert dialog.thumbnail_quality_mode_combo.currentData() == "high"
+    assert dialog.thumbnail_cache_max_edge_spin.value() == 1536
     assert dialog.browser_display_density_combo.currentData() == "comfortable"
     assert dialog.browser_sort_key_combo.currentData() == "modified_time"
     assert dialog.browser_sort_order_combo.currentData() == "descending"
@@ -69,6 +73,10 @@ def test_apply_and_ok_persist_settings(tmp_path: Path, qapp: QApplication) -> No
     dialog.thumbnail_crop_mode_combo.setCurrentIndex(
         dialog.thumbnail_crop_mode_combo.findData("letterbox")
     )
+    dialog.thumbnail_quality_mode_combo.setCurrentIndex(
+        dialog.thumbnail_quality_mode_combo.findData("economy")
+    )
+    dialog.thumbnail_cache_max_edge_spin.setValue(768)
     dialog.browser_display_density_combo.setCurrentIndex(
         dialog.browser_display_density_combo.findData("compact")
     )
@@ -87,6 +95,8 @@ def test_apply_and_ok_persist_settings(tmp_path: Path, qapp: QApplication) -> No
     assert ConfigManager(config.path).load()["thumbnail_size"] == 260
     assert changed["thumbnail_frame_ratio"] == "portrait_2_3"
     assert changed["thumbnail_crop_mode"] == "letterbox"
+    assert changed["thumbnail_quality_mode"] == "economy"
+    assert changed["thumbnail_cache_max_edge"] == 768
     assert changed["browser_display_density"] == "compact"
     assert changed["browser_sort_key"] == "file_size"
     assert changed["browser_sort_order"] == "descending"

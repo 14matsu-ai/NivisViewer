@@ -51,7 +51,13 @@
     - お気に入りフォルダと5種のサイドバーレイアウト
     - current folderへのgeneration付きツリー同期
     - お気に入り／ツリーをコピー・移動先として利用
-18. 後続候補：ファイル操作と項目表示の拡張
+18. Sprint 15追補：高DPIサムネイル鮮明化（完了）
+    - DPR-aware high-resolution thumbnail cache
+    - display size／cache physical sizeの分離
+    - multi-resolution cache selectionとprogressive replacement
+    - WebP／PNG encoding quality review
+    - fractional-DPIでのphysical pixel snapping
+19. 後続候補：ファイル操作と項目表示の拡張
     - Browser一覧からツリー／お気に入りへのドラッグ＆ドロップ
     - Ctrl＝コピー、Shift＝移動等のWindows型操作
     - 衝突時のスキップ／別名／上書き選択UI
@@ -61,9 +67,9 @@
     - 再帰的なサブフォルダ表示
     - PDFパスワード入力、PDF目次
     - 画像中央クロップ／余白除去、Viewerメモリ予算調整
-19. 後続候補：レート／タグ編集UIと検索
+20. 後続候補：レート／タグ編集UIと検索
     - 基本ナビゲーションとファイル操作の安定後に着手
     - ZipPla `{zpi$...}` の明示的な読み取り互換
     - タグ・レート検索と絞り込み
     - サムネイル上のレート／タグ表示
-20. 公開前ライセンス監査、コード署名の将来検討
+21. 公開前ライセンス監査、コード署名の将来検討

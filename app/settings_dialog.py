@@ -446,8 +446,26 @@ class SettingsDialog(QDialog):
             self.thumbnail_crop_mode_combo.addItem(label, mode)
         form.addRow("切り抜き:", self.thumbnail_crop_mode_combo)
 
+        self.thumbnail_quality_mode_combo = QComboBox(cache_group)
+        self.thumbnail_quality_mode_combo.addItem("容量優先", "economy")
+        self.thumbnail_quality_mode_combo.addItem("自動・推奨", "auto")
+        self.thumbnail_quality_mode_combo.addItem("高画質", "high")
+        self.thumbnail_quality_mode_combo.setToolTip(
+            "容量優先: 表示に近い解像度。自動: 高DPIと再縮小を考慮。"
+            "高画質: より大きなキャッシュを使用します。"
+        )
+        form.addRow("生成品質:", self.thumbnail_quality_mode_combo)
+
+        self.thumbnail_cache_max_edge_spin = QSpinBox(cache_group)
+        self.thumbnail_cache_max_edge_spin.setRange(256, 2048)
+        self.thumbnail_cache_max_edge_spin.setSingleStep(256)
+        self.thumbnail_cache_max_edge_spin.setSuffix(" px")
+        form.addRow("生成最大辺:", self.thumbnail_cache_max_edge_spin)
+
         bucket_note = QLabel(
-            "生成・キャッシュは近い幅・高さbucketへ量子化して再利用します。",
+            "論理表示サイズと画面DPIから物理解像度を選び、複数のbucketを"
+            "再利用します。設定変更後も互換キャッシュは再利用されます。"
+            "完全に作り直す場合だけ「キャッシュを削除」を使用してください。",
             cache_group,
         )
         bucket_note.setWordWrap(True)
@@ -589,6 +607,13 @@ class SettingsDialog(QDialog):
         self._select_data(
             self.thumbnail_crop_mode_combo,
             self.config.get("thumbnail_crop_mode", "smart_crop"),
+        )
+        self._select_data(
+            self.thumbnail_quality_mode_combo,
+            self.config.get("thumbnail_quality_mode", "auto"),
+        )
+        self.thumbnail_cache_max_edge_spin.setValue(
+            int(self.config.get("thumbnail_cache_max_edge", 1024))
         )
         self._select_data(
             self.browser_display_density_combo,
@@ -846,6 +871,10 @@ class SettingsDialog(QDialog):
             "thumbnail_crop_mode": str(
                 self.thumbnail_crop_mode_combo.currentData()
             ),
+            "thumbnail_quality_mode": str(
+                self.thumbnail_quality_mode_combo.currentData()
+            ),
+            "thumbnail_cache_max_edge": self.thumbnail_cache_max_edge_spin.value(),
             "browser_display_density": str(
                 self.browser_display_density_combo.currentData()
             ),

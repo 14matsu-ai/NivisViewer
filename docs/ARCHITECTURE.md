@@ -379,9 +379,21 @@ BrowserWindowは`last_browser_path`、`browser_sidebar_visible`、`browser_sideb
 
 ### Browser固定セルとサムネイル要求
 
-Browser一覧は`QListView`のIconModeと固定`gridSize`、`BrowserItemDelegate`を使用します。デリゲートの`sizeHint()`は項目内容に依存せず、サムネイル領域とタイトル領域の大きさを表示密度ごとに固定します。`thumbnail_size`は画像枠の長辺のlogical pixelであり、選択した`thumbnail_frame_ratio`から枠の幅と高さを決定します。後着したサムネイルは`DecorationRole`だけを更新するためセル配置を変更しません。
+Browser一覧は`QListView`のIconModeと固定`gridSize`、`BrowserItemDelegate`を使用します。デリゲートの`sizeHint()`は項目内容に依存せず、サムネイル領域とタイトル領域の大きさを表示密度ごとに固定します。`thumbnail_size`は画像枠の長辺のlogical pixelであり、選択した`thumbnail_frame_ratio`から枠の幅と高さを決定します。後着したQImageは項目固有のroleだけを更新するためセル配置を変更しません。
 
-サムネイル要求は可視範囲を最優先にし、その前後2画面だけを先読みします。スクロール量と時間から高速スクロールを検出した間は先読み要求をキャンセルし、停止から180ms後に再開します。フォルダを開いた時点で全項目を要求しません。長辺は96、128、160、192、256、320、384pxへ量子化し、そこから得たframe width／height、比率ID、crop mode、smart crop version、実装versionを2次元cache tokenへ含めます。同一bucket、比率、crop modeでは既存のメモリ／ディスクキャッシュとgenerationを再利用します。モデルは正規化パスから行番号への索引を持ち、サムネイル後着時の項目検索を項目数に依存しない処理にします。
+サムネイル要求は可視範囲を最優先にし、その前後2画面だけを先読みします。スクロール量と時間から高速スクロールを検出した間は先読み要求をキャンセルし、停止から180ms後に再開します。フォルダを開いた時点で全項目を要求しません。モデルは正規化パスから行番号への索引を持ち、サムネイル後着時の項目検索を項目数に依存しない処理にします。
+
+### DPR-awareサムネイル描画と複数解像度キャッシュ
+
+`ThumbnailRenderPolicy`は一覧のlogical display sizeとキャッシュのphysical pixel sizeを分離します。必要な物理解像度はlogical frameの各辺へ、BrowserWindowが置かれたscreenのDPRと品質余裕（容量優先1.0、自動√2、高画質2.0）を掛け、上方向へ丸めて決めます。レイアウトへDPRを掛けず、キャッシュ生成だけへ一度適用します。長辺bucketは96、128、160、192、256、320、384、512、768、1024、1536、2048pxで、設定した256～2048pxの最大辺を上限にします。
+
+キャッシュキーはphysical frame width／height、logical frame ratio、crop mode、smart crop version、quality mode、encoder format／quality、render policy versionとsource fingerprintを含みます。書庫ではsource fingerprintとentry pathもcrop rectの識別に含めます。旧versionはmissとして扱い、同一source／ratio／crop／policyの複数解像度を共存させます。要求以上の最小解像度を選び、なければ元画像または書庫内元画像から不足bucketだけを生成します。小さいキャッシュから大きいキャッシュは作りません。
+
+小さい互換キャッシュしかない場合は項目を`low_resolution_placeholder`として一時表示し、同じgenerationで高解像度版を要求します。到着時は該当項目のQImage roleだけを置換し、選択、current、scroll、一覧layoutを変更しません。5%のbucket丸め許容を除き、小さいキャッシュと小さい元画像を最終表示用に拡大しません。高DPI版は低DPI画面で1回縮小して再利用できます。
+
+生成はworker内でPillow LANCZOSを使い、元画像（smart cropでは元画像のcrop領域）から最終physical sizeへ原則1回だけ縮小します。smart crop解析用の最大256px proxyは表示画像の中間生成物にはしません。ディスクは不透明画像をWebP quality 90、実際に透過を持つ画像をlossless WebP、WebP非対応環境をPNGで保存します。cache schemaとrender implementation versionを更新し、旧キャッシュを誤利用しません。
+
+delegateはQIconへの事前縮小を挟まず、DPR 1.0のcache QImageを明示destination rectへ直接描画します。destinationの四辺をphysical pixel空間でroundしてlogical座標へ戻し、`SmoothPixmapTransform`を有効にします。screen変更またはDPI変更では可視項目だけを新しいrender targetで再要求し、既存の十分大きいcacheを縮小再利用します。通常はログを出さず、`nivisviewer.thumbnail` loggerのDEBUG時だけlogical frame、DPR、cache/display pixel、upscale率、resize回数、source/proxy/cache size、encoder policyを記録します。
 
 `thumbnail_crop_mode`は次の3方式です。
 

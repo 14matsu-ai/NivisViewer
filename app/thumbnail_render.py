@@ -8,13 +8,34 @@ from pathlib import Path
 from threading import Lock
 
 from PIL import Image, ImageChops, ImageFilter, ImageOps, ImageStat
-from PySide6.QtCore import QSize
+from PySide6.QtCore import QRectF, QSize
 from PySide6.QtGui import QImage
 
 
-THUMBNAIL_IMPLEMENTATION_VERSION = 2
+THUMBNAIL_IMPLEMENTATION_VERSION = 3
+THUMBNAIL_RENDER_POLICY_VERSION = 1
 SMART_CROP_ALGORITHM_VERSION = 1
-THUMBNAIL_SIZE_BUCKETS = (96, 128, 160, 192, 256, 320, 384)
+THUMBNAIL_SIZE_BUCKETS = (
+    96,
+    128,
+    160,
+    192,
+    256,
+    320,
+    384,
+    512,
+    768,
+    1024,
+    1536,
+    2048,
+)
+THUMBNAIL_QUALITY_MARGINS = {
+    "economy": 1.0,
+    "auto": math.sqrt(2),
+    "high": 2.0,
+}
+THUMBNAIL_ENCODER_FORMAT = "webp-or-png"
+THUMBNAIL_ENCODER_QUALITY = 90
 
 FRAME_RATIOS: dict[str, tuple[float, str]] = {
     "square_1_1": (1.0, "1:1"),
@@ -40,6 +61,16 @@ def quantize_thumbnail_size(size: int) -> int:
     return min(THUMBNAIL_SIZE_BUCKETS, key=lambda bucket: (abs(bucket - value), bucket))
 
 
+def quantize_thumbnail_required_edge(required_edge: float, max_edge: int = 1024) -> int:
+    """Select the smallest cache bucket that satisfies a physical-pixel request."""
+    cap = max(256, min(2048, int(max_edge)))
+    usable = tuple(bucket for bucket in THUMBNAIL_SIZE_BUCKETS if bucket <= cap)
+    if not usable:
+        return cap
+    required = max(1, math.ceil(float(required_edge)))
+    return next((bucket for bucket in usable if bucket >= required), usable[-1])
+
+
 def frame_size_from_long_edge(size: int, ratio_id: str) -> QSize:
     long_edge = max(1, int(size))
     ratio = FRAME_RATIOS.get(
@@ -61,6 +92,10 @@ class ThumbnailRenderSpec:
     frame_height: int
     frame_ratio_id: str
     crop_mode: str
+    quality_mode: str = "economy"
+    encoder_format: str = THUMBNAIL_ENCODER_FORMAT
+    encoder_quality: int = THUMBNAIL_ENCODER_QUALITY
+    render_policy_version: int = THUMBNAIL_RENDER_POLICY_VERSION
     smart_crop_version: int = SMART_CROP_ALGORITHM_VERSION
     implementation_version: int = THUMBNAIL_IMPLEMENTATION_VERSION
 
@@ -70,6 +105,10 @@ class ThumbnailRenderSpec:
         thumbnail_size: int,
         frame_ratio_id: str,
         crop_mode: str,
+        *,
+        device_pixel_ratio: float = 1.0,
+        quality_mode: str = "economy",
+        max_edge: int = 1024,
     ) -> ThumbnailRenderSpec:
         ratio_id = (
             frame_ratio_id
@@ -77,11 +116,27 @@ class ThumbnailRenderSpec:
             else "portrait_1_sqrt2"
         )
         mode = crop_mode if crop_mode in CROP_MODES else "smart_crop"
+        normalized_quality = (
+            quality_mode
+            if quality_mode in THUMBNAIL_QUALITY_MARGINS
+            else "auto"
+        )
+        required_edge = (
+            max(1, int(thumbnail_size))
+            * max(0.5, min(8.0, float(device_pixel_ratio)))
+            * THUMBNAIL_QUALITY_MARGINS[normalized_quality]
+        )
         frame = frame_size_from_long_edge(
-            quantize_thumbnail_size(thumbnail_size),
+            quantize_thumbnail_required_edge(required_edge, max_edge),
             ratio_id,
         )
-        return cls(frame.width(), frame.height(), ratio_id, mode)
+        return cls(
+            frame.width(),
+            frame.height(),
+            ratio_id,
+            mode,
+            quality_mode=normalized_quality,
+        )
 
     @property
     def long_edge(self) -> int:
@@ -91,12 +146,111 @@ class ThumbnailRenderSpec:
     def cache_token(self) -> int:
         payload = (
             f"{self.frame_width}x{self.frame_height}|{self.frame_ratio_id}|"
-            f"{self.crop_mode}|{self.smart_crop_version}|"
+            f"{self.crop_mode}|{self.quality_mode}|{self.encoder_format}|"
+            f"{self.encoder_quality}|{self.render_policy_version}|"
+            f"{self.smart_crop_version}|{self.implementation_version}"
+        ).encode("utf-8")
+        return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & (
+            (1 << 63) - 1
+        )
+
+    @property
+    def family_token(self) -> int:
+        """Cache identity shared by compatible physical resolutions."""
+        payload = (
+            f"{self.frame_ratio_id}|{self.crop_mode}|{self.quality_mode}|"
+            f"{self.encoder_format}|{self.encoder_quality}|"
+            f"{self.render_policy_version}|{self.smart_crop_version}|"
             f"{self.implementation_version}"
         ).encode("utf-8")
         return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & (
             (1 << 63) - 1
         )
+
+
+@dataclass(frozen=True)
+class ThumbnailRenderPolicy:
+    """Converts logical Browser geometry into a physical cache request."""
+
+    logical_thumbnail_size: int
+    frame_ratio_id: str
+    crop_mode: str
+    device_pixel_ratio: float = 1.0
+    quality_mode: str = "auto"
+    max_edge: int = 1024
+
+    @property
+    def logical_frame_size(self) -> QSize:
+        return frame_size_from_long_edge(
+            max(1, int(self.logical_thumbnail_size)),
+            self.frame_ratio_id,
+        )
+
+    @property
+    def quality_margin(self) -> float:
+        return THUMBNAIL_QUALITY_MARGINS.get(self.quality_mode, math.sqrt(2))
+
+    @property
+    def required_physical_edge(self) -> int:
+        return math.ceil(
+            max(1, int(self.logical_thumbnail_size))
+            * max(0.5, min(8.0, float(self.device_pixel_ratio)))
+            * self.quality_margin
+        )
+
+    def render_spec(self) -> ThumbnailRenderSpec:
+        return ThumbnailRenderSpec.from_settings(
+            self.logical_thumbnail_size,
+            self.frame_ratio_id,
+            self.crop_mode,
+            device_pixel_ratio=self.device_pixel_ratio,
+            quality_mode=self.quality_mode,
+            max_edge=self.max_edge,
+        )
+
+    def diagnostics(self) -> ThumbnailRenderDiagnostics:
+        logical = self.logical_frame_size
+        spec = self.render_spec()
+        display_width = logical.width() * self.device_pixel_ratio
+        display_height = logical.height() * self.device_pixel_ratio
+        return ThumbnailRenderDiagnostics(
+            logical_frame=(logical.width(), logical.height()),
+            window_dpr=float(self.device_pixel_ratio),
+            cache_pixels=(spec.frame_width, spec.frame_height),
+            qimage_dpr=1.0,
+            display_pixels=(
+                math.ceil(display_width),
+                math.ceil(display_height),
+            ),
+            upscale_factor=max(
+                display_width / max(1, spec.frame_width),
+                display_height / max(1, spec.frame_height),
+            ),
+            resize_count=1,
+            smooth_pixmap_transform=True,
+        )
+
+
+@dataclass(frozen=True)
+class ThumbnailRenderDiagnostics:
+    logical_frame: tuple[int, int]
+    window_dpr: float
+    cache_pixels: tuple[int, int]
+    qimage_dpr: float
+    display_pixels: tuple[int, int]
+    upscale_factor: float
+    resize_count: int
+    smooth_pixmap_transform: bool
+
+
+def snap_logical_rect_to_physical_pixels(rect: QRectF, dpr: float) -> QRectF:
+    """Snap both rectangle edges in physical space, then return logical units."""
+    scale = max(0.5, float(dpr))
+    left = round(rect.left() * scale) / scale
+    top = round(rect.top() * scale) / scale
+    right = round(rect.right() * scale) / scale
+    bottom = round(rect.bottom() * scale) / scale
+    return QRectF(left, top, max(0.0, right - left), max(0.0, bottom - top))
 
 
 class SmartCropCache:
@@ -244,6 +398,7 @@ def render_pil_thumbnail(
     frame = image.copy()
     frame.seek(0)
     prepared = ImageOps.exif_transpose(frame)
+    source_size = prepared.size
     crop = normalized_crop
     if spec.crop_mode != "letterbox":
         if crop is None:
@@ -275,7 +430,10 @@ def render_pil_thumbnail(
         prepared.thumbnail(target, Image.Resampling.LANCZOS)
 
     if spec.crop_mode != "letterbox":
-        prepared = prepared.resize(target, Image.Resampling.LANCZOS)
+        if source_size[0] >= target[0] or source_size[1] >= target[1]:
+            prepared = prepared.resize(target, Image.Resampling.LANCZOS)
+        else:
+            prepared.thumbnail(target, Image.Resampling.LANCZOS)
     return pil_to_qimage(prepared), crop
 
 
@@ -309,4 +467,3 @@ def pil_to_qimage(image: Image.Image) -> QImage:
         ).copy()
     converted = image.convert("RGBA" if "transparency" in image.info else "RGB")
     return pil_to_qimage(converted)
-

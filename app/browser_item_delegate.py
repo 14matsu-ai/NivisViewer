@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import QModelIndex, QRect, QSize, Qt
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen
+from PySide6.QtCore import QModelIndex, QRect, QRectF, QSize, Qt
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QImage, QPainter, QPen
 from PySide6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
 from .browser_model import BrowserItem, BrowserItemKind, BrowserItemModel
@@ -13,6 +13,7 @@ from .thumbnail_render import (
     THUMBNAIL_SIZE_BUCKETS,
     frame_size_from_long_edge,
     quantize_thumbnail_size,
+    snap_logical_rect_to_physical_pixels,
 )
 
 
@@ -211,11 +212,50 @@ class BrowserItemDelegate(QStyledItemDelegate):
                 self.frame_size,
                 self.cell_padding,
             )
-            painter.fillRect(thumbnail_rect, option.palette.base())
+            dpr = max(0.5, painter.device().devicePixelRatioF())
+            snapped_frame = snap_logical_rect_to_physical_pixels(
+                QRectF(thumbnail_rect),
+                dpr,
+            )
+            painter.fillRect(snapped_frame, option.palette.base())
             painter.setPen(QPen(option.palette.mid().color(), 1))
-            painter.drawRect(thumbnail_rect.adjusted(0, 0, -1, -1))
-            icon = index.data(Qt.ItemDataRole.DecorationRole)
-            if isinstance(icon, QIcon) and not icon.isNull():
+            painter.drawRect(snapped_frame.adjusted(0, 0, -1 / dpr, -1 / dpr))
+            thumbnail_image = index.data(BrowserItemModel.ThumbnailImageRole)
+            if isinstance(thumbnail_image, QImage) and not thumbnail_image.isNull():
+                self._paint_thumbnail_image(
+                    painter,
+                    thumbnail_rect,
+                    thumbnail_image,
+                    enabled=bool(option.state & QStyle.StateFlag.State_Enabled),
+                )
+            else:
+                icon = index.data(Qt.ItemDataRole.DecorationRole)
+                self._paint_fallback_icon(painter, thumbnail_rect, icon, option)
+            if bool(index.data(BrowserItemModel.ThumbnailLowResolutionRole)):
+                color = option.palette.highlight().color()
+                color.setAlpha(190)
+                painter.setPen(QPen(color, 1, Qt.PenStyle.DotLine))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(
+                    snap_logical_rect_to_physical_pixels(
+                        QRectF(thumbnail_rect.adjusted(2, 2, -3, -3)),
+                        dpr,
+                    )
+                )
+            self._paint_type_icon(painter, thumbnail_rect, item)
+            self._paint_title(painter, option, thumbnail_rect, item.display_name)
+            self._paint_interaction_frame(painter, option, thumbnail_rect)
+        finally:
+            painter.restore()
+
+    @staticmethod
+    def _paint_fallback_icon(
+        painter: QPainter,
+        thumbnail_rect: QRect,
+        icon: object,
+        option: QStyleOptionViewItem,
+    ) -> None:
+        if isinstance(icon, QIcon) and not icon.isNull():
                 mode = (
                     QIcon.Mode.Disabled
                     if not (option.state & QStyle.StateFlag.State_Enabled)
@@ -230,11 +270,49 @@ class BrowserItemDelegate(QStyledItemDelegate):
                     )
                     point = thumbnail_rect.center() - scaled.rect().center()
                     painter.drawPixmap(point, scaled)
-            self._paint_type_icon(painter, thumbnail_rect, item)
-            self._paint_title(painter, option, thumbnail_rect, item.display_name)
-            self._paint_interaction_frame(painter, option, thumbnail_rect)
-        finally:
-            painter.restore()
+
+    @staticmethod
+    def _paint_thumbnail_image(
+        painter: QPainter,
+        thumbnail_rect: QRect,
+        image: QImage,
+        *,
+        enabled: bool,
+    ) -> None:
+        available = QRectF(thumbnail_rect.adjusted(4, 4, -4, -4))
+        source_ratio = image.width() / max(1, image.height())
+        target_ratio = available.width() / max(1.0, available.height())
+        if source_ratio > target_ratio:
+            width = available.width()
+            height = width / source_ratio
+        else:
+            height = available.height()
+            width = height * source_ratio
+        dpr = max(0.5, painter.device().devicePixelRatioF())
+        no_upscale = min(
+            1.0,
+            image.width() / max(1.0, width * dpr),
+            image.height() / max(1.0, height * dpr),
+        )
+        width *= no_upscale
+        height *= no_upscale
+        target = QRectF(
+            available.center().x() - width / 2,
+            available.center().y() - height / 2,
+            width,
+            height,
+        )
+        target = snap_logical_rect_to_physical_pixels(target, dpr)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        if not enabled:
+            painter.setOpacity(0.55)
+        painter.drawImage(
+            target,
+            image,
+            QRectF(0.0, 0.0, float(image.width()), float(image.height())),
+        )
+        if not enabled:
+            painter.setOpacity(1.0)
 
     @staticmethod
     def _paint_background(
@@ -305,7 +383,9 @@ class BrowserItemDelegate(QStyledItemDelegate):
         }
         badge_size = badge_sizes[self.density]
         badge = type_badge_rect(thumbnail_rect, badge_size)
-        shadow = badge.adjusted(-2, -2, 2, 2)
+        dpr = max(0.5, painter.device().devicePixelRatioF())
+        badge_target = snap_logical_rect_to_physical_pixels(QRectF(badge), dpr)
+        shadow = badge_target.adjusted(-2, -2, 2, 2)
         shadow_color = QColor(0, 0, 0, 105)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(shadow_color)
@@ -313,11 +393,14 @@ class BrowserItemDelegate(QStyledItemDelegate):
         icon = self.shell_icon_provider.icon_for(item)
         if icon.isNull():
             return
-        dpr = max(1.0, painter.device().devicePixelRatioF())
         pixel_size = max(1, round(badge_size * dpr))
         pixmap = icon.pixmap(QSize(pixel_size, pixel_size))
-        pixmap.setDevicePixelRatio(dpr)
-        painter.drawPixmap(badge, pixmap)
+        pixmap.setDevicePixelRatio(1.0)
+        painter.drawPixmap(
+            badge_target,
+            pixmap,
+            QRectF(0, 0, pixmap.width(), pixmap.height()),
+        )
 
     @staticmethod
     def _paint_interaction_frame(
@@ -325,20 +408,25 @@ class BrowserItemDelegate(QStyledItemDelegate):
         option: QStyleOptionViewItem,
         thumbnail_rect: QRect,
     ) -> None:
+        dpr = max(0.5, painter.device().devicePixelRatioF())
+
+        def snapped(adjusted: QRect) -> QRectF:
+            return snap_logical_rect_to_physical_pixels(QRectF(adjusted), dpr)
+
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
         focused = bool(option.state & QStyle.StateFlag.State_HasFocus)
         if selected:
             painter.setPen(QPen(option.palette.highlight().color(), 2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(thumbnail_rect.adjusted(1, 1, -2, -2))
+            painter.drawRect(snapped(thumbnail_rect.adjusted(1, 1, -2, -2)))
         elif hovered:
             color = option.palette.highlight().color()
             color.setAlpha(170)
             painter.setPen(QPen(color, 1))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(thumbnail_rect.adjusted(1, 1, -2, -2))
+            painter.drawRect(snapped(thumbnail_rect.adjusted(1, 1, -2, -2)))
         if focused:
             painter.setPen(QPen(option.palette.highlightedText().color(), 1))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(thumbnail_rect.adjusted(4, 4, -5, -5))
+            painter.drawRect(snapped(thumbnail_rect.adjusted(4, 4, -5, -5)))

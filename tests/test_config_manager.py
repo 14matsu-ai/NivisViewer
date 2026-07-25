@@ -20,6 +20,8 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
     assert manager.data["browser_sidebar_visible"] is True
     assert manager.data["browser_sidebar_width"] == 280
     assert manager.data["thumbnail_size"] == 180
+    assert manager.data["thumbnail_quality_mode"] == "auto"
+    assert manager.data["thumbnail_cache_max_edge"] == 1024
     assert manager.data["browser_sort_key"] == "name"
     assert manager.data["browser_sort_order"] == "ascending"
     assert manager.data["browser_folders_first"] is True
@@ -104,6 +106,33 @@ def test_thumbnail_size_has_safe_lower_bound(tmp_path: Path) -> None:
     manager.apply({"thumbnail_size": -20})
 
     assert manager.get("thumbnail_size") == 96
+
+
+def test_thumbnail_quality_settings_are_normalized_and_persisted(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    manager = ConfigManager(path)
+    manager.load()
+    manager.apply(
+        {
+            "thumbnail_quality_mode": "high",
+            "thumbnail_cache_max_edge": 1536,
+        },
+        save=True,
+    )
+    restored = ConfigManager(path).load()
+    assert restored["thumbnail_quality_mode"] == "high"
+    assert restored["thumbnail_cache_max_edge"] == 1536
+
+    manager.apply(
+        {
+            "thumbnail_quality_mode": "unknown",
+            "thumbnail_cache_max_edge": 99999,
+        }
+    )
+    assert manager.get("thumbnail_quality_mode") == "auto"
+    assert manager.get("thumbnail_cache_max_edge") == 2048
 
 
 def test_browser_setting_values_are_not_shared_between_instances(
