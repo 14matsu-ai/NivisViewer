@@ -1,3 +1,4 @@
 PySide6
 Pillow
 natsort
+pypdfium2>=5.12,<6

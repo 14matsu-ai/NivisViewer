@@ -39,14 +39,17 @@ from .config_manager import ConfigManager
 from .image_cache import CachedImage, PRELOAD_RADIUS
 from .image_source import (
     ARCHIVE_EXTENSIONS,
+    PDF_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
     ImageSourceError,
     create_image_source,
 )
 from .metadata_store import MetadataStore
+from .pdf_backend import PageRenderSpec
+from .pdf_image_source import PdfImageSource
 from .thumbnail_provider import PageThumbnailProvider
 from . import viewer_commands as commands
-from .viewer_widget import ViewerImage, ViewerWidget
+from .viewer_widget import ViewerImage, ViewerWidget, calculate_spread_layout
 
 
 class ViewerWindow(QMainWindow):
@@ -63,6 +66,7 @@ class ViewerWindow(QMainWindow):
         open_path_handler: Callable[[str, bool | None, object], object] | None = None,
         adjacent_book_handler: Callable[[object, int], str] | None = None,
         archive_backend_registry=None,
+        pdfium_service=None,
     ) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -77,12 +81,27 @@ class ViewerWindow(QMainWindow):
             archive_backend_registry
             or ArchiveBackendRegistry(config_manager=self.config)
         )
+        if pdfium_service is None:
+            from .pdfium_service import PdfiumService
+
+            pdfium_service = PdfiumService()
+            self._owns_pdfium_service = True
+        else:
+            self._owns_pdfium_service = False
+        self.pdfium_service = pdfium_service
         self.book_session = book_session or BookSession(
             int(self.settings.get("cache_size", 10)),
             self,
             source_factory=lambda source_path, **kwargs: create_image_source(
                 source_path,
                 archive_backend_registry=self.archive_backend_registry,
+                pdfium_service=self.pdfium_service,
+                pdf_render_base_dpi=int(
+                    self.settings.get("pdf_render_base_dpi", 96)
+                ),
+                pdf_render_annotations=bool(
+                    self.settings.get("pdf_render_annotations", True)
+                ),
                 **kwargs,
             ),
         )
@@ -152,6 +171,10 @@ class ViewerWindow(QMainWindow):
         self.slideshow_timer = QTimer(self)
         self.slideshow_timer.setInterval(max(500, self.slideshow_interval_ms))
         self.slideshow_timer.timeout.connect(self._advance_slideshow)
+        self._pdf_render_timer = QTimer(self)
+        self._pdf_render_timer.setSingleShot(True)
+        self._pdf_render_timer.setInterval(180)
+        self._pdf_render_timer.timeout.connect(self._rerender_pdf)
         self.image_cache.set_adjustments(brightness=self.brightness, contrast=self.contrast, gamma=self.gamma)
 
         self._build_ui()
@@ -257,6 +280,7 @@ class ViewerWindow(QMainWindow):
         self.viewer.gestureRecognized.connect(self._on_mouse_gesture)
         self.viewer.extraMouseButtonPressed.connect(self._on_extra_mouse_button)
         self.viewer.zoomChanged.connect(self._on_zoom_changed)
+        self.viewer.viewportChanged.connect(self._schedule_pdf_rerender)
         self.slider.valueChanged.connect(self._on_slider_changed)
 
     def _create_menus(self) -> None:
@@ -712,7 +736,7 @@ class ViewerWindow(QMainWindow):
 
     def open_dialog(self) -> None:
         start = self.settings.get("last_open_path") or str(Path.home())
-        extensions = sorted(SUPPORTED_EXTENSIONS | ARCHIVE_EXTENSIONS)
+        extensions = sorted(SUPPORTED_EXTENSIONS | ARCHIVE_EXTENSIONS | PDF_EXTENSIONS)
         patterns = " ".join(f"*{extension}" for extension in extensions)
         image_filter = f"画像/書庫 ({patterns});;すべてのファイル (*.*)"
         path, _ = QFileDialog.getOpenFileName(self, "画像、ZIP/CBZ、またはフォルダを開く", start, image_filter)
@@ -727,13 +751,18 @@ class ViewerWindow(QMainWindow):
     def open_path(self, path: str | Path) -> bool:
         self._save_current_reading_position()
         self._active_request_id += 1
-        if Path(path).suffix.lower() in EXTERNAL_ARCHIVE_EXTENSIONS:
+        suffix = Path(path).suffix.lower()
+        if suffix in EXTERNAL_ARCHIVE_EXTENSIONS | PDF_EXTENSIONS:
             self.book_session.open_book_async(
                 path,
                 recursive_folder=self.recursive_folder,
                 sort_descending=self.sort_descending,
             )
-            self._set_status_override("書庫を読み込んでいます…")
+            self._set_status_override(
+                "PDFを読み込んでいます…"
+                if suffix in PDF_EXTENSIONS
+                else "書庫を読み込んでいます…"
+            )
             return True
         try:
             opened = self.book_session.open_book(
@@ -855,6 +884,8 @@ class ViewerWindow(QMainWindow):
             return "folder"
         if path.suffix.lower() in ARCHIVE_EXTENSIONS:
             return "archive"
+        if path.suffix.lower() in PDF_EXTENSIONS:
+            return "pdf"
         return "image"
 
     def _clear_page_history(self) -> None:
@@ -1414,6 +1445,7 @@ class ViewerWindow(QMainWindow):
         self._active_request_id += 1
         spread = self.model.spread_at()
         self._visible_page_indexes = tuple(slot.page_index for slot in spread.slots)
+        self.image_cache.set_render_spec(self._current_pdf_render_spec())
         self.image_cache.preload_around(
             self.model.current_index,
             radius=PRELOAD_RADIUS,
@@ -1457,7 +1489,16 @@ class ViewerWindow(QMainWindow):
             and width >= 2
         )
         if not should_split:
-            return [ViewerWidget.from_qimage(cached.page_index, cached.image_id, cached.qimage, cached.original_size)]
+            return [
+                ViewerWidget.from_qimage(
+                    cached.page_index,
+                    cached.image_id,
+                    cached.qimage,
+                    cached.original_size,
+                    cached.rendered_size,
+                    bool(cached.rendered_rotation),
+                )
+            ]
 
         left_width = width // 2
         right_width = width - left_width
@@ -1650,8 +1691,15 @@ class ViewerWindow(QMainWindow):
         path = self.model.display_path_for_index(self.model.current_index)
         page_text = f"{self.model.current_index + 1} / {self.model.total_pages}"
         resolution = self.viewer.current_resolution_text()
+        zoom = (
+            f"{round(self.viewer.manual_zoom * 100)}%"
+            if self.fit_mode == "manual_zoom"
+            else ("100%" if self.fit_mode == "actual_size" else self.fit_mode)
+        )
         size = self._format_file_size(self.model.file_size_for_index(self.model.current_index))
-        details = "    ".join(part for part in (path, page_text, resolution, size) if part)
+        details = "    ".join(
+            part for part in (path, page_text, resolution, zoom, size) if part
+        )
         self.status.showMessage(details)
 
     def _set_status_override(
@@ -1701,6 +1749,59 @@ class ViewerWindow(QMainWindow):
         self._update_shared_setting("fit_mode", self.fit_mode)
         self._sync_actions()
         self._update_status()
+        self._schedule_pdf_rerender()
+
+    def _current_pdf_render_spec(self) -> dict[int, PageRenderSpec] | None:
+        if not isinstance(self.book_session.source, PdfImageSource):
+            return None
+        spread = self.model.spread_at()
+        viewport_width = max(1, self.viewer.width())
+        viewport_height = max(1, self.viewer.height())
+        logical_sizes = [
+            self.model.get_image_size(slot.page_index) or (360, 520)
+            for slot in spread.slots
+        ]
+        if self.rotation_angle in {90, 270}:
+            logical_sizes = [(height, width) for width, height in logical_sizes]
+        layout = calculate_spread_layout(
+            logical_sizes,
+            (viewport_width, viewport_height),
+            fit_mode=self.fit_mode,
+            manual_zoom=self.viewer.manual_zoom,
+            gap=self.gap,
+            join_spread_pages=self.join_spread_pages,
+            spread_is_single=spread.is_single,
+            horizontal_alignment=self.horizontal_alignment,
+        )
+        dpr = max(1.0, float(self.viewer.devicePixelRatioF()))
+        specs: dict[int, PageRenderSpec] = {}
+        first = max(0, self.model.current_index - PRELOAD_RADIUS)
+        last = min(
+            self.model.total_pages,
+            self.model.current_index + PRELOAD_RADIUS + 2,
+        )
+        for page_index in range(first, last):
+            width, height = self.model.get_image_size(page_index) or (360, 520)
+            if self.rotation_angle in {90, 270}:
+                width, height = height, width
+            specs[page_index] = PageRenderSpec(
+                max(1, round(width * layout.scale)),
+                max(1, round(height * layout.scale)),
+                device_pixel_ratio=dpr,
+                rotation_degrees=self.rotation_angle,
+                mode=self.fit_mode,
+            )
+        return specs
+
+    def _schedule_pdf_rerender(self) -> None:
+        if isinstance(self.book_session.source, PdfImageSource):
+            self._pdf_render_timer.start()
+
+    def _rerender_pdf(self) -> None:
+        if not isinstance(self.book_session.source, PdfImageSource):
+            return
+        if self.image_cache.set_render_spec(self._current_pdf_render_spec()):
+            self._refresh_view()
 
     def set_view_mode(self, mode: str) -> None:
         self.view_mode = mode
@@ -1766,6 +1867,7 @@ class ViewerWindow(QMainWindow):
         self._update_shared_setting("fit_mode", mode)
         self._sync_actions()
         self._update_status()
+        self._rerender_pdf()
 
     def zoom_in(self) -> None:
         self.viewer.set_manual_zoom(self.viewer.manual_zoom * 1.15)
@@ -1777,16 +1879,19 @@ class ViewerWindow(QMainWindow):
         self.rotation_angle = (self.rotation_angle - 90) % 360
         self.viewer.set_rotation_angle(self.rotation_angle)
         self._update_status()
+        self._rerender_pdf()
 
     def rotate_right(self) -> None:
         self.rotation_angle = (self.rotation_angle + 90) % 360
         self.viewer.set_rotation_angle(self.rotation_angle)
         self._update_status()
+        self._rerender_pdf()
 
     def reset_rotation(self) -> None:
         self.rotation_angle = 0
         self.viewer.set_rotation_angle(self.rotation_angle)
         self._update_status()
+        self._rerender_pdf()
 
     def toggle_slideshow(self) -> None:
         if self.slideshow_timer.isActive():
@@ -1904,16 +2009,19 @@ class ViewerWindow(QMainWindow):
     def _apply_cursor_visibility_policy(self) -> None:
         self.viewer.set_auto_hide_cursor(self.isFullScreen() and self.hide_cursor_in_fullscreen)
 
-    def prepare_shutdown(self) -> None:
+    def prepare_shutdown(self, *, wait_msecs: int = 250) -> None:
         if self._shutdown_prepared:
             return
         self._shutdown_prepared = True
         self.viewer.cancel_mouse_gesture()
         self.slideshow_timer.stop()
+        self._pdf_render_timer.stop()
         self._save_current_reading_position()
-        self.book_session.shutdown()
+        self.book_session.shutdown(wait_msecs=wait_msecs)
         if self._owns_archive_backend_registry:
             self.archive_backend_registry.close()
+        if self._owns_pdfium_service:
+            self.pdfium_service.shutdown()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
         self.prepare_shutdown()

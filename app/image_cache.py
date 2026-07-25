@@ -8,6 +8,7 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 from PySide6.QtGui import QImage
 
 from .image_source import ImageSource
+from .pdf_backend import PageRenderSpec, PdfRenderPriority
 
 
 PRELOAD_RADIUS = 3
@@ -21,6 +22,8 @@ class CachedImage:
     original_size: tuple[int, int] | None
     error: str | None
     generation: int
+    rendered_size: tuple[int, int] | None = None
+    rendered_rotation: int = 0
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,8 @@ class _ImageLoadTask(QRunnable):
         image_id: str,
         generation: int,
         adjustments: tuple[float, float, float],
+        render_spec: PageRenderSpec | None,
+        priority: int,
     ) -> None:
         super().__init__()
         self.source = source
@@ -48,17 +53,29 @@ class _ImageLoadTask(QRunnable):
         self.image_id = image_id
         self.generation = generation
         self.adjustments = adjustments
+        self.render_spec = render_spec
+        self.priority = priority
         self.signals = _ImageLoadSignals()
 
     @Slot()
     def run(self) -> None:
         try:
-            image = self.source.open_image(self.image_id)
+            renderer = getattr(self.source, "open_image_for_render", None)
+            if callable(renderer):
+                image = renderer(
+                    self.image_id,
+                    self.render_spec,
+                    priority=self.priority,
+                    generation=self.generation,
+                )
+            else:
+                image = self.source.open_image(self.image_id)
             adjusted: Image.Image | None = None
             try:
                 adjusted = self._apply_adjustments(image)
                 qimage = self._pil_to_qimage(adjusted)
-                original_size = adjusted.size
+                original_size = image.info.get("logical_size", adjusted.size)
+                rendered_size = image.info.get("pdf_render_size")
             finally:
                 if adjusted is not None and adjusted is not image:
                     adjusted.close()
@@ -70,6 +87,12 @@ class _ImageLoadTask(QRunnable):
                 original_size=original_size,
                 error=None,
                 generation=self.generation,
+                rendered_size=rendered_size,
+                rendered_rotation=(
+                    self.render_spec.rotation_degrees % 360
+                    if self.render_spec is not None
+                    else 0
+                ),
             )
         except Exception as exc:
             result = CachedImage(
@@ -117,8 +140,10 @@ class ImageCache(QObject):
         self._in_flight: dict[tuple[int, int], ImageSource] = {}
         self._wanted_indexes: set[int] = set()
         self._protected_indexes: set[int] = set()
+        self._center_index = 0
         self._thread_pool = QThreadPool(self)
         self._adjustments = (1.0, 1.0, 1.0)
+        self._render_spec: PageRenderSpec | dict[int, PageRenderSpec] | None = None
 
     def set_cache_size(self, cache_size: int) -> None:
         self.cache_size = max(1, int(cache_size))
@@ -143,6 +168,40 @@ class ImageCache(QObject):
         self._cache.clear()
         self._wanted_indexes.clear()
         self._protected_indexes.clear()
+        self._center_index = 0
+
+    def set_render_spec(
+        self,
+        render_spec: PageRenderSpec | dict[int, PageRenderSpec] | None,
+    ) -> bool:
+        if self._render_spec_signature(render_spec) == self._render_spec_signature(
+            self._render_spec
+        ):
+            return False
+        self._cancel_in_flight()
+        self._render_spec = render_spec
+        self.generation += 1
+        self._cache.clear()
+        return True
+
+    @staticmethod
+    def _render_spec_signature(
+        render_spec: PageRenderSpec | dict[int, PageRenderSpec] | None,
+    ):
+        def signature(spec: PageRenderSpec):
+            return (
+                spec.target_pixel_size,
+                spec.rotation_degrees % 360,
+                spec.mode,
+                round(max(0.1, spec.device_pixel_ratio) * 4) / 4,
+            )
+
+        if isinstance(render_spec, dict):
+            return tuple(
+                (index, signature(spec))
+                for index, spec in sorted(render_spec.items())
+            )
+        return None if render_spec is None else signature(render_spec)
 
     def clear(self) -> None:
         self._cancel_in_flight()
@@ -152,6 +211,7 @@ class ImageCache(QObject):
         self._cache.clear()
         self._wanted_indexes.clear()
         self._protected_indexes.clear()
+        self._center_index = 0
 
     def has_in_flight_for_source(self, source: ImageSource) -> bool:
         return any(active_source is source for active_source in self._in_flight.values())
@@ -181,6 +241,7 @@ class ImageCache(QObject):
         wanted.update(index for index in visible_indexes if 0 <= index < len(self.image_ids))
         self._wanted_indexes = wanted
         self._protected_indexes = set(visible_indexes)
+        self._center_index = center_index
         for (generation, index), source in tuple(self._in_flight.items()):
             if generation == self.generation and index not in wanted:
                 cancel = getattr(source, "cancel_image_request", None)
@@ -206,7 +267,28 @@ class ImageCache(QObject):
             return
 
         self._in_flight[in_flight_key] = self.source
-        task = _ImageLoadTask(self.source, page_index, self.image_ids[page_index], self.generation, self._adjustments)
+        if page_index == self._center_index:
+            priority = int(PdfRenderPriority.VIEWER_CURRENT)
+        elif page_index in self._protected_indexes:
+            priority = int(PdfRenderPriority.VIEWER_SPREAD_PARTNER)
+        elif page_index > self._center_index:
+            priority = int(PdfRenderPriority.VIEWER_NEXT)
+        else:
+            priority = int(PdfRenderPriority.VIEWER_PREVIOUS)
+        render_spec = (
+            self._render_spec.get(page_index)
+            if isinstance(self._render_spec, dict)
+            else self._render_spec
+        )
+        task = _ImageLoadTask(
+            self.source,
+            page_index,
+            self.image_ids[page_index],
+            self.generation,
+            self._adjustments,
+            render_spec,
+            priority,
+        )
         task.signals.loaded.connect(self._on_loaded)
         self._thread_pool.start(task)
 

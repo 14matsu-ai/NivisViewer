@@ -56,6 +56,8 @@ class ConfigManager(QObject):
         "join_spread_pages": False,
         "thumbnail_disk_cache_enabled": True,
         "thumbnail_cache_limit_mb": 512,
+        "pdf_render_base_dpi": 96,
+        "pdf_render_annotations": True,
         "archive_backend_preference": "auto",
         "winrar_executable": "",
         "seven_zip_executable": "",
@@ -212,6 +214,7 @@ class ConfigManager(QObject):
             "single_first_page",
             "treat_wide_image_as_single",
             "thumbnail_disk_cache_enabled",
+            "pdf_render_annotations",
         ):
             if not isinstance(normalized.get(key), bool):
                 normalized[key] = cls.DEFAULTS[key]
@@ -246,6 +249,12 @@ class ConfigManager(QObject):
             default=int(cls.DEFAULTS["thumbnail_cache_limit_mb"]),
             minimum=128,
             maximum=4096,
+        )
+        normalized["pdf_render_base_dpi"] = cls._clamped_int(
+            normalized.get("pdf_render_base_dpi"),
+            default=int(cls.DEFAULTS["pdf_render_base_dpi"]),
+            minimum=72,
+            maximum=300,
         )
         return normalized
 

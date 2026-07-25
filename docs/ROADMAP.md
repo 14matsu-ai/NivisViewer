@@ -25,7 +25,10 @@
     - 非同期の書庫一覧取得と単一ページstdout抽出
     - Browser、サムネイル、Viewer、前後の本、履歴への統合
     - 通常RARと`.part1.rar`を初期範囲とし、7z分割は正式対応外
-13. Sprint 12：PDF対応
+13. Sprint 12：PDF対応（完了）
+    - pypdfium2 v5の遅延読み込みとアプリ全体で直列化したPdfiumService
+    - Browser、表紙サムネイル、Viewer、履歴、前後の本への統合
+    - 96 logical DPI、DPR、64px bucket、リサイズ／ズーム後の再レンダー
 14. Sprint 13：レート／タグ編集UIと検索
     - 基本ナビゲーションとファイル操作の安定後に着手
     - ZipPla `{zpi$...}` の明示的な読み取り互換

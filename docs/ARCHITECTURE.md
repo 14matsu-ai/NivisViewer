@@ -256,13 +256,36 @@ WinRAR関連付けは`WinRAR.exe`自体を書庫処理として起動せず、�
 
 パスワード付き書庫は`-p-`で対話プロンプトを抑止し、検出時に`password_required`へ分類します。パスワード入力・保存は未実装です。solid書庫は一覧情報をSourceへ保持しますが、全体の事前展開は行わないため後方ページが遅い場合があります。マルチボリュームRARは通常`.rar`と`.part1.rar`を候補にし、`.part2.rar`以降と`.r00`等をBrowserおよび前後の本候補から除外します。7z分割`.7z.001`は正式対応外です。
 
-BrowserWindowはbackend利用不可でも外部書庫項目を一覧へ残し、標準の書庫アイコンへフォールバックします。サムネイル失敗はモーダル通知せず、Viewerで明示的に開いた失敗は対象Viewerのステータスへ短く表示します。RAR／7z系ファイルはSprint 10のファイル操作では通常の不透明なファイルであり、内部項目のrename、delete、追加、再圧縮は提供しません。元書庫へ書き込まず、書庫全体や一時ディレクトリへ展開せず、stdoutから単一ページだけを取得します。PDFはSprint 12で外部書庫backendとは別のImageSourceとして接続します。
+BrowserWindowはbackend利用不可でも外部書庫項目を一覧へ残し、標準の書庫アイコンへフォールバックします。サムネイル失敗はモーダル通知せず、Viewerで明示的に開いた失敗は対象Viewerのステータスへ短く表示します。RAR／7z系ファイルはSprint 10のファイル操作では通常の不透明なファイルであり、内部項目のrename、delete、追加、再圧縮は提供しません。元書庫へ書き込まず、書庫全体や一時ディレクトリへ展開せず、stdoutから単一ページだけを取得します。PDFは外部書庫backendとは別の`PdfImageSource`として接続します。
+
+### PDFレンダリング
+
+```text
+ApplicationController
+└─ PdfiumService（アプリ全体で1個）
+   ├─ 単一priority queue／専用worker
+   ├─ PdfiumBackend（pypdfium2 v5、遅延import）
+   ├─ BrowserThumbnailProvider
+   └─ ViewerWindow [0..n]
+      └─ BookSession
+         └─ PdfImageSource
+```
+
+PDFium APIはApplicationControllerが所有する1つの`PdfiumService`だけを通し、異なるPDFや複数Viewer、Browserサムネイルを含めて直列実行します。`PdfDocument`、`PdfPage`、`PdfBitmap`は専用workerの外へ渡しません。ページとbitmapはレンダーごとに明示的にcloseし、GUIへはPDFiumから独立したpixel bytesだけを返します。Sourceのcloseは同じqueueへ文書closeを登録し、終了時の`close_all`もworker内で実行します。
+
+`PdfImageSource`は文書IDと不変のページ情報だけを保持します。ページの論理寸法はPDFポイントから96 logical DPIへ変換し、PDF固有回転を反映するため、PageModelはレンダリングせず横長判定と見開き構成を決定できます。PDFの`actual_size`は100%を96 logical DPI相当とし、device pixel ratioは画面上の論理サイズではなくレンダー解像度だけへ反映します。
+
+ViewerのPDFレンダー要求は表示矩形、DPR、表示モードから目標pixel数を作り、64px単位で切り上げます。最大1辺32,768px、最大64,000,000画素へ制限します。現在ページを最優先とし、前後ページとBrowserサムネイルは低優先にします。同一文書・ページ・サイズ・回転・用途・注釈設定のpending要求は共有し、より高い優先度へ昇格できます。リサイズと連続ズーム中は既存pixmapを一時拡縮し、停止から180ms後に高品質画像へ差し替えます。ImageCache generationとBookSession generationにより別ページ・別文書の後着結果を破棄します。
+
+Browser scannerはPDFium依存の有無に関係なく`.pdf`を`pdf`項目として列挙します。表紙サムネイルは第1ページだけを同じPdfiumServiceへ低優先で要求し、既存のメモリ／ディスクキャッシュへ保存します。パスワード、破損、0ページ、backend不在では静かに標準アイコンへ戻ります。明示openはBookSessionの非同期prepareを使用し、成功時だけ現在Source、履歴、読書位置へcommitします。
+
+PDFは元ファイルへ書き込まず、隣へ画像・サイドカー・キャッシュを作りません。注釈は`draw_annots=True`で表示しますが、編集、フォーム入力、テキスト選択／検索、リンク、目次UI、JavaScript、XFAは初期範囲外です。パスワード付きPDFは`password_required`として検出し、パスワードを入力・保存・記録しません。pypdfium2がない場合もアプリと他形式を継続し、PDF機能だけを`backend_unavailable`にします。
 
 ### メタデータと元ファイルの分離
 
 ApplicationControllerは`<config.jsonの配置ディレクトリ>/data/metadata.sqlite3`に接続するMetadataStoreを1つだけ所有し、BrowserWindowとすべてのViewerWindowへ共有注入します。各ウィンドウは独自接続を生成しません。DBは`PRAGMA user_version`でスキーマバージョンを保持し、`library_items`、`reading_history`、`browser_bookmarks`、`tags`、`item_tags`を管理します。
 
-NivisViewerのメタデータは元画像、画像フォルダ、ZIP/CBZ/RAR/CBR/7z/CB7から完全に分離します。レート、タグ、ブックマーク、履歴の変更先はSQLiteだけであり、元ファイル名、内容、画像メタデータ、書庫、ADS、サイドカーファイル、元ファイルと元フォルダのmtimeを変更しません。`library_items.source_mtime_ns`は元項目を確認した時点の値、`metadata_updated_at`はNivisViewer内のレートやタグの更新時刻であり、別の概念です。BrowserWindowの更新日時表示とソートは従来どおり元項目の`st_mtime_ns`だけを使います。
+NivisViewerのメタデータは元画像、画像フォルダ、ZIP/CBZ/RAR/CBR/7z/CB7/PDFから完全に分離します。レート、タグ、ブックマーク、履歴の変更先はSQLiteだけであり、元ファイル名、内容、画像メタデータ、書庫、PDF、ADS、サイドカーファイル、元ファイルと元フォルダのmtimeを変更しません。`library_items.source_mtime_ns`は元項目を確認した時点の値、`metadata_updated_at`はNivisViewer内のレートやタグの更新時刻であり、別の概念です。BrowserWindowの更新日時表示とソートは従来どおり元項目の`st_mtime_ns`だけを使います。
 
 パスは絶対化、区切りの正規化、Windowsの大文字小文字を考慮した正規化キーで重複を抑えます。表示用パスは元の表記を別に保持し、存在しなくなった項目も自動削除しません。欠損項目はモデルが補助表示と無効色で示し、開こうとした場合はBrowserWindowのステータスバーへ短く通知します。
 
@@ -336,7 +359,7 @@ BrowserWindowは`last_browser_path`、`browser_sidebar_visible`、`browser_sideb
 
 ## 次の構成
 
-次段階ではPageSource抽象化を進め、Sprint 12でPDFを7-Zipとは別のSourceとして接続します。基本操作と対応形式の安定後にMetadataStoreのレート／タグAPIへ編集UI、検索、絞り込み、サムネイル上の表示を接続します。ZipPlaの`{zpi$...}`は明示的な読み取り互換から始め、元ファイルへ自動的に書き戻さない境界を維持します。
+次段階では既存ImageSourceとPDFのtarget-aware renderingを踏まえてPageSource抽象化を進めます。基本操作と対応形式の安定後にMetadataStoreのレート／タグAPIへ編集UI、検索、絞り込み、サムネイル上の表示を接続します。ZipPlaの`{zpi$...}`は明示的な読み取り互換から始め、元ファイルへ自動的に書き戻さない境界を維持します。
 
 `ApplicationController`は引き続きアプリ全体の寿命、共有設定、単一MetadataStore、ウィンドウ群、ウィンドウ間イベントを管理します。`BrowserWindow`は本を探して選ぶ責務、`ViewerWindow`はBookSessionとViewerWidgetを接続して読む責務を持ちます。PageModelはGUIに依存しない状態を保ちます。
 

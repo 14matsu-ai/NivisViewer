@@ -24,6 +24,7 @@ from .image_source import (
     SUPPORTED_EXTENSIONS,
 )
 from .metadata_store import MetadataStore
+from .pdfium_service import PdfiumService
 from .viewer_window import ViewerWindow
 
 
@@ -48,6 +49,7 @@ class ApplicationController(QObject):
         metadata_store: MetadataStore | None = None,
         window_factory: WindowFactory = ViewerWindow,
         browser_window_factory: BrowserWindowFactory = BrowserWindow,
+        pdfium_service: PdfiumService | None = None,
     ) -> None:
         super().__init__(parent if parent is not None else application)
         self.application = application
@@ -60,6 +62,7 @@ class ApplicationController(QObject):
         self.archive_backend_registry = ArchiveBackendRegistry(
             config_manager=self.config,
         )
+        self.pdfium_service = pdfium_service or PdfiumService()
         self.config.settings_changed.connect(self._on_controller_settings_changed)
         self.file_operation_coordinator = FileOperationCoordinator(
             self.metadata_store,
@@ -111,6 +114,7 @@ class ApplicationController(QObject):
             affected_viewers_handler=self.viewers_using_paths,
             close_affected_viewers_handler=self.close_viewers,
             archive_backend_registry=self.archive_backend_registry,
+            pdfium_service=self.pdfium_service,
         )
         self._browser_window = window
         self._quit_requested = False
@@ -142,6 +146,7 @@ class ApplicationController(QObject):
             open_path_handler=self._handle_viewer_open_request,
             adjacent_book_handler=self.open_adjacent_book,
             archive_backend_registry=self.archive_backend_registry,
+            pdfium_service=self.pdfium_service,
         )
         self._viewer_windows.append(window)
         self._active_viewer = window
@@ -205,10 +210,12 @@ class ApplicationController(QObject):
                     break
         return tuple(affected)
 
-    def close_viewers(self, viewers: tuple[ViewerWindow, ...]) -> None:
+    def close_viewers(self, viewers: tuple[ViewerWindow, ...]) -> bool:
         for window in tuple(viewers):
             if window in self._viewer_windows:
+                window.prepare_shutdown(wait_msecs=2000)
                 window.close()
+        return self.pdfium_service.flush(wait_seconds=2.0)
 
     def open_adjacent_book(self, window: object, direction: int) -> str:
         if not isinstance(window, ViewerWindow) or window not in self._viewer_windows:
@@ -265,6 +272,7 @@ class ApplicationController(QObject):
             browser.prepare_shutdown()
         self.file_operation_coordinator.close()
         self.archive_backend_registry.close()
+        self.pdfium_service.shutdown()
         self.config.save()
         self.metadata_store.flush()
         self.metadata_store.close()

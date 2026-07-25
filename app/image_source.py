@@ -21,7 +21,8 @@ from .archive_backend import (
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".ico"}
 ZIP_ARCHIVE_EXTENSIONS = {".zip", ".cbz"}
 ARCHIVE_EXTENSIONS = set(ZIP_ARCHIVE_EXTENSIONS | EXTERNAL_ARCHIVE_EXTENSIONS)
-BOOK_FILE_EXTENSIONS = frozenset(ARCHIVE_EXTENSIONS | SUPPORTED_EXTENSIONS)
+PDF_EXTENSIONS = {".pdf"}
+BOOK_FILE_EXTENSIONS = frozenset(ARCHIVE_EXTENSIONS | SUPPORTED_EXTENSIONS | PDF_EXTENSIONS)
 
 
 class ImageSourceError(RuntimeError):
@@ -49,6 +50,9 @@ class ImageSource(ABC):
         raise NotImplementedError
 
     def file_size(self, image_id: str) -> int | None:
+        return None
+
+    def logical_size(self, image_id: str) -> tuple[int, int] | None:
         return None
 
     def close(self) -> None:
@@ -286,6 +290,9 @@ def create_image_source(
     recursive_folder: bool = False,
     sort_descending: bool = False,
     archive_backend_registry=None,
+    pdfium_service=None,
+    pdf_render_base_dpi: int = 96,
+    pdf_render_annotations: bool = True,
     cancel_token=None,
 ) -> tuple[ImageSource, str | None]:
     target = Path(path)
@@ -295,6 +302,24 @@ def create_image_source(
         return FolderImageSource(target, recursive=recursive_folder, sort_descending=sort_descending), None
 
     suffix = target.suffix.lower()
+    if suffix in PDF_EXTENSIONS:
+        if pdfium_service is None:
+            raise ImageSourceError(
+                "PDFレンダリング機能を利用できません。",
+                code="backend_unavailable",
+            )
+        from .pdf_image_source import PdfImageSource
+
+        return (
+            PdfImageSource(
+                target,
+                pdfium_service=pdfium_service,
+                cancel_token=cancel_token,
+                base_dpi=pdf_render_base_dpi,
+                draw_annotations=pdf_render_annotations,
+            ),
+            None,
+        )
     if suffix in ZIP_ARCHIVE_EXTENSIONS:
         return ZipImageSource(target, sort_descending=sort_descending), None
     if suffix in EXTERNAL_ARCHIVE_EXTENSIONS:

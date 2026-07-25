@@ -11,7 +11,7 @@ from typing import Callable
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
 from .archive_backend import EXTERNAL_ARCHIVE_EXTENSIONS, is_supported_archive_candidate
-from .image_source import ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS
+from .image_source import ARCHIVE_EXTENSIONS, PDF_EXTENSIONS, SUPPORTED_EXTENSIONS
 
 
 DEFAULT_SCAN_BATCH_SIZE = 128
@@ -106,6 +106,8 @@ def scan_entry_from_dir_entry(
                 item_kind = "archive"
             elif suffix in SUPPORTED_EXTENSIONS:
                 item_kind = "image"
+            elif suffix in PDF_EXTENSIONS:
+                item_kind = "pdf"
             else:
                 return None
         else:

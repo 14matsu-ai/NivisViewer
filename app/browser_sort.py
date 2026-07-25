@@ -50,7 +50,8 @@ _natural_key = natsort_keygen(alg=ns.IGNORECASE)
 _ITEM_TYPE_ORDER = {
     "folder": 0,
     "archive": 1,
-    "image": 2,
+    "pdf": 2,
+    "image": 3,
 }
 
 

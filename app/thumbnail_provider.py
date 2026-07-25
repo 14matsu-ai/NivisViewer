@@ -22,6 +22,7 @@ from .browser_model import (
 )
 from .browser_thumbnail_scheduler import ThumbnailPriority
 from .image_source import EXTERNAL_ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS, SevenZipImageSource
+from .pdf_backend import PageRenderSpec, PdfRenderPriority
 from .thumbnail_disk_cache import ThumbnailDiskCache
 
 
@@ -63,12 +64,14 @@ class _ThumbnailWorker(QRunnable):
         size: int,
         generation: int,
         loader: Callable[[BrowserItem, int], ThumbnailLoadResult],
+        priority: ThumbnailPriority = ThumbnailPriority.VISIBLE,
     ) -> None:
         super().__init__()
         self.item = item
         self.size = size
         self.generation = generation
         self.loader = loader
+        self.priority = ThumbnailPriority(priority)
         self.cancelled = Event()
         self.signals = _ThumbnailWorkerSignals()
 
@@ -79,6 +82,7 @@ class _ThumbnailWorker(QRunnable):
             self.item,
             self.size,
             self.cancelled,
+            self.priority,
         )
         self.signals.finished.emit(
             str(self.item.path),
@@ -103,6 +107,7 @@ class BrowserThumbnailProvider(QObject):
         disk_cache: ThumbnailDiskCache | None = None,
         disk_cache_enabled: bool = True,
         archive_backend_registry=None,
+        pdfium_service=None,
     ) -> None:
         super().__init__(parent)
         self._pool = QThreadPool(self)
@@ -121,6 +126,7 @@ class BrowserThumbnailProvider(QObject):
         self._failed: set[tuple[str, int, float | None]] = set()
         self._maintenance_started = False
         self._archive_backend_registry = archive_backend_registry
+        self._pdfium_service = pdfium_service
 
     @property
     def generation(self) -> int:
@@ -179,6 +185,7 @@ class BrowserThumbnailProvider(QObject):
                         existing.worker,
                         normalized_priority,
                     )
+                    existing.worker.priority = normalized_priority
                     self._pool.start(existing.worker, int(normalized_priority))
                 return False
 
@@ -187,6 +194,7 @@ class BrowserThumbnailProvider(QObject):
                 normalized_size,
                 requested_generation,
                 self._loader,
+                normalized_priority,
             )
             worker.signals.finished.connect(self._on_finished)
             self._pending[pending_key] = _PendingThumbnail(
@@ -328,6 +336,8 @@ class BrowserThumbnailProvider(QObject):
         size: int,
         archive_backend_registry=None,
         cancel_token=None,
+        pdfium_service=None,
+        pdf_render_priority: int = int(PdfRenderPriority.THUMBNAIL_VISIBLE),
     ) -> ThumbnailLoadResult:
         try:
             if item.kind == BrowserItemKind.IMAGE:
@@ -349,6 +359,27 @@ class BrowserThumbnailProvider(QObject):
                 return ThumbnailLoadResult(
                     BrowserThumbnailProvider._load_archive(item.path, size)
                 )
+            if item.kind == BrowserItemKind.PDF and pdfium_service is not None:
+                from .pdf_image_source import PdfImageSource
+
+                source = PdfImageSource(
+                    item.path,
+                    pdfium_service=pdfium_service,
+                    cancel_token=cancel_token,
+                )
+                try:
+                    image_id = source.list_images()[0]
+                    with source.open_image_for_render(
+                        image_id,
+                        PageRenderSpec(size, size),
+                        priority=int(pdf_render_priority),
+                        purpose="thumbnail",
+                    ) as image:
+                        return ThumbnailLoadResult(
+                            BrowserThumbnailProvider._pil_to_qimage(image, size)
+                        )
+                finally:
+                    source.close()
         except Exception:
             return ThumbnailLoadResult(None)
         return ThumbnailLoadResult(None)
@@ -358,6 +389,7 @@ class BrowserThumbnailProvider(QObject):
         item: BrowserItem,
         size: int,
         cancel_token=None,
+        thumbnail_priority: ThumbnailPriority = ThumbnailPriority.VISIBLE,
     ) -> ThumbnailLoadResult:
         failure_key = (self._path_key(item.path), size, item.modified_at)
         disk_cache = self._disk_cache
@@ -378,6 +410,8 @@ class BrowserThumbnailProvider(QObject):
                 size,
                 self._archive_backend_registry,
                 cancel_token,
+                self._pdfium_service,
+                self._pdf_render_priority(thumbnail_priority),
             )
         else:
             loaded = _invoke_thumbnail_loader(
@@ -411,6 +445,14 @@ class BrowserThumbnailProvider(QObject):
                 return
             self._maintenance_started = True
         disk_cache.prune()
+
+    @staticmethod
+    def _pdf_render_priority(priority: ThumbnailPriority) -> int:
+        return {
+            ThumbnailPriority.VISIBLE: int(PdfRenderPriority.THUMBNAIL_VISIBLE),
+            ThumbnailPriority.SELECTED: int(PdfRenderPriority.THUMBNAIL_SELECTED),
+            ThumbnailPriority.PREFETCH: int(PdfRenderPriority.THUMBNAIL_PREFETCH),
+        }[ThumbnailPriority(priority)]
 
     @Slot(str, int, int, object, object)
     def _on_finished(
@@ -578,23 +620,37 @@ class BrowserThumbnailProvider(QObject):
         _RETIRED_THUMBNAIL_PROVIDERS.discard(self)
 
 
-def _invoke_thumbnail_loader(loader, item: BrowserItem, size: int, cancel_token):
+def _invoke_thumbnail_loader(
+    loader,
+    item: BrowserItem,
+    size: int,
+    cancel_token,
+    thumbnail_priority: ThumbnailPriority = ThumbnailPriority.VISIBLE,
+):
     try:
         signature = inspect.signature(loader)
+        positional_count = len(
+            [
+                parameter
+                for parameter in signature.parameters.values()
+                if parameter.kind
+                in {
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                }
+            ]
+        )
+        accepts_priority = (
+            "thumbnail_priority" in signature.parameters
+            or positional_count >= 4
+            or any(
+                parameter.kind is inspect.Parameter.VAR_POSITIONAL
+                for parameter in signature.parameters.values()
+            )
+        )
         accepts_cancel = (
             "cancel_token" in signature.parameters
-            or len(
-                [
-                    parameter
-                    for parameter in signature.parameters.values()
-                    if parameter.kind
-                    in {
-                        inspect.Parameter.POSITIONAL_ONLY,
-                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    }
-                ]
-            )
-            >= 3
+            or positional_count >= 3
             or any(
                 parameter.kind is inspect.Parameter.VAR_POSITIONAL
                 for parameter in signature.parameters.values()
@@ -602,6 +658,9 @@ def _invoke_thumbnail_loader(loader, item: BrowserItem, size: int, cancel_token)
         )
     except (TypeError, ValueError):
         accepts_cancel = False
+        accepts_priority = False
+    if accepts_priority:
+        return loader(item, size, cancel_token, thumbnail_priority)
     if accepts_cancel:
         return loader(item, size, cancel_token)
     return loader(item, size)

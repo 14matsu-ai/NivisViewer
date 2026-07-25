@@ -112,7 +112,7 @@ from .windows_filename import (
 
 BrowserOpenHandler = Callable[[str, bool], object]
 AffectedViewersHandler = Callable[[tuple[str, ...]], tuple[object, ...]]
-CloseAffectedViewersHandler = Callable[[tuple[object, ...]], None]
+CloseAffectedViewersHandler = Callable[[tuple[object, ...]], bool | None]
 
 
 @dataclass(frozen=True)
@@ -154,6 +154,7 @@ class BrowserWindow(QMainWindow):
         affected_viewers_handler: AffectedViewersHandler | None = None,
         close_affected_viewers_handler: CloseAffectedViewersHandler | None = None,
         archive_backend_registry=None,
+        pdfium_service=None,
     ) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -171,6 +172,14 @@ class BrowserWindow(QMainWindow):
             archive_backend_registry
             or ArchiveBackendRegistry(config_manager=self.config)
         )
+        if pdfium_service is None:
+            from .pdfium_service import PdfiumService
+
+            pdfium_service = PdfiumService()
+            self._owns_pdfium_service = True
+        else:
+            self._owns_pdfium_service = False
+        self.pdfium_service = pdfium_service
         self._owns_file_operation_coordinator = file_operation_coordinator is None
         self.file_operation_coordinator = (
             file_operation_coordinator
@@ -205,6 +214,7 @@ class BrowserWindow(QMainWindow):
                     self.settings.get("thumbnail_disk_cache_enabled", True)
                 ),
                 archive_backend_registry=self.archive_backend_registry,
+                pdfium_service=self.pdfium_service,
             )
         self.thumbnail_provider = thumbnail_provider
         self.thumbnail_provider.thumbnail_ready.connect(self._on_thumbnail_ready)
@@ -918,7 +928,12 @@ class BrowserWindow(QMainWindow):
             return False
         if self._close_affected_viewers_handler is None:
             return False
-        self._close_affected_viewers_handler(viewers)
+        closed = self._close_affected_viewers_handler(viewers)
+        if closed is False:
+            self._show_temporary_status(
+                "PDFの解放を待機中のためファイル操作を開始できません"
+            )
+            return False
         return True
 
     def _prompt_for_filename(
@@ -1307,6 +1322,8 @@ class BrowserWindow(QMainWindow):
         self.thumbnail_provider.close()
         if self._owns_archive_backend_registry:
             self.archive_backend_registry.close()
+        if self._owns_pdfium_service:
+            self.pdfium_service.shutdown()
 
     def apply_settings(self, changed: dict[str, object]) -> None:
         list_keys = {
@@ -1623,6 +1640,7 @@ class BrowserWindow(QMainWindow):
                     QStyle.StandardPixmap.SP_DialogOpenButton
                 ),
                 BrowserItemKind.IMAGE: style.standardIcon(QStyle.StandardPixmap.SP_FileIcon),
+                BrowserItemKind.PDF: style.standardIcon(QStyle.StandardPixmap.SP_FileIcon),
             }
         )
 
@@ -2494,6 +2512,8 @@ class BrowserWindow(QMainWindow):
             return "folder"
         if item.kind == BrowserItemKind.ARCHIVE:
             return "archive"
+        if item.kind == BrowserItemKind.PDF:
+            return "pdf"
         return "image"
 
     @staticmethod

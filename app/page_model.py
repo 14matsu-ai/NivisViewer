@@ -109,6 +109,12 @@ class PageModel:
     def get_image_size(self, index: int) -> tuple[int, int] | None:
         if index in self._size_cache:
             return self._size_cache[index]
+        image_id = self.image_id_at(index)
+        if self.source is not None and image_id is not None:
+            logical_size = self.source.logical_size(image_id)
+            if logical_size is not None:
+                self._size_cache[index] = logical_size
+                return logical_size
         if self.source is not None and self.source.load_sizes_lazily:
             return None
 
