@@ -77,6 +77,72 @@ class BrowserNavigationHistory:
             return None
         return self._locations[self._current_index]
 
+    def relocate_path(self, old_path: str, new_path: str) -> bool:
+        return self.relocate_tree(old_path, new_path)
+
+    def relocate_tree(self, old_root: str, new_root: str) -> bool:
+        old_key = self._path_key(old_root)
+        changed = False
+        relocated: list[BrowserLocation] = []
+        relocated_current = -1
+        for index, location in enumerate(self._locations):
+            new_location = replace(
+                location,
+                path=self._relocated_value(
+                    location.path,
+                    old_root,
+                    new_root,
+                    old_key,
+                ),
+                selected_path=(
+                    self._relocated_value(
+                        location.selected_path,
+                        old_root,
+                        new_root,
+                        old_key,
+                    )
+                    if location.selected_path is not None
+                    else None
+                ),
+            )
+            changed = changed or new_location != location
+            if (
+                relocated
+                and self._path_key(relocated[-1].path)
+                == self._path_key(new_location.path)
+            ):
+                relocated[-1] = new_location
+                if index <= self._current_index:
+                    relocated_current = len(relocated) - 1
+                continue
+            relocated.append(new_location)
+            if index <= self._current_index:
+                relocated_current = len(relocated) - 1
+        if changed:
+            self._locations = relocated
+            self._current_index = relocated_current
+        return changed
+
+    @classmethod
+    def _relocated_value(
+        cls,
+        path: str,
+        old_root: str,
+        new_root: str,
+        old_key: str,
+    ) -> str:
+        key = cls._path_key(path)
+        if key == old_key:
+            return os.path.abspath(os.path.normpath(new_root))
+        prefix = old_key.rstrip("\\/") + os.sep.casefold()
+        if not key.startswith(prefix):
+            return path
+        relative = os.path.relpath(
+            os.path.abspath(os.path.normpath(path)),
+            os.path.abspath(os.path.normpath(old_root)),
+        )
+        return os.path.abspath(os.path.normpath(os.path.join(new_root, relative)))
+
     @staticmethod
     def _path_key(path: str) -> str:
         absolute = os.path.abspath(os.path.normpath(os.path.expanduser(path)))

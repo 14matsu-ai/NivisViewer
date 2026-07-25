@@ -13,6 +13,7 @@ from PySide6.QtCore import (
     QEvent,
     QItemSelectionModel,
     QModelIndex,
+    QMimeData,
     QPoint,
     QSize,
     Qt,
@@ -31,14 +32,19 @@ from PySide6.QtGui import (
     QShortcut,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QFileDialog,
     QFileSystemModel,
+    QInputDialog,
     QLineEdit,
     QListView,
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPushButton,
     QSplitter,
     QStyle,
     QTabWidget,
@@ -84,14 +90,28 @@ from .browser_thumbnail_scheduler import (
 )
 from .bookmark_model import BookmarkModel
 from .config_manager import ConfigManager
+from .file_operation_coordinator import FileOperationCoordinator
+from .file_operation_service import (
+    FileCollisionPolicy,
+    FileOperationKind,
+    FileOperationProgress,
+    FileOperationRequest,
+    FileOperationResult,
+)
 from .history_model import HistoryModel
 from .metadata_store import MetadataStore
 from .settings_dialog import SettingsDialog
 from .thumbnail_provider import BrowserThumbnailProvider, PageThumbnailProvider
 from .thumbnail_disk_cache import ThumbnailDiskCache
+from .windows_filename import (
+    generate_numbered_name,
+    validate_windows_filename,
+)
 
 
 BrowserOpenHandler = Callable[[str, bool], object]
+AffectedViewersHandler = Callable[[tuple[str, ...]], tuple[object, ...]]
+CloseAffectedViewersHandler = Callable[[tuple[object, ...]], None]
 
 
 @dataclass(frozen=True)
@@ -129,6 +149,9 @@ class BrowserWindow(QMainWindow):
         scanner: BrowserDirectoryScanner | None = None,
         thumbnail_provider: BrowserThumbnailProvider | None = None,
         metadata_store: MetadataStore | None = None,
+        file_operation_coordinator: FileOperationCoordinator | None = None,
+        affected_viewers_handler: AffectedViewersHandler | None = None,
+        close_affected_viewers_handler: CloseAffectedViewersHandler | None = None,
     ) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -139,6 +162,22 @@ class BrowserWindow(QMainWindow):
         self.settings = config_manager.data
         self.metadata_store = metadata_store
         self._open_path_handler = open_path_handler
+        self._affected_viewers_handler = affected_viewers_handler
+        self._close_affected_viewers_handler = close_affected_viewers_handler
+        self._owns_file_operation_coordinator = file_operation_coordinator is None
+        self.file_operation_coordinator = (
+            file_operation_coordinator
+            or FileOperationCoordinator(self.metadata_store)
+        )
+        self.file_operation_coordinator.operation_started.connect(
+            self._on_file_operation_started
+        )
+        self.file_operation_coordinator.operation_progress.connect(
+            self._on_file_operation_progress
+        )
+        self.file_operation_coordinator.operation_completed.connect(
+            self._on_file_operation_completed
+        )
         self.discovery = discovery or BrowserItemDiscovery()
         # The scanner is intentionally not a QObject child: a running
         # QThreadPool must not be destroyed synchronously with this window.
@@ -178,6 +217,19 @@ class BrowserWindow(QMainWindow):
         self._fast_scrolling = False
         self._last_scroll_value = 0
         self._last_scroll_time = 0.0
+        self._file_operation_request_id = 0
+        self._active_file_operation_id: int | None = None
+        self._clipboard_paths: tuple[str, ...] = ()
+        self._clipboard_cut = False
+        self._setting_clipboard = False
+        self._operation_restore_paths: tuple[str, ...] = ()
+        self._operation_restore_row: int | None = None
+        self._operation_refresh_generation: int | None = None
+        self._operation_completion_message: str | None = None
+        self._file_operation_requests: dict[int, FileOperationRequest] = {}
+        self._file_operation_selection_before: dict[
+            int, tuple[tuple[str, ...], int | None]
+        ] = {}
         self._sidebar_width = self._safe_sidebar_width(
             self.settings.get("browser_sidebar_width", 280)
         )
@@ -404,6 +456,9 @@ class BrowserWindow(QMainWindow):
                     else None
                 ),
             )
+        if self._operation_refresh_generation == result.generation:
+            self._operation_refresh_generation = None
+            QTimer.singleShot(0, self._restore_file_operation_selection)
 
     def _on_scan_failed(self, error: BrowserScanError) -> None:
         pending = self._matching_pending_scan(error.generation, error.path)
@@ -613,6 +668,527 @@ class BrowserWindow(QMainWindow):
         if self._open_path_handler is not None:
             self._open_path_handler(str(item.path), open_in_new_window)
 
+    def selected_file_operation_paths(self) -> tuple[str, ...]:
+        indexes = sorted(
+            self.list_view.selectionModel().selectedIndexes(),
+            key=lambda index: index.row(),
+        )
+        paths: list[str] = []
+        seen: set[str] = set()
+        for index in indexes:
+            item = self.item_model.item_at(index)
+            if item is None:
+                continue
+            path = str(self._absolute_browser_path(item.path))
+            key = self._path_key(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            paths.append(path)
+        return tuple(paths)
+
+    def copy_selected_items(self) -> bool:
+        paths = self.selected_file_operation_paths()
+        if not paths:
+            return False
+        self._set_file_clipboard(paths, cut=False)
+        self._show_temporary_status(f"{len(paths)}項目をコピー候補にしました")
+        return True
+
+    def cut_selected_items(self) -> bool:
+        paths = self.selected_file_operation_paths()
+        if not paths:
+            return False
+        self._set_file_clipboard(paths, cut=True)
+        self._show_temporary_status(f"{len(paths)}項目を切り取り候補にしました")
+        return True
+
+    def clear_file_clipboard(self) -> None:
+        self._clipboard_paths = ()
+        self._clipboard_cut = False
+        self._update_file_action_states()
+
+    def paste_items(self) -> bool:
+        if self.current_path is None:
+            return False
+        sources = self._clipboard_paths or self._clipboard_file_urls()
+        if not sources:
+            self._show_temporary_status("貼り付けるファイルがありません")
+            return False
+        operation = (
+            FileOperationKind.MOVE
+            if self._clipboard_paths and self._clipboard_cut
+            else FileOperationKind.COPY
+        )
+        if (
+            operation is FileOperationKind.MOVE
+            and all(
+                self._same_path(Path(path).parent, self.current_path)
+                for path in sources
+            )
+        ):
+            self._show_temporary_status("同じフォルダへの移動は行いません")
+            return False
+        return self._start_file_operation(
+            operation,
+            sources=sources,
+            destination=self.current_path,
+        )
+
+    def rename_selected_item(self) -> bool:
+        paths = self.selected_file_operation_paths()
+        if len(paths) != 1:
+            return False
+        source = Path(paths[0])
+        new_name = self._prompt_for_filename(
+            "名前の変更",
+            "新しい名前:",
+            source.name,
+        )
+        if new_name is None or new_name == source.name:
+            return False
+        old_suffix = source.suffix.casefold()
+        new_suffix = Path(new_name).suffix.casefold()
+        if old_suffix != new_suffix:
+            answer = QMessageBox.question(
+                self,
+                "拡張子の変更",
+                "拡張子を変更すると項目を開けなくなる場合があります。続行しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+        return self._start_file_operation(
+            FileOperationKind.RENAME,
+            sources=paths,
+            new_name=new_name,
+        )
+
+    def move_selected_to_recycle_bin(self) -> bool:
+        paths = self.selected_file_operation_paths()
+        if not paths:
+            return False
+        if len(paths) == 1:
+            prompt = f"「{Path(paths[0]).name}」をごみ箱へ移動しますか？"
+        else:
+            prompt = f"{len(paths)}項目をごみ箱へ移動しますか？"
+        answer = QMessageBox.question(
+            self,
+            "ごみ箱へ移動",
+            prompt,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        return self._start_file_operation(
+            FileOperationKind.RECYCLE,
+            sources=paths,
+        )
+
+    def copy_selected_to(self, destination: str | Path | None = None) -> bool:
+        paths = self.selected_file_operation_paths()
+        if not paths:
+            return False
+        target = self._choose_destination("コピー先を選択", destination)
+        if target is None:
+            return False
+        return self._start_file_operation(
+            FileOperationKind.COPY,
+            sources=paths,
+            destination=target,
+        )
+
+    def move_selected_to(self, destination: str | Path | None = None) -> bool:
+        paths = self.selected_file_operation_paths()
+        if not paths:
+            return False
+        target = self._choose_destination("移動先を選択", destination)
+        if target is None:
+            return False
+        return self._start_file_operation(
+            FileOperationKind.MOVE,
+            sources=paths,
+            destination=target,
+        )
+
+    def create_new_folder(self) -> bool:
+        if self.current_path is None:
+            return False
+        initial_name = generate_numbered_name(
+            "新しいフォルダ",
+            (item.display_name for item in self.items),
+        )
+        if initial_name is None:
+            self._show_temporary_status("新しいフォルダ名を生成できません")
+            return False
+        name = self._prompt_for_filename(
+            "新しいフォルダ",
+            "フォルダ名:",
+            initial_name,
+        )
+        if name is None:
+            return False
+        return self._start_file_operation(
+            FileOperationKind.CREATE_DIRECTORY,
+            destination=self.current_path,
+            new_name=name,
+        )
+
+    def cancel_file_operation(self) -> None:
+        if self.file_operation_coordinator.busy:
+            self.file_operation_coordinator.cancel()
+            self.statusBar().showMessage("安全な境界でキャンセルしています…")
+
+    def _start_file_operation(
+        self,
+        operation: FileOperationKind,
+        *,
+        sources: tuple[str, ...] = (),
+        destination: str | Path | None = None,
+        new_name: str | None = None,
+    ) -> bool:
+        if self.file_operation_coordinator.busy:
+            self._show_temporary_status("別のファイル操作を実行中です")
+            return False
+        if operation in {
+            FileOperationKind.RENAME,
+            FileOperationKind.MOVE,
+            FileOperationKind.RECYCLE,
+        } and not self._confirm_and_close_affected_viewers(sources):
+            return False
+        self._file_operation_request_id += 1
+        request = FileOperationRequest(
+            self._file_operation_request_id,
+            operation,
+            tuple(str(self._absolute_browser_path(path)) for path in sources),
+            (
+                str(self._absolute_browser_path(destination))
+                if destination is not None
+                else None
+            ),
+            new_name,
+            FileCollisionPolicy.SKIP,
+        )
+        selected_paths = self.selected_file_operation_paths()
+        current_row = (
+            self.list_view.currentIndex().row()
+            if self.list_view.currentIndex().isValid()
+            else None
+        )
+        self._file_operation_requests[request.request_id] = request
+        self._file_operation_selection_before[request.request_id] = (
+            selected_paths,
+            current_row,
+        )
+        if not self.file_operation_coordinator.execute(request):
+            self._file_operation_requests.pop(request.request_id, None)
+            self._file_operation_selection_before.pop(request.request_id, None)
+            self._show_temporary_status("ファイル操作を開始できません")
+            return False
+        return True
+
+    def _confirm_and_close_affected_viewers(
+        self,
+        paths: tuple[str, ...],
+    ) -> bool:
+        if self._affected_viewers_handler is None:
+            return True
+        viewers = self._affected_viewers_handler(paths)
+        if not viewers:
+            return True
+        answer = QMessageBox.question(
+            self,
+            "ViewerWindowで使用中",
+            "この項目はViewerWindowで開かれています。\n"
+            "対象Viewerを閉じて操作を続けますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        if self._close_affected_viewers_handler is None:
+            return False
+        self._close_affected_viewers_handler(viewers)
+        return True
+
+    def _prompt_for_filename(
+        self,
+        title: str,
+        label: str,
+        initial_name: str,
+    ) -> str | None:
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setLabelText(label)
+        dialog.setInputMode(QInputDialog.InputMode.TextInput)
+        dialog.setTextValue(initial_name)
+        editor = dialog.findChild(QLineEdit)
+        if editor is not None:
+            stem_length = len(Path(initial_name).stem)
+            QTimer.singleShot(
+                0,
+                lambda editor=editor, length=stem_length: editor.setSelection(0, length),
+            )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        name = dialog.textValue()
+        validation = validate_windows_filename(name)
+        if not validation.valid:
+            QMessageBox.warning(
+                self,
+                "名前を使用できません",
+                validation.error_message or "名前が無効です",
+            )
+            return None
+        return validation.normalized_name
+
+    def _choose_destination(
+        self,
+        title: str,
+        destination: str | Path | None,
+    ) -> Path | None:
+        if destination is not None:
+            return self._absolute_browser_path(destination)
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            title,
+            str(self.current_path or Path.home()),
+        )
+        return self._absolute_browser_path(selected) if selected else None
+
+    def _set_file_clipboard(self, paths: tuple[str, ...], *, cut: bool) -> None:
+        self._clipboard_paths = paths
+        self._clipboard_cut = cut
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(path) for path in paths])
+        self._setting_clipboard = True
+        try:
+            QApplication.clipboard().setMimeData(mime)
+        finally:
+            self._setting_clipboard = False
+        self._update_file_action_states()
+
+    def _clipboard_file_urls(self) -> tuple[str, ...]:
+        mime = QApplication.clipboard().mimeData()
+        if mime is None or not mime.hasUrls():
+            return ()
+        paths = [
+            url.toLocalFile()
+            for url in mime.urls()
+            if url.isLocalFile() and url.toLocalFile()
+        ]
+        return tuple(paths)
+
+    def _on_system_clipboard_changed(self) -> None:
+        if not self._setting_clipboard:
+            self.clear_file_clipboard()
+
+    def _on_file_operation_started(self, request: FileOperationRequest) -> None:
+        if self._shutdown_prepared:
+            return
+        self._active_file_operation_id = request.request_id
+        self.cancel_operation_button.setVisible(True)
+        self.cancel_operation_button.setEnabled(True)
+        self._update_file_action_states()
+        self.statusBar().showMessage(
+            f"{self._operation_label(request.operation)}中… 0 / "
+            f"{max(1, len(request.source_paths))}"
+        )
+
+    def _on_file_operation_progress(
+        self,
+        progress: FileOperationProgress,
+    ) -> None:
+        if (
+            self._shutdown_prepared
+            or progress.request_id != self._active_file_operation_id
+        ):
+            return
+        self.statusBar().showMessage(
+            f"{self._operation_label(progress.operation)}中… "
+            f"{progress.completed} / {progress.total}"
+        )
+
+    def _on_file_operation_completed(
+        self,
+        result: FileOperationResult,
+    ) -> None:
+        request = self._file_operation_requests.pop(result.request_id, None)
+        before_paths, before_row = self._file_operation_selection_before.pop(
+            result.request_id,
+            ((), None),
+        )
+        if (
+            self._shutdown_prepared
+            or request is None
+            or result.request_id != self._active_file_operation_id
+        ):
+            return
+        self._active_file_operation_id = None
+        self.cancel_operation_button.setEnabled(False)
+        self.cancel_operation_button.setVisible(False)
+        self._update_file_action_states()
+
+        if result.operation in {FileOperationKind.RENAME, FileOperationKind.MOVE}:
+            for item in result.successes:
+                if item.source_path and item.destination_path:
+                    self.navigation_history.relocate_tree(
+                        item.source_path,
+                        item.destination_path,
+                    )
+
+        if result.operation is FileOperationKind.MOVE and self._clipboard_cut:
+            succeeded = {
+                self._path_key(item.source_path)
+                for item in result.successes
+                if item.source_path
+            }
+            remaining = tuple(
+                path
+                for path in self._clipboard_paths
+                if self._path_key(path) not in succeeded
+            )
+            if remaining:
+                self._set_file_clipboard(remaining, cut=True)
+            else:
+                self.clear_file_clipboard()
+
+        success_count = len(result.successes)
+        failure_count = len(result.failures)
+        if result.cancelled:
+            completion_message = (
+                f"{self._operation_label(result.operation)}をキャンセルしました"
+            )
+        elif failure_count:
+            completion_message = (
+                f"{self._operation_label(result.operation)}完了: "
+                f"成功{success_count}件、失敗{failure_count}件"
+            )
+            codes = sorted(
+                {
+                    item.error_code or "unknown"
+                    for item in result.failures
+                }
+            )
+            QMessageBox.warning(
+                self,
+                "ファイル操作の一部を完了できませんでした",
+                f"成功: {success_count}件\n失敗: {failure_count}件\n"
+                f"エラー種別: {', '.join(codes)}\n"
+                "同名項目は上書きせずスキップします。",
+            )
+        else:
+            completion_message = (
+                f"{self._operation_label(result.operation)}が完了しました"
+            )
+
+        if self.current_path is None:
+            self._show_temporary_status(completion_message)
+            return
+
+        current_key = self._path_key(self.current_path)
+        successful_sources = {
+            self._path_key(item.source_path)
+            for item in result.successes
+            if item.source_path
+        }
+        destination_paths = tuple(
+            item.destination_path
+            for item in result.successes
+            if item.destination_path
+            and self._path_key(Path(item.destination_path).parent) == current_key
+        )
+        source_is_current = any(
+            item.source_path
+            and self._path_key(Path(item.source_path).parent) == current_key
+            for item in result.successes
+        )
+        destination_is_current = bool(destination_paths)
+        should_refresh = (
+            result.operation
+            in {
+                FileOperationKind.RENAME,
+                FileOperationKind.RECYCLE,
+                FileOperationKind.CREATE_DIRECTORY,
+            }
+            and (source_is_current or destination_is_current)
+        ) or (
+            result.operation is FileOperationKind.MOVE
+            and (source_is_current or destination_is_current)
+        ) or (
+            result.operation is FileOperationKind.COPY
+            and destination_is_current
+        )
+        if not should_refresh:
+            self._show_temporary_status(completion_message)
+            return
+
+        unaffected = tuple(
+            path
+            for path in before_paths
+            if self._path_key(path) not in successful_sources
+        )
+        self._operation_restore_paths = destination_paths or unaffected
+        self._operation_restore_row = (
+            before_row
+            if result.operation is FileOperationKind.RECYCLE
+            and not self._operation_restore_paths
+            else None
+        )
+        self._operation_completion_message = completion_message
+        if self.refresh_current_folder() and self._pending_scan is not None:
+            self._operation_refresh_generation = self._pending_scan.generation
+        else:
+            self._show_temporary_status(completion_message)
+
+    def _restore_file_operation_selection(self) -> None:
+        selection_model = self.list_view.selectionModel()
+        selection_model.clearSelection()
+        current_index = QModelIndex()
+        for path in self._operation_restore_paths:
+            row = self.item_model.row_for_path(path)
+            if row < 0:
+                continue
+            index = self.item_model.index(row, 0)
+            selection_model.select(
+                index,
+                QItemSelectionModel.SelectionFlag.Select,
+            )
+            if not current_index.isValid():
+                current_index = index
+        if not current_index.isValid() and self._operation_restore_row is not None:
+            count = self.item_model.rowCount()
+            if count:
+                row = min(max(0, self._operation_restore_row), count - 1)
+                current_index = self.item_model.index(row, 0)
+                selection_model.select(
+                    current_index,
+                    QItemSelectionModel.SelectionFlag.Select,
+                )
+        if current_index.isValid():
+            self.list_view.setCurrentIndex(current_index)
+            self.list_view.scrollTo(current_index)
+        else:
+            self.list_view.setCurrentIndex(QModelIndex())
+        self._operation_restore_paths = ()
+        self._operation_restore_row = None
+        message = self._operation_completion_message
+        self._operation_completion_message = None
+        if message:
+            self._show_temporary_status(message)
+
+    @staticmethod
+    def _operation_label(operation: FileOperationKind) -> str:
+        return {
+            FileOperationKind.RENAME: "名前変更",
+            FileOperationKind.COPY: "コピー",
+            FileOperationKind.MOVE: "移動",
+            FileOperationKind.RECYCLE: "ごみ箱への移動",
+            FileOperationKind.CREATE_DIRECTORY: "フォルダ作成",
+        }[operation]
+
     def add_browser_bookmark(
         self,
         path: str | Path,
@@ -709,6 +1285,10 @@ class BrowserWindow(QMainWindow):
         if self._shutdown_prepared:
             return
         self._shutdown_prepared = True
+        if self._active_file_operation_id is not None:
+            self.file_operation_coordinator.cancel()
+        if self._owns_file_operation_coordinator:
+            self.file_operation_coordinator.close()
         self._cancel_pending_scan(rollback_history=False)
         self.scanner.close()
         self._thumbnail_request_timer.stop()
@@ -910,6 +1490,17 @@ class BrowserWindow(QMainWindow):
             watched is not self.address_bar
             and event.type() == QEvent.Type.KeyPress
             and isinstance(event, QKeyEvent)
+            and event.key() == Qt.Key.Key_Escape
+            and watched in (self.list_view, self.list_view.viewport())
+            and bool(self._clipboard_paths)
+        ):
+            self.clear_file_clipboard()
+            self._show_temporary_status("切り取り／コピー候補を解除しました")
+            return True
+        if (
+            watched is not self.address_bar
+            and event.type() == QEvent.Type.KeyPress
+            and isinstance(event, QKeyEvent)
             and event.key() == Qt.Key.Key_Backspace
             and event.modifiers() == Qt.KeyboardModifier.NoModifier
         ):
@@ -1015,6 +1606,9 @@ class BrowserWindow(QMainWindow):
         )
         self.list_view.selectionModel().selectionChanged.connect(
             lambda _selected, _deselected: self._update_status()
+        )
+        self.list_view.selectionModel().selectionChanged.connect(
+            lambda _selected, _deselected: self._update_file_action_states()
         )
         self.list_view.verticalScrollBar().valueChanged.connect(
             self._on_list_scrolled
@@ -1141,6 +1735,40 @@ class BrowserWindow(QMainWindow):
         self.focus_address_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
         self.focus_address_shortcut.activated.connect(self.focus_address_bar)
 
+        self.rename_shortcut = QShortcut(QKeySequence("F2"), self.list_view)
+        self.rename_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.rename_shortcut.activated.connect(self.rename_selected_item)
+        self.recycle_shortcut = QShortcut(QKeySequence("Delete"), self.list_view)
+        self.recycle_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.recycle_shortcut.activated.connect(self.move_selected_to_recycle_bin)
+        self.copy_shortcut = QShortcut(QKeySequence("Ctrl+C"), self.list_view)
+        self.copy_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.copy_shortcut.activated.connect(self.copy_selected_items)
+        self.cut_shortcut = QShortcut(QKeySequence("Ctrl+X"), self.list_view)
+        self.cut_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.cut_shortcut.activated.connect(self.cut_selected_items)
+        self.paste_shortcut = QShortcut(QKeySequence("Ctrl+V"), self.list_view)
+        self.paste_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.paste_shortcut.activated.connect(self.paste_items)
+        self.new_folder_shortcut = QShortcut(
+            QKeySequence("Ctrl+Shift+N"),
+            self.list_view,
+        )
+        self.new_folder_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.new_folder_shortcut.activated.connect(self.create_new_folder)
+
         for target in (
             self,
             self.list_view,
@@ -1155,6 +1783,27 @@ class BrowserWindow(QMainWindow):
             self.splitter,
         ):
             target.installEventFilter(self)
+
+        file_menu = self.menuBar().addMenu("ファイル")
+        self.copy_action = file_menu.addAction("コピー")
+        self.copy_action.triggered.connect(self.copy_selected_items)
+        self.cut_action = file_menu.addAction("切り取り")
+        self.cut_action.triggered.connect(self.cut_selected_items)
+        self.paste_action = file_menu.addAction("貼り付け")
+        self.paste_action.triggered.connect(self.paste_items)
+        file_menu.addSeparator()
+        self.copy_to_action = file_menu.addAction("指定先へコピー...")
+        self.copy_to_action.triggered.connect(self.copy_selected_to)
+        self.move_to_action = file_menu.addAction("指定先へ移動...")
+        self.move_to_action.triggered.connect(self.move_selected_to)
+        file_menu.addSeparator()
+        self.rename_action = file_menu.addAction("名前の変更")
+        self.rename_action.triggered.connect(self.rename_selected_item)
+        self.recycle_action = file_menu.addAction("ごみ箱へ移動")
+        self.recycle_action.triggered.connect(self.move_selected_to_recycle_bin)
+        file_menu.addSeparator()
+        self.new_folder_action = file_menu.addAction("新しいフォルダ")
+        self.new_folder_action.triggered.connect(self.create_new_folder)
 
         view_menu = self.menuBar().addMenu("表示")
         self.sidebar_action = QAction("サイドバーを表示", self)
@@ -1183,9 +1832,20 @@ class BrowserWindow(QMainWindow):
         settings_menu.addAction(settings_action)
 
         self.statusBar().showMessage("フォルダを選択してください。")
+        self.cancel_operation_button = QPushButton("キャンセル", self)
+        self.cancel_operation_button.setObjectName(
+            "cancel_file_operation_button"
+        )
+        self.cancel_operation_button.clicked.connect(self.cancel_file_operation)
+        self.cancel_operation_button.setVisible(False)
+        self.statusBar().addPermanentWidget(self.cancel_operation_button)
+        QApplication.clipboard().changed.connect(
+            self._on_system_clipboard_changed
+        )
         self.splitter.setSizes([self._sidebar_width, max(1, self.width() - self._sidebar_width)])
         self.set_sidebar_visible(self.sidebar_action.isChecked())
         self._update_navigation_actions()
+        self._update_file_action_states()
 
     def _restore_initial_folder(self) -> None:
         raw_path = self.settings.get("last_browser_path", "")
@@ -1350,6 +2010,10 @@ class BrowserWindow(QMainWindow):
         error: str | None = None,
         force: bool = False,
     ) -> None:
+        if self._shutdown_prepared:
+            return
+        if self._active_file_operation_id is not None:
+            return
         if self._temporary_status_message is not None and not force:
             return
         if force:
@@ -1393,6 +2057,8 @@ class BrowserWindow(QMainWindow):
         self.statusBar().showMessage(message)
 
         def restore_status() -> None:
+            if self._shutdown_prepared:
+                return
             if token == self._status_message_token:
                 self._temporary_status_message = None
                 self._update_status(force=True)
@@ -1588,6 +2254,30 @@ class BrowserWindow(QMainWindow):
             )
         self.up_action.setEnabled(can_go_up)
         self.refresh_action.setEnabled(self.current_path is not None)
+        self._update_file_action_states()
+
+    def _update_file_action_states(self) -> None:
+        if not hasattr(self, "rename_action"):
+            return
+        selected_count = len(
+            self.list_view.selectionModel().selectedIndexes()
+        )
+        busy = self.file_operation_coordinator.busy
+        has_selection = selected_count > 0
+        self.rename_action.setEnabled(selected_count == 1 and not busy)
+        self.recycle_action.setEnabled(has_selection and not busy)
+        self.copy_action.setEnabled(has_selection and not busy)
+        self.cut_action.setEnabled(has_selection and not busy)
+        self.copy_to_action.setEnabled(has_selection and not busy)
+        self.move_to_action.setEnabled(has_selection and not busy)
+        self.paste_action.setEnabled(
+            self.current_path is not None
+            and not busy
+            and bool(self._clipboard_paths or self._clipboard_file_urls())
+        )
+        self.new_folder_action.setEnabled(
+            self.current_path is not None and not busy
+        )
 
     def _absolute_browser_path(self, path: str | Path) -> Path:
         target = Path(path).expanduser()
@@ -1608,33 +2298,103 @@ class BrowserWindow(QMainWindow):
         ).casefold()
         return first_key == second_key
 
+    @staticmethod
+    def _path_key(path: str | Path) -> str:
+        return os.path.normcase(
+            os.path.abspath(os.path.normpath(os.fspath(path)))
+        ).casefold()
+
     def _show_context_menu(self, position: QPoint) -> None:
         index = self.list_view.indexAt(position)
         item = self.item_model.item_at(index)
-        if item is None:
-            return
+        if item is not None and not self.list_view.selectionModel().isSelected(index):
+            self.list_view.selectionModel().select(
+                index,
+                QItemSelectionModel.SelectionFlag.ClearAndSelect,
+            )
+            self.list_view.setCurrentIndex(index)
+        selection_count = len(self.selected_file_operation_paths())
+        busy = self.file_operation_coordinator.busy
         menu = QMenu(self)
-        open_action = menu.addAction("開く")
-        new_action = menu.addAction("新しいViewerWindowで開く")
-        location_action = menu.addAction("エクスプローラーで場所を開く")
+        open_action = menu.addAction("開く") if item is not None else None
+        new_action = (
+            menu.addAction("新しいViewerWindowで開く")
+            if item is not None
+            else None
+        )
+        if open_action is not None:
+            open_action.setEnabled(selection_count == 1)
+        if new_action is not None:
+            new_action.setEnabled(
+                selection_count == 1 and item.kind is not BrowserItemKind.FOLDER
+            )
+        if item is not None:
+            menu.addSeparator()
+        cut_action = menu.addAction("切り取り")
+        copy_action = menu.addAction("コピー")
+        paste_action = menu.addAction("貼り付け")
+        cut_action.setEnabled(selection_count > 0 and not busy)
+        copy_action.setEnabled(selection_count > 0 and not busy)
+        paste_action.setEnabled(
+            self.current_path is not None
+            and not busy
+            and bool(self._clipboard_paths or self._clipboard_file_urls())
+        )
+        menu.addSeparator()
+        copy_to_action = menu.addAction("指定先へコピー...")
+        move_to_action = menu.addAction("指定先へ移動...")
+        copy_to_action.setEnabled(selection_count > 0 and not busy)
+        move_to_action.setEnabled(selection_count > 0 and not busy)
+        menu.addSeparator()
+        rename_action = menu.addAction("名前の変更")
+        recycle_action = menu.addAction("ごみ箱へ移動")
+        rename_action.setEnabled(selection_count == 1 and not busy)
+        recycle_action.setEnabled(selection_count > 0 and not busy)
+        menu.addSeparator()
+        new_folder_action = menu.addAction("新しいフォルダ")
+        refresh_action = menu.addAction("更新")
+        new_folder_action.setEnabled(self.current_path is not None and not busy)
+        refresh_action.setEnabled(self.current_path is not None)
+        location_action = None
         bookmark_action = None
-        if self.metadata_store is not None:
+        if item is not None:
+            menu.addSeparator()
+            location_action = menu.addAction("エクスプローラーで場所を開く")
+        if item is not None and self.metadata_store is not None:
             menu.addSeparator()
             if self.metadata_store.is_browser_bookmarked(str(item.path)):
                 bookmark_action = menu.addAction("ブックマークから削除")
             else:
                 bookmark_action = menu.addAction("ブックマークに追加")
-        if item.kind == BrowserItemKind.FOLDER:
-            new_action.setEnabled(False)
         selected = menu.exec(self.list_view.viewport().mapToGlobal(position))
-        if selected == open_action:
+        if open_action is not None and selected == open_action:
             self.open_item(index)
-        elif selected == new_action:
+        elif new_action is not None and selected == new_action:
             self.open_item(index, open_in_new_window=True)
-        elif selected == location_action:
+        elif selected == cut_action:
+            self.cut_selected_items()
+        elif selected == copy_action:
+            self.copy_selected_items()
+        elif selected == paste_action:
+            self.paste_items()
+        elif selected == copy_to_action:
+            self.copy_selected_to()
+        elif selected == move_to_action:
+            self.move_selected_to()
+        elif selected == rename_action:
+            self.rename_selected_item()
+        elif selected == recycle_action:
+            self.move_selected_to_recycle_bin()
+        elif selected == new_folder_action:
+            self.create_new_folder()
+        elif selected == refresh_action:
+            self.refresh_current_folder()
+        elif location_action is not None and selected == location_action:
+            assert item is not None
             target = item.path if item.kind == BrowserItemKind.FOLDER else item.path.parent
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
         elif bookmark_action is not None and selected == bookmark_action:
+            assert item is not None
             if self.metadata_store is None:
                 return
             if self.metadata_store.is_browser_bookmarked(str(item.path)):

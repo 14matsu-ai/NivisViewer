@@ -84,3 +84,35 @@ def test_empty_history_operations_are_safe() -> None:
     assert history.go_forward() is None
     assert not history.can_go_back()
     assert not history.can_go_forward()
+
+
+def test_relocate_path_updates_folder_and_selected_path() -> None:
+    history = BrowserNavigationHistory()
+    history.visit(
+        BrowserLocation(
+            path=r"C:\Books\Old",
+            selected_path=r"C:\Books\Old\book.cbz",
+            vertical_scroll=20,
+        )
+    )
+
+    assert history.relocate_path(r"C:\Books\Old", r"C:\Books\New")
+
+    assert history.current() == BrowserLocation(
+        path=r"C:\Books\New",
+        selected_path=r"C:\Books\New\book.cbz",
+        vertical_scroll=20,
+    )
+
+
+def test_relocate_tree_updates_prefix_and_does_not_create_duplicate() -> None:
+    history = BrowserNavigationHistory()
+    history.visit(location(r"C:\Books\Old"))
+    history.visit(location(r"C:\Books\Old\Child"))
+    history.visit(location(r"C:\Other"))
+    history.go_back()
+
+    assert history.relocate_tree(r"C:\Books\Old", r"D:\Library\New")
+
+    assert history.current() == location(r"D:\Library\New\Child")
+    assert len(history) == 3
