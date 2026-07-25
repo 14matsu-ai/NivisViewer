@@ -6,7 +6,7 @@ from enum import Enum
 from pathlib import Path
 
 from PySide6.QtCore import QAbstractListModel, QModelIndex, Qt
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QImage
 
 from .browser_sort import (
     BrowserSortKey,
@@ -105,6 +105,8 @@ class BrowserItemModel(QAbstractListModel):
     ItemRole = PathRole + 2
     FileSizeRole = PathRole + 3
     ModifiedTimeRole = PathRole + 4
+    ThumbnailImageRole = PathRole + 5
+    ThumbnailLowResolutionRole = PathRole + 6
 
     _KIND_LABELS = {
         BrowserItemKind.FOLDER: "フォルダ",
@@ -121,6 +123,8 @@ class BrowserItemModel(QAbstractListModel):
         self._scan_generation: int | None = None
         self._source_keys: set[str] = set()
         self._icons: dict[str, QIcon] = {}
+        self._thumbnail_images: dict[str, QImage] = {}
+        self._low_resolution_thumbnails: set[str] = set()
         self._fallback_icons: dict[BrowserItemKind, QIcon] = {}
         self._row_by_key: dict[str, int] = {}
 
@@ -139,6 +143,11 @@ class BrowserItemModel(QAbstractListModel):
             return f"{item.display_name}\n{self._KIND_LABELS[item.kind]}"
         if role == int(Qt.ItemDataRole.DecorationRole):
             return self._icons.get(self._key(item.path), self._fallback_icons.get(item.kind))
+        if role == self.ThumbnailImageRole:
+            image = self._thumbnail_images.get(self._key(item.path))
+            return image
+        if role == self.ThumbnailLowResolutionRole:
+            return self._key(item.path) in self._low_resolution_thumbnails
         if role == self.PathRole:
             return str(item.path)
         if role == self.KindRole:
@@ -159,6 +168,8 @@ class BrowserItemModel(QAbstractListModel):
         self._source_keys = {self._key(item.path) for item in self._source_items}
         self._items = self._sort_policy.sorted_items(self._source_items)
         self._icons.clear()
+        self._thumbnail_images.clear()
+        self._low_resolution_thumbnails.clear()
         self._scan_generation = None
         self._rebuild_row_index()
         self.endResetModel()
@@ -169,6 +180,8 @@ class BrowserItemModel(QAbstractListModel):
         self._source_keys.clear()
         self._items = []
         self._icons.clear()
+        self._thumbnail_images.clear()
+        self._low_resolution_thumbnails.clear()
         self._row_by_key.clear()
         self._scan_generation = int(generation)
         self.endResetModel()
@@ -252,10 +265,38 @@ class BrowserItemModel(QAbstractListModel):
         self.dataChanged.emit(index, index, [int(Qt.ItemDataRole.DecorationRole)])
         return True
 
+    def set_thumbnail_image(
+        self,
+        path: str | Path,
+        image: QImage,
+        *,
+        low_resolution: bool = False,
+    ) -> bool:
+        row = self.row_for_path(path)
+        if row < 0 or image is None or image.isNull():
+            return False
+        item = self._items[row]
+        key = self._key(item.path)
+        self._thumbnail_images[key] = image.copy()
+        if low_resolution:
+            self._low_resolution_thumbnails.add(key)
+        else:
+            self._low_resolution_thumbnails.discard(key)
+        index = self.index(row, 0)
+        self.dataChanged.emit(
+            index,
+            index,
+            [self.ThumbnailImageRole, self.ThumbnailLowResolutionRole],
+        )
+        return True
+
     def clear_thumbnails(self) -> None:
         if not self._icons:
-            return
+            if not self._thumbnail_images:
+                return
         self._icons.clear()
+        self._thumbnail_images.clear()
+        self._low_resolution_thumbnails.clear()
         if self._items:
             self.dataChanged.emit(
                 self.index(0, 0),

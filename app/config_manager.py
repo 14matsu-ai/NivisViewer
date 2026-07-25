@@ -35,6 +35,8 @@ class ConfigManager(QObject):
         "thumbnail_size": 180,
         "thumbnail_frame_ratio": "portrait_1_sqrt2",
         "thumbnail_crop_mode": "smart_crop",
+        "thumbnail_quality_mode": "auto",
+        "thumbnail_cache_max_edge": 1024,
         "browser_sort_key": "name",
         "browser_sort_order": "ascending",
         "browser_folders_first": True,
@@ -249,6 +251,20 @@ class ConfigManager(QObject):
             normalized["thumbnail_crop_mode"] = cls.DEFAULTS[
                 "thumbnail_crop_mode"
             ]
+        if normalized.get("thumbnail_quality_mode") not in {
+            "economy",
+            "auto",
+            "high",
+        }:
+            normalized["thumbnail_quality_mode"] = cls.DEFAULTS[
+                "thumbnail_quality_mode"
+            ]
+        normalized["thumbnail_cache_max_edge"] = cls._clamped_int(
+            normalized.get("thumbnail_cache_max_edge"),
+            default=int(cls.DEFAULTS["thumbnail_cache_max_edge"]),
+            minimum=256,
+            maximum=2048,
+        )
         if normalized.get("browser_sort_key") not in {
             "name",
             "modified_time",

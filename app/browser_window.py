@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import monotonic
@@ -110,9 +111,9 @@ from .image_source import FolderListingSnapshot
 from .metadata_store import MetadataStore
 from .settings_dialog import SettingsDialog
 from .sidebar_layout import SidebarLayoutController
-from .thumbnail_provider import BrowserThumbnailProvider, PageThumbnailProvider
+from .thumbnail_provider import BrowserThumbnailProvider
 from .thumbnail_disk_cache import ThumbnailDiskCache
-from .thumbnail_render import ThumbnailRenderSpec
+from .thumbnail_render import ThumbnailRenderPolicy, ThumbnailRenderSpec
 from .windows_filename import (
     generate_numbered_name,
     validate_windows_filename,
@@ -122,6 +123,7 @@ from .windows_filename import (
 BrowserOpenHandler = Callable[..., object]
 AffectedViewersHandler = Callable[[tuple[str, ...]], tuple[object, ...]]
 CloseAffectedViewersHandler = Callable[[tuple[object, ...]], bool | None]
+_THUMBNAIL_LOG = logging.getLogger("nivisviewer.thumbnail")
 
 
 @dataclass(frozen=True)
@@ -235,6 +237,9 @@ class BrowserWindow(QMainWindow):
             )
         self.thumbnail_provider = thumbnail_provider
         self.thumbnail_provider.thumbnail_ready.connect(self._on_thumbnail_ready)
+        provisional = getattr(self.thumbnail_provider, "thumbnail_provisional", None)
+        if provisional is not None:
+            provisional.connect(self._on_thumbnail_provisional)
         resumed = getattr(self.thumbnail_provider, "scheduling_resumed", None)
         if resumed is not None:
             resumed.connect(self._schedule_thumbnail_requests)
@@ -248,6 +253,7 @@ class BrowserWindow(QMainWindow):
         self._list_view_restore_token = 0
         self._status_message_token = 0
         self._temporary_status_message: str | None = None
+        self._screen_tracking_window = None
         self._pressed_extra_buttons: set[Qt.MouseButton] = set()
         self._shutdown_prepared = False
         self._fast_scrolling = False
@@ -278,11 +284,15 @@ class BrowserWindow(QMainWindow):
         self.thumbnail_crop_mode = str(
             self.settings.get("thumbnail_crop_mode", "smart_crop")
         )
-        self.thumbnail_render_spec = ThumbnailRenderSpec.from_settings(
-            self.thumbnail_size,
-            self.thumbnail_frame_ratio,
-            self.thumbnail_crop_mode,
+        self.thumbnail_quality_mode = str(
+            self.settings.get("thumbnail_quality_mode", "auto")
         )
+        self.thumbnail_cache_max_edge = max(
+            256,
+            min(2048, int(self.settings.get("thumbnail_cache_max_edge", 1024))),
+        )
+        self._thumbnail_dpr = self._current_device_pixel_ratio()
+        self.thumbnail_render_spec = self._build_thumbnail_render_spec()
         self.thumbnail_bucket_size = self.thumbnail_render_spec.long_edge
         self.browser_sort_key = normalize_browser_sort_key(
             self.settings.get("browser_sort_key", BrowserSortKey.NAME.value)
@@ -1623,6 +1633,8 @@ class BrowserWindow(QMainWindow):
             "thumbnail_size",
             "thumbnail_frame_ratio",
             "thumbnail_crop_mode",
+            "thumbnail_quality_mode",
+            "thumbnail_cache_max_edge",
             "browser_sort_key",
             "browser_sort_order",
             "browser_folders_first",
@@ -1676,6 +1688,8 @@ class BrowserWindow(QMainWindow):
                 "thumbnail_size",
                 "thumbnail_frame_ratio",
                 "thumbnail_crop_mode",
+                "thumbnail_quality_mode",
+                "thumbnail_cache_max_edge",
             }.intersection(changed)
         )
         if thumbnail_changed:
@@ -1694,21 +1708,48 @@ class BrowserWindow(QMainWindow):
                     self.thumbnail_crop_mode,
                 )
             )
-            new_spec = ThumbnailRenderSpec.from_settings(
-                new_size,
-                new_ratio,
-                new_crop_mode,
+            new_quality_mode = str(
+                changed.get(
+                    "thumbnail_quality_mode",
+                    self.thumbnail_quality_mode,
+                )
             )
-            bucket_changed = (
-                new_spec.cache_token != self.thumbnail_render_spec.cache_token
+            new_max_edge = max(
+                256,
+                min(
+                    2048,
+                    int(
+                        changed.get(
+                            "thumbnail_cache_max_edge",
+                            self.thumbnail_cache_max_edge,
+                        )
+                    ),
+                ),
             )
+            old_ratio = self.thumbnail_frame_ratio
+            old_crop_mode = self.thumbnail_crop_mode
+            old_quality_mode = self.thumbnail_quality_mode
+            old_max_edge = self.thumbnail_cache_max_edge
             self.thumbnail_size = new_size
             self.thumbnail_frame_ratio = new_ratio
             self.thumbnail_crop_mode = new_crop_mode
+            self.thumbnail_quality_mode = new_quality_mode
+            self.thumbnail_cache_max_edge = new_max_edge
+            new_spec = self._build_thumbnail_render_spec()
+            bucket_changed = (
+                new_spec.cache_token != self.thumbnail_render_spec.cache_token
+            )
             self.thumbnail_render_spec = new_spec
             self.thumbnail_bucket_size = new_spec.long_edge
             if bucket_changed:
-                self.item_model.clear_thumbnails()
+                policy_changed = (
+                    old_ratio != new_ratio
+                    or old_crop_mode != new_crop_mode
+                    or old_quality_mode != new_quality_mode
+                    or old_max_edge != new_max_edge
+                )
+                if policy_changed and (old_ratio != new_ratio or old_crop_mode != new_crop_mode):
+                    self.item_model.clear_thumbnails()
                 self._generation = self.thumbnail_provider.begin_generation()
         if thumbnail_changed or {
             "browser_display_density",
@@ -1936,6 +1977,12 @@ class BrowserWindow(QMainWindow):
         handled = super().event(event)
         if event.type() == QEvent.Type.WindowActivate:
             self.activated.emit(self)
+        elif event.type() in {
+            QEvent.Type.Show,
+            QEvent.Type.ScreenChangeInternal,
+        }:
+            QTimer.singleShot(0, self._install_screen_tracking)
+            QTimer.singleShot(0, self._reevaluate_thumbnail_dpr)
         return handled
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
@@ -2587,6 +2634,64 @@ class BrowserWindow(QMainWindow):
                 generation=self._generation,
             )
 
+    def _current_device_pixel_ratio(self) -> float:
+        window = self.windowHandle()
+        screen = window.screen() if window is not None else QApplication.primaryScreen()
+        return max(1.0, float(screen.devicePixelRatio())) if screen is not None else 1.0
+
+    def _build_thumbnail_render_spec(self) -> ThumbnailRenderSpec:
+        policy = ThumbnailRenderPolicy(
+            logical_thumbnail_size=self.thumbnail_size,
+            frame_ratio_id=self.thumbnail_frame_ratio,
+            crop_mode=self.thumbnail_crop_mode,
+            device_pixel_ratio=self._thumbnail_dpr,
+            quality_mode=self.thumbnail_quality_mode,
+            max_edge=self.thumbnail_cache_max_edge,
+        )
+        spec = policy.render_spec()
+        if _THUMBNAIL_LOG.isEnabledFor(logging.DEBUG):
+            metrics = policy.diagnostics()
+            _THUMBNAIL_LOG.debug(
+                "policy logical=%s dpr=%.3f cache=%s qimage_dpr=%.1f "
+                "display=%s upscale=%.3f resize_count=%d smooth=%s",
+                metrics.logical_frame,
+                metrics.window_dpr,
+                metrics.cache_pixels,
+                metrics.qimage_dpr,
+                metrics.display_pixels,
+                metrics.upscale_factor,
+                metrics.resize_count,
+                metrics.smooth_pixmap_transform,
+            )
+        return spec
+
+    def _install_screen_tracking(self) -> None:
+        if self._shutdown_prepared:
+            return
+        window = self.windowHandle()
+        if window is None or window is self._screen_tracking_window:
+            return
+        self._screen_tracking_window = window
+        window.screenChanged.connect(self._on_screen_changed)
+
+    def _on_screen_changed(self, _screen) -> None:
+        QTimer.singleShot(0, self._reevaluate_thumbnail_dpr)
+
+    def _reevaluate_thumbnail_dpr(self) -> None:
+        if self._shutdown_prepared:
+            return
+        current = self._current_device_pixel_ratio()
+        if abs(current - self._thumbnail_dpr) < 0.01:
+            return
+        self._thumbnail_dpr = current
+        new_spec = self._build_thumbnail_render_spec()
+        if new_spec.cache_token == self.thumbnail_render_spec.cache_token:
+            return
+        self.thumbnail_render_spec = new_spec
+        self.thumbnail_bucket_size = new_spec.long_edge
+        self._generation = self.thumbnail_provider.begin_generation()
+        self._schedule_thumbnail_requests(0)
+
     def _visible_row_range(self) -> tuple[int, int] | None:
         viewport = self.list_view.viewport()
         grid = self.list_view.gridSize()
@@ -2632,10 +2737,22 @@ class BrowserWindow(QMainWindow):
             or qimage.isNull()
         ):
             return
-        self.item_model.set_thumbnail(
-            path,
-            PageThumbnailProvider.create_icon(qimage, self.thumbnail_size),
-        )
+        self.item_model.set_thumbnail_image(path, qimage, low_resolution=False)
+
+    def _on_thumbnail_provisional(
+        self,
+        path: str,
+        generation: int,
+        qimage,
+    ) -> None:
+        if (
+            self._shutdown_prepared
+            or generation != self._generation
+            or qimage is None
+            or qimage.isNull()
+        ):
+            return
+        self.item_model.set_thumbnail_image(path, qimage, low_resolution=True)
 
     def _update_status(
         self,

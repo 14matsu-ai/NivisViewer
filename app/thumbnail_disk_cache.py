@@ -14,9 +14,10 @@ from PIL import Image, features
 from PySide6.QtGui import QImage
 
 from .browser_model import BrowserItem, BrowserItemKind
+from .thumbnail_render import ThumbnailRenderSpec
 
 
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,7 @@ class _Fingerprint:
     cover_path: str
     cover_size: int
     cover_mtime_ns: int
+    entry_path: str
     thumbnail_size: int
     format_version: str
 
@@ -35,6 +37,15 @@ class _Fingerprint:
     def key(self) -> str:
         payload = json.dumps(self.__dict__, ensure_ascii=False, sort_keys=True).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
+
+
+@dataclass(frozen=True)
+class CachedThumbnail:
+    image: QImage
+    cache_token: int
+    frame_width: int
+    frame_height: int
+    low_resolution_placeholder: bool = False
 
 
 class ThumbnailDiskCache:
@@ -63,7 +74,9 @@ class ThumbnailDiskCache:
         self._pending_accesses: dict[str, float] = {}
         self._saves_since_cleanup = 0
         self._encoder, self._extension = self._select_encoder()
-        self.format_version = f"{CACHE_SCHEMA_VERSION}-{self._encoder.lower()}-80"
+        self.format_version = (
+            f"{CACHE_SCHEMA_VERSION}-{self._encoder.lower()}-q90-alpha-lossless"
+        )
         self.enabled = False
         self.last_error: str | None = None
         if enabled:
@@ -135,13 +148,104 @@ class ThumbnailDiskCache:
                 self._remove_entries(invalid)
             return None
 
+    def get_suitable(
+        self,
+        item: BrowserItem,
+        spec: ThumbnailRenderSpec,
+    ) -> CachedThumbnail | None:
+        """Return the smallest compatible resolution, or the best lower placeholder."""
+        with self._lock:
+            if not self.enabled or self._connection is None:
+                return None
+            source = self._stat_path(item.path)
+            if source is None:
+                return None
+            try:
+                rows = self._connection.execute(
+                    """
+                    SELECT cache_key, file_name, source_size, source_mtime_ns,
+                           cover_path, cover_size, cover_mtime_ns,
+                           thumbnail_size, frame_width, frame_height
+                      FROM entries
+                     WHERE source_path = ? AND item_kind = ?
+                       AND family_token = ? AND format_version = ?
+                     ORDER BY CASE WHEN thumbnail_size = ? THEN -1 ELSE 0 END,
+                     CASE
+                         WHEN MAX(frame_width, frame_height) >= ? THEN 0 ELSE 1
+                     END,
+                     CASE
+                         WHEN MAX(frame_width, frame_height) >= ?
+                         THEN MAX(frame_width, frame_height)
+                         ELSE -MAX(frame_width, frame_height)
+                     END ASC
+                    """,
+                    (
+                        self._normalize_path(item.path),
+                        item.kind.value,
+                        spec.family_token,
+                        self.format_version,
+                        spec.cache_token,
+                        spec.long_edge,
+                        spec.long_edge,
+                    ),
+                ).fetchall()
+            except sqlite3.DatabaseError as exc:
+                self.last_error = str(exc)
+                return None
+            invalid: list[tuple[str, str]] = []
+            for row in rows:
+                (
+                    key,
+                    file_name,
+                    source_size,
+                    source_mtime_ns,
+                    cover_path,
+                    cover_size,
+                    cover_mtime_ns,
+                    cache_token,
+                    frame_width,
+                    frame_height,
+                ) = row
+                if (source[0], source[1]) != (source_size, source_mtime_ns):
+                    invalid.append((key, file_name))
+                    continue
+                if cover_path:
+                    cover = self._stat_path(Path(cover_path))
+                    if cover is None or cover != (cover_size, cover_mtime_ns):
+                        invalid.append((key, file_name))
+                        continue
+                cache_file = self.files_dir / file_name
+                if not cache_file.is_file():
+                    invalid.append((key, file_name))
+                    continue
+                image = self._read_qimage(cache_file)
+                if image is None:
+                    invalid.append((key, file_name))
+                    continue
+                self._pending_accesses.setdefault(key, time.time())
+                if invalid:
+                    self._remove_entries(invalid)
+                actual_edge = max(int(frame_width), int(frame_height))
+                return CachedThumbnail(
+                    image,
+                    int(cache_token),
+                    int(frame_width),
+                    int(frame_height),
+                    int(cache_token) != spec.cache_token
+                    and actual_edge < spec.long_edge * 0.95,
+                )
+            if invalid:
+                self._remove_entries(invalid)
+            return None
+
     def put(
         self,
         item: BrowserItem,
-        thumbnail_size: int,
+        thumbnail_size: int | ThumbnailRenderSpec,
         image: QImage,
         *,
         cover_path: str | Path | None = None,
+        entry_path: str = "",
     ) -> bool:
         with self._lock:
             if (
@@ -151,10 +255,21 @@ class ThumbnailDiskCache:
                 or image.isNull()
             ):
                 return False
+            if isinstance(thumbnail_size, ThumbnailRenderSpec):
+                cache_token = thumbnail_size.cache_token
+                family_token = thumbnail_size.family_token
+                frame_width = max(1, image.width())
+                frame_height = max(1, image.height())
+            else:
+                cache_token = int(thumbnail_size)
+                family_token = cache_token
+                frame_width = max(1, image.width())
+                frame_height = max(1, image.height())
             fingerprint = self._fingerprint(
                 item,
-                int(thumbnail_size),
+                cache_token,
                 Path(cover_path) if cover_path else None,
+                entry_path,
             )
             if fingerprint is None:
                 return False
@@ -172,13 +287,16 @@ class ThumbnailDiskCache:
                 self.files_dir.mkdir(parents=True, exist_ok=True)
                 pil_image = self._qimage_to_pil(image)
                 if self._encoder == "WEBP":
-                    pil_image.save(
-                        temporary,
-                        format="WEBP",
-                        quality=80,
-                        method=4,
-                        exact=True,
-                    )
+                    alpha_extrema = pil_image.getchannel("A").getextrema()
+                    save_options = {
+                        "format": "WEBP",
+                        "quality": 90,
+                        "method": 4,
+                        "exact": True,
+                    }
+                    if alpha_extrema[0] < 255:
+                        save_options["lossless"] = True
+                    pil_image.save(temporary, **save_options)
                 else:
                     pil_image.save(temporary, format="PNG", optimize=False)
                 os.replace(temporary, cache_file)
@@ -189,9 +307,10 @@ class ThumbnailDiskCache:
                     INSERT OR REPLACE INTO entries (
                         cache_key, source_path, item_kind, source_size,
                         source_mtime_ns, cover_path, cover_size,
-                        cover_mtime_ns, thumbnail_size, format_version,
+                        cover_mtime_ns, entry_path, thumbnail_size, family_token,
+                        frame_width, frame_height, format_version,
                         file_name, byte_size, created_at, last_used
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         key,
@@ -202,7 +321,11 @@ class ThumbnailDiskCache:
                         fingerprint.cover_path,
                         fingerprint.cover_size,
                         fingerprint.cover_mtime_ns,
+                        fingerprint.entry_path,
                         fingerprint.thumbnail_size,
+                        family_token,
+                        frame_width,
+                        frame_height,
                         fingerprint.format_version,
                         file_name,
                         byte_size,
@@ -213,7 +336,7 @@ class ThumbnailDiskCache:
                 self._connection.commit()
                 self._saves_since_cleanup += 1
                 if self._saves_since_cleanup >= self.cleanup_interval:
-                    self.prune()
+                    self.prune(remove_orphans=True)
                 return True
             except (OSError, sqlite3.DatabaseError, ValueError) as exc:
                 self.last_error = str(exc)
@@ -255,7 +378,7 @@ class ThumbnailDiskCache:
             except sqlite3.DatabaseError as exc:
                 self.last_error = str(exc)
 
-    def prune(self) -> int:
+    def prune(self, *, remove_orphans: bool = False) -> int:
         with self._lock:
             if not self.enabled or self._connection is None:
                 return 0
@@ -294,20 +417,22 @@ class ThumbnailDiskCache:
                         total -= byte_size
                         removed += 1
 
-                known_files = {
-                    row[0]
-                    for row in self._connection.execute(
-                        "SELECT file_name FROM entries"
-                    ).fetchall()
-                }
-                if self.files_dir.exists():
+                if remove_orphans and self.files_dir.exists():
+                    known_files = {
+                        row[0]
+                        for row in self._connection.execute(
+                            "SELECT file_name FROM entries"
+                        ).fetchall()
+                    }
                     for path in self.files_dir.iterdir():
-                        if path.is_file() and path.name not in known_files:
-                            try:
-                                path.unlink()
-                                removed += 1
-                            except OSError:
-                                continue
+                        if not path.is_file() or path.name in known_files:
+                            continue
+                        try:
+                            path.unlink()
+                            removed += 1
+                        except OSError:
+                            continue
+
                 self._connection.commit()
                 self._saves_since_cleanup = 0
                 return removed
@@ -364,7 +489,11 @@ class ThumbnailDiskCache:
                 is not None
             )
             if has_entries and user_version != CACHE_SCHEMA_VERSION:
-                raise sqlite3.DatabaseError("unsupported thumbnail cache schema")
+                self._connection.execute("DROP TABLE entries")
+                self._connection.execute("PRAGMA user_version=0")
+                self._connection.commit()
+                self._create_schema()
+                return True
             if user_version not in (0, CACHE_SCHEMA_VERSION):
                 raise sqlite3.DatabaseError("unsupported thumbnail cache version")
             self._create_schema()
@@ -405,7 +534,11 @@ class ThumbnailDiskCache:
                 cover_path TEXT NOT NULL,
                 cover_size INTEGER NOT NULL,
                 cover_mtime_ns INTEGER NOT NULL,
+                entry_path TEXT NOT NULL,
                 thumbnail_size INTEGER NOT NULL,
+                family_token INTEGER NOT NULL,
+                frame_width INTEGER NOT NULL,
+                frame_height INTEGER NOT NULL,
                 format_version TEXT NOT NULL,
                 file_name TEXT NOT NULL UNIQUE,
                 byte_size INTEGER NOT NULL,
@@ -418,6 +551,10 @@ class ThumbnailDiskCache:
             "CREATE INDEX IF NOT EXISTS lookup_entries "
             "ON entries(source_path, item_kind, thumbnail_size, format_version)"
         )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS suitable_entries "
+            "ON entries(source_path, item_kind, family_token, format_version)"
+        )
         self._connection.execute(f"PRAGMA user_version={CACHE_SCHEMA_VERSION}")
         self._connection.commit()
 
@@ -426,6 +563,7 @@ class ThumbnailDiskCache:
         item: BrowserItem,
         thumbnail_size: int,
         cover_path: Path | None,
+        entry_path: str,
     ) -> _Fingerprint | None:
         source = self._stat_path(item.path)
         if source is None:
@@ -448,6 +586,7 @@ class ThumbnailDiskCache:
             cover_path=normalized_cover,
             cover_size=cover[0],
             cover_mtime_ns=cover[1],
+            entry_path=str(entry_path),
             thumbnail_size=thumbnail_size,
             format_version=self.format_version,
         )
