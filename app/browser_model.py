@@ -106,7 +106,7 @@ class BrowserItemModel(QAbstractListModel):
 
     _KIND_LABELS = {
         BrowserItemKind.FOLDER: "フォルダ",
-        BrowserItemKind.ARCHIVE: "ZIP / CBZ",
+        BrowserItemKind.ARCHIVE: "書庫",
         BrowserItemKind.IMAGE: "画像",
     }
 

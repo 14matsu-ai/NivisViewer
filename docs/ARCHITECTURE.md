@@ -2,10 +2,20 @@
 
 ## 現在の実装
 
-Sprint 10では、BrowserWindowへ安全な名前変更、コピー、移動、ごみ箱、新規フォルダ操作を追加しました。ファイルシステム変更は直列の専用workerで実行し、成功結果を受けた後だけMetadataStore、BrowserNavigationHistory、一覧選択を追従させます。BrowserWindowとViewerWindowは同じ`QApplication`・同じプロセス内で動く別ウィンドウで、ApplicationControllerが寿命、選択状態、共有MetadataStore、ファイル操作、Viewer使用中確認を管理します。
+Sprint 11では、利用者環境のWinRARまたは7-Zipを利用するRAR／7z／CBR／CB7閲覧を追加しました。書庫一覧のprepareはBookSessionのworker、各ページの抽出とデコードはImageCache worker、表紙生成はBrowserThumbnailProvider workerで実行します。既存のZIP／CBZ経路とファイル操作は維持し、ApplicationControllerが外部書庫backendの設定と寿命も管理します。
 
 ```text
 ApplicationController
+├─ ArchiveBackendRegistry
+│  ├─ WindowsFileAssociationResolver
+│  ├─ WinRARBackend
+│  │  ├─ WinRARLocator
+│  │  ├─ WinRARProcessRunner
+│  │  └─ WinRARListingParser
+│  └─ SevenZipBackend
+│     ├─ SevenZipLocator
+│     ├─ SevenZipProcessRunner
+│     └─ SevenZipListingParser
 ├─ FileOperationCoordinator
 │  ├─ FileOperationService
 │  ├─ FileOperationExecutor
@@ -30,6 +40,7 @@ ApplicationController
 └─ ViewerWindow [0..n]
    ├─ BookSession
    │  ├─ ImageSource
+   │  │  └─ SevenZipImageSource
    │  ├─ PageModel
    │  └─ ImageCache
    ├─ Viewer command dispatcher
@@ -38,7 +49,17 @@ ApplicationController
 ```
 
 - `main.py`: `QApplication`を生成し、起動引数を`ApplicationController`へ渡すエントリーポイント
-- `ApplicationController`: 共通の`ConfigManager`と単一`MetadataStore`、単一FileOperationCoordinator、単一BrowserWindow、ViewerWindow群、最後にアクティブだったViewerWindow、ウィンドウ選択、隣接書庫探索、前面表示、ウィンドウ間同期、Viewer使用中確認、終了判定を管理
+- `ApplicationController`: 共通の`ConfigManager`と単一`MetadataStore`、ArchiveBackendRegistry、単一FileOperationCoordinator、単一BrowserWindow、ViewerWindow群、最後にアクティブだったViewerWindow、ウィンドウ選択、隣接書庫探索、前面表示、ウィンドウ間同期、Viewer使用中確認、終了判定を管理
+- `ArchiveBackendRegistry`: 外部書庫拡張子ごとにWinRAR／7-Zip backendを選び、設定変更時の再検出、限定的な代替試行、アプリ終了時のprocess cancellationを管理
+- `WindowsFileAssociationResolver`: `AssocQueryStringW`のUnicode APIを二段階バッファで呼び、認識済み実行ファイルの発見だけを行う。関連付け先を起動せず、未知アプリ、UNC実行ファイル、OpenWith／Explorerを拒否
+- `WinRARLocator`: 明示指定、対象拡張子の関連付け、64bit/32bit Program Files、PATHの順でWinRARを探し、同一フォルダの公式コンソールCLIへ変換して短いバージョン確認に成功した絶対パスだけを採用
+- `WinRARBackend`: 確認済みのbare listと単一エントリstdout出力、WinRAR終了コードの構造化エラー変換を隔離
+- `WinRARProcessRunner`: SevenZipProcessRunnerと同じ非対話・出力上限・timeout・cancel・process停止境界を共有
+- `WinRARListingParser`: ロケール依存見出しのないUTF-8 bare listを解析し、日本語とサブフォルダを保持
+- `SevenZipLocator`: 明示指定、アプリ配下候補、64bit/32bit Program Files、PATHの順で候補を組み立て、短い情報取得コマンドに成功した絶対パスだけをセッション内でキャッシュ
+- `SevenZipBackend`: 7-Zip固有の一覧・単一エントリ取得と構造化エラー変換を隔離
+- `SevenZipProcessRunner`: shellを使わない引数配列、stdin無効、stdout/stderr上限、timeout、cancel、terminate/kill、Windowsコンソール非表示、最大2プロセスを一元管理
+- `SevenZipListingParser`: `-slt`技術情報を純粋関数で解析し、書庫ヘッダと最大100,000件の内部項目を分離
 - `FileOperationCoordinator`: 直列workerへの要求、進捗と完了通知、成功したrename/moveのMetadataStore追従を管理
 - `FileOperationService`: QtとGUIに依存せず、絶対パスの検証、重複・親子選択の整理、名前変更、コピー、移動、ごみ箱、新規フォルダ、項目単位の構造化結果を管理
 - `FileOperationExecutor`: 最大1スレッドの`QThreadPool`でファイル操作を直列実行し、安全な項目境界でキャンセルを確認
@@ -49,17 +70,17 @@ ApplicationController
 - `BrowserNavigationHistory`: Qtに依存せず、訪問フォルダ、選択項目、縦横スクロール位置、戻る／進むの分岐をセッション内で管理
 - `BrowserDirectoryScanner`: 最大2スレッドの専用`QThreadPool`で`os.scandir()`を実行し、128件単位の軽量な結果だけをGUIスレッドへ渡す
 - `BookmarkModel` / `HistoryModel`: MetadataStoreの公開APIと変更通知をQt Model/Viewへ公開し、BrowserWindowからSQLを分離
-- `BrowserItemDiscovery`: サブフォルダ、ZIP/CBZ、対応画像を列挙し、列挙時のmtimeとファイルサイズをBrowserItemへ保存する。画像のデコードや書庫の展開は行わない
+- `BrowserItemDiscovery`: サブフォルダ、ZIP/CBZ/RAR/CBR/7z/CB7、対応画像を列挙し、列挙時のmtimeとファイルサイズをBrowserItemへ保存する。画像のデコードや書庫の展開は行わない
 - `BrowserItemModel`: BrowserItemの表示名、絶対パス、種類、元項目のmtime、ファイルサイズ、表示アイコンをQt Model/Viewへ公開し、BrowserSortPolicyで保持リストを並べ替える
 - `BrowserSortPolicy`: QtやMetadataStoreに依存せず、自然順、更新日時、種類、サイズ、昇降順、フォルダ優先を一元管理
 - `BrowserThumbnailScheduler`: viewport、gridSize、スクロール位置から可視行、選択行、前後2画面の先読み行を計画
-- `BrowserThumbnailProvider`: 最大2スレッドの専用`QThreadPool`で画像、画像フォルダ、ZIP/CBZのサムネイルを生成し、メモリLRUキャッシュを管理
+- `BrowserThumbnailProvider`: 最大2スレッドの専用`QThreadPool`で画像、画像フォルダ、ZIP/CBZ/RAR/CBR/7z/CB7のサムネイルを生成し、メモリLRUキャッシュを管理
 - `ThumbnailDiskCache`: SQLiteインデックスとWebPまたはPNGファイルによるポータブルな永続サムネイルキャッシュ
-- `SettingsDialog`: Viewerの開き方、見開き表示、Browserのサムネイルとディスクキャッシュ、マウス操作割り当てを編集
+- `SettingsDialog`: Viewerの開き方、見開き表示、Browserのサムネイルとディスクキャッシュ、マウス操作割り当て、外部書庫backend選択、WinRAR／7-Zipの自動検出／明示パスを編集
 - `ViewerWindow`: 閲覧メニュー、ダイアログ、入力、ViewerWidgetへの描画、ページ移動、全画面などウィンドウ固有UIを管理し、キー・メニュー・マウス入力を共通コマンドへdispatch
-- `BookSession`: 現在のパス、ImageSource、PageModel、ImageCache、読み込み世代、ソース切替と終了を管理
+- `BookSession`: 現在のパス、ImageSource、PageModel、ImageCache、読み込み世代、外部書庫の非同期prepare→commit、ソース切替と終了を管理
 - `ConfigManager`: 実行ファイル基準の`config.json`を読み書きし、メタデータDBやキャッシュの配置基準も提供するポータブル設定管理
-- `ImageSource`: フォルダ、単体画像の親フォルダ、ZIP/CBZを共通化する画像供給層
+- `ImageSource`: フォルダ、単体画像の親フォルダ、ZIP/CBZ、外部backend書庫を共通化する画像供給層
 - `PageModel`: 論理ページ順と単ページ／見開きの表示単位を管理する非GUIモデル
 - `ImageCache`: セッション専用`QThreadPool`で画像を非同期デコードし、LRU形式で保持するキャッシュ
 - `ViewerWidget`: 渡された画像の描画、拡大縮小、パン、クリックやホイール入力、追加ボタン検出、ジェスチャー軌跡オーバーレイを担当
@@ -167,7 +188,7 @@ BrowserNavigationHistoryもrename/move成功後だけフォルダパスと選択
 
 BrowserThumbnailSchedulerは`ScrollPerPixel`のQListViewについて、viewport、gridSize、スクロール値、モデル件数から可視行を定数時間で近似します。優先順位はVISIBLE、SELECTED、PREFETCHです。可視範囲を先に要求し、その前後各2画面だけを先読みします。1万件でも要求数は可視範囲と限定先読みに収まり、全行の`visualRect()`走査や全件要求を行いません。
 
-ThumbnailProviderはQThreadPoolの優先度を使い、未開始の低優先度要求を可視要求が追い越せるようにします。同一パス・サイズ・generationのpendingは重複させず、queued要求は優先度を引き上げられます。高速スクロール中は可視・選択項目だけを要求し、未開始の旧PREFETCHを`tryTake()`可能な範囲で除外します。最後のスクロールから180ms後に可視範囲を再計算して前後2画面の先読みを再開します。実行中デコードは停止せず、完了結果はパスとthumbnail generationで安全にキャッシュ・照合します。
+ThumbnailProviderはQThreadPoolの優先度を使い、未開始の低優先度要求を可視要求が追い越せるようにします。同一パス・サイズ・generationのpendingは重複させず、queued要求は優先度を引き上げられます。高速スクロール中は可視・選択項目だけを要求し、未開始の旧PREFETCHを`tryTake()`可能な範囲で除外します。最後のスクロールから180ms後に可視範囲を再計算して前後2画面の先読みを再開します。通常画像の実行中デコードは強制停止せず、外部7-Zip処理にはcancel tokenを渡します。完了結果はパスとthumbnail generationで安全にキャッシュ・照合します。
 
 増分バッチ、ウィンドウリサイズ、並び替え、表示密度変更は30msの単発タイマーへサムネイル再計画をまとめます。並び替えと密度だけではthumbnail generationやキャッシュキーを変更しません。サムネイルサイズ変更時だけ新generationを開始し、旧サイズ結果を表示へ適用しません。この構造は将来のページング、仮想化、方向別先読みへの接続点です。
 
@@ -197,11 +218,51 @@ SSDへの書き込みを抑えるため、ディスクヒットでは画像を�
 
 各ViewerWindowは独立したBookSessionを1つ持つため、本、現在ページ、ImageSource、PageModel、ImageCache、読み込み世代、ズーム、全画面、スライドショーはウィンドウ間で独立します。非同期画像読み込みでは`ImageCache.generation`で古い結果を破棄し、ViewerWindowでも表示要求IDを確認します。本を切り替えた時点でキャッシュ世代を更新し、旧ImageSourceを参照するタスクが残っている場合は、BookSessionがソースを遅延破棄します。
 
+### 外部書庫backend
+
+```text
+ApplicationController
+├─ ArchiveBackendRegistry
+│  ├─ WindowsFileAssociationResolver
+│  ├─ WinRARBackend
+│  │  ├─ WinRARLocator
+│  │  ├─ WinRARProcessRunner
+│  │  └─ WinRARListingParser
+│  └─ SevenZipBackend
+│     ├─ SevenZipLocator
+│     ├─ SevenZipProcessRunner
+│     └─ SevenZipListingParser
+├─ BrowserWindow
+├─ ThumbnailProvider
+└─ ViewerWindow [0..n]
+   └─ SevenZipImageSource
+```
+
+RAR／CBR／7z／CB7は`ArchiveBackend`抽象を介して外部WinRARまたは7-Zipへ委譲します。両バイナリを同梱せず、自動ダウンロードも行いません。設定のbackend preferenceと明示パスを最優先し、autoでは対象拡張子のWindows関連付け、標準インストール先、PATHの順に選びます。`.cbr`は未関連付けなら`.rar`、`.cb7`は未関連付けなら`.7z`を照会します。選択は拡張子単位でキャッシュするため、RAR系をWinRAR、7z系を7-Zipとする混在も可能です。
+
+関連付けは`AssocQueryStringW`の`ASSOCSTR_EXECUTABLE`と`open`動詞を利用したbackend発見にだけ使います。結果をShellExecuteせず、未知アプリ、OpenWith、Explorer、UNC上または不存在の実行ファイルは起動しません。`7zFM.exe`／`7zG.exe`は同一フォルダの`7z.exe`、次に`7zz.exe`へ変換できた場合だけ採用します。設定変更と再検出で関連付けおよび選択キャッシュを破棄します。
+
+WinRAR関連付けは`WinRAR.exe`自体を書庫処理として起動せず、同一インストールフォルダの公式`UnRAR.exe`、次に`Rar.exe`へ変換します。ローカルWinRAR 7.13の同梱ヘルプと実行結果で、一覧を`lb -scfr -- <archive>`のUTF-8 bare list、単一ページを`p -inul -- <archive> <entry>`のstdoutとして取得できることを確認しています。stdinはDEVNULLで、パスワードを保存も引数指定もしません。終了値11を`password_required`、3／12／13を破損、255をcancelとして扱います。確認済みコンソールCLIはRAR形式専用なので7z／CB7で形式非対応となった場合は`unsupported_archive`へ変換し、autoかつ利用可能な7-Zipがあるときだけ1回代替します。
+
+`SevenZipLocator`は設定の明示パス、アプリ配下の将来用候補、64bit Program Files、32bit Program Files、PATHの順に候補を作り、情報取得コマンドが短いtimeout内で成功した実行ファイルの絶対パスだけを採用します。結果はセッション内でキャッシュし、backend設定変更時に破棄します。検出失敗は外部書庫機能だけを利用不可とし、画像、フォルダ、ZIP／CBZは継続します。
+
+外部CLIコマンドは`subprocess.Popen`へ引数リストとして渡し、`shell=False`、`stdin=DEVNULL`、Windowsの`CREATE_NO_WINDOW`、UTF-8出力指定を使用します。stdoutとstderrには別々の上限を設け、UTF-8不正列は置換して解析します。timeoutまたはcancel時は短いterminate待機後に必要な場合だけkillし、プロセス枠を必ず解放します。ViewerページとBrowserサムネイルを通したWinRAR／7-Zip合計の同時process数は共有runner全体で最大2です。
+
+一覧は`l -slt -sccUTF-8 -p- -spd -- <archive>`の技術情報形式を使い、純粋関数で書庫ヘッダと内部項目を分離します。未知フィールドや同一キーを安全に扱い、項目数は100,000件で制限します。画像ページ選択では既存の対応画像拡張子を共有し、ディレクトリ、`__MACOSX`、`.DS_Store`、`Thumbs.db`、隠し・テンポラリ相当、制御文字入り項目を除外して内部パスの自然順にします。重複する正規化名は最初の項目だけを採用し、抽出には元のエントリ名を保持します。入れ子書庫は自動展開しません。
+
+単一ページは`x -so -sccUTF-8 -p- -spd -- <archive> <entry>`でワイルドカード解釈を無効にしてstdoutへだけ抽出し、`BytesIO`から既存Pillowデコード経路へ渡します。書庫全体、一時フォルダ、書庫の隣、カレントディレクトリへは展開せず、元書庫へ書き込みません。単一エントリは一覧の展開後サイズと受信中の出力の両方を1GiBで制限します。ディスクサムネイルキーは従来どおり元書庫の絶対パス、サイズ、mtime、thumbnail size、実装format versionを含むため、書庫変更で自動的にmissします。
+
+外部書庫のSource prepareはBookSession workerで行い、成功後だけ現在Sourceへcommitします。失敗、新generation、cancelでは既存の正常な本、履歴、読書位置を維持します。ページ抽出はImageCache worker、表紙抽出はThumbnailProvider workerで実行します。Source、Viewer、Browserの終了やgeneration変更はcancel tokenへ伝播し、後着結果を破棄します。Qt modelやWidgetをworkerから変更せず、GUIスレッドで外部process終了を長時間waitしません。
+
+パスワード付き書庫は`-p-`で対話プロンプトを抑止し、検出時に`password_required`へ分類します。パスワード入力・保存は未実装です。solid書庫は一覧情報をSourceへ保持しますが、全体の事前展開は行わないため後方ページが遅い場合があります。マルチボリュームRARは通常`.rar`と`.part1.rar`を候補にし、`.part2.rar`以降と`.r00`等をBrowserおよび前後の本候補から除外します。7z分割`.7z.001`は正式対応外です。
+
+BrowserWindowはbackend利用不可でも外部書庫項目を一覧へ残し、標準の書庫アイコンへフォールバックします。サムネイル失敗はモーダル通知せず、Viewerで明示的に開いた失敗は対象Viewerのステータスへ短く表示します。RAR／7z系ファイルはSprint 10のファイル操作では通常の不透明なファイルであり、内部項目のrename、delete、追加、再圧縮は提供しません。元書庫へ書き込まず、書庫全体や一時ディレクトリへ展開せず、stdoutから単一ページだけを取得します。PDFはSprint 12で外部書庫backendとは別のImageSourceとして接続します。
+
 ### メタデータと元ファイルの分離
 
 ApplicationControllerは`<config.jsonの配置ディレクトリ>/data/metadata.sqlite3`に接続するMetadataStoreを1つだけ所有し、BrowserWindowとすべてのViewerWindowへ共有注入します。各ウィンドウは独自接続を生成しません。DBは`PRAGMA user_version`でスキーマバージョンを保持し、`library_items`、`reading_history`、`browser_bookmarks`、`tags`、`item_tags`を管理します。
 
-NivisViewerのメタデータは元画像、画像フォルダ、ZIP/CBZから完全に分離します。レート、タグ、ブックマーク、履歴の変更先はSQLiteだけであり、元ファイル名、内容、画像メタデータ、書庫、ADS、サイドカーファイル、元ファイルと元フォルダのmtimeを変更しません。`library_items.source_mtime_ns`は元項目を確認した時点の値、`metadata_updated_at`はNivisViewer内のレートやタグの更新時刻であり、別の概念です。BrowserWindowの更新日時表示とソートは従来どおり元項目の`st_mtime_ns`だけを使います。
+NivisViewerのメタデータは元画像、画像フォルダ、ZIP/CBZ/RAR/CBR/7z/CB7から完全に分離します。レート、タグ、ブックマーク、履歴の変更先はSQLiteだけであり、元ファイル名、内容、画像メタデータ、書庫、ADS、サイドカーファイル、元ファイルと元フォルダのmtimeを変更しません。`library_items.source_mtime_ns`は元項目を確認した時点の値、`metadata_updated_at`はNivisViewer内のレートやタグの更新時刻であり、別の概念です。BrowserWindowの更新日時表示とソートは従来どおり元項目の`st_mtime_ns`だけを使います。
 
 パスは絶対化、区切りの正規化、Windowsの大文字小文字を考慮した正規化キーで重複を抑えます。表示用パスは元の表記を別に保持し、存在しなくなった項目も自動削除しません。欠損項目はモデルが補助表示と無効色で示し、開こうとした場合はBrowserWindowのステータスバーへ短く通知します。
 
@@ -260,7 +321,7 @@ ViewerWidgetの描画矩形は`calculate_spread_layout()`で計算します。2�
 
 共有設定はApplicationControllerが所有するConfigManagerへ変更時に反映します。ConfigManagerは変更キーを`settings_changed`シグナルで配信し、開いているBrowserWindowとViewerWindowが必要な項目だけを即時反映します。ViewerWindowを閉じる際にローカルな設定スナップショットを一括保存しないため、古い状態のウィンドウを後から閉じても共有設定は巻き戻りません。
 
-共有設定には表示モード、綴じ方向、フィットモード、余白、表紙・横長画像の扱い、背景色、`open_viewer_behavior`、書庫移動ループ、前面表示設定、マウスジェスチャーと追加ボタンの割り当てなどが含まれます。
+共有設定には表示モード、綴じ方向、フィットモード、余白、表紙・横長画像の扱い、背景色、`open_viewer_behavior`、書庫移動ループ、前面表示設定、マウスジェスチャーと追加ボタンの割り当て、`archive_backend_preference`、`winrar_executable`、`seven_zip_executable`などが含まれます。
 
 ジオメトリ、ウィンドウ状態、全画面、回転角度はウィンドウ固有です。複数ウィンドウの完全な復元はまだ行わず、最後にアクティブだったViewerWindowの値を次回作成時の標準状態として保存します。現在の本、ズーム、パン、スライドショーの実行状態は各ViewerWindow内で独立し、ウィンドウ群としての復元対象にはしていません。読書位置だけは本ごとの履歴としてMetadataStoreへ保存します。
 
@@ -275,7 +336,7 @@ BrowserWindowは`last_browser_path`、`browser_sidebar_visible`、`browser_sideb
 
 ## 次の構成
 
-次段階ではPageSource抽象化を進め、Sprint 11でRAR／7z／CBR／CB7、Sprint 12でPDFへ対応します。基本操作と対応形式の安定後にMetadataStoreのレート／タグAPIへ編集UI、検索、絞り込み、サムネイル上の表示を接続します。ZipPlaの`{zpi$...}`は明示的な読み取り互換から始め、元ファイルへ自動的に書き戻さない境界を維持します。
+次段階ではPageSource抽象化を進め、Sprint 12でPDFを7-Zipとは別のSourceとして接続します。基本操作と対応形式の安定後にMetadataStoreのレート／タグAPIへ編集UI、検索、絞り込み、サムネイル上の表示を接続します。ZipPlaの`{zpi$...}`は明示的な読み取り互換から始め、元ファイルへ自動的に書き戻さない境界を維持します。
 
 `ApplicationController`は引き続きアプリ全体の寿命、共有設定、単一MetadataStore、ウィンドウ群、ウィンドウ間イベントを管理します。`BrowserWindow`は本を探して選ぶ責務、`ViewerWindow`はBookSessionとViewerWidgetを接続して読む責務を持ちます。PageModelはGUIに依存しない状態を保ちます。
 
@@ -291,5 +352,5 @@ BrowserWindowは`last_browser_path`、`browser_sidebar_visible`、`browser_sideb
 - 右クリックドラッグのマウスジェスチャーは、通常の右クリックと排他的に判定し、操作割り当てを設定可能にする。
 - サムネイルサイズは設定画面から変更する。
 - 設定、履歴、ブックマーク、キャッシュはポータブル配置を基本とする。
-- 将来PDF、RAR、7z、CBR、CB7へ対応する。
+- RAR／7z／CBR／CB7は利用者環境のWinRAR／7-Zip backendを使用し、PDFは別Sourceで対応する。
 - 入力形式ごとの差異を吸収する`PageSource`抽象化への移行を予定する。

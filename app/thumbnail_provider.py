@@ -3,9 +3,10 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from io import BytesIO
+import inspect
 import os
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from typing import Callable
 import zipfile
 
@@ -20,7 +21,11 @@ from .browser_model import (
     BrowserItemKind,
 )
 from .browser_thumbnail_scheduler import ThumbnailPriority
+from .image_source import EXTERNAL_ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS, SevenZipImageSource
 from .thumbnail_disk_cache import ThumbnailDiskCache
+
+
+_RETIRED_THUMBNAIL_PROVIDERS: set[BrowserThumbnailProvider] = set()
 
 
 class PageThumbnailProvider:
@@ -64,11 +69,17 @@ class _ThumbnailWorker(QRunnable):
         self.size = size
         self.generation = generation
         self.loader = loader
+        self.cancelled = Event()
         self.signals = _ThumbnailWorkerSignals()
 
     @Slot()
     def run(self) -> None:
-        result = self.loader(self.item, self.size)
+        result = _invoke_thumbnail_loader(
+            self.loader,
+            self.item,
+            self.size,
+            self.cancelled,
+        )
         self.signals.finished.emit(
             str(self.item.path),
             self.generation,
@@ -91,6 +102,7 @@ class BrowserThumbnailProvider(QObject):
         loader: Callable[[BrowserItem, int], QImage | None] | None = None,
         disk_cache: ThumbnailDiskCache | None = None,
         disk_cache_enabled: bool = True,
+        archive_backend_registry=None,
     ) -> None:
         super().__init__(parent)
         self._pool = QThreadPool(self)
@@ -108,6 +120,7 @@ class BrowserThumbnailProvider(QObject):
         self._disk_cache_enabled = bool(disk_cache_enabled)
         self._failed: set[tuple[str, int, float | None]] = set()
         self._maintenance_started = False
+        self._archive_backend_registry = archive_backend_registry
 
     @property
     def generation(self) -> int:
@@ -116,6 +129,8 @@ class BrowserThumbnailProvider(QObject):
     def begin_generation(self) -> int:
         self._generation += 1
         with self._pending_lock:
+            for pending in self._pending.values():
+                pending.worker.cancelled.set()
             self._pending.clear()
         self._pool.clear()
         return self._generation
@@ -201,6 +216,7 @@ class BrowserThumbnailProvider(QObject):
                     or path_key in keep
                 ):
                     continue
+                pending.worker.cancelled.set()
                 if self._try_take(pending.worker):
                     self._pending.pop(key, None)
                     cancelled += 1
@@ -286,24 +302,33 @@ class BrowserThumbnailProvider(QObject):
         worker.signals.finished.connect(self._on_cache_clear_finished)
         self._pool.start(worker)
 
-    def close(self, wait_msecs: int = 5000) -> None:
+    def close(self, wait_msecs: int = 250) -> None:
         if self._closed:
             return
         self._closed = True
         self._generation += 1
-        self._pool.clear()
-        self._pool.waitForDone(wait_msecs)
         with self._pending_lock:
-            self._pending.clear()
-        if self._disk_cache is not None:
-            self._disk_cache.close()
+            for pending in self._pending.values():
+                pending.worker.cancelled.set()
+        self._pool.clear()
+        if self._pool.waitForDone(wait_msecs):
+            self._finalize_close()
+            return
+        self.setParent(None)
+        _RETIRED_THUMBNAIL_PROVIDERS.add(self)
+        QTimer.singleShot(100, self, self._release_retired_if_idle)
 
     @staticmethod
     def load_thumbnail(item: BrowserItem, size: int) -> QImage | None:
         return BrowserThumbnailProvider.load_thumbnail_result(item, size).image
 
     @staticmethod
-    def load_thumbnail_result(item: BrowserItem, size: int) -> ThumbnailLoadResult:
+    def load_thumbnail_result(
+        item: BrowserItem,
+        size: int,
+        archive_backend_registry=None,
+        cancel_token=None,
+    ) -> ThumbnailLoadResult:
         try:
             if item.kind == BrowserItemKind.IMAGE:
                 return ThumbnailLoadResult(
@@ -312,6 +337,15 @@ class BrowserThumbnailProvider(QObject):
             if item.kind == BrowserItemKind.FOLDER:
                 return BrowserThumbnailProvider._load_folder_result(item.path, size)
             if item.kind == BrowserItemKind.ARCHIVE:
+                if item.path.suffix.lower() in EXTERNAL_ARCHIVE_EXTENSIONS:
+                    return ThumbnailLoadResult(
+                        BrowserThumbnailProvider._load_external_archive(
+                            item.path,
+                            size,
+                            archive_backend_registry,
+                            cancel_token,
+                        )
+                    )
                 return ThumbnailLoadResult(
                     BrowserThumbnailProvider._load_archive(item.path, size)
                 )
@@ -319,7 +353,12 @@ class BrowserThumbnailProvider(QObject):
             return ThumbnailLoadResult(None)
         return ThumbnailLoadResult(None)
 
-    def _load_pipeline(self, item: BrowserItem, size: int) -> ThumbnailLoadResult:
+    def _load_pipeline(
+        self,
+        item: BrowserItem,
+        size: int,
+        cancel_token=None,
+    ) -> ThumbnailLoadResult:
         failure_key = (self._path_key(item.path), size, item.modified_at)
         disk_cache = self._disk_cache
         if self._disk_cache_enabled and disk_cache is not None:
@@ -334,9 +373,19 @@ class BrowserThumbnailProvider(QObject):
                 return ThumbnailLoadResult(None)
 
         if self._decode_loader is None:
-            result = self.load_thumbnail_result(item, size)
+            result = self.load_thumbnail_result(
+                item,
+                size,
+                self._archive_backend_registry,
+                cancel_token,
+            )
         else:
-            loaded = self._decode_loader(item, size)
+            loaded = _invoke_thumbnail_loader(
+                self._decode_loader,
+                item,
+                size,
+                cancel_token,
+            )
             result = (
                 loaded
                 if isinstance(loaded, ThumbnailLoadResult)
@@ -377,7 +426,10 @@ class BrowserThumbnailProvider(QObject):
         cache_key = (path_key, size, modified_at)
         with self._pending_lock:
             self._pending.pop(pending_key, None)
-        if self._closed or generation != self._generation or image is None or image.isNull():
+        if self._closed:
+            self._release_retired_if_idle()
+            return
+        if generation != self._generation or image is None or image.isNull():
             return
         self._cache[cache_key] = image.copy()
         self._cache.move_to_end(cache_key)
@@ -456,6 +508,34 @@ class BrowserThumbnailProvider(QObject):
         return None
 
     @staticmethod
+    def _load_external_archive(
+        archive: Path,
+        size: int,
+        archive_backend_registry,
+        cancel_token,
+    ) -> QImage | None:
+        if archive_backend_registry is None:
+            return None
+        backend = archive_backend_registry.backend_for_path(archive)
+        if backend is None:
+            return None
+        source: SevenZipImageSource | None = None
+        try:
+            source = SevenZipImageSource(
+                archive,
+                backend=backend,
+                cancel_token=cancel_token,
+            )
+            first = source.list_images()[0]
+            with source.open_image(first) as image:
+                return BrowserThumbnailProvider._pil_to_qimage(image, size)
+        except Exception:
+            return None
+        finally:
+            if source is not None:
+                source.close()
+
+    @staticmethod
     def _pil_to_qimage(image: Image.Image, size: int) -> QImage:
         prepared = image.convert("RGBA")
         prepared.thumbnail((size, size), Image.Resampling.LANCZOS)
@@ -481,3 +561,47 @@ class BrowserThumbnailProvider(QObject):
             # The worker completed and Qt auto-deleted its QRunnable before
             # the queued finished signal removed the Python pending record.
             return False
+
+    def _release_retired_if_idle(self) -> None:
+        if not self._closed:
+            return
+        if not self._pool.waitForDone(0):
+            QTimer.singleShot(100, self, self._release_retired_if_idle)
+            return
+        self._finalize_close()
+
+    def _finalize_close(self) -> None:
+        with self._pending_lock:
+            self._pending.clear()
+        if self._disk_cache is not None:
+            self._disk_cache.close()
+        _RETIRED_THUMBNAIL_PROVIDERS.discard(self)
+
+
+def _invoke_thumbnail_loader(loader, item: BrowserItem, size: int, cancel_token):
+    try:
+        signature = inspect.signature(loader)
+        accepts_cancel = (
+            "cancel_token" in signature.parameters
+            or len(
+                [
+                    parameter
+                    for parameter in signature.parameters.values()
+                    if parameter.kind
+                    in {
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    }
+                ]
+            )
+            >= 3
+            or any(
+                parameter.kind is inspect.Parameter.VAR_POSITIONAL
+                for parameter in signature.parameters.values()
+            )
+        )
+    except (TypeError, ValueError):
+        accepts_cancel = False
+    if accepts_cancel:
+        return loader(item, size, cancel_token)
+    return loader(item, size)

@@ -2,16 +2,18 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -29,7 +31,65 @@ from .browser_sort import (
     BrowserSortOrder,
 )
 from .config_manager import ConfigManager
+from .seven_zip_locator import SevenZipInfo, SevenZipLocator
 from .viewer_commands import COMMAND_CHOICES
+from .winrar_locator import WinRARInfo, WinRARLocator
+
+
+class _SevenZipProbeSignals(QObject):
+    completed = Signal(int, object)
+
+
+class _SevenZipProbeWorker(QRunnable):
+    def __init__(
+        self,
+        generation: int,
+        locator: SevenZipLocator,
+        path: str,
+    ) -> None:
+        super().__init__()
+        self.generation = generation
+        self.locator = locator
+        self.path = path
+        self.signals = _SevenZipProbeSignals()
+
+    @Slot()
+    def run(self) -> None:
+        info = self.locator.locate(self.path, force=True)
+        self.signals.completed.emit(self.generation, info)
+
+
+class _WinRARProbeSignals(QObject):
+    completed = Signal(int, object)
+
+
+class _WinRARProbeWorker(QRunnable):
+    def __init__(
+        self,
+        generation: int,
+        locator: WinRARLocator,
+        path: str,
+    ) -> None:
+        super().__init__()
+        self.generation = generation
+        self.locator = locator
+        self.path = path
+        self.signals = _WinRARProbeSignals()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            info = self.locator.locate(
+                self.path,
+                extension=".rar",
+                force=True,
+            )
+        except TypeError:
+            info = self.locator.locate(self.path, force=True)  # type: ignore[call-arg]
+        self.signals.completed.emit(self.generation, info)
+
+
+_RETIRED_SETTINGS_POOLS: set[QThreadPool] = set()
 
 
 class SettingsDialog(QDialog):
@@ -42,13 +102,28 @@ class SettingsDialog(QDialog):
         parent: QWidget | None = None,
         *,
         cache_usage_getter: Callable[[], int] | None = None,
+        seven_zip_locator: SevenZipLocator | None = None,
+        winrar_locator: WinRARLocator | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("環境設定")
         self.setModal(True)
-        self.resize(560, 470)
+        self.resize(620, 680)
         self.config = config_manager
         self._cache_usage_getter = cache_usage_getter
+        self._seven_zip_locator = seven_zip_locator or SevenZipLocator()
+        self._winrar_locator = winrar_locator or WinRARLocator()
+        self._probe_pool = QThreadPool()
+        self._probe_pool.setMaxThreadCount(2)
+        self._probe_generation = 0
+        self._probe_workers: dict[int, _SevenZipProbeWorker] = {}
+        self._pending_explicit_path: str | None = None
+        self._accept_after_probe = False
+        self._winrar_probe_generation = 0
+        self._winrar_probe_workers: dict[int, _WinRARProbeWorker] = {}
+        self._pending_winrar_path: str | None = None
+        self._accept_after_winrar_probe = False
+        self._initial_probe_started = False
         raw_bindings = self.config.get("mouse_gesture_bindings", {})
         self._gesture_bindings_base = (
             dict(raw_bindings) if isinstance(raw_bindings, dict) else {}
@@ -61,6 +136,7 @@ class SettingsDialog(QDialog):
         tabs = QTabWidget(self)
         tabs.addTab(self._build_viewer_tab(), "Viewer")
         tabs.addTab(self._build_browser_tab(), "Browser")
+        tabs.addTab(self._build_archive_tab(), "書庫")
         tabs.addTab(self._build_mouse_tab(), "Mouse")
 
         self.button_box = QDialogButtonBox(
@@ -126,6 +202,90 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(behavior_group)
         layout.addWidget(spread_group)
+        layout.addStretch(1)
+        return tab
+
+    def _build_archive_tab(self) -> QWidget:
+        tab = QWidget(self)
+        layout = QVBoxLayout(tab)
+        preference_group = QGroupBox("外部書庫バックエンド", tab)
+        preference_form = QFormLayout(preference_group)
+        self.archive_backend_combo = QComboBox(preference_group)
+        self.archive_backend_combo.addItem(
+            "自動（Windowsの関連付けを優先）",
+            "auto",
+        )
+        self.archive_backend_combo.addItem("WinRAR", "winrar")
+        self.archive_backend_combo.addItem("7-Zip", "seven_zip")
+        preference_form.addRow("使用するバックエンド:", self.archive_backend_combo)
+        layout.addWidget(preference_group)
+
+        winrar_group = QGroupBox("WinRAR", tab)
+        winrar_form = QFormLayout(winrar_group)
+        self.winrar_path_edit = QLineEdit(winrar_group)
+        self.winrar_path_edit.setPlaceholderText("空欄の場合は自動検出")
+        self.winrar_browse_button = QPushButton("参照…", winrar_group)
+        self.winrar_browse_button.clicked.connect(self.browse_winrar)
+        winrar_path_row = QWidget(winrar_group)
+        winrar_path_layout = QHBoxLayout(winrar_path_row)
+        winrar_path_layout.setContentsMargins(0, 0, 0, 0)
+        winrar_path_layout.addWidget(self.winrar_path_edit, 1)
+        winrar_path_layout.addWidget(self.winrar_browse_button)
+        winrar_form.addRow("実行ファイル:", winrar_path_row)
+        self.winrar_auto_button = QPushButton("自動検出へ戻す", winrar_group)
+        self.winrar_auto_button.clicked.connect(self.use_automatic_winrar)
+        self.winrar_redetect_button = QPushButton("再検出", winrar_group)
+        self.winrar_redetect_button.clicked.connect(self.redetect_winrar)
+        winrar_action_row = QWidget(winrar_group)
+        winrar_action_layout = QHBoxLayout(winrar_action_row)
+        winrar_action_layout.setContentsMargins(0, 0, 0, 0)
+        winrar_action_layout.addWidget(self.winrar_auto_button)
+        winrar_action_layout.addWidget(self.winrar_redetect_button)
+        winrar_action_layout.addStretch(1)
+        winrar_form.addRow(winrar_action_row)
+        self.winrar_status_label = QLabel("WinRAR：未確認", winrar_group)
+        self.winrar_status_label.setWordWrap(True)
+        winrar_form.addRow("現在の状態:", self.winrar_status_label)
+        layout.addWidget(winrar_group)
+
+        group = QGroupBox("7-Zip", tab)
+        form = QFormLayout(group)
+
+        self.seven_zip_path_edit = QLineEdit(group)
+        self.seven_zip_path_edit.setPlaceholderText("空欄の場合は自動検出")
+        self.seven_zip_browse_button = QPushButton("参照…", group)
+        self.seven_zip_browse_button.clicked.connect(self.browse_seven_zip)
+        path_row = QWidget(group)
+        path_layout = QHBoxLayout(path_row)
+        path_layout.setContentsMargins(0, 0, 0, 0)
+        path_layout.addWidget(self.seven_zip_path_edit, 1)
+        path_layout.addWidget(self.seven_zip_browse_button)
+        form.addRow("7-Zip実行ファイル:", path_row)
+
+        self.seven_zip_auto_button = QPushButton("自動検出へ戻す", group)
+        self.seven_zip_auto_button.clicked.connect(self.use_automatic_seven_zip)
+        self.seven_zip_redetect_button = QPushButton("再検出", group)
+        self.seven_zip_redetect_button.clicked.connect(self.redetect_seven_zip)
+        action_row = QWidget(group)
+        action_layout = QHBoxLayout(action_row)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.addWidget(self.seven_zip_auto_button)
+        action_layout.addWidget(self.seven_zip_redetect_button)
+        action_layout.addStretch(1)
+        form.addRow(action_row)
+
+        self.seven_zip_status_label = QLabel("7-Zip：未確認", group)
+        self.seven_zip_status_label.setWordWrap(True)
+        form.addRow("現在の状態:", self.seven_zip_status_label)
+        note = QLabel(
+            "WinRARと7-Zipは第三者ソフトウェアです。Windowsの関連付けと"
+            "利用者が指定した実行ファイルだけを検証し、自動ダウンロードや"
+            "自動インストールは行いません。",
+            group,
+        )
+        note.setWordWrap(True)
+        form.addRow(note)
+        layout.addWidget(group)
         layout.addStretch(1)
         return tab
 
@@ -276,6 +436,16 @@ class SettingsDialog(QDialog):
         self.cache_limit_spin.setValue(
             int(self.config.get("thumbnail_cache_limit_mb", 512))
         )
+        self._select_data(
+            self.archive_backend_combo,
+            self.config.get("archive_backend_preference", "auto"),
+        )
+        self.winrar_path_edit.setText(
+            str(self.config.get("winrar_executable", "") or "")
+        )
+        self.seven_zip_path_edit.setText(
+            str(self.config.get("seven_zip_executable", "") or "")
+        )
         self.mouse_gestures_checkbox.setChecked(
             bool(self.config.get("mouse_gestures_enabled", True))
         )
@@ -341,6 +511,11 @@ class SettingsDialog(QDialog):
             ),
             "thumbnail_disk_cache_enabled": self.disk_cache_checkbox.isChecked(),
             "thumbnail_cache_limit_mb": self.cache_limit_spin.value(),
+            "archive_backend_preference": str(
+                self.archive_backend_combo.currentData() or "auto"
+            ),
+            "winrar_executable": self.winrar_path_edit.text().strip().strip('"'),
+            "seven_zip_executable": self.seven_zip_path_edit.text().strip().strip('"'),
             "mouse_gestures_enabled": self.mouse_gestures_checkbox.isChecked(),
             "mouse_gesture_show_trail": self.mouse_gesture_trail_checkbox.isChecked(),
             "mouse_gesture_min_distance": self.mouse_gesture_distance_spin.value(),
@@ -354,14 +529,269 @@ class SettingsDialog(QDialog):
         }
 
     def apply_settings(self) -> dict[str, object]:
-        changed = self.config.apply(self.values(), save=True)
+        values = self.values()
+        requested_winrar = str(values.pop("winrar_executable", "") or "")
+        requested_path = str(values.pop("seven_zip_executable", "") or "")
+        changed = self.config.apply(values, save=True)
+        current_winrar = str(self.config.get("winrar_executable", "") or "")
+        if requested_winrar == current_winrar:
+            self.redetect_winrar()
+        elif not requested_winrar:
+            archive_changed = self.config.apply(
+                {"winrar_executable": ""},
+                save=True,
+            )
+            changed.update(archive_changed)
+            self.redetect_winrar()
+        else:
+            self._start_winrar_probe(
+                requested_winrar,
+                apply_on_success=True,
+                accept_after=False,
+            )
+        current_path = str(self.config.get("seven_zip_executable", "") or "")
+        if requested_path == current_path:
+            self.redetect_seven_zip()
+        elif not requested_path:
+            archive_changed = self.config.apply(
+                {"seven_zip_executable": ""},
+                save=True,
+            )
+            changed.update(archive_changed)
+            self.redetect_seven_zip()
+        else:
+            self._start_seven_zip_probe(
+                requested_path,
+                apply_on_success=True,
+                accept_after=False,
+            )
         self.load_current_values()
+        if requested_winrar and requested_winrar != current_winrar:
+            self.winrar_path_edit.setText(requested_winrar)
+        if requested_path and requested_path != current_path:
+            self.seven_zip_path_edit.setText(requested_path)
         self.settings_applied.emit(changed)
         return changed
 
     def accept(self) -> None:  # type: ignore[override]
+        requested_winrar = self.winrar_path_edit.text().strip().strip('"')
+        current_winrar = str(self.config.get("winrar_executable", "") or "")
+        if requested_winrar and requested_winrar != current_winrar:
+            values = self.values()
+            values.pop("winrar_executable", None)
+            values.pop("seven_zip_executable", None)
+            changed = self.config.apply(values, save=True)
+            if changed:
+                self.settings_applied.emit(changed)
+            self._start_winrar_probe(
+                requested_winrar,
+                apply_on_success=True,
+                accept_after=True,
+            )
+            return
+        requested_path = self.seven_zip_path_edit.text().strip().strip('"')
+        current_path = str(self.config.get("seven_zip_executable", "") or "")
+        if requested_path and requested_path != current_path:
+            values = self.values()
+            values.pop("winrar_executable", None)
+            values.pop("seven_zip_executable", None)
+            changed = self.config.apply(values, save=True)
+            if changed:
+                self.settings_applied.emit(changed)
+            self._start_seven_zip_probe(
+                requested_path,
+                apply_on_success=True,
+                accept_after=True,
+            )
+            return
         self.apply_settings()
         super().accept()
+
+    def reject(self) -> None:  # type: ignore[override]
+        self._probe_generation += 1
+        self._winrar_probe_generation += 1
+        self._pending_explicit_path = None
+        self._accept_after_probe = False
+        self._pending_winrar_path = None
+        self._accept_after_winrar_probe = False
+        if not self._probe_pool.waitForDone(0):
+            _RETIRED_SETTINGS_POOLS.add(self._probe_pool)
+        super().reject()
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        if not self._initial_probe_started:
+            self._initial_probe_started = True
+            self.redetect_winrar()
+            self.redetect_seven_zip()
+
+    def browse_winrar(self) -> None:
+        start = self.winrar_path_edit.text().strip()
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "WinRAR実行ファイルを選択",
+            start,
+            "WinRAR executable (WinRAR.exe UnRAR.exe Rar.exe);;実行ファイル (*.exe);;すべてのファイル (*.*)",
+        )
+        if path:
+            self.winrar_path_edit.setText(path)
+            self._start_winrar_probe(path)
+
+    def use_automatic_winrar(self) -> None:
+        self.winrar_path_edit.clear()
+        self.redetect_winrar()
+
+    def redetect_winrar(self) -> None:
+        self._start_winrar_probe(
+            self.winrar_path_edit.text().strip().strip('"')
+        )
+
+    def _start_winrar_probe(
+        self,
+        path: str,
+        *,
+        apply_on_success: bool = False,
+        accept_after: bool = False,
+    ) -> None:
+        self._winrar_probe_generation += 1
+        generation = self._winrar_probe_generation
+        self._pending_winrar_path = path if apply_on_success else None
+        self._accept_after_winrar_probe = bool(accept_after)
+        self.winrar_status_label.setText("WinRAR：確認中…")
+        self.winrar_redetect_button.setEnabled(False)
+        worker = _WinRARProbeWorker(
+            generation,
+            self._winrar_locator,
+            path,
+        )
+        worker.signals.completed.connect(self._on_winrar_probe_completed)
+        self._winrar_probe_workers[generation] = worker
+        self._probe_pool.start(worker)
+
+    @Slot(int, object)
+    def _on_winrar_probe_completed(
+        self,
+        generation: int,
+        info: WinRARInfo,
+    ) -> None:
+        self._winrar_probe_workers.pop(generation, None)
+        if generation != self._winrar_probe_generation:
+            return
+        self.winrar_redetect_button.setEnabled(True)
+        if info.available:
+            version = f"\n{info.version_text}" if info.version_text else ""
+            source = (
+                "\nWindows関連付けから検出"
+                if getattr(info, "discovery_source", None) == "association"
+                else ""
+            )
+            self.winrar_status_label.setText(
+                f"WinRAR：検出済み{source}\n{info.executable_path}{version}"
+            )
+        else:
+            detail = f"\n{info.error_message}" if info.error_message else ""
+            self.winrar_status_label.setText(f"WinRAR：見つかりません{detail}")
+
+        pending = self._pending_winrar_path
+        close_after = self._accept_after_winrar_probe
+        self._pending_winrar_path = None
+        self._accept_after_winrar_probe = False
+        if pending is not None:
+            if not info.available:
+                return
+            installation_path = str(
+                getattr(info, "installation_executable_path", None) or pending
+            )
+            changed = self.config.apply(
+                {"winrar_executable": installation_path},
+                save=True,
+            )
+            self.winrar_path_edit.setText(installation_path)
+            if changed:
+                self.settings_applied.emit(changed)
+        if close_after and (pending is None or info.available):
+            self.accept()
+
+    def browse_seven_zip(self) -> None:
+        start = self.seven_zip_path_edit.text().strip()
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "7-Zip実行ファイルを選択",
+            start,
+            "7-Zip executable (7z.exe 7zz.exe);;実行ファイル (*.exe);;すべてのファイル (*.*)",
+        )
+        if path:
+            self.seven_zip_path_edit.setText(path)
+            self._start_seven_zip_probe(path)
+
+    def use_automatic_seven_zip(self) -> None:
+        self.seven_zip_path_edit.clear()
+        self.redetect_seven_zip()
+
+    def redetect_seven_zip(self) -> None:
+        self._start_seven_zip_probe(
+            self.seven_zip_path_edit.text().strip().strip('"')
+        )
+
+    def _start_seven_zip_probe(
+        self,
+        path: str,
+        *,
+        apply_on_success: bool = False,
+        accept_after: bool = False,
+    ) -> None:
+        self._probe_generation += 1
+        generation = self._probe_generation
+        self._pending_explicit_path = path if apply_on_success else None
+        self._accept_after_probe = bool(accept_after)
+        self.seven_zip_status_label.setText("7-Zip：確認中…")
+        self.seven_zip_redetect_button.setEnabled(False)
+        worker = _SevenZipProbeWorker(
+            generation,
+            self._seven_zip_locator,
+            path,
+        )
+        worker.signals.completed.connect(self._on_seven_zip_probe_completed)
+        self._probe_workers[generation] = worker
+        self._probe_pool.start(worker)
+
+    @Slot(int, object)
+    def _on_seven_zip_probe_completed(
+        self,
+        generation: int,
+        info: SevenZipInfo,
+    ) -> None:
+        self._probe_workers.pop(generation, None)
+        if not self._probe_workers:
+            _RETIRED_SETTINGS_POOLS.discard(self._probe_pool)
+        if generation != self._probe_generation:
+            return
+        self.seven_zip_redetect_button.setEnabled(True)
+        if info.available:
+            version = f"\n{info.version_text}" if info.version_text else ""
+            self.seven_zip_status_label.setText(
+                f"7-Zip：検出済み\n{info.executable_path}{version}"
+            )
+        else:
+            detail = f"\n{info.error_message}" if info.error_message else ""
+            self.seven_zip_status_label.setText(f"7-Zip：見つかりません{detail}")
+
+        pending = self._pending_explicit_path
+        close_after = self._accept_after_probe
+        self._pending_explicit_path = None
+        self._accept_after_probe = False
+        if pending is not None:
+            if not info.available:
+                return
+            changed = self.config.apply(
+                {"seven_zip_executable": info.executable_path},
+                save=True,
+            )
+            self.seven_zip_path_edit.setText(info.executable_path)
+            if changed:
+                self.settings_applied.emit(changed)
+        if close_after and (pending is None or info.available):
+            super().accept()
 
     def request_cache_clear(self, *, confirm: bool = True) -> None:
         if confirm:

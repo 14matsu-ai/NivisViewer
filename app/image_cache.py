@@ -145,6 +145,7 @@ class ImageCache(QObject):
         self._protected_indexes.clear()
 
     def clear(self) -> None:
+        self._cancel_in_flight()
         self.generation += 1
         self.source = None
         self.image_ids = []
@@ -180,6 +181,11 @@ class ImageCache(QObject):
         wanted.update(index for index in visible_indexes if 0 <= index < len(self.image_ids))
         self._wanted_indexes = wanted
         self._protected_indexes = set(visible_indexes)
+        for (generation, index), source in tuple(self._in_flight.items()):
+            if generation == self.generation and index not in wanted:
+                cancel = getattr(source, "cancel_image_request", None)
+                if callable(cancel) and 0 <= index < len(self.image_ids):
+                    cancel(self.image_ids[index])
 
         for index in list(self._cache):
             if index not in wanted:
@@ -234,3 +240,11 @@ class ImageCache(QObject):
                     break
             if not evicted:
                 break
+
+    def _cancel_in_flight(self) -> None:
+        for (generation, index), source in tuple(self._in_flight.items()):
+            if generation != self.generation or not (0 <= index < len(self.image_ids)):
+                continue
+            cancel = getattr(source, "cancel_image_request", None)
+            if callable(cancel):
+                cancel(self.image_ids[index])

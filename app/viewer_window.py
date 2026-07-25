@@ -32,10 +32,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .book_session import BookSession
+from .archive_backend import EXTERNAL_ARCHIVE_EXTENSIONS
+from .archive_backend_registry import ArchiveBackendRegistry
+from .book_session import AsyncBookOpenFailed, BookOpened, BookSession
 from .config_manager import ConfigManager
 from .image_cache import CachedImage, PRELOAD_RADIUS
-from .image_source import ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS, ImageSourceError
+from .image_source import (
+    ARCHIVE_EXTENSIONS,
+    SUPPORTED_EXTENSIONS,
+    ImageSourceError,
+    create_image_source,
+)
 from .metadata_store import MetadataStore
 from .thumbnail_provider import PageThumbnailProvider
 from . import viewer_commands as commands
@@ -55,6 +62,7 @@ class ViewerWindow(QMainWindow):
         book_session: BookSession | None = None,
         open_path_handler: Callable[[str, bool | None, object], object] | None = None,
         adjacent_book_handler: Callable[[object, int], str] | None = None,
+        archive_backend_registry=None,
     ) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -64,14 +72,26 @@ class ViewerWindow(QMainWindow):
         self.config = config_manager
         self.settings = self.config.data
         self.metadata_store = metadata_store
+        self._owns_archive_backend_registry = archive_backend_registry is None
+        self.archive_backend_registry = (
+            archive_backend_registry
+            or ArchiveBackendRegistry(config_manager=self.config)
+        )
         self.book_session = book_session or BookSession(
             int(self.settings.get("cache_size", 10)),
             self,
+            source_factory=lambda source_path, **kwargs: create_image_source(
+                source_path,
+                archive_backend_registry=self.archive_backend_registry,
+                **kwargs,
+            ),
         )
         self.model = self.book_session.model
         self.image_cache = self.book_session.image_cache
         self.image_cache.pageLoaded.connect(self._on_cache_page_loaded)
         self.book_session.page_changed.connect(self._queue_metadata_progress)
+        self.book_session.async_opened.connect(self._on_async_book_opened)
+        self.book_session.async_open_failed.connect(self._on_async_book_open_failed)
         self._open_path_handler = open_path_handler
         self._adjacent_book_handler = adjacent_book_handler
         self._shutdown_prepared = False
@@ -80,6 +100,8 @@ class ViewerWindow(QMainWindow):
         self._page_history_back: list[int] = []
         self._page_history_forward: list[int] = []
         self._metadata_book_path = ""
+        self._status_override_message: str | None = None
+        self._status_override_token = 0
         self.setAcceptDrops(True)
 
         self.view_mode = str(self.settings["view_mode"])
@@ -613,6 +635,15 @@ class ViewerWindow(QMainWindow):
                 cached = self.image_cache.get(index)
                 if cached is not None:
                     self._update_page_list_thumbnail(cached)
+        if (
+            {
+                "archive_backend_preference",
+                "winrar_executable",
+                "seven_zip_executable",
+            }.intersection(changed)
+            and self._owns_archive_backend_registry
+        ):
+            self.archive_backend_registry.reset()
         gesture_options_changed = False
         if "mouse_gestures_enabled" in changed:
             self.mouse_gestures_enabled = bool(changed["mouse_gestures_enabled"])
@@ -696,6 +727,14 @@ class ViewerWindow(QMainWindow):
     def open_path(self, path: str | Path) -> bool:
         self._save_current_reading_position()
         self._active_request_id += 1
+        if Path(path).suffix.lower() in EXTERNAL_ARCHIVE_EXTENSIONS:
+            self.book_session.open_book_async(
+                path,
+                recursive_folder=self.recursive_folder,
+                sort_descending=self.sort_descending,
+            )
+            self._set_status_override("書庫を読み込んでいます…")
+            return True
         try:
             opened = self.book_session.open_book(
                 path,
@@ -705,9 +744,20 @@ class ViewerWindow(QMainWindow):
         except ImageSourceError as exc:
             QMessageBox.critical(self, "読み込みエラー", str(exc))
             return False
+        return self._finish_opened_book(opened, modal_on_empty=True)
 
+    def _finish_opened_book(
+        self,
+        opened: BookOpened,
+        *,
+        modal_on_empty: bool,
+    ) -> bool:
+        self._clear_status_override()
         if self.model.total_pages == 0:
-            QMessageBox.warning(self, "画像なし", "対応画像が見つかりませんでした。")
+            if modal_on_empty:
+                QMessageBox.warning(self, "画像なし", "対応画像が見つかりませんでした。")
+            else:
+                self._set_status_override("表示可能な画像がありません", 5000)
             self.book_session.close_book()
             self._metadata_book_path = ""
             self.viewer.clear()
@@ -738,6 +788,19 @@ class ViewerWindow(QMainWindow):
         self._refresh_view()
         self.book_changed.emit(self, opened_path)
         return True
+
+    def _on_async_book_opened(self, opened: BookOpened) -> None:
+        if self._shutdown_prepared:
+            return
+        self._finish_opened_book(opened, modal_on_empty=False)
+
+    def _on_async_book_open_failed(self, failed: AsyncBookOpenFailed) -> None:
+        if self._shutdown_prepared or failed.cancelled:
+            return
+        self._set_status_override(
+            failed.message or "書庫を開けません",
+            5000,
+        )
 
     def _restore_reading_position(self, book_key: str) -> None:
         if not bool(self.settings.get("restore_last_reading_position", True)):
@@ -1173,14 +1236,14 @@ class ViewerWindow(QMainWindow):
 
     def _open_adjacent_book(self, direction: int) -> None:
         if self._adjacent_book_handler is None:
-            self.status.showMessage("移動できる書庫がありません", 2500)
+            self._set_status_override("移動できる書庫がありません", 2500)
             return
         result = self._adjacent_book_handler(self, direction)
         if result == "boundary":
             message = "前の書庫はありません" if direction < 0 else "次の書庫はありません"
-            self.status.showMessage(message, 2500)
+            self._set_status_override(message, 2500)
         elif result == "unavailable":
-            self.status.showMessage("移動できる書庫がありません", 2500)
+            self._set_status_override("移動できる書庫がありません", 2500)
 
     def _bookmark_pages(self) -> list[int]:
         if not self._current_book_key:
@@ -1409,6 +1472,7 @@ class ViewerWindow(QMainWindow):
     def _on_cache_page_loaded(self, cached: CachedImage) -> None:
         if cached.generation != self.image_cache.generation:
             return
+        self.model.set_image_size(cached.page_index, cached.original_size)
         if cached.page_index not in self._visible_page_indexes:
             self._update_page_list_thumbnail(cached)
             return
@@ -1576,6 +1640,9 @@ class ViewerWindow(QMainWindow):
         self.slider.blockSignals(False)
 
     def _update_status(self) -> None:
+        if self._status_override_message is not None:
+            self.status.showMessage(self._status_override_message)
+            return
         if self.model.total_pages == 0:
             self.status.showMessage("画像が読み込まれていません")
             return
@@ -1586,6 +1653,30 @@ class ViewerWindow(QMainWindow):
         size = self._format_file_size(self.model.file_size_for_index(self.model.current_index))
         details = "    ".join(part for part in (path, page_text, resolution, size) if part)
         self.status.showMessage(details)
+
+    def _set_status_override(
+        self,
+        message: str,
+        duration_ms: int | None = None,
+    ) -> None:
+        self._status_override_token += 1
+        token = self._status_override_token
+        self._status_override_message = message
+        self.status.showMessage(message)
+        if duration_ms is None:
+            return
+
+        def release_override() -> None:
+            if self._shutdown_prepared or token != self._status_override_token:
+                return
+            self._status_override_message = None
+            self._update_status()
+
+        QTimer.singleShot(max(0, int(duration_ms)), self, release_override)
+
+    def _clear_status_override(self) -> None:
+        self._status_override_token += 1
+        self._status_override_message = None
 
     @staticmethod
     def _format_file_size(size: int | None) -> str:
@@ -1821,6 +1912,8 @@ class ViewerWindow(QMainWindow):
         self.slideshow_timer.stop()
         self._save_current_reading_position()
         self.book_session.shutdown()
+        if self._owns_archive_backend_registry:
+            self.archive_backend_registry.close()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
         self.prepare_shutdown()

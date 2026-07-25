@@ -9,6 +9,11 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication, QWidget
 from natsort import natsorted
 
+from .archive_backend import (
+    EXTERNAL_ARCHIVE_EXTENSIONS,
+    is_supported_archive_candidate,
+)
+from .archive_backend_registry import ArchiveBackendRegistry
 from .browser_window import BrowserWindow
 from .config_manager import ConfigManager
 from .file_operation_coordinator import FileOperationCoordinator
@@ -52,6 +57,10 @@ class ApplicationController(QObject):
             self.config.metadata_database_path,
             self,
         )
+        self.archive_backend_registry = ArchiveBackendRegistry(
+            config_manager=self.config,
+        )
+        self.config.settings_changed.connect(self._on_controller_settings_changed)
         self.file_operation_coordinator = FileOperationCoordinator(
             self.metadata_store,
             self,
@@ -101,6 +110,7 @@ class ApplicationController(QObject):
             file_operation_coordinator=self.file_operation_coordinator,
             affected_viewers_handler=self.viewers_using_paths,
             close_affected_viewers_handler=self.close_viewers,
+            archive_backend_registry=self.archive_backend_registry,
         )
         self._browser_window = window
         self._quit_requested = False
@@ -131,6 +141,7 @@ class ApplicationController(QObject):
             metadata_store=self.metadata_store,
             open_path_handler=self._handle_viewer_open_request,
             adjacent_book_handler=self.open_adjacent_book,
+            archive_backend_registry=self.archive_backend_registry,
         )
         self._viewer_windows.append(window)
         self._active_viewer = window
@@ -253,6 +264,7 @@ class ApplicationController(QObject):
         if browser is not None:
             browser.prepare_shutdown()
         self.file_operation_coordinator.close()
+        self.archive_backend_registry.close()
         self.config.save()
         self.metadata_store.flush()
         self.metadata_store.close()
@@ -492,6 +504,11 @@ class ApplicationController(QObject):
                 if has_images:
                     candidates.append(path)
             elif path.is_file() and path.suffix.lower() in BOOK_FILE_EXTENSIONS:
+                if (
+                    path.suffix.lower() in EXTERNAL_ARCHIVE_EXTENSIONS
+                    and not is_supported_archive_candidate(path.name)
+                ):
+                    continue
                 candidates.append(path.parent if path.suffix.lower() in SUPPORTED_EXTENSIONS else path)
 
         unique: dict[str, Path] = {}
@@ -513,3 +530,11 @@ class ApplicationController(QObject):
             return os.path.commonpath((path_key, root_key)) == root_key
         except ValueError:
             return False
+
+    def _on_controller_settings_changed(self, changed: dict[str, object]) -> None:
+        if {
+            "archive_backend_preference",
+            "winrar_executable",
+            "seven_zip_executable",
+        }.intersection(changed):
+            self.archive_backend_registry.reset()

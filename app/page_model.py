@@ -37,8 +37,16 @@ class PageModel:
 
     def set_source(self, source: ImageSource, selected_image: str | None = None) -> None:
         image_ids = source.list_images()
+        self.set_prepared_source(source, image_ids, selected_image)
+
+    def set_prepared_source(
+        self,
+        source: ImageSource,
+        image_ids: list[str],
+        selected_image: str | None = None,
+    ) -> None:
         self.source = source
-        self.image_ids = image_ids
+        self.image_ids = list(image_ids)
         self._size_cache.clear()
 
         if not self.image_ids:
@@ -101,6 +109,8 @@ class PageModel:
     def get_image_size(self, index: int) -> tuple[int, int] | None:
         if index in self._size_cache:
             return self._size_cache[index]
+        if self.source is not None and self.source.load_sizes_lazily:
+            return None
 
         try:
             image = self.load_image_at(index)
@@ -112,6 +122,10 @@ class PageModel:
         image.close()
         self._size_cache[index] = size
         return size
+
+    def set_image_size(self, index: int, size: tuple[int, int] | None) -> None:
+        if 0 <= index < self.total_pages:
+            self._size_cache[index] = size
 
     def is_wide_image(self, index: int) -> bool:
         if not self.treat_wide_image_as_single:

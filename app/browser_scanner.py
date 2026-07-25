@@ -10,6 +10,7 @@ from typing import Callable
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
+from .archive_backend import EXTERNAL_ARCHIVE_EXTENSIONS, is_supported_archive_candidate
 from .image_source import ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS
 
 
@@ -97,6 +98,11 @@ def scan_entry_from_dir_entry(
         elif entry.is_file(follow_symlinks=False):
             suffix = Path(name).suffix.lower()
             if suffix in ARCHIVE_EXTENSIONS:
+                if (
+                    suffix in EXTERNAL_ARCHIVE_EXTENSIONS
+                    and not is_supported_archive_candidate(name)
+                ):
+                    return None
                 item_kind = "archive"
             elif suffix in SUPPORTED_EXTENSIONS:
                 item_kind = "image"

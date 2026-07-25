@@ -18,7 +18,13 @@
     - Windowsごみ箱、新規フォルダ、複数選択
     - 直列非同期worker、進捗、キャンセル、部分失敗
     - MetadataStore、BrowserNavigationHistory、Viewer使用中確認
-12. Sprint 11：RAR／7z／CBR／CB7対応
+12. Sprint 11：RAR／7z／CBR／CB7対応（完了）
+    - Windows関連付けからのWinRAR／7-Zip自動検出と明示指定
+    - 拡張子ごとのbackend選択、認識済みCLIへの安全な変換
+    - WinRAR公式コンソールCLIとSevenZipBackendの共存
+    - 非同期の書庫一覧取得と単一ページstdout抽出
+    - Browser、サムネイル、Viewer、前後の本、履歴への統合
+    - 通常RARと`.part1.rar`を初期範囲とし、7z分割は正式対応外
 13. Sprint 12：PDF対応
 14. Sprint 13：レート／タグ編集UIと検索
     - 基本ナビゲーションとファイル操作の安定後に着手

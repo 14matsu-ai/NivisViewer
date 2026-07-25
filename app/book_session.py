@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 from pathlib import Path
+from threading import Event
 from typing import Callable
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
+from .archive_backend import ArchiveErrorCode
 from .image_cache import ImageCache
 from .image_source import ImageSource, ImageSourceError, create_image_source
 from .page_model import PageModel
@@ -23,11 +26,125 @@ class BookOpened:
     generation: int
 
 
+@dataclass(frozen=True)
+class AsyncBookOpenFailed:
+    requested_path: Path
+    generation: int
+    message: str
+    code: str | None
+    cancelled: bool = False
+
+
+@dataclass(frozen=True)
+class _PreparedBook:
+    requested_path: Path
+    source: ImageSource | None
+    selected_image: str | None
+    image_ids: tuple[str, ...]
+    generation: int
+    error: ImageSourceError | None = None
+    cancelled: bool = False
+
+
+class _BookOpenSignals(QObject):
+    completed = Signal(object)
+
+
+class _BookOpenWorker(QRunnable):
+    def __init__(
+        self,
+        factory: SourceFactory,
+        requested_path: Path,
+        generation: int,
+        cancelled: Event,
+        *,
+        recursive_folder: bool,
+        sort_descending: bool,
+    ) -> None:
+        super().__init__()
+        self.factory = factory
+        self.requested_path = requested_path
+        self.generation = generation
+        self.cancelled = cancelled
+        self.recursive_folder = recursive_folder
+        self.sort_descending = sort_descending
+        self.signals = _BookOpenSignals()
+
+    @Slot()
+    def run(self) -> None:
+        source: ImageSource | None = None
+        try:
+            source, selected = _invoke_source_factory(
+                self.factory,
+                self.requested_path,
+                recursive_folder=self.recursive_folder,
+                sort_descending=self.sort_descending,
+                cancel_token=self.cancelled,
+            )
+            images = tuple(source.list_images())
+            if self.cancelled.is_set():
+                source.close()
+                source = None
+                result = _PreparedBook(
+                    self.requested_path,
+                    None,
+                    None,
+                    (),
+                    self.generation,
+                    cancelled=True,
+                )
+            else:
+                result = _PreparedBook(
+                    self.requested_path,
+                    source,
+                    selected,
+                    images,
+                    self.generation,
+                )
+        except ImageSourceError as exc:
+            if source is not None:
+                source.close()
+            result = _PreparedBook(
+                self.requested_path,
+                None,
+                None,
+                (),
+                self.generation,
+                error=exc,
+                cancelled=(
+                    self.cancelled.is_set()
+                    or exc.code == ArchiveErrorCode.PROCESS_CANCELLED.value
+                ),
+            )
+        except Exception as exc:
+            if source is not None:
+                source.close()
+            result = _PreparedBook(
+                self.requested_path,
+                None,
+                None,
+                (),
+                self.generation,
+                error=ImageSourceError(
+                    f"本を開けません: {self.requested_path}",
+                    code="open_failed",
+                ),
+            )
+            result.error.__cause__ = exc
+        self.signals.completed.emit(result)
+
+
+_RETIRED_BOOK_OPEN_POOLS: set[QThreadPool] = set()
+_RETIRED_BOOK_SESSIONS: set[BookSession] = set()
+
+
 class BookSession(QObject):
     book_opened = Signal(object)
     book_closed = Signal()
     page_changed = Signal()
     error_occurred = Signal(str)
+    async_opened = Signal(object)
+    async_open_failed = Signal(object)
 
     def __init__(
         self,
@@ -44,6 +161,10 @@ class BookSession(QObject):
         self.generation = 0
         self._source_factory = source_factory
         self._retired_sources: dict[int, ImageSource] = {}
+        self._open_pool = QThreadPool()
+        self._open_pool.setMaxThreadCount(1)
+        self._open_cancel: Event | None = None
+        self._open_workers: dict[int, _BookOpenWorker] = {}
         self._shutdown = False
         self.image_cache.sourceIdle.connect(self._release_retired_source)
 
@@ -64,6 +185,7 @@ class BookSession(QObject):
         recursive_folder: bool = False,
         sort_descending: bool = False,
     ) -> BookOpened:
+        self.cancel_pending_open()
         requested_path = Path(path)
         self.generation += 1
         self._shutdown = False
@@ -105,7 +227,44 @@ class BookSession(QObject):
         self.book_opened.emit(opened)
         return opened
 
+    def open_book_async(
+        self,
+        path: str | Path,
+        *,
+        recursive_folder: bool = False,
+        sort_descending: bool = False,
+    ) -> int:
+        self.cancel_pending_open()
+        self.generation += 1
+        self._shutdown = False
+        generation = self.generation
+        cancelled = Event()
+        worker = _BookOpenWorker(
+            self._source_factory,
+            Path(path),
+            generation,
+            cancelled,
+            recursive_folder=recursive_folder,
+            sort_descending=sort_descending,
+        )
+        worker.signals.completed.connect(self._on_async_prepared)
+        self._open_cancel = cancelled
+        self._open_workers[generation] = worker
+        self._open_pool.start(worker)
+        return generation
+
+    def cancel_pending_open(self) -> None:
+        cancelled = self._open_cancel
+        self._open_cancel = None
+        if cancelled is not None:
+            cancelled.set()
+        self._open_pool.clear()
+
+    def wait_for_async(self, msecs: int = 5000) -> bool:
+        return self._open_pool.waitForDone(max(0, int(msecs)))
+
     def close_book(self) -> None:
+        self.cancel_pending_open()
         old_source = self.source
         had_book = old_source is not None
         self.generation += 1
@@ -122,15 +281,91 @@ class BookSession(QObject):
         if self.is_open:
             self.page_changed.emit()
 
-    def shutdown(self, wait_msecs: int = 5000) -> None:
+    def shutdown(self, wait_msecs: int = 250) -> None:
         if self._shutdown:
             return
         self._shutdown = True
         self.close_book()
+        if not self._open_pool.waitForDone(0):
+            _RETIRED_BOOK_OPEN_POOLS.add(self._open_pool)
         if self.image_cache.wait_for_done(wait_msecs):
             for source in list(self._retired_sources.values()):
                 self._close_source(source)
             self._retired_sources.clear()
+        else:
+            self.setParent(None)
+            _RETIRED_BOOK_SESSIONS.add(self)
+
+    @Slot(object)
+    def _on_async_prepared(self, result: _PreparedBook) -> None:
+        self._open_workers.pop(result.generation, None)
+        if not self._open_workers:
+            _RETIRED_BOOK_OPEN_POOLS.discard(self._open_pool)
+        if self._shutdown or result.generation != self.generation:
+            if result.source is not None:
+                self._close_source(result.source)
+            return
+        self._open_cancel = None
+        if result.cancelled:
+            self.async_open_failed.emit(
+                AsyncBookOpenFailed(
+                    result.requested_path,
+                    result.generation,
+                    "",
+                    ArchiveErrorCode.PROCESS_CANCELLED.value,
+                    cancelled=True,
+                )
+            )
+            return
+        if result.error is not None or result.source is None:
+            error = result.error or ImageSourceError(
+                f"本を開けません: {result.requested_path}"
+            )
+            failed = AsyncBookOpenFailed(
+                result.requested_path,
+                result.generation,
+                str(error),
+                error.code,
+            )
+            self.error_occurred.emit(str(error))
+            self.async_open_failed.emit(failed)
+            return
+
+        try:
+            self.model.set_prepared_source(
+                result.source,
+                list(result.image_ids),
+                result.selected_image,
+            )
+        except Exception as exc:
+            self._close_source(result.source)
+            error = ImageSourceError(f"本を開けません: {result.requested_path}")
+            error.__cause__ = exc
+            self.error_occurred.emit(str(error))
+            self.async_open_failed.emit(
+                AsyncBookOpenFailed(
+                    result.requested_path,
+                    result.generation,
+                    str(error),
+                    error.code,
+                )
+            )
+            return
+        old_source = self.source
+        self.source = result.source
+        self.current_path = result.requested_path
+        self.image_cache.set_source(result.source, self.model.image_ids)
+        if old_source is not None and old_source is not result.source:
+            self._retire_source(old_source)
+        opened = BookOpened(
+            requested_path=result.requested_path,
+            source_path=result.source.source_path,
+            selected_image=result.selected_image,
+            total_pages=self.model.total_pages,
+            generation=result.generation,
+        )
+        self.book_opened.emit(opened)
+        self.async_opened.emit(opened)
 
     def _retire_source(self, source: ImageSource) -> None:
         if self.image_cache.has_in_flight_for_source(source):
@@ -142,9 +377,44 @@ class BookSession(QObject):
         retired = self._retired_sources.pop(id(source), None)
         if retired is source:
             self._close_source(source)
+        if (
+            self._shutdown
+            and not self._retired_sources
+            and self.image_cache.wait_for_done(0)
+        ):
+            _RETIRED_BOOK_SESSIONS.discard(self)
+            self.deleteLater()
 
     def _close_source(self, source: ImageSource) -> None:
         try:
             source.close()
         except Exception as exc:
             self.error_occurred.emit(f"画像ソースを閉じられません: {exc}")
+
+
+def _invoke_source_factory(
+    factory: SourceFactory,
+    path: Path,
+    *,
+    recursive_folder: bool,
+    sort_descending: bool,
+    cancel_token: Event,
+) -> tuple[ImageSource, str | None]:
+    kwargs = {
+        "recursive_folder": recursive_folder,
+        "sort_descending": sort_descending,
+    }
+    try:
+        signature = inspect.signature(factory)
+        accepts_cancel = (
+            "cancel_token" in signature.parameters
+            or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            )
+        )
+    except (TypeError, ValueError):
+        accepts_cancel = False
+    if accepts_cancel:
+        kwargs["cancel_token"] = cancel_token
+    return factory(path, **kwargs)
