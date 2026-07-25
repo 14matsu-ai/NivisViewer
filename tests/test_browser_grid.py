@@ -101,7 +101,7 @@ def test_delegate_uses_fixed_cell_and_uniform_thumbnail_rect(qapp):
     thumbnail = thumbnail_rect_for_cell(
         cell,
         delegate.frame_size,
-        delegate.profile.spacing,
+        delegate.cell_padding,
     )
     assert thumbnail.size() == QSize(127, 180)
     assert thumbnail.left() == (first.width() - 127) // 2
@@ -147,7 +147,11 @@ def test_badge_paints_at_high_dpi(qapp, tmp_path):
     delegate.paint(painter, option, model.index(0, 0))
     painter.end()
 
-    thumbnail = thumbnail_rect_for_cell(option.rect, delegate.frame_size, 6)
+    thumbnail = thumbnail_rect_for_cell(
+        option.rect,
+        delegate.frame_size,
+        delegate.cell_padding,
+    )
     badge = type_badge_rect(thumbnail, 18)
     physical_center = badge.center() * 2
     color = canvas.pixelColor(physical_center)

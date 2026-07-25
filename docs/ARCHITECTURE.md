@@ -44,6 +44,9 @@ ApplicationController
 │  ├─ BrowserNavigationHistory
 │  ├─ BrowserDirectoryScanner
 │  ├─ FolderTree (QFileSystemModel / QTreeView)
+│  ├─ FolderTreeSyncController
+│  ├─ FolderBookmarkModel
+│  ├─ SidebarLayoutController
 │  ├─ NavigationToolbar
 │  ├─ DisplaySettings
 │  ├─ AddressBar
@@ -51,6 +54,7 @@ ApplicationController
 │  ├─ HistoryModel
 │  ├─ BrowserItemModel
 │  │  └─ BrowserSortPolicy
+│  ├─ BrowserItemDelegate
 │  ├─ BrowserThumbnailScheduler
 │  ├─ BrowserThumbnailProvider
 │  │  └─ ThumbnailDiskCache
@@ -62,6 +66,7 @@ ApplicationController
    │  ├─ PageModel
    │  └─ ImageCache
    ├─ Viewer command dispatcher
+   ├─ FullscreenChromeController
    └─ ViewerWidget
       └─ MouseGestureRecognizer
 ```
@@ -88,6 +93,9 @@ ApplicationController
 - `BrowserNavigationHistory`: Qtに依存せず、訪問フォルダ、選択項目、縦横スクロール位置、戻る／進むの分岐をセッション内で管理
 - `BrowserDirectoryScanner`: 最大2スレッドの専用`QThreadPool`で`os.scandir()`を実行し、128件単位の軽量な結果だけをGUIスレッドへ渡す
 - `BookmarkModel` / `HistoryModel`: MetadataStoreの公開APIと変更通知をQt Model/Viewへ公開し、BrowserWindowからSQLを分離
+- `FolderBookmarkModel`: MetadataStoreの`item_type=folder`だけをお気に入りフォルダとして公開し、存在確認をGUIスレッド外で行う
+- `SidebarLayoutController`: お気に入り、フォルダツリー、履歴のWidgetを再利用し、上下分割、逆順、タブ、単独表示を切り替える
+- `FolderTreeSyncController`: 現在フォルダへの有限回・generation付き同期と、自動展開／ユーザー展開の区別を管理する
 - `BrowserItemDiscovery`: サブフォルダ、ZIP/CBZ/RAR/CBR/7z/CB7、対応画像を列挙し、列挙時のmtimeとファイルサイズをBrowserItemへ保存する。画像のデコードや書庫の展開は行わない
 - `BrowserItemModel`: BrowserItemの表示名、絶対パス、種類、元項目のmtime、ファイルサイズ、表示アイコンをQt Model/Viewへ公開し、BrowserSortPolicyで保持リストを並べ替える
 - `BrowserSortPolicy`: QtやMetadataStoreに依存せず、自然順、更新日時、種類、サイズ、昇降順、フォルダ優先を一元管理
@@ -96,6 +104,7 @@ ApplicationController
 - `ThumbnailDiskCache`: SQLiteインデックスとWebPまたはPNGファイルによるポータブルな永続サムネイルキャッシュ
 - `SettingsDialog`: Viewerの開き方、見開き表示、Browserのサムネイルとディスクキャッシュ、マウス操作割り当て、外部書庫backend選択、WinRAR／7-Zipの自動検出／明示パスを編集
 - `ViewerWindow`: 閲覧メニュー、ダイアログ、入力、ViewerWidgetへの描画、ページ移動、全画面などウィンドウ固有UIを管理し、キー・メニュー・マウス入力を共通コマンドへdispatch
+- `FullscreenChromeController`: 全画面時の上下端検出とmenu／slider／statusのoverlay表示、自動非表示、通常配置への復元を担当
 - `BookSession`: 現在のパス、ImageSource、PageModel、ImageCache、読み込み世代、外部書庫の非同期prepare→commit、ソース切替と終了を管理
 - `ConfigManager`: 実行ファイル基準の`config.json`を読み書きし、メタデータDBやキャッシュの配置基準も提供するポータブル設定管理
 - `ImageSource`: フォルダ、単体画像の親フォルダ、ZIP/CBZ、外部backend書庫を共通化する画像供給層
@@ -138,7 +147,7 @@ BrowserWindow
 
 `browser_folders_first`が有効なら昇順・降順やキーにかかわらずフォルダを先頭グループへ固定し、各グループ内部へ現在の並び替え条件を適用します。ZIPとCBZはフォルダ扱いせず、同一の書庫カテゴリです。無効時はすべての項目を選択キーだけで並べます。
 
-表示密度はコンパクト、標準、ゆったりの3段階で、`QListView`の`gridSize`、`spacing`、折り返しだけを変更します。サムネイル画像サイズとは独立しているため、密度変更ではサムネイル世代、メモリキャッシュ、永続キャッシュキーを変更しません。`thumbnail_size`変更時だけ新しい世代を開始し、古い非同期結果を破棄してサイズ別キャッシュを利用します。
+表示密度はExtra Compact（96px級）、Compact、Standard、Comfortable、Largeの5段階で、`QListView`の`gridSize`、`spacing`、フォント、タイトル行数を変更します。`browser_item_spacing_mode=custom`ではセル間隔を0～32 logical px、セル内余白を0～12 logical pxで指定できます。spacing／paddingはサムネイル画像サイズと独立しているため、変更してもthumbnail generation、smart crop解析、Shell icon cacheを変更しません。`thumbnail_size`のcache tokenが変わる場合だけ新しい世代を開始します。
 
 並び替え、フォルダ優先、密度、サムネイルサイズの変更前には、主選択、複数選択、表示基準項目、縦横スクロール位置を絶対パスで記録します。モデル更新とQtのレイアウト完了後に存在するパスだけを復元します。この処理はViewerのopen経路もBrowserNavigationHistoryのvisit経路も通りません。非同期サムネイル結果も従来どおりパスで照合するため、行番号が変わっても別項目へ混入しません。
 
@@ -384,7 +393,29 @@ smart crop rectは元画像に対する正規化座標として、source path、
 
 Windowsでは`ShellAssociatedIconProvider`が`SHGetFileInfoW`と`SHGFI_USEFILEATTRIBUTES`相当の指定で、実ファイルを開かず拡張子ごとのExplorer関連付けアイコンを取得します。folder、画像、ZIP/CBZ、RAR/CBR、7z/CB7、PDFを拡張子単位でキャッシュし、非Windowsまたは取得失敗時は`QFileIconProvider`へ戻ります。アイコンはCompact 16px、Standard 18px、Comfortable 20px、Large 22pxで画像枠左下へoverlayし、キャッシュ画像へ焼き込みません。
 
-選択時はQt既定の不透明selection fillを使用しません。サムネイルは通常の明るさを保ち、palette由来の3px外枠、タイトル領域の半透明色、current itemの内側focus indicatorだけをデリゲートが描画します。hoverは弱い1px枠です。
+選択時はQt既定の不透明selection fillを使用しません。サムネイルは通常の明るさを保ち、セル内部の2px selection枠、タイトル領域の半透明色、current itemだけの内側focus indicatorを描画します。hoverは弱い1px枠です。`BrowserItemDelegate`はselected/current/hover/focusのパスやindexを保持せず、描画ごとの`QStyleOptionViewItem`だけを参照します。BrowserWindowはcurrent変更時に旧・新双方の`visualRect`を更新し、selection、focus、hover、model reset、layout変更、行追加削除、scan切替でも必要範囲を再描画します。
+
+### Sprint 15のサイドバー、ツリー同期、全画面UI
+
+```text
+BrowserWindow
+├─ BrowserItemDelegate
+├─ FolderBookmarkModel
+├─ SidebarLayoutController
+├─ FolderTreeSyncController
+└─ FileOperationCoordinator
+
+ViewerWindow
+└─ FullscreenChromeController
+```
+
+お気に入りフォルダは新しい保存形式を作らず、既存MetadataStoreの`browser_bookmarks`を`item_type=folder`で再利用します。任意ラベル、重複防止、並べ替え順、日本語・UNC・欠損パスを扱い、欠損確認は非同期です。従来のファイル／書庫ブックマークは同じパネルの「本」タブへ残し、データとUI導線を維持します。お気に入りとフォルダツリーの右クリック先は既存FileOperationCoordinatorへ渡されるため、コピー／移動の衝突規則、Viewer使用中確認、部分失敗、成功時だけのMetadataStore追従を共有します。
+
+サイドバーは`favorites_top_tree_bottom`、`tree_top_favorites_bottom`、`tabs`、`favorites_only`、`tree_only`を切り替えます。同じModel/View Widgetを再利用し、お気に入りの主選択と現在フォルダを維持します。上下splitterのサイズは共有configへ保存し、40～4000 logical pxへクランプします。
+
+FolderTreeSyncControllerはフォルダ移動のcommit後に起動し、`off`、`select_current`、`focus_current`を扱います。QFileSystemModelの遅延読み込みに対して有限回の再試行と独立generationを持ち、旧要求を適用しません。プログラム選択中はツリーの`currentChanged`から再navigateしないためBrowser履歴を増やしません。自動で展開したancestorとユーザーが手動展開した枝を別集合で追跡し、focus_currentで閉じるのは現在ancestorではない自動展開枝だけです。
+
+FullscreenChromeControllerは`hide_ui_in_fullscreen`時にmenu bar、page slider、status barをViewer上の上下overlayへ一時移設します。上端／下端の既定8 logical px（4～32）で該当側だけを表示し、離れてから既定900ms（300～3000）で隠します。overlayの表示・非表示はcentral layoutを変更しないため画像のサイズ、ズーム、パン、ページを動かしません。ポップアップ、メニュー、slider drag、UI上のボタン操作、子modalの間は隠さず、端へのhoverだけではViewerWidgetからfocusを奪いません。全画面解除時は各Widgetを通常のQMainWindow配置へ戻します。
 
 ### Viewer最優先の画像作業調整
 

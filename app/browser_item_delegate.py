@@ -26,6 +26,7 @@ class BrowserGridProfile:
 
 
 GRID_PROFILES = {
+    BrowserDisplayDensity.EXTRA_COMPACT: BrowserGridProfile(4, 22, 0, 7, 1),
     BrowserDisplayDensity.COMPACT: BrowserGridProfile(20, 32, 2, 8, 1),
     BrowserDisplayDensity.STANDARD: BrowserGridProfile(44, 58, 6, 9, 2),
     BrowserDisplayDensity.COMFORTABLE: BrowserGridProfile(72, 88, 12, 10, 2),
@@ -33,11 +34,14 @@ GRID_PROFILES = {
 }
 
 GRID_PRESET_THUMBNAIL_SIZES = {
+    BrowserDisplayDensity.EXTRA_COMPACT: 96,
     BrowserDisplayDensity.COMPACT: 128,
     BrowserDisplayDensity.STANDARD: 180,
     BrowserDisplayDensity.COMFORTABLE: 240,
     BrowserDisplayDensity.LARGE: 320,
 }
+
+
 def browser_item_type_key(item: BrowserItem) -> str:
     if item.kind is BrowserItemKind.FOLDER:
         return "folder"
@@ -68,7 +72,7 @@ def type_badge_rect(thumbnail_rect: QRect, badge_size: int = 16) -> QRect:
 def thumbnail_rect_for_cell(
     cell_rect: QRect,
     thumbnail_size: int | QSize,
-    spacing: int,
+    cell_padding: int,
 ) -> QRect:
     if isinstance(thumbnail_size, QSize):
         size = QSize(
@@ -80,7 +84,7 @@ def thumbnail_rect_for_cell(
         size = QSize(edge, edge)
     return QRect(
         cell_rect.left() + (cell_rect.width() - size.width()) // 2,
-        cell_rect.top() + max(2, int(spacing) // 2),
+        cell_rect.top() + max(0, int(cell_padding)),
         size.width(),
         size.height(),
     )
@@ -133,12 +137,14 @@ class BrowserItemDelegate(QStyledItemDelegate):
         thumbnail_size: int = 180,
         density: BrowserDisplayDensity = BrowserDisplayDensity.STANDARD,
         frame_ratio_id: str = "portrait_1_sqrt2",
+        cell_padding: int = 0,
         shell_icon_provider: ShellAssociatedIconProvider | None = None,
     ) -> None:
         super().__init__(parent)
         self.thumbnail_size = int(thumbnail_size)
         self.density = density
         self.frame_ratio_id = frame_ratio_id
+        self.cell_padding = max(0, min(12, int(cell_padding)))
         self.shell_icon_provider = (
             shell_icon_provider or ShellAssociatedIconProvider()
         )
@@ -152,8 +158,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
         profile = self.profile
         frame = self.frame_size
         return QSize(
-            frame.width() + profile.horizontal_margin,
-            frame.height() + profile.vertical_margin,
+            frame.width() + profile.horizontal_margin + self.cell_padding * 2,
+            frame.height() + profile.vertical_margin + self.cell_padding * 2,
         )
 
     @property
@@ -169,11 +175,14 @@ class BrowserItemDelegate(QStyledItemDelegate):
         thumbnail_size: int,
         density: BrowserDisplayDensity,
         frame_ratio_id: str | None = None,
+        cell_padding: int | None = None,
     ) -> None:
         self.thumbnail_size = int(thumbnail_size)
         self.density = density
         if frame_ratio_id is not None:
             self.frame_ratio_id = frame_ratio_id
+        if cell_padding is not None:
+            self.cell_padding = max(0, min(12, int(cell_padding)))
 
     def sizeHint(
         self,
@@ -200,7 +209,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
             thumbnail_rect = thumbnail_rect_for_cell(
                 cell,
                 self.frame_size,
-                profile.spacing,
+                self.cell_padding,
             )
             painter.fillRect(thumbnail_rect, option.palette.base())
             painter.setPen(QPen(option.palette.mid().color(), 1))
@@ -288,6 +297,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
         item: BrowserItem,
     ) -> None:
         badge_sizes = {
+            BrowserDisplayDensity.EXTRA_COMPACT: 14,
             BrowserDisplayDensity.COMPACT: 16,
             BrowserDisplayDensity.STANDARD: 18,
             BrowserDisplayDensity.COMFORTABLE: 20,
@@ -319,16 +329,16 @@ class BrowserItemDelegate(QStyledItemDelegate):
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
         focused = bool(option.state & QStyle.StateFlag.State_HasFocus)
         if selected:
-            painter.setPen(QPen(option.palette.highlight().color(), 3))
+            painter.setPen(QPen(option.palette.highlight().color(), 2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(thumbnail_rect.adjusted(-2, -2, 2, 2))
+            painter.drawRect(thumbnail_rect.adjusted(1, 1, -2, -2))
         elif hovered:
             color = option.palette.highlight().color()
             color.setAlpha(170)
             painter.setPen(QPen(color, 1))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(thumbnail_rect.adjusted(-1, -1, 1, 1))
+            painter.drawRect(thumbnail_rect.adjusted(1, 1, -2, -2))
         if focused:
             painter.setPen(QPen(option.palette.highlightedText().color(), 1))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(thumbnail_rect.adjusted(2, 2, -2, -2))
+            painter.drawRect(thumbnail_rect.adjusted(4, 4, -5, -5))
