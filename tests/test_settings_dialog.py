@@ -122,6 +122,29 @@ def test_density_apply_does_not_request_cache_clear(
     dialog.reject()
 
 
+def test_browser_grid_presets_apply_density_and_thumbnail_size(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    config = make_config(tmp_path)
+    dialog = SettingsDialog(config)
+    large_index = dialog.browser_grid_preset_combo.findData("large")
+
+    assert dialog.browser_grid_preset_combo.count() == 4
+    assert large_index >= 0
+    dialog.browser_grid_preset_combo.setCurrentIndex(large_index)
+    dialog.browser_grid_preset_combo.activated.emit(large_index)
+    changed = dialog.apply_settings()
+
+    assert dialog.browser_display_density_combo.currentData() == "large"
+    assert dialog.thumbnail_size_spin.value() == 320
+    assert changed["browser_display_density"] == "large"
+    restored = ConfigManager(config.path).load()
+    assert restored["browser_display_density"] == "large"
+    assert restored["thumbnail_size"] == 320
+    dialog.reject()
+
+
 def test_cache_clear_button_emits_request(
     tmp_path: Path,
     qapp: QApplication,

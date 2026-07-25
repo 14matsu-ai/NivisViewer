@@ -30,6 +30,7 @@ from .browser_sort import (
     BrowserSortKey,
     BrowserSortOrder,
 )
+from .browser_item_delegate import GRID_PRESET_THUMBNAIL_SIZES
 from .config_manager import ConfigManager
 from .seven_zip_locator import SevenZipInfo, SevenZipLocator
 from .viewer_commands import COMMAND_CHOICES
@@ -346,6 +347,18 @@ class SettingsDialog(QDialog):
 
         list_group = QGroupBox("一覧表示", tab)
         list_form = QFormLayout(list_group)
+        self.browser_grid_preset_combo = QComboBox(list_group)
+        for density, size in GRID_PRESET_THUMBNAIL_SIZES.items():
+            label = BROWSER_DISPLAY_DENSITY_LABELS[density]
+            self.browser_grid_preset_combo.addItem(
+                f"{label} ({size}px)",
+                density.value,
+            )
+        self.browser_grid_preset_combo.activated.connect(
+            self._apply_browser_grid_preset
+        )
+        list_form.addRow("一覧プリセット:", self.browser_grid_preset_combo)
+
         self.browser_display_density_combo = QComboBox(list_group)
         for value, label in BROWSER_DISPLAY_DENSITY_LABELS.items():
             self.browser_display_density_combo.addItem(label, value.value)
@@ -372,8 +385,15 @@ class SettingsDialog(QDialog):
 
         self.thumbnail_size_spin = QSpinBox(cache_group)
         self.thumbnail_size_spin.setRange(96, 384)
+        self.thumbnail_size_spin.setSingleStep(32)
         self.thumbnail_size_spin.setSuffix(" px")
         form.addRow("サムネイルサイズ:", self.thumbnail_size_spin)
+        bucket_note = QLabel(
+            "生成・キャッシュは近いサイズbucketへ量子化して再利用します。",
+            cache_group,
+        )
+        bucket_note.setWordWrap(True)
+        form.addRow(bucket_note)
 
         self.disk_cache_checkbox = QCheckBox(
             "ディスクサムネイルキャッシュを使用する",
@@ -467,6 +487,7 @@ class SettingsDialog(QDialog):
                 BrowserDisplayDensity.STANDARD.value,
             ),
         )
+        self._sync_browser_grid_preset()
         self._select_data(
             self.browser_sort_key_combo,
             self.config.get("browser_sort_key", BrowserSortKey.NAME.value),
@@ -530,6 +551,47 @@ class SettingsDialog(QDialog):
         self._sync_gesture_controls(self.mouse_gestures_checkbox.isChecked())
         self.refresh_cache_usage()
         self.refresh_registration_status()
+
+    def _apply_browser_grid_preset(self, index: int) -> None:
+        density_value = str(self.browser_grid_preset_combo.itemData(index))
+        density = next(
+            (
+                candidate
+                for candidate in GRID_PRESET_THUMBNAIL_SIZES
+                if candidate.value == density_value
+            ),
+            None,
+        )
+        if density is None:
+            return
+        self._select_data(self.browser_display_density_combo, density.value)
+        self.thumbnail_size_spin.setValue(
+            GRID_PRESET_THUMBNAIL_SIZES[density]
+        )
+
+    def _sync_browser_grid_preset(self) -> None:
+        density_value = str(self.browser_display_density_combo.currentData())
+        density = next(
+            (
+                candidate
+                for candidate in GRID_PRESET_THUMBNAIL_SIZES
+                if candidate.value == density_value
+            ),
+            None,
+        )
+        expected_size = (
+            GRID_PRESET_THUMBNAIL_SIZES.get(density)
+            if density is not None
+            else None
+        )
+        index = (
+            self.browser_grid_preset_combo.findData(density_value)
+            if expected_size == self.thumbnail_size_spin.value()
+            else -1
+        )
+        self.browser_grid_preset_combo.blockSignals(True)
+        self.browser_grid_preset_combo.setCurrentIndex(index if index >= 0 else -1)
+        self.browser_grid_preset_combo.blockSignals(False)
 
     def refresh_registration_status(self) -> None:
         service = self._file_registration_service
