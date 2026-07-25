@@ -28,6 +28,9 @@ class ConfigManager(QObject):
         "sort_descending": False,
         "hide_ui_in_fullscreen": False,
         "hide_cursor_in_fullscreen": False,
+        "fullscreen_auto_reveal_ui": True,
+        "fullscreen_edge_trigger_px": 8,
+        "fullscreen_ui_hide_delay_ms": 900,
         "show_page_list": False,
         "thumbnail_size": 180,
         "thumbnail_frame_ratio": "portrait_1_sqrt2",
@@ -36,9 +39,20 @@ class ConfigManager(QObject):
         "browser_sort_order": "ascending",
         "browser_folders_first": True,
         "browser_display_density": "standard",
+        "browser_item_spacing_mode": "preset",
+        "browser_item_spacing": 2,
+        "browser_cell_padding": 0,
         "last_browser_path": "",
         "browser_sidebar_visible": True,
         "browser_sidebar_width": 280,
+        "browser_sidebar_layout": "favorites_top_tree_bottom",
+        "browser_sidebar_splitter_sizes": [220, 420],
+        "browser_show_favorites": True,
+        "browser_show_folder_tree": True,
+        "browser_show_history": True,
+        "folder_tree_sync_mode": "focus_current",
+        "folder_tree_collapse_unrelated": True,
+        "clear_browser_filter_on_navigation": False,
         "browser_window_geometry": "",
         "auto_open_adjacent_book": False,
         "open_viewer_behavior": "reuse_or_create",
@@ -189,6 +203,16 @@ class ConfigManager(QObject):
             normalized["last_browser_path"] = cls.DEFAULTS["last_browser_path"]
         if not isinstance(normalized.get("browser_sidebar_visible"), bool):
             normalized["browser_sidebar_visible"] = cls.DEFAULTS["browser_sidebar_visible"]
+        for key in (
+            "browser_show_favorites",
+            "browser_show_folder_tree",
+            "browser_show_history",
+            "folder_tree_collapse_unrelated",
+            "clear_browser_filter_on_navigation",
+            "fullscreen_auto_reveal_ui",
+        ):
+            if not isinstance(normalized.get(key), bool):
+                normalized[key] = cls.DEFAULTS[key]
         if not isinstance(normalized.get("browser_window_geometry"), str):
             normalized["browser_window_geometry"] = cls.DEFAULTS["browser_window_geometry"]
         normalized["browser_sidebar_width"] = cls._clamped_int(
@@ -237,6 +261,7 @@ class ConfigManager(QObject):
         if not isinstance(normalized.get("browser_folders_first"), bool):
             normalized["browser_folders_first"] = cls.DEFAULTS["browser_folders_first"]
         if normalized.get("browser_display_density") not in {
+            "extra_compact",
             "compact",
             "standard",
             "comfortable",
@@ -245,6 +270,67 @@ class ConfigManager(QObject):
             normalized["browser_display_density"] = cls.DEFAULTS[
                 "browser_display_density"
             ]
+        if normalized.get("browser_item_spacing_mode") not in {"preset", "custom"}:
+            normalized["browser_item_spacing_mode"] = cls.DEFAULTS[
+                "browser_item_spacing_mode"
+            ]
+        normalized["browser_item_spacing"] = cls._clamped_int(
+            normalized.get("browser_item_spacing"),
+            default=int(cls.DEFAULTS["browser_item_spacing"]),
+            minimum=0,
+            maximum=32,
+        )
+        normalized["browser_cell_padding"] = cls._clamped_int(
+            normalized.get("browser_cell_padding"),
+            default=int(cls.DEFAULTS["browser_cell_padding"]),
+            minimum=0,
+            maximum=12,
+        )
+        if normalized.get("browser_sidebar_layout") not in {
+            "favorites_top_tree_bottom",
+            "tree_top_favorites_bottom",
+            "tabs",
+            "favorites_only",
+            "tree_only",
+        }:
+            normalized["browser_sidebar_layout"] = cls.DEFAULTS[
+                "browser_sidebar_layout"
+            ]
+        raw_splitter_sizes = normalized.get("browser_sidebar_splitter_sizes")
+        if not (
+            isinstance(raw_splitter_sizes, list)
+            and len(raw_splitter_sizes) == 2
+        ):
+            raw_splitter_sizes = cls.DEFAULTS["browser_sidebar_splitter_sizes"]
+        normalized["browser_sidebar_splitter_sizes"] = [
+            cls._clamped_int(
+                value,
+                default=220 if index == 0 else 420,
+                minimum=40,
+                maximum=4000,
+            )
+            for index, value in enumerate(raw_splitter_sizes)
+        ]
+        if normalized.get("folder_tree_sync_mode") not in {
+            "off",
+            "select_current",
+            "focus_current",
+        }:
+            normalized["folder_tree_sync_mode"] = cls.DEFAULTS[
+                "folder_tree_sync_mode"
+            ]
+        normalized["fullscreen_edge_trigger_px"] = cls._clamped_int(
+            normalized.get("fullscreen_edge_trigger_px"),
+            default=int(cls.DEFAULTS["fullscreen_edge_trigger_px"]),
+            minimum=4,
+            maximum=32,
+        )
+        normalized["fullscreen_ui_hide_delay_ms"] = cls._clamped_int(
+            normalized.get("fullscreen_ui_hide_delay_ms"),
+            default=int(cls.DEFAULTS["fullscreen_ui_hide_delay_ms"]),
+            minimum=300,
+            maximum=3000,
+        )
         behavior = normalized.get("open_viewer_behavior")
         if behavior not in {"reuse_active", "always_new", "reuse_or_create"}:
             normalized["open_viewer_behavior"] = "reuse_or_create"

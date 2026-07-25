@@ -286,7 +286,10 @@ class MetadataStore(QObject):
                 return
             try:
                 actual_type = item_type or self._infer_item_type(path)
-                item_id = self._ensure_library_item(path, item_type=actual_type)
+                item_id = self._ensure_bookmark_item(
+                    path,
+                    item_type=actual_type,
+                )
                 display = self.display_path(path)
                 bookmark_label = (label or "").strip() or Path(display).name or display
                 next_order = int(
@@ -382,6 +385,105 @@ class MetadataStore(QObject):
             )
             for row in rows
         ]
+
+    def list_folder_bookmarks(self) -> list[BrowserBookmark]:
+        return [
+            entry
+            for entry in self.list_browser_bookmarks()
+            if entry.item_type == "folder"
+        ]
+
+    def add_folder_bookmark(
+        self,
+        path: str,
+        *,
+        label: str | None = None,
+    ) -> bool:
+        if self.is_browser_bookmarked(path):
+            return False
+        self.add_browser_bookmark(path, label=label, item_type="folder")
+        return self.is_browser_bookmarked(path)
+
+    def remove_folder_bookmark(self, path: str) -> bool:
+        if not any(
+            self.normalize_path(entry.path) == self.normalize_path(path)
+            for entry in self.list_folder_bookmarks()
+        ):
+            return False
+        self.remove_browser_bookmark(path)
+        return True
+
+    def rename_bookmark_label(self, path: str, label: str) -> bool:
+        normalized_label = str(label).strip()
+        if not normalized_label:
+            return False
+        changed = False
+        with self._lock:
+            if not self._available:
+                return False
+            try:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE browser_bookmarks
+                       SET label = ?
+                     WHERE library_item_id = (
+                        SELECT id FROM library_items WHERE normalized_path = ?
+                     )
+                    """,
+                    (normalized_label, self.normalize_path(path)),
+                )
+                self._connection.commit()
+                changed = cursor.rowcount > 0
+            except sqlite3.DatabaseError as exc:
+                self._disable(exc)
+        if changed:
+            self.bookmarks_changed.emit()
+        return changed
+
+    def reorder_folder_bookmarks(self, ordered_paths: Iterable[str]) -> bool:
+        entries = self.list_folder_bookmarks()
+        by_key = {
+            self.normalize_path(entry.path): entry
+            for entry in entries
+        }
+        requested: list[BrowserBookmark] = []
+        seen: set[str] = set()
+        for path in ordered_paths:
+            key = self.normalize_path(path)
+            entry = by_key.get(key)
+            if entry is not None and key not in seen:
+                seen.add(key)
+                requested.append(entry)
+        requested.extend(
+            entry
+            for entry in entries
+            if self.normalize_path(entry.path) not in seen
+        )
+        if [entry.path for entry in requested] == [entry.path for entry in entries]:
+            return False
+        available_orders = sorted(entry.sort_order for entry in entries)
+        with self._lock:
+            if not self._available:
+                return False
+            try:
+                for entry, sort_order in zip(requested, available_orders):
+                    self._connection.execute(
+                        """
+                        UPDATE browser_bookmarks
+                           SET sort_order = ?
+                         WHERE library_item_id = (
+                            SELECT id FROM library_items
+                             WHERE normalized_path = ?
+                         )
+                        """,
+                        (sort_order, self.normalize_path(entry.path)),
+                    )
+                self._connection.commit()
+            except sqlite3.DatabaseError as exc:
+                self._disable(exc)
+                return False
+        self.bookmarks_changed.emit()
+        return True
 
     def set_rating(self, path: str, rating: int | None) -> None:
         if rating is not None and not 0 <= int(rating) <= 5:
@@ -752,6 +854,33 @@ class MetadataStore(QObject):
         ).fetchone()
         if row is None:
             raise sqlite3.DatabaseError("library item was not created")
+        return int(row[0])
+
+    def _ensure_bookmark_item(self, path: str, *, item_type: str) -> int:
+        """Create the bookmark identity without a synchronous source stat."""
+        assert self._connection is not None
+        display = self.display_path(path)
+        normalized = self.normalize_path(display)
+        now = time.time()
+        self._connection.execute(
+            """
+            INSERT INTO library_items (
+                normalized_path, display_path, item_type, file_size,
+                source_mtime_ns, identity_hint, rating, comment,
+                metadata_updated_at, created_at, last_verified_at
+            ) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, '', ?, ?, ?)
+            ON CONFLICT(normalized_path) DO UPDATE SET
+                display_path = excluded.display_path,
+                item_type = excluded.item_type
+            """,
+            (normalized, display, item_type, now, now, 0.0),
+        )
+        row = self._connection.execute(
+            "SELECT id FROM library_items WHERE normalized_path = ?",
+            (normalized,),
+        ).fetchone()
+        if row is None:
+            raise sqlite3.DatabaseError("bookmark library item was not created")
         return int(row[0])
 
     def _flush_pending_locked(self) -> bool:

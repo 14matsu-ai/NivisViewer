@@ -102,11 +102,14 @@ from .file_operation_service import (
     FileOperationRequest,
     FileOperationResult,
 )
+from .folder_bookmark_model import FolderBookmarkModel
+from .folder_tree_sync import FolderTreeSyncController
 from .history_model import HistoryModel
 from .image_work_coordinator import ImageWorkCoordinator
 from .image_source import FolderListingSnapshot
 from .metadata_store import MetadataStore
 from .settings_dialog import SettingsDialog
+from .sidebar_layout import SidebarLayoutController
 from .thumbnail_provider import BrowserThumbnailProvider, PageThumbnailProvider
 from .thumbnail_disk_cache import ThumbnailDiskCache
 from .thumbnail_render import ThumbnailRenderSpec
@@ -240,9 +243,7 @@ class BrowserWindow(QMainWindow):
         self._generation = self.thumbnail_provider.generation
         self._scan_generation = 0
         self._pending_scan: _PendingDirectoryScan | None = None
-        self._syncing_tree = False
         self._pending_tree_navigation_path: Path | None = None
-        self._pending_tree_sync_path: Path | None = None
         self._location_restore_token = 0
         self._list_view_restore_token = 0
         self._status_message_token = 0
@@ -301,6 +302,46 @@ class BrowserWindow(QMainWindow):
                 BrowserDisplayDensity.STANDARD.value,
             )
         )
+        self.browser_item_spacing_mode = str(
+            self.settings.get("browser_item_spacing_mode", "preset")
+        )
+        self.browser_item_spacing = max(
+            0, min(32, int(self.settings.get("browser_item_spacing", 2)))
+        )
+        self.browser_cell_padding = max(
+            0, min(12, int(self.settings.get("browser_cell_padding", 0)))
+        )
+        self.browser_sidebar_layout = str(
+            self.settings.get(
+                "browser_sidebar_layout",
+                "favorites_top_tree_bottom",
+            )
+        )
+        raw_sidebar_sizes = self.settings.get(
+            "browser_sidebar_splitter_sizes",
+            [220, 420],
+        )
+        self.browser_sidebar_splitter_sizes = (
+            [int(value) for value in raw_sidebar_sizes[:2]]
+            if isinstance(raw_sidebar_sizes, list)
+            else [220, 420]
+        )
+        self.browser_show_favorites = bool(
+            self.settings.get("browser_show_favorites", True)
+        )
+        self.browser_show_folder_tree = bool(
+            self.settings.get("browser_show_folder_tree", True)
+        )
+        self.browser_show_history = bool(
+            self.settings.get("browser_show_history", True)
+        )
+        self.folder_tree_sync_mode = str(
+            self.settings.get("folder_tree_sync_mode", "focus_current")
+        )
+        self.folder_tree_collapse_unrelated = bool(
+            self.settings.get("folder_tree_collapse_unrelated", True)
+        )
+        self._hovered_list_path: str | None = None
 
         self._folder_change_timer = QTimer(self)
         self._folder_change_timer.setSingleShot(True)
@@ -364,6 +405,7 @@ class BrowserWindow(QMainWindow):
         if same_path and not force_reload:
             if restore_location is not None:
                 self._schedule_location_restore(restore_location)
+            self._sync_tree_to_path(target)
             self._sync_address_bar()
             self._update_navigation_actions()
             return True
@@ -1320,8 +1362,96 @@ class BrowserWindow(QMainWindow):
             self.metadata_store.remove_browser_bookmark(str(path))
 
     def add_current_folder_bookmark(self) -> None:
-        if self.current_path is not None:
-            self.add_browser_bookmark(self.current_path, item_type="folder")
+        if self.current_path is None or self.metadata_store is None:
+            return
+        if self.metadata_store.add_folder_bookmark(str(self.current_path)):
+            self._show_temporary_status("現在のフォルダをお気に入りへ追加しました")
+        else:
+            self._show_temporary_status("このフォルダは登録済みです")
+
+    def add_selected_folder_bookmark(self) -> bool:
+        item = self.item_model.item_at(self.list_view.currentIndex())
+        if (
+            item is None
+            or item.kind is not BrowserItemKind.FOLDER
+            or self.metadata_store is None
+        ):
+            return False
+        added = self.metadata_store.add_folder_bookmark(
+            str(item.path),
+            label=item.display_name,
+        )
+        self._show_temporary_status(
+            "フォルダをお気に入りへ追加しました"
+            if added
+            else "このフォルダは登録済みです"
+        )
+        return added
+
+    def toggle_current_folder_bookmark(self) -> None:
+        if self.current_path is None or self.metadata_store is None:
+            return
+        if any(
+            self._same_path(Path(entry.path), self.current_path)
+            for entry in self.metadata_store.list_folder_bookmarks()
+        ):
+            self.metadata_store.remove_folder_bookmark(str(self.current_path))
+            self._show_temporary_status("現在のフォルダをお気に入りから削除しました")
+        else:
+            self.add_current_folder_bookmark()
+
+    def open_folder_bookmark(self, index: QModelIndex) -> None:
+        entry = self.folder_bookmark_model.entry_at(index)
+        if entry is None:
+            return
+        if entry.exists is False:
+            self._show_temporary_status("お気に入りフォルダが見つかりません")
+            return
+        self.navigate_to(entry.path)
+
+    def rename_folder_bookmark(
+        self,
+        index: QModelIndex,
+        label: str | None = None,
+    ) -> bool:
+        entry = self.folder_bookmark_model.entry_at(index)
+        if entry is None or self.metadata_store is None:
+            return False
+        if label is None:
+            label, accepted = QInputDialog.getText(
+                self,
+                "お気に入りの表示名",
+                "表示名:",
+                text=entry.label,
+            )
+            if not accepted:
+                return False
+        return self.metadata_store.rename_bookmark_label(entry.path, label)
+
+    def move_folder_bookmark(self, index: QModelIndex, offset: int) -> bool:
+        entry = self.folder_bookmark_model.entry_at(index)
+        if entry is None or self.metadata_store is None:
+            return False
+        paths = [candidate.path for candidate in self.folder_bookmark_model.entries]
+        old_row = index.row()
+        new_row = max(0, min(len(paths) - 1, old_row + int(offset)))
+        if new_row == old_row:
+            return False
+        paths.insert(new_row, paths.pop(old_row))
+        changed = self.metadata_store.reorder_folder_bookmarks(paths)
+        if changed:
+            QTimer.singleShot(
+                0,
+                lambda path=entry.path: self._select_folder_bookmark_path(path),
+            )
+        return changed
+
+    def _select_folder_bookmark_path(self, path: str) -> None:
+        row = self.folder_bookmark_model.row_for_path(path)
+        if row >= 0:
+            self.favorite_view.setCurrentIndex(
+                self.folder_bookmark_model.index(row, 0)
+            )
 
     def open_bookmark(
         self,
@@ -1392,6 +1522,81 @@ class BrowserWindow(QMainWindow):
         self.config.set("browser_sidebar_visible", visible)
         self.config.set("browser_sidebar_width", self._sidebar_width)
 
+    def _apply_sidebar_layout(self) -> None:
+        selected = self.folder_bookmark_model.entry_at(
+            self.favorite_view.currentIndex()
+        )
+        selected_path = selected.path if selected is not None else None
+        self.sidebar_layout_controller.apply(
+            self.browser_sidebar_layout,
+            splitter_sizes=self.browser_sidebar_splitter_sizes,
+            show_favorites=self.browser_show_favorites,
+            show_tree=self.browser_show_folder_tree,
+            show_history=self.browser_show_history,
+        )
+        if selected_path:
+            row = self.folder_bookmark_model.row_for_path(selected_path)
+            if row >= 0:
+                self.favorite_view.setCurrentIndex(
+                    self.folder_bookmark_model.index(row, 0)
+                )
+
+    def _on_sidebar_splitter_sizes_changed(self, sizes: object) -> None:
+        if not isinstance(sizes, list) or len(sizes) < 2:
+            return
+        self.browser_sidebar_splitter_sizes = [
+            max(40, min(4000, int(value)))
+            for value in sizes[:2]
+        ]
+        self.config.set(
+            "browser_sidebar_splitter_sizes",
+            list(self.browser_sidebar_splitter_sizes),
+        )
+
+    def set_sidebar_layout(self, layout_name: str) -> None:
+        self.config.apply(
+            {"browser_sidebar_layout": str(layout_name)},
+            save=True,
+        )
+
+    def set_sidebar_component_visible(self, component: str, visible: bool) -> None:
+        key = {
+            "favorites": "browser_show_favorites",
+            "tree": "browser_show_folder_tree",
+            "history": "browser_show_history",
+        }.get(component)
+        if key is not None:
+            self.config.apply({key: bool(visible)}, save=True)
+
+    def set_folder_tree_sync_mode(self, mode: str) -> None:
+        self.config.apply({"folder_tree_sync_mode": str(mode)}, save=True)
+
+    def set_folder_tree_collapse_unrelated(self, enabled: bool) -> None:
+        self.config.apply(
+            {"folder_tree_collapse_unrelated": bool(enabled)},
+            save=True,
+        )
+
+    def _sync_sidebar_actions(self) -> None:
+        if not hasattr(self, "favorites_visible_action"):
+            return
+        pairs = (
+            (self.favorites_visible_action, self.browser_show_favorites),
+            (self.folder_tree_visible_action, self.browser_show_folder_tree),
+            (self.history_visible_action, self.browser_show_history),
+        )
+        for action, checked in pairs:
+            action.blockSignals(True)
+            action.setChecked(checked)
+            action.blockSignals(False)
+        for name, action in self.sidebar_layout_actions.items():
+            action.setChecked(name == self.browser_sidebar_layout)
+        for name, action in self.folder_tree_sync_actions.items():
+            action.setChecked(name == self.folder_tree_sync_mode)
+        self.collapse_auto_tree_action.setChecked(
+            self.folder_tree_collapse_unrelated
+        )
+
     def prepare_shutdown(self) -> None:
         if self._shutdown_prepared:
             return
@@ -1422,6 +1627,9 @@ class BrowserWindow(QMainWindow):
             "browser_sort_order",
             "browser_folders_first",
             "browser_display_density",
+            "browser_item_spacing_mode",
+            "browser_item_spacing",
+            "browser_cell_padding",
         }
         list_changed = bool(list_keys.intersection(changed))
         view_state = self._capture_list_view_state() if list_changed else None
@@ -1439,6 +1647,18 @@ class BrowserWindow(QMainWindow):
         if "browser_display_density" in changed:
             self.browser_display_density = normalize_browser_display_density(
                 changed["browser_display_density"]
+            )
+        if "browser_item_spacing_mode" in changed:
+            self.browser_item_spacing_mode = str(
+                changed["browser_item_spacing_mode"]
+            )
+        if "browser_item_spacing" in changed:
+            self.browser_item_spacing = max(
+                0, min(32, int(changed["browser_item_spacing"]))
+            )
+        if "browser_cell_padding" in changed:
+            self.browser_cell_padding = max(
+                0, min(12, int(changed["browser_cell_padding"]))
             )
         if {
             "browser_sort_key",
@@ -1490,7 +1710,12 @@ class BrowserWindow(QMainWindow):
             if bucket_changed:
                 self.item_model.clear_thumbnails()
                 self._generation = self.thumbnail_provider.begin_generation()
-        if thumbnail_changed or "browser_display_density" in changed:
+        if thumbnail_changed or {
+            "browser_display_density",
+            "browser_item_spacing_mode",
+            "browser_item_spacing",
+            "browser_cell_padding",
+        }.intersection(changed):
             self._apply_list_view_geometry()
 
         if list_changed:
@@ -1499,6 +1724,60 @@ class BrowserWindow(QMainWindow):
                 self._schedule_list_view_state_restore(view_state)
             self._update_status()
             self._schedule_thumbnail_requests()
+        sidebar_keys = {
+            "browser_sidebar_layout",
+            "browser_sidebar_splitter_sizes",
+            "browser_show_favorites",
+            "browser_show_folder_tree",
+            "browser_show_history",
+        }
+        if sidebar_keys.intersection(changed):
+            self.browser_sidebar_layout = str(
+                changed.get(
+                    "browser_sidebar_layout",
+                    self.browser_sidebar_layout,
+                )
+            )
+            raw_sizes = changed.get(
+                "browser_sidebar_splitter_sizes",
+                self.browser_sidebar_splitter_sizes,
+            )
+            if isinstance(raw_sizes, list) and len(raw_sizes) == 2:
+                self.browser_sidebar_splitter_sizes = [
+                    max(40, min(4000, int(value)))
+                    for value in raw_sizes
+                ]
+            self.browser_show_favorites = bool(
+                changed.get(
+                    "browser_show_favorites",
+                    self.browser_show_favorites,
+                )
+            )
+            self.browser_show_folder_tree = bool(
+                changed.get(
+                    "browser_show_folder_tree",
+                    self.browser_show_folder_tree,
+                )
+            )
+            self.browser_show_history = bool(
+                changed.get(
+                    "browser_show_history",
+                    self.browser_show_history,
+                )
+            )
+            self._apply_sidebar_layout()
+            self._sync_sidebar_actions()
+        if "folder_tree_sync_mode" in changed:
+            self.folder_tree_sync_mode = str(changed["folder_tree_sync_mode"])
+        if "folder_tree_collapse_unrelated" in changed:
+            self.folder_tree_collapse_unrelated = bool(
+                changed["folder_tree_collapse_unrelated"]
+            )
+        if {
+            "folder_tree_sync_mode",
+            "folder_tree_collapse_unrelated",
+        }.intersection(changed) and self.current_path is not None:
+            self._sync_tree_to_path(self.current_path)
         if "thumbnail_disk_cache_enabled" in changed:
             self.thumbnail_provider.set_disk_cache_enabled(
                 bool(changed["thumbnail_disk_cache_enabled"])
@@ -1579,11 +1858,55 @@ class BrowserWindow(QMainWindow):
             thumbnail_size=self.thumbnail_size,
             density=self.browser_display_density,
             frame_ratio_id=self.thumbnail_frame_ratio,
+            cell_padding=self.browser_cell_padding,
         )
         self.list_view.setIconSize(QSize(self.thumbnail_size, self.thumbnail_size))
         self.list_view.setGridSize(self.item_delegate.cell_size)
-        self.list_view.setSpacing(self.item_delegate.profile.spacing)
+        self.list_view.setSpacing(
+            self.item_delegate.profile.spacing
+            if self.browser_item_spacing_mode == "preset"
+            else self.browser_item_spacing
+        )
         self.list_view.setWordWrap(self.item_delegate.profile.title_lines > 1)
+        self.list_view.viewport().update()
+
+    def _on_list_current_changed(
+        self,
+        current: QModelIndex,
+        previous: QModelIndex,
+    ) -> None:
+        self._update_index_rect(previous)
+        self._update_index_rect(current)
+        self._update_status()
+
+    def _on_list_selection_changed(self, selected, deselected) -> None:
+        for index in tuple(selected.indexes()) + tuple(deselected.indexes()):
+            self._update_index_rect(index)
+        self._update_status()
+        self._update_file_action_states()
+
+    def _on_list_hovered(self, index: QModelIndex) -> None:
+        old_path = self._hovered_list_path
+        item = self.item_model.item_at(index)
+        new_path = str(item.path) if item is not None else None
+        if old_path == new_path:
+            return
+        if old_path:
+            old_row = self.item_model.row_for_path(old_path)
+            if old_row >= 0:
+                self._update_index_rect(self.item_model.index(old_row, 0))
+        self._hovered_list_path = new_path
+        self._update_index_rect(index)
+
+    def _update_index_rect(self, index: QModelIndex) -> None:
+        if not index.isValid():
+            return
+        rect = self.list_view.visualRect(index)
+        if rect.isValid():
+            self.list_view.viewport().update(rect)
+
+    def _update_list_viewport(self, *_args: object) -> None:
+        self._hovered_list_path = None
         self.list_view.viewport().update()
 
     def open_settings_dialog(self) -> None:
@@ -1616,6 +1939,19 @@ class BrowserWindow(QMainWindow):
         return handled
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
+        if watched in (self.list_view, self.list_view.viewport()):
+            if event.type() in {
+                QEvent.Type.FocusIn,
+                QEvent.Type.FocusOut,
+            }:
+                self._update_index_rect(self.list_view.currentIndex())
+            elif event.type() == QEvent.Type.Leave:
+                old_path = self._hovered_list_path
+                self._hovered_list_path = None
+                if old_path:
+                    row = self.item_model.row_for_path(old_path)
+                    if row >= 0:
+                        self._update_index_rect(self.item_model.index(row, 0))
         if watched is self.address_bar and event.type() == QEvent.Type.KeyPress:
             key_event = event
             if isinstance(key_event, QKeyEvent) and key_event.key() == Qt.Key.Key_Escape:
@@ -1713,13 +2049,20 @@ class BrowserWindow(QMainWindow):
         self.folder_tree.setModel(self.file_system_model)
         self.folder_tree.setRootIndex(QModelIndex())
         self.folder_tree.setHeaderHidden(True)
+        self.folder_tree.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.folder_tree.customContextMenuRequested.connect(
+            self._show_folder_tree_context_menu
+        )
         for column in range(1, self.file_system_model.columnCount()):
             self.folder_tree.hideColumn(column)
         self.folder_tree.selectionModel().currentChanged.connect(self._on_tree_current_changed)
-        self.file_system_model.directoryLoaded.connect(self._on_tree_directory_loaded)
-
-        self.sidebar = QTabWidget(self)
-        self.sidebar.addTab(self.folder_tree, "フォルダ")
+        self.folder_tree_sync = FolderTreeSyncController(
+            self.folder_tree,
+            self.file_system_model,
+            self,
+        )
 
         self.bookmark_model = BookmarkModel(self.metadata_store, self)
         self.bookmark_view = QListView(self)
@@ -1731,7 +2074,20 @@ class BrowserWindow(QMainWindow):
         self.bookmark_view.customContextMenuRequested.connect(
             self._show_bookmark_context_menu
         )
-        self.sidebar.addTab(self.bookmark_view, "ブックマーク")
+        self.folder_bookmark_model = FolderBookmarkModel(
+            self.metadata_store,
+            self,
+        )
+        self.favorite_view = QListView(self)
+        self.favorite_view.setObjectName("folder_favorite_view")
+        self.favorite_view.setModel(self.folder_bookmark_model)
+        self.favorite_view.activated.connect(self.open_folder_bookmark)
+        self.favorite_view.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.favorite_view.customContextMenuRequested.connect(
+            self._show_folder_bookmark_context_menu
+        )
 
         self.history_model = HistoryModel(self.metadata_store, self)
         self.history_view = QListView(self)
@@ -1743,7 +2099,19 @@ class BrowserWindow(QMainWindow):
         self.history_view.customContextMenuRequested.connect(
             self._show_history_context_menu
         )
-        self.sidebar.addTab(self.history_view, "履歴")
+        self.sidebar = QWidget(self)
+        self.sidebar.setObjectName("browser_sidebar")
+        self.sidebar_layout_controller = SidebarLayoutController(
+            self.sidebar,
+            favorites_view=self.favorite_view,
+            folder_tree=self.folder_tree,
+            history_view=self.history_view,
+            bookmarks_view=self.bookmark_view,
+        )
+        self.sidebar_layout_controller.splitter_sizes_changed.connect(
+            self._on_sidebar_splitter_sizes_changed
+        )
+        self._apply_sidebar_layout()
 
         self.item_model = BrowserItemModel(self)
         self.item_model.configure_sort(
@@ -1770,6 +2138,7 @@ class BrowserWindow(QMainWindow):
             thumbnail_size=self.thumbnail_size,
             density=self.browser_display_density,
             frame_ratio_id=self.thumbnail_frame_ratio,
+            cell_padding=self.browser_cell_padding,
         )
         self.list_view.setItemDelegate(self.item_delegate)
         self.list_view.setViewMode(QListView.ViewMode.IconMode)
@@ -1785,13 +2154,19 @@ class BrowserWindow(QMainWindow):
         self._apply_list_view_geometry()
         self.list_view.activated.connect(self.open_item)
         self.list_view.selectionModel().currentChanged.connect(
-            lambda _current, _previous: self._update_status()
+            self._on_list_current_changed
         )
         self.list_view.selectionModel().selectionChanged.connect(
-            lambda _selected, _deselected: self._update_status()
+            self._on_list_selection_changed
         )
-        self.list_view.selectionModel().selectionChanged.connect(
-            lambda _selected, _deselected: self._update_file_action_states()
+        self.list_view.entered.connect(self._on_list_hovered)
+        self.item_model.modelReset.connect(self._update_list_viewport)
+        self.item_model.layoutChanged.connect(self._update_list_viewport)
+        self.item_model.rowsInserted.connect(
+            lambda _parent, _first, _last: self._update_list_viewport()
+        )
+        self.item_model.rowsRemoved.connect(
+            lambda _parent, _first, _last: self._update_list_viewport()
         )
         self.list_view.verticalScrollBar().valueChanged.connect(
             self._on_list_scrolled
@@ -1960,6 +2335,8 @@ class BrowserWindow(QMainWindow):
             self.folder_tree.viewport(),
             self.bookmark_view,
             self.bookmark_view.viewport(),
+            self.favorite_view,
+            self.favorite_view.viewport(),
             self.history_view,
             self.history_view.viewport(),
             self.sidebar,
@@ -1996,11 +2373,83 @@ class BrowserWindow(QMainWindow):
         )
         self.sidebar_action.toggled.connect(self.set_sidebar_visible)
         view_menu.addAction(self.sidebar_action)
+        self.favorites_visible_action = QAction("お気に入りを表示", self)
+        self.favorites_visible_action.setCheckable(True)
+        self.favorites_visible_action.toggled.connect(
+            lambda checked: self.set_sidebar_component_visible(
+                "favorites", checked
+            )
+        )
+        view_menu.addAction(self.favorites_visible_action)
+        self.folder_tree_visible_action = QAction("フォルダツリーを表示", self)
+        self.folder_tree_visible_action.setCheckable(True)
+        self.folder_tree_visible_action.toggled.connect(
+            lambda checked: self.set_sidebar_component_visible("tree", checked)
+        )
+        view_menu.addAction(self.folder_tree_visible_action)
+        self.history_visible_action = QAction("履歴を表示", self)
+        self.history_visible_action.setCheckable(True)
+        self.history_visible_action.toggled.connect(
+            lambda checked: self.set_sidebar_component_visible(
+                "history", checked
+            )
+        )
+        view_menu.addAction(self.history_visible_action)
+        layout_menu = view_menu.addMenu("サイドバーレイアウト")
+        self.sidebar_layout_actions: dict[str, QAction] = {}
+        for name, label in (
+            ("favorites_top_tree_bottom", "お気に入り上／ツリー下"),
+            ("tree_top_favorites_bottom", "ツリー上／お気に入り下"),
+            ("tabs", "タブ"),
+            ("favorites_only", "お気に入りのみ"),
+            ("tree_only", "ツリーのみ"),
+        ):
+            action = layout_menu.addAction(label)
+            action.setCheckable(True)
+            action.triggered.connect(
+                lambda _checked=False, value=name: self.set_sidebar_layout(value)
+            )
+            self.sidebar_layout_actions[name] = action
+        tree_sync_menu = view_menu.addMenu("フォルダツリー同期")
+        self.folder_tree_sync_actions: dict[str, QAction] = {}
+        for name, label in (
+            ("off", "同期しない"),
+            ("select_current", "現在フォルダを選択"),
+            ("focus_current", "現在フォルダへフォーカス"),
+        ):
+            action = tree_sync_menu.addAction(label)
+            action.setCheckable(True)
+            action.triggered.connect(
+                lambda _checked=False, value=name: (
+                    self.set_folder_tree_sync_mode(value)
+                )
+            )
+            self.folder_tree_sync_actions[name] = action
+        self.collapse_auto_tree_action = tree_sync_menu.addAction(
+            "無関係な自動展開を折りたたむ"
+        )
+        self.collapse_auto_tree_action.setCheckable(True)
+        self.collapse_auto_tree_action.triggered.connect(
+            self.set_folder_tree_collapse_unrelated
+        )
+        self._sync_sidebar_actions()
 
         bookmark_menu = self.menuBar().addMenu("ブックマーク")
-        add_folder_bookmark_action = QAction("現在のフォルダを追加", self)
-        add_folder_bookmark_action.triggered.connect(self.add_current_folder_bookmark)
-        bookmark_menu.addAction(add_folder_bookmark_action)
+        self.add_folder_bookmark_action = QAction("現在のフォルダを追加", self)
+        self.add_folder_bookmark_action.triggered.connect(
+            self.add_current_folder_bookmark
+        )
+        bookmark_menu.addAction(self.add_folder_bookmark_action)
+        self.toggle_folder_bookmark_shortcut = QShortcut(
+            QKeySequence("Ctrl+B"),
+            self,
+        )
+        self.toggle_folder_bookmark_shortcut.setContext(
+            Qt.ShortcutContext.WindowShortcut
+        )
+        self.toggle_folder_bookmark_shortcut.activated.connect(
+            self.toggle_current_folder_bookmark
+        )
 
         history_menu = self.menuBar().addMenu("履歴")
         clear_history_action = QAction("閲覧履歴をすべて消去...", self)
@@ -2052,6 +2501,10 @@ class BrowserWindow(QMainWindow):
         self.config.set("browser_sidebar_visible", self.sidebar.isVisible())
         self.config.set("browser_sidebar_width", self._sidebar_width)
         self.config.set(
+            "browser_sidebar_splitter_sizes",
+            self.sidebar_layout_controller.current_splitter_sizes(),
+        )
+        self.config.set(
             "browser_window_geometry",
             bytes(self.saveGeometry().toBase64()).decode("ascii"),
         )
@@ -2061,7 +2514,10 @@ class BrowserWindow(QMainWindow):
         current: QModelIndex,
         _previous: QModelIndex,
     ) -> None:
-        if self._syncing_tree or not current.isValid():
+        if (
+            self.folder_tree_sync.applying
+            or not current.isValid()
+        ):
             return
         path = Path(self.file_system_model.filePath(current))
         self._pending_tree_navigation_path = path
@@ -2074,27 +2530,16 @@ class BrowserWindow(QMainWindow):
             self.navigate_to(path)
 
     def _sync_tree_to_path(self, path: Path) -> None:
-        index = self.file_system_model.index(str(path))
-        if not index.isValid():
-            self._pending_tree_sync_path = path
-            return
-        if self._pending_tree_sync_path == path:
-            self._pending_tree_sync_path = None
-        self._syncing_tree = True
-        try:
-            self.folder_tree.setCurrentIndex(index)
-            self.folder_tree.scrollTo(index, QTreeView.ScrollHint.PositionAtCenter)
-            parent = index.parent()
-            while parent.isValid():
-                self.folder_tree.expand(parent)
-                parent = parent.parent()
-        finally:
-            self._syncing_tree = False
+        self.folder_tree_sync.sync(
+            path,
+            mode=self.folder_tree_sync_mode,
+            collapse_unrelated=self.folder_tree_collapse_unrelated,
+        )
 
     def _on_tree_directory_loaded(self, _path: str) -> None:
-        pending = self._pending_tree_sync_path
-        if pending is not None:
-            self._sync_tree_to_path(pending)
+        # Compatibility hook retained for older tests and integrations.
+        if self.current_path is not None:
+            self._sync_tree_to_path(self.current_path)
 
     def _request_visible_thumbnails(self) -> None:
         row_count = self.item_model.rowCount()
@@ -2617,6 +3062,87 @@ class BrowserWindow(QMainWindow):
             self.open_bookmark(index, open_in_new_window=True)
         elif selected == remove_action:
             self.remove_browser_bookmark(entry.path)
+
+    def _show_folder_bookmark_context_menu(self, position: QPoint) -> None:
+        index = self.favorite_view.indexAt(position)
+        entry = self.folder_bookmark_model.entry_at(index)
+        if entry is None:
+            return
+        menu = QMenu(self)
+        open_action = menu.addAction("移動")
+        location_action = menu.addAction("エクスプローラーで場所を開く")
+        menu.addSeparator()
+        rename_action = menu.addAction("表示名を変更")
+        move_up_action = menu.addAction("上へ移動")
+        move_down_action = menu.addAction("下へ移動")
+        remove_action = menu.addAction("お気に入りから削除")
+        menu.addSeparator()
+        copy_here_action = menu.addAction("選択項目をここへコピー")
+        move_here_action = menu.addAction("選択項目をここへ移動")
+        has_selection = bool(self.selected_file_operation_paths())
+        busy = self.file_operation_coordinator.busy
+        copy_here_action.setEnabled(has_selection and not busy and entry.exists is not False)
+        move_here_action.setEnabled(has_selection and not busy and entry.exists is not False)
+        move_up_action.setEnabled(index.row() > 0)
+        move_down_action.setEnabled(
+            0 <= index.row() < self.folder_bookmark_model.rowCount() - 1
+        )
+        selected = menu.exec(self.favorite_view.viewport().mapToGlobal(position))
+        if selected == open_action:
+            self.open_folder_bookmark(index)
+        elif selected == location_action:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(entry.path))
+        elif selected == rename_action:
+            self.rename_folder_bookmark(index)
+        elif selected == move_up_action:
+            self.move_folder_bookmark(index, -1)
+        elif selected == move_down_action:
+            self.move_folder_bookmark(index, 1)
+        elif selected == remove_action and self.metadata_store is not None:
+            self.metadata_store.remove_folder_bookmark(entry.path)
+        elif selected == copy_here_action:
+            self.copy_selected_to_folder_bookmark(index)
+        elif selected == move_here_action:
+            self.move_selected_to_folder_bookmark(index)
+
+    def copy_selected_to_folder_bookmark(self, index: QModelIndex) -> bool:
+        entry = self.folder_bookmark_model.entry_at(index)
+        if entry is None or entry.exists is False:
+            return False
+        return self.copy_selected_to(entry.path)
+
+    def move_selected_to_folder_bookmark(self, index: QModelIndex) -> bool:
+        entry = self.folder_bookmark_model.entry_at(index)
+        if entry is None or entry.exists is False:
+            return False
+        return self.move_selected_to(entry.path)
+
+    def _show_folder_tree_context_menu(self, position: QPoint) -> None:
+        index = self.folder_tree.indexAt(position)
+        if not index.isValid():
+            return
+        menu = QMenu(self)
+        copy_here_action = menu.addAction("選択項目をここへコピー")
+        move_here_action = menu.addAction("選択項目をここへ移動")
+        has_selection = bool(self.selected_file_operation_paths())
+        busy = self.file_operation_coordinator.busy
+        copy_here_action.setEnabled(has_selection and not busy)
+        move_here_action.setEnabled(has_selection and not busy)
+        selected = menu.exec(self.folder_tree.viewport().mapToGlobal(position))
+        if selected == copy_here_action:
+            self.copy_selected_to_tree_index(index)
+        elif selected == move_here_action:
+            self.move_selected_to_tree_index(index)
+
+    def copy_selected_to_tree_index(self, index: QModelIndex) -> bool:
+        if not index.isValid():
+            return False
+        return self.copy_selected_to(self.file_system_model.filePath(index))
+
+    def move_selected_to_tree_index(self, index: QModelIndex) -> bool:
+        if not index.isValid():
+            return False
+        return self.move_selected_to(self.file_system_model.filePath(index))
 
     def _show_history_context_menu(self, position: QPoint) -> None:
         index = self.history_view.indexAt(position)

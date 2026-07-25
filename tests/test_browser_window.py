@@ -6,7 +6,12 @@ from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import QItemSelectionModel, QSize
-from PySide6.QtWidgets import QApplication, QListView, QMessageBox
+from PySide6.QtWidgets import (
+    QApplication,
+    QListView,
+    QMessageBox,
+    QTabWidget,
+)
 
 from app.browser_model import BrowserItemKind
 from app.browser_window import BrowserWindow
@@ -389,17 +394,27 @@ def test_sidebar_has_folder_bookmark_and_history_tabs(
     folder = tmp_path / "three-tabs"
     folder.mkdir()
     store = MetadataStore(tmp_path / "data" / "metadata.sqlite3")
+    config = make_config(tmp_path, folder)
+    config.set("browser_sidebar_layout", "tabs")
     window = BrowserWindow(
-        config_manager=make_config(tmp_path, folder),
+        config_manager=config,
         metadata_store=store,
     )
     finish_scan(window, qapp)
 
-    assert [window.sidebar.tabText(index) for index in range(window.sidebar.count())] == [
+    tabs = window.sidebar_layout_controller.tabs
+    assert tabs is not None
+    assert [tabs.tabText(index) for index in range(tabs.count())] == [
         "フォルダ",
-        "ブックマーク",
+        "お気に入り",
         "履歴",
     ]
+    favorites_panel = tabs.widget(1)
+    assert isinstance(favorites_panel, QTabWidget)
+    assert [
+        favorites_panel.tabText(index)
+        for index in range(favorites_panel.count())
+    ] == ["フォルダ", "本"]
     window.close()
     store.close()
     qapp.processEvents()

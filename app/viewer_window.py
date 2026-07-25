@@ -36,6 +36,7 @@ from .archive_backend import EXTERNAL_ARCHIVE_EXTENSIONS
 from .archive_backend_registry import ArchiveBackendRegistry
 from .book_session import AsyncBookOpenFailed, BookOpened, BookSession
 from .config_manager import ConfigManager
+from .fullscreen_chrome import FullscreenChromeController
 from .image_cache import CachedImage, PRELOAD_RADIUS
 from .image_work_coordinator import ImageWorkCoordinator
 from .image_source import (
@@ -157,6 +158,15 @@ class ViewerWindow(QMainWindow):
         self.sort_descending = bool(self.settings.get("sort_descending", False))
         self.hide_ui_in_fullscreen = bool(self.settings.get("hide_ui_in_fullscreen", False))
         self.hide_cursor_in_fullscreen = bool(self.settings.get("hide_cursor_in_fullscreen", False))
+        self.fullscreen_auto_reveal_ui = bool(
+            self.settings.get("fullscreen_auto_reveal_ui", True)
+        )
+        self.fullscreen_edge_trigger_px = int(
+            self.settings.get("fullscreen_edge_trigger_px", 8)
+        )
+        self.fullscreen_ui_hide_delay_ms = int(
+            self.settings.get("fullscreen_ui_hide_delay_ms", 900)
+        )
         self.show_page_list = bool(self.settings.get("show_page_list", False))
         self.thumbnail_size = int(self.settings.get("thumbnail_size", 96))
         self.auto_open_adjacent_book = bool(self.settings.get("auto_open_adjacent_book", False))
@@ -296,6 +306,16 @@ class ViewerWindow(QMainWindow):
         self.viewer.viewportChanged.connect(self._schedule_pdf_rerender)
         self.viewer.contentPainted.connect(self._on_viewer_content_painted)
         self.slider.valueChanged.connect(self._on_slider_changed)
+        self.fullscreen_chrome = FullscreenChromeController(
+            self,
+            viewer=self.viewer,
+            menu_bar=self.menuBar(),
+            slider=self.slider,
+            status_bar=self.status,
+            auto_reveal=self.fullscreen_auto_reveal_ui,
+            edge_trigger_px=self.fullscreen_edge_trigger_px,
+            hide_delay_ms=self.fullscreen_ui_hide_delay_ms,
+        )
 
     def _create_menus(self) -> None:
         menu_bar = self.menuBar()
@@ -694,6 +714,28 @@ class ViewerWindow(QMainWindow):
                 cached = self.image_cache.get(index)
                 if cached is not None:
                     self._update_page_list_thumbnail(cached)
+        fullscreen_chrome_changed = False
+        if "fullscreen_auto_reveal_ui" in changed:
+            self.fullscreen_auto_reveal_ui = bool(
+                changed["fullscreen_auto_reveal_ui"]
+            )
+            fullscreen_chrome_changed = True
+        if "fullscreen_edge_trigger_px" in changed:
+            self.fullscreen_edge_trigger_px = max(
+                4, min(32, int(changed["fullscreen_edge_trigger_px"]))
+            )
+            fullscreen_chrome_changed = True
+        if "fullscreen_ui_hide_delay_ms" in changed:
+            self.fullscreen_ui_hide_delay_ms = max(
+                300, min(3000, int(changed["fullscreen_ui_hide_delay_ms"]))
+            )
+            fullscreen_chrome_changed = True
+        if fullscreen_chrome_changed:
+            self.fullscreen_chrome.configure(
+                auto_reveal=self.fullscreen_auto_reveal_ui,
+                edge_trigger_px=self.fullscreen_edge_trigger_px,
+                hide_delay_ms=self.fullscreen_ui_hide_delay_ms,
+            )
         if (
             {
                 "archive_backend_preference",
@@ -2133,10 +2175,13 @@ class ViewerWindow(QMainWindow):
             self._apply_chrome_visibility()
 
     def _apply_chrome_visibility(self) -> None:
-        show_chrome = not (self.isFullScreen() and self.hide_ui_in_fullscreen)
-        self.menuBar().setVisible(show_chrome)
-        self.slider.setVisible(show_chrome)
-        self.status.setVisible(show_chrome)
+        overlay_mode = self.isFullScreen() and self.hide_ui_in_fullscreen
+        self.fullscreen_chrome.set_active(overlay_mode)
+        show_chrome = not overlay_mode
+        if show_chrome:
+            self.menuBar().setVisible(True)
+            self.slider.setVisible(True)
+            self.status.setVisible(True)
         self.page_list_dock.setVisible(show_chrome and self.show_page_list)
         self._apply_cursor_visibility_policy()
 

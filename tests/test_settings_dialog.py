@@ -142,7 +142,8 @@ def test_browser_grid_presets_apply_density_and_thumbnail_size(
     dialog = SettingsDialog(config)
     large_index = dialog.browser_grid_preset_combo.findData("large")
 
-    assert dialog.browser_grid_preset_combo.count() == 4
+    assert dialog.browser_grid_preset_combo.count() == 5
+    assert dialog.browser_grid_preset_combo.findData("extra_compact") >= 0
     assert large_index >= 0
     dialog.browser_grid_preset_combo.setCurrentIndex(large_index)
     dialog.browser_grid_preset_combo.activated.emit(large_index)

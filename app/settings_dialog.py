@@ -253,8 +253,32 @@ class SettingsDialog(QDialog):
         self.wide_single_checkbox = QCheckBox("横長画像を単独表示", spread_group)
         spread_form.addRow(self.wide_single_checkbox)
 
+        fullscreen_group = QGroupBox("全画面UI", tab)
+        fullscreen_form = QFormLayout(fullscreen_group)
+        self.fullscreen_auto_reveal_checkbox = QCheckBox(
+            "全画面時、画面端でUIを表示",
+            fullscreen_group,
+        )
+        fullscreen_form.addRow(self.fullscreen_auto_reveal_checkbox)
+        self.fullscreen_edge_trigger_spin = QSpinBox(fullscreen_group)
+        self.fullscreen_edge_trigger_spin.setRange(4, 32)
+        self.fullscreen_edge_trigger_spin.setSuffix(" px")
+        fullscreen_form.addRow(
+            "画面端の反応範囲:",
+            self.fullscreen_edge_trigger_spin,
+        )
+        self.fullscreen_hide_delay_spin = QSpinBox(fullscreen_group)
+        self.fullscreen_hide_delay_spin.setRange(300, 3000)
+        self.fullscreen_hide_delay_spin.setSingleStep(100)
+        self.fullscreen_hide_delay_spin.setSuffix(" ms")
+        fullscreen_form.addRow(
+            "自動的に隠すまで:",
+            self.fullscreen_hide_delay_spin,
+        )
+
         layout.addWidget(behavior_group)
         layout.addWidget(spread_group)
+        layout.addWidget(fullscreen_group)
         layout.addStretch(1)
         return tab
 
@@ -380,6 +404,28 @@ class SettingsDialog(QDialog):
             list_group,
         )
         list_form.addRow(self.browser_folders_first_checkbox)
+        self.browser_spacing_preset_checkbox = QCheckBox(
+            "密度プリセットに従う",
+            list_group,
+        )
+        self.browser_spacing_preset_checkbox.toggled.connect(
+            self._sync_browser_spacing_controls
+        )
+        list_form.addRow(self.browser_spacing_preset_checkbox)
+        self.browser_item_spacing_spin = QSpinBox(list_group)
+        self.browser_item_spacing_spin.setRange(0, 32)
+        self.browser_item_spacing_spin.setSuffix(" px")
+        list_form.addRow(
+            "サムネイル間隔:",
+            self.browser_item_spacing_spin,
+        )
+        self.browser_cell_padding_spin = QSpinBox(list_group)
+        self.browser_cell_padding_spin.setRange(0, 12)
+        self.browser_cell_padding_spin.setSuffix(" px")
+        list_form.addRow(
+            "セル内余白:",
+            self.browser_cell_padding_spin,
+        )
 
         cache_group = QGroupBox("サムネイル", tab)
         form = QFormLayout(cache_group)
@@ -430,6 +476,41 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(list_group)
         layout.addWidget(cache_group)
+        sidebar_group = QGroupBox("サイドバー", tab)
+        sidebar_form = QFormLayout(sidebar_group)
+        self.browser_sidebar_layout_combo = QComboBox(sidebar_group)
+        for value, label in (
+            ("favorites_top_tree_bottom", "お気に入り上／ツリー下"),
+            ("tree_top_favorites_bottom", "ツリー上／お気に入り下"),
+            ("tabs", "タブ"),
+            ("favorites_only", "お気に入りのみ"),
+            ("tree_only", "ツリーのみ"),
+        ):
+            self.browser_sidebar_layout_combo.addItem(label, value)
+        sidebar_form.addRow(
+            "レイアウト:",
+            self.browser_sidebar_layout_combo,
+        )
+        self.folder_tree_sync_mode_combo = QComboBox(sidebar_group)
+        self.folder_tree_sync_mode_combo.addItem("同期しない", "off")
+        self.folder_tree_sync_mode_combo.addItem(
+            "現在フォルダを選択",
+            "select_current",
+        )
+        self.folder_tree_sync_mode_combo.addItem(
+            "現在フォルダへフォーカス",
+            "focus_current",
+        )
+        sidebar_form.addRow(
+            "フォルダツリー同期:",
+            self.folder_tree_sync_mode_combo,
+        )
+        self.folder_tree_collapse_checkbox = QCheckBox(
+            "無関係な自動展開を折りたたむ",
+            sidebar_group,
+        )
+        sidebar_form.addRow(self.folder_tree_collapse_checkbox)
+        layout.addWidget(sidebar_group)
         layout.addStretch(1)
         return tab
 
@@ -491,6 +572,15 @@ class SettingsDialog(QDialog):
         self.wide_single_checkbox.setChecked(
             bool(self.config.get("treat_wide_image_as_single", True))
         )
+        self.fullscreen_auto_reveal_checkbox.setChecked(
+            bool(self.config.get("fullscreen_auto_reveal_ui", True))
+        )
+        self.fullscreen_edge_trigger_spin.setValue(
+            int(self.config.get("fullscreen_edge_trigger_px", 8))
+        )
+        self.fullscreen_hide_delay_spin.setValue(
+            int(self.config.get("fullscreen_ui_hide_delay_ms", 900))
+        )
         self.thumbnail_size_spin.setValue(int(self.config.get("thumbnail_size", 180)))
         self._select_data(
             self.thumbnail_frame_ratio_combo,
@@ -521,6 +611,32 @@ class SettingsDialog(QDialog):
         )
         self.browser_folders_first_checkbox.setChecked(
             bool(self.config.get("browser_folders_first", True))
+        )
+        self.browser_spacing_preset_checkbox.setChecked(
+            self.config.get("browser_item_spacing_mode", "preset") == "preset"
+        )
+        self.browser_item_spacing_spin.setValue(
+            int(self.config.get("browser_item_spacing", 2))
+        )
+        self.browser_cell_padding_spin.setValue(
+            int(self.config.get("browser_cell_padding", 0))
+        )
+        self._select_data(
+            self.browser_sidebar_layout_combo,
+            self.config.get(
+                "browser_sidebar_layout",
+                "favorites_top_tree_bottom",
+            ),
+        )
+        self._select_data(
+            self.folder_tree_sync_mode_combo,
+            self.config.get("folder_tree_sync_mode", "focus_current"),
+        )
+        self.folder_tree_collapse_checkbox.setChecked(
+            bool(self.config.get("folder_tree_collapse_unrelated", True))
+        )
+        self._sync_browser_spacing_controls(
+            self.browser_spacing_preset_checkbox.isChecked()
         )
         self.disk_cache_checkbox.setChecked(
             bool(self.config.get("thumbnail_disk_cache_enabled", True))
@@ -612,6 +728,10 @@ class SettingsDialog(QDialog):
         self.browser_grid_preset_combo.blockSignals(True)
         self.browser_grid_preset_combo.setCurrentIndex(index if index >= 0 else -1)
         self.browser_grid_preset_combo.blockSignals(False)
+
+    def _sync_browser_spacing_controls(self, use_preset: bool) -> None:
+        self.browser_item_spacing_spin.setEnabled(not use_preset)
+        self.browser_cell_padding_spin.setEnabled(True)
 
     def refresh_registration_status(self) -> None:
         service = self._file_registration_service
@@ -714,6 +834,11 @@ class SettingsDialog(QDialog):
             "gap": self.gap_spin.value(),
             "single_first_page": self.single_first_checkbox.isChecked(),
             "treat_wide_image_as_single": self.wide_single_checkbox.isChecked(),
+            "fullscreen_auto_reveal_ui": (
+                self.fullscreen_auto_reveal_checkbox.isChecked()
+            ),
+            "fullscreen_edge_trigger_px": self.fullscreen_edge_trigger_spin.value(),
+            "fullscreen_ui_hide_delay_ms": self.fullscreen_hide_delay_spin.value(),
             "thumbnail_size": self.thumbnail_size_spin.value(),
             "thumbnail_frame_ratio": str(
                 self.thumbnail_frame_ratio_combo.currentData()
@@ -730,6 +855,22 @@ class SettingsDialog(QDialog):
             ),
             "browser_folders_first": (
                 self.browser_folders_first_checkbox.isChecked()
+            ),
+            "browser_item_spacing_mode": (
+                "preset"
+                if self.browser_spacing_preset_checkbox.isChecked()
+                else "custom"
+            ),
+            "browser_item_spacing": self.browser_item_spacing_spin.value(),
+            "browser_cell_padding": self.browser_cell_padding_spin.value(),
+            "browser_sidebar_layout": str(
+                self.browser_sidebar_layout_combo.currentData()
+            ),
+            "folder_tree_sync_mode": str(
+                self.folder_tree_sync_mode_combo.currentData()
+            ),
+            "folder_tree_collapse_unrelated": (
+                self.folder_tree_collapse_checkbox.isChecked()
             ),
             "thumbnail_disk_cache_enabled": self.disk_cache_checkbox.isChecked(),
             "thumbnail_cache_limit_mb": self.cache_limit_spin.value(),
