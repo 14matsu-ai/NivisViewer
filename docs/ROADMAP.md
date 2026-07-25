@@ -29,9 +29,16 @@
     - pypdfium2 v5の遅延読み込みとアプリ全体で直列化したPdfiumService
     - Browser、表紙サムネイル、Viewer、履歴、前後の本への統合
     - 96 logical DPI、DPR、64px bucket、リサイズ／ズーム後の再レンダー
-14. Sprint 13：レート／タグ編集UIと検索
+14. Sprint 13：Windowsポータブル配布、起動統合、任意の関連付け、安定性試験（完了）
+    - PyInstaller one-folder、portable.flag、ZIP／SHA-256
+    - AppPaths、起動引数、QLocalServer単一インスタンス
+    - opt-inのOpen With／Capabilities登録とローカル診断ログ
+15. 後続候補：実機不具合修正、ポータブル版UI磨き込み
+    - ファイルドラッグ＆ドロップ、PDFパスワード入力、PDF目次
+    - 画像中央クロップ／余白除去、Viewerメモリ予算調整
+16. 後続候補：レート／タグ編集UIと検索
     - 基本ナビゲーションとファイル操作の安定後に着手
     - ZipPla `{zpi$...}` の明示的な読み取り互換
     - タグ・レート検索と絞り込み
     - サムネイル上のレート／タグ表示
-15. Sprint 14：ポータブルビルドと公開準備
+17. 公開前ライセンス監査、コード署名の将来検討

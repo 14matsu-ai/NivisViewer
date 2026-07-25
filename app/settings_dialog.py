@@ -34,6 +34,7 @@ from .config_manager import ConfigManager
 from .seven_zip_locator import SevenZipInfo, SevenZipLocator
 from .viewer_commands import COMMAND_CHOICES
 from .winrar_locator import WinRARInfo, WinRARLocator
+from .windows_file_registration import WindowsFileRegistrationService
 
 
 class _SevenZipProbeSignals(QObject):
@@ -104,6 +105,7 @@ class SettingsDialog(QDialog):
         cache_usage_getter: Callable[[], int] | None = None,
         seven_zip_locator: SevenZipLocator | None = None,
         winrar_locator: WinRARLocator | None = None,
+        file_registration_service: WindowsFileRegistrationService | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("環境設定")
@@ -113,6 +115,7 @@ class SettingsDialog(QDialog):
         self._cache_usage_getter = cache_usage_getter
         self._seven_zip_locator = seven_zip_locator or SevenZipLocator()
         self._winrar_locator = winrar_locator or WinRARLocator()
+        self._file_registration_service = file_registration_service
         self._probe_pool = QThreadPool()
         self._probe_pool.setMaxThreadCount(2)
         self._probe_generation = 0
@@ -138,6 +141,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._build_browser_tab(), "Browser")
         tabs.addTab(self._build_archive_tab(), "書庫")
         tabs.addTab(self._build_mouse_tab(), "Mouse")
+        tabs.addTab(self._build_windows_tab(), "Windows連携")
 
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -154,6 +158,53 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(tabs, 1)
         layout.addWidget(self.button_box)
+
+    def _build_windows_tab(self) -> QWidget:
+        tab = QWidget(self)
+        layout = QVBoxLayout(tab)
+        self.registration_status_label = QLabel(tab)
+        self.registration_status_label.setWordWrap(True)
+        layout.addWidget(self.registration_status_label)
+        self.register_images_checkbox = QCheckBox("画像を登録", tab)
+        self.register_archives_checkbox = QCheckBox("漫画書庫を登録", tab)
+        self.register_pdf_checkbox = QCheckBox("PDFを登録", tab)
+        self.register_context_menu_checkbox = QCheckBox(
+            "「NivisViewerで開く」を右クリックメニューへ追加",
+            tab,
+        )
+        for checkbox in (
+            self.register_images_checkbox,
+            self.register_archives_checkbox,
+            self.register_pdf_checkbox,
+            self.register_context_menu_checkbox,
+        ):
+            layout.addWidget(checkbox)
+        note = QLabel(
+            "登録は「プログラムから開く」と既定アプリ候補を追加するだけで、"
+            "既定アプリを強制変更しません。",
+            tab,
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        buttons = QHBoxLayout()
+        self.register_button = QPushButton("Windowsへ登録", tab)
+        self.unregister_button = QPushButton("登録を解除", tab)
+        self.default_apps_button = QPushButton(
+            "Windowsの既定のアプリ設定を開く", tab
+        )
+        buttons.addWidget(self.register_button)
+        buttons.addWidget(self.unregister_button)
+        layout.addLayout(buttons)
+        layout.addWidget(self.default_apps_button)
+        layout.addStretch(1)
+        self.register_button.clicked.connect(self._register_with_windows)
+        self.unregister_button.clicked.connect(self._unregister_from_windows)
+        self.default_apps_button.clicked.connect(self._open_default_apps)
+        available = self._file_registration_service is not None
+        self.register_button.setEnabled(available)
+        self.unregister_button.setEnabled(available)
+        self.default_apps_button.setEnabled(available)
+        return tab
 
     def _build_viewer_tab(self) -> QWidget:
         tab = QWidget(self)
@@ -478,6 +529,89 @@ class SettingsDialog(QDialog):
         self._sync_gap_enabled(self.join_spread_checkbox.isChecked())
         self._sync_gesture_controls(self.mouse_gestures_checkbox.isChecked())
         self.refresh_cache_usage()
+        self.refresh_registration_status()
+
+    def refresh_registration_status(self) -> None:
+        service = self._file_registration_service
+        if service is None:
+            self.registration_status_label.setText(
+                "Windows関連付けはこの起動環境では利用できません。"
+            )
+            return
+        status = service.get_status()
+        if status.registered:
+            match = (
+                "現在の実行ファイルと一致"
+                if status.matches_current_executable
+                else "現在の実行ファイルと不一致（移動後は再登録が必要）"
+            )
+            self.registration_status_label.setText(
+                f"登録済み: {', '.join(status.registered_extensions)}\n"
+                f"{status.executable_path}\n{match}"
+            )
+        else:
+            detail = f"\n{status.error_message}" if status.error_message else ""
+            self.registration_status_label.setText(f"未登録{detail}")
+
+    def _register_with_windows(self) -> None:
+        service = self._file_registration_service
+        if service is None:
+            return
+        from .supported_formats import FORMAT_CATEGORIES
+
+        extensions: set[str] = set()
+        if self.register_images_checkbox.isChecked():
+            extensions.update(FORMAT_CATEGORIES["image"])
+        if self.register_archives_checkbox.isChecked():
+            extensions.update(FORMAT_CATEGORIES["archive"])
+        if self.register_pdf_checkbox.isChecked():
+            extensions.update(FORMAT_CATEGORIES["pdf"])
+        if not extensions:
+            QMessageBox.information(self, "Windows連携", "登録する形式を選択してください。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Windowsへ登録",
+            "選択した形式の「プログラムから開く」候補へNivisViewerを登録しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        status = service.register(
+            tuple(extensions),
+            add_context_menu=self.register_context_menu_checkbox.isChecked(),
+        )
+        self.refresh_registration_status()
+        if status.error_message:
+            QMessageBox.warning(self, "Windows連携", status.error_message)
+
+    def _unregister_from_windows(self) -> None:
+        service = self._file_registration_service
+        if service is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "登録を解除",
+            "NivisViewerが作成したWindows関連付け情報を解除しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        status = service.unregister()
+        self.refresh_registration_status()
+        if status.error_message:
+            QMessageBox.warning(self, "Windows連携", status.error_message)
+
+    def _open_default_apps(self) -> None:
+        service = self._file_registration_service
+        if service is not None and not service.open_default_apps_settings():
+            QMessageBox.warning(
+                self,
+                "Windows連携",
+                "Windowsの既定のアプリ設定を開けませんでした。",
+            )
 
     def values(self) -> dict[str, object]:
         bindings = dict(self._gesture_bindings_base)

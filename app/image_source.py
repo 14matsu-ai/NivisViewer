@@ -13,16 +13,19 @@ from PIL import Image, ImageOps
 from .archive_backend import (
     ArchiveBackendError,
     ArchiveErrorCode,
-    EXTERNAL_ARCHIVE_EXTENSIONS,
     MAX_IMAGE_ENTRY_BYTES,
     select_image_entries,
 )
+from .supported_formats import (
+    ARCHIVE_EXTENSIONS,
+    BOOK_FILE_EXTENSIONS,
+    EXTERNAL_ARCHIVE_EXTENSIONS,
+    IMAGE_EXTENSIONS,
+    PDF_EXTENSIONS,
+    ZIP_ARCHIVE_EXTENSIONS,
+)
 
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".ico"}
-ZIP_ARCHIVE_EXTENSIONS = {".zip", ".cbz"}
-ARCHIVE_EXTENSIONS = set(ZIP_ARCHIVE_EXTENSIONS | EXTERNAL_ARCHIVE_EXTENSIONS)
-PDF_EXTENSIONS = {".pdf"}
-BOOK_FILE_EXTENSIONS = frozenset(ARCHIVE_EXTENSIONS | SUPPORTED_EXTENSIONS | PDF_EXTENSIONS)
+SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS
 
 
 class ImageSourceError(RuntimeError):

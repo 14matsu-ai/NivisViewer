@@ -2,6 +2,24 @@
 
 ## 現在の実装
 
+Sprint 13では起動と配布境界を次のように分離しました。
+
+```text
+ApplicationBootstrap
+├─ CommandLineOptions
+├─ AppPaths
+├─ SingleInstanceBroker
+├─ Logging
+├─ ApplicationController
+└─ WindowsFileRegistrationService
+```
+
+`AppPaths`はPyInstaller bundle内の読み取り専用resourceと、exe側のmutable profileを分離します。`portable.flag`があるone-folder配布ではexeの隣に`config.json`と`data/`を置きます。書き込み検査に失敗した場合は別の保存先へ勝手に移らず、ConfigManagerを読み取り専用、MetadataStoreとディスクサムネイルキャッシュを無効状態として基本閲覧を継続します。
+
+単一インスタンスはユーザーとportable配置をハッシュ化した名前のQLocalServer／QLocalSocketを使い、最大1 MiBの長さprefix付きUTF-8 JSONだけを受け取ります。セカンダリはConfigManager、MetadataStore、サムネイルDB、PdfiumServiceを開く前に要求を転送してACK後に終了します。生存確認に失敗したendpointだけをstale候補として除去します。
+
+Windows関連付けはHKCUのNivisViewer所有ProgID、Applications、Capabilities、RegisteredApplications、OpenWithProgidsだけを明示操作時に登録します。拡張子の既定値、HKLM、UserChoiceには書き込みません。ログはprofile内だけにローテーション保存し、telemetryは行いません。frozen smokeと負荷ツールは一時profileを使い、通常ユーザーデータへ触れません。
+
 Sprint 11では、利用者環境のWinRARまたは7-Zipを利用するRAR／7z／CBR／CB7閲覧を追加しました。書庫一覧のprepareはBookSessionのworker、各ページの抽出とデコードはImageCache worker、表紙生成はBrowserThumbnailProvider workerで実行します。既存のZIP／CBZ経路とファイル操作は維持し、ApplicationControllerが外部書庫backendの設定と寿命も管理します。
 
 ```text

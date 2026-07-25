@@ -81,10 +81,17 @@ class ConfigManager(QObject):
         "window_state": "",
     }
 
-    def __init__(self, path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        writable: bool = True,
+    ) -> None:
         super().__init__()
         base_dir = Path(__file__).resolve().parents[1]
         self.path = Path(path) if path else base_dir / "config.json"
+        self.writable = bool(writable)
+        self.last_error: str | None = None
         self.data: dict[str, Any] = deepcopy(self.DEFAULTS)
 
     @property
@@ -124,9 +131,22 @@ class ConfigManager(QObject):
         if updates:
             self.apply(updates)
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("w", encoding="utf-8") as file:
-            json.dump(self.data, file, ensure_ascii=False, indent=2)
+        if not self.writable:
+            self.last_error = "プロファイルは読み取り専用です。"
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_name(f".{self.path.name}.tmp")
+            with temporary.open("w", encoding="utf-8") as file:
+                json.dump(self.data, file, ensure_ascii=False, indent=2)
+            temporary.replace(self.path)
+            self.last_error = None
+        except OSError as exc:
+            self.last_error = str(exc)
+            try:
+                temporary.unlink(missing_ok=True)
+            except (OSError, UnboundLocalError):
+                pass
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.data.get(key, default)

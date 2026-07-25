@@ -4,6 +4,18 @@ NivisViewerは、Windows向けの漫画・画像ビューアです。ZipPlaの�
 
 現在は開発初期段階です。フォルダツリーとサムネイル一覧を持つBrowserWindow、本を表示する独立したViewerWindow、基本設定画面、見開き密着表示、ポータブルなサムネイルキャッシュ、フォルダ・単体画像・ZIP/CBZ・RAR/7z系書庫・PDFの読み込み、自然順ソート、非同期画像読み込みなどを実装しています。ViewerWindowではマウスの戻る／進むボタンによる前後の本への移動と、設定可能な右クリックドラッグジェスチャーも利用できます。
 
+## Windows x64ポータブル版
+
+配布ZIPを任意の書き込み可能なフォルダへ展開し、`NivisViewer.exe`を起動します。Pythonの別途インストールは不要です。標準配布はPyInstaller one-folder形式で、`portable.flag`がexeの隣にあると`config.json`と`data/`（履歴DB、サムネイルキャッシュ、ログ）も同じポータブルフォルダへ保存します。カレントディレクトリや閲覧中の画像フォルダは保存先に使いません。
+
+読み取り専用の場所では閲覧を継続できますが、設定、履歴、サムネイルキャッシュ、ログは保存されません。書き込み可能な場所へフォルダごと移動してください。アンインストールはNivisViewerフォルダの削除です。Windows関連付けを登録した場合は、削除前に設定画面の「Windows連携」から解除してください。
+
+二重起動やExplorerからの連続openは、同じユーザー・同じポータブルフォルダの既存プロセスへ安全に転送します。別の場所へコピーしたポータブル版は別インスタンスです。フォルダ移動後はWindows関連付けのexeパスが変わるため再登録が必要です。
+
+Windows連携は設定画面で利用者が明示的に登録した場合だけ有効になります。「プログラムから開く」と既定アプリ候補を登録しますが、Windowsの既定アプリやUserChoiceを強制変更しません。WinRAR／7-Zipは同梱しません。pypdfium2／PDFiumはポータブル版へ同梱します。
+
+コード署名はまだ行っていないため、ダウンロードした配布物でSmartScreen警告が表示される可能性があります。不具合報告時はViewerの「ヘルプ」から診断情報をコピーできます。ログは`data\logs\NivisViewer.log`に保存され、外部へ自動送信されません。
+
 ## 対応入力形式
 
 - フォルダ
@@ -37,6 +49,17 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 python main.py
 ```
+
+コマンドラインではファイル、フォルダ、複数パスを指定できます。2件目以降は別Viewerで開きます。
+
+```powershell
+NivisViewer.exe "D:\漫画\book.cbz"
+NivisViewer.exe --reuse "book1.cbz" "book2.pdf"
+NivisViewer.exe --new-window "C:\画像集"
+NivisViewer.exe --browser-only "D:\Books"
+```
+
+`--new-window`と`--reuse`は同時指定できません。`--no-restore`はその起動だけ前回位置の復元を抑止します。
 
 テストを実行する場合は、開発用依存もインストールします。
 
