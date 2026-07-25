@@ -10,8 +10,15 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
 from .archive_backend import ArchiveErrorCode
 from .image_cache import ImageCache
-from .image_source import ImageSource, ImageSourceError, create_image_source
+from .image_work_coordinator import ImageWorkCoordinator
+from .image_source import (
+    FolderListingSnapshot,
+    ImageSource,
+    ImageSourceError,
+    create_image_source,
+)
 from .page_model import PageModel
+from .performance_trace import performance_trace
 
 
 SourceFactory = Callable[..., tuple[ImageSource, str | None]]
@@ -44,6 +51,7 @@ class _PreparedBook:
     generation: int
     error: ImageSourceError | None = None
     cancelled: bool = False
+    trace_id: int = 0
 
 
 class _BookOpenSignals(QObject):
@@ -60,6 +68,8 @@ class _BookOpenWorker(QRunnable):
         *,
         recursive_folder: bool,
         sort_descending: bool,
+        trace_id: int = 0,
+        folder_snapshot: FolderListingSnapshot | None = None,
     ) -> None:
         super().__init__()
         self.factory = factory
@@ -68,20 +78,37 @@ class _BookOpenWorker(QRunnable):
         self.cancelled = cancelled
         self.recursive_folder = recursive_folder
         self.sort_descending = sort_descending
+        self.trace_id = int(trace_id)
+        self.folder_snapshot = folder_snapshot
         self.signals = _BookOpenSignals()
 
     @Slot()
     def run(self) -> None:
         source: ImageSource | None = None
         try:
+            performance_trace.mark(
+                self.trace_id,
+                "image_source.prepare.started",
+                str(self.requested_path),
+            )
             source, selected = _invoke_source_factory(
                 self.factory,
                 self.requested_path,
                 recursive_folder=self.recursive_folder,
                 sort_descending=self.sort_descending,
                 cancel_token=self.cancelled,
+                folder_snapshot=self.folder_snapshot,
+            )
+            performance_trace.mark(
+                self.trace_id,
+                "image_source.prepare.completed",
             )
             images = tuple(source.list_images())
+            performance_trace.mark(
+                self.trace_id,
+                "page_list.completed",
+                f"pages={len(images)}",
+            )
             if self.cancelled.is_set():
                 source.close()
                 source = None
@@ -92,6 +119,7 @@ class _BookOpenWorker(QRunnable):
                     (),
                     self.generation,
                     cancelled=True,
+                    trace_id=self.trace_id,
                 )
             else:
                 result = _PreparedBook(
@@ -100,6 +128,7 @@ class _BookOpenWorker(QRunnable):
                     selected,
                     images,
                     self.generation,
+                    trace_id=self.trace_id,
                 )
         except ImageSourceError as exc:
             if source is not None:
@@ -115,6 +144,7 @@ class _BookOpenWorker(QRunnable):
                     self.cancelled.is_set()
                     or exc.code == ArchiveErrorCode.PROCESS_CANCELLED.value
                 ),
+                trace_id=self.trace_id,
             )
         except Exception as exc:
             if source is not None:
@@ -129,6 +159,7 @@ class _BookOpenWorker(QRunnable):
                     f"本を開けません: {self.requested_path}",
                     code="open_failed",
                 ),
+                trace_id=self.trace_id,
             )
             result.error.__cause__ = exc
         self.signals.completed.emit(result)
@@ -152,10 +183,15 @@ class BookSession(QObject):
         parent: QObject | None = None,
         *,
         source_factory: SourceFactory = create_image_source,
+        image_work_coordinator: ImageWorkCoordinator | None = None,
     ) -> None:
         super().__init__(parent)
         self.model = PageModel()
-        self.image_cache = ImageCache(cache_size, self)
+        self.image_cache = ImageCache(
+            cache_size,
+            self,
+            image_work_coordinator=image_work_coordinator,
+        )
         self.current_path: Path | None = None
         self.source: ImageSource | None = None
         self.generation = 0
@@ -184,6 +220,8 @@ class BookSession(QObject):
         *,
         recursive_folder: bool = False,
         sort_descending: bool = False,
+        trace_id: int = 0,
+        folder_snapshot: FolderListingSnapshot | None = None,
     ) -> BookOpened:
         self.cancel_pending_open()
         requested_path = Path(path)
@@ -192,12 +230,36 @@ class BookSession(QObject):
 
         new_source: ImageSource | None = None
         try:
-            new_source, selected_image = self._source_factory(
+            performance_trace.mark(
+                trace_id,
+                "image_source.prepare.started",
+                str(requested_path),
+            )
+            new_source, selected_image = _invoke_source_factory(
+                self._source_factory,
                 requested_path,
                 recursive_folder=recursive_folder,
                 sort_descending=sort_descending,
+                cancel_token=Event(),
+                folder_snapshot=folder_snapshot,
             )
-            self.model.set_source(new_source, selected_image)
+            performance_trace.mark(trace_id, "image_source.prepare.completed")
+            image_ids = new_source.list_images()
+            performance_trace.mark(
+                trace_id,
+                "page_list.completed",
+                f"pages={len(image_ids)}",
+            )
+            self.model.set_prepared_source(
+                new_source,
+                image_ids,
+                selected_image,
+            )
+            performance_trace.mark(
+                trace_id,
+                "page_model.constructed",
+                f"pages={self.model.total_pages}",
+            )
         except ImageSourceError as exc:
             if new_source is not None:
                 self._close_source(new_source)
@@ -213,7 +275,11 @@ class BookSession(QObject):
         old_source = self.source
         self.source = new_source
         self.current_path = requested_path
-        self.image_cache.set_source(new_source, self.model.image_ids)
+        self.image_cache.set_source(
+            new_source,
+            self.model.image_ids,
+            trace_id=trace_id,
+        )
         if old_source is not None and old_source is not new_source:
             self._retire_source(old_source)
 
@@ -233,6 +299,8 @@ class BookSession(QObject):
         *,
         recursive_folder: bool = False,
         sort_descending: bool = False,
+        trace_id: int = 0,
+        folder_snapshot: FolderListingSnapshot | None = None,
     ) -> int:
         self.cancel_pending_open()
         self.generation += 1
@@ -246,6 +314,8 @@ class BookSession(QObject):
             cancelled,
             recursive_folder=recursive_folder,
             sort_descending=sort_descending,
+            trace_id=trace_id,
+            folder_snapshot=folder_snapshot,
         )
         worker.signals.completed.connect(self._on_async_prepared)
         self._open_cancel = cancelled
@@ -337,6 +407,11 @@ class BookSession(QObject):
                 list(result.image_ids),
                 result.selected_image,
             )
+            performance_trace.mark(
+                result.trace_id,
+                "page_model.constructed",
+                f"pages={self.model.total_pages}",
+            )
         except Exception as exc:
             self._close_source(result.source)
             error = ImageSourceError(f"本を開けません: {result.requested_path}")
@@ -354,7 +429,12 @@ class BookSession(QObject):
         old_source = self.source
         self.source = result.source
         self.current_path = result.requested_path
-        self.image_cache.set_source(result.source, self.model.image_ids)
+        trace_id = result.trace_id
+        self.image_cache.set_source(
+            result.source,
+            self.model.image_ids,
+            trace_id=trace_id,
+        )
         if old_source is not None and old_source is not result.source:
             self._retire_source(old_source)
         opened = BookOpened(
@@ -399,6 +479,7 @@ def _invoke_source_factory(
     recursive_folder: bool,
     sort_descending: bool,
     cancel_token: Event,
+    folder_snapshot: FolderListingSnapshot | None = None,
 ) -> tuple[ImageSource, str | None]:
     kwargs = {
         "recursive_folder": recursive_folder,
@@ -406,15 +487,22 @@ def _invoke_source_factory(
     }
     try:
         signature = inspect.signature(factory)
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
         accepts_cancel = (
             "cancel_token" in signature.parameters
-            or any(
-                parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in signature.parameters.values()
-            )
+            or accepts_kwargs
+        )
+        accepts_snapshot = (
+            "folder_snapshot" in signature.parameters or accepts_kwargs
         )
     except (TypeError, ValueError):
         accepts_cancel = False
+        accepts_snapshot = False
     if accepts_cancel:
         kwargs["cancel_token"] = cancel_token
+    if accepts_snapshot:
+        kwargs["folder_snapshot"] = folder_snapshot
     return factory(path, **kwargs)

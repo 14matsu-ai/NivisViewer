@@ -370,9 +370,43 @@ BrowserWindowは`last_browser_path`、`browser_sidebar_visible`、`browser_sideb
 
 ### Browser固定セルとサムネイル要求
 
-Browser一覧は`QListView`のIconModeと固定`gridSize`、`BrowserItemDelegate`を使用します。デリゲートの`sizeHint()`は項目内容に依存せず、サムネイル領域とタイトル領域の大きさを表示密度ごとに固定します。画像はアスペクト比を維持してサムネイル領域へ収め、後着したサムネイルは`DecorationRole`だけを更新するためセル配置を変更しません。左下の論理16px前後の種別バッジはfolder、image、ZIP/CBZ、RAR/CBR、7z/CB7、PDFを区別し、Qtの論理座標で描画してDPI倍率へ追従します。
+Browser一覧は`QListView`のIconModeと固定`gridSize`、`BrowserItemDelegate`を使用します。デリゲートの`sizeHint()`は項目内容に依存せず、サムネイル領域とタイトル領域の大きさを表示密度ごとに固定します。`thumbnail_size`は画像枠の長辺のlogical pixelであり、選択した`thumbnail_frame_ratio`から枠の幅と高さを決定します。後着したサムネイルは`DecorationRole`だけを更新するためセル配置を変更しません。
 
-サムネイル要求は可視範囲を最優先にし、その前後2画面だけを先読みします。スクロール量と時間から高速スクロールを検出した間は先読み要求をキャンセルし、停止から180ms後に再開します。フォルダを開いた時点で全項目を要求しません。生成サイズは96、128、160、192、256、320、384pxのbucketへ量子化し、同一bucket内の表示サイズ変更では既存のメモリ／ディスクキャッシュとgenerationを再利用します。モデルは正規化パスから行番号への索引を持ち、サムネイル後着時の項目検索を項目数に依存しない処理にします。
+サムネイル要求は可視範囲を最優先にし、その前後2画面だけを先読みします。スクロール量と時間から高速スクロールを検出した間は先読み要求をキャンセルし、停止から180ms後に再開します。フォルダを開いた時点で全項目を要求しません。長辺は96、128、160、192、256、320、384pxへ量子化し、そこから得たframe width／height、比率ID、crop mode、smart crop version、実装versionを2次元cache tokenへ含めます。同一bucket、比率、crop modeでは既存のメモリ／ディスクキャッシュとgenerationを再利用します。モデルは正規化パスから行番号への索引を持ち、サムネイル後着時の項目検索を項目数に依存しない処理にします。
+
+`thumbnail_crop_mode`は次の3方式です。
+
+- `letterbox`: 全体をアスペクト比維持で収め、余白はデリゲートがpalette由来の色で枠内だけに描画する。
+- `center_crop`: 枠を満たす最小倍率で中央を切り抜く。
+- `smart_crop`: 最大256pxのproxyで透明／低分散外周を除き、grayscale edge energyと中央への弱いbiasから決定的なcrop rectを求める。信頼差が小さい場合は中央cropへ戻る。
+
+smart crop rectは元画像に対する正規化座標として、source path、archive entry、size、mtime、比率、algorithm versionをキーにメモリキャッシュします。サムネイルサイズだけが変わった場合は同じrectを使い、比率または元画像が変わった場合は再解析します。生成済みサムネイル自体はportable disk cacheにも保存されるため、次回起動時のcache hitでは解析しません。
+
+Windowsでは`ShellAssociatedIconProvider`が`SHGetFileInfoW`と`SHGFI_USEFILEATTRIBUTES`相当の指定で、実ファイルを開かず拡張子ごとのExplorer関連付けアイコンを取得します。folder、画像、ZIP/CBZ、RAR/CBR、7z/CB7、PDFを拡張子単位でキャッシュし、非Windowsまたは取得失敗時は`QFileIconProvider`へ戻ります。アイコンはCompact 16px、Standard 18px、Comfortable 20px、Large 22pxで画像枠左下へoverlayし、キャッシュ画像へ焼き込みません。
+
+選択時はQt既定の不透明selection fillを使用しません。サムネイルは通常の明るさを保ち、palette由来の3px外枠、タイトル領域の半透明色、current itemの内側focus indicatorだけをデリゲートが描画します。hoverは弱い1px枠です。
+
+### Viewer最優先の画像作業調整
+
+ApplicationControllerは`ImageWorkCoordinator`を1つ所有し、すべてのViewerWindowのImageCacheとBrowserThumbnailProviderへ共有注入します。通常の最大画像worker数は2で、1枠をViewer専用、1枠をBrowser専用とします。Viewer専用枠をBrowserへ貸し出さないため、Browser background decodeだけで全枠を占有しません。Browser枠は最大1件だけ実行します。
+
+優先度は`VIEWER_CURRENT`、`VIEWER_SPREAD_PARTNER`、`VIEWER_INTERACTIVE_RERENDER`、`VIEWER_NEXT`、`VIEWER_PREVIOUS`、`BROWSER_VISIBLE`、`BROWSER_SELECTED`、`BROWSER_PREFETCH`の順です。同じ要求はImageCacheまたはThumbnailProviderで重複抑止し、未開始の要求がcurrent／visibleへ変わった場合はqueueから取り出して昇格します。実行中のdecodeは強制停止せず、generationとimage IDで後着結果を破棄します。
+
+ViewerWindowは明示openの冒頭で`interactive_open_started`を通知します。ApplicationControllerはfirst frame gateを開始し、新規Browser decodeを保留して未開始要求を取り消します。ImageCacheは論理currentだけを最初に登録し、ViewerWidgetがそのpixmapを実際にpaintした時点で`first_frame_ready`を通知します。その後、見開き相方、前後ページとBrowser処理を再開します。open失敗、置換、Viewer終了は`interactive_open_cancelled`で必ずgateを解放します。Browserのメモリcache hitと実行中decodeは継続できます。
+
+見開きでは論理currentを視覚上のRTL／LTR位置に関係なく最初に要求します。相方が未到着でもcurrentを描画し、相方位置には既存の軽量placeholderを置きます。相方到着時は同じDisplaySpreadへ追加するだけで、パン、ズーム、slider、ページ順を変更しません。
+
+Browserから単体画像を開く場合は、現在モデルが持つ画像path順、選択画像、size、mtimeの`FolderListingSnapshot`を渡します。通常の非再帰openではFolderImageSourceがこのsnapshotを使用し、同じフォルダを再列挙しません。起動引数、Explorer、履歴などsnapshotがない経路は従来どおりSourceが列挙します。
+
+Folder／ZIP／外部書庫はpage sizeをlazy扱いとし、PageModel構築時に全ページのfull decodeや全header走査を行いません。未確定サイズは暫定的な通常ページとして局所的に組み、currentのdecode結果が届いた時だけその周辺の横長／単独判定を更新します。PDFはdocument metadataに全ページ寸法が既にあるため、従来の論理サイズを使用します。
+
+### WebP decode pipeline
+
+WebPはImageCacheのworker内で処理します。file-backed WebPはbytesを短時間で読み終えてファイルhandleを閉じ、worker-localの`QBuffer`と`QImageReader("webp")`、`setAutoTransform(True)`で先頭frameをQImageへ直接decodeします。ZIP内WebPも展開bytesを同じQBuffer経路へ渡します。QImageReaderまたはQt WebP pluginが利用できない場合だけPillowへ戻ります。
+
+Pillow fallbackは先頭frameへ固定し、EXIF transposeを一度だけ適用します。RGB、RGBA、Lを維持し、palette等で必要な場合だけRGB／RGBAへ変換します。QImageはPillow bufferから必ずcopyし、buffer破棄後も安全に保持します。明るさ、コントラスト、ガンマが既定値なら追加mode変換を行いません。decode済みQImageはImageCacheに保持し、zoom、resize、fit、pan、joined spread切替では元WebPを再decodeしません。currentとspread partnerはLRU保護対象です。
+
+`performance_trace.py`はDEBUG loggingまたは`NIVISVIEWER_DEBUG_TIMING=1`のときだけ、Controller open、Source準備、page list、PageModel、要求登録、worker開始、WebP decode、Pillow→QImage、ImageCache、結果到着、first paintを記録します。通常利用時はイベントを保存せず詳細ログも出しません。Browser pending件数もopen開始イベントへ含めます。
 
 ### ウィンドウの寿命
 

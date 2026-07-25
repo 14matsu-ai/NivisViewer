@@ -38,12 +38,18 @@
     - 固定サムネイル領域、固定タイトル領域、左下の種別バッジ
     - 可視範囲優先、2画面先読み、高速スクロール抑制、サイズbucket再利用
     - 大量項目のパス検索を定数時間化
-16. 後続候補：実機不具合修正、ポータブル版UI磨き込み
+16. Sprint 14追補：Viewer最優先とサムネイル表示統合（完了）
+    - Viewer current専用実行枠とfirst-frame gate
+    - QImageReader優先のWebP decode、Pillow fallback、lazy page metadata
+    - 9種類の固定frame ratioとletterbox／center crop／smart crop
+    - 2次元thumbnail bucketとsmart crop rect cache
+    - Explorer関連付けアイコンとサムネイルを隠さない選択枠
+17. 後続候補：実機不具合修正、ポータブル版UI磨き込み
     - ファイルドラッグ＆ドロップ、PDFパスワード入力、PDF目次
     - 画像中央クロップ／余白除去、Viewerメモリ予算調整
-17. 後続候補：レート／タグ編集UIと検索
+18. 後続候補：レート／タグ編集UIと検索
     - 基本ナビゲーションとファイル操作の安定後に着手
     - ZipPla `{zpi$...}` の明示的な読み取り互換
     - タグ・レート検索と絞り込み
     - サムネイル上のレート／タグ表示
-18. 公開前ライセンス監査、コード署名の将来検討
+19. 公開前ライセンス監査、コード署名の将来検討

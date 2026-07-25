@@ -124,6 +124,7 @@ class ViewerWidget(QWidget):
     gestureRecognized = Signal(str)
     extraMouseButtonPressed = Signal(str)
     viewportChanged = Signal()
+    contentPainted = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -350,15 +351,19 @@ class ViewerWidget(QWidget):
 
         layout = self._layout_for_current_images()
         self._last_draw_layout = []
+        painted_image_ids: list[str] = []
         for image, rect in zip(self._images, layout.rects):
             pixmap = self._display_pixmap(image)
             if pixmap is not None:
                 painter.drawPixmap(rect, pixmap)
                 self._last_draw_layout.append((rect, pixmap))
+                painted_image_ids.append(image.image_id)
             else:
                 self._draw_placeholder(painter, rect, image)
         self._draw_magnifier(painter)
         self._draw_gesture_trail(painter)
+        if painted_image_ids:
+            self.contentPainted.emit(tuple(painted_image_ids))
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
         if self.fit_mode in {"fit_window", "fit_no_upscale", "fit_width", "fit_height"}:

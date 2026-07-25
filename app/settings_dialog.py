@@ -32,6 +32,7 @@ from .browser_sort import (
 )
 from .browser_item_delegate import GRID_PRESET_THUMBNAIL_SIZES
 from .config_manager import ConfigManager
+from .thumbnail_render import CROP_MODES, FRAME_RATIOS
 from .seven_zip_locator import SevenZipInfo, SevenZipLocator
 from .viewer_commands import COMMAND_CHOICES
 from .winrar_locator import WinRARInfo, WinRARLocator
@@ -388,8 +389,19 @@ class SettingsDialog(QDialog):
         self.thumbnail_size_spin.setSingleStep(32)
         self.thumbnail_size_spin.setSuffix(" px")
         form.addRow("サムネイルサイズ:", self.thumbnail_size_spin)
+
+        self.thumbnail_frame_ratio_combo = QComboBox(cache_group)
+        for ratio_id, (_ratio, label) in FRAME_RATIOS.items():
+            self.thumbnail_frame_ratio_combo.addItem(label, ratio_id)
+        form.addRow("画像枠の比率:", self.thumbnail_frame_ratio_combo)
+
+        self.thumbnail_crop_mode_combo = QComboBox(cache_group)
+        for mode, label in CROP_MODES.items():
+            self.thumbnail_crop_mode_combo.addItem(label, mode)
+        form.addRow("切り抜き:", self.thumbnail_crop_mode_combo)
+
         bucket_note = QLabel(
-            "生成・キャッシュは近いサイズbucketへ量子化して再利用します。",
+            "生成・キャッシュは近い幅・高さbucketへ量子化して再利用します。",
             cache_group,
         )
         bucket_note.setWordWrap(True)
@@ -480,6 +492,14 @@ class SettingsDialog(QDialog):
             bool(self.config.get("treat_wide_image_as_single", True))
         )
         self.thumbnail_size_spin.setValue(int(self.config.get("thumbnail_size", 180)))
+        self._select_data(
+            self.thumbnail_frame_ratio_combo,
+            self.config.get("thumbnail_frame_ratio", "portrait_1_sqrt2"),
+        )
+        self._select_data(
+            self.thumbnail_crop_mode_combo,
+            self.config.get("thumbnail_crop_mode", "smart_crop"),
+        )
         self._select_data(
             self.browser_display_density_combo,
             self.config.get(
@@ -695,6 +715,12 @@ class SettingsDialog(QDialog):
             "single_first_page": self.single_first_checkbox.isChecked(),
             "treat_wide_image_as_single": self.wide_single_checkbox.isChecked(),
             "thumbnail_size": self.thumbnail_size_spin.value(),
+            "thumbnail_frame_ratio": str(
+                self.thumbnail_frame_ratio_combo.currentData()
+            ),
+            "thumbnail_crop_mode": str(
+                self.thumbnail_crop_mode_combo.currentData()
+            ),
             "browser_display_density": str(
                 self.browser_display_density_combo.currentData()
             ),
