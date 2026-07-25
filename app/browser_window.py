@@ -64,7 +64,6 @@ from .browser_model import (
 )
 from .browser_item_delegate import (
     BrowserItemDelegate,
-    quantize_thumbnail_size,
 )
 from .browser_navigation import BrowserLocation, BrowserNavigationHistory
 from .browser_scanner import (
@@ -104,17 +103,20 @@ from .file_operation_service import (
     FileOperationResult,
 )
 from .history_model import HistoryModel
+from .image_work_coordinator import ImageWorkCoordinator
+from .image_source import FolderListingSnapshot
 from .metadata_store import MetadataStore
 from .settings_dialog import SettingsDialog
 from .thumbnail_provider import BrowserThumbnailProvider, PageThumbnailProvider
 from .thumbnail_disk_cache import ThumbnailDiskCache
+from .thumbnail_render import ThumbnailRenderSpec
 from .windows_filename import (
     generate_numbered_name,
     validate_windows_filename,
 )
 
 
-BrowserOpenHandler = Callable[[str, bool], object]
+BrowserOpenHandler = Callable[..., object]
 AffectedViewersHandler = Callable[[tuple[str, ...]], tuple[object, ...]]
 CloseAffectedViewersHandler = Callable[[tuple[object, ...]], bool | None]
 
@@ -160,6 +162,7 @@ class BrowserWindow(QMainWindow):
         archive_backend_registry=None,
         pdfium_service=None,
         file_registration_service=None,
+        image_work_coordinator: ImageWorkCoordinator | None = None,
         restore_initial_location: bool = True,
     ) -> None:
         super().__init__()
@@ -187,6 +190,7 @@ class BrowserWindow(QMainWindow):
             self._owns_pdfium_service = False
         self.pdfium_service = pdfium_service
         self.file_registration_service = file_registration_service
+        self.image_work_coordinator = image_work_coordinator
         self._owns_file_operation_coordinator = file_operation_coordinator is None
         self.file_operation_coordinator = (
             file_operation_coordinator
@@ -224,9 +228,13 @@ class BrowserWindow(QMainWindow):
                 ),
                 archive_backend_registry=self.archive_backend_registry,
                 pdfium_service=self.pdfium_service,
+                image_work_coordinator=self.image_work_coordinator,
             )
         self.thumbnail_provider = thumbnail_provider
         self.thumbnail_provider.thumbnail_ready.connect(self._on_thumbnail_ready)
+        resumed = getattr(self.thumbnail_provider, "scheduling_resumed", None)
+        if resumed is not None:
+            resumed.connect(self._schedule_thumbnail_requests)
         self.current_path: Path | None = None
         self.navigation_history = BrowserNavigationHistory()
         self._generation = self.thumbnail_provider.generation
@@ -263,7 +271,18 @@ class BrowserWindow(QMainWindow):
         self.thumbnail_size = self._safe_thumbnail_size(
             self.settings.get("thumbnail_size", 180)
         )
-        self.thumbnail_bucket_size = quantize_thumbnail_size(self.thumbnail_size)
+        self.thumbnail_frame_ratio = str(
+            self.settings.get("thumbnail_frame_ratio", "portrait_1_sqrt2")
+        )
+        self.thumbnail_crop_mode = str(
+            self.settings.get("thumbnail_crop_mode", "smart_crop")
+        )
+        self.thumbnail_render_spec = ThumbnailRenderSpec.from_settings(
+            self.thumbnail_size,
+            self.thumbnail_frame_ratio,
+            self.thumbnail_crop_mode,
+        )
+        self.thumbnail_bucket_size = self.thumbnail_render_spec.long_edge
         self.browser_sort_key = normalize_browser_sort_key(
             self.settings.get("browser_sort_key", BrowserSortKey.NAME.value)
         )
@@ -695,7 +714,65 @@ class BrowserWindow(QMainWindow):
             self.navigate_to(item.path)
             return
         if self._open_path_handler is not None:
-            self._open_path_handler(str(item.path), open_in_new_window)
+            self._invoke_open_path_handler(
+                str(item.path),
+                open_in_new_window,
+                self._folder_snapshot_for_item(item),
+            )
+
+    def _folder_snapshot_for_item(
+        self,
+        item: BrowserItem,
+    ) -> FolderListingSnapshot | None:
+        if (
+            item.kind is not BrowserItemKind.IMAGE
+            or self.current_path is None
+        ):
+            return None
+        image_ids = tuple(
+            str(candidate.path)
+            for candidate in self.items
+            if candidate.kind is BrowserItemKind.IMAGE
+        )
+        if str(item.path) not in image_ids:
+            return None
+        return FolderListingSnapshot(
+            self.current_path,
+            image_ids,
+            str(item.path),
+            tuple(
+                (
+                    str(candidate.path),
+                    candidate.file_size,
+                    candidate.modified_time_ns,
+                )
+                for candidate in self.items
+                if candidate.kind is BrowserItemKind.IMAGE
+            ),
+        )
+
+    def _invoke_open_path_handler(
+        self,
+        path: str,
+        open_in_new_window: bool,
+        folder_snapshot: FolderListingSnapshot | None = None,
+    ) -> object | None:
+        handler = self._open_path_handler
+        if handler is None:
+            return None
+        try:
+            import inspect
+
+            signature = inspect.signature(handler)
+            accepts_snapshot = len(signature.parameters) >= 3 or any(
+                parameter.kind is inspect.Parameter.VAR_POSITIONAL
+                for parameter in signature.parameters.values()
+            )
+        except (TypeError, ValueError):
+            accepts_snapshot = False
+        if accepts_snapshot:
+            return handler(path, open_in_new_window, folder_snapshot)
+        return handler(path, open_in_new_window)
 
     def selected_file_operation_paths(self) -> tuple[str, ...]:
         indexes = sorted(
@@ -1262,7 +1339,7 @@ class BrowserWindow(QMainWindow):
             self.navigate_to(entry.path)
             return
         if self._open_path_handler is not None:
-            self._open_path_handler(entry.path, open_in_new_window)
+            self._invoke_open_path_handler(entry.path, open_in_new_window)
 
     def open_history(
         self,
@@ -1277,7 +1354,7 @@ class BrowserWindow(QMainWindow):
             self.statusBar().showMessage("履歴の項目が見つかりません", 3000)
             return
         if self._open_path_handler is not None:
-            self._open_path_handler(entry.path, open_in_new_window)
+            self._invoke_open_path_handler(entry.path, open_in_new_window)
 
     def remove_history_entry(self, index: QModelIndex) -> None:
         entry = self.history_model.entry_at(index)
@@ -1339,6 +1416,8 @@ class BrowserWindow(QMainWindow):
     def apply_settings(self, changed: dict[str, object]) -> None:
         list_keys = {
             "thumbnail_size",
+            "thumbnail_frame_ratio",
+            "thumbnail_crop_mode",
             "browser_sort_key",
             "browser_sort_order",
             "browser_folders_first",
@@ -1372,13 +1451,42 @@ class BrowserWindow(QMainWindow):
                 self.browser_folders_first,
             )
 
-        thumbnail_changed = "thumbnail_size" in changed
+        thumbnail_changed = bool(
+            {
+                "thumbnail_size",
+                "thumbnail_frame_ratio",
+                "thumbnail_crop_mode",
+            }.intersection(changed)
+        )
         if thumbnail_changed:
-            new_size = self._safe_thumbnail_size(changed["thumbnail_size"])
-            new_bucket = quantize_thumbnail_size(new_size)
-            bucket_changed = new_bucket != self.thumbnail_bucket_size
+            new_size = self._safe_thumbnail_size(
+                changed.get("thumbnail_size", self.thumbnail_size)
+            )
+            new_ratio = str(
+                changed.get(
+                    "thumbnail_frame_ratio",
+                    self.thumbnail_frame_ratio,
+                )
+            )
+            new_crop_mode = str(
+                changed.get(
+                    "thumbnail_crop_mode",
+                    self.thumbnail_crop_mode,
+                )
+            )
+            new_spec = ThumbnailRenderSpec.from_settings(
+                new_size,
+                new_ratio,
+                new_crop_mode,
+            )
+            bucket_changed = (
+                new_spec.cache_token != self.thumbnail_render_spec.cache_token
+            )
             self.thumbnail_size = new_size
-            self.thumbnail_bucket_size = new_bucket
+            self.thumbnail_frame_ratio = new_ratio
+            self.thumbnail_crop_mode = new_crop_mode
+            self.thumbnail_render_spec = new_spec
+            self.thumbnail_bucket_size = new_spec.long_edge
             if bucket_changed:
                 self.item_model.clear_thumbnails()
                 self._generation = self.thumbnail_provider.begin_generation()
@@ -1470,6 +1578,7 @@ class BrowserWindow(QMainWindow):
         self.item_delegate.configure(
             thumbnail_size=self.thumbnail_size,
             density=self.browser_display_density,
+            frame_ratio_id=self.thumbnail_frame_ratio,
         )
         self.list_view.setIconSize(QSize(self.thumbnail_size, self.thumbnail_size))
         self.list_view.setGridSize(self.item_delegate.cell_size)
@@ -1660,6 +1769,7 @@ class BrowserWindow(QMainWindow):
             self.list_view,
             thumbnail_size=self.thumbnail_size,
             density=self.browser_display_density,
+            frame_ratio_id=self.thumbnail_frame_ratio,
         )
         self.list_view.setItemDelegate(self.item_delegate)
         self.list_view.setViewMode(QListView.ViewMode.IconMode)
@@ -2016,7 +2126,7 @@ class BrowserWindow(QMainWindow):
                     continue
                 self.thumbnail_provider.request(
                     item,
-                    self.thumbnail_bucket_size,
+                    self.thumbnail_render_spec,
                     generation=self._generation,
                     priority=priority,
                 )
@@ -2028,7 +2138,7 @@ class BrowserWindow(QMainWindow):
             }
             self.thumbnail_provider.cancel_prefetch_except(
                 keep_paths,
-                size=self.thumbnail_bucket_size,
+                size=self.thumbnail_render_spec,
                 generation=self._generation,
             )
 

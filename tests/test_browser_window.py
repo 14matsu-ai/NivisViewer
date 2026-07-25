@@ -221,7 +221,7 @@ def test_sort_and_density_preserve_multiple_selection_and_thumbnail_cache(
     current = window.item_model.item_at(window.list_view.currentIndex())
     assert restored_names == selected_names
     assert current is not None and current.display_name == "book10.jpg"
-    assert window.list_view.gridSize() == QSize(252, 268)
+    assert window.list_view.gridSize() == QSize(199, 268)
     assert window.thumbnail_provider.generation == initial_generation
     assert len(window.navigation_history) == initial_history_length
     window.close()
@@ -268,9 +268,10 @@ def test_display_density_changes_layout_without_changing_thumbnail_size(
     finish_scan(window, qapp)
 
     expectations = {
-        "compact": QSize(200, 212),
-        "standard": QSize(224, 238),
-        "comfortable": QSize(252, 268),
+        "compact": QSize(147, 212),
+        "standard": QSize(171, 238),
+        "comfortable": QSize(199, 268),
+        "large": QSize(231, 298),
     }
     for density, grid_size in expectations.items():
         window.browser_display_density_combo.setCurrentIndex(

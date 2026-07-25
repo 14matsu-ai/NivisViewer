@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import os
 import weakref
 from pathlib import Path
@@ -21,10 +22,13 @@ from .image_source import (
     ARCHIVE_EXTENSIONS,
     BOOK_FILE_EXTENSIONS,
     FolderImageSource,
+    FolderListingSnapshot,
     SUPPORTED_EXTENSIONS,
 )
+from .image_work_coordinator import ImageWorkCoordinator
 from .metadata_store import MetadataStore
 from .pdfium_service import PdfiumService
+from .performance_trace import performance_trace
 from .single_instance import InstanceMessage
 from .viewer_window import ViewerWindow
 
@@ -65,6 +69,7 @@ class ApplicationController(QObject):
             config_manager=self.config,
         )
         self.pdfium_service = pdfium_service or PdfiumService()
+        self.image_work_coordinator = ImageWorkCoordinator(self, max_workers=2)
         self.file_registration_service = file_registration_service
         self.config.settings_changed.connect(self._on_controller_settings_changed)
         self.file_operation_coordinator = FileOperationCoordinator(
@@ -150,6 +155,7 @@ class ApplicationController(QObject):
             archive_backend_registry=self.archive_backend_registry,
             pdfium_service=self.pdfium_service,
             file_registration_service=self.file_registration_service,
+            image_work_coordinator=self.image_work_coordinator,
             restore_initial_location=self._restore_on_start,
         )
         self._browser_window = window
@@ -183,6 +189,7 @@ class ApplicationController(QObject):
             adjacent_book_handler=self.open_adjacent_book,
             archive_backend_registry=self.archive_backend_registry,
             pdfium_service=self.pdfium_service,
+            image_work_coordinator=self.image_work_coordinator,
         )
         self._viewer_windows.append(window)
         self._active_viewer = window
@@ -190,6 +197,13 @@ class ApplicationController(QObject):
         window.activated.connect(self._on_viewer_activated)
         window.closing.connect(self._on_viewer_closing)
         window.book_changed.connect(self._on_viewer_book_changed)
+        window.interactive_open_started.connect(
+            self._on_viewer_interactive_open_started
+        )
+        window.first_frame_ready.connect(self._on_viewer_first_frame_ready)
+        window.interactive_open_cancelled.connect(
+            self._on_viewer_interactive_open_cancelled
+        )
         window.destroyed.connect(
             lambda _object=None, window_id=id(window): self._on_viewer_destroyed(window_id)
         )
@@ -207,11 +221,16 @@ class ApplicationController(QObject):
         path: str | Path,
         *,
         open_in_new_window: bool | None = None,
+        folder_snapshot: FolderListingSnapshot | None = None,
     ) -> ViewerWindow:
         window = self._select_viewer_for_open(open_in_new_window)
         if not window.isVisible():
             window.show_initial()
-        self._open_path_in_viewer(window, path)
+        self._open_path_in_viewer(
+            window,
+            path,
+            folder_snapshot=folder_snapshot,
+        )
         return window
 
     def close_viewer_window(self, window: ViewerWindow) -> None:
@@ -309,6 +328,7 @@ class ApplicationController(QObject):
         self.file_operation_coordinator.close()
         self.archive_backend_registry.close()
         self.pdfium_service.shutdown()
+        self.image_work_coordinator.shutdown()
         self.config.save()
         self.metadata_store.flush()
         self.metadata_store.close()
@@ -340,9 +360,21 @@ class ApplicationController(QObject):
         path: str | Path,
         *,
         bring_to_front: bool = True,
+        folder_snapshot: FolderListingSnapshot | None = None,
     ) -> bool:
         self._active_viewer = window
-        opened = window.open_path(path)
+        browser = self.get_browser_window()
+        pending = (
+            browser.thumbnail_provider.pending_count
+            if browser is not None
+            else 0
+        )
+        trace_id = performance_trace.begin(
+            "application_controller.open_path.started",
+            f"path={path} browser_pending={pending}",
+        )
+        window.set_next_open_trace(trace_id)
+        opened = window.open_path(path, folder_snapshot=folder_snapshot)
         if (
             opened
             and bring_to_front
@@ -368,8 +400,25 @@ class ApplicationController(QObject):
         self,
         path: str,
         open_in_new_window: bool,
+        folder_snapshot: FolderListingSnapshot | None = None,
     ) -> ViewerWindow:
-        return self.open_path(path, open_in_new_window=True if open_in_new_window else None)
+        try:
+            accepts_snapshot = (
+                "folder_snapshot"
+                in inspect.signature(self.open_path).parameters
+            )
+        except (TypeError, ValueError):
+            accepts_snapshot = False
+        if not accepts_snapshot:
+            return self.open_path(
+                path,
+                open_in_new_window=True if open_in_new_window else None,
+            )
+        return self.open_path(
+            path,
+            open_in_new_window=True if open_in_new_window else None,
+            folder_snapshot=folder_snapshot,
+        )
 
     def _on_viewer_activated(self, window: object) -> None:
         if isinstance(window, ViewerWindow) and window in self._viewer_windows:
@@ -380,6 +429,15 @@ class ApplicationController(QObject):
     def _on_viewer_book_changed(self, window: object, path: str) -> None:
         if window is self.get_active_viewer():
             self.select_path_in_browser(path)
+
+    def _on_viewer_interactive_open_started(self, _window: object) -> None:
+        self.image_work_coordinator.begin_viewer_interactive()
+
+    def _on_viewer_first_frame_ready(self, _window: object) -> None:
+        self.image_work_coordinator.end_viewer_interactive()
+
+    def _on_viewer_interactive_open_cancelled(self, _window: object) -> None:
+        self.image_work_coordinator.cancel_viewer_interactive()
 
     def _on_viewer_closing(self, window: object) -> None:
         if isinstance(window, ViewerWindow):

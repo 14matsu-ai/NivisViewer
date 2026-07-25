@@ -30,6 +30,8 @@ class ConfigManager(QObject):
         "hide_cursor_in_fullscreen": False,
         "show_page_list": False,
         "thumbnail_size": 180,
+        "thumbnail_frame_ratio": "portrait_1_sqrt2",
+        "thumbnail_crop_mode": "smart_crop",
         "browser_sort_key": "name",
         "browser_sort_order": "ascending",
         "browser_folders_first": True,
@@ -201,6 +203,28 @@ class ConfigManager(QObject):
             minimum=96,
             maximum=384,
         )
+        if normalized.get("thumbnail_frame_ratio") not in {
+            "square_1_1",
+            "landscape_3_2",
+            "portrait_2_3",
+            "landscape_4_3",
+            "portrait_3_4",
+            "landscape_16_9",
+            "portrait_9_16",
+            "landscape_sqrt2_1",
+            "portrait_1_sqrt2",
+        }:
+            normalized["thumbnail_frame_ratio"] = cls.DEFAULTS[
+                "thumbnail_frame_ratio"
+            ]
+        if normalized.get("thumbnail_crop_mode") not in {
+            "letterbox",
+            "center_crop",
+            "smart_crop",
+        }:
+            normalized["thumbnail_crop_mode"] = cls.DEFAULTS[
+                "thumbnail_crop_mode"
+            ]
         if normalized.get("browser_sort_key") not in {
             "name",
             "modified_time",

@@ -37,16 +37,19 @@ from .archive_backend_registry import ArchiveBackendRegistry
 from .book_session import AsyncBookOpenFailed, BookOpened, BookSession
 from .config_manager import ConfigManager
 from .image_cache import CachedImage, PRELOAD_RADIUS
+from .image_work_coordinator import ImageWorkCoordinator
 from .image_source import (
     ARCHIVE_EXTENSIONS,
     PDF_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
+    FolderListingSnapshot,
     ImageSourceError,
     create_image_source,
 )
 from .metadata_store import MetadataStore
 from .pdf_backend import PageRenderSpec
 from .pdf_image_source import PdfImageSource
+from .performance_trace import performance_trace
 from .thumbnail_provider import PageThumbnailProvider
 from . import viewer_commands as commands
 from .viewer_widget import ViewerImage, ViewerWidget, calculate_spread_layout
@@ -56,6 +59,9 @@ class ViewerWindow(QMainWindow):
     activated = Signal(object)
     closing = Signal(object)
     book_changed = Signal(object, str)
+    interactive_open_started = Signal(object)
+    first_frame_ready = Signal(object)
+    interactive_open_cancelled = Signal(object)
 
     def __init__(
         self,
@@ -67,6 +73,7 @@ class ViewerWindow(QMainWindow):
         adjacent_book_handler: Callable[[object, int], str] | None = None,
         archive_backend_registry=None,
         pdfium_service=None,
+        image_work_coordinator: ImageWorkCoordinator | None = None,
     ) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -89,6 +96,7 @@ class ViewerWindow(QMainWindow):
         else:
             self._owns_pdfium_service = False
         self.pdfium_service = pdfium_service
+        self.image_work_coordinator = image_work_coordinator
         self.book_session = book_session or BookSession(
             int(self.settings.get("cache_size", 10)),
             self,
@@ -104,6 +112,7 @@ class ViewerWindow(QMainWindow):
                 ),
                 **kwargs,
             ),
+            image_work_coordinator=self.image_work_coordinator,
         )
         self.model = self.book_session.model
         self.image_cache = self.book_session.image_cache
@@ -121,6 +130,10 @@ class ViewerWindow(QMainWindow):
         self._metadata_book_path = ""
         self._status_override_message: str | None = None
         self._status_override_token = 0
+        self._awaiting_first_frame = False
+        self._first_frame_image_id: str | None = None
+        self._next_open_trace_id = 0
+        self._active_open_trace_id = 0
         self.setAcceptDrops(True)
 
         self.view_mode = str(self.settings["view_mode"])
@@ -281,6 +294,7 @@ class ViewerWindow(QMainWindow):
         self.viewer.extraMouseButtonPressed.connect(self._on_extra_mouse_button)
         self.viewer.zoomChanged.connect(self._on_zoom_changed)
         self.viewer.viewportChanged.connect(self._schedule_pdf_rerender)
+        self.viewer.contentPainted.connect(self._on_viewer_content_painted)
         self.slider.valueChanged.connect(self._on_slider_changed)
 
     def _create_menus(self) -> None:
@@ -769,7 +783,23 @@ class ViewerWindow(QMainWindow):
         if folder:
             self._request_open_path(folder)
 
-    def open_path(self, path: str | Path) -> bool:
+    def open_path(
+        self,
+        path: str | Path,
+        *,
+        folder_snapshot: FolderListingSnapshot | None = None,
+    ) -> bool:
+        self._active_open_trace_id = (
+            self._next_open_trace_id
+            or performance_trace.begin("viewer.open_path.started", str(path))
+        )
+        self._next_open_trace_id = 0
+        performance_trace.mark(
+            self._active_open_trace_id,
+            "viewer.open_path.started",
+            str(path),
+        )
+        self._begin_interactive_open()
         self._save_current_reading_position()
         self._active_request_id += 1
         suffix = Path(path).suffix.lower()
@@ -778,6 +808,8 @@ class ViewerWindow(QMainWindow):
                 path,
                 recursive_folder=self.recursive_folder,
                 sort_descending=self.sort_descending,
+                trace_id=self._active_open_trace_id,
+                folder_snapshot=folder_snapshot,
             )
             self._set_status_override(
                 "PDFを読み込んでいます…"
@@ -790,8 +822,11 @@ class ViewerWindow(QMainWindow):
                 path,
                 recursive_folder=self.recursive_folder,
                 sort_descending=self.sort_descending,
+                trace_id=self._active_open_trace_id,
+                folder_snapshot=folder_snapshot,
             )
         except ImageSourceError as exc:
+            self._cancel_interactive_open()
             QMessageBox.critical(self, "読み込みエラー", str(exc))
             return False
         return self._finish_opened_book(opened, modal_on_empty=True)
@@ -804,6 +839,7 @@ class ViewerWindow(QMainWindow):
     ) -> bool:
         self._clear_status_override()
         if self.model.total_pages == 0:
+            self._cancel_interactive_open()
             if modal_on_empty:
                 QMessageBox.warning(self, "画像なし", "対応画像が見つかりませんでした。")
             else:
@@ -835,7 +871,14 @@ class ViewerWindow(QMainWindow):
         self.image_cache.set_cache_size(self.cache_size)
         self._clear_page_history()
         self._rebuild_page_list()
+        self._first_frame_image_id = self.model.image_id_at(
+            self.model.current_index
+        )
         self._refresh_view()
+        performance_trace.mark(
+            self._active_open_trace_id,
+            "viewer.initial_requests.completed",
+        )
         self.book_changed.emit(self, opened_path)
         return True
 
@@ -845,6 +888,7 @@ class ViewerWindow(QMainWindow):
         self._finish_opened_book(opened, modal_on_empty=False)
 
     def _on_async_book_open_failed(self, failed: AsyncBookOpenFailed) -> None:
+        self._cancel_interactive_open()
         if self._shutdown_prepared or failed.cancelled:
             return
         self._set_status_override(
@@ -1467,10 +1511,18 @@ class ViewerWindow(QMainWindow):
         spread = self.model.spread_at()
         self._visible_page_indexes = tuple(slot.page_index for slot in spread.slots)
         self.image_cache.set_render_spec(self._current_pdf_render_spec())
+        first_frame_gate = (
+            self._awaiting_first_frame
+            and self._first_frame_image_id is not None
+        )
         self.image_cache.preload_around(
             self.model.current_index,
-            radius=PRELOAD_RADIUS,
-            visible_indexes=self._visible_page_indexes,
+            radius=0 if first_frame_gate else PRELOAD_RADIUS,
+            visible_indexes=(
+                (self.model.current_index,)
+                if first_frame_gate
+                else self._visible_page_indexes
+            ),
         )
         self._render_spread(spread, self._active_request_id)
 
@@ -1534,12 +1586,73 @@ class ViewerWindow(QMainWindow):
     def _on_cache_page_loaded(self, cached: CachedImage) -> None:
         if cached.generation != self.image_cache.generation:
             return
+        performance_trace.mark(
+            self._active_open_trace_id,
+            "viewer.result.arrived",
+            f"page={cached.page_index}",
+        )
         self.model.set_image_size(cached.page_index, cached.original_size)
         if cached.page_index not in self._visible_page_indexes:
             self._update_page_list_thumbnail(cached)
             return
+        if (
+            self._awaiting_first_frame
+            and cached.page_index == self.model.current_index
+        ):
+            # The logical current page has completed decoding, so the reserved
+            # Viewer lane may now continue with its spread partner and nearby
+            # pages. Browser work remains gated until contentPainted confirms
+            # that the first frame actually reached the screen.
+            self.image_cache.preload_around(
+                self.model.current_index,
+                radius=PRELOAD_RADIUS,
+                visible_indexes=self._visible_page_indexes,
+            )
         self._update_page_list_thumbnail(cached)
         self._render_spread(self.model.spread_at(), self._active_request_id)
+
+    def _begin_interactive_open(self) -> None:
+        if self._awaiting_first_frame:
+            self.interactive_open_cancelled.emit(self)
+        self._awaiting_first_frame = True
+        self._first_frame_image_id = None
+        self.interactive_open_started.emit(self)
+
+    def _cancel_interactive_open(self) -> None:
+        if not self._awaiting_first_frame:
+            return
+        self._awaiting_first_frame = False
+        self._first_frame_image_id = None
+        self.interactive_open_cancelled.emit(self)
+
+    def _on_viewer_content_painted(self, image_ids: object) -> None:
+        if (
+            not self._awaiting_first_frame
+            or not self._first_frame_image_id
+            or not isinstance(image_ids, tuple)
+        ):
+            return
+        expected = self._first_frame_image_id
+        if not any(
+            image_id == expected or str(image_id).startswith(f"{expected}#")
+            for image_id in image_ids
+        ):
+            return
+        self._awaiting_first_frame = False
+        self._first_frame_image_id = None
+        performance_trace.mark(
+            self._active_open_trace_id,
+            "viewer.first_paint.completed",
+        )
+        self.image_cache.preload_around(
+            self.model.current_index,
+            radius=PRELOAD_RADIUS,
+            visible_indexes=self._visible_page_indexes,
+        )
+        self.first_frame_ready.emit(self)
+
+    def set_next_open_trace(self, trace_id: int) -> None:
+        self._next_open_trace_id = int(trace_id)
 
     def _on_left_side_clicked(self) -> None:
         if self.reading_direction == "rtl":
@@ -2034,6 +2147,7 @@ class ViewerWindow(QMainWindow):
         if self._shutdown_prepared:
             return
         self._shutdown_prepared = True
+        self._cancel_interactive_open()
         self.viewer.cancel_mouse_gesture()
         self.slideshow_timer.stop()
         self._pdf_render_timer.stop()

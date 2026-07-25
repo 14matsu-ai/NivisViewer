@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import io
+import os
 import threading
 import zipfile
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
 from natsort import natsorted
 from PIL import Image, ImageOps
+from PySide6.QtCore import QByteArray, QBuffer, QIODevice
+from PySide6.QtGui import QImage, QImageReader
 
 from .archive_backend import (
     ArchiveBackendError,
@@ -26,6 +30,70 @@ from .supported_formats import (
 )
 
 SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS
+
+
+def _read_image_file_bytes(path: str | Path) -> bytes:
+    """Read a local image without preventing rename/delete on Windows."""
+    target = Path(path)
+    if os.name != "nt":
+        return target.read_bytes()
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    create_file = ctypes.windll.kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(target),
+        0x80000000,  # GENERIC_READ
+        0x00000001 | 0x00000002 | 0x00000004,  # SHARE_READ | WRITE | DELETE
+        None,
+        3,  # OPEN_EXISTING
+        0x00000080,  # FILE_ATTRIBUTE_NORMAL
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        raise OSError(ctypes.get_last_error(), f"画像を開けません: {target}")
+    try:
+        file_descriptor = msvcrt.open_osfhandle(
+            int(handle),
+            os.O_RDONLY | os.O_BINARY,
+        )
+    except Exception:
+        ctypes.windll.kernel32.CloseHandle(handle)
+        raise
+    with os.fdopen(file_descriptor, "rb") as file:
+        return file.read()
+
+
+def _read_webp_qimage(data: bytes) -> QImage | None:
+    buffer = QBuffer()
+    buffer.setData(QByteArray(data))
+    if not buffer.open(QIODevice.OpenModeFlag.ReadOnly):
+        return None
+    reader = QImageReader(buffer, b"webp")
+    reader.setAutoTransform(True)
+    image = reader.read()
+    buffer.close()
+    return None if image.isNull() else image.copy()
+
+
+@dataclass(frozen=True)
+class FolderListingSnapshot:
+    folder: Path
+    image_ids: tuple[str, ...]
+    selected_image: str
+    fingerprints: tuple[tuple[str, int | None, int | None], ...] = ()
 
 
 class ImageSourceError(RuntimeError):
@@ -58,19 +126,37 @@ class ImageSource(ABC):
     def logical_size(self, image_id: str) -> tuple[int, int] | None:
         return None
 
+    def open_qimage(self, image_id: str) -> QImage | None:
+        return None
+
     def close(self) -> None:
         pass
 
 
 class FolderImageSource(ImageSource):
-    def __init__(self, folder_path: str | Path, *, recursive: bool = False, sort_descending: bool = False) -> None:
+    load_sizes_lazily = True
+
+    def __init__(
+        self,
+        folder_path: str | Path,
+        *,
+        recursive: bool = False,
+        sort_descending: bool = False,
+        image_snapshot: tuple[str, ...] | None = None,
+    ) -> None:
         super().__init__(folder_path)
         self.recursive = recursive
         self.sort_descending = sort_descending
+        self._image_snapshot = (
+            tuple(image_snapshot) if image_snapshot is not None else None
+        )
+        self._size_cache: dict[str, tuple[int, int]] = {}
         if not self.source_path.is_dir():
             raise ImageSourceError(f"フォルダが見つかりません: {self.source_path}")
 
     def list_images(self) -> list[str]:
+        if self._image_snapshot is not None:
+            return list(self._image_snapshot)
         try:
             iterator = self.source_path.rglob("*") if self.recursive else self.source_path.iterdir()
             files = [
@@ -92,10 +178,47 @@ class FolderImageSource(ImageSource):
 
     def open_image(self, image_id: str) -> Image.Image:
         try:
-            with Image.open(image_id) as image:
-                return ImageOps.exif_transpose(image).convert("RGBA")
+            # Detach the decoder from the filesystem before Pillow performs
+            # potentially expensive pixel decoding.  On Windows this avoids
+            # holding the source file open while a queued Viewer task runs.
+            data = _read_image_file_bytes(image_id)
+            with Image.open(io.BytesIO(data)) as image:
+                image.seek(0)
+                prepared = ImageOps.exif_transpose(image)
+                result = prepared.copy()
+                self._size_cache[image_id] = result.size
+                return result
         except Exception as exc:
             raise ImageSourceError(f"画像を読み込めません: {image_id}") from exc
+
+    def open_qimage(self, image_id: str) -> QImage | None:
+        if Path(image_id).suffix.casefold() != ".webp":
+            return None
+        try:
+            data = _read_image_file_bytes(image_id)
+        except OSError:
+            return None
+        image = _read_webp_qimage(data)
+        if image is None:
+            return None
+        self._size_cache[image_id] = (image.width(), image.height())
+        return image
+
+    def logical_size(self, image_id: str) -> tuple[int, int] | None:
+        cached = self._size_cache.get(image_id)
+        if cached is not None:
+            return cached
+        try:
+            with Image.open(image_id) as image:
+                width, height = image.size
+                orientation = image.getexif().get(274, 1)
+                if orientation in {5, 6, 7, 8}:
+                    width, height = height, width
+                logical = (width, height)
+                self._size_cache[image_id] = logical
+                return logical
+        except Exception:
+            return None
 
     def display_path(self, image_id: str) -> str:
         return str(Path(image_id))
@@ -108,6 +231,8 @@ class FolderImageSource(ImageSource):
 
 
 class ZipImageSource(ImageSource):
+    load_sizes_lazily = True
+
     def __init__(self, archive_path: str | Path, *, sort_descending: bool = False) -> None:
         super().__init__(archive_path)
         self.sort_descending = sort_descending
@@ -143,9 +268,21 @@ class ZipImageSource(ImageSource):
                     data = file.read()
             stream: BinaryIO = io.BytesIO(data)
             with Image.open(stream) as image:
-                return ImageOps.exif_transpose(image).convert("RGBA")
+                image.seek(0)
+                return ImageOps.exif_transpose(image).copy()
         except Exception as exc:
             raise ImageSourceError(f"書庫内の画像を読み込めません: {image_id}") from exc
+
+    def open_qimage(self, image_id: str) -> QImage | None:
+        if Path(image_id).suffix.casefold() != ".webp":
+            return None
+        try:
+            with self._lock:
+                with self._zip.open(image_id, "r") as file:
+                    data = file.read()
+            return _read_webp_qimage(data)
+        except Exception:
+            return None
 
     def display_path(self, image_id: str) -> str:
         display_name = getattr(self, "_display_names", {}).get(image_id, image_id)
@@ -246,7 +383,8 @@ class SevenZipImageSource(ImageSource):
                 ),
             )
             with Image.open(io.BytesIO(data)) as image:
-                return ImageOps.exif_transpose(image).convert("RGBA")
+                image.seek(0)
+                return ImageOps.exif_transpose(image).copy()
         except ArchiveBackendError as exc:
             raise ImageSourceError(
                 exc.user_message,
@@ -297,6 +435,7 @@ def create_image_source(
     pdf_render_base_dpi: int = 96,
     pdf_render_annotations: bool = True,
     cancel_token=None,
+    folder_snapshot: FolderListingSnapshot | None = None,
 ) -> tuple[ImageSource, str | None]:
     target = Path(path)
     selected_image: str | None = None
@@ -348,7 +487,20 @@ def create_image_source(
         )
 
     if target.is_file() and suffix in SUPPORTED_EXTENSIONS:
-        source = FolderImageSource(target.parent, recursive=recursive_folder, sort_descending=sort_descending)
+        snapshot_paths: tuple[str, ...] | None = None
+        if (
+            folder_snapshot is not None
+            and not recursive_folder
+            and folder_snapshot.folder.absolute() == target.parent.absolute()
+            and str(target) in folder_snapshot.image_ids
+        ):
+            snapshot_paths = folder_snapshot.image_ids
+        source = FolderImageSource(
+            target.parent,
+            recursive=recursive_folder,
+            sort_descending=sort_descending,
+            image_snapshot=snapshot_paths,
+        )
         selected_image = str(target)
         return source, selected_image
 

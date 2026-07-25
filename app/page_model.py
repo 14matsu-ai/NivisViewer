@@ -109,15 +109,14 @@ class PageModel:
     def get_image_size(self, index: int) -> tuple[int, int] | None:
         if index in self._size_cache:
             return self._size_cache[index]
+        if self.source is not None and self.source.load_sizes_lazily:
+            return None
         image_id = self.image_id_at(index)
         if self.source is not None and image_id is not None:
             logical_size = self.source.logical_size(image_id)
             if logical_size is not None:
                 self._size_cache[index] = logical_size
                 return logical_size
-        if self.source is not None and self.source.load_sizes_lazily:
-            return None
-
         try:
             image = self.load_image_at(index)
         except ImageSourceError:
@@ -153,6 +152,14 @@ class PageModel:
         if self.total_pages == 0:
             return 0
         target_index = max(0, min(target_index, self.total_pages - 1))
+        if self.source is not None and self.source.load_sizes_lazily:
+            if self.view_mode == "single":
+                return target_index
+            if self.single_first_page:
+                if target_index == 0:
+                    return 0
+                return 1 + ((target_index - 1) // 2) * 2
+            return (target_index // 2) * 2
         start = 0
         while start < self.total_pages:
             spread = self.spread_at(start)
@@ -207,6 +214,12 @@ class PageModel:
         start_index = self.spread_start_for_index(start_index)
         if start_index <= 0:
             return 0
+        if self.source is not None and self.source.load_sizes_lazily:
+            if self.view_mode == "single":
+                return start_index - 1
+            if self.single_first_page and start_index <= 2:
+                return 0
+            return max(1 if self.single_first_page else 0, start_index - 2)
 
         probe = 0
         previous = 0

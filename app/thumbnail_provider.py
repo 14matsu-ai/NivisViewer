@@ -11,7 +11,7 @@ from typing import Callable
 import zipfile
 
 from natsort import natsorted
-from PIL import Image, ImageOps
+from PIL import Image
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QIcon, QImage, QPixmap
 
@@ -21,9 +21,17 @@ from .browser_model import (
     BrowserItemKind,
 )
 from .browser_thumbnail_scheduler import ThumbnailPriority
+from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
 from .image_source import EXTERNAL_ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS, SevenZipImageSource
 from .pdf_backend import PageRenderSpec, PdfRenderPriority
 from .thumbnail_disk_cache import ThumbnailDiskCache
+from .thumbnail_render import (
+    SmartCropCache,
+    ThumbnailRenderSpec,
+    pil_to_qimage,
+    render_pil_thumbnail,
+    smart_crop_cache_key,
+)
 
 
 _RETIRED_THUMBNAIL_PROVIDERS: set[BrowserThumbnailProvider] = set()
@@ -54,16 +62,16 @@ class _PendingThumbnail:
 
 
 class _ThumbnailWorkerSignals(QObject):
-    finished = Signal(str, int, int, object, object)
+    finished = Signal(str, int, object, object, object)
 
 
 class _ThumbnailWorker(QRunnable):
     def __init__(
         self,
         item: BrowserItem,
-        size: int,
+        size: int | ThumbnailRenderSpec,
         generation: int,
-        loader: Callable[[BrowserItem, int], ThumbnailLoadResult],
+        loader: Callable[..., ThumbnailLoadResult],
         priority: ThumbnailPriority = ThumbnailPriority.VISIBLE,
     ) -> None:
         super().__init__()
@@ -87,7 +95,11 @@ class _ThumbnailWorker(QRunnable):
         self.signals.finished.emit(
             str(self.item.path),
             self.generation,
-            self.size,
+            (
+                self.size.cache_token
+                if isinstance(self.size, ThumbnailRenderSpec)
+                else self.size
+            ),
             self.item.modified_at,
             result.image,
         )
@@ -96,6 +108,7 @@ class _ThumbnailWorker(QRunnable):
 class BrowserThumbnailProvider(QObject):
     thumbnail_ready = Signal(str, int, object)
     cache_cleared = Signal()
+    scheduling_resumed = Signal()
 
     def __init__(
         self,
@@ -108,10 +121,12 @@ class BrowserThumbnailProvider(QObject):
         disk_cache_enabled: bool = True,
         archive_backend_registry=None,
         pdfium_service=None,
+        image_work_coordinator: ImageWorkCoordinator | None = None,
     ) -> None:
         super().__init__(parent)
+        self._coordinator = image_work_coordinator
         self._pool = QThreadPool(self)
-        self._pool.setMaxThreadCount(max(1, min(2, max_workers)))
+        self._pool.setMaxThreadCount(1)
         self._cache_capacity = max(1, cache_capacity)
         self._cache: OrderedDict[tuple[str, int, float | None], QImage] = OrderedDict()
         self._pending: dict[tuple[str, int, int], _PendingThumbnail] = {}
@@ -127,6 +142,13 @@ class BrowserThumbnailProvider(QObject):
         self._maintenance_started = False
         self._archive_backend_registry = archive_backend_registry
         self._pdfium_service = pdfium_service
+        self._smart_crop_cache = SmartCropCache()
+        self._paused = bool(
+            image_work_coordinator is not None
+            and image_work_coordinator.browser_paused
+        )
+        if image_work_coordinator is not None:
+            image_work_coordinator.browser_pause_changed.connect(self.set_paused)
 
     @property
     def generation(self) -> int:
@@ -137,14 +159,16 @@ class BrowserThumbnailProvider(QObject):
         with self._pending_lock:
             for pending in self._pending.values():
                 pending.worker.cancelled.set()
+                self._try_take(pending.worker)
             self._pending.clear()
-        self._pool.clear()
+        if self._coordinator is None:
+            self._pool.clear()
         return self._generation
 
     def request(
         self,
         item: BrowserItem,
-        size: int,
+        size: int | ThumbnailRenderSpec,
         *,
         generation: int | None = None,
         priority: ThumbnailPriority = ThumbnailPriority.VISIBLE,
@@ -155,9 +179,15 @@ class BrowserThumbnailProvider(QObject):
         if requested_generation != self._generation:
             return False
 
-        normalized_size = max(16, min(1024, int(size)))
+        normalized_size: int | ThumbnailRenderSpec
+        if isinstance(size, ThumbnailRenderSpec):
+            normalized_size = size
+            cache_token = size.cache_token
+        else:
+            normalized_size = max(16, min(1024, int(size)))
+            cache_token = normalized_size
         path_key = self._path_key(item.path)
-        cache_key = (path_key, normalized_size, item.modified_at)
+        cache_key = (path_key, cache_token, item.modified_at)
         cached = self._cache.get(cache_key)
         if cached is not None:
             self._cache.move_to_end(cache_key)
@@ -172,7 +202,10 @@ class BrowserThumbnailProvider(QObject):
             )
             return False
 
-        pending_key = (path_key, normalized_size, requested_generation)
+        if self._paused:
+            return False
+
+        pending_key = (path_key, cache_token, requested_generation)
         normalized_priority = ThumbnailPriority(priority)
         with self._pending_lock:
             existing = self._pending.get(pending_key)
@@ -186,7 +219,7 @@ class BrowserThumbnailProvider(QObject):
                         normalized_priority,
                     )
                     existing.worker.priority = normalized_priority
-                    self._pool.start(existing.worker, int(normalized_priority))
+                    self._start_worker(existing.worker, normalized_priority)
                 return False
 
             worker = _ThumbnailWorker(
@@ -201,17 +234,21 @@ class BrowserThumbnailProvider(QObject):
                 worker,
                 normalized_priority,
             )
-        self._pool.start(worker, int(normalized_priority))
-        return True
+        if self._start_worker(worker, normalized_priority):
+            return True
+        with self._pending_lock:
+            self._pending.pop(pending_key, None)
+        return False
 
     def cancel_prefetch_except(
         self,
         paths: set[str],
         *,
-        size: int,
+        size: int | ThumbnailRenderSpec,
         generation: int,
     ) -> int:
         keep = {self._path_key(Path(path)) for path in paths}
+        size_token = size.cache_token if isinstance(size, ThumbnailRenderSpec) else int(size)
         cancelled = 0
         with self._pending_lock:
             candidates = tuple(self._pending.items())
@@ -219,7 +256,7 @@ class BrowserThumbnailProvider(QObject):
                 path_key, pending_size, pending_generation = key
                 if (
                     pending_generation != generation
-                    or pending_size != int(size)
+                    or pending_size != size_token
                     or pending.priority is not ThumbnailPriority.PREFETCH
                     or path_key in keep
                 ):
@@ -230,12 +267,29 @@ class BrowserThumbnailProvider(QObject):
                     cancelled += 1
         return cancelled
 
+    @Slot(bool)
+    def set_paused(self, paused: bool) -> None:
+        normalized = bool(paused)
+        if normalized == self._paused:
+            return
+        self._paused = normalized
+        if normalized:
+            with self._pending_lock:
+                for key, pending in tuple(self._pending.items()):
+                    if self._try_take(pending.worker):
+                        pending.worker.cancelled.set()
+                        self._pending.pop(key, None)
+        else:
+            self.scheduling_resumed.emit()
+
     @property
     def pending_count(self) -> int:
         with self._pending_lock:
             return len(self._pending)
 
     def wait_for_done(self, msecs: int = 5000) -> bool:
+        if self._coordinator is not None:
+            return self._coordinator.wait_for_browser(msecs)
         return self._pool.waitForDone(msecs)
 
     @property
@@ -269,14 +323,13 @@ class BrowserThumbnailProvider(QObject):
             kind=BrowserItemKind.FOLDER,
             modified_at=None,
         )
-        self._pool.start(
-            _ThumbnailWorker(
-                item,
-                16,
-                self._generation,
-                lambda _item, _size: prune_disk(),
-            )
+        worker = _ThumbnailWorker(
+            item,
+            16,
+            self._generation,
+            lambda _item, _size: prune_disk(),
         )
+        self._start_worker(worker, ThumbnailPriority.PREFETCH)
 
     def clear_memory_cache(self) -> None:
         self._cache.clear()
@@ -308,7 +361,7 @@ class BrowserThumbnailProvider(QObject):
             lambda _item, _size: ThumbnailLoadResult(clear_disk()),
         )
         worker.signals.finished.connect(self._on_cache_clear_finished)
-        self._pool.start(worker)
+        self._start_worker(worker, ThumbnailPriority.PREFETCH)
 
     def close(self, wait_msecs: int = 250) -> None:
         if self._closed:
@@ -318,8 +371,10 @@ class BrowserThumbnailProvider(QObject):
         with self._pending_lock:
             for pending in self._pending.values():
                 pending.worker.cancelled.set()
-        self._pool.clear()
-        if self._pool.waitForDone(wait_msecs):
+                self._try_take(pending.worker)
+        if self._coordinator is None:
+            self._pool.clear()
+        if self.wait_for_done(wait_msecs):
             self._finalize_close()
             return
         self.setParent(None)
@@ -327,37 +382,59 @@ class BrowserThumbnailProvider(QObject):
         QTimer.singleShot(100, self, self._release_retired_if_idle)
 
     @staticmethod
-    def load_thumbnail(item: BrowserItem, size: int) -> QImage | None:
+    def load_thumbnail(
+        item: BrowserItem,
+        size: int | ThumbnailRenderSpec,
+    ) -> QImage | None:
         return BrowserThumbnailProvider.load_thumbnail_result(item, size).image
 
     @staticmethod
     def load_thumbnail_result(
         item: BrowserItem,
-        size: int,
+        size: int | ThumbnailRenderSpec,
         archive_backend_registry=None,
         cancel_token=None,
         pdfium_service=None,
         pdf_render_priority: int = int(PdfRenderPriority.THUMBNAIL_VISIBLE),
+        smart_crop_cache: SmartCropCache | None = None,
     ) -> ThumbnailLoadResult:
+        spec = (
+            size
+            if isinstance(size, ThumbnailRenderSpec)
+            else ThumbnailRenderSpec.from_settings(size, "square_1_1", "letterbox")
+        )
         try:
             if item.kind == BrowserItemKind.IMAGE:
                 return ThumbnailLoadResult(
-                    BrowserThumbnailProvider._load_image_path(item.path, size)
+                    BrowserThumbnailProvider._load_image_path(
+                        item.path,
+                        spec,
+                        smart_crop_cache,
+                    )
                 )
             if item.kind == BrowserItemKind.FOLDER:
-                return BrowserThumbnailProvider._load_folder_result(item.path, size)
+                return BrowserThumbnailProvider._load_folder_result(
+                    item.path,
+                    spec,
+                    smart_crop_cache,
+                )
             if item.kind == BrowserItemKind.ARCHIVE:
                 if item.path.suffix.lower() in EXTERNAL_ARCHIVE_EXTENSIONS:
                     return ThumbnailLoadResult(
                         BrowserThumbnailProvider._load_external_archive(
                             item.path,
-                            size,
+                            spec,
                             archive_backend_registry,
                             cancel_token,
+                            smart_crop_cache,
                         )
                     )
                 return ThumbnailLoadResult(
-                    BrowserThumbnailProvider._load_archive(item.path, size)
+                    BrowserThumbnailProvider._load_archive(
+                        item.path,
+                        spec,
+                        smart_crop_cache,
+                    )
                 )
             if item.kind == BrowserItemKind.PDF and pdfium_service is not None:
                 from .pdf_image_source import PdfImageSource
@@ -371,13 +448,27 @@ class BrowserThumbnailProvider(QObject):
                     image_id = source.list_images()[0]
                     with source.open_image_for_render(
                         image_id,
-                        PageRenderSpec(size, size),
+                        PageRenderSpec(spec.long_edge, spec.long_edge),
                         priority=int(pdf_render_priority),
                         purpose="thumbnail",
                     ) as image:
-                        return ThumbnailLoadResult(
-                            BrowserThumbnailProvider._pil_to_qimage(image, size)
+                        rendered, _crop = BrowserThumbnailProvider._render_image(
+                            image,
+                            spec,
+                            smart_crop_cache,
+                            smart_crop_cache_key(
+                                item.path,
+                                source_size=item.file_size,
+                                source_mtime_ns=(
+                                    int(item.modified_at * 1_000_000_000)
+                                    if item.modified_at is not None
+                                    else None
+                                ),
+                                entry_path="0",
+                                ratio_id=spec.frame_ratio_id,
+                            ),
                         )
+                        return ThumbnailLoadResult(rendered)
                 finally:
                     source.close()
         except Exception:
@@ -387,16 +478,17 @@ class BrowserThumbnailProvider(QObject):
     def _load_pipeline(
         self,
         item: BrowserItem,
-        size: int,
+        size: int | ThumbnailRenderSpec,
         cancel_token=None,
         thumbnail_priority: ThumbnailPriority = ThumbnailPriority.VISIBLE,
     ) -> ThumbnailLoadResult:
-        failure_key = (self._path_key(item.path), size, item.modified_at)
+        cache_token = size.cache_token if isinstance(size, ThumbnailRenderSpec) else int(size)
+        failure_key = (self._path_key(item.path), cache_token, item.modified_at)
         disk_cache = self._disk_cache
         if self._disk_cache_enabled and disk_cache is not None:
             disk_cache.set_enabled(True)
             self._run_initial_maintenance(disk_cache)
-            cached = disk_cache.get(item, size)
+            cached = disk_cache.get(item, cache_token)
             if cached is not None:
                 return ThumbnailLoadResult(cached)
 
@@ -412,12 +504,13 @@ class BrowserThumbnailProvider(QObject):
                 cancel_token,
                 self._pdfium_service,
                 self._pdf_render_priority(thumbnail_priority),
+                self._smart_crop_cache,
             )
         else:
             loaded = _invoke_thumbnail_loader(
                 self._decode_loader,
                 item,
-                size,
+                size.long_edge if isinstance(size, ThumbnailRenderSpec) else size,
                 cancel_token,
             )
             result = (
@@ -433,7 +526,7 @@ class BrowserThumbnailProvider(QObject):
         if self._disk_cache_enabled and disk_cache is not None:
             disk_cache.put(
                 item,
-                size,
+                cache_token,
                 result.image,
                 cover_path=result.cover_path,
             )
@@ -454,18 +547,18 @@ class BrowserThumbnailProvider(QObject):
             ThumbnailPriority.PREFETCH: int(PdfRenderPriority.THUMBNAIL_PREFETCH),
         }[ThumbnailPriority(priority)]
 
-    @Slot(str, int, int, object, object)
+    @Slot(str, int, object, object, object)
     def _on_finished(
         self,
         path: str,
         generation: int,
-        size: int,
+        size_token: int,
         modified_at: float | None,
         image: QImage | None,
     ) -> None:
         path_key = self._path_key(Path(path))
-        pending_key = (path_key, size, generation)
-        cache_key = (path_key, size, modified_at)
+        pending_key = (path_key, int(size_token), generation)
+        cache_key = (path_key, int(size_token), modified_at)
         with self._pending_lock:
             self._pending.pop(pending_key, None)
         if self._closed:
@@ -479,7 +572,7 @@ class BrowserThumbnailProvider(QObject):
             self._cache.popitem(last=False)
         self.thumbnail_ready.emit(path, generation, image)
 
-    @Slot(str, int, int, object, object)
+    @Slot(str, int, object, object, object)
     def _on_cache_clear_finished(
         self,
         _path: str,
@@ -491,20 +584,47 @@ class BrowserThumbnailProvider(QObject):
         self.cache_cleared.emit()
 
     @staticmethod
-    def _load_image_path(path: Path, size: int) -> QImage | None:
+    def _load_image_path(
+        path: Path,
+        spec: ThumbnailRenderSpec,
+        smart_crop_cache: SmartCropCache | None = None,
+    ) -> QImage | None:
         try:
+            stat = path.stat()
             with Image.open(path) as image:
-                prepared = ImageOps.exif_transpose(image)
-                return BrowserThumbnailProvider._pil_to_qimage(prepared, size)
+                rendered, _crop = BrowserThumbnailProvider._render_image(
+                    image,
+                    spec,
+                    smart_crop_cache,
+                    smart_crop_cache_key(
+                        path,
+                        source_size=stat.st_size,
+                        source_mtime_ns=stat.st_mtime_ns,
+                        ratio_id=spec.frame_ratio_id,
+                    ),
+                )
+                return rendered
         except Exception:
             return None
 
     @staticmethod
-    def _load_folder(folder: Path, size: int) -> QImage | None:
-        return BrowserThumbnailProvider._load_folder_result(folder, size).image
+    def _load_folder(
+        folder: Path,
+        size: int | ThumbnailRenderSpec,
+    ) -> QImage | None:
+        spec = (
+            size
+            if isinstance(size, ThumbnailRenderSpec)
+            else ThumbnailRenderSpec.from_settings(size, "square_1_1", "letterbox")
+        )
+        return BrowserThumbnailProvider._load_folder_result(folder, spec).image
 
     @staticmethod
-    def _load_folder_result(folder: Path, size: int) -> ThumbnailLoadResult:
+    def _load_folder_result(
+        folder: Path,
+        spec: ThumbnailRenderSpec,
+        smart_crop_cache: SmartCropCache | None = None,
+    ) -> ThumbnailLoadResult:
         try:
             candidates = natsorted(
                 (
@@ -517,14 +637,23 @@ class BrowserThumbnailProvider(QObject):
         except OSError:
             return ThumbnailLoadResult(None)
         for path in candidates:
-            image = BrowserThumbnailProvider._load_image_path(path, size)
+            image = BrowserThumbnailProvider._load_image_path(
+                path,
+                spec,
+                smart_crop_cache,
+            )
             if image is not None:
                 return ThumbnailLoadResult(image, path)
         return ThumbnailLoadResult(None)
 
     @staticmethod
-    def _load_archive(archive: Path, size: int) -> QImage | None:
+    def _load_archive(
+        archive: Path,
+        spec: ThumbnailRenderSpec,
+        smart_crop_cache: SmartCropCache | None = None,
+    ) -> QImage | None:
         try:
+            stat = archive.stat()
             with zipfile.ZipFile(archive, "r") as source:
                 names = natsorted(
                     (
@@ -539,8 +668,18 @@ class BrowserThumbnailProvider(QObject):
                         with source.open(name, "r") as file:
                             data = file.read()
                         with Image.open(BytesIO(data)) as image:
-                            prepared = ImageOps.exif_transpose(image)
-                            qimage = BrowserThumbnailProvider._pil_to_qimage(prepared, size)
+                            qimage, _crop = BrowserThumbnailProvider._render_image(
+                                image,
+                                spec,
+                                smart_crop_cache,
+                                smart_crop_cache_key(
+                                    archive,
+                                    source_size=stat.st_size,
+                                    source_mtime_ns=stat.st_mtime_ns,
+                                    entry_path=name,
+                                    ratio_id=spec.frame_ratio_id,
+                                ),
+                            )
                         if qimage is not None:
                             return qimage
                     except Exception:
@@ -552,9 +691,10 @@ class BrowserThumbnailProvider(QObject):
     @staticmethod
     def _load_external_archive(
         archive: Path,
-        size: int,
+        spec: ThumbnailRenderSpec,
         archive_backend_registry,
         cancel_token,
+        smart_crop_cache: SmartCropCache | None = None,
     ) -> QImage | None:
         if archive_backend_registry is None:
             return None
@@ -570,7 +710,20 @@ class BrowserThumbnailProvider(QObject):
             )
             first = source.list_images()[0]
             with source.open_image(first) as image:
-                return BrowserThumbnailProvider._pil_to_qimage(image, size)
+                stat = archive.stat()
+                rendered, _crop = BrowserThumbnailProvider._render_image(
+                    image,
+                    spec,
+                    smart_crop_cache,
+                    smart_crop_cache_key(
+                        archive,
+                        source_size=stat.st_size,
+                        source_mtime_ns=stat.st_mtime_ns,
+                        entry_path=first,
+                        ratio_id=spec.frame_ratio_id,
+                    ),
+                )
+                return rendered
         except Exception:
             return None
         finally:
@@ -579,16 +732,35 @@ class BrowserThumbnailProvider(QObject):
 
     @staticmethod
     def _pil_to_qimage(image: Image.Image, size: int) -> QImage:
-        prepared = image.convert("RGBA")
+        prepared = image.copy()
         prepared.thumbnail((size, size), Image.Resampling.LANCZOS)
-        data = prepared.tobytes("raw", "RGBA")
-        return QImage(
-            data,
-            prepared.width,
-            prepared.height,
-            prepared.width * 4,
-            QImage.Format.Format_RGBA8888,
-        ).copy()
+        return pil_to_qimage(prepared)
+
+    @staticmethod
+    def _render_image(
+        image: Image.Image,
+        spec: ThumbnailRenderSpec,
+        smart_crop_cache: SmartCropCache | None,
+        crop_key: tuple[object, ...],
+    ) -> tuple[QImage, tuple[float, float, float, float] | None]:
+        cached_crop = (
+            smart_crop_cache.get(crop_key)
+            if spec.crop_mode == "smart_crop" and smart_crop_cache is not None
+            else None
+        )
+        rendered, crop = render_pil_thumbnail(
+            image,
+            spec,
+            normalized_crop=cached_crop,
+        )
+        if (
+            spec.crop_mode == "smart_crop"
+            and cached_crop is None
+            and crop is not None
+            and smart_crop_cache is not None
+        ):
+            smart_crop_cache.put(crop_key, crop)
+        return rendered, crop
 
     @staticmethod
     def _path_key(path: Path) -> str:
@@ -597,6 +769,8 @@ class BrowserThumbnailProvider(QObject):
         ).casefold()
 
     def _try_take(self, worker: _ThumbnailWorker) -> bool:
+        if self._coordinator is not None:
+            return self._coordinator.try_take_browser(worker)
         try:
             return self._pool.tryTake(worker)
         except RuntimeError:
@@ -604,10 +778,26 @@ class BrowserThumbnailProvider(QObject):
             # the queued finished signal removed the Python pending record.
             return False
 
+    def _start_worker(
+        self,
+        worker: _ThumbnailWorker,
+        priority: ThumbnailPriority,
+    ) -> bool:
+        normalized = ThumbnailPriority(priority)
+        if self._coordinator is not None:
+            mapped = {
+                ThumbnailPriority.VISIBLE: ImageWorkPriority.BROWSER_VISIBLE,
+                ThumbnailPriority.SELECTED: ImageWorkPriority.BROWSER_SELECTED,
+                ThumbnailPriority.PREFETCH: ImageWorkPriority.BROWSER_PREFETCH,
+            }[normalized]
+            return self._coordinator.start_browser(worker, mapped)
+        self._pool.start(worker, int(normalized))
+        return True
+
     def _release_retired_if_idle(self) -> None:
         if not self._closed:
             return
-        if not self._pool.waitForDone(0):
+        if not self.wait_for_done(0):
             QTimer.singleShot(100, self, self._release_retired_if_idle)
             return
         self._finalize_close()

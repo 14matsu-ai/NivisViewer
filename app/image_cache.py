@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 
 from PIL import Image, ImageEnhance
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 from PySide6.QtGui import QImage
 
+from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
 from .image_source import ImageSource
 from .pdf_backend import PageRenderSpec, PdfRenderPriority
+from .performance_trace import performance_trace
+from .thumbnail_render import pil_to_qimage
 
 
 PRELOAD_RADIUS = 3
@@ -46,6 +50,7 @@ class _ImageLoadTask(QRunnable):
         adjustments: tuple[float, float, float],
         render_spec: PageRenderSpec | None,
         priority: int,
+        trace_id: int = 0,
     ) -> None:
         super().__init__()
         self.source = source
@@ -55,31 +60,84 @@ class _ImageLoadTask(QRunnable):
         self.adjustments = adjustments
         self.render_spec = render_spec
         self.priority = priority
+        self.trace_id = int(trace_id)
         self.signals = _ImageLoadSignals()
 
     @Slot()
     def run(self) -> None:
+        performance_trace.mark(
+            self.trace_id,
+            "viewer.worker.started",
+            f"page={self.page_index}",
+        )
         try:
-            renderer = getattr(self.source, "open_image_for_render", None)
-            if callable(renderer):
-                image = renderer(
+            qimage: QImage | None = None
+            original_size: tuple[int, int] | None = None
+            rendered_size: tuple[int, int] | None = None
+            open_qimage = getattr(self.source, "open_qimage", None)
+            if (
+                callable(open_qimage)
+                and Path(self.image_id).suffix.casefold() == ".webp"
+                and self.adjustments == (1.0, 1.0, 1.0)
+                and self.render_spec is None
+            ):
+                performance_trace.mark(
+                    self.trace_id,
+                    "webp.qimagereader.started",
                     self.image_id,
-                    self.render_spec,
-                    priority=self.priority,
-                    generation=self.generation,
                 )
-            else:
-                image = self.source.open_image(self.image_id)
-            adjusted: Image.Image | None = None
-            try:
-                adjusted = self._apply_adjustments(image)
-                qimage = self._pil_to_qimage(adjusted)
-                original_size = image.info.get("logical_size", adjusted.size)
-                rendered_size = image.info.get("pdf_render_size")
-            finally:
-                if adjusted is not None and adjusted is not image:
-                    adjusted.close()
-                image.close()
+                qimage = open_qimage(self.image_id)
+                performance_trace.mark(
+                    self.trace_id,
+                    "webp.qimagereader.completed",
+                    (
+                        "fallback"
+                        if qimage is None or qimage.isNull()
+                        else f"{qimage.width()}x{qimage.height()}"
+                    ),
+                )
+                if qimage is not None and not qimage.isNull():
+                    original_size = (qimage.width(), qimage.height())
+            renderer = getattr(self.source, "open_image_for_render", None)
+            if qimage is None or qimage.isNull():
+                performance_trace.mark(
+                    self.trace_id,
+                    "source.bytes_decode.started",
+                    self.image_id,
+                )
+                if callable(renderer):
+                    image = renderer(
+                        self.image_id,
+                        self.render_spec,
+                        priority=self.priority,
+                        generation=self.generation,
+                    )
+                else:
+                    image = self.source.open_image(self.image_id)
+                performance_trace.mark(
+                    self.trace_id,
+                    "source.bytes_decode.completed",
+                    f"mode={image.mode}",
+                )
+                adjusted: Image.Image | None = None
+                try:
+                    adjusted = self._apply_adjustments(image)
+                    performance_trace.mark(
+                        self.trace_id,
+                        "pillow_to_qimage.started",
+                        f"mode={adjusted.mode}",
+                    )
+                    qimage = self._pil_to_qimage(adjusted)
+                    performance_trace.mark(
+                        self.trace_id,
+                        "pillow_to_qimage.completed",
+                    )
+                    original_size = image.info.get("logical_size", adjusted.size)
+                    rendered_size = image.info.get("pdf_render_size")
+                finally:
+                    if adjusted is not None and adjusted is not image:
+                        adjusted.close()
+                    image.close()
             result = CachedImage(
                 page_index=self.page_index,
                 image_id=self.image_id,
@@ -107,13 +165,13 @@ class _ImageLoadTask(QRunnable):
 
     @staticmethod
     def _pil_to_qimage(image: Image.Image) -> QImage:
-        rgba = image.convert("RGBA")
-        data = rgba.tobytes("raw", "RGBA")
-        return QImage(data, rgba.width, rgba.height, QImage.Format.Format_RGBA8888).copy()
+        return pil_to_qimage(image)
 
     def _apply_adjustments(self, image: Image.Image) -> Image.Image:
         brightness, contrast, gamma = self.adjustments
-        adjusted = image.convert("RGBA")
+        if (brightness, contrast, gamma) == (1.0, 1.0, 1.0):
+            return image
+        adjusted = image
         if brightness != 1.0:
             adjusted = ImageEnhance.Brightness(adjusted).enhance(brightness)
         if contrast != 1.0:
@@ -121,8 +179,26 @@ class _ImageLoadTask(QRunnable):
         if gamma != 1.0:
             inverse_gamma = 1.0 / gamma
             lut = [min(255, max(0, int(((value / 255.0) ** inverse_gamma) * 255.0 + 0.5))) for value in range(256)]
-            red, green, blue, alpha = adjusted.split()
-            adjusted = Image.merge("RGBA", (red.point(lut), green.point(lut), blue.point(lut), alpha))
+            if adjusted.mode == "RGBA":
+                red, green, blue, alpha = adjusted.split()
+                adjusted = Image.merge(
+                    "RGBA",
+                    (
+                        red.point(lut),
+                        green.point(lut),
+                        blue.point(lut),
+                        alpha,
+                    ),
+                )
+            elif adjusted.mode == "RGB":
+                adjusted = Image.merge(
+                    "RGB",
+                    tuple(channel.point(lut) for channel in adjusted.split()),
+                )
+            elif adjusted.mode == "L":
+                adjusted = adjusted.point(lut)
+            else:
+                adjusted = adjusted.convert("RGBA")
         return adjusted
 
 
@@ -130,7 +206,13 @@ class ImageCache(QObject):
     pageLoaded = Signal(object)
     sourceIdle = Signal(object)
 
-    def __init__(self, cache_size: int = 10, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        cache_size: int = 10,
+        parent: QObject | None = None,
+        *,
+        image_work_coordinator: ImageWorkCoordinator | None = None,
+    ) -> None:
         super().__init__(parent)
         self.cache_size = max(1, int(cache_size))
         self.generation = 0
@@ -138,12 +220,19 @@ class ImageCache(QObject):
         self.image_ids: list[str] = []
         self._cache: OrderedDict[int, CachedImage] = OrderedDict()
         self._in_flight: dict[tuple[int, int], ImageSource] = {}
+        self._tasks: dict[
+            tuple[int, int],
+            tuple[_ImageLoadTask, ImageWorkPriority],
+        ] = {}
         self._wanted_indexes: set[int] = set()
         self._protected_indexes: set[int] = set()
         self._center_index = 0
         self._thread_pool = QThreadPool(self)
+        self._thread_pool.setMaxThreadCount(1)
+        self._coordinator = image_work_coordinator
         self._adjustments = (1.0, 1.0, 1.0)
         self._render_spec: PageRenderSpec | dict[int, PageRenderSpec] | None = None
+        self._trace_id = 0
 
     def set_cache_size(self, cache_size: int) -> None:
         self.cache_size = max(1, int(cache_size))
@@ -161,7 +250,13 @@ class ImageCache(QObject):
         self.generation += 1
         self._cache.clear()
 
-    def set_source(self, source: ImageSource | None, image_ids: list[str]) -> None:
+    def set_source(
+        self,
+        source: ImageSource | None,
+        image_ids: list[str],
+        *,
+        trace_id: int = 0,
+    ) -> None:
         self.generation += 1
         self.source = source
         self.image_ids = list(image_ids)
@@ -169,6 +264,7 @@ class ImageCache(QObject):
         self._wanted_indexes.clear()
         self._protected_indexes.clear()
         self._center_index = 0
+        self._trace_id = int(trace_id)
 
     def set_render_spec(
         self,
@@ -217,6 +313,8 @@ class ImageCache(QObject):
         return any(active_source is source for active_source in self._in_flight.values())
 
     def wait_for_done(self, msecs: int = 5000) -> bool:
+        if self._coordinator is not None:
+            return self._coordinator.wait_for_viewer(msecs)
         return self._thread_pool.waitForDone(msecs)
 
     def get(self, page_index: int) -> CachedImage | None:
@@ -252,8 +350,10 @@ class ImageCache(QObject):
             if index not in wanted:
                 del self._cache[index]
 
+        self.ensure_loaded(center_index)
         for index in visible_indexes:
-            self.ensure_loaded(index)
+            if index != center_index:
+                self.ensure_loaded(index)
         for index in range(start, end + 1):
             self.ensure_loaded(index)
 
@@ -263,18 +363,31 @@ class ImageCache(QObject):
         if self.source is None or not (0 <= page_index < len(self.image_ids)):
             return
         in_flight_key = (self.generation, page_index)
-        if page_index in self._cache or in_flight_key in self._in_flight:
+        if page_index in self._cache:
+            return
+
+        if page_index == self._center_index:
+            priority = int(PdfRenderPriority.VIEWER_CURRENT)
+            work_priority = ImageWorkPriority.VIEWER_CURRENT
+        elif page_index in self._protected_indexes:
+            priority = int(PdfRenderPriority.VIEWER_SPREAD_PARTNER)
+            work_priority = ImageWorkPriority.VIEWER_SPREAD_PARTNER
+        elif page_index > self._center_index:
+            priority = int(PdfRenderPriority.VIEWER_NEXT)
+            work_priority = ImageWorkPriority.VIEWER_NEXT
+        else:
+            priority = int(PdfRenderPriority.VIEWER_PREVIOUS)
+            work_priority = ImageWorkPriority.VIEWER_PREVIOUS
+        existing = self._tasks.get(in_flight_key)
+        if existing is not None:
+            task, old_priority = existing
+            if work_priority > old_priority and self._try_take_task(task):
+                task.priority = priority
+                self._tasks[in_flight_key] = (task, work_priority)
+                self._start_task(task, work_priority)
             return
 
         self._in_flight[in_flight_key] = self.source
-        if page_index == self._center_index:
-            priority = int(PdfRenderPriority.VIEWER_CURRENT)
-        elif page_index in self._protected_indexes:
-            priority = int(PdfRenderPriority.VIEWER_SPREAD_PARTNER)
-        elif page_index > self._center_index:
-            priority = int(PdfRenderPriority.VIEWER_NEXT)
-        else:
-            priority = int(PdfRenderPriority.VIEWER_PREVIOUS)
         render_spec = (
             self._render_spec.get(page_index)
             if isinstance(self._render_spec, dict)
@@ -288,14 +401,40 @@ class ImageCache(QObject):
             self._adjustments,
             render_spec,
             priority,
+            self._trace_id,
+        )
+        performance_trace.mark(
+            self._trace_id,
+            "viewer.request.registered",
+            f"page={page_index} priority={priority}",
         )
         task.signals.loaded.connect(self._on_loaded)
-        self._thread_pool.start(task)
+        self._tasks[in_flight_key] = (task, work_priority)
+        self._start_task(task, work_priority)
+
+    def _start_task(
+        self,
+        task: _ImageLoadTask,
+        work_priority: ImageWorkPriority,
+    ) -> None:
+        if self._coordinator is not None:
+            self._coordinator.start_viewer(task, work_priority)
+        else:
+            self._thread_pool.start(task, int(work_priority))
+
+    def _try_take_task(self, task: _ImageLoadTask) -> bool:
+        if self._coordinator is not None:
+            return self._coordinator.try_take_viewer(task)
+        try:
+            return self._thread_pool.tryTake(task)
+        except RuntimeError:
+            return False
 
     @Slot(object)
     def _on_loaded(self, result: _ImageLoadResult) -> None:
         cached = result.cached
         self._in_flight.pop((cached.generation, cached.page_index), None)
+        self._tasks.pop((cached.generation, cached.page_index), None)
         if not self.has_in_flight_for_source(result.source):
             self.sourceIdle.emit(result.source)
         if cached.generation != self.generation:
@@ -308,6 +447,11 @@ class ImageCache(QObject):
             return
 
         self._cache[cached.page_index] = cached
+        performance_trace.mark(
+            self._trace_id,
+            "image_cache.stored",
+            f"page={cached.page_index}",
+        )
         self._cache.move_to_end(cached.page_index)
         self._enforce_limit()
         self.pageLoaded.emit(cached)

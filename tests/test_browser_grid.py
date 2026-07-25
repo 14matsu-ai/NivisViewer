@@ -51,6 +51,16 @@ class RecordingThumbnailProvider(BrowserThumbnailProvider):
         return 0
 
 
+class FixedShellIconProvider:
+    def __init__(self, color: str = "#d03030") -> None:
+        pixmap = QPixmap(32, 32)
+        pixmap.fill(QColor(color))
+        self.icon = QIcon(pixmap)
+
+    def icon_for(self, _item):
+        return self.icon
+
+
 def make_item(path: Path, kind: BrowserItemKind) -> BrowserItem:
     return BrowserItem(path.name, path, kind, None)
 
@@ -85,16 +95,16 @@ def test_delegate_uses_fixed_cell_and_uniform_thumbnail_rect(qapp):
     option = QStyleOptionViewItem()
     first = delegate.sizeHint(option, BrowserItemModel().index(0, 0))
     second = delegate.sizeHint(option, BrowserItemModel().index(99, 0))
-    assert first == second == QSize(224, 238)
+    assert first == second == QSize(171, 238)
 
     cell = QRect(0, 0, first.width(), first.height())
     thumbnail = thumbnail_rect_for_cell(
         cell,
-        delegate.thumbnail_size,
+        delegate.frame_size,
         delegate.profile.spacing,
     )
-    assert thumbnail.size() == QSize(180, 180)
-    assert thumbnail.left() == (first.width() - 180) // 2
+    assert thumbnail.size() == QSize(127, 180)
+    assert thumbnail.left() == (first.width() - 127) // 2
 
 
 def test_type_badges_distinguish_supported_item_types_and_are_bottom_left(tmp_path):
@@ -124,6 +134,7 @@ def test_badge_paints_at_high_dpi(qapp, tmp_path):
     delegate = BrowserItemDelegate(
         thumbnail_size=180,
         density=BrowserDisplayDensity.STANDARD,
+        shell_icon_provider=FixedShellIconProvider(),
     )
     canvas = QImage(448, 476, QImage.Format.Format_ARGB32)
     canvas.setDevicePixelRatio(2.0)
@@ -136,8 +147,8 @@ def test_badge_paints_at_high_dpi(qapp, tmp_path):
     delegate.paint(painter, option, model.index(0, 0))
     painter.end()
 
-    thumbnail = thumbnail_rect_for_cell(option.rect, 180, 6)
-    badge = type_badge_rect(thumbnail)
+    thumbnail = thumbnail_rect_for_cell(option.rect, delegate.frame_size, 6)
+    badge = type_badge_rect(thumbnail, 18)
     physical_center = badge.center() * 2
     color = canvas.pixelColor(physical_center)
     assert color.red() > color.blue()
@@ -168,7 +179,7 @@ def test_four_density_profiles_keep_selection_and_visible_anchor(
 
     selected = window.item_model.item_at(window.list_view.currentIndex())
     assert selected is not None and selected.path == items[55].path
-    assert window.list_view.gridSize() == QSize(284, 298)
+    assert window.list_view.gridSize() == QSize(231, 298)
     restored_anchor = window.item_model.index(
         window.item_model.row_for_path(anchor.path),
         0,
@@ -196,6 +207,27 @@ def test_same_thumbnail_bucket_reuses_generation(tmp_path, qapp):
     qapp.processEvents()
 
 
+def test_ratio_and_crop_changes_use_2d_cache_generation(tmp_path, qapp):
+    window = make_window(tmp_path, qapp)
+    initial_generation = window.thumbnail_provider.generation
+    initial_height = window.list_view.gridSize().height()
+
+    window.config.apply({"thumbnail_frame_ratio": "landscape_16_9"})
+    ratio_generation = window.thumbnail_provider.generation
+    landscape_grid = window.list_view.gridSize()
+    window.config.apply({"thumbnail_crop_mode": "letterbox"})
+    crop_generation = window.thumbnail_provider.generation
+
+    assert ratio_generation == initial_generation + 1
+    assert crop_generation == ratio_generation + 1
+    assert landscape_grid.width() == 224
+    assert landscape_grid.height() < initial_height
+    assert window.config.get("thumbnail_frame_ratio") == "landscape_16_9"
+    assert window.config.get("thumbnail_crop_mode") == "letterbox"
+    window.close()
+    qapp.processEvents()
+
+
 def test_ten_thousand_items_request_only_visible_and_prefetch_ranges(
     tmp_path, qapp
 ):
@@ -217,7 +249,7 @@ def test_ten_thousand_items_request_only_visible_and_prefetch_ranges(
     assert len(provider.requests) < window.item_model.rowCount() // 10
     assert any(priority is ThumbnailPriority.VISIBLE for _, _, priority in provider.requests)
     assert {size for _, size, _ in provider.requests} == {
-        window.thumbnail_bucket_size
+        window.thumbnail_render_spec
     }
 
     provider.requests.clear()
