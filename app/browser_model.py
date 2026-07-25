@@ -16,17 +16,19 @@ from .browser_sort import (
     normalize_browser_sort_order,
 )
 from .browser_scanner import BrowserScanEntry, scan_entry_from_dir_entry
-from .image_source import ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS
+from .image_source import ARCHIVE_EXTENSIONS, PDF_EXTENSIONS, SUPPORTED_EXTENSIONS
 
 
 BROWSER_IMAGE_EXTENSIONS = set(SUPPORTED_EXTENSIONS)
 BROWSER_ARCHIVE_EXTENSIONS = set(ARCHIVE_EXTENSIONS)
+BROWSER_PDF_EXTENSIONS = set(PDF_EXTENSIONS)
 
 
 class BrowserItemKind(str, Enum):
     FOLDER = "folder"
     ARCHIVE = "archive"
     IMAGE = "image"
+    PDF = "pdf"
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,7 @@ class BrowserItemModel(QAbstractListModel):
         BrowserItemKind.FOLDER: "フォルダ",
         BrowserItemKind.ARCHIVE: "書庫",
         BrowserItemKind.IMAGE: "画像",
+        BrowserItemKind.PDF: "PDF",
     }
 
     def __init__(self, parent=None) -> None:

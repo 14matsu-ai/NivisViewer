@@ -11,7 +11,7 @@ from typing import Iterable
 
 from PySide6.QtCore import QObject, Signal
 
-from .image_source import ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS
+from .image_source import ARCHIVE_EXTENSIONS, PDF_EXTENSIONS, SUPPORTED_EXTENSIONS
 
 
 METADATA_SCHEMA_VERSION = 1
@@ -984,6 +984,8 @@ class MetadataStore(QObject):
         suffix = target.suffix.lower()
         if suffix in ARCHIVE_EXTENSIONS:
             return "archive"
+        if suffix in PDF_EXTENSIONS:
+            return "pdf"
         if suffix in SUPPORTED_EXTENSIONS:
             return "image"
         return "unknown"

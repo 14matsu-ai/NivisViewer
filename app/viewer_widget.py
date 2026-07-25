@@ -30,6 +30,8 @@ class ViewerImage:
     original_size: tuple[int, int] | None
     error: str | None = None
     loading: bool = False
+    rendered_size: tuple[int, int] | None = None
+    pre_rotated: bool = False
 
 
 @dataclass(frozen=True)
@@ -121,6 +123,7 @@ class ViewerWidget(QWidget):
     contextMenuRequested = Signal(QPoint)
     gestureRecognized = Signal(str)
     extraMouseButtonPressed = Signal(str)
+    viewportChanged = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -277,18 +280,33 @@ class ViewerWidget(QWidget):
         return self._scroll_vertical(-1)
 
     def set_pages(self, spread: DisplaySpread, pages: list[ViewerImage]) -> None:
+        same_display_unit = (
+            spread.start_index == self._spread.start_index
+            and tuple(slot.page_index for slot in spread.slots)
+            == tuple(slot.page_index for slot in self._spread.slots)
+        )
         self._spread = spread
         self._images = pages
-        self._pan = QPoint(0, 0)
+        if not same_display_unit:
+            self._pan = QPoint(0, 0)
         self.update()
 
     @staticmethod
-    def from_qimage(page_index: int, image_id: str, qimage: QImage, original_size: tuple[int, int]) -> ViewerImage:
+    def from_qimage(
+        page_index: int,
+        image_id: str,
+        qimage: QImage,
+        original_size: tuple[int, int],
+        rendered_size: tuple[int, int] | None = None,
+        pre_rotated: bool = False,
+    ) -> ViewerImage:
         return ViewerImage(
             page_index=page_index,
             image_id=image_id,
             pixmap=QPixmap.fromImage(qimage),
             original_size=original_size,
+            rendered_size=rendered_size,
+            pre_rotated=pre_rotated,
         )
 
     @staticmethod
@@ -310,8 +328,9 @@ class ViewerWidget(QWidget):
             return ""
         parts = []
         for image in self._images:
-            if image.original_size is not None:
-                parts.append(f"{image.original_size[0]}x{image.original_size[1]}")
+            size = image.rendered_size or image.original_size
+            if size is not None:
+                parts.append(f"{size[0]}x{size[1]}")
             elif image.error:
                 parts.append("error")
             else:
@@ -345,6 +364,7 @@ class ViewerWidget(QWidget):
         if self.fit_mode in {"fit_window", "fit_no_upscale", "fit_width", "fit_height"}:
             self._pan = QPoint(0, 0)
         super().resizeEvent(event)
+        self.viewportChanged.emit()
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -554,7 +574,9 @@ class ViewerWidget(QWidget):
         return self.gap if len(self._images) > 1 else 0
 
     def _base_size(self, image: ViewerImage) -> QSize:
-        if image.pixmap is not None:
+        if image.original_size is not None:
+            size = QSize(*image.original_size)
+        elif image.pixmap is not None:
             size = image.pixmap.size()
         else:
             size = QSize(360, 520)
@@ -565,7 +587,7 @@ class ViewerWidget(QWidget):
     def _display_pixmap(self, image: ViewerImage) -> QPixmap | None:
         if image.pixmap is None:
             return None
-        if self.rotation_angle == 0:
+        if self.rotation_angle == 0 or image.pre_rotated:
             return image.pixmap
         transform = QTransform().rotate(self.rotation_angle)
         return image.pixmap.transformed(transform, Qt.TransformationMode.SmoothTransformation)
