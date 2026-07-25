@@ -26,6 +26,7 @@ class BrowserDisplayDensity(str, Enum):
     COMPACT = "compact"
     STANDARD = "standard"
     COMFORTABLE = "comfortable"
+    LARGE = "large"
 
 
 BROWSER_SORT_KEY_LABELS = {
@@ -44,6 +45,7 @@ BROWSER_DISPLAY_DENSITY_LABELS = {
     BrowserDisplayDensity.COMPACT: "コンパクト",
     BrowserDisplayDensity.STANDARD: "標準",
     BrowserDisplayDensity.COMFORTABLE: "ゆったり",
+    BrowserDisplayDensity.LARGE: "大",
 }
 
 _natural_key = natsort_keygen(alg=ns.IGNORECASE)

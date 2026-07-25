@@ -216,6 +216,7 @@ class ConfigManager(QObject):
             "compact",
             "standard",
             "comfortable",
+            "large",
         }:
             normalized["browser_display_density"] = cls.DEFAULTS[
                 "browser_display_density"

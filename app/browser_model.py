@@ -122,6 +122,7 @@ class BrowserItemModel(QAbstractListModel):
         self._source_keys: set[str] = set()
         self._icons: dict[str, QIcon] = {}
         self._fallback_icons: dict[BrowserItemKind, QIcon] = {}
+        self._row_by_key: dict[str, int] = {}
 
     @property
     def items(self) -> tuple[BrowserItem, ...]:
@@ -159,6 +160,7 @@ class BrowserItemModel(QAbstractListModel):
         self._items = self._sort_policy.sorted_items(self._source_items)
         self._icons.clear()
         self._scan_generation = None
+        self._rebuild_row_index()
         self.endResetModel()
 
     def begin_directory_scan(self, *, generation: int) -> None:
@@ -167,6 +169,7 @@ class BrowserItemModel(QAbstractListModel):
         self._source_keys.clear()
         self._items = []
         self._icons.clear()
+        self._row_by_key.clear()
         self._scan_generation = int(generation)
         self.endResetModel()
 
@@ -190,6 +193,7 @@ class BrowserItemModel(QAbstractListModel):
         self.beginResetModel()
         self._source_items.extend(additions)
         self._items = self._sort_policy.sorted_items(self._source_items)
+        self._rebuild_row_index()
         self.endResetModel()
         return len(additions)
 
@@ -198,6 +202,7 @@ class BrowserItemModel(QAbstractListModel):
             return False
         self.beginResetModel()
         self._items = self._sort_policy.sorted_items(self._source_items)
+        self._rebuild_row_index()
         self._scan_generation = None
         self.endResetModel()
         return True
@@ -224,6 +229,7 @@ class BrowserItemModel(QAbstractListModel):
         self.beginResetModel()
         self._sort_policy = policy
         self._items = policy.sorted_items(self._source_items)
+        self._rebuild_row_index()
         self.endResetModel()
         return True
 
@@ -264,11 +270,12 @@ class BrowserItemModel(QAbstractListModel):
         return None
 
     def row_for_path(self, path: str | Path) -> int:
-        key = self._key(Path(path))
-        for row, item in enumerate(self._items):
-            if self._key(item.path) == key:
-                return row
-        return -1
+        return self._row_by_key.get(self._key(Path(path)), -1)
+
+    def _rebuild_row_index(self) -> None:
+        self._row_by_key = {
+            self._key(item.path): row for row, item in enumerate(self._items)
+        }
 
     @staticmethod
     def _key(path: Path) -> str:

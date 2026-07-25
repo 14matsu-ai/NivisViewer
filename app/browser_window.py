@@ -62,6 +62,10 @@ from .browser_model import (
     BrowserItemModel,
     browser_item_from_scan_entry,
 )
+from .browser_item_delegate import (
+    BrowserItemDelegate,
+    quantize_thumbnail_size,
+)
 from .browser_navigation import BrowserLocation, BrowserNavigationHistory
 from .browser_scanner import (
     BrowserDirectoryScanner,
@@ -259,6 +263,7 @@ class BrowserWindow(QMainWindow):
         self.thumbnail_size = self._safe_thumbnail_size(
             self.settings.get("thumbnail_size", 180)
         )
+        self.thumbnail_bucket_size = quantize_thumbnail_size(self.thumbnail_size)
         self.browser_sort_key = normalize_browser_sort_key(
             self.settings.get("browser_sort_key", BrowserSortKey.NAME.value)
         )
@@ -1369,9 +1374,14 @@ class BrowserWindow(QMainWindow):
 
         thumbnail_changed = "thumbnail_size" in changed
         if thumbnail_changed:
-            self.thumbnail_size = self._safe_thumbnail_size(changed["thumbnail_size"])
-            self.item_model.clear_thumbnails()
-            self._generation = self.thumbnail_provider.begin_generation()
+            new_size = self._safe_thumbnail_size(changed["thumbnail_size"])
+            new_bucket = quantize_thumbnail_size(new_size)
+            bucket_changed = new_bucket != self.thumbnail_bucket_size
+            self.thumbnail_size = new_size
+            self.thumbnail_bucket_size = new_bucket
+            if bucket_changed:
+                self.item_model.clear_thumbnails()
+                self._generation = self.thumbnail_provider.begin_generation()
         if thumbnail_changed or "browser_display_density" in changed:
             self._apply_list_view_geometry()
 
@@ -1457,22 +1467,15 @@ class BrowserWindow(QMainWindow):
                 control.blockSignals(False)
 
     def _apply_list_view_geometry(self) -> None:
-        density = self.browser_display_density
-        if density is BrowserDisplayDensity.COMPACT:
-            horizontal_margin, vertical_margin, spacing, word_wrap = 20, 32, 2, False
-        elif density is BrowserDisplayDensity.COMFORTABLE:
-            horizontal_margin, vertical_margin, spacing, word_wrap = 72, 88, 12, True
-        else:
-            horizontal_margin, vertical_margin, spacing, word_wrap = 44, 58, 6, True
-        self.list_view.setIconSize(QSize(self.thumbnail_size, self.thumbnail_size))
-        self.list_view.setGridSize(
-            QSize(
-                self.thumbnail_size + horizontal_margin,
-                self.thumbnail_size + vertical_margin,
-            )
+        self.item_delegate.configure(
+            thumbnail_size=self.thumbnail_size,
+            density=self.browser_display_density,
         )
-        self.list_view.setSpacing(spacing)
-        self.list_view.setWordWrap(word_wrap)
+        self.list_view.setIconSize(QSize(self.thumbnail_size, self.thumbnail_size))
+        self.list_view.setGridSize(self.item_delegate.cell_size)
+        self.list_view.setSpacing(self.item_delegate.profile.spacing)
+        self.list_view.setWordWrap(self.item_delegate.profile.title_lines > 1)
+        self.list_view.viewport().update()
 
     def open_settings_dialog(self) -> None:
         dialog = SettingsDialog(
@@ -1653,6 +1656,12 @@ class BrowserWindow(QMainWindow):
 
         self.list_view = QListView(self)
         self.list_view.setModel(self.item_model)
+        self.item_delegate = BrowserItemDelegate(
+            self.list_view,
+            thumbnail_size=self.thumbnail_size,
+            density=self.browser_display_density,
+        )
+        self.list_view.setItemDelegate(self.item_delegate)
         self.list_view.setViewMode(QListView.ViewMode.IconMode)
         self.list_view.setResizeMode(QListView.ResizeMode.Adjust)
         self.list_view.setMovement(QListView.Movement.Static)
@@ -1661,6 +1670,7 @@ class BrowserWindow(QMainWindow):
         )
         self.list_view.setSelectionMode(QListView.SelectionMode.ExtendedSelection)
         self.list_view.setUniformItemSizes(True)
+        self.list_view.setMouseTracking(True)
         self.list_view.setTextElideMode(Qt.TextElideMode.ElideRight)
         self._apply_list_view_geometry()
         self.list_view.activated.connect(self.open_item)
@@ -1977,7 +1987,8 @@ class BrowserWindow(QMainWindow):
             self._sync_tree_to_path(pending)
 
     def _request_visible_thumbnails(self) -> None:
-        if self._shutdown_prepared or not self.items:
+        row_count = self.item_model.rowCount()
+        if self._shutdown_prepared or row_count <= 0:
             return
         visible_range = self._visible_row_range()
         if visible_range is None:
@@ -1987,7 +1998,7 @@ class BrowserWindow(QMainWindow):
             for index in self.list_view.selectionModel().selectedIndexes()
         )
         plan = build_thumbnail_request_plan(
-            row_count=len(self.items),
+            row_count=row_count,
             first_visible=visible_range[0],
             last_visible=visible_range[1],
             selected_rows=selected_rows,
@@ -2000,20 +2011,24 @@ class BrowserWindow(QMainWindow):
             (plan.prefetch_rows, ThumbnailPriority.PREFETCH),
         ):
             for row in rows:
+                item = self.item_model.item_at(row)
+                if item is None:
+                    continue
                 self.thumbnail_provider.request(
-                    self.items[row],
-                    self.thumbnail_size,
+                    item,
+                    self.thumbnail_bucket_size,
                     generation=self._generation,
                     priority=priority,
                 )
         if self._fast_scrolling:
             keep_paths = {
-                str(self.items[row].path)
+                str(item.path)
                 for row in plan.visible_rows + plan.selected_rows
+                if (item := self.item_model.item_at(row)) is not None
             }
             self.thumbnail_provider.cancel_prefetch_except(
                 keep_paths,
-                size=self.thumbnail_size,
+                size=self.thumbnail_bucket_size,
                 generation=self._generation,
             )
 
@@ -2021,7 +2036,7 @@ class BrowserWindow(QMainWindow):
         viewport = self.list_view.viewport()
         grid = self.list_view.gridSize()
         return calculate_grid_visible_range(
-            row_count=len(self.items),
+            row_count=self.item_model.rowCount(),
             viewport_width=viewport.width(),
             viewport_height=viewport.height(),
             grid_width=grid.width(),
@@ -2105,7 +2120,11 @@ class BrowserWindow(QMainWindow):
         folder = str(self.current_path) if self.current_path is not None else ""
         sort_label = BROWSER_SORT_KEY_LABELS[self.browser_sort_key]
         order_label = BROWSER_SORT_ORDER_LABELS[self.browser_sort_order]
-        message = f"{folder} — {count}件 — {sort_label}・{order_label}"
+        density_label = BROWSER_DISPLAY_DENSITY_LABELS[self.browser_display_density]
+        message = (
+            f"{folder} — {count}件 — {sort_label}・{order_label}"
+            f" — 表示: {density_label}"
+        )
         if selected is not None:
             message += f" — 選択: {selected.display_name}"
             selected_count = len(self.list_view.selectionModel().selectedIndexes())
