@@ -56,6 +56,9 @@ class ConfigManager(QObject):
         "join_spread_pages": False,
         "thumbnail_disk_cache_enabled": True,
         "thumbnail_cache_limit_mb": 512,
+        "archive_backend_preference": "auto",
+        "winrar_executable": "",
+        "seven_zip_executable": "",
         "magnifier_enabled": False,
         "magnifier_zoom": 2.0,
         "magnifier_size": 220,
@@ -148,6 +151,16 @@ class ConfigManager(QObject):
     @classmethod
     def _normalize(cls, values: dict[str, Any]) -> dict[str, Any]:
         normalized = values
+        if normalized.get("archive_backend_preference") not in {
+            "auto",
+            "winrar",
+            "seven_zip",
+        }:
+            normalized["archive_backend_preference"] = "auto"
+        if not isinstance(normalized.get("winrar_executable"), str):
+            normalized["winrar_executable"] = ""
+        if not isinstance(normalized.get("seven_zip_executable"), str):
+            normalized["seven_zip_executable"] = ""
         if not isinstance(normalized.get("last_browser_path"), str):
             normalized["last_browser_path"] = cls.DEFAULTS["last_browser_path"]
         if not isinstance(normalized.get("browser_sidebar_visible"), bool):

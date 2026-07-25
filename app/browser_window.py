@@ -88,6 +88,7 @@ from .browser_thumbnail_scheduler import (
     build_thumbnail_request_plan,
     calculate_grid_visible_range,
 )
+from .archive_backend_registry import ArchiveBackendRegistry
 from .bookmark_model import BookmarkModel
 from .config_manager import ConfigManager
 from .file_operation_coordinator import FileOperationCoordinator
@@ -152,6 +153,7 @@ class BrowserWindow(QMainWindow):
         file_operation_coordinator: FileOperationCoordinator | None = None,
         affected_viewers_handler: AffectedViewersHandler | None = None,
         close_affected_viewers_handler: CloseAffectedViewersHandler | None = None,
+        archive_backend_registry=None,
     ) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -164,6 +166,11 @@ class BrowserWindow(QMainWindow):
         self._open_path_handler = open_path_handler
         self._affected_viewers_handler = affected_viewers_handler
         self._close_affected_viewers_handler = close_affected_viewers_handler
+        self._owns_archive_backend_registry = archive_backend_registry is None
+        self.archive_backend_registry = (
+            archive_backend_registry
+            or ArchiveBackendRegistry(config_manager=self.config)
+        )
         self._owns_file_operation_coordinator = file_operation_coordinator is None
         self.file_operation_coordinator = (
             file_operation_coordinator
@@ -197,6 +204,7 @@ class BrowserWindow(QMainWindow):
                 disk_cache_enabled=bool(
                     self.settings.get("thumbnail_disk_cache_enabled", True)
                 ),
+                archive_backend_registry=self.archive_backend_registry,
             )
         self.thumbnail_provider = thumbnail_provider
         self.thumbnail_provider.thumbnail_ready.connect(self._on_thumbnail_ready)
@@ -1297,6 +1305,8 @@ class BrowserWindow(QMainWindow):
         self._scan_batch_timer.stop()
         self._save_window_state()
         self.thumbnail_provider.close()
+        if self._owns_archive_backend_registry:
+            self.archive_backend_registry.close()
 
     def apply_settings(self, changed: dict[str, object]) -> None:
         list_keys = {
@@ -1356,6 +1366,24 @@ class BrowserWindow(QMainWindow):
             self.thumbnail_provider.set_disk_cache_limit_mb(
                 int(changed["thumbnail_cache_limit_mb"])
             )
+        if (
+            {
+                "archive_backend_preference",
+                "winrar_executable",
+                "seven_zip_executable",
+            }.intersection(changed)
+            and self._owns_archive_backend_registry
+        ):
+            self.archive_backend_registry.reset()
+        if {
+            "archive_backend_preference",
+            "winrar_executable",
+            "seven_zip_executable",
+        }.intersection(changed):
+            self.thumbnail_provider.clear_memory_cache()
+            self.item_model.clear_thumbnails()
+            self._generation = self.thumbnail_provider.begin_generation()
+            self._schedule_thumbnail_requests()
 
     def _apply_browser_controls(self, *_args: object) -> None:
         self.config.apply(
@@ -1428,6 +1456,16 @@ class BrowserWindow(QMainWindow):
             self.config,
             self,
             cache_usage_getter=self.thumbnail_provider.disk_cache_usage_bytes,
+            seven_zip_locator=(
+                self.archive_backend_registry.locator
+                if self.archive_backend_registry is not None
+                else None
+            ),
+            winrar_locator=(
+                self.archive_backend_registry.winrar_locator
+                if self.archive_backend_registry is not None
+                else None
+            ),
         )
         dialog.cache_clear_requested.connect(
             self.thumbnail_provider.clear_all_caches_async

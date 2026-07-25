@@ -10,17 +10,29 @@ from typing import BinaryIO
 from natsort import natsorted
 from PIL import Image, ImageOps
 
+from .archive_backend import (
+    ArchiveBackendError,
+    ArchiveErrorCode,
+    EXTERNAL_ARCHIVE_EXTENSIONS,
+    MAX_IMAGE_ENTRY_BYTES,
+    select_image_entries,
+)
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".ico"}
-ARCHIVE_EXTENSIONS = {".zip", ".cbz"}
+ZIP_ARCHIVE_EXTENSIONS = {".zip", ".cbz"}
+ARCHIVE_EXTENSIONS = set(ZIP_ARCHIVE_EXTENSIONS | EXTERNAL_ARCHIVE_EXTENSIONS)
 BOOK_FILE_EXTENSIONS = frozenset(ARCHIVE_EXTENSIONS | SUPPORTED_EXTENSIONS)
 
 
 class ImageSourceError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        self.code = code
+        super().__init__(message)
 
 
 class ImageSource(ABC):
+    load_sizes_lazily = False
+
     def __init__(self, source_path: str | Path) -> None:
         self.source_path = Path(source_path)
 
@@ -151,11 +163,130 @@ class ZipImageSource(ImageSource):
             return info.filename
 
 
+class SevenZipImageSource(ImageSource):
+    load_sizes_lazily = True
+
+    def __init__(
+        self,
+        archive_path: str | Path,
+        *,
+        backend,
+        sort_descending: bool = False,
+        cancel_token=None,
+    ) -> None:
+        super().__init__(archive_path)
+        self.backend = backend
+        self.sort_descending = sort_descending
+        self._closed = threading.Event()
+        self._active_lock = threading.RLock()
+        self._active_requests: dict[str, set[threading.Event]] = {}
+        try:
+            listing = backend.list_entries(
+                str(self.source_path),
+                cancel_token=cancel_token,
+            )
+            if listing.encrypted:
+                raise ArchiveBackendError(ArchiveErrorCode.PASSWORD_REQUIRED)
+            entries = select_image_entries(
+                listing,
+                SUPPORTED_EXTENSIONS,
+                descending=sort_descending,
+            )
+        except ArchiveBackendError as exc:
+            raise ImageSourceError(
+                exc.user_message,
+                code=exc.code.value,
+            ) from exc
+        if not entries:
+            raise ImageSourceError(
+                "表示可能な画像がありません。",
+                code="no_images",
+            )
+        self.listing = listing
+        self.solid = listing.solid
+        self._entries = entries
+        self._entry_by_id = {entry.path: entry for entry in entries}
+
+    def list_images(self) -> list[str]:
+        return [entry.path for entry in self._entries]
+
+    def open_image(self, image_id: str) -> Image.Image:
+        entry = self._entry_by_id.get(image_id)
+        if entry is None:
+            raise ImageSourceError(
+                "書庫内の画像が見つかりません。",
+                code=ArchiveErrorCode.ENTRY_NOT_FOUND.value,
+            )
+        if entry.size is not None and entry.size > MAX_IMAGE_ENTRY_BYTES:
+            raise ImageSourceError(
+                "書庫内の画像が大きすぎます。",
+                code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
+            )
+        cancelled = threading.Event()
+        with self._active_lock:
+            if self._closed.is_set():
+                cancelled.set()
+            self._active_requests.setdefault(image_id, set()).add(cancelled)
+        try:
+            data = self.backend.read_entry(
+                str(self.source_path),
+                entry.extraction_path,
+                cancel_token=cancelled,
+                maximum_bytes=(
+                    min(MAX_IMAGE_ENTRY_BYTES, entry.size)
+                    if entry.size is not None
+                    else MAX_IMAGE_ENTRY_BYTES
+                ),
+            )
+            with Image.open(io.BytesIO(data)) as image:
+                return ImageOps.exif_transpose(image).convert("RGBA")
+        except ArchiveBackendError as exc:
+            raise ImageSourceError(
+                exc.user_message,
+                code=exc.code.value,
+            ) from exc
+        except ImageSourceError:
+            raise
+        except Exception as exc:
+            raise ImageSourceError(
+                f"書庫内の画像を読み込めません: {image_id}",
+                code="decode_failed",
+            ) from exc
+        finally:
+            with self._active_lock:
+                requests = self._active_requests.get(image_id)
+                if requests is not None:
+                    requests.discard(cancelled)
+                    if not requests:
+                        self._active_requests.pop(image_id, None)
+
+    def cancel_image_request(self, image_id: str) -> None:
+        with self._active_lock:
+            for cancelled in tuple(self._active_requests.get(image_id, ())):
+                cancelled.set()
+
+    def display_path(self, image_id: str) -> str:
+        return f"{self.source_path}!/{image_id}"
+
+    def file_size(self, image_id: str) -> int | None:
+        entry = self._entry_by_id.get(image_id)
+        return entry.size if entry is not None else None
+
+    def close(self) -> None:
+        self._closed.set()
+        with self._active_lock:
+            for requests in tuple(self._active_requests.values()):
+                for cancelled in tuple(requests):
+                    cancelled.set()
+
+
 def create_image_source(
     path: str | Path,
     *,
     recursive_folder: bool = False,
     sort_descending: bool = False,
+    archive_backend_registry=None,
+    cancel_token=None,
 ) -> tuple[ImageSource, str | None]:
     target = Path(path)
     selected_image: str | None = None
@@ -164,8 +295,29 @@ def create_image_source(
         return FolderImageSource(target, recursive=recursive_folder, sort_descending=sort_descending), None
 
     suffix = target.suffix.lower()
-    if suffix in ARCHIVE_EXTENSIONS:
+    if suffix in ZIP_ARCHIVE_EXTENSIONS:
         return ZipImageSource(target, sort_descending=sort_descending), None
+    if suffix in EXTERNAL_ARCHIVE_EXTENSIONS:
+        backend = (
+            archive_backend_registry.backend_for_path(target)
+            if archive_backend_registry is not None
+            else None
+        )
+        if backend is None:
+            raise ImageSourceError(
+                "RAR／7zの閲覧には7-Zipが必要です。"
+                "設定から実行ファイルを指定してください。",
+                code=ArchiveErrorCode.BACKEND_NOT_FOUND.value,
+            )
+        return (
+            SevenZipImageSource(
+                target,
+                backend=backend,
+                sort_descending=sort_descending,
+                cancel_token=cancel_token,
+            ),
+            None,
+        )
 
     if target.is_file() and suffix in SUPPORTED_EXTENSIONS:
         source = FolderImageSource(target.parent, recursive=recursive_folder, sort_descending=sort_descending)

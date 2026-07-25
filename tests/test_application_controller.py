@@ -481,6 +481,38 @@ def test_book_candidates_use_natural_order_and_adjacent_open_stays_in_background
     close_controller(controller, qapp)
 
 
+def test_book_candidates_include_external_archives_and_hide_later_rar_volumes(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    first = tmp_path / "books" / "book1" / "1.jpg"
+    write_image(first)
+    for name in (
+        "book2.rar",
+        "book3.cbr",
+        "book4.7z",
+        "book5.cb7",
+        "series.part1.rar",
+        "series.part2.rar",
+        "series.r00",
+    ):
+        (tmp_path / "books" / name).write_bytes(b"archive")
+    controller = make_controller(tmp_path, qapp)
+    viewer = controller.open_path(first)
+
+    names = [path.name for path in controller._book_candidates(viewer)]
+
+    assert names == [
+        "book1",
+        "book2.rar",
+        "book3.cbr",
+        "book4.7z",
+        "book5.cb7",
+        "series.part1.rar",
+    ]
+    close_controller(controller, qapp)
+
+
 def test_missing_current_book_is_unavailable_without_exception(
     tmp_path: Path,
     qapp: QApplication,
