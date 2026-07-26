@@ -64,6 +64,10 @@ from .browser_model import (
     BrowserItemModel,
     browser_item_from_scan_entry,
 )
+from .browser_main_drop import (
+    BrowserMainDropController,
+    PendingBrowserFocusRequest,
+)
 from .browser_item_delegate import (
     BrowserItemDelegate,
 )
@@ -248,6 +252,7 @@ class BrowserWindow(QMainWindow):
                 archive_backend_registry=self.archive_backend_registry,
                 pdfium_service=self.pdfium_service,
                 image_work_coordinator=self.image_work_coordinator,
+                preview_settings=self.settings,
             )
         self.thumbnail_provider = thumbnail_provider
         self.thumbnail_provider.thumbnail_ready.connect(self._on_thumbnail_ready)
@@ -257,6 +262,13 @@ class BrowserWindow(QMainWindow):
         provisional = getattr(self.thumbnail_provider, "thumbnail_provisional", None)
         if provisional is not None:
             provisional.connect(self._on_thumbnail_provisional)
+        preview_state_changed = getattr(
+            self.thumbnail_provider,
+            "preview_state_changed",
+            None,
+        )
+        if preview_state_changed is not None:
+            preview_state_changed.connect(self._on_preview_state_changed)
         resumed = getattr(self.thumbnail_provider, "scheduling_resumed", None)
         if resumed is not None:
             resumed.connect(self._schedule_thumbnail_requests)
@@ -287,6 +299,18 @@ class BrowserWindow(QMainWindow):
         self._operation_completion_message: str | None = None
         self._file_operation_requests: dict[int, FileOperationRequest] = {}
         self._drop_probe_workers: set[FolderDropProbe] = set()
+        self.browser_main_drop = BrowserMainDropController(self)
+        self.browser_main_drop.focus_request_ready.connect(
+            self._begin_browser_drop_focus
+        )
+        self._pending_browser_focus: PendingBrowserFocusRequest | None = None
+        self._starting_drop_focus_navigation = False
+        self.browser_external_drop_behavior = str(
+            self.settings.get(
+                "browser_external_drop_behavior",
+                "focus_only",
+            )
+        )
         self._file_operation_selection_before: dict[
             int, tuple[tuple[str, ...], int | None]
         ] = {}
@@ -476,6 +500,8 @@ class BrowserWindow(QMainWindow):
         capture_current: bool = True,
         failure_history_revert: str | None = None,
     ) -> bool:
+        if not self._starting_drop_focus_navigation:
+            self._cancel_browser_drop_focus()
         target = self._absolute_browser_path(path)
 
         same_path = self._same_path(self.current_path, target)
@@ -564,6 +590,7 @@ class BrowserWindow(QMainWindow):
         )
         self._restore_list_view_state(previous_state)
         self._restore_pending_scan_location(pending, final=False)
+        self._apply_pending_browser_focus(final=False)
 
     def _flush_pending_scan_batch(self) -> None:
         pending = self._pending_scan
@@ -591,6 +618,7 @@ class BrowserWindow(QMainWindow):
                     generation=pending.generation
                 )
             self._pending_scan = None
+            self._pending_browser_focus = None
             self._update_status()
             return
 
@@ -601,7 +629,8 @@ class BrowserWindow(QMainWindow):
             )
             self._generation = self.thumbnail_provider.begin_generation()
             self.item_model.set_items(items)
-            self._schedule_list_view_state_restore(state)
+            if self._pending_browser_focus is None:
+                self._schedule_list_view_state_restore(state)
             self._restore_location(
                 pending.restore_location,
                 update_status=False,
@@ -615,6 +644,7 @@ class BrowserWindow(QMainWindow):
                 generation=pending.generation
             )
             self._restore_pending_scan_location(pending, final=True)
+        self._apply_pending_browser_focus(final=True)
 
         self._pending_scan = None
         self._update_status()
@@ -643,6 +673,7 @@ class BrowserWindow(QMainWindow):
         else:
             self._rollback_pending_history(pending)
         self._pending_scan = None
+        self._pending_browser_focus = None
         self._scan_batch_timer.stop()
         self._sync_address_bar()
         self._update_navigation_actions()
@@ -1730,6 +1761,8 @@ class BrowserWindow(QMainWindow):
             self.file_operation_coordinator.cancel()
         if self._owns_file_operation_coordinator:
             self.file_operation_coordinator.close()
+        self.browser_main_drop.close()
+        self._pending_browser_focus = None
         self._cancel_pending_scan(rollback_history=False)
         self.scanner.close()
         self._thumbnail_request_timer.stop()
@@ -2011,6 +2044,10 @@ class BrowserWindow(QMainWindow):
             self.browser_show_system_items = bool(
                 changed["browser_show_system_items"]
             )
+        if "browser_external_drop_behavior" in changed:
+            self.browser_external_drop_behavior = str(
+                changed["browser_external_drop_behavior"]
+            )
         if visibility_changed and self.current_path is not None:
             self.refresh_current_folder()
         if "thumbnail_disk_cache_enabled" in changed:
@@ -2025,6 +2062,24 @@ class BrowserWindow(QMainWindow):
             self.thumbnail_provider.set_disk_cache_max_unused_days(
                 int(changed["thumbnail_cache_max_unused_days"])
             )
+        preview_setting_keys = {
+            "text_preview_enabled",
+            "video_thumbnail_enabled",
+            "video_thumbnail_backend",
+            "ffmpeg_executable",
+        }
+        if preview_setting_keys.intersection(changed):
+            update_preview_settings = getattr(
+                self.thumbnail_provider,
+                "update_preview_settings",
+                None,
+            )
+            if callable(update_preview_settings):
+                self.item_model.clear_thumbnails()
+                self._generation = int(
+                    update_preview_settings(self.settings)
+                )
+                self._schedule_thumbnail_requests()
         if (
             {
                 "archive_backend_preference",
@@ -2890,8 +2945,7 @@ class BrowserWindow(QMainWindow):
                 item = self.item_model.item_at(row)
                 if (
                     item is None
-                    or not item.openable_by_nivisviewer
-                    or item.kind is BrowserItemKind.OTHER
+                    or not item.can_generate_preview
                 ):
                     continue
                 effective_priority = priority
@@ -3030,6 +3084,16 @@ class BrowserWindow(QMainWindow):
         if self._shutdown_prepared or generation != self._generation:
             return
         self.item_model.set_thumbnail_error(path, message)
+
+    def _on_preview_state_changed(
+        self,
+        path: str,
+        generation: int,
+        status: str,
+    ) -> None:
+        if self._shutdown_prepared or generation != self._generation:
+            return
+        self.item_model.set_preview_status(path, status)
 
     def _on_thumbnail_provisional(
         self,
@@ -3355,8 +3419,14 @@ class BrowserWindow(QMainWindow):
         paths: tuple[str, ...],
         index: QModelIndex,
         modifiers: Qt.KeyboardModifier,
-        _source: object,
+        source: object,
     ) -> None:
+        if source is not self.list_view:
+            self.browser_main_drop.handle_external_paths(
+                paths,
+                behavior=self.browser_external_drop_behavior,
+            )
+            return
         item = self.item_model.item_at(index)
         if item is not None and item.kind is BrowserItemKind.FOLDER:
             self._start_drop_operation(paths, item.path, modifiers)
@@ -3379,6 +3449,124 @@ class BrowserWindow(QMainWindow):
                     else None
                 ),
             )
+
+    def _begin_browser_drop_focus(
+        self,
+        request: PendingBrowserFocusRequest,
+    ) -> None:
+        if (
+            self._shutdown_prepared
+            or request.request_id != self.browser_main_drop.active_request_id
+        ):
+            return
+        if request.ignored_count:
+            self._show_temporary_status(
+                f"先頭のフォルダを使用します（ほか{request.ignored_count}件）"
+            )
+        if not request.paths:
+            self._starting_drop_focus_navigation = True
+            try:
+                self.navigate_to(request.folder, record_history=True)
+            finally:
+                self._starting_drop_focus_navigation = False
+            return
+        if self._same_path(self.current_path, request.folder):
+            active_scan = self._pending_scan
+            scan_in_progress = bool(
+                active_scan is not None
+                and self._same_path(active_scan.path, request.folder)
+            )
+            self._pending_browser_focus = request.with_generation(
+                (
+                    active_scan.generation
+                    if scan_in_progress and active_scan is not None
+                    else self._scan_generation
+                )
+            )
+            self._apply_pending_browser_focus(final=not scan_in_progress)
+            return
+        self._starting_drop_focus_navigation = True
+        try:
+            started = self.navigate_to(
+                request.folder,
+                record_history=True,
+            )
+        finally:
+            self._starting_drop_focus_navigation = False
+        if not started:
+            return
+        pending_scan = self._pending_scan
+        if pending_scan is None or not self._same_path(
+            pending_scan.path,
+            request.folder,
+        ):
+            return
+        self._pending_browser_focus = request.with_generation(
+            pending_scan.generation
+        )
+
+    def _apply_pending_browser_focus(self, *, final: bool) -> None:
+        request = self._pending_browser_focus
+        if (
+            request is None
+            or self._shutdown_prepared
+            or request.request_id != self.browser_main_drop.active_request_id
+            or request.scan_generation != self._scan_generation
+            or not self._same_path(self.current_path, request.folder)
+        ):
+            return
+        selection_model = self.list_view.selectionModel()
+        if selection_model is None:
+            return
+        found: list[tuple[Path, QModelIndex]] = []
+        for path in request.paths:
+            row = self.item_model.row_for_path(path)
+            if row >= 0:
+                found.append((path, self.item_model.index(row, 0)))
+        if found:
+            selection_model.clearSelection()
+            for _path, index in found:
+                selection_model.select(
+                    index,
+                    QItemSelectionModel.SelectionFlag.Select,
+                )
+            primary_index = QModelIndex()
+            if request.primary is not None:
+                primary_row = self.item_model.row_for_path(request.primary)
+                if primary_row >= 0:
+                    primary_index = self.item_model.index(primary_row, 0)
+            if not primary_index.isValid():
+                primary_index = found[0][1]
+            selection_model.setCurrentIndex(
+                primary_index,
+                QItemSelectionModel.SelectionFlag.NoUpdate,
+            )
+            self.list_view.scrollTo(
+                primary_index,
+                QListView.ScrollHint.PositionAtCenter,
+            )
+        if not final:
+            return
+        self._pending_browser_focus = None
+        if not found:
+            self._show_temporary_status(
+                "ドロップした項目は現在の一覧に表示されません"
+            )
+            return
+        if request.open_after:
+            primary = self.item_model.item_at(
+                self.list_view.currentIndex()
+            )
+            if (
+                primary is not None
+                and primary.openable_by_nivisviewer
+                and primary.kind is not BrowserItemKind.OTHER
+            ):
+                self.open_item(self.list_view.currentIndex())
+
+    def _cancel_browser_drop_focus(self) -> None:
+        self._pending_browser_focus = None
+        self.browser_main_drop.cancel()
 
     def _on_favorite_paths_dropped(
         self,
@@ -3526,7 +3714,7 @@ class BrowserWindow(QMainWindow):
         retry_thumbnail_action = None
         if (
             item is not None
-            and item.openable_by_nivisviewer
+            and item.can_generate_preview
             and index.data(BrowserItemModel.ThumbnailErrorRole)
         ):
             retry_thumbnail_action = menu.addAction("サムネイルを再試行")

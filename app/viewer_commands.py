@@ -2,6 +2,10 @@ from __future__ import annotations
 
 PREVIOUS_PAGE = "previous_page"
 NEXT_PAGE = "next_page"
+PREVIOUS_DISPLAY_UNIT = "previous_display_unit"
+NEXT_DISPLAY_UNIT = "next_display_unit"
+PREVIOUS_SINGLE_PAGE = "previous_single_page"
+NEXT_SINGLE_PAGE = "next_single_page"
 FIRST_PAGE = "first_page"
 LAST_PAGE = "last_page"
 PREVIOUS_BOOK = "previous_book"
@@ -18,6 +22,10 @@ VIEWER_COMMANDS = frozenset(
     {
         PREVIOUS_PAGE,
         NEXT_PAGE,
+        PREVIOUS_DISPLAY_UNIT,
+        NEXT_DISPLAY_UNIT,
+        PREVIOUS_SINGLE_PAGE,
+        NEXT_SINGLE_PAGE,
         FIRST_PAGE,
         LAST_PAGE,
         PREVIOUS_BOOK,
@@ -36,6 +44,8 @@ COMMAND_CHOICES: tuple[tuple[str, str], ...] = (
     ("何もしない", ""),
     ("前のページ", PREVIOUS_PAGE),
     ("次のページ", NEXT_PAGE),
+    ("1ページ戻る", PREVIOUS_SINGLE_PAGE),
+    ("1ページ進む", NEXT_SINGLE_PAGE),
     ("先頭ページ", FIRST_PAGE),
     ("最終ページ", LAST_PAGE),
     ("前の本", PREVIOUS_BOOK),

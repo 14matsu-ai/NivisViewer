@@ -411,7 +411,7 @@ def test_folder_favorite_and_tree_drops_route_copy_move(
         (source,),
         window.item_model.index(0),
         Qt.KeyboardModifier.ControlModifier,
-        None,
+        window.list_view,
     )
     assert calls[-1][0].value == "copy"
 

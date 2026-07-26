@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from PySide6.QtCore import QPoint, QRect, QSize, QTimer, Qt, Signal
@@ -19,6 +20,10 @@ from PySide6.QtWidgets import QWidget
 
 from .mouse_gesture import MouseGestureRecognizer
 from .page_model import DisplaySpread
+from .viewer_canvas_pointer import (
+    ViewerCanvasPointerController,
+    ViewerCanvasPointerState,
+)
 
 
 @dataclass
@@ -119,6 +124,7 @@ class ViewerWidget(QWidget):
     fullscreenToggleRequested = Signal()
     leftSideClicked = Signal()
     rightSideClicked = Signal()
+    imageLeftClicked = Signal()
     contextMenuRequested = Signal(QPoint)
     gestureRecognized = Signal(str)
     extraMouseButtonPressed = Signal(str)
@@ -159,6 +165,37 @@ class ViewerWidget(QWidget):
         self._gesture_trail: list[QPoint] = []
         self._right_button_down = False
         self._suppress_context_until_release = False
+        self._canvas_context_provider = lambda: None
+        self._canvas_click_allowed = lambda _position: True
+        self._canvas_press_flags = lambda _position: {}
+        self.canvas_pointer = ViewerCanvasPointerController(
+            context_provider=lambda: self._canvas_context_provider(),
+            click_allowed=lambda position: self._canvas_click_allowed(position),
+            parent=self,
+        )
+        self.canvas_pointer.singleClickConfirmed.connect(
+            self.imageLeftClicked
+        )
+        self.canvas_pointer.doubleClickConfirmed.connect(
+            self.fullscreenToggleRequested
+        )
+
+    def set_canvas_input_context(
+        self,
+        *,
+        context_provider: Callable[[], object],
+        click_allowed: Callable[[QPoint], bool],
+        press_flags: Callable[[QPoint], dict[str, bool]] | None = None,
+    ) -> None:
+        self._canvas_context_provider = context_provider
+        self._canvas_click_allowed = click_allowed
+        self._canvas_press_flags = press_flags or (lambda _position: {})
+
+    def cancel_pending_canvas_click(self) -> None:
+        self.canvas_pointer.cancel()
+        self._press_position = None
+        self._drag_start = None
+        self.unsetCursor()
 
     def set_background_color(self, color: str) -> None:
         self.background_color = QColor(color)
@@ -388,6 +425,7 @@ class ViewerWidget(QWidget):
             event.accept()
             return
         if event.button() == Qt.MouseButton.RightButton:
+            self.cancel_pending_canvas_click()
             self._right_button_down = True
             self._suppress_context_until_release = False
             if self.mouse_gestures_enabled:
@@ -399,11 +437,23 @@ class ViewerWidget(QWidget):
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton:
-            self._press_position = event.position().toPoint()
-        if event.button() == Qt.MouseButton.LeftButton and self._can_pan():
-            self._drag_start = event.position().toPoint()
+            position = event.position().toPoint()
+            global_position = event.globalPosition().toPoint()
+            flags = self._canvas_press_flags(global_position)
+            self._press_position = position
+            self._drag_start = position
             self._drag_origin = QPoint(self._pan)
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.canvas_pointer.begin(
+                local_position=position,
+                global_position=global_position,
+                button=event.button(),
+                modifiers=event.modifiers(),
+                fullscreen=bool(flags.get("fullscreen", False)),
+                overlay=bool(flags.get("overlay", False)),
+                edge_trigger=bool(flags.get("edge_trigger", False)),
+                mouse_gesture=bool(flags.get("mouse_gesture", False)),
+                drop_active=bool(flags.get("drop_active", False)),
+            )
             event.accept()
             return
         super().mousePressEvent(event)
@@ -420,12 +470,19 @@ class ViewerWidget(QWidget):
                 self.update()
             event.accept()
             return
-        if self._drag_start is not None:
+        if (
+            self._drag_start is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            state = self.canvas_pointer.move(event.position().toPoint())
             delta = event.position().toPoint() - self._drag_start
-            self._pan = self._drag_origin + delta
-            self.update()
-            event.accept()
-            return
+            if state is ViewerCanvasPointerState.PANNING:
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                if self._can_pan():
+                    self._pan = self._drag_origin + delta
+                    self.update()
+                event.accept()
+                return
         if self.magnifier_enabled:
             self.update()
         super().mouseMoveEvent(event)
@@ -468,29 +525,33 @@ class ViewerWidget(QWidget):
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
+            self.canvas_pointer.release(
+                local_position=event.position().toPoint(),
+                global_position=event.globalPosition().toPoint(),
+            )
             self._drag_start = None
+            self._press_position = None
             self.unsetCursor()
             event.accept()
             return
-        if event.button() == Qt.MouseButton.LeftButton and self._press_position is not None:
-            release_position = event.position().toPoint()
-            moved = (release_position - self._press_position).manhattanLength()
-            self._press_position = None
-            if moved < 6:
-                if release_position.x() >= self.width() / 2:
-                    self.rightSideClicked.emit()
-                else:
-                    self.leftSideClicked.emit()
-                event.accept()
-                return
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.fullscreenToggleRequested.emit()
+        if self.canvas_pointer.double_click(
+            button=event.button(),
+            modifiers=event.modifiers(),
+            global_position=event.globalPosition().toPoint(),
+        ):
+            self._drag_start = None
+            self._press_position = None
+            self.unsetCursor()
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
+
+    def focusOutEvent(self, event) -> None:  # type: ignore[override]
+        self.cancel_pending_canvas_click()
+        super().focusOutEvent(event)
 
     def contextMenuEvent(self, event: QContextMenuEvent) -> None:  # type: ignore[override]
         event.accept()

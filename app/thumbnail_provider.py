@@ -22,9 +22,11 @@ from .browser_model import (
     BrowserItemKind,
 )
 from .browser_thumbnail_scheduler import ThumbnailPriority
+from .file_preview import PreviewResult, PreviewResultKind, PreviewSource
 from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
 from .image_source import EXTERNAL_ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS, SevenZipImageSource
 from .pdf_backend import PageRenderSpec, PdfRenderPriority
+from .preview_provider_registry import PreviewProviderRegistry
 from .thumbnail_disk_cache import ThumbnailDiskCache
 from .thumbnail_render import (
     SmartCropCache,
@@ -57,6 +59,27 @@ class ThumbnailLoadResult:
     cover_path: Path | None = None
     provisional_image: QImage | None = None
     entry_path: str = ""
+    result_kind: PreviewResultKind | None = None
+    preview_source: PreviewSource = PreviewSource.EXISTING
+    persist_to_disk: bool = True
+
+    @property
+    def resolved_kind(self) -> PreviewResultKind:
+        if self.result_kind is not None:
+            return self.result_kind
+        if self.image is not None and not self.image.isNull():
+            return PreviewResultKind.READY
+        return PreviewResultKind.FAILED
+
+    @classmethod
+    def from_preview(cls, result: PreviewResult) -> ThumbnailLoadResult:
+        return cls(
+            result.image,
+            entry_path=result.entry_path,
+            result_kind=result.kind,
+            preview_source=result.source,
+            persist_to_disk=result.persist_to_disk,
+        )
 
 
 @dataclass(frozen=True)
@@ -128,6 +151,7 @@ class BrowserThumbnailProvider(QObject):
     thumbnail_ready = Signal(str, int, object)
     thumbnail_provisional = Signal(str, int, object)
     thumbnail_failed = Signal(str, int, str)
+    preview_state_changed = Signal(str, int, str)
     cache_cleared = Signal()
     scheduling_resumed = Signal()
 
@@ -143,6 +167,8 @@ class BrowserThumbnailProvider(QObject):
         archive_backend_registry=None,
         pdfium_service=None,
         image_work_coordinator: ImageWorkCoordinator | None = None,
+        preview_registry: PreviewProviderRegistry | None = None,
+        preview_settings: dict[str, object] | None = None,
     ) -> None:
         super().__init__(parent)
         self._coordinator = image_work_coordinator
@@ -191,9 +217,18 @@ class BrowserThumbnailProvider(QObject):
             and disk_cache.enabled
         )
         self._failed: set[tuple[str, int, float | None]] = set()
+        self._quiet_results: dict[
+            tuple[str, int, float | None],
+            PreviewResultKind,
+        ] = {}
         self._maintenance_started = False
         self._archive_backend_registry = archive_backend_registry
         self._pdfium_service = pdfium_service
+        self._owns_preview_registry = preview_registry is None
+        self._preview_registry = (
+            preview_registry
+            or PreviewProviderRegistry(settings=preview_settings or {})
+        )
         self._smart_crop_cache = SmartCropCache()
         self._paused = bool(
             image_work_coordinator is not None
@@ -210,6 +245,8 @@ class BrowserThumbnailProvider(QObject):
     def begin_generation(self) -> int:
         self._generation += 1
         self._active_request_tokens.clear()
+        with self._failure_lock:
+            self._quiet_results.clear()
         with self._pending_lock:
             for pending in self._pending.values():
                 pending.worker.cancelled.set()
@@ -348,6 +385,7 @@ class BrowserThumbnailProvider(QObject):
         failure_key = (self._path_key(item.path), token, item.modified_at)
         with self._failure_lock:
             self._failed.discard(failure_key)
+            self._quiet_results.pop(failure_key, None)
         return self.request(
             item,
             size,
@@ -518,8 +556,14 @@ class BrowserThumbnailProvider(QObject):
     def clear_memory_cache(self) -> None:
         self._cache.clear()
         self._cache_specs.clear()
+        self._preview_registry.shell_service.clear_memory_cache()
         with self._failure_lock:
             self._failed.clear()
+            self._quiet_results.clear()
+
+    def update_preview_settings(self, settings: dict[str, object]) -> int:
+        self._preview_registry.update_settings(settings)
+        return self.begin_generation()
 
     def clear_all_caches_async(self) -> None:
         self.clear_memory_cache()
@@ -652,9 +696,31 @@ class BrowserThumbnailProvider(QObject):
                         return ThumbnailLoadResult(rendered, entry_path="0")
                 finally:
                     source.close()
+        except IndexError:
+            return ThumbnailLoadResult(
+                None,
+                result_kind=PreviewResultKind.NO_CONTENT,
+                persist_to_disk=False,
+            )
         except Exception:
-            return ThumbnailLoadResult(None)
-        return ThumbnailLoadResult(None)
+            cancelled = bool(
+                cancel_token is not None
+                and getattr(cancel_token, "is_set", lambda: False)()
+            )
+            return ThumbnailLoadResult(
+                None,
+                result_kind=(
+                    PreviewResultKind.CANCELLED
+                    if cancelled
+                    else PreviewResultKind.FAILED
+                ),
+                persist_to_disk=False,
+            )
+        return ThumbnailLoadResult(
+            None,
+            result_kind=PreviewResultKind.UNAVAILABLE,
+            persist_to_disk=False,
+        )
 
     def _load_pipeline(
         self,
@@ -667,6 +733,11 @@ class BrowserThumbnailProvider(QObject):
         cache_token = size.cache_token if isinstance(size, ThumbnailRenderSpec) else int(size)
         failure_key = (self._path_key(item.path), cache_token, item.modified_at)
         disk_cache = self._disk_cache
+        disk_entry_path = (
+            self._preview_registry.disk_cache_variant(item)
+            if item.kind is BrowserItemKind.OTHER
+            else None
+        )
         provisional: QImage | None = None
         if self._disk_cache_enabled and disk_cache is not None:
             disk_cache.set_enabled(True)
@@ -678,7 +749,14 @@ class BrowserThumbnailProvider(QObject):
             if isinstance(size, ThumbnailRenderSpec) and hasattr(
                 disk_cache, "get_suitable"
             ):
-                cached_result = disk_cache.get_suitable(item, size)
+                try:
+                    cached_result = disk_cache.get_suitable(
+                        item,
+                        size,
+                        entry_path=disk_entry_path,
+                    )
+                except TypeError:
+                    cached_result = disk_cache.get_suitable(item, size)
                 if cached_result is not None:
                     self._increment_stat("disk_hit")
                     if not cached_result.low_resolution_placeholder:
@@ -688,32 +766,79 @@ class BrowserThumbnailProvider(QObject):
                         provisional_callback(provisional.copy())
                         provisional = None
             else:
-                cached = disk_cache.get(item, cache_token)
+                try:
+                    cached = disk_cache.get(
+                        item,
+                        cache_token,
+                        entry_path=disk_entry_path,
+                    )
+                except TypeError:
+                    cached = disk_cache.get(item, cache_token)
                 if cached is not None:
                     self._increment_stat("disk_hit")
                     return ThumbnailLoadResult(cached)
 
         if (
             ThumbnailPriority(thumbnail_priority) is ThumbnailPriority.PREFETCH
-            and item.kind is not BrowserItemKind.PDF
+            and item.kind in {
+                BrowserItemKind.FOLDER,
+                BrowserItemKind.IMAGE,
+                BrowserItemKind.ARCHIVE,
+            }
         ):
             self._increment_stat("prefetch_skipped")
-            return ThumbnailLoadResult(None, provisional_image=provisional)
+            return ThumbnailLoadResult(
+                None,
+                provisional_image=provisional,
+                result_kind=PreviewResultKind.NOT_APPLICABLE,
+                persist_to_disk=False,
+            )
 
         with self._failure_lock:
+            quiet_kind = self._quiet_results.get(failure_key)
+            if quiet_kind is not None:
+                return ThumbnailLoadResult(
+                    None,
+                    provisional_image=provisional,
+                    result_kind=quiet_kind,
+                    persist_to_disk=False,
+                )
             if failure_key in self._failed:
-                return ThumbnailLoadResult(None, provisional_image=provisional)
+                return ThumbnailLoadResult(
+                    None,
+                    provisional_image=provisional,
+                    result_kind=PreviewResultKind.FAILED,
+                    persist_to_disk=False,
+                )
 
         if self._decode_loader is None:
-            result = self.load_thumbnail_result(
-                item,
-                size,
-                self._archive_backend_registry,
-                cancel_token,
-                self._pdfium_service,
-                self._pdf_render_priority(thumbnail_priority),
-                self._smart_crop_cache,
-            )
+            if item.kind is BrowserItemKind.OTHER:
+                result = ThumbnailLoadResult.from_preview(
+                    self._preview_registry.generate(
+                        item,
+                        (
+                            size
+                            if isinstance(size, ThumbnailRenderSpec)
+                            else ThumbnailRenderSpec.from_settings(
+                                size,
+                                "square_1_1",
+                                "letterbox",
+                            )
+                        ),
+                        priority=ThumbnailPriority(thumbnail_priority),
+                        cancel_token=cancel_token,
+                    )
+                )
+            else:
+                result = self.load_thumbnail_result(
+                    item,
+                    size,
+                    self._archive_backend_registry,
+                    cancel_token,
+                    self._pdfium_service,
+                    self._pdf_render_priority(thumbnail_priority),
+                    self._smart_crop_cache,
+                )
         else:
             loaded = _invoke_thumbnail_loader(
                 self._decode_loader,
@@ -727,9 +852,23 @@ class BrowserThumbnailProvider(QObject):
                 else ThumbnailLoadResult(loaded)
             )
         if result.image is None or result.image.isNull():
-            with self._failure_lock:
-                self._failed.add(failure_key)
-            return ThumbnailLoadResult(None, provisional_image=provisional)
+            if result.resolved_kind is PreviewResultKind.FAILED:
+                with self._failure_lock:
+                    self._failed.add(failure_key)
+            elif result.resolved_kind not in {
+                PreviewResultKind.CANCELLED,
+                PreviewResultKind.PENDING,
+            }:
+                with self._failure_lock:
+                    self._quiet_results[failure_key] = result.resolved_kind
+            return ThumbnailLoadResult(
+                None,
+                provisional_image=provisional,
+                entry_path=result.entry_path,
+                result_kind=result.resolved_kind,
+                preview_source=result.preview_source,
+                persist_to_disk=False,
+            )
 
         self._increment_stat("generated")
         normalized_priority = ThumbnailPriority(thumbnail_priority)
@@ -761,6 +900,7 @@ class BrowserThumbnailProvider(QObject):
         if (
             ThumbnailPriority(thumbnail_priority)
             is not ThumbnailPriority.PREFETCH
+            and result.persist_to_disk
             and self._disk_cache_enabled
             and disk_cache is not None
         ):
@@ -786,6 +926,9 @@ class BrowserThumbnailProvider(QObject):
             result.cover_path,
             provisional_image=provisional,
             entry_path=result.entry_path,
+            result_kind=result.resolved_kind,
+            preview_source=result.preview_source,
+            persist_to_disk=result.persist_to_disk,
         )
 
     @Slot(str, int, object, object, object)
@@ -859,11 +1002,14 @@ class BrowserThumbnailProvider(QObject):
         provisional = loaded.provisional_image
         if provisional is not None and not provisional.isNull():
             self.thumbnail_provisional.emit(path, generation, provisional)
+        kind = loaded.resolved_kind
+        self.preview_state_changed.emit(path, generation, kind.value)
         image = loaded.image
         if image is None or image.isNull():
             if (
                 pending is not None
                 and pending.priority is not ThumbnailPriority.PREFETCH
+                and kind is PreviewResultKind.FAILED
             ):
                 self.thumbnail_failed.emit(
                     path,
@@ -973,7 +1119,11 @@ class BrowserThumbnailProvider(QObject):
                 key=lambda path: path.name,
             )
         except OSError:
-            return ThumbnailLoadResult(None)
+            return ThumbnailLoadResult(
+                None,
+                result_kind=PreviewResultKind.FAILED,
+                persist_to_disk=False,
+            )
         for path in candidates:
             image = BrowserThumbnailProvider._load_image_path(
                 path,
@@ -982,7 +1132,11 @@ class BrowserThumbnailProvider(QObject):
             )
             if image is not None:
                 return ThumbnailLoadResult(image, path)
-        return ThumbnailLoadResult(None)
+        return ThumbnailLoadResult(
+            None,
+            result_kind=PreviewResultKind.NO_CONTENT,
+            persist_to_disk=False,
+        )
 
     @staticmethod
     def _load_archive(
@@ -1035,8 +1189,16 @@ class BrowserThumbnailProvider(QObject):
                     except Exception:
                         continue
         except (OSError, zipfile.BadZipFile):
-            return ThumbnailLoadResult(None)
-        return ThumbnailLoadResult(None)
+            return ThumbnailLoadResult(
+                None,
+                result_kind=PreviewResultKind.FAILED,
+                persist_to_disk=False,
+            )
+        return ThumbnailLoadResult(
+            None,
+            result_kind=PreviewResultKind.NO_CONTENT,
+            persist_to_disk=False,
+        )
 
     @staticmethod
     def _load_external_archive(
@@ -1063,10 +1225,18 @@ class BrowserThumbnailProvider(QObject):
         smart_crop_cache: SmartCropCache | None = None,
     ) -> ThumbnailLoadResult:
         if archive_backend_registry is None:
-            return ThumbnailLoadResult(None)
+            return ThumbnailLoadResult(
+                None,
+                result_kind=PreviewResultKind.UNAVAILABLE,
+                persist_to_disk=False,
+            )
         backend = archive_backend_registry.backend_for_path(archive)
         if backend is None:
-            return ThumbnailLoadResult(None)
+            return ThumbnailLoadResult(
+                None,
+                result_kind=PreviewResultKind.UNAVAILABLE,
+                persist_to_disk=False,
+            )
         source: SevenZipImageSource | None = None
         try:
             source = SevenZipImageSource(
@@ -1090,8 +1260,26 @@ class BrowserThumbnailProvider(QObject):
                     ),
                 )
                 return ThumbnailLoadResult(rendered, entry_path=first)
+        except IndexError:
+            return ThumbnailLoadResult(
+                None,
+                result_kind=PreviewResultKind.NO_CONTENT,
+                persist_to_disk=False,
+            )
         except Exception:
-            return ThumbnailLoadResult(None)
+            cancelled = bool(
+                cancel_token is not None
+                and getattr(cancel_token, "is_set", lambda: False)()
+            )
+            return ThumbnailLoadResult(
+                None,
+                result_kind=(
+                    PreviewResultKind.CANCELLED
+                    if cancelled
+                    else PreviewResultKind.FAILED
+                ),
+                persist_to_disk=False,
+            )
         finally:
             if source is not None:
                 source.close()
@@ -1184,6 +1372,8 @@ class BrowserThumbnailProvider(QObject):
     def _finalize_close(self) -> None:
         with self._pending_lock:
             self._pending.clear()
+        if self._owns_preview_registry:
+            self._preview_registry.shutdown()
         if self._disk_cache is not None:
             self._disk_cache.close()
         _RETIRED_THUMBNAIL_PROVIDERS.discard(self)

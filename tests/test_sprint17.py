@@ -497,7 +497,7 @@ def test_external_drop_controller_rejects_http_and_text_commands() -> None:
     assert ExternalDropOpenController.paths(mime) == ()
 
 
-def test_browser_window_shows_all_items_but_never_requests_other_thumbnail(
+def test_browser_window_shows_all_items_and_requests_generic_preview(
     tmp_path: Path,
     qapp,
 ) -> None:
@@ -531,7 +531,8 @@ def test_browser_window_shows_all_items_but_never_requests_other_thumbnail(
     finally:
         window.thumbnail_provider.request = original_request
     assert requested
-    assert all(item.kind is not BrowserItemKind.OTHER for item in requested)
+    assert any(item.path == other.path for item in requested)
+    assert not other.openable_by_nivisviewer
     window.open_item(window.item_model.index(window.item_model.row_for_path(other.path), 0))
     assert "表示できません" in window.statusBar().currentMessage()
     window.close()
@@ -585,14 +586,14 @@ def test_favorite_single_click_and_double_click_navigate_once(
     window._favorite_click_timer.setInterval(1)
     try:
         window._on_favorite_clicked(index)
-        QTest.qWait(5)
+        QTest.qWait(30)
         qapp.processEvents()
         assert calls == [0]
 
         calls.clear()
         window._on_favorite_clicked(index)
         window._on_favorite_double_clicked(index)
-        QTest.qWait(5)
+        QTest.qWait(30)
         qapp.processEvents()
         assert calls == [0]
     finally:

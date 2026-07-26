@@ -30,13 +30,21 @@ class ConfigManager(QObject):
         "hide_cursor_in_fullscreen": False,
         "fullscreen_auto_reveal_ui": True,
         "fullscreen_edge_trigger_px": 8,
+        "fullscreen_top_edge_trigger_px": 8,
+        "fullscreen_bottom_edge_trigger_px": 28,
         "fullscreen_ui_hide_delay_ms": 0,
+        "viewer_canvas_left_click_action": "next_single_page",
         "show_page_list": False,
         "thumbnail_size": 180,
         "thumbnail_frame_ratio": "portrait_1_sqrt2",
         "thumbnail_crop_mode": "smart_crop",
         "thumbnail_quality_mode": "auto",
         "thumbnail_cache_max_edge": 1024,
+        "text_preview_enabled": True,
+        "video_thumbnail_enabled": True,
+        "video_thumbnail_backend": "auto",
+        "ffmpeg_executable": "",
+        "browser_external_drop_behavior": "focus_only",
         "browser_sort_key": "name",
         "browser_sort_order": "ascending",
         "browser_folders_first": True,
@@ -152,6 +160,17 @@ class ConfigManager(QObject):
         if isinstance(loaded, dict):
             merged = defaults
             merged.update(loaded)
+            legacy_edge = loaded.get("fullscreen_edge_trigger_px")
+            if (
+                "fullscreen_top_edge_trigger_px" not in loaded
+                and legacy_edge is not None
+            ):
+                merged["fullscreen_top_edge_trigger_px"] = legacy_edge
+            if (
+                "fullscreen_bottom_edge_trigger_px" not in loaded
+                and legacy_edge is not None
+            ):
+                merged["fullscreen_bottom_edge_trigger_px"] = legacy_edge
             self._replace_data(self._normalize(merged))
         else:
             self._replace_data(defaults)
@@ -230,11 +249,31 @@ class ConfigManager(QObject):
             "browser_show_hidden_items",
             "browser_show_unsupported_files",
             "browser_show_system_items",
+            "text_preview_enabled",
+            "video_thumbnail_enabled",
         ):
             if not isinstance(normalized.get(key), bool):
                 normalized[key] = cls.DEFAULTS[key]
         if not isinstance(normalized.get("browser_window_geometry"), str):
             normalized["browser_window_geometry"] = cls.DEFAULTS["browser_window_geometry"]
+        if normalized.get("video_thumbnail_backend") not in {
+            "auto",
+            "windows_shell",
+            "ffmpeg",
+            "disabled",
+        }:
+            normalized["video_thumbnail_backend"] = cls.DEFAULTS[
+                "video_thumbnail_backend"
+            ]
+        if not isinstance(normalized.get("ffmpeg_executable"), str):
+            normalized["ffmpeg_executable"] = ""
+        if normalized.get("browser_external_drop_behavior") not in {
+            "focus_only",
+            "focus_and_open",
+        }:
+            normalized["browser_external_drop_behavior"] = cls.DEFAULTS[
+                "browser_external_drop_behavior"
+            ]
         normalized["browser_sidebar_width"] = cls._clamped_int(
             normalized.get("browser_sidebar_width"),
             default=int(cls.DEFAULTS["browser_sidebar_width"]),
@@ -403,6 +442,26 @@ class ConfigManager(QObject):
             minimum=4,
             maximum=32,
         )
+        normalized["fullscreen_top_edge_trigger_px"] = cls._clamped_int(
+            normalized.get("fullscreen_top_edge_trigger_px"),
+            default=int(cls.DEFAULTS["fullscreen_top_edge_trigger_px"]),
+            minimum=4,
+            maximum=32,
+        )
+        normalized["fullscreen_bottom_edge_trigger_px"] = cls._clamped_int(
+            normalized.get("fullscreen_bottom_edge_trigger_px"),
+            default=int(cls.DEFAULTS["fullscreen_bottom_edge_trigger_px"]),
+            minimum=12,
+            maximum=64,
+        )
+        if normalized.get("viewer_canvas_left_click_action") not in {
+            "next_single_page",
+            "next_display_unit",
+            "none",
+        }:
+            normalized["viewer_canvas_left_click_action"] = cls.DEFAULTS[
+                "viewer_canvas_left_click_action"
+            ]
         normalized["fullscreen_ui_hide_delay_ms"] = cls._clamped_int(
             normalized.get("fullscreen_ui_hide_delay_ms"),
             default=int(cls.DEFAULTS["fullscreen_ui_hide_delay_ms"]),

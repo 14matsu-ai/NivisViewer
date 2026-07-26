@@ -260,7 +260,18 @@ class BrowserItemDelegate(QStyledItemDelegate):
             else:
                 icon = index.data(Qt.ItemDataRole.DecorationRole)
                 if item.kind is BrowserItemKind.OTHER or not isinstance(icon, QIcon):
-                    icon = self.shell_icon_provider.icon_for(item)
+                    icon_size = max(
+                        16,
+                        min(
+                            96,
+                            min(thumbnail_rect.width(), thumbnail_rect.height()) - 8,
+                        ),
+                    )
+                    icon = self._association_image(
+                        item,
+                        icon_size,
+                        dpr,
+                    )
                 self._paint_fallback_icon(painter, thumbnail_rect, icon, option)
             if bool(index.data(BrowserItemModel.ThumbnailLowResolutionRole)):
                 color = option.palette.highlight().color()
@@ -293,6 +304,29 @@ class BrowserItemDelegate(QStyledItemDelegate):
         icon: object,
         option: QStyleOptionViewItem,
     ) -> None:
+        if isinstance(icon, QImage) and not icon.isNull():
+            dpr = max(0.5, painter.device().devicePixelRatioF())
+            logical_width = icon.width() / dpr
+            logical_height = icon.height() / dpr
+            scale = min(
+                1.0,
+                max(1.0, thumbnail_rect.width() - 8) / max(1.0, logical_width),
+                max(1.0, thumbnail_rect.height() - 8) / max(1.0, logical_height),
+            )
+            width = logical_width * scale
+            height = logical_height * scale
+            target = QRectF(
+                thumbnail_rect.center().x() - width / 2,
+                thumbnail_rect.center().y() - height / 2,
+                width,
+                height,
+            )
+            painter.drawImage(
+                target,
+                icon,
+                QRectF(0, 0, icon.width(), icon.height()),
+            )
+            return
         if isinstance(icon, QIcon) and not icon.isNull():
                 mode = (
                     QIcon.Mode.Disabled
@@ -430,17 +464,35 @@ class BrowserItemDelegate(QStyledItemDelegate):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(shadow_color)
         painter.drawRoundedRect(shadow, 4, 4)
-        icon = self.shell_icon_provider.icon_for(item)
-        if icon.isNull():
+        image = self._association_image(item, badge_size, dpr)
+        if image.isNull():
             return
-        pixel_size = max(1, round(badge_size * dpr))
-        pixmap = icon.pixmap(QSize(pixel_size, pixel_size))
-        pixmap.setDevicePixelRatio(1.0)
-        painter.drawPixmap(
+        painter.drawImage(
             badge_target,
-            pixmap,
-            QRectF(0, 0, pixmap.width(), pixmap.height()),
+            image,
+            QRectF(0, 0, image.width(), image.height()),
         )
+
+    def _association_image(
+        self,
+        item: BrowserItem,
+        logical_size: int,
+        dpr: float,
+    ) -> QImage:
+        image_for = getattr(self.shell_icon_provider, "image_for", None)
+        if callable(image_for):
+            return image_for(
+                item,
+                logical_size=logical_size,
+                device_pixel_ratio=dpr,
+            )
+        icon_for = getattr(self.shell_icon_provider, "icon_for", None)
+        icon = icon_for(item) if callable(icon_for) else QIcon()
+        if not isinstance(icon, QIcon) or icon.isNull():
+            return QImage()
+        pixel_size = max(1, round(logical_size * dpr))
+        pixmap = icon.pixmap(QSize(pixel_size, pixel_size))
+        return pixmap.toImage() if not pixmap.isNull() else QImage()
 
     @staticmethod
     def _paint_error_badge(painter: QPainter, thumbnail_rect: QRect) -> None:

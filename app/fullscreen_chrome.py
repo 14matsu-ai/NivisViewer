@@ -29,6 +29,8 @@ class FullscreenChromeController(QObject):
         slider: QSlider,
         status_bar: QStatusBar,
         edge_trigger_px: int = 8,
+        top_edge_trigger_px: int | None = None,
+        bottom_edge_trigger_px: int = 28,
         hide_delay_ms: int = 900,
         auto_reveal: bool = True,
     ) -> None:
@@ -45,6 +47,8 @@ class FullscreenChromeController(QObject):
         self.active = False  # Compatibility: fullscreen overlay ownership is active.
         self.auto_reveal = True
         self.edge_trigger_px = 8
+        self.top_edge_trigger_px = 8
+        self.bottom_edge_trigger_px = 28
         self.hide_delay_ms = 900
         self.top_overlay_visible = False
         self.bottom_overlay_visible = False
@@ -86,6 +90,13 @@ class FullscreenChromeController(QObject):
         self._bottom_layout.setSpacing(0)
         self.fullscreen_status_bar = QStatusBar(self.bottom_overlay)
         self._bottom_layout.addWidget(self.fullscreen_status_bar)
+        self.bottom_reveal_strip = QWidget(parent)
+        self.bottom_reveal_strip.setObjectName("fullscreen_bottom_reveal_strip")
+        self.bottom_reveal_strip.setMouseTracking(True)
+        self.bottom_reveal_strip.setAttribute(
+            Qt.WidgetAttribute.WA_NoSystemBackground,
+            True,
+        )
         self.status_bar.messageChanged.connect(
             self.fullscreen_status_bar.showMessage
         )
@@ -106,6 +117,7 @@ class FullscreenChromeController(QObject):
             viewer,
             self.top_overlay,
             self.bottom_overlay,
+            self.bottom_reveal_strip,
             menu_bar,
             slider,
             status_bar,
@@ -122,19 +134,38 @@ class FullscreenChromeController(QObject):
         self.configure(
             auto_reveal=auto_reveal,
             edge_trigger_px=edge_trigger_px,
+            top_edge_trigger_px=top_edge_trigger_px,
+            bottom_edge_trigger_px=bottom_edge_trigger_px,
             hide_delay_ms=hide_delay_ms,
         )
         self.hide_overlays()
+        self.bottom_reveal_strip.hide()
 
     def configure(
         self,
         *,
         auto_reveal: bool,
-        edge_trigger_px: int,
+        edge_trigger_px: int | None = None,
+        top_edge_trigger_px: int | None = None,
+        bottom_edge_trigger_px: int | None = None,
         hide_delay_ms: int,
     ) -> None:
         self.auto_reveal = bool(auto_reveal)
-        self.edge_trigger_px = max(4, min(32, int(edge_trigger_px)))
+        top_value = (
+            top_edge_trigger_px
+            if top_edge_trigger_px is not None
+            else edge_trigger_px
+        )
+        if top_value is None:
+            top_value = self.top_edge_trigger_px
+        bottom_value = (
+            bottom_edge_trigger_px
+            if bottom_edge_trigger_px is not None
+            else self.bottom_edge_trigger_px
+        )
+        self.top_edge_trigger_px = max(4, min(32, int(top_value)))
+        self.bottom_edge_trigger_px = max(12, min(64, int(bottom_value)))
+        self.edge_trigger_px = self.top_edge_trigger_px
         self.hide_delay_ms = max(0, min(3000, int(hide_delay_ms)))
         self._hide_timer.setInterval(self.hide_delay_ms)
         self.reconcile_state()
@@ -155,7 +186,9 @@ class FullscreenChromeController(QObject):
         if self.fullscreen:
             self._attach_chrome()
             self._update_geometry()
+            self._update_reveal_strip_visibility()
         else:
+            self.bottom_reveal_strip.hide()
             self.hide_overlays()
             self._restore_chrome()
             self._set_cursor_hidden(False)
@@ -204,6 +237,7 @@ class FullscreenChromeController(QObject):
             return
         self._attach_chrome()
         self._update_geometry()
+        self._update_reveal_strip_visibility()
 
         if not self.hide_ui_enabled:
             self._show_both_overlays()
@@ -255,6 +289,10 @@ class FullscreenChromeController(QObject):
         self.bottom_overlay_visible = False
         self._requested_overlay = None
 
+    def is_edge_trigger(self, global_position: QPoint) -> bool:
+        self._update_pointer_state(global_position)
+        return self.pointer_in_top_trigger or self.pointer_in_bottom_trigger
+
     def schedule_hide(self) -> None:
         if not self.fullscreen or not self.hide_ui_enabled:
             return
@@ -265,13 +303,21 @@ class FullscreenChromeController(QObject):
 
     def reevaluate_visibility(self) -> None:
         self._invalidate_hide_timer()
-        self._update_pointer_state(QCursor.pos())
+        cursor_position = QCursor.pos()
+        if (
+            (self.top_overlay_visible or self.bottom_overlay_visible)
+            and not self._pointer_in_reveal_area(cursor_position)
+        ):
+            self.schedule_hide()
+            return
+        self._update_pointer_state(cursor_position)
         self.reconcile_state()
 
     def shutdown(self) -> None:
         self._invalidate_hide_timer()
         self._invalidate_cursor_timer()
         self._set_cursor_hidden(False)
+        self.bottom_reveal_strip.hide()
         application = QApplication.instance()
         if application is not None:
             application.removeEventFilter(self)
@@ -300,6 +346,22 @@ class FullscreenChromeController(QObject):
                 self.mouse_button_down = False
                 self._update_pointer_state(QCursor.pos())
                 self.reconcile_state()
+            elif (
+                watched is self.bottom_reveal_strip
+                and event_type == QEvent.Type.Wheel
+            ):
+                self.show_bottom()
+                return True
+        if (
+            watched is self.bottom_reveal_strip
+            and event_type
+            in {
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.MouseButtonRelease,
+                QEvent.Type.MouseButtonDblClick,
+            }
+        ):
+            return True
         return False
 
     def _show_overlay(self, side: str) -> None:
@@ -370,6 +432,19 @@ class FullscreenChromeController(QObject):
             width,
             bottom_height,
         )
+        self.bottom_reveal_strip.setGeometry(
+            0,
+            max(
+                0,
+                self.overlay_parent.height() - self.bottom_edge_trigger_px,
+            ),
+            width,
+            self.bottom_edge_trigger_px,
+        )
+        if self.bottom_reveal_strip.isVisible():
+            self.bottom_reveal_strip.raise_()
+            if self.bottom_overlay.isVisible():
+                self.bottom_overlay.raise_()
 
     def _hide_if_idle(self) -> None:
         if self._scheduled_hide_generation != self.hide_timer_generation:
@@ -418,6 +493,7 @@ class FullscreenChromeController(QObject):
             self.viewer,
             self.top_overlay,
             self.bottom_overlay,
+            self.bottom_reveal_strip,
             self.fullscreen_menu_bar,
             self.fullscreen_status_bar,
         ):
@@ -431,11 +507,11 @@ class FullscreenChromeController(QObject):
         local = self.overlay_parent.mapFromGlobal(global_position)
         inside = self.overlay_parent.rect().contains(local)
         self.pointer_in_top_trigger = bool(
-            inside and 0 <= local.y() <= self.edge_trigger_px
+            inside and 0 <= local.y() <= self.top_edge_trigger_px
         )
         self.pointer_in_bottom_trigger = bool(
             inside
-            and self.overlay_parent.height() - self.edge_trigger_px - 1
+            and self.overlay_parent.height() - self.bottom_edge_trigger_px
             <= local.y()
             < self.overlay_parent.height()
         )
@@ -484,6 +560,18 @@ class FullscreenChromeController(QObject):
             or self.slider_dragging
             or self.menu_popup_or_modal_open
         )
+
+    def _update_reveal_strip_visibility(self) -> None:
+        visible = bool(
+            self.fullscreen
+            and self.hide_ui_enabled
+            and self.auto_reveal
+        )
+        self.bottom_reveal_strip.setVisible(visible)
+        if visible:
+            self.bottom_reveal_strip.raise_()
+            if self.bottom_overlay.isVisible():
+                self.bottom_overlay.raise_()
 
     def _invalidate_hide_timer(self) -> None:
         self.hide_timer_generation += 1

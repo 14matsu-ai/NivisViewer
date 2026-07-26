@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal, Slot
 from PySide6.QtGui import QGuiApplication
@@ -34,6 +35,7 @@ from .browser_sort import (
 )
 from .browser_item_delegate import GRID_PRESET_THUMBNAIL_SIZES
 from .config_manager import ConfigManager
+from .ffmpeg_thumbnail_backend import FFmpegLocator
 from .thumbnail_render import CROP_MODES, FRAME_RATIOS
 from .seven_zip_locator import SevenZipInfo, SevenZipLocator
 from .viewer_commands import COMMAND_CHOICES
@@ -61,7 +63,10 @@ class _SevenZipProbeWorker(QRunnable):
     @Slot()
     def run(self) -> None:
         info = self.locator.locate(self.path, force=True)
-        self.signals.completed.emit(self.generation, info)
+        try:
+            self.signals.completed.emit(self.generation, info)
+        except RuntimeError:
+            pass
 
 
 class _WinRARProbeSignals(QObject):
@@ -91,7 +96,36 @@ class _WinRARProbeWorker(QRunnable):
             )
         except TypeError:
             info = self.locator.locate(self.path, force=True)  # type: ignore[call-arg]
-        self.signals.completed.emit(self.generation, info)
+        try:
+            self.signals.completed.emit(self.generation, info)
+        except RuntimeError:
+            pass
+
+
+class _FFmpegProbeSignals(QObject):
+    completed = Signal(int, object)
+
+
+class _FFmpegProbeWorker(QRunnable):
+    def __init__(
+        self,
+        generation: int,
+        locator: FFmpegLocator,
+        path: str,
+    ) -> None:
+        super().__init__()
+        self.generation = generation
+        self.locator = locator
+        self.path = path
+        self.signals = _FFmpegProbeSignals()
+
+    @Slot()
+    def run(self) -> None:
+        result = self.locator.locate(self.path)
+        try:
+            self.signals.completed.emit(self.generation, result)
+        except RuntimeError:
+            pass
 
 
 _RETIRED_SETTINGS_POOLS: set[QThreadPool] = set()
@@ -111,6 +145,7 @@ class SettingsDialog(QDialog):
         cache_statistics_getter: Callable[[], dict[str, object]] | None = None,
         seven_zip_locator: SevenZipLocator | None = None,
         winrar_locator: WinRARLocator | None = None,
+        ffmpeg_locator: FFmpegLocator | None = None,
         file_registration_service: WindowsFileRegistrationService | None = None,
     ) -> None:
         super().__init__(parent)
@@ -123,6 +158,7 @@ class SettingsDialog(QDialog):
         self._last_save_error_reported: str | None = None
         self._seven_zip_locator = seven_zip_locator or SevenZipLocator()
         self._winrar_locator = winrar_locator or WinRARLocator()
+        self._ffmpeg_locator = ffmpeg_locator or FFmpegLocator()
         self._file_registration_service = file_registration_service
         self._probe_pool = QThreadPool()
         self._probe_pool.setMaxThreadCount(2)
@@ -134,6 +170,8 @@ class SettingsDialog(QDialog):
         self._winrar_probe_workers: dict[int, _WinRARProbeWorker] = {}
         self._pending_winrar_path: str | None = None
         self._accept_after_winrar_probe = False
+        self._ffmpeg_probe_generation = 0
+        self._ffmpeg_probe_workers: dict[int, _FFmpegProbeWorker] = {}
         self._initial_probe_started = False
         raw_bindings = self.config.get("mouse_gesture_bindings", {})
         self._gesture_bindings_base = (
@@ -273,6 +311,20 @@ class SettingsDialog(QDialog):
         spread_form.addRow(self.single_first_checkbox)
         self.wide_single_checkbox = QCheckBox("横長画像を単独表示", spread_group)
         spread_form.addRow(self.wide_single_checkbox)
+        self.viewer_canvas_left_click_combo = QComboBox(spread_group)
+        self.viewer_canvas_left_click_combo.addItem(
+            "1ページ進む",
+            "next_single_page",
+        )
+        self.viewer_canvas_left_click_combo.addItem(
+            "見開き単位で進む",
+            "next_display_unit",
+        )
+        self.viewer_canvas_left_click_combo.addItem("何もしない", "none")
+        spread_form.addRow(
+            "画像表示領域を左クリックしたとき:",
+            self.viewer_canvas_left_click_combo,
+        )
 
         fullscreen_group = QGroupBox("全画面UI", tab)
         fullscreen_form = QFormLayout(fullscreen_group)
@@ -291,13 +343,21 @@ class SettingsDialog(QDialog):
             fullscreen_group,
         )
         fullscreen_form.addRow(self.fullscreen_auto_reveal_checkbox)
-        self.fullscreen_edge_trigger_spin = QSpinBox(fullscreen_group)
-        self.fullscreen_edge_trigger_spin.setRange(4, 32)
-        self.fullscreen_edge_trigger_spin.setSuffix(" px")
+        self.fullscreen_top_edge_trigger_spin = QSpinBox(fullscreen_group)
+        self.fullscreen_top_edge_trigger_spin.setRange(4, 32)
+        self.fullscreen_top_edge_trigger_spin.setSuffix(" px")
         fullscreen_form.addRow(
-            "画面端の反応範囲:",
-            self.fullscreen_edge_trigger_spin,
+            "上端の反応範囲:",
+            self.fullscreen_top_edge_trigger_spin,
         )
+        self.fullscreen_bottom_edge_trigger_spin = QSpinBox(fullscreen_group)
+        self.fullscreen_bottom_edge_trigger_spin.setRange(12, 64)
+        self.fullscreen_bottom_edge_trigger_spin.setSuffix(" px")
+        fullscreen_form.addRow(
+            "下端の反応範囲:",
+            self.fullscreen_bottom_edge_trigger_spin,
+        )
+        self.fullscreen_edge_trigger_spin = self.fullscreen_top_edge_trigger_spin
         self.fullscreen_hide_delay_spin = QSpinBox(fullscreen_group)
         self.fullscreen_hide_delay_spin.setRange(0, 3000)
         self.fullscreen_hide_delay_spin.setSingleStep(100)
@@ -588,6 +648,67 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(list_group)
         layout.addWidget(cache_group)
+
+        preview_group = QGroupBox("汎用ファイルプレビュー", tab)
+        preview_form = QFormLayout(preview_group)
+        self.text_preview_checkbox = QCheckBox(
+            "テキストファイルの内容をプレビューする",
+            preview_group,
+        )
+        preview_form.addRow(self.text_preview_checkbox)
+        self.video_thumbnail_checkbox = QCheckBox(
+            "動画のサムネイルを表示する",
+            preview_group,
+        )
+        preview_form.addRow(self.video_thumbnail_checkbox)
+        self.video_thumbnail_backend_combo = QComboBox(preview_group)
+        self.video_thumbnail_backend_combo.addItem("自動・推奨", "auto")
+        self.video_thumbnail_backend_combo.addItem(
+            "Windows Shellのみ",
+            "windows_shell",
+        )
+        self.video_thumbnail_backend_combo.addItem("FFmpegのみ", "ffmpeg")
+        self.video_thumbnail_backend_combo.addItem("無効", "disabled")
+        preview_form.addRow(
+            "動画バックエンド:",
+            self.video_thumbnail_backend_combo,
+        )
+        self.ffmpeg_path_edit = QLineEdit(preview_group)
+        ffmpeg_path_row = QWidget(preview_group)
+        ffmpeg_path_layout = QHBoxLayout(ffmpeg_path_row)
+        ffmpeg_path_layout.setContentsMargins(0, 0, 0, 0)
+        ffmpeg_path_layout.addWidget(self.ffmpeg_path_edit, 1)
+        self.ffmpeg_browse_button = QPushButton("参照...", preview_group)
+        self.ffmpeg_browse_button.clicked.connect(self.browse_ffmpeg)
+        ffmpeg_path_layout.addWidget(self.ffmpeg_browse_button)
+        self.ffmpeg_redetect_button = QPushButton("再検出", preview_group)
+        self.ffmpeg_redetect_button.clicked.connect(self.redetect_ffmpeg)
+        ffmpeg_path_layout.addWidget(self.ffmpeg_redetect_button)
+        preview_form.addRow("FFmpeg:", ffmpeg_path_row)
+        self.ffmpeg_status_label = QLabel("FFmpeg：未確認", preview_group)
+        self.ffmpeg_status_label.setWordWrap(True)
+        preview_form.addRow("現在の状態:", self.ffmpeg_status_label)
+        ffmpeg_note = QLabel(
+            "FFmpegは任意です。自動ダウンロードや自動同梱は行いません。",
+            preview_group,
+        )
+        ffmpeg_note.setWordWrap(True)
+        preview_form.addRow(ffmpeg_note)
+        self.browser_external_drop_combo = QComboBox(preview_group)
+        self.browser_external_drop_combo.addItem(
+            "一覧で選択・中央表示のみ",
+            "focus_only",
+        )
+        self.browser_external_drop_combo.addItem(
+            "選択後に対応ファイルを開く",
+            "focus_and_open",
+        )
+        preview_form.addRow(
+            "Browser中央への外部ドロップ:",
+            self.browser_external_drop_combo,
+        )
+        layout.addWidget(preview_group)
+
         sidebar_group = QGroupBox("サイドバー", tab)
         sidebar_form = QFormLayout(sidebar_group)
         self.browser_sidebar_layout_combo = QComboBox(sidebar_group)
@@ -720,6 +841,13 @@ class SettingsDialog(QDialog):
         self.wide_single_checkbox.setChecked(
             bool(self.config.get("treat_wide_image_as_single", True))
         )
+        self._select_data(
+            self.viewer_canvas_left_click_combo,
+            self.config.get(
+                "viewer_canvas_left_click_action",
+                "next_single_page",
+            ),
+        )
         self.fullscreen_hide_ui_checkbox.setChecked(
             bool(self.config.get("hide_ui_in_fullscreen", False))
         )
@@ -729,8 +857,21 @@ class SettingsDialog(QDialog):
         self.fullscreen_auto_reveal_checkbox.setChecked(
             bool(self.config.get("fullscreen_auto_reveal_ui", True))
         )
-        self.fullscreen_edge_trigger_spin.setValue(
-            int(self.config.get("fullscreen_edge_trigger_px", 8))
+        self.fullscreen_top_edge_trigger_spin.setValue(
+            int(
+                self.config.get(
+                    "fullscreen_top_edge_trigger_px",
+                    self.config.get("fullscreen_edge_trigger_px", 8),
+                )
+            )
+        )
+        self.fullscreen_bottom_edge_trigger_spin.setValue(
+            int(
+                self.config.get(
+                    "fullscreen_bottom_edge_trigger_px",
+                    28,
+                )
+            )
         )
         self.fullscreen_hide_delay_spin.setValue(
             int(self.config.get("fullscreen_ui_hide_delay_ms", 0))
@@ -847,6 +988,23 @@ class SettingsDialog(QDialog):
         self.cache_unused_days_spin.setValue(max(7, unused_days or 90))
         self.cache_unused_days_spin.setEnabled(
             int(self.cache_unused_days_combo.currentData()) == -1
+        )
+        self.text_preview_checkbox.setChecked(
+            bool(self.config.get("text_preview_enabled", True))
+        )
+        self.video_thumbnail_checkbox.setChecked(
+            bool(self.config.get("video_thumbnail_enabled", True))
+        )
+        self._select_data(
+            self.video_thumbnail_backend_combo,
+            self.config.get("video_thumbnail_backend", "auto"),
+        )
+        self.ffmpeg_path_edit.setText(
+            str(self.config.get("ffmpeg_executable", "") or "")
+        )
+        self._select_data(
+            self.browser_external_drop_combo,
+            self.config.get("browser_external_drop_behavior", "focus_only"),
         )
         self._select_data(
             self.archive_backend_combo,
@@ -1038,6 +1196,9 @@ class SettingsDialog(QDialog):
             "gap": self.gap_spin.value(),
             "single_first_page": self.single_first_checkbox.isChecked(),
             "treat_wide_image_as_single": self.wide_single_checkbox.isChecked(),
+            "viewer_canvas_left_click_action": str(
+                self.viewer_canvas_left_click_combo.currentData()
+            ),
             "hide_ui_in_fullscreen": self.fullscreen_hide_ui_checkbox.isChecked(),
             "hide_cursor_in_fullscreen": (
                 self.fullscreen_hide_cursor_checkbox.isChecked()
@@ -1045,7 +1206,15 @@ class SettingsDialog(QDialog):
             "fullscreen_auto_reveal_ui": (
                 self.fullscreen_auto_reveal_checkbox.isChecked()
             ),
-            "fullscreen_edge_trigger_px": self.fullscreen_edge_trigger_spin.value(),
+            "fullscreen_edge_trigger_px": (
+                self.fullscreen_top_edge_trigger_spin.value()
+            ),
+            "fullscreen_top_edge_trigger_px": (
+                self.fullscreen_top_edge_trigger_spin.value()
+            ),
+            "fullscreen_bottom_edge_trigger_px": (
+                self.fullscreen_bottom_edge_trigger_spin.value()
+            ),
             "fullscreen_ui_hide_delay_ms": self.fullscreen_hide_delay_spin.value(),
             "thumbnail_size": self.thumbnail_size_spin.value(),
             "thumbnail_frame_ratio": str(
@@ -1115,6 +1284,15 @@ class SettingsDialog(QDialog):
                 self.cache_unused_days_spin.value()
                 if int(self.cache_unused_days_combo.currentData()) == -1
                 else int(self.cache_unused_days_combo.currentData())
+            ),
+            "text_preview_enabled": self.text_preview_checkbox.isChecked(),
+            "video_thumbnail_enabled": self.video_thumbnail_checkbox.isChecked(),
+            "video_thumbnail_backend": str(
+                self.video_thumbnail_backend_combo.currentData() or "auto"
+            ),
+            "ffmpeg_executable": self.ffmpeg_path_edit.text().strip().strip('"'),
+            "browser_external_drop_behavior": str(
+                self.browser_external_drop_combo.currentData() or "focus_only"
             ),
             "archive_backend_preference": str(
                 self.archive_backend_combo.currentData() or "auto"
@@ -1222,6 +1400,7 @@ class SettingsDialog(QDialog):
     def reject(self) -> None:  # type: ignore[override]
         self._probe_generation += 1
         self._winrar_probe_generation += 1
+        self._ffmpeg_probe_generation += 1
         self._pending_explicit_path = None
         self._accept_after_probe = False
         self._pending_winrar_path = None
@@ -1246,6 +1425,51 @@ class SettingsDialog(QDialog):
             self._initial_probe_started = True
             self.redetect_winrar()
             self.redetect_seven_zip()
+            self.redetect_ffmpeg()
+
+    def browse_ffmpeg(self) -> None:
+        start = self.ffmpeg_path_edit.text().strip()
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "FFmpeg実行ファイルを選択",
+            start,
+            "FFmpeg executable (ffmpeg.exe);;実行ファイル (*.exe);;すべてのファイル (*.*)",
+        )
+        if path:
+            self.ffmpeg_path_edit.setText(path)
+            self.redetect_ffmpeg()
+
+    def redetect_ffmpeg(self) -> None:
+        explicit = self.ffmpeg_path_edit.text().strip().strip('"')
+        self._ffmpeg_probe_generation += 1
+        generation = self._ffmpeg_probe_generation
+        self.ffmpeg_status_label.setText("FFmpeg：確認中…")
+        self.ffmpeg_redetect_button.setEnabled(False)
+        worker = _FFmpegProbeWorker(
+            generation,
+            self._ffmpeg_locator,
+            explicit,
+        )
+        worker.signals.completed.connect(self._on_ffmpeg_probe_completed)
+        self._ffmpeg_probe_workers[generation] = worker
+        self._probe_pool.start(worker)
+
+    @Slot(int, object)
+    def _on_ffmpeg_probe_completed(
+        self,
+        generation: int,
+        executable: Path | None,
+    ) -> None:
+        self._ffmpeg_probe_workers.pop(generation, None)
+        if generation != self._ffmpeg_probe_generation:
+            return
+        self.ffmpeg_redetect_button.setEnabled(True)
+        if executable is None:
+            self.ffmpeg_status_label.setText(
+                "FFmpeg：見つかりません（動画はWindows Shellを使用します）"
+            )
+        else:
+            self.ffmpeg_status_label.setText(f"FFmpeg：検出済み\n{executable}")
 
     def browse_winrar(self) -> None:
         start = self.winrar_path_edit.text().strip()
