@@ -79,6 +79,7 @@ from .browser_scanner import (
     BrowserScanEntry,
     BrowserScanError,
     BrowserScanRequest,
+    BrowserScanPriority,
     BrowserScanStatus,
 )
 from .browser_sort import (
@@ -112,6 +113,7 @@ from .file_operation_service import (
     FileOperationProgress,
     FileOperationRequest,
     FileOperationResult,
+    FileOperationItemState,
 )
 from .drag_drop import (
     FolderDropProbe,
@@ -128,6 +130,7 @@ from .history_model import HistoryModel
 from .image_work_coordinator import ImageWorkCoordinator
 from .image_source import FolderListingSnapshot
 from .metadata_store import MetadataStore
+from .performance_trace import performance_trace
 from .settings_dialog import SettingsDialog
 from .sidebar_layout import SidebarLayoutController
 from .thumbnail_provider import BrowserThumbnailProvider
@@ -165,6 +168,10 @@ class _PendingDirectoryScan:
     committed: bool = False
     refresh_entries: list[BrowserScanEntry] = field(default_factory=list)
     buffered_entries: list[BrowserScanEntry] = field(default_factory=list)
+    trace_id: int = 0
+    navigation_source: str = "interactive"
+    first_batch_arrived: bool = False
+    first_batch_applied: bool = False
 
 
 class BrowserWindow(QMainWindow):
@@ -191,6 +198,7 @@ class BrowserWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setAcceptDrops(True)
         self.setWindowTitle("NivisViewer - ブラウザ")
         self.resize(1100, 760)
 
@@ -287,6 +295,12 @@ class BrowserWindow(QMainWindow):
         self._scan_generation = 0
         self._pending_scan: _PendingDirectoryScan | None = None
         self._pending_tree_navigation_path: Path | None = None
+        self._deferred_tree_sync_generation: int | None = None
+        self._first_paint_pending_generation: int | None = None
+        self._first_paint_trace_id = 0
+        self._tree_trace_ids: dict[int, int] = {}
+        self._favorite_trace_id = 0
+        self._favorite_release_navigated = False
         self._location_restore_token = 0
         self._list_view_restore_token = 0
         self._status_message_token = 0
@@ -440,17 +454,11 @@ class BrowserWindow(QMainWindow):
             spacing=int(self.settings.get("favorite_row_spacing", 0)),
             icon_size=int(self.settings.get("favorite_icon_size", 16)),
         )
+        # Kept as an inert compatibility object for integrations that adjusted
+        # the former delay timer. Favorite navigation no longer starts it.
         self._favorite_click_timer = QTimer(self)
         self._favorite_click_timer.setSingleShot(True)
-        self._favorite_click_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._favorite_click_timer.setInterval(
-            QApplication.styleHints().mouseDoubleClickInterval()
-        )
-        self._favorite_click_timer.timeout.connect(
-            self._open_pending_favorite_click
-        )
         self._pending_favorite_path: str | None = None
-        self._suppress_favorite_click_once = False
         self._hovered_list_path: str | None = None
 
         self._folder_change_timer = QTimer(self)
@@ -509,7 +517,11 @@ class BrowserWindow(QMainWindow):
         force_reload: bool = False,
         capture_current: bool = True,
         failure_history_revert: str | None = None,
+        navigation_source: str = "interactive",
+        trace_id: int = 0,
     ) -> bool:
+        if trace_id:
+            performance_trace.mark(trace_id, "navigation.navigate_to.called")
         if not self._starting_drop_focus_navigation:
             self._cancel_browser_drop_focus()
         target = self._absolute_browser_path(path)
@@ -518,7 +530,8 @@ class BrowserWindow(QMainWindow):
         if same_path and not force_reload:
             if restore_location is not None:
                 self._schedule_location_restore(restore_location)
-            self._sync_tree_to_path(target)
+            if navigation_source != "favorite":
+                self._sync_tree_to_path(target)
             self._sync_address_bar()
             self._update_navigation_actions()
             return True
@@ -538,6 +551,12 @@ class BrowserWindow(QMainWindow):
             self._update_current_navigation_state()
         self._cancel_pending_scan(rollback_history=True)
         self._scan_generation += 1
+        if trace_id:
+            performance_trace.mark(
+                trace_id,
+                "navigation.generation.issued",
+                str(self._scan_generation),
+            )
         request = BrowserScanRequest(
             path=str(target),
             generation=self._scan_generation,
@@ -546,6 +565,12 @@ class BrowserWindow(QMainWindow):
                 show_unsupported_files=self.browser_show_unsupported_files,
                 show_system_items=self.browser_show_system_items,
             ),
+            priority=(
+                BrowserScanPriority.REFRESH
+                if force_reload
+                else BrowserScanPriority.INTERACTIVE_NAVIGATION
+            ),
+            trace_id=trace_id,
         )
         self._pending_scan = _PendingDirectoryScan(
             path=target,
@@ -556,7 +581,10 @@ class BrowserWindow(QMainWindow):
             ),
             refresh=same_path and force_reload,
             failure_history_revert=failure_history_revert,
+            trace_id=trace_id,
+            navigation_source=navigation_source,
         )
+        self.address_bar.setText(str(target))
         if not self.scanner.start(request):
             self._pending_scan = None
             self._show_temporary_status("フォルダへアクセスできません")
@@ -572,6 +600,13 @@ class BrowserWindow(QMainWindow):
         pending = self._matching_pending_scan(batch.generation, batch.path)
         if pending is None or self._shutdown_prepared:
             return
+        if pending.trace_id and not pending.first_batch_arrived:
+            pending.first_batch_arrived = True
+            performance_trace.mark(
+                pending.trace_id,
+                "scanner.first_batch.gui_arrived",
+                str(len(batch.entries)),
+            )
         if pending.refresh:
             pending.refresh_entries.extend(batch.entries)
             self._schedule_scan_status_update()
@@ -585,7 +620,8 @@ class BrowserWindow(QMainWindow):
             if not self._scan_batch_timer.isActive():
                 self._scan_batch_timer.start()
         self._schedule_scan_status_update()
-        self._schedule_thumbnail_requests()
+        if self._first_paint_pending_generation != pending.generation:
+            self._schedule_thumbnail_requests()
 
     def _append_scan_entries(
         self,
@@ -598,6 +634,13 @@ class BrowserWindow(QMainWindow):
             items,
             generation=pending.generation,
         )
+        if pending.trace_id and not pending.first_batch_applied:
+            pending.first_batch_applied = True
+            performance_trace.mark(
+                pending.trace_id,
+                "browser.model.first_batch.applied",
+                str(len(entries)),
+            )
         self._restore_list_view_state(previous_state)
         self._restore_pending_scan_location(pending, final=False)
         self._apply_pending_browser_focus(final=False)
@@ -658,7 +701,8 @@ class BrowserWindow(QMainWindow):
 
         self._pending_scan = None
         self._update_status()
-        self._schedule_thumbnail_requests()
+        if self._first_paint_pending_generation != pending.generation:
+            self._schedule_thumbnail_requests()
         if pending.refresh:
             QTimer.singleShot(
                 0,
@@ -709,7 +753,11 @@ class BrowserWindow(QMainWindow):
             self.navigation_history.visit(BrowserLocation(str(pending.path)))
         self._folder_change_timer.stop()
         self._pending_tree_navigation_path = None
-        self._sync_tree_to_path(pending.path)
+        self.folder_tree_sync.cancel()
+        self._deferred_tree_sync_generation = pending.generation
+        self._first_paint_pending_generation = pending.generation
+        self._first_paint_trace_id = pending.trace_id
+        self.list_view.notify_after_next_paint()
         self._sync_address_bar()
         self._update_navigation_actions()
 
@@ -1457,10 +1505,26 @@ class BrowserWindow(QMainWindow):
                 f"{self._operation_label(result.operation)}をキャンセルしました"
             )
         elif failure_count:
+            skipped_count = sum(
+                item.state is FileOperationItemState.SKIPPED
+                for item in result.failures
+            )
+            source_remaining_count = sum(
+                item.state
+                in {
+                    FileOperationItemState.COPIED_SOURCE_REMAINS,
+                    FileOperationItemState.SOURCE_REMOVAL_FAILED,
+                    FileOperationItemState.DESTINATION_PUBLISHED_SOURCE_REMAINS,
+                }
+                for item in result.failures
+            )
             completion_message = (
                 f"{self._operation_label(result.operation)}完了: "
-                f"成功{success_count}件、失敗{failure_count}件"
+                f"成功{success_count}件、スキップ{skipped_count}件、"
+                f"失敗{max(0, failure_count - skipped_count)}件"
             )
+            if source_remaining_count:
+                completion_message += f"（元項目残留{source_remaining_count}件）"
             codes = sorted(
                 {
                     item.error_code or "unknown"
@@ -1654,44 +1718,63 @@ class BrowserWindow(QMainWindow):
         entry = self.folder_bookmark_model.entry_at(index)
         if entry is None:
             return
-        if entry.exists is False:
-            self._show_temporary_status("お気に入りフォルダが見つかりません")
-            return
-        self.navigate_to(entry.path)
+        self.navigate_to(
+            entry.path,
+            navigation_source="favorite",
+            trace_id=self._favorite_trace_id,
+        )
+
+    def _on_favorite_pressed(self, path: str) -> None:
+        self._favorite_release_navigated = False
+        self._favorite_trace_id = performance_trace.begin(
+            "favorite.mouse_press",
+            path,
+        )
+
+    def _on_favorite_release_confirmed(self, path: str) -> None:
+        trace_id = self._favorite_trace_id
+        if trace_id:
+            performance_trace.mark(trace_id, "favorite.mouse_release", path)
 
     def _on_favorite_clicked(self, index: QModelIndex) -> None:
-        if self._suppress_favorite_click_once:
-            self._suppress_favorite_click_once = False
-            return
         if (
             self.favorite_view.selection_controller.press_modifiers
             != Qt.KeyboardModifier.NoModifier
         ):
             return
-        if self.favorite_view.drag_started or not index.isValid():
+        if (
+            self.favorite_view.drag_started
+            or self.favorite_view.drop_in_progress
+            or not index.isValid()
+        ):
             return
         entry = self.folder_bookmark_model.entry_at(index)
         if entry is None:
             return
-        self._pending_favorite_path = entry.path
-        self._favorite_click_timer.start()
+        trace_id = self._favorite_trace_id
+        if trace_id:
+            performance_trace.mark(
+                trace_id,
+                "favorite.navigation.confirmed",
+                entry.path,
+            )
+        self._favorite_release_navigated = True
+        self.open_folder_bookmark(index)
+        QTimer.singleShot(
+            0,
+            lambda: setattr(self, "_favorite_release_navigated", False),
+        )
 
     def _on_favorite_double_clicked(self, index: QModelIndex) -> None:
-        self._favorite_click_timer.stop()
-        self._pending_favorite_path = None
-        self._suppress_favorite_click_once = True
-        self.open_folder_bookmark(index)
+        # The first release already committed the navigation. Delaying the
+        # single click to distinguish this signal would add the platform
+        # double-click interval to every favorite navigation.
+        if not self._favorite_release_navigated:
+            self._favorite_release_navigated = True
+            self.open_folder_bookmark(index)
 
     def _open_pending_favorite_click(self) -> None:
-        path = self._pending_favorite_path
-        self._pending_favorite_path = None
-        if path is None or self.favorite_view.drag_started:
-            return
-        row = self.folder_bookmark_model.row_for_path(path)
-        if row >= 0:
-            self.open_folder_bookmark(
-                self.folder_bookmark_model.index(row, 0)
-            )
+        """Compatibility hook: favorite clicks are now release-confirmed."""
 
     def rename_folder_bookmark(
         self,
@@ -2197,6 +2280,8 @@ class BrowserWindow(QMainWindow):
             "text_preview_enabled",
             "video_thumbnail_enabled",
             "video_thumbnail_backend",
+            "video_thumbnail_frame_mode",
+            "video_thumbnail_shell_placeholder",
             "ffmpeg_executable",
         }
         if preview_setting_keys.intersection(changed):
@@ -2380,6 +2465,20 @@ class BrowserWindow(QMainWindow):
         return handled
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
+        if watched is self.list_view.viewport():
+            event_type = event.type()
+            if event_type == QEvent.Type.DragEnter:
+                self.list_view.dragEnterEvent(event)
+                return True
+            if event_type == QEvent.Type.DragMove:
+                self.list_view.dragMoveEvent(event)
+                return True
+            if event_type == QEvent.Type.DragLeave:
+                self.list_view.dragLeaveEvent(event)
+                return True
+            if event_type == QEvent.Type.Drop:
+                self.list_view.dropEvent(event)
+                return True
         if watched in (self.list_view, self.list_view.viewport()):
             if event.type() in {
                 QEvent.Type.FocusIn,
@@ -2511,6 +2610,9 @@ class BrowserWindow(QMainWindow):
             self.file_system_model,
             self,
         )
+        self.folder_tree_sync.sync_finished.connect(
+            self._on_folder_tree_sync_finished
+        )
 
         self.bookmark_model = BookmarkModel(self.metadata_store, self)
         self.bookmark_view = QListView(self)
@@ -2547,6 +2649,10 @@ class BrowserWindow(QMainWindow):
         self.favorite_view.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.favorite_view.clicked.connect(self._on_favorite_clicked)
         self.favorite_view.doubleClicked.connect(self._on_favorite_double_clicked)
+        self.favorite_view.itemPressCaptured.connect(self._on_favorite_pressed)
+        self.favorite_view.itemReleaseConfirmed.connect(
+            self._on_favorite_release_confirmed
+        )
         self.favorite_view.enterActivated.connect(self.open_folder_bookmark)
         self.favorite_view.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
@@ -2601,6 +2707,7 @@ class BrowserWindow(QMainWindow):
 
         self.list_view = ExplorerListView(self)
         self.list_view.setModel(self.item_model)
+        self.list_view.paintCompleted.connect(self._on_list_paint_completed)
         self.item_delegate = BrowserItemDelegate(
             self.list_view,
             thumbnail_size=self.thumbnail_size,
@@ -2623,6 +2730,7 @@ class BrowserWindow(QMainWindow):
         self.list_view.setUniformItemSizes(True)
         self.list_view.setMouseTracking(True)
         self.list_view.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.list_view.ensure_viewport_drop_target()
         self._apply_list_view_geometry()
         self.list_view.activated.connect(self.open_item)
         self.list_view.selectionModel().currentChanged.connect(
@@ -2654,6 +2762,7 @@ class BrowserWindow(QMainWindow):
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setCollapsible(0, True)
         self.setCentralWidget(self.splitter)
+        self.splitter.setAcceptDrops(True)
 
         self.navigation_toolbar = QToolBar("ナビゲーション", self)
         self.navigation_toolbar.setObjectName("browser_navigation_toolbar")
@@ -3060,6 +3169,58 @@ class BrowserWindow(QMainWindow):
             focus_rebase=self.folder_tree_focus_rebase,
             context_ancestor_levels=self.folder_tree_context_ancestor_levels,
         )
+
+    def _on_list_paint_completed(self) -> None:
+        generation = self._first_paint_pending_generation
+        if generation is None:
+            return
+        self._first_paint_pending_generation = None
+        trace_id = self._first_paint_trace_id
+        self._first_paint_trace_id = 0
+        if trace_id:
+            performance_trace.mark(trace_id, "browser.list.first_paint")
+        QTimer.singleShot(
+            0,
+            lambda generation=generation, trace_id=trace_id: (
+                self._run_deferred_after_first_paint(generation, trace_id)
+            ),
+        )
+
+    def _run_deferred_after_first_paint(
+        self,
+        generation: int,
+        trace_id: int,
+    ) -> None:
+        if (
+            self._shutdown_prepared
+            or generation != self._scan_generation
+            or self.current_path is None
+        ):
+            return
+        if self._deferred_tree_sync_generation == generation:
+            self._deferred_tree_sync_generation = None
+            if trace_id:
+                performance_trace.mark(trace_id, "folder_tree.sync.begin")
+                self._tree_trace_ids[
+                    self.folder_tree_sync.generation + 1
+                ] = trace_id
+            self._sync_tree_to_path(self.current_path)
+        if trace_id:
+            performance_trace.mark(trace_id, "thumbnail.request.begin")
+        self._schedule_thumbnail_requests(0)
+
+    def _on_folder_tree_sync_finished(
+        self,
+        generation: int,
+        path: str,
+    ) -> None:
+        trace_id = self._tree_trace_ids.pop(int(generation), 0)
+        if trace_id:
+            performance_trace.mark(
+                trace_id,
+                "folder_tree.sync.complete",
+                path,
+            )
 
     def _on_tree_directory_loaded(self, _path: str) -> None:
         # Compatibility hook retained for older tests and integrations.

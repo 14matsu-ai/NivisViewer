@@ -526,7 +526,7 @@ PageModelは表示単位先頭とは別にfocused page identityを保持しま�
 
 FolderTreeは`currentChanged`、selection、hover、expanded、directoryLoadedからnavigateしません。左buttonのpressとreleaseが同じpath、drag threshold未満、非disclosure、非programmatic syncの場合だけ`navigationConfirmed`を発行します。file drag hoverはoverlay highlightだけを描き、drop成立時だけ既存`FileOperationCoordinator`へtarget pathを渡します。展開矢印は展開／折りたたみだけを行います。
 
-お気に入りはpress時にnavigateせず、同一項目上のreleaseから発生するsingle clickをdouble-click interval内で確定します。待機対象は`QModelIndex`ではなくpathで保持し、並べ替え後に再解決します。dragが成立した入力列ではclickを発生させません。`FavoriteRowMetrics`の行高は`max(fontMetrics.height(), icon_size) + padding_y * 2`だけで決まり、wrapなし、elideあり、行間隔と14～24pxのfolder iconを独立設定します。
+お気に入りはpress時にnavigateせず、同一項目上でdrag threshold未満のreleaseが成立した時点で即座にnavigateします。double-click判定のためsingle clickを遅延させず、double-click event自体は新しいscanを発行しません。対象は`QModelIndex`の長期保持やMetadataStore再照会をせず、`FolderBookmarkModel`が保持するabsolute pathを直接使います。drag、drop、Ctrl／Shiftが成立した入力列ではnavigateしません。`FavoriteRowMetrics`の行高は`max(fontMetrics.height(), icon_size) + padding_y * 2`だけで決まり、wrapなし、elideあり、行間隔と14～24pxのfolder iconを独立設定します。
 
 ### Sprint 18の汎用ファイルプレビューとBrowser中央ドロップ
 
@@ -555,6 +555,8 @@ Explorer external drop
 
 Browser一覧中央への外部local-file dropはViewer openやファイル移動を既定動作にしません。`BrowserMainDropController`がworkerでfile／folderを判定し、folderならそこへ移動、fileなら親folderへ移動して同一親のdrop項目をpathで複数選択し、primaryをcurrent・中央表示にします。異なる親が混在する場合は先頭親groupだけを使い、件数をstatusへ通知します。scan中は`PendingBrowserFocusRequest`がfolder、paths、primary、scan generation、request IDを保持し、各batchと正常完了でpathを再解決します。他のnavigation、新しいdrop、終了、旧generationでは要求を破棄します。内部NivisViewer dragをfolder／tree／favoriteへ落とす既存copy／move経路は維持します。
 
+中央dropは`ExplorerListView`だけでなく、実際のnative drop targetである`viewport()`へevent filterを設定します。IconMode等の設定でviewportが再構成された後に`acceptDrops`とfilterを再適用します。`application/x-nivisviewer-paths+json`かつNivisViewer自身がsourceのdragだけを内部操作とし、Explorerの`text/uri-list`は項目上／空白上を問わずfocus-onlyへ送ります。HTTP／HTTPSは受理しません。
+
 `browser_external_drop_behavior=focus_only`が既定です。`focus_and_open`ではfocus確定後、primaryがNivisViewer対応項目の場合だけ既存`open_viewer_behavior`に従って開きます。自動選択は一覧へkeyboard focusを移さず、Viewerを前面へ出し直しません。
 
 Viewer画像領域の通常の左クリックは`next_one_page()`へ接続し、論理ページを1ページだけ進めます。矢印キー、ホイール、メニューの前／次ページは従来どおり`PageModel.next()`／`previous()`による表示単位移動で、見開きでは通常2ページずつ進みます。
@@ -570,6 +572,48 @@ ApplicationController
    └─ FileOperationService
       └─ ChunkedFileCopier
 ```
+
+Sprint 19追補では次の境界を追加します。
+
+```text
+FileOperationQueue
+└─ FileOperationService
+   └─ MovePostconditionVerifier
+
+PreviewProviderRegistry
+└─ VideoThumbnailPolicy
+   ├─ Shell placeholder
+   ├─ one-third representative frame
+   └─ smart representative frame
+
+BrowserWindow
+└─ BrowserMainDropController
+   ├─ viewport event filter
+   ├─ external/internal MIME split
+   └─ PendingBrowserFocusRequest
+```
+
+MOVE成功はdestinationが存在し、かつsourceが存在しない場合だけです。同一volumeは`rename`／`replace`後にもこの事後条件を確認し、`EXDEV`だけを一時出力経由のcopy＋deleteへ戻します。destination公開後にsourceが残った場合は`SOURCE_REMOVAL_FAILED`または`DESTINATION_PUBLISHED_SOURCE_REMAINS`で部分成功とし、成功件数、MetadataStore relocate、cut bufferから除外しません。結果はdestination/sourceの存在、公開／削除状態、copy bytes、expected bytes、残留source pathを保持します。
+
+動画は既定`smart`で再生時間の1/3、1/2、2/3から少数候補を評価し、黒／白／単色／低分散／低edge energyのframeを避けます。`one_third`は再生時間の約1/3を使い、終端直前を避けます。Shell画像は設定した場合だけmemory-only placeholderとし、FFmpeg結果を最終表示します。ShellとFFmpegのどちらもrotation、SAR／DAR補正後に共通のthumbnail ratio、letterbox／center crop／smart crop、物理cache sizeへ通します。PREFETCH missではFFmpegを起動しません。
+
+### FavoriteNavigation
+
+```text
+FavoriteNavigation
+├─ release-confirmed click
+├─ immediate navigate request
+├─ no synchronous validation
+├─ interactive scan priority
+├─ first-batch commit
+└─ deferred tree synchronization
+```
+
+mouse press、release、navigation確定、generation、scanner登録／worker、path確認、scandir、first batch、GUI到着、model反映、first paint、tree sync、thumbnail要求は、DEBUGまたは`NIVISVIEWER_DEBUG_TIMING=1`時だけ同じperformance trace IDへ記録します。通常ログには出しません。
+
+favorite、アドレス入力、戻る／進む、treeなどの明示移動は`INTERACTIVE_NAVIGATION`としてscanner queueへ登録します。GUI threadでは存在・種類・アクセスを検証せず、scannerが分類します。最新navigation generationが常に勝ち、旧batch／error／completeは破棄します。同じpathへのfavorite移動は再scan、履歴追加、tree再同期を行いません。
+
+通常folderは最初の有効batch、空folderは正常completeでcommitします。favorite release直後はcached pathをアドレス欄へ置き、読み込み中を表示しますが、履歴と`last_browser_path`はcommitまで更新しません。失敗時は前の一覧、履歴、アドレスへ戻します。first batchをmodelへ反映して一覧が一度paintされた後、独立generationのtree syncをqueued実行し、その後に可視／選択／限定prefetchのthumbnail要求を始めます。
 
 コピー／移動はGUIスレッドでファイルを列挙せず、worker上の`FileOperationPlanner`が絶対パス化、重複と親子選択の整理、同一／子孫移動の拒否、ファイル・フォルダ件数とbyte数、空き容量、衝突を先に確定します。再解析ポイントとsymlinkは再帰しません。状態は`PREPARING`、`WAITING_FOR_CONFLICTS`、`READY`、`RUNNING`、`CANCELLING`、`COMPLETED`、`FAILED`、`CANCELLED`を区別し、衝突待ちを含めてアプリ全体で一度に1操作だけ進めます。
 

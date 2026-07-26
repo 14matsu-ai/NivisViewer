@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import stat
 from threading import Event
+from time import monotonic
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
@@ -18,6 +19,8 @@ class PendingBrowserFocusRequest:
     open_after: bool
     request_id: int
     ignored_count: int = 0
+    created_time: float = 0.0
+    source: str = "external_drop"
 
     def with_generation(self, generation: int) -> PendingBrowserFocusRequest:
         return replace(self, scan_generation=int(generation))
@@ -76,6 +79,7 @@ class _BrowserDropProbe(QRunnable):
                 open_after=False,
                 request_id=self.request_id,
                 ignored_count=max(0, len(resolved) - 1),
+                created_time=monotonic(),
             )
         folder = first_path.parent
         same_parent = tuple(
@@ -92,6 +96,7 @@ class _BrowserDropProbe(QRunnable):
             open_after=self.open_after,
             request_id=self.request_id,
             ignored_count=max(0, ignored),
+            created_time=monotonic(),
         )
 
 

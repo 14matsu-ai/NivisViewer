@@ -14,6 +14,7 @@ from PySide6.QtGui import QImage
 
 from .file_preview import PreviewResult, PreviewResultKind, PreviewSource
 from .thumbnail_render import ThumbnailRenderSpec
+from .video_thumbnail_policy import VideoThumbnailPolicy
 
 
 SIIGBF_RESIZETOFIT = 0x00000000
@@ -187,12 +188,19 @@ class WindowsShellPreviewService:
         with self._lock:
             if image is None or image.isNull():
                 return PreviewResult(PreviewResultKind.UNAVAILABLE)
-            self._cache[key] = image.copy()
+            try:
+                normalized = VideoThumbnailPolicy.render(
+                    VideoThumbnailPolicy.qimage_to_pil(image),
+                    spec,
+                )
+            except Exception:
+                return PreviewResult(PreviewResultKind.UNAVAILABLE)
+            self._cache[key] = normalized.copy()
             self._cache.move_to_end(key)
             while len(self._cache) > self._cache_capacity:
                 self._cache.popitem(last=False)
             return PreviewResult.ready_image(
-                image,
+                normalized,
                 source=PreviewSource.WINDOWS_SHELL,
                 persist_to_disk=False,
             )

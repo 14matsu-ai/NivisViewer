@@ -99,7 +99,19 @@
     - 非モーダル進捗パネルとBrowser終了後のfallback
     - 最近使ったコピー／移動先とお気に入り／指定先メニュー
     - Viewer使用中のsource／replace destination解放
-24. 後続候補：ファイル操作と項目表示の拡張
+24. Sprint 19追補：Explorer経路の完全性・動画・中央D&D安定化（完了）
+    - MOVEのdestination存在＋source不存在の物理事後条件
+    - source削除失敗／部分成功とcut／MetadataStore整合
+    - smart／one-third動画frame、SAR／DAR／rotation、共通ratio／crop
+    - Shell placeholderからFFmpeg finalへの置換
+    - Browser viewport drop routingと外部／内部MIME分離
+25. Sprint 20優先修正：お気に入りフォルダ移動の応答性改善（完了）
+    - release確定時の即時navigateと同一path dedupe
+    - GUI threadの同期path検証・DB再queryなし
+    - interactive scanner priorityとlatest generation wins
+    - first list paint後のtree sync／thumbnail開始
+    - DEBUG／テスト限定の区間performance trace
+26. 後続候補：ファイル操作と項目表示の拡張
     - ファイル操作履歴と安全に可能なrename／moveのUndo
     - pause／resume、失敗項目の再試行
     - 右ドラッグ後のcopy／moveメニュー
@@ -108,9 +120,9 @@
     - 再帰的なサブフォルダ表示
     - PDFパスワード入力、PDF目次
     - 画像中央クロップ／余白除去、Viewerメモリ予算調整
-25. 後続候補：レート／タグ編集UIと検索
+27. 後続候補：レート／タグ編集UIと検索
     - 基本ナビゲーションとファイル操作の安定後に着手
     - ZipPla `{zpi$...}` の明示的な読み取り互換
     - タグ・レート検索と絞り込み
     - サムネイル上のレート／タグ表示
-26. 公開前ライセンス監査、コード署名の将来検討
+28. 公開前ライセンス監査、コード署名の将来検討

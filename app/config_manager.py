@@ -43,6 +43,8 @@ class ConfigManager(QObject):
         "text_preview_enabled": True,
         "video_thumbnail_enabled": True,
         "video_thumbnail_backend": "auto",
+        "video_thumbnail_frame_mode": "smart",
+        "video_thumbnail_shell_placeholder": True,
         "ffmpeg_executable": "",
         "browser_external_drop_behavior": "focus_only",
         "file_operation_destinations": [],
@@ -252,6 +254,7 @@ class ConfigManager(QObject):
             "browser_show_system_items",
             "text_preview_enabled",
             "video_thumbnail_enabled",
+            "video_thumbnail_shell_placeholder",
         ):
             if not isinstance(normalized.get(key), bool):
                 normalized[key] = cls.DEFAULTS[key]
@@ -265,6 +268,14 @@ class ConfigManager(QObject):
         }:
             normalized["video_thumbnail_backend"] = cls.DEFAULTS[
                 "video_thumbnail_backend"
+            ]
+        if normalized.get("video_thumbnail_frame_mode") not in {
+            "smart",
+            "one_third",
+            "windows_shell",
+        }:
+            normalized["video_thumbnail_frame_mode"] = cls.DEFAULTS[
+                "video_thumbnail_frame_mode"
             ]
         if not isinstance(normalized.get("ffmpeg_executable"), str):
             normalized["ffmpeg_executable"] = ""

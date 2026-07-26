@@ -51,6 +51,7 @@ class PreviewResult:
     message: str = ""
     persist_to_disk: bool = False
     entry_path: str = ""
+    provisional_image: QImage | None = None
 
     @property
     def ready(self) -> bool:

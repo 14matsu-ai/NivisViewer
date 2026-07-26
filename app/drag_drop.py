@@ -73,6 +73,10 @@ def paths_from_mime_data(mime: QMimeData) -> tuple[str, ...]:
     return normalize_local_paths(candidates)
 
 
+def is_internal_path_mime(mime: QMimeData) -> bool:
+    return bool(mime.hasFormat(NIVIS_PATHS_MIME))
+
+
 def is_lexically_supported_viewer_path(path: str | Path) -> bool:
     suffix = Path(path).suffix.casefold()
     return not suffix or suffix in VIEWER_FILE_EXTENSIONS

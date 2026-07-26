@@ -75,6 +75,7 @@ class ThumbnailLoadResult:
     def from_preview(cls, result: PreviewResult) -> ThumbnailLoadResult:
         return cls(
             result.image,
+            provisional_image=result.provisional_image,
             entry_path=result.entry_path,
             result_kind=result.kind,
             preview_source=result.source,

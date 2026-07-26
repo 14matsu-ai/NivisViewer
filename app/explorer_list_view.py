@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
+
 from PySide6.QtCore import (
+    QEvent,
     QItemSelection,
     QItemSelectionModel,
     QModelIndex,
@@ -28,7 +31,11 @@ from .browser_pointer_controller import (
     BrowserPointerController,
     BrowserPointerState,
 )
-from .drag_drop import FileDragController, paths_from_mime_data
+from .drag_drop import (
+    FileDragController,
+    is_internal_path_mime,
+    paths_from_mime_data,
+)
 from .folder_tree_pointer import FolderTreePointerController, FolderTreePointerState
 
 
@@ -37,6 +44,9 @@ class ExplorerListView(QListView):
 
     paths_dropped = Signal(object, object, object, object)
     enterActivated = Signal(QModelIndex)
+    itemPressCaptured = Signal(str)
+    itemReleaseConfirmed = Signal(str)
+    paintCompleted = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -46,12 +56,22 @@ class ExplorerListView(QListView):
         self._selection_anchor_path: str | None = None
         self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self.viewport())
         self._drag_started = False
+        self._drop_in_progress = False
+        self._notify_after_next_paint = False
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
         # All source drags are created by start_path_drag(). Qt's standard
         # startDrag and rubber-band paths stay disabled.
         self.setDragEnabled(False)
         self.setDragDropMode(QListView.DragDropMode.DropOnly)
+
+    def ensure_viewport_drop_target(self) -> None:
+        """Reapply drop routing after QListView replaces/configures its viewport."""
+        self.viewport().setAcceptDrops(True)
+
+    def notify_after_next_paint(self) -> None:
+        self._notify_after_next_paint = True
+        self.viewport().update()
 
     @property
     def drag_started(self) -> bool:
@@ -78,6 +98,8 @@ class ExplorerListView(QListView):
         )
         self._drag_started = False
         self._hide_rubber_band()
+        if path is not None:
+            self.itemPressCaptured.emit(path)
         event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
@@ -129,6 +151,7 @@ class ExplorerListView(QListView):
                 current_index = self._index_for_path(press.path)
                 if current_index.isValid():
                     self._commit_item_click(current_index, press.modifiers)
+                    self.itemReleaseConfirmed.emit(press.path)
                     self.clicked.emit(current_index)
         elif state is BrowserPointerState.PRESSED_ON_EMPTY and press is not None:
             if release_path is None:
@@ -367,8 +390,11 @@ class ExplorerListView(QListView):
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # type: ignore[override]
         if paths_from_mime_data(event.mimeData()):
+            self._drop_in_progress = True
+            self._debug_drop("dragEnter", event, accepted=True)
             event.acceptProposedAction()
             return
+        self._debug_drop("dragEnter", event, accepted=False)
         event.ignore()
 
     def dragMoveEvent(self, event) -> None:  # type: ignore[override]
@@ -377,14 +403,90 @@ class ExplorerListView(QListView):
             return
         event.ignore()
 
+    def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:  # type: ignore[override]
+        self._drop_in_progress = False
+        event.accept()
+
     def dropEvent(self, event: QDropEvent) -> None:  # type: ignore[override]
         paths = paths_from_mime_data(event.mimeData())
+        self._drop_in_progress = False
         if not paths:
+            self._debug_drop("drop", event, accepted=False)
             event.ignore()
             return
         index: QModelIndex = self.indexAt(event.position().toPoint())
-        self.paths_dropped.emit(paths, index, event.modifiers(), event.source())
+        source = event.source()
+        internal = bool(
+            is_internal_path_mime(event.mimeData())
+            and source in {self, self.viewport()}
+        )
+        self._debug_drop(
+            "drop",
+            event,
+            accepted=True,
+            internal=internal,
+            path_count=len(paths),
+        )
+        self.paths_dropped.emit(
+            paths,
+            index,
+            event.modifiers(),
+            self if internal else None,
+        )
         event.acceptProposedAction()
+
+    @property
+    def drop_in_progress(self) -> bool:
+        return self._drop_in_progress
+
+    def paintEvent(self, event: QPaintEvent) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        if self._notify_after_next_paint:
+            self._notify_after_next_paint = False
+            self.paintCompleted.emit()
+
+    def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
+        return super().eventFilter(watched, event)
+
+    def viewportEvent(self, event) -> bool:  # type: ignore[override]
+        event_type = event.type()
+        if event_type == QEvent.Type.DragEnter:
+            self.dragEnterEvent(event)
+            return event.isAccepted()
+        if event_type == QEvent.Type.DragMove:
+            self.dragMoveEvent(event)
+            return event.isAccepted()
+        if event_type == QEvent.Type.DragLeave:
+            self.dragLeaveEvent(event)
+            return True
+        if event_type == QEvent.Type.Drop:
+            self.dropEvent(event)
+            return event.isAccepted()
+        return super().viewportEvent(event)
+
+    @staticmethod
+    def _debug_drop(
+        name: str,
+        event,
+        *,
+        accepted: bool,
+        internal: bool | None = None,
+        path_count: int | None = None,
+    ) -> None:
+        logger = logging.getLogger("nivisviewer.browser_drop")
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        mime = event.mimeData()
+        logger.debug(
+            "%s receiver=ExplorerListView.viewport formats=%s internal=%s "
+            "paths=%s position=%s accepted=%s",
+            name,
+            tuple(mime.formats()),
+            internal,
+            path_count,
+            event.position().toPoint(),
+            accepted,
+        )
 
 
 class PathDropTreeView(QTreeView):

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QModelIndex, QObject, QTimer
+from PySide6.QtCore import QModelIndex, QObject, QTimer, Signal
 from PySide6.QtWidgets import QFileSystemModel, QTreeView
 
 
@@ -11,6 +11,8 @@ TREE_SYNC_MODES = {"off", "select_current", "focus_current"}
 
 
 class FolderTreeSyncController(QObject):
+    sync_finished = Signal(int, str)
+
     def __init__(
         self,
         tree: QTreeView,
@@ -66,6 +68,7 @@ class FolderTreeSyncController(QObject):
         self._retry_count = 0
         if self._mode == "off":
             self._target = None
+            self.sync_finished.emit(self.generation, str(path))
         else:
             self._attempt(self.generation)
         return self.generation
@@ -93,6 +96,10 @@ class FolderTreeSyncController(QObject):
             self._retry_count += 1
             if self._retry_count <= self.maximum_retries:
                 QTimer.singleShot(50, lambda: self._attempt(generation))
+            else:
+                target = str(self._target)
+                self._target = None
+                self.sync_finished.emit(generation, target)
             return
 
         ancestor_indexes: list[QModelIndex] = []
@@ -149,6 +156,7 @@ class FolderTreeSyncController(QObject):
                 set_programmatic_sync(False)
             self.applying = False
         self._target = None
+        self.sync_finished.emit(generation, str(self.model.filePath(index)))
 
     @staticmethod
     def _focused_root_index(

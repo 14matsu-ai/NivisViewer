@@ -68,6 +68,12 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
+## Windows ExplorerからBrowser中央へのドロップ確認
+
+NivisViewerを管理者権限ではなく通常ユーザーとして起動し、ExplorerからBrowser中央の項目上と空白上へファイルをドロップします。cursorが受理表示になり、ファイルの親フォルダを表示して対象を選択・中央表示し、Viewerを開かないことを確認します。フォルダをドロップした場合はそのフォルダを表示します。複数ファイルでは同じ親の項目を選択し、別の親にある項目は件数だけを通知します。HTTP／HTTPS URLは受理しません。
+
+Browser中央へのExplorer dropはコピー／移動ではなく「場所を表示」です。NivisViewer内の項目をフォルダ項目、フォルダツリー、お気に入りへdropした場合だけ、既存のコピー／移動操作になります。
+
 ## License
 
 NivisViewer本体は[MIT License](LICENSE)で公開します。直接依存するソフトウェアについては[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)を参照してください。
