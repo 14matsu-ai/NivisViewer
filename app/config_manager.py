@@ -45,6 +45,7 @@ class ConfigManager(QObject):
         "video_thumbnail_backend": "auto",
         "ffmpeg_executable": "",
         "browser_external_drop_behavior": "focus_only",
+        "file_operation_destinations": [],
         "browser_sort_key": "name",
         "browser_sort_order": "ascending",
         "browser_folders_first": True,

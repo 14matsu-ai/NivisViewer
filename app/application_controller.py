@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QObject, QTimer, Signal
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 from natsort import natsorted
 
 from .archive_backend import (
@@ -18,6 +18,9 @@ from .archive_backend_registry import ArchiveBackendRegistry
 from .browser_window import BrowserWindow
 from .config_manager import ConfigManager
 from .file_operation_coordinator import FileOperationCoordinator
+from .file_conflict_dialog import ConflictResolutionDialog
+from .file_operation_panel import FileOperationPanel
+from .file_operation_queue import FileOperationQueue
 from .image_source import (
     ARCHIVE_EXTENSIONS,
     BOOK_FILE_EXTENSIONS,
@@ -72,9 +75,11 @@ class ApplicationController(QObject):
         self.image_work_coordinator = ImageWorkCoordinator(self, max_workers=2)
         self.file_registration_service = file_registration_service
         self.config.settings_changed.connect(self._on_controller_settings_changed)
+        self.file_operation_queue = FileOperationQueue(self)
         self.file_operation_coordinator = FileOperationCoordinator(
             self.metadata_store,
             self,
+            queue=self.file_operation_queue,
         )
         self._migrate_legacy_metadata()
         self._window_factory = window_factory
@@ -83,11 +88,20 @@ class ApplicationController(QObject):
         self._active_viewer: ViewerWindow | None = None
         self._browser_window: BrowserWindow | None = None
         self._shutdown = False
+        self._operation_fallback_panel: FileOperationPanel | None = None
+        self._operation_conflict_dialog: ConflictResolutionDialog | None = None
+        self._continue_operations_without_main_window = False
         self._quit_requested = False
         self._restore_on_start = True
         self.quit_when_last_viewer_closed = False
         self.application.setQuitOnLastWindowClosed(False)
         self.application.aboutToQuit.connect(self.shutdown)
+        self.file_operation_queue.operation_completed.connect(
+            self._on_background_file_operation_completed
+        )
+        self.file_operation_queue.conflicts_required.connect(
+            self._on_background_conflicts_required
+        )
 
     @property
     def viewer_windows(self) -> tuple[ViewerWindow, ...]:
@@ -159,6 +173,7 @@ class ApplicationController(QObject):
             restore_initial_location=self._restore_on_start,
         )
         self._browser_window = window
+        window._application_close_guard = self._allow_window_close
         self._quit_requested = False
         window.closing.connect(self._on_browser_closing)
         window.destroyed.connect(
@@ -192,6 +207,7 @@ class ApplicationController(QObject):
             image_work_coordinator=self.image_work_coordinator,
         )
         self._viewer_windows.append(window)
+        window._application_close_guard = self._allow_window_close
         self._active_viewer = window
         self._quit_requested = False
         window.activated.connect(self._on_viewer_activated)
@@ -326,6 +342,12 @@ class ApplicationController(QObject):
         if browser is not None:
             browser.prepare_shutdown()
         self.file_operation_coordinator.close()
+        if self._operation_conflict_dialog is not None:
+            self._operation_conflict_dialog.close()
+            self._operation_conflict_dialog = None
+        if self._operation_fallback_panel is not None:
+            self._operation_fallback_panel.close()
+            self._operation_fallback_panel = None
         self.archive_backend_registry.close()
         self.pdfium_service.shutdown()
         self.image_work_coordinator.shutdown()
@@ -452,6 +474,8 @@ class ApplicationController(QObject):
     def _on_browser_closing(self, window: object) -> None:
         if isinstance(window, BrowserWindow) and window is self._browser_window:
             self._unregister_browser(window)
+            if self.file_operation_queue.busy:
+                self._show_operation_fallback()
 
     def _on_browser_destroyed(self, window_id: int) -> None:
         browser = self._browser_window
@@ -490,7 +514,94 @@ class ApplicationController(QObject):
 
     def _evaluate_application_exit(self) -> None:
         if self._browser_window is None and not self._viewer_windows:
+            if (
+                self.file_operation_queue.busy
+                and self._continue_operations_without_main_window
+            ):
+                self._show_operation_fallback()
+                return
             self._request_application_exit()
+
+    def _allow_window_close(self, window: QWidget) -> bool:
+        if not self.file_operation_queue.busy:
+            return True
+        is_last = (
+            window is self._browser_window and not self._viewer_windows
+        ) or (
+            window in self._viewer_windows
+            and self._browser_window is None
+            and len(self._viewer_windows) == 1
+        )
+        if not is_last:
+            return True
+        answer = QMessageBox.question(
+            window,
+            "ファイル操作を実行中",
+            "ファイル操作を実行中です。\n"
+            "［はい］: 操作を続けてウィンドウを閉じる\n"
+            "［いいえ］: 操作をキャンセルして閉じる\n"
+            "［キャンセル］: ウィンドウを閉じない",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Cancel:
+            return False
+        if answer == QMessageBox.StandardButton.No:
+            self.file_operation_queue.cancel()
+            self._continue_operations_without_main_window = False
+            return True
+        self._continue_operations_without_main_window = True
+        self._show_operation_fallback()
+        return True
+
+    def _show_operation_fallback(self) -> None:
+        if self._operation_fallback_panel is None:
+            panel = FileOperationPanel()
+            panel.setWindowTitle("NivisViewer - ファイル操作")
+            panel.bind(self.file_operation_queue)
+            self._operation_fallback_panel = panel
+        active = self.file_operation_queue.active_operation
+        state = self.file_operation_queue.active_state
+        if active is not None and state is not None:
+            self._operation_fallback_panel.show_state(
+                active.operation.value,
+                state,
+            )
+        self._operation_fallback_panel.show()
+
+    def _on_background_file_operation_completed(self, _result: object) -> None:
+        if self.file_operation_queue.busy:
+            return
+        if self._operation_fallback_panel is not None:
+            self._operation_fallback_panel.hide()
+        if (
+            self._continue_operations_without_main_window
+            and self._browser_window is None
+            and not self._viewer_windows
+        ):
+            self._continue_operations_without_main_window = False
+            QTimer.singleShot(0, self._evaluate_application_exit)
+
+    def _on_background_conflicts_required(self, plan: object) -> None:
+        if self._browser_window is not None or self._shutdown:
+            return
+        dialog = ConflictResolutionDialog(plan, self.get_active_viewer())
+        self._operation_conflict_dialog = dialog
+        dialog.resolved.connect(
+            lambda operation_id, resolutions, apply_same: (
+                self.file_operation_queue.resolve_conflicts(
+                    operation_id,
+                    resolutions,
+                    apply_to_same_kind=apply_same,
+                )
+            )
+        )
+        dialog.finished.connect(
+            lambda _result: setattr(self, "_operation_conflict_dialog", None)
+        )
+        dialog.open()
 
     def _request_application_exit(self) -> None:
         if self._quit_requested:

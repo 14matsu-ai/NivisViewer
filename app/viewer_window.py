@@ -2457,6 +2457,10 @@ class ViewerWindow(QMainWindow):
             self.pdfium_service.shutdown()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
+        guard = getattr(self, "_application_close_guard", None)
+        if callable(guard) and not guard(self):
+            event.ignore()
+            return
         self.prepare_shutdown()
         self.closing.emit(self)
         super().closeEvent(event)
