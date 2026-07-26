@@ -59,6 +59,7 @@ class ThumbnailDiskCache:
         limit_mb: int = 512,
         limit_bytes: int | None = None,
         cleanup_interval: int = 32,
+        max_unused_days: int = 0,
     ) -> None:
         self.cache_dir = Path(cache_dir)
         self.files_dir = self.cache_dir / "files"
@@ -69,6 +70,7 @@ class ThumbnailDiskCache:
             else max(128, min(4096, int(limit_mb))) * 1024 * 1024
         )
         self.cleanup_interval = max(2, int(cleanup_interval))
+        self.max_unused_days = self._normalize_unused_days(max_unused_days)
         self._lock = threading.RLock()
         self._connection: sqlite3.Connection | None = None
         self._pending_accesses: dict[str, float] = {}
@@ -93,6 +95,29 @@ class ThumbnailDiskCache:
 
     def set_limit_mb(self, limit_mb: int) -> None:
         self.limit_bytes = max(128, min(4096, int(limit_mb))) * 1024 * 1024
+
+    def set_max_unused_days(self, days: int) -> None:
+        self.max_unused_days = self._normalize_unused_days(days)
+
+    def touch_source_tokens(
+        self,
+        requests: tuple[tuple[str, int], ...],
+    ) -> None:
+        with self._lock:
+            if not self.enabled or self._connection is None or not requests:
+                return
+            now = time.time()
+            self._connection.executemany(
+                """
+                UPDATE entries SET last_used = ?
+                 WHERE source_path = ? AND thumbnail_size = ?
+                """,
+                (
+                    (now, self._normalize_path(Path(path)), int(token))
+                    for path, token in requests
+                ),
+            )
+            self._connection.commit()
 
     def get(self, item: BrowserItem, thumbnail_size: int) -> QImage | None:
         with self._lock:
@@ -246,6 +271,7 @@ class ThumbnailDiskCache:
         *,
         cover_path: str | Path | None = None,
         entry_path: str = "",
+        protected_thumbnail_sizes: set[int] | None = None,
     ) -> bool:
         with self._lock:
             if (
@@ -333,6 +359,14 @@ class ThumbnailDiskCache:
                         now,
                     ),
                 )
+                self._enforce_source_caps(
+                    fingerprint.source_path,
+                    fingerprint.item_kind,
+                    fingerprint.entry_path,
+                    family_token,
+                    current_key=key,
+                    protected_thumbnail_sizes=protected_thumbnail_sizes or set(),
+                )
                 self._connection.commit()
                 self._saves_since_cleanup += 1
                 if self._saves_since_cleanup >= self.cleanup_interval:
@@ -359,6 +393,25 @@ class ThumbnailDiskCache:
             except sqlite3.DatabaseError:
                 return 0
 
+    def cleanup_if_due(self, *, force: bool = False) -> int:
+        with self._lock:
+            if not self.enabled or self._connection is None:
+                return 0
+            row = self._connection.execute(
+                "SELECT value FROM maintenance WHERE key = 'last_cleanup'"
+            ).fetchone()
+            last_cleanup = float(row[0]) if row is not None else 0.0
+            now = time.time()
+            if not force and now - last_cleanup < 86400:
+                return 0
+            removed = self.prune(remove_orphans=True)
+            self._connection.execute(
+                "INSERT OR REPLACE INTO maintenance(key, value) VALUES (?, ?)",
+                ("last_cleanup", str(now)),
+            )
+            self._connection.commit()
+            return removed
+
     def flush_accesses(self) -> None:
         with self._lock:
             if (
@@ -378,17 +431,35 @@ class ThumbnailDiskCache:
             except sqlite3.DatabaseError as exc:
                 self.last_error = str(exc)
 
-    def prune(self, *, remove_orphans: bool = False) -> int:
+    def prune(
+        self,
+        *,
+        remove_orphans: bool = False,
+        max_unused_days: int | None = None,
+    ) -> int:
         with self._lock:
             if not self.enabled or self._connection is None:
                 return 0
             self.flush_accesses()
             try:
+                removed = 0
+                days = (
+                    self.max_unused_days
+                    if max_unused_days is None
+                    else self._normalize_unused_days(max_unused_days)
+                )
+                if days:
+                    cutoff = time.time() - days * 86400
+                    expired = self._connection.execute(
+                        "SELECT cache_key, file_name FROM entries WHERE last_used < ?",
+                        (cutoff,),
+                    ).fetchall()
+                    self._remove_entries_without_commit(expired)
+                    removed += len(expired)
                 rows = self._connection.execute(
                     "SELECT cache_key, file_name, byte_size, last_used FROM entries "
                     "ORDER BY last_used ASC"
                 ).fetchall()
-                removed = 0
                 valid_rows: list[tuple[str, str, int, float]] = []
                 for key, file_name, byte_size, last_used in rows:
                     if not (self.files_dir / file_name).is_file():
@@ -399,23 +470,6 @@ class ThumbnailDiskCache:
                         removed += 1
                     else:
                         valid_rows.append((key, file_name, int(byte_size), float(last_used)))
-
-                total = sum(row[2] for row in valid_rows)
-                target = int(self.limit_bytes * 0.9)
-                if total > self.limit_bytes:
-                    for key, file_name, byte_size, _last_used in valid_rows:
-                        if total <= target:
-                            break
-                        try:
-                            (self.files_dir / file_name).unlink(missing_ok=True)
-                        except OSError:
-                            continue
-                        self._connection.execute(
-                            "DELETE FROM entries WHERE cache_key = ?",
-                            (key,),
-                        )
-                        total -= byte_size
-                        removed += 1
 
                 if remove_orphans and self.files_dir.exists():
                     known_files = {
@@ -432,6 +486,85 @@ class ThumbnailDiskCache:
                             removed += 1
                         except OSError:
                             continue
+
+                variants = self._connection.execute(
+                    """
+                    SELECT DISTINCT source_path, item_kind, entry_path, family_token
+                      FROM entries
+                     WHERE format_version = ?
+                    """,
+                    (self.format_version,),
+                ).fetchall()
+                for source_path, item_kind, entry_path, family_token in variants:
+                    cap_rows = self._connection.execute(
+                        """
+                        SELECT cache_key, file_name, thumbnail_size, last_used
+                          FROM entries
+                         WHERE source_path = ? AND item_kind = ? AND entry_path = ?
+                           AND family_token = ? AND format_version = ?
+                         ORDER BY last_used DESC
+                        """,
+                        (
+                            source_path,
+                            item_kind,
+                            entry_path,
+                            family_token,
+                            self.format_version,
+                        ),
+                    ).fetchall()
+                    removed += self._trim_rows(
+                        cap_rows,
+                        limit=2,
+                        current_key="",
+                        protected_thumbnail_sizes=set(),
+                    )
+
+                items = self._connection.execute(
+                    """
+                    SELECT DISTINCT source_path, item_kind, entry_path
+                      FROM entries
+                     WHERE format_version = ?
+                    """,
+                    (self.format_version,),
+                ).fetchall()
+                for source_path, item_kind, entry_path in items:
+                    cap_rows = self._connection.execute(
+                        """
+                        SELECT cache_key, file_name, thumbnail_size, last_used
+                          FROM entries
+                         WHERE source_path = ? AND item_kind = ? AND entry_path = ?
+                           AND format_version = ?
+                         ORDER BY last_used DESC
+                        """,
+                        (source_path, item_kind, entry_path, self.format_version),
+                    ).fetchall()
+                    removed += self._trim_rows(
+                        cap_rows,
+                        limit=4,
+                        current_key="",
+                        protected_thumbnail_sizes=set(),
+                    )
+
+                lru_rows = self._connection.execute(
+                    "SELECT cache_key, file_name, byte_size, last_used FROM entries "
+                    "ORDER BY last_used ASC"
+                ).fetchall()
+                total = sum(int(row[2]) for row in lru_rows)
+                target = int(self.limit_bytes * 0.9)
+                if total > self.limit_bytes:
+                    for key, file_name, byte_size, _last_used in lru_rows:
+                        if total <= target:
+                            break
+                        try:
+                            (self.files_dir / file_name).unlink(missing_ok=True)
+                        except OSError:
+                            continue
+                        self._connection.execute(
+                            "DELETE FROM entries WHERE cache_key = ?",
+                            (key,),
+                        )
+                        total -= int(byte_size)
+                        removed += 1
 
                 self._connection.commit()
                 self._saves_since_cleanup = 0
@@ -548,6 +681,14 @@ class ThumbnailDiskCache:
             """
         )
         self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS maintenance (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
             "CREATE INDEX IF NOT EXISTS lookup_entries "
             "ON entries(source_path, item_kind, thumbnail_size, format_version)"
         )
@@ -593,6 +734,14 @@ class ThumbnailDiskCache:
 
     def _remove_entries(self, entries: list[tuple[str, str]]) -> None:
         assert self._connection is not None
+        self._remove_entries_without_commit(entries)
+        self._connection.commit()
+
+    def _remove_entries_without_commit(
+        self,
+        entries: list[tuple[str, str]] | tuple[tuple[str, str], ...],
+    ) -> None:
+        assert self._connection is not None
         for key, file_name in entries:
             try:
                 (self.files_dir / file_name).unlink(missing_ok=True)
@@ -603,7 +752,96 @@ class ThumbnailDiskCache:
                 (key,),
             )
             self._pending_accesses.pop(key, None)
-        self._connection.commit()
+
+    def _enforce_source_caps(
+        self,
+        source_path: str,
+        item_kind: str,
+        entry_path: str,
+        family_token: int,
+        *,
+        current_key: str,
+        protected_thumbnail_sizes: set[int],
+    ) -> None:
+        assert self._connection is not None
+        protected = {int(value) for value in protected_thumbnail_sizes}
+        variant_rows = self._connection.execute(
+            """
+            SELECT cache_key, file_name, thumbnail_size, last_used
+              FROM entries
+             WHERE source_path = ? AND item_kind = ? AND entry_path = ?
+               AND family_token = ? AND format_version = ?
+             ORDER BY last_used DESC
+            """,
+            (
+                source_path,
+                item_kind,
+                entry_path,
+                family_token,
+                self.format_version,
+            ),
+        ).fetchall()
+        self._trim_rows(
+            variant_rows,
+            limit=2,
+            current_key=current_key,
+            protected_thumbnail_sizes=protected,
+        )
+        item_rows = self._connection.execute(
+            """
+            SELECT cache_key, file_name, thumbnail_size, last_used,
+                   family_token
+              FROM entries
+             WHERE source_path = ? AND item_kind = ? AND entry_path = ?
+               AND format_version = ?
+             ORDER BY CASE WHEN family_token = ? THEN 0 ELSE 1 END,
+                      last_used DESC
+            """,
+            (
+                source_path,
+                item_kind,
+                entry_path,
+                self.format_version,
+                family_token,
+            ),
+        ).fetchall()
+        self._trim_rows(
+            [row[:4] for row in item_rows],
+            limit=4,
+            current_key=current_key,
+            protected_thumbnail_sizes=protected,
+        )
+
+    def _trim_rows(
+        self,
+        rows: list[tuple[object, ...]],
+        *,
+        limit: int,
+        current_key: str,
+        protected_thumbnail_sizes: set[int],
+    ) -> int:
+        if len(rows) <= limit:
+            return 0
+        keep: set[str] = {current_key} if current_key else set()
+        for key, _file_name, thumbnail_size, _last_used in rows:
+            if int(thumbnail_size) in protected_thumbnail_sizes:
+                keep.add(str(key))
+        for key, _file_name, _thumbnail_size, _last_used in rows:
+            if len(keep) >= limit:
+                break
+            keep.add(str(key))
+        victims = [
+            (str(key), str(file_name))
+            for key, file_name, _thumbnail_size, _last_used in rows
+            if str(key) not in keep
+        ]
+        self._remove_entries_without_commit(victims)
+        return len(victims)
+
+    @staticmethod
+    def _normalize_unused_days(days: int) -> int:
+        value = max(0, min(3650, int(days)))
+        return value if value == 0 or value >= 7 else 7
 
     def _close_connection(self) -> None:
         connection = self._connection

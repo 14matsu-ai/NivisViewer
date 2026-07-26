@@ -150,6 +150,7 @@ class BrowserThumbnailProvider(QObject):
         self._cache_capacity = max(1, cache_capacity)
         self._cache: OrderedDict[tuple[str, int, float | None], QImage] = OrderedDict()
         self._cache_specs: dict[int, ThumbnailRenderSpec] = {}
+        self._active_request_tokens: dict[str, set[int]] = {}
         self._pending: dict[tuple[str, int, int], _PendingThumbnail] = {}
         self._pending_lock = Lock()
         self._failure_lock = Lock()
@@ -177,6 +178,7 @@ class BrowserThumbnailProvider(QObject):
 
     def begin_generation(self) -> int:
         self._generation += 1
+        self._active_request_tokens.clear()
         with self._pending_lock:
             for pending in self._pending.values():
                 pending.worker.cancelled.set()
@@ -208,6 +210,7 @@ class BrowserThumbnailProvider(QObject):
             normalized_size = max(16, min(1024, int(size)))
             cache_token = normalized_size
         path_key = self._path_key(item.path)
+        self._active_request_tokens.setdefault(path_key, set()).add(cache_token)
         cache_key = (path_key, cache_token, item.modified_at)
         cached = self._cache.get(cache_key)
         if cached is not None:
@@ -378,6 +381,40 @@ class BrowserThumbnailProvider(QObject):
             16,
             self._generation,
             lambda _item, _size: prune_disk(),
+        )
+        self._start_worker(worker, ThumbnailPriority.PREFETCH)
+
+    def set_disk_cache_max_unused_days(self, days: int) -> None:
+        if self._disk_cache is not None:
+            self._disk_cache.set_max_unused_days(days)
+            self.cleanup_caches_async(force=True)
+
+    def cleanup_caches_async(self, *, force: bool = True) -> None:
+        disk_cache = self._disk_cache
+        if disk_cache is None or not self._disk_cache_enabled:
+            return
+
+        item = BrowserItem(
+            display_name="cache-cleanup",
+            path=disk_cache.cache_dir,
+            kind=BrowserItemKind.FOLDER,
+            modified_at=None,
+        )
+        def cleanup() -> ThumbnailLoadResult:
+            protected = tuple(
+                (path, token)
+                for path, tokens in self._active_request_tokens.items()
+                for token in tokens
+            )
+            disk_cache.touch_source_tokens(protected)
+            disk_cache.cleanup_if_due(force=force)
+            return ThumbnailLoadResult(None)
+
+        worker = _ThumbnailWorker(
+            item,
+            16,
+            self._generation,
+            lambda _item, _size: cleanup(),
         )
         self._start_worker(worker, ThumbnailPriority.PREFETCH)
 
@@ -591,6 +628,7 @@ class BrowserThumbnailProvider(QObject):
                 result.image,
                 cover_path=result.cover_path,
                 entry_path=result.entry_path,
+                protected_thumbnail_sizes=self._protected_thumbnail_sizes(item),
             )
         return ThumbnailLoadResult(
             result.image,
@@ -622,7 +660,18 @@ class BrowserThumbnailProvider(QObject):
             if self._maintenance_started:
                 return
             self._maintenance_started = True
-        disk_cache.prune()
+        disk_cache.cleanup_if_due()
+
+    def _protected_thumbnail_sizes(self, item: BrowserItem) -> set[int]:
+        path_key = self._path_key(item.path)
+        protected = set(self._active_request_tokens.get(path_key, set()))
+        with self._pending_lock:
+            protected.update(
+                token
+                for cached_path, token, _generation in self._pending
+                if cached_path == path_key
+            )
+        return protected
 
     @staticmethod
     def _pdf_render_priority(priority: ThumbnailPriority) -> int:

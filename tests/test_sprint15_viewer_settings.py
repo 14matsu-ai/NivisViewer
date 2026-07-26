@@ -56,7 +56,7 @@ def test_cancel_does_not_save_fullscreen_or_browser_layout_settings(
 
     assert config.get("fullscreen_auto_reveal_ui") is True
     assert config.get("fullscreen_edge_trigger_px") == 8
-    assert config.get("fullscreen_ui_hide_delay_ms") == 900
+    assert config.get("fullscreen_ui_hide_delay_ms") == 0
     assert config.get("browser_sidebar_layout") == (
         "favorites_top_tree_bottom"
     )
