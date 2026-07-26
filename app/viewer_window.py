@@ -36,7 +36,8 @@ from .archive_backend import EXTERNAL_ARCHIVE_EXTENSIONS
 from .archive_backend_registry import ArchiveBackendRegistry
 from .book_session import AsyncBookOpenFailed, BookOpened, BookSession
 from .config_manager import ConfigManager
-from .drag_drop import ExternalDropOpenController, FolderDropProbe
+from .drag_drop import FolderDropProbe
+from .external_drop_open import ExternalDropOpenController
 from .fullscreen_chrome import FullscreenChromeController
 from .image_cache import CachedImage, PRELOAD_RADIUS
 from .image_work_coordinator import ImageWorkCoordinator
@@ -324,6 +325,22 @@ class ViewerWindow(QMainWindow):
             edge_trigger_px=self.fullscreen_edge_trigger_px,
             hide_delay_ms=self.fullscreen_ui_hide_delay_ms,
         )
+        self.viewer.set_auto_hide_cursor(False)
+        drop_targets = (
+            self.viewer,
+            central,
+            self.fullscreen_chrome.top_overlay,
+            self.fullscreen_chrome.bottom_overlay,
+            self.fullscreen_chrome.fullscreen_menu_bar,
+            self.fullscreen_chrome.fullscreen_status_bar,
+            self.menuBar(),
+            self.slider,
+            self.status,
+        )
+        self._drop_targets = drop_targets
+        for target in drop_targets:
+            target.setAcceptDrops(True)
+            target.installEventFilter(self)
 
     def _create_menus(self) -> None:
         menu_bar = self.menuBar()
@@ -691,6 +708,15 @@ class ViewerWindow(QMainWindow):
 
     def apply_settings(self, changed: dict[str, object]) -> None:
         refresh = False
+        fullscreen_policy_changed = False
+        if "hide_ui_in_fullscreen" in changed:
+            self.hide_ui_in_fullscreen = bool(changed["hide_ui_in_fullscreen"])
+            fullscreen_policy_changed = True
+        if "hide_cursor_in_fullscreen" in changed:
+            self.hide_cursor_in_fullscreen = bool(
+                changed["hide_cursor_in_fullscreen"]
+            )
+            fullscreen_policy_changed = True
         if "gap" in changed:
             self.gap = max(0, min(100, int(changed["gap"])))
             self.viewer.set_gap(self.gap)
@@ -745,6 +771,8 @@ class ViewerWindow(QMainWindow):
                 hide_delay_ms=self.fullscreen_ui_hide_delay_ms,
             )
             self.fullscreen_chrome.reevaluate_visibility()
+        if fullscreen_policy_changed:
+            self._apply_chrome_visibility()
         if (
             {
                 "archive_backend_preference",
@@ -912,7 +940,7 @@ class ViewerWindow(QMainWindow):
             self.metadata_store.record_book_opened(
                 self._metadata_book_path,
                 item_type=self._metadata_item_type(opened.source_path),
-                start_page_index=self.model.current_index,
+                start_page_index=self.model.focused_index,
                 total_pages=self.model.total_pages,
             )
 
@@ -923,7 +951,7 @@ class ViewerWindow(QMainWindow):
         self._clear_page_history()
         self._rebuild_page_list()
         self._first_frame_image_id = self.model.image_id_at(
-            self.model.current_index
+            self.model.focused_index
         )
         self._refresh_view()
         performance_trace.mark(
@@ -973,7 +1001,7 @@ class ViewerWindow(QMainWindow):
         positions = self.settings.get("reading_positions")
         if not isinstance(positions, dict):
             positions = {}
-        positions[self._current_book_key] = self.model.current_index
+        positions[self._current_book_key] = self.model.focused_index
         while len(positions) > 100:
             oldest_key = next(iter(positions))
             del positions[oldest_key]
@@ -990,7 +1018,7 @@ class ViewerWindow(QMainWindow):
             return
         self.metadata_store.update_reading_progress(
             self._metadata_book_path,
-            page_index=self.model.current_index,
+            page_index=self.model.focused_index,
             total_pages=self.model.total_pages,
         )
 
@@ -1012,7 +1040,7 @@ class ViewerWindow(QMainWindow):
     def _record_page_history(self, previous_index: int) -> None:
         if not 0 <= previous_index < self.model.total_pages:
             return
-        if previous_index == self.model.current_index:
+        if previous_index == self.model.focused_index:
             return
         if self._page_history_back and self._page_history_back[-1] == previous_index:
             self._page_history_forward.clear()
@@ -1026,12 +1054,13 @@ class ViewerWindow(QMainWindow):
     def _go_to_index_with_history(self, page_index: int, *, raw: bool = False) -> bool:
         if self.model.total_pages <= 0:
             return False
-        old = self.model.current_index
+        old = self.model.focused_index
+        old_start = self.model.current_index
         if raw:
             self.model.go_to_raw_index(page_index)
         else:
             self.model.go_to_index(page_index)
-        if self.model.current_index == old:
+        if self.model.current_index == old_start and self.model.focused_index == old:
             return False
         self._record_page_history(old)
         self.book_session.notify_page_changed()
@@ -1041,9 +1070,10 @@ class ViewerWindow(QMainWindow):
     def _go_to_model_move_with_history(self, move) -> bool:
         if self.model.total_pages <= 0:
             return False
-        old = self.model.current_index
+        old = self.model.focused_index
+        old_start = self.model.current_index
         move()
-        if self.model.current_index == old:
+        if self.model.current_index == old_start and self.model.focused_index == old:
             return False
         self._record_page_history(old)
         self.book_session.notify_page_changed()
@@ -1053,7 +1083,7 @@ class ViewerWindow(QMainWindow):
     def go_back_in_page_history(self) -> None:
         if self.model.total_pages <= 0 or not self._page_history_back:
             return
-        current = self.model.current_index
+        current = self.model.focused_index
         target = self._page_history_back.pop()
         if 0 <= current < self.model.total_pages:
             self._page_history_forward.append(current)
@@ -1066,7 +1096,7 @@ class ViewerWindow(QMainWindow):
     def go_forward_in_page_history(self) -> None:
         if self.model.total_pages <= 0 or not self._page_history_forward:
             return
-        current = self.model.current_index
+        current = self.model.focused_index
         target = self._page_history_forward.pop()
         if 0 <= current < self.model.total_pages:
             self._page_history_back.append(current)
@@ -1120,12 +1150,14 @@ class ViewerWindow(QMainWindow):
     def copy_current_image_path(self) -> None:
         if self.model.total_pages <= 0:
             return
-        QApplication.clipboard().setText(self.model.display_path_for_index(self.model.current_index))
+        QApplication.clipboard().setText(
+            self.model.display_path_for_index(self.model.focused_index)
+        )
 
     def copy_current_image(self) -> None:
         if self.model.total_pages <= 0:
             return
-        cached = self.image_cache.get(self.model.current_index)
+        cached = self.image_cache.get(self.model.focused_index)
         if cached is not None and cached.qimage is not None:
             QApplication.clipboard().setImage(cached.qimage)
 
@@ -1137,7 +1169,7 @@ class ViewerWindow(QMainWindow):
     def show_page_info(self) -> None:
         if self.model.total_pages <= 0:
             return
-        page_index = self.model.current_index
+        page_index = self.model.focused_index
         cached = self.image_cache.get(page_index)
         resolution = ""
         if cached is not None and cached.original_size is not None:
@@ -1483,7 +1515,7 @@ class ViewerWindow(QMainWindow):
         target_item = None
         for row in range(self.page_list.count()):
             item = self.page_list.item(row)
-            if item is not None and item.data(Qt.ItemDataRole.UserRole) == self.model.current_index:
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == self.model.focused_index:
                 target_item = item
                 break
         if target_item is None:
@@ -1560,6 +1592,13 @@ class ViewerWindow(QMainWindow):
     def _refresh_view(self) -> None:
         if hasattr(self, "fullscreen_chrome"):
             self.fullscreen_chrome.reevaluate_visibility()
+        if self._awaiting_first_frame:
+            focused_image_id = self.model.image_id_at(self.model.focused_index)
+            if focused_image_id is not None:
+                # Navigation can occur before the original first frame paints.
+                # Move the gate to the newly requested identity so an old page
+                # cannot keep spread-partner work blocked indefinitely.
+                self._first_frame_image_id = focused_image_id
         self._active_request_id += 1
         spread = self.model.spread_at()
         self._visible_page_indexes = tuple(slot.page_index for slot in spread.slots)
@@ -1644,13 +1683,20 @@ class ViewerWindow(QMainWindow):
             "viewer.result.arrived",
             f"page={cached.page_index}",
         )
-        self.model.set_image_size(cached.page_index, cached.original_size)
+        repositioned = self.model.set_image_size(
+            cached.page_index,
+            cached.original_size,
+        )
+        if repositioned:
+            self._update_page_list_thumbnail(cached)
+            self._refresh_view()
+            return
         if cached.page_index not in self._visible_page_indexes:
             self._update_page_list_thumbnail(cached)
             return
         if (
             self._awaiting_first_frame
-            and cached.page_index == self.model.current_index
+            and cached.image_id == self._first_frame_image_id
         ):
             # The logical current page has completed decoding, so the reserved
             # Viewer lane may now continue with its spread partner and nearby
@@ -1840,7 +1886,25 @@ class ViewerWindow(QMainWindow):
             return
         super().dragEnterEvent(event)
 
+    def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
+        if watched in getattr(self, "_drop_targets", ()):
+            if event.type() in {QEvent.Type.DragEnter, QEvent.Type.DragMove}:
+                if ExternalDropOpenController.local_paths(event.mimeData()):
+                    event.acceptProposedAction()
+                    return True
+                event.ignore()
+                return True
+            if event.type() == QEvent.Type.Drop:
+                self._handle_drop_event(event)
+                return True
+        return super().eventFilter(watched, event)
+
     def dropEvent(self, event: QDropEvent) -> None:  # type: ignore[override]
+        if self._handle_drop_event(event):
+            return
+        super().dropEvent(event)
+
+    def _handle_drop_event(self, event: QDropEvent) -> bool:
         local_paths = ExternalDropOpenController.local_paths(event.mimeData())
         paths = ExternalDropOpenController.paths(event.mimeData())
         if local_paths:
@@ -1855,22 +1919,39 @@ class ViewerWindow(QMainWindow):
                     if self._shutdown_prepared:
                         return
                     allowed = set(paths) | set(folders)
-                    self._dispatch_dropped_paths(
-                        tuple(path for path in local_paths if path in allowed)
+                    dispatch = tuple(
+                        path for path in local_paths if path in allowed
                     )
+                    if dispatch:
+                        self._dispatch_dropped_paths(dispatch)
+                    else:
+                        self._set_status_override(
+                            "ドロップした項目はNivisViewerで表示できません",
+                            3000,
+                        )
 
                 worker.signals.finished.connect(finished)
                 QThreadPool.globalInstance().start(worker)
             event.acceptProposedAction()
-            return
-        super().dropEvent(event)
+            return True
+        event.ignore()
+        return False
 
     def _dispatch_dropped_paths(self, paths: tuple[str, ...]) -> None:
+        failures = 0
         for offset, path in enumerate(paths):
-            if self._open_path_handler is not None:
-                self._open_path_handler(path, offset > 0, self)
-            elif offset == 0:
-                self.open_path(path)
+            try:
+                if self._open_path_handler is not None:
+                    self._open_path_handler(path, offset > 0, self)
+                elif offset == 0:
+                    self.open_path(path)
+            except Exception:
+                failures += 1
+        if failures:
+            self._set_status_override(
+                f"{failures}件を開けませんでした",
+                3000,
+            )
 
     def _update_slider(self) -> None:
         total = max(1, self.model.total_pages)
@@ -1878,7 +1959,7 @@ class ViewerWindow(QMainWindow):
         self.slider.setEnabled(self.model.total_pages > 0)
         self.slider.setMinimum(1)
         self.slider.setMaximum(total)
-        self.slider.setValue(min(total, self.model.current_index + 1))
+        self.slider.setValue(min(total, self.model.focused_index + 1))
         self.slider.blockSignals(False)
 
     def _update_status(self) -> None:
@@ -1889,15 +1970,16 @@ class ViewerWindow(QMainWindow):
             self.status.showMessage("画像が読み込まれていません")
             return
 
-        path = self.model.display_path_for_index(self.model.current_index)
-        page_text = f"{self.model.current_index + 1} / {self.model.total_pages}"
+        focused_index = self.model.focused_index
+        path = self.model.display_path_for_index(focused_index)
+        page_text = f"{focused_index + 1} / {self.model.total_pages}"
         resolution = self.viewer.current_resolution_text()
         zoom = (
             f"{round(self.viewer.manual_zoom * 100)}%"
             if self.fit_mode == "manual_zoom"
             else ("100%" if self.fit_mode == "actual_size" else self.fit_mode)
         )
-        size = self._format_file_size(self.model.file_size_for_index(self.model.current_index))
+        size = self._format_file_size(self.model.file_size_for_index(focused_index))
         details = "    ".join(
             part for part in (path, page_text, resolution, zoom, size) if part
         )
@@ -2206,24 +2288,25 @@ class ViewerWindow(QMainWindow):
             self._apply_chrome_visibility()
 
     def _apply_chrome_visibility(self) -> None:
-        overlay_mode = self.isFullScreen() and self.hide_ui_in_fullscreen
-        self.fullscreen_chrome.set_active(overlay_mode)
-        show_chrome = not overlay_mode
-        if show_chrome:
-            self.menuBar().setVisible(True)
-            self.slider.setVisible(True)
-            self.status.setVisible(True)
-        self.page_list_dock.setVisible(show_chrome and self.show_page_list)
-        self._apply_cursor_visibility_policy()
-        self.fullscreen_chrome.reevaluate_visibility()
+        fullscreen = self.isFullScreen()
+        self.fullscreen_chrome.set_fullscreen_state(
+            fullscreen,
+            hide_ui=self.hide_ui_in_fullscreen,
+            hide_cursor=self.hide_cursor_in_fullscreen,
+        )
+        self.page_list_dock.setVisible(not fullscreen and self.show_page_list)
 
     def _apply_cursor_visibility_policy(self) -> None:
-        self.viewer.set_auto_hide_cursor(self.isFullScreen() and self.hide_cursor_in_fullscreen)
+        self.viewer.set_auto_hide_cursor(False)
+        self.fullscreen_chrome.set_hide_cursor_enabled(
+            self.isFullScreen() and self.hide_cursor_in_fullscreen
+        )
 
     def prepare_shutdown(self, *, wait_msecs: int = 250) -> None:
         if self._shutdown_prepared:
             return
         self._shutdown_prepared = True
+        self.fullscreen_chrome.shutdown()
         self._cancel_interactive_open()
         self.viewer.cancel_mouse_gesture()
         self.slideshow_timer.stop()

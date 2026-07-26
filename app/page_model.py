@@ -30,10 +30,20 @@ class PageModel:
         self.single_first_page = True
         self.treat_wide_image_as_single = True
         self._size_cache: dict[int, tuple[int, int] | None] = {}
+        self._focused_page_identity: str | None = None
 
     @property
     def total_pages(self) -> int:
         return len(self.image_ids)
+
+    @property
+    def focused_index(self) -> int:
+        resolved = self.index_for_identity(self._focused_page_identity)
+        return resolved if resolved >= 0 else self.current_index
+
+    @property
+    def focused_page_identity(self) -> str | None:
+        return self._focused_page_identity
 
     def set_source(self, source: ImageSource, selected_image: str | None = None) -> None:
         image_ids = source.list_images()
@@ -51,19 +61,27 @@ class PageModel:
 
         if not self.image_ids:
             self.current_index = 0
+            self._focused_page_identity = None
             return
 
-        if selected_image and selected_image in self.image_ids:
-            self.current_index = self.image_ids.index(selected_image)
+        selected_index = self.index_for_identity(selected_image)
+        if selected_index >= 0:
+            self._focused_page_identity = self.page_identity(selected_index)
+            # A lazily-sized selected page must be the first decode request.
+            # Its final DisplayUnit is reconciled by set_image_size().
+            self.current_index = selected_index
+            if not source.load_sizes_lazily:
+                self.current_index = self.spread_start_for_index(selected_index)
         else:
             self.current_index = 0
-        self.current_index = self.spread_start_for_index(self.current_index)
+            self._focused_page_identity = self.page_identity(0)
 
     def clear_source(self) -> None:
         self.source = None
         self.image_ids = []
         self.current_index = 0
         self._size_cache.clear()
+        self._focused_page_identity = None
 
     def update_options(
         self,
@@ -81,12 +99,32 @@ class PageModel:
             self.single_first_page = single_first_page
         if treat_wide_image_as_single is not None:
             self.treat_wide_image_as_single = treat_wide_image_as_single
-        self.current_index = self.spread_start_for_index(self.current_index)
+        self.current_index = self.spread_start_for_index(self.focused_index)
 
     def image_id_at(self, index: int) -> str | None:
         if 0 <= index < self.total_pages:
             return self.image_ids[index]
         return None
+
+    def page_identity(self, index: int) -> str | None:
+        image_id = self.image_id_at(index)
+        if image_id is None:
+            return None
+        if self.source is not None:
+            return self.source.page_identity(image_id)
+        return image_id
+
+    def index_for_identity(self, identity: str | None) -> int:
+        if not identity:
+            return -1
+        if self.source is not None:
+            resolved = self.source.index_for_identity(identity)
+            if 0 <= resolved < self.total_pages:
+                return resolved
+        for index, image_id in enumerate(self.image_ids):
+            if image_id == identity:
+                return index
+        return -1
 
     def display_path_for_index(self, index: int) -> str:
         image_id = self.image_id_at(index)
@@ -128,9 +166,14 @@ class PageModel:
         self._size_cache[index] = size
         return size
 
-    def set_image_size(self, index: int, size: tuple[int, int] | None) -> None:
+    def set_image_size(self, index: int, size: tuple[int, int] | None) -> bool:
+        previous = self.current_index
         if 0 <= index < self.total_pages:
             self._size_cache[index] = size
+            focused = self.focused_index
+            if focused >= 0:
+                self.current_index = self.spread_start_for_index(focused)
+        return previous != self.current_index
 
     def is_wide_image(self, index: int) -> bool:
         if not self.treat_wide_image_as_single:
@@ -152,14 +195,6 @@ class PageModel:
         if self.total_pages == 0:
             return 0
         target_index = max(0, min(target_index, self.total_pages - 1))
-        if self.source is not None and self.source.load_sizes_lazily:
-            if self.view_mode == "single":
-                return target_index
-            if self.single_first_page:
-                if target_index == 0:
-                    return 0
-                return 1 + ((target_index - 1) // 2) * 2
-            return (target_index // 2) * 2
         start = 0
         while start < self.total_pages:
             spread = self.spread_at(start)
@@ -232,23 +267,33 @@ class PageModel:
         return previous
 
     def go_to_index(self, index: int) -> None:
-        self.current_index = self.spread_start_for_index(index)
+        if not self.total_pages:
+            return
+        target = max(0, min(index, self.total_pages - 1))
+        self._focused_page_identity = self.page_identity(target)
+        self.current_index = self.spread_start_for_index(target)
 
     def go_to_raw_index(self, index: int) -> None:
         if self.total_pages:
-            self.current_index = max(0, min(index, self.total_pages - 1))
+            target = max(0, min(index, self.total_pages - 1))
+            self.current_index = target
+            self._focused_page_identity = self.page_identity(target)
 
     def next(self) -> None:
         if self.total_pages:
             self.current_index = self.next_index_from(self.current_index)
+            self._focused_page_identity = self.page_identity(self.current_index)
 
     def previous(self) -> None:
         if self.total_pages:
             self.current_index = self.previous_index_from(self.current_index)
+            self._focused_page_identity = self.page_identity(self.current_index)
 
     def first(self) -> None:
         self.current_index = 0
+        self._focused_page_identity = self.page_identity(0)
 
     def last(self) -> None:
         if self.total_pages:
             self.current_index = self.spread_start_for_index(self.total_pages - 1)
+            self._focused_page_identity = self.page_identity(self.total_pages - 1)

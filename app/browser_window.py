@@ -93,6 +93,7 @@ from .browser_thumbnail_scheduler import (
     build_thumbnail_request_plan,
     calculate_grid_visible_range,
 )
+from .browser_visibility import BrowserVisibilityPolicy
 from .archive_backend_registry import ArchiveBackendRegistry
 from .bookmark_model import BookmarkModel
 from .config_manager import ConfigManager
@@ -111,6 +112,8 @@ from .drag_drop import (
     is_lexically_supported_viewer_path,
 )
 from .explorer_list_view import ExplorerListView, PathDropTreeView
+from .favorite_item_delegate import FavoriteItemDelegate
+from .favorite_row_metrics import FavoriteRowMetrics
 from .folder_bookmark_model import FolderBookmarkModel
 from .folder_tree_sync import FolderTreeSyncController
 from .history_model import HistoryModel
@@ -248,6 +251,9 @@ class BrowserWindow(QMainWindow):
             )
         self.thumbnail_provider = thumbnail_provider
         self.thumbnail_provider.thumbnail_ready.connect(self._on_thumbnail_ready)
+        thumbnail_failed = getattr(self.thumbnail_provider, "thumbnail_failed", None)
+        if thumbnail_failed is not None:
+            thumbnail_failed.connect(self._on_thumbnail_failed)
         provisional = getattr(self.thumbnail_provider, "thumbnail_provisional", None)
         if provisional is not None:
             provisional.connect(self._on_thumbnail_provisional)
@@ -342,6 +348,15 @@ class BrowserWindow(QMainWindow):
         self.browser_filename_padding_y = max(
             0, min(16, int(self.settings.get("browser_filename_padding_y", 0)))
         )
+        self.browser_show_hidden_items = bool(
+            self.settings.get("browser_show_hidden_items", True)
+        )
+        self.browser_show_unsupported_files = bool(
+            self.settings.get("browser_show_unsupported_files", True)
+        )
+        self.browser_show_system_items = bool(
+            self.settings.get("browser_show_system_items", False)
+        )
         self.browser_sidebar_layout = str(
             self.settings.get(
                 "browser_sidebar_layout",
@@ -372,6 +387,36 @@ class BrowserWindow(QMainWindow):
         self.folder_tree_collapse_unrelated = bool(
             self.settings.get("folder_tree_collapse_unrelated", True)
         )
+        self.folder_tree_focus_rebase = bool(
+            self.settings.get("folder_tree_focus_rebase", True)
+        )
+        self.folder_tree_context_ancestor_levels = max(
+            0,
+            min(
+                12,
+                int(
+                    self.settings.get(
+                        "folder_tree_context_ancestor_levels",
+                        3,
+                    )
+                ),
+            ),
+        )
+        self.favorite_row_metrics = FavoriteRowMetrics.normalized(
+            padding_y=int(self.settings.get("favorite_row_padding_y", 1)),
+            spacing=int(self.settings.get("favorite_row_spacing", 0)),
+            icon_size=int(self.settings.get("favorite_icon_size", 16)),
+        )
+        self._favorite_click_timer = QTimer(self)
+        self._favorite_click_timer.setSingleShot(True)
+        self._favorite_click_timer.setInterval(
+            QApplication.styleHints().mouseDoubleClickInterval()
+        )
+        self._favorite_click_timer.timeout.connect(
+            self._open_pending_favorite_click
+        )
+        self._pending_favorite_path: str | None = None
+        self._suppress_favorite_click_once = False
         self._hovered_list_path: str | None = None
 
         self._folder_change_timer = QTimer(self)
@@ -460,6 +505,11 @@ class BrowserWindow(QMainWindow):
         request = BrowserScanRequest(
             path=str(target),
             generation=self._scan_generation,
+            visibility_policy=BrowserVisibilityPolicy(
+                show_hidden_items=self.browser_show_hidden_items,
+                show_unsupported_files=self.browser_show_unsupported_files,
+                show_system_items=self.browser_show_system_items,
+            ),
         )
         self._pending_scan = _PendingDirectoryScan(
             path=target,
@@ -787,6 +837,9 @@ class BrowserWindow(QMainWindow):
         if item.kind == BrowserItemKind.FOLDER:
             self.navigate_to(item.path)
             return
+        if not item.openable_by_nivisviewer or item.kind is BrowserItemKind.OTHER:
+            self._show_temporary_status("NivisViewerでは表示できません")
+            return
         if self._open_path_handler is not None:
             self._invoke_open_path_handler(
                 str(item.path),
@@ -822,6 +875,12 @@ class BrowserWindow(QMainWindow):
                 )
                 for candidate in self.items
                 if candidate.kind is BrowserItemKind.IMAGE
+            ),
+            generation=self._scan_generation,
+            sort_identity=(
+                f"{self.browser_sort_key.value}:"
+                f"{self.browser_sort_order.value}:"
+                f"folders_first={int(self.browser_folders_first)}"
             ),
         )
 
@@ -1441,6 +1500,40 @@ class BrowserWindow(QMainWindow):
             return
         self.navigate_to(entry.path)
 
+    def _on_favorite_clicked(self, index: QModelIndex) -> None:
+        if self._suppress_favorite_click_once:
+            self._suppress_favorite_click_once = False
+            return
+        if (
+            self.favorite_view.selection_controller.press_modifiers
+            != Qt.KeyboardModifier.NoModifier
+        ):
+            return
+        if self.favorite_view.drag_started or not index.isValid():
+            return
+        entry = self.folder_bookmark_model.entry_at(index)
+        if entry is None:
+            return
+        self._pending_favorite_path = entry.path
+        self._favorite_click_timer.start()
+
+    def _on_favorite_double_clicked(self, index: QModelIndex) -> None:
+        self._favorite_click_timer.stop()
+        self._pending_favorite_path = None
+        self._suppress_favorite_click_once = True
+        self.open_folder_bookmark(index)
+
+    def _open_pending_favorite_click(self) -> None:
+        path = self._pending_favorite_path
+        self._pending_favorite_path = None
+        if path is None or self.favorite_view.drag_started:
+            return
+        row = self.folder_bookmark_model.row_for_path(path)
+        if row >= 0:
+            self.open_folder_bookmark(
+                self.folder_bookmark_model.index(row, 0)
+            )
+
     def rename_folder_bookmark(
         self,
         index: QModelIndex,
@@ -1856,11 +1949,70 @@ class BrowserWindow(QMainWindow):
             self.folder_tree_collapse_unrelated = bool(
                 changed["folder_tree_collapse_unrelated"]
             )
+        if "folder_tree_focus_rebase" in changed:
+            self.folder_tree_focus_rebase = bool(
+                changed["folder_tree_focus_rebase"]
+            )
+        if "folder_tree_context_ancestor_levels" in changed:
+            self.folder_tree_context_ancestor_levels = max(
+                0,
+                min(12, int(changed["folder_tree_context_ancestor_levels"])),
+            )
         if {
             "folder_tree_sync_mode",
             "folder_tree_collapse_unrelated",
+            "folder_tree_focus_rebase",
+            "folder_tree_context_ancestor_levels",
         }.intersection(changed) and self.current_path is not None:
             self._sync_tree_to_path(self.current_path)
+        favorite_metric_keys = {
+            "favorite_row_padding_y",
+            "favorite_row_spacing",
+            "favorite_icon_size",
+        }
+        if favorite_metric_keys.intersection(changed):
+            self.favorite_row_metrics = FavoriteRowMetrics.normalized(
+                padding_y=int(
+                    changed.get(
+                        "favorite_row_padding_y",
+                        self.favorite_row_metrics.padding_y,
+                    )
+                ),
+                spacing=int(
+                    changed.get(
+                        "favorite_row_spacing",
+                        self.favorite_row_metrics.spacing,
+                    )
+                ),
+                icon_size=int(
+                    changed.get(
+                        "favorite_icon_size",
+                        self.favorite_row_metrics.icon_size,
+                    )
+                ),
+            )
+            self._apply_favorite_row_metrics()
+        visibility_changed = bool(
+            {
+                "browser_show_hidden_items",
+                "browser_show_unsupported_files",
+                "browser_show_system_items",
+            }.intersection(changed)
+        )
+        if "browser_show_hidden_items" in changed:
+            self.browser_show_hidden_items = bool(
+                changed["browser_show_hidden_items"]
+            )
+        if "browser_show_unsupported_files" in changed:
+            self.browser_show_unsupported_files = bool(
+                changed["browser_show_unsupported_files"]
+            )
+        if "browser_show_system_items" in changed:
+            self.browser_show_system_items = bool(
+                changed["browser_show_system_items"]
+            )
+        if visibility_changed and self.current_path is not None:
+            self.refresh_current_folder()
         if "thumbnail_disk_cache_enabled" in changed:
             self.thumbnail_provider.set_disk_cache_enabled(
                 bool(changed["thumbnail_disk_cache_enabled"])
@@ -2007,6 +2159,7 @@ class BrowserWindow(QMainWindow):
             self.config,
             self,
             cache_usage_getter=self.thumbnail_provider.disk_cache_usage_bytes,
+            cache_statistics_getter=self.thumbnail_provider.cache_statistics,
             seven_zip_locator=(
                 self.archive_backend_registry.locator
                 if self.archive_backend_registry is not None
@@ -2160,7 +2313,9 @@ class BrowserWindow(QMainWindow):
         self.folder_tree.paths_dropped.connect(self._on_tree_paths_dropped)
         for column in range(1, self.file_system_model.columnCount()):
             self.folder_tree.hideColumn(column)
-        self.folder_tree.selectionModel().currentChanged.connect(self._on_tree_current_changed)
+        self.folder_tree.navigationConfirmed.connect(
+            self._on_tree_navigation_confirmed
+        )
         self.folder_tree_sync = FolderTreeSyncController(
             self.folder_tree,
             self.file_system_model,
@@ -2184,7 +2339,25 @@ class BrowserWindow(QMainWindow):
         self.favorite_view = ExplorerListView(self)
         self.favorite_view.setObjectName("folder_favorite_view")
         self.favorite_view.setModel(self.folder_bookmark_model)
-        self.favorite_view.activated.connect(self.open_folder_bookmark)
+        self.favorite_view.setItemDelegate(
+            FavoriteItemDelegate(
+                self.favorite_view,
+                metrics=self.favorite_row_metrics,
+            )
+        )
+        self.favorite_view.setIconSize(
+            QSize(
+                self.favorite_row_metrics.icon_size,
+                self.favorite_row_metrics.icon_size,
+            )
+        )
+        self.favorite_view.setSpacing(self.favorite_row_metrics.spacing)
+        self.favorite_view.setUniformItemSizes(True)
+        self.favorite_view.setWordWrap(False)
+        self.favorite_view.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.favorite_view.clicked.connect(self._on_favorite_clicked)
+        self.favorite_view.doubleClicked.connect(self._on_favorite_double_clicked)
+        self.favorite_view.enterActivated.connect(self.open_folder_bookmark)
         self.favorite_view.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
         )
@@ -2232,6 +2405,7 @@ class BrowserWindow(QMainWindow):
                 ),
                 BrowserItemKind.IMAGE: style.standardIcon(QStyle.StandardPixmap.SP_FileIcon),
                 BrowserItemKind.PDF: style.standardIcon(QStyle.StandardPixmap.SP_FileIcon),
+                BrowserItemKind.OTHER: style.standardIcon(QStyle.StandardPixmap.SP_FileIcon),
             }
         )
 
@@ -2623,26 +2797,56 @@ class BrowserWindow(QMainWindow):
         current: QModelIndex,
         _previous: QModelIndex,
     ) -> None:
-        if (
-            self.folder_tree_sync.applying
-            or not current.isValid()
-        ):
+        # Compatibility hook: currentChanged is display state, never a
+        # navigation command. User navigation comes from click confirmation.
+        del current, _previous
+
+    def _on_tree_navigation_confirmed(self, index: QModelIndex) -> None:
+        if self.folder_tree_sync.applying or not index.isValid():
             return
-        path = Path(self.file_system_model.filePath(current))
-        self._pending_tree_navigation_path = path
-        self._folder_change_timer.start()
+        path = self.file_system_model.filePath(index)
+        if path:
+            self.navigate_to(path)
 
     def _apply_pending_tree_path(self) -> None:
+        # Kept for binary/test compatibility with Sprint 15. No currentChanged
+        # path is queued by the click-confirmed tree implementation. A direct
+        # call is treated as an explicit legacy activation, not a signal.
         path = self._pending_tree_navigation_path
         self._pending_tree_navigation_path = None
+        if path is None and self.folder_tree.currentIndex().isValid():
+            current_path = self.file_system_model.filePath(
+                self.folder_tree.currentIndex()
+            )
+            path = Path(current_path) if current_path else None
         if path is not None:
             self.navigate_to(path)
+
+    def _apply_favorite_row_metrics(self) -> None:
+        if not hasattr(self, "favorite_view"):
+            return
+        self.favorite_view.setItemDelegate(
+            FavoriteItemDelegate(
+                self.favorite_view,
+                metrics=self.favorite_row_metrics,
+            )
+        )
+        self.favorite_view.setIconSize(
+            QSize(
+                self.favorite_row_metrics.icon_size,
+                self.favorite_row_metrics.icon_size,
+            )
+        )
+        self.favorite_view.setSpacing(self.favorite_row_metrics.spacing)
+        self.favorite_view.doItemsLayout()
 
     def _sync_tree_to_path(self, path: Path) -> None:
         self.folder_tree_sync.sync(
             path,
             mode=self.folder_tree_sync_mode,
             collapse_unrelated=self.folder_tree_collapse_unrelated,
+            focus_rebase=self.folder_tree_focus_rebase,
+            context_ancestor_levels=self.folder_tree_context_ancestor_levels,
         )
 
     def _on_tree_directory_loaded(self, _path: str) -> None:
@@ -2666,9 +2870,17 @@ class BrowserWindow(QMainWindow):
             first_visible=visible_range[0],
             last_visible=visible_range[1],
             selected_rows=selected_rows,
-            prefetch_screens=2,
+            prefetch_screens=1,
             fast_scrolling=self._fast_scrolling,
         )
+        selected_set = set(selected_rows)
+        set_fast_scroll = getattr(
+            self.thumbnail_provider,
+            "set_fast_scroll_suppressed",
+            None,
+        )
+        if callable(set_fast_scroll):
+            set_fast_scroll(self._fast_scrolling)
         for rows, priority in (
             (plan.visible_rows, ThumbnailPriority.VISIBLE),
             (plan.selected_rows, ThumbnailPriority.SELECTED),
@@ -2676,13 +2888,21 @@ class BrowserWindow(QMainWindow):
         ):
             for row in rows:
                 item = self.item_model.item_at(row)
-                if item is None:
+                if (
+                    item is None
+                    or not item.openable_by_nivisviewer
+                    or item.kind is BrowserItemKind.OTHER
+                ):
                     continue
+                effective_priority = priority
+                if self._fast_scrolling and priority is ThumbnailPriority.VISIBLE:
+                    if row in selected_set:
+                        effective_priority = ThumbnailPriority.SELECTED
                 self.thumbnail_provider.request(
                     item,
                     self.thumbnail_render_spec,
                     generation=self._generation,
-                    priority=priority,
+                    priority=effective_priority,
                 )
         if self._fast_scrolling:
             keep_paths = {
@@ -2800,6 +3020,16 @@ class BrowserWindow(QMainWindow):
         ):
             return
         self.item_model.set_thumbnail_image(path, qimage, low_resolution=False)
+
+    def _on_thumbnail_failed(
+        self,
+        path: str,
+        generation: int,
+        message: str,
+    ) -> None:
+        if self._shutdown_prepared or generation != self._generation:
+            return
+        self.item_model.set_thumbnail_error(path, message)
 
     def _on_thumbnail_provisional(
         self,
@@ -3266,7 +3496,20 @@ class BrowserWindow(QMainWindow):
         selection_count = len(self.selected_file_operation_paths())
         busy = self.file_operation_coordinator.busy
         menu = QMenu(self)
-        open_action = menu.addAction("開く") if item is not None else None
+        unsupported = bool(
+            item is not None
+            and (
+                item.kind is BrowserItemKind.OTHER
+                or not item.openable_by_nivisviewer
+            )
+        )
+        open_action = (
+            menu.addAction(
+                "既定のアプリで開く" if unsupported else "開く"
+            )
+            if item is not None
+            else None
+        )
         new_action = (
             menu.addAction("新しいViewerWindowで開く")
             if item is not None
@@ -3276,8 +3519,17 @@ class BrowserWindow(QMainWindow):
             open_action.setEnabled(selection_count == 1)
         if new_action is not None:
             new_action.setEnabled(
-                selection_count == 1 and item.kind is not BrowserItemKind.FOLDER
+                selection_count == 1
+                and item.kind is not BrowserItemKind.FOLDER
+                and not unsupported
             )
+        retry_thumbnail_action = None
+        if (
+            item is not None
+            and item.openable_by_nivisviewer
+            and index.data(BrowserItemModel.ThumbnailErrorRole)
+        ):
+            retry_thumbnail_action = menu.addAction("サムネイルを再試行")
         if item is not None:
             menu.addSeparator()
         cut_action = menu.addAction("切り取り")
@@ -3306,10 +3558,13 @@ class BrowserWindow(QMainWindow):
         new_folder_action.setEnabled(self.current_path is not None and not busy)
         refresh_action.setEnabled(self.current_path is not None)
         location_action = None
+        properties_action = None
         bookmark_action = None
         if item is not None:
             menu.addSeparator()
             location_action = menu.addAction("エクスプローラーで場所を開く")
+            properties_action = menu.addAction("プロパティ")
+            properties_action.setEnabled(False)
         if item is not None and self.metadata_store is not None:
             menu.addSeparator()
             if self.metadata_store.is_browser_bookmarked(str(item.path)):
@@ -3318,9 +3573,24 @@ class BrowserWindow(QMainWindow):
                 bookmark_action = menu.addAction("ブックマークに追加")
         selected = menu.exec(self.list_view.viewport().mapToGlobal(position))
         if open_action is not None and selected == open_action:
-            self.open_item(index)
+            if unsupported:
+                assert item is not None
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(item.path)))
+            else:
+                self.open_item(index)
         elif new_action is not None and selected == new_action:
             self.open_item(index, open_in_new_window=True)
+        elif (
+            retry_thumbnail_action is not None
+            and selected == retry_thumbnail_action
+        ):
+            assert item is not None
+            self.item_model.clear_thumbnail_error(item.path)
+            self.thumbnail_provider.retry(
+                item,
+                self.thumbnail_render_spec,
+                generation=self._generation,
+            )
         elif selected == cut_action:
             self.cut_selected_items()
         elif selected == copy_action:
@@ -3432,17 +3702,19 @@ class BrowserWindow(QMainWindow):
 
     def _show_folder_tree_context_menu(self, position: QPoint) -> None:
         index = self.folder_tree.indexAt(position)
-        if not index.isValid():
-            return
         menu = QMenu(self)
+        full_tree_action = menu.addAction("ツリーのルートを戻す")
+        menu.addSeparator()
         copy_here_action = menu.addAction("選択項目をここへコピー")
         move_here_action = menu.addAction("選択項目をここへ移動")
         has_selection = bool(self.selected_file_operation_paths())
         busy = self.file_operation_coordinator.busy
-        copy_here_action.setEnabled(has_selection and not busy)
-        move_here_action.setEnabled(has_selection and not busy)
+        copy_here_action.setEnabled(index.isValid() and has_selection and not busy)
+        move_here_action.setEnabled(index.isValid() and has_selection and not busy)
         selected = menu.exec(self.folder_tree.viewport().mapToGlobal(position))
-        if selected == copy_here_action:
+        if selected == full_tree_action:
+            self.folder_tree_sync.show_full_tree()
+        elif selected == copy_here_action:
             self.copy_selected_to_tree_index(index)
         elif selected == move_here_action:
             self.move_selected_to_tree_index(index)
@@ -3489,6 +3761,8 @@ class BrowserWindow(QMainWindow):
             return "archive"
         if item.kind == BrowserItemKind.PDF:
             return "pdf"
+        if item.kind == BrowserItemKind.OTHER:
+            return "other"
         return "image"
 
     @staticmethod

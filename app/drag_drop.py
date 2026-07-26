@@ -142,9 +142,11 @@ class ExplorerSelectionController:
     press_row: int = -1
     blank_press: bool = False
     shift_rubber_band: bool = False
+    press_modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier
 
     def begin(self, row: int, modifiers: Qt.KeyboardModifier) -> None:
         self.press_row = int(row)
+        self.press_modifiers = modifiers
         self.blank_press = row < 0
         self.shift_rubber_band = self.blank_press and bool(
             modifiers & Qt.KeyboardModifier.ShiftModifier
@@ -155,16 +157,6 @@ class FileDragController:
     @staticmethod
     def mime_data(paths: tuple[str, ...]) -> QMimeData:
         return build_path_mime_data(paths, source="browser")
-
-
-class ExternalDropOpenController:
-    @staticmethod
-    def local_paths(mime: QMimeData) -> tuple[str, ...]:
-        return paths_from_mime_data(mime)
-
-    @staticmethod
-    def paths(mime: QMimeData) -> tuple[str, ...]:
-        return viewer_drop_paths(mime)
 
 
 class FolderDropProbeSignals(QObject):

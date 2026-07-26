@@ -99,7 +99,7 @@ ApplicationController
 - `BrowserItemDiscovery`: サブフォルダ、ZIP/CBZ/RAR/CBR/7z/CB7、対応画像を列挙し、列挙時のmtimeとファイルサイズをBrowserItemへ保存する。画像のデコードや書庫の展開は行わない
 - `BrowserItemModel`: BrowserItemの表示名、絶対パス、種類、元項目のmtime、ファイルサイズ、表示アイコンをQt Model/Viewへ公開し、BrowserSortPolicyで保持リストを並べ替える
 - `BrowserSortPolicy`: QtやMetadataStoreに依存せず、自然順、更新日時、種類、サイズ、昇降順、フォルダ優先を一元管理
-- `BrowserThumbnailScheduler`: viewport、gridSize、スクロール位置から可視行、選択行、前後2画面の先読み行を計画
+- `BrowserThumbnailScheduler`: viewport、gridSize、スクロール位置から可視行、選択行、通常時は前後1画面の先読み行を計画
 - `BrowserThumbnailProvider`: 最大2スレッドの専用`QThreadPool`で画像、画像フォルダ、ZIP/CBZ/RAR/CBR/7z/CB7のサムネイルを生成し、メモリLRUキャッシュを管理
 - `ThumbnailDiskCache`: SQLiteインデックスとWebPまたはPNGファイルによるポータブルな永続サムネイルキャッシュ
 - `SettingsDialog`: Viewerの開き方、見開き表示、Browserのサムネイルとディスクキャッシュ、マウス操作割り当て、外部書庫backend選択、WinRAR／7-Zipの自動検出／明示パスを編集
@@ -141,7 +141,7 @@ BrowserWindow
 └─ DisplaySettings
 ```
 
-並び替えキーは`name`、`modified_time`、`item_type`、`file_size`です。名前はnatsortによる大文字小文字を過度に区別しない自然順とし、同一判定時は絶対パスで安定化します。更新日時とサイズが同じ項目、および同じ種類の項目は名前の自然順を二次順序にします。種類はフォルダ、ZIP/CBZ共通の書庫カテゴリ、画像の順です。未対応形式は一覧へ追加しません。
+並び替えキーは`name`、`modified_time`、`item_type`、`file_size`です。名前はnatsortによる大文字小文字を過度に区別しない自然順とし、同一判定時は絶対パスで安定化します。更新日時とサイズが同じ項目、および同じ種類の項目は名前の自然順を二次順序にします。種類はフォルダ、書庫、PDF、画像、その他の順です。未対応形式も設定に従って`other`として保持しますが、NivisViewerのthumbnail decodeやViewer openへ渡しません。
 
 更新日時は列挙時に取得した元ファイルまたは元フォルダ自身の`st_mtime_ns`だけを使います。サイズはファイル自身の`st_size`で、フォルダを再帰走査しません。stat失敗時は`None`として安全な既定値で比較します。MetadataStoreの`metadata_updated_at`、サムネイル生成日時、キャッシュ時刻は並び替えへ混ぜません。更新操作は再列挙するため最新のファイルシステム情報を取得しますが、並び替えだけで`os.stat()`を繰り返しません。
 
@@ -215,7 +215,7 @@ BrowserNavigationHistoryもrename/move成功後だけフォルダパスと選択
 
 BrowserThumbnailSchedulerは`ScrollPerPixel`のQListViewについて、viewport、gridSize、スクロール値、モデル件数から可視行を定数時間で近似します。優先順位はVISIBLE、SELECTED、PREFETCHです。可視範囲を先に要求し、その前後各2画面だけを先読みします。1万件でも要求数は可視範囲と限定先読みに収まり、全行の`visualRect()`走査や全件要求を行いません。
 
-ThumbnailProviderはQThreadPoolの優先度を使い、未開始の低優先度要求を可視要求が追い越せるようにします。同一パス・サイズ・generationのpendingは重複させず、queued要求は優先度を引き上げられます。高速スクロール中は可視・選択項目だけを要求し、未開始の旧PREFETCHを`tryTake()`可能な範囲で除外します。最後のスクロールから180ms後に可視範囲を再計算して前後2画面の先読みを再開します。通常画像の実行中デコードは強制停止せず、外部7-Zip処理にはcancel tokenを渡します。完了結果はパスとthumbnail generationで安全にキャッシュ・照合します。
+ThumbnailProviderはQThreadPoolの優先度を使い、未開始の低優先度要求を可視要求が追い越せるようにします。同一パス・サイズ・generationのpendingは重複させず、queued要求は優先度を引き上げられます。高速スクロール中はselection以外をdisk-hit-onlyのPREFETCHとして扱い、未開始の旧PREFETCHを`tryTake()`可能な範囲で除外します。最後のスクロールから180ms後に可視範囲を再計算して前後1画面の先読みを再開します。PREFETCH missはdecodeも永続保存も行わず、VISIBLE／SELECTEDへ昇格した時だけ適切なDPR版を生成します。通常画像の実行中デコードは強制停止せず、外部7-Zip処理にはcancel tokenを渡します。完了結果はパスとthumbnail generationで安全にキャッシュ・照合します。
 
 増分バッチ、ウィンドウリサイズ、並び替え、表示密度変更は30msの単発タイマーへサムネイル再計画をまとめます。並び替えと密度だけではthumbnail generationやキャッシュキーを変更しません。サムネイルサイズ変更時だけ新generationを開始し、旧サイズ結果を表示へ適用しません。この構造は将来のページング、仮想化、方向別先読みへの接続点です。
 
@@ -381,7 +381,7 @@ BrowserWindowは`last_browser_path`、`browser_sidebar_visible`、`browser_sideb
 
 Browser一覧は`QListView`のIconModeと固定`gridSize`、`BrowserItemDelegate`を使用します。デリゲートの`sizeHint()`は項目内容に依存せず、サムネイル領域とタイトル領域の大きさを表示密度ごとに固定します。`thumbnail_size`は画像枠の長辺のlogical pixelであり、選択した`thumbnail_frame_ratio`から枠の幅と高さを決定します。後着したQImageは項目固有のroleだけを更新するためセル配置を変更しません。
 
-サムネイル要求は可視範囲を最優先にし、その前後2画面だけを先読みします。スクロール量と時間から高速スクロールを検出した間は先読み要求をキャンセルし、停止から180ms後に再開します。フォルダを開いた時点で全項目を要求しません。モデルは正規化パスから行番号への索引を持ち、サムネイル後着時の項目検索を項目数に依存しない処理にします。
+サムネイル要求は可視範囲を最優先にし、その前後1画面だけを先読みします。スクロール量と時間から高速スクロールを検出した間はmiss時の生成を抑止し、停止から180ms後に再開します。フォルダを開いた時点で全項目を要求しません。モデルは正規化パスから行番号への索引を持ち、サムネイル後着時の項目検索を項目数に依存しない処理にします。
 
 ### DPR-awareサムネイル描画と複数解像度キャッシュ
 
@@ -427,7 +427,7 @@ ViewerWindow
 
 FolderTreeSyncControllerはフォルダ移動のcommit後に起動し、`off`、`select_current`、`focus_current`を扱います。QFileSystemModelの遅延読み込みに対して有限回の再試行と独立generationを持ち、旧要求を適用しません。プログラム選択中はツリーの`currentChanged`から再navigateしないためBrowser履歴を増やしません。自動で展開したancestorとユーザーが手動展開した枝を別集合で追跡し、focus_currentで閉じるのは現在ancestorではない自動展開枝だけです。
 
-FullscreenChromeControllerは`hide_ui_in_fullscreen`時にmenu bar、page slider、status barをViewer上の上下overlayへ一時移設します。上端／下端の既定8 logical px（4～32）で該当側だけを表示し、離れた次のevent loop（設定範囲0～3000ms、既定0ms）で隠します。overlayの表示・非表示はcentral layoutを変更しないため画像のサイズ、ズーム、パン、ページを動かしません。ポップアップ、メニュー、slider drag、UI上のボタン操作、子modalの間は隠さず、端へのhoverだけではViewerWidgetからfocusを奪いません。全画面解除時は各Widgetを通常のQMainWindow配置へ戻します。
+FullscreenChromeControllerはfullscreen、UI非表示設定、上下overlay、pointer領域、popup／modal、slider、mouse button、timer generation、window-local cursorを単一の`reconcile_state()`で調停します。通常menu barとstatus barはQMainWindow配下のまま全画面中は常に隠し、fullscreen専用menu/statusをoverlayへ表示するため、後続の`menuBar()`／`statusBar()`呼び出しで通常UIが再生成・残留しません。上端／下端の既定8 logical px（4～32）で該当側だけを表示し、離れた次のevent loop（設定範囲0～3000ms、既定0ms）で隠します。cursorはViewerWindow配下だけへBlankCursorを設定し、600～1000msのidle、mouse move、edge UI、popup、slider、fullscreen解除、window終了を同じControllerで管理します。
 
 ### Sprint 16のExplorer型操作と高密度タイトル
 
@@ -446,6 +446,57 @@ FullscreenChromeControllerの既定hide delayは0msです。cursorがoverlayとe
 ディスクcacheはsource fingerprint、archive entry、ratio、crop、smart crop、encoder、render policyをrender variantとして、1 variantにつき最大2解像度、同一source／entry全体で最大4派生を保持します。3個目／5個目の保存時は現在保存中とBrowser memory／pendingで保護された要求を残し、inactive familyと最終利用が古いentryを先に削除します。全bucketは生成せず、可視要求の解像度だけをon-demand保存します。
 
 cleanupは欠損record、孤立file、任意の未使用期間、per-variant、per-item、global LRUの各制限を適用し、容量超過時は90%まで減らします。cache hitのaccess時刻は従来どおり遅延flushです。未使用期間は0（無効）または7～3650日で、起動後のworker、前回から24時間経過、設定変更、手動「今すぐ整理」でGUI外実行します。短期間設定は再生成とSSD書き込みを増やす可能性があるため設定画面に警告します。
+
+### Sprint 17の信頼性境界
+
+`BrowserVisibilityPolicy`はhidden、system、unsupportedを別々に扱います。scanner workerは列挙時にWindows file attributesまたはdot-prefixを分類し、`BrowserItem`へflag、拡張子、`openable_by_nivisviewer`を渡します。unsupportedはShell関連付けiconとファイル名を表示しますがthumbnail decodeを要求せず、既定アプリ起動はcontext menuの明示操作だけです。対応形式のthumbnail失敗は項目を残し、tooltipと小さな警告表示、再試行接続点を提供します。
+
+`ThumbnailPersistencePolicy`はVISIBLE／SELECTEDだけを高DPI生成・disk保存対象にします。PREFETCHは既存disk cache hitを利用できますが、miss時は生成を省略します。session counterは優先度別要求、memory/disk hit、生成、disk保存、bucket、ratio/crop/codec、起動後増加量を増分管理します。SQLiteの使用量、entry数、最終cleanupはcache mutation時にworker側で更新した集計値をSettingsDialogへ返し、画面表示のたびに全DB走査しません。
+
+`FolderTreeFocusController`相当の責務は`FolderTreeSyncController`が持ちます。`focus_current`ではgeneration確認後に現在folderを`PositionAtCenter`へ配置し、設定された0～12のcontext depthでtree rootをrebaseします。current pathやBrowser historyは変更せず、context menuの「ツリーのルートを戻す」で全体表示へ戻せます。次のnavigationでは設定に従って再rebaseします。
+
+`ExternalDropOpenController`はViewerWindow、ViewerWidget、central widget、通常control、fullscreen overlayのevent chainでlocal URLだけを受理します。子Widgetのdrag/dropはViewerWindowの共通処理へ転送し、複数pathの順序、重複排除、1件目reuse、2件目以降newを維持します。folder判定はworkerで行い、unsupported、HTTP、text commandはopen経路へ渡しません。
+
+`SettingsDialog`は各tabの内容だけを`QScrollArea(widgetResizable=True)`へ入れ、OK／Cancel／Applyの`QDialogButtonBox`をroot layout下部へ固定します。初回表示時はcurrent screenのavailable geometryの88%以内へ収めます。全画面UI／cursor、visibility、tree focus、thumbnail max edgeを含むcontrolはConfigManagerのdefault、normalizer、load、Apply、settings_changedの同じkeyへround-tripします。
+
+### Sprint 17追補の入力状態とpage identity
+
+```text
+BrowserListView
+└─ BrowserPointerController
+   ├─ Idle
+   ├─ PressedOnItem
+   ├─ PressedOnEmpty
+   ├─ FileDragging
+   ├─ RubberBandSelecting
+   └─ Cancelled
+
+BookOpenRequest
+├─ requested page identity
+├─ source index resolution
+└─ DisplayUnit containment
+
+FolderTree
+└─ FolderTreePointerController
+   ├─ ClickConfirmedNavigation
+   ├─ DragHoverOnly
+   └─ ProgrammaticSync
+
+FolderBookmarkView
+└─ FavoriteRowMetrics
+```
+
+`ExplorerListView`の左入力は`BrowserPointerController`だけが所有します。項目pressでは絶対path、選択path snapshot、current path、anchor、modifierを保存し、drag開始直前にpathを現在のmodelへ再解決します。標準`QListView.startDrag()`は使わず、独自file dragを開始したmoveとその後のreleaseを標準mouse処理へ渡しません。plain blank dragも標準rubber-bandへ渡さず、Shift+blankだけを専用rubber-band経路として扱います。これにより標準selection、標準drag、独自QDragが同じ入力列で二重実行されません。
+
+Shift／Ctrlはpressからreleaseまでdrag threshold未満だった場合だけ、範囲選択／追加解除として解釈します。file drag成立後のCtrl＝copy、Shift＝moveはdrop時のmodifierから決めるため、選択modifierとdrop action modifierを時間的に分離します。選択済み項目のplain pressでは複数選択を保持し、dragせず同一項目上でreleaseした場合だけ単一選択へ畳みます。sort、model reset、増分scan後も保存rowや古い`QModelIndex`ではなくpathから対象を復元します。
+
+Browser一覧のrowはViewerのpage indexとして使用しません。`FolderListingSnapshot`は画像だけの順序付き絶対path、選択path、scan generation、sort identity、fingerprintを保持します。`FolderImageSource`と`PageModel`は`page_identity()`、`index_for_identity()`、`index_for_path()`、`path_for_index()`でWindows正規化pathを解決します。snapshotが選択pathを含まない場合はSource側の通常列挙へ戻ります。
+
+PageModelは表示単位先頭とは別にfocused page identityを保持します。lazy size確定前はBrowserで指定されたpageを最初のdecode対象とし、寸法後着によるDisplayUnit再構成後はfocused identityを含むunitへ再配置します。`go_to_index(i)`も算術的な偶数／奇数補正ではなく、既知のwide単独ページを含む実際のDisplayUnit列から`i`を含むunitを求めます。status、slider、読書位置、ページ一覧の主選択はfocused pageを参照するため、wide判定後もクリックしたpathと一致します。
+
+FolderTreeは`currentChanged`、selection、hover、expanded、directoryLoadedからnavigateしません。左buttonのpressとreleaseが同じpath、drag threshold未満、非disclosure、非programmatic syncの場合だけ`navigationConfirmed`を発行します。file drag hoverはoverlay highlightだけを描き、drop成立時だけ既存`FileOperationCoordinator`へtarget pathを渡します。展開矢印は展開／折りたたみだけを行います。
+
+お気に入りはpress時にnavigateせず、同一項目上のreleaseから発生するsingle clickをdouble-click interval内で確定します。待機対象は`QModelIndex`ではなくpathで保持し、並べ替え後に再解決します。dragが成立した入力列ではclickを発生させません。`FavoriteRowMetrics`の行高は`max(fontMetrics.height(), icon_size) + padding_y * 2`だけで決まり、wrapなし、elideあり、行間隔と14～24pxのfolder iconを独立設定します。
 
 ### Viewer最優先の画像作業調整
 

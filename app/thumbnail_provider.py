@@ -127,6 +127,7 @@ class _ThumbnailWorker(QRunnable):
 class BrowserThumbnailProvider(QObject):
     thumbnail_ready = Signal(str, int, object)
     thumbnail_provisional = Signal(str, int, object)
+    thumbnail_failed = Signal(str, int, str)
     cache_cleared = Signal()
     scheduling_resumed = Signal()
 
@@ -154,12 +155,41 @@ class BrowserThumbnailProvider(QObject):
         self._pending: dict[tuple[str, int, int], _PendingThumbnail] = {}
         self._pending_lock = Lock()
         self._failure_lock = Lock()
+        self._stats_lock = Lock()
+        self._stats: dict[str, int] = {
+            "requested_visible": 0,
+            "requested_selected": 0,
+            "requested_prefetch": 0,
+            "memory_hit": 0,
+            "disk_hit": 0,
+            "generated": 0,
+            "generated_visible": 0,
+            "generated_selected": 0,
+            "generated_prefetch": 0,
+            "disk_saved": 0,
+            "disk_saved_visible": 0,
+            "disk_saved_selected": 0,
+            "memory_only": 0,
+            "prefetch_skipped": 0,
+        }
+        self._generated_buckets: dict[str, int] = {}
+        self._generated_variants: dict[str, int] = {}
         self._generation = 0
         self._closed = False
         self._decode_loader = loader
         self._loader = self._load_pipeline
         self._disk_cache = disk_cache
         self._disk_cache_enabled = bool(disk_cache_enabled)
+        self._session_start_disk_bytes = (
+            disk_cache.usage_bytes()
+            if disk_cache_enabled and disk_cache is not None
+            else 0
+        )
+        self._session_disk_baseline_initialized = bool(
+            disk_cache_enabled
+            and disk_cache is not None
+            and disk_cache.enabled
+        )
         self._failed: set[tuple[str, int, float | None]] = set()
         self._maintenance_started = False
         self._archive_backend_registry = archive_backend_registry
@@ -169,6 +199,7 @@ class BrowserThumbnailProvider(QObject):
             image_work_coordinator is not None
             and image_work_coordinator.browser_paused
         )
+        self._fast_scroll_suppressed = False
         if image_work_coordinator is not None:
             image_work_coordinator.browser_pause_changed.connect(self.set_paused)
 
@@ -210,10 +241,24 @@ class BrowserThumbnailProvider(QObject):
             normalized_size = max(16, min(1024, int(size)))
             cache_token = normalized_size
         path_key = self._path_key(item.path)
+        normalized_priority = ThumbnailPriority(priority)
+        if (
+            self._fast_scroll_suppressed
+            and normalized_priority is ThumbnailPriority.VISIBLE
+        ):
+            normalized_priority = ThumbnailPriority.PREFETCH
+        self._increment_stat(
+            {
+                ThumbnailPriority.VISIBLE: "requested_visible",
+                ThumbnailPriority.SELECTED: "requested_selected",
+                ThumbnailPriority.PREFETCH: "requested_prefetch",
+            }[normalized_priority]
+        )
         self._active_request_tokens.setdefault(path_key, set()).add(cache_token)
         cache_key = (path_key, cache_token, item.modified_at)
         cached = self._cache.get(cache_key)
         if cached is not None:
+            self._increment_stat("memory_hit")
             self._cache.move_to_end(cache_key)
             image = cached.copy()
             QTimer.singleShot(
@@ -258,7 +303,6 @@ class BrowserThumbnailProvider(QObject):
             return False
 
         pending_key = (path_key, cache_token, requested_generation)
-        normalized_priority = ThumbnailPriority(priority)
         with self._pending_lock:
             existing = self._pending.get(pending_key)
             if existing is not None:
@@ -292,6 +336,43 @@ class BrowserThumbnailProvider(QObject):
         with self._pending_lock:
             self._pending.pop(pending_key, None)
         return False
+
+    def retry(
+        self,
+        item: BrowserItem,
+        size: int | ThumbnailRenderSpec,
+        *,
+        generation: int | None = None,
+    ) -> bool:
+        token = size.cache_token if isinstance(size, ThumbnailRenderSpec) else int(size)
+        failure_key = (self._path_key(item.path), token, item.modified_at)
+        with self._failure_lock:
+            self._failed.discard(failure_key)
+        return self.request(
+            item,
+            size,
+            generation=generation,
+            priority=ThumbnailPriority.VISIBLE,
+        )
+
+    def request_disk_only(
+        self,
+        item: BrowserItem,
+        size: int | ThumbnailRenderSpec,
+        *,
+        generation: int | None = None,
+    ) -> bool:
+        """Use an existing disk entry, but do not decode a cache miss."""
+
+        return self.request(
+            item,
+            size,
+            generation=generation,
+            priority=ThumbnailPriority.PREFETCH,
+        )
+
+    def set_fast_scroll_suppressed(self, suppressed: bool) -> None:
+        self._fast_scroll_suppressed = bool(suppressed)
 
     def cancel_prefetch_except(
         self,
@@ -353,6 +434,22 @@ class BrowserThumbnailProvider(QObject):
         if not self._disk_cache_enabled or self._disk_cache is None:
             return 0
         return self._disk_cache.usage_bytes()
+
+    def cache_statistics(self) -> dict[str, object]:
+        disk_stats: dict[str, object] = {}
+        if self._disk_cache_enabled and self._disk_cache is not None:
+            disk_stats = self._disk_cache.statistics()
+        with self._stats_lock:
+            stats: dict[str, object] = dict(self._stats)
+            stats["generated_buckets"] = dict(self._generated_buckets)
+            stats["generated_variants"] = dict(self._generated_variants)
+        usage = int(disk_stats.get("usage_bytes", 0))
+        stats.update(disk_stats)
+        stats["session_growth_bytes"] = max(
+            0,
+            usage - self._session_start_disk_bytes,
+        )
+        return stats
 
     def set_disk_cache_enabled(self, enabled: bool) -> None:
         self._disk_cache_enabled = bool(enabled)
@@ -573,12 +670,17 @@ class BrowserThumbnailProvider(QObject):
         provisional: QImage | None = None
         if self._disk_cache_enabled and disk_cache is not None:
             disk_cache.set_enabled(True)
+            with self._stats_lock:
+                if not self._session_disk_baseline_initialized:
+                    self._session_start_disk_bytes = disk_cache.usage_bytes()
+                    self._session_disk_baseline_initialized = True
             self._run_initial_maintenance(disk_cache)
             if isinstance(size, ThumbnailRenderSpec) and hasattr(
                 disk_cache, "get_suitable"
             ):
                 cached_result = disk_cache.get_suitable(item, size)
                 if cached_result is not None:
+                    self._increment_stat("disk_hit")
                     if not cached_result.low_resolution_placeholder:
                         return ThumbnailLoadResult(cached_result.image)
                     provisional = cached_result.image
@@ -588,7 +690,15 @@ class BrowserThumbnailProvider(QObject):
             else:
                 cached = disk_cache.get(item, cache_token)
                 if cached is not None:
+                    self._increment_stat("disk_hit")
                     return ThumbnailLoadResult(cached)
+
+        if (
+            ThumbnailPriority(thumbnail_priority) is ThumbnailPriority.PREFETCH
+            and item.kind is not BrowserItemKind.PDF
+        ):
+            self._increment_stat("prefetch_skipped")
+            return ThumbnailLoadResult(None, provisional_image=provisional)
 
         with self._failure_lock:
             if failure_key in self._failed:
@@ -621,8 +731,40 @@ class BrowserThumbnailProvider(QObject):
                 self._failed.add(failure_key)
             return ThumbnailLoadResult(None, provisional_image=provisional)
 
-        if self._disk_cache_enabled and disk_cache is not None:
-            disk_cache.put(
+        self._increment_stat("generated")
+        normalized_priority = ThumbnailPriority(thumbnail_priority)
+        self._increment_stat(
+            {
+                ThumbnailPriority.VISIBLE: "generated_visible",
+                ThumbnailPriority.SELECTED: "generated_selected",
+                ThumbnailPriority.PREFETCH: "generated_prefetch",
+            }[normalized_priority]
+        )
+        bucket = (
+            f"{size.frame_width}x{size.frame_height}"
+            if isinstance(size, ThumbnailRenderSpec)
+            else str(cache_token)
+        )
+        with self._stats_lock:
+            self._generated_buckets[bucket] = (
+                self._generated_buckets.get(bucket, 0) + 1
+            )
+            if isinstance(size, ThumbnailRenderSpec):
+                variant = (
+                    f"{size.frame_ratio_id}/{size.crop_mode}/"
+                    f"{size.encoder_format}"
+                )
+                self._generated_variants[variant] = (
+                    self._generated_variants.get(variant, 0) + 1
+                )
+
+        if (
+            ThumbnailPriority(thumbnail_priority)
+            is not ThumbnailPriority.PREFETCH
+            and self._disk_cache_enabled
+            and disk_cache is not None
+        ):
+            saved = disk_cache.put(
                 item,
                 size if isinstance(size, ThumbnailRenderSpec) else cache_token,
                 result.image,
@@ -630,6 +772,15 @@ class BrowserThumbnailProvider(QObject):
                 entry_path=result.entry_path,
                 protected_thumbnail_sizes=self._protected_thumbnail_sizes(item),
             )
+            if saved:
+                self._increment_stat("disk_saved")
+                self._increment_stat(
+                    "disk_saved_visible"
+                    if normalized_priority is ThumbnailPriority.VISIBLE
+                    else "disk_saved_selected"
+                )
+        else:
+            self._increment_stat("memory_only")
         return ThumbnailLoadResult(
             result.image,
             result.cover_path,
@@ -710,6 +861,15 @@ class BrowserThumbnailProvider(QObject):
             self.thumbnail_provisional.emit(path, generation, provisional)
         image = loaded.image
         if image is None or image.isNull():
+            if (
+                pending is not None
+                and pending.priority is not ThumbnailPriority.PREFETCH
+            ):
+                self.thumbnail_failed.emit(
+                    path,
+                    generation,
+                    "サムネイルを生成できませんでした",
+                )
             return
         self._cache[cache_key] = image.copy()
         if pending is not None and isinstance(
@@ -720,6 +880,10 @@ class BrowserThumbnailProvider(QObject):
         while len(self._cache) > self._cache_capacity:
             self._cache.popitem(last=False)
         self.thumbnail_ready.emit(path, generation, image)
+
+    def _increment_stat(self, key: str, amount: int = 1) -> None:
+        with self._stats_lock:
+            self._stats[key] = self._stats.get(key, 0) + int(amount)
 
     def _memory_candidate(
         self,

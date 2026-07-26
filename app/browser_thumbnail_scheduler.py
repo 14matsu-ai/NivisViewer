@@ -50,7 +50,7 @@ def build_thumbnail_request_plan(
     first_visible: int,
     last_visible: int,
     selected_rows: tuple[int, ...] = (),
-    prefetch_screens: int = 2,
+    prefetch_screens: int = 1,
     fast_scrolling: bool = False,
 ) -> ThumbnailRequestPlan:
     count = max(0, int(row_count))

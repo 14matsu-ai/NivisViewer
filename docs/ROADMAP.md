@@ -64,7 +64,19 @@
     - 同一volume move／異なるvolume copyと修飾キーoverride
     - 全画面chromeの0ms非表示と状態変更後の再評価
     - thumbnail cacheのvariant最大2、source最大4、age cleanup
-20. 後続候補：ファイル操作と項目表示の拡張
+20. Sprint 17：全画面・一覧・設定・dropの信頼性改善（完了）
+    - fullscreen chromeの単一状態調停とcursor idle hide
+    - hidden／system／unsupported項目の表示policy
+    - visible-only高品質thumbnail永続化とsession統計
+    - folder treeの中央表示、ancestor-depth rebase、全体表示復帰
+    - お気に入りfolderのsingle-click navigation
+    - Viewer child widget／fullscreen overlayのnative drop転送
+    - scroll可能なSettingsDialogとconfig round-trip監査
+    - 追補：Browser pointer state machineとpath基準drag
+    - 追補：wide-imageのexact open identityと遅延寸法後の再配置
+    - 追補：folder treeのclick-confirmed navigation
+    - 追補：FavoriteRowMetricsによる高密度お気に入り行
+21. 後続候補：ファイル操作と項目表示の拡張
     - Browser一覧からツリー／お気に入りへのドラッグ＆ドロップ
     - Ctrl＝コピー、Shift＝移動等のWindows型操作
     - 衝突時のスキップ／別名／上書き選択UI
@@ -74,9 +86,9 @@
     - 再帰的なサブフォルダ表示
     - PDFパスワード入力、PDF目次
     - 画像中央クロップ／余白除去、Viewerメモリ予算調整
-21. 後続候補：レート／タグ編集UIと検索
+22. 後続候補：レート／タグ編集UIと検索
     - 基本ナビゲーションとファイル操作の安定後に着手
     - ZipPla `{zpi$...}` の明示的な読み取り互換
     - タグ・レート検索と絞り込み
     - サムネイル上のレート／タグ表示
-22. 公開前ライセンス監査、コード署名の将来検討
+23. 公開前ライセンス監査、コード署名の将来検討

@@ -56,6 +56,7 @@ _ITEM_TYPE_ORDER = {
     "archive": 1,
     "pdf": 2,
     "image": 3,
+    "other": 4,
 }
 
 
