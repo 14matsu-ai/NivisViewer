@@ -122,7 +122,13 @@ class ThumbnailDiskCache:
             )
             self._connection.commit()
 
-    def get(self, item: BrowserItem, thumbnail_size: int) -> QImage | None:
+    def get(
+        self,
+        item: BrowserItem,
+        thumbnail_size: int,
+        *,
+        entry_path: str | None = None,
+    ) -> QImage | None:
         with self._lock:
             if not self.enabled or self._connection is None:
                 return None
@@ -130,20 +136,27 @@ class ThumbnailDiskCache:
             if source is None:
                 return None
             try:
+                entry_clause = (
+                    "" if entry_path is None else " AND entry_path = ?"
+                )
+                parameters: list[object] = [
+                    self._normalize_path(item.path),
+                    item.kind.value,
+                    int(thumbnail_size),
+                    self.format_version,
+                ]
+                if entry_path is not None:
+                    parameters.append(str(entry_path))
                 rows = self._connection.execute(
-                    """
+                    f"""
                     SELECT cache_key, file_name, source_size, source_mtime_ns,
                            cover_path, cover_size, cover_mtime_ns
                       FROM entries
                      WHERE source_path = ? AND item_kind = ?
                        AND thumbnail_size = ? AND format_version = ?
-                    """,
-                    (
-                        self._normalize_path(item.path),
-                        item.kind.value,
-                        int(thumbnail_size),
-                        self.format_version,
-                    ),
+                       {entry_clause}
+                    """,  # nosec B608: entry_clause is a fixed internal fragment.
+                    tuple(parameters),
                 ).fetchall()
             except sqlite3.DatabaseError as exc:
                 self.last_error = str(exc)
@@ -180,6 +193,8 @@ class ThumbnailDiskCache:
         self,
         item: BrowserItem,
         spec: ThumbnailRenderSpec,
+        *,
+        entry_path: str | None = None,
     ) -> CachedThumbnail | None:
         """Return the smallest compatible resolution, or the best lower placeholder."""
         with self._lock:
@@ -189,14 +204,33 @@ class ThumbnailDiskCache:
             if source is None:
                 return None
             try:
+                entry_clause = (
+                    "" if entry_path is None else " AND entry_path = ?"
+                )
+                parameters: list[object] = [
+                    self._normalize_path(item.path),
+                    item.kind.value,
+                    spec.family_token,
+                    self.format_version,
+                ]
+                if entry_path is not None:
+                    parameters.append(str(entry_path))
+                parameters.extend(
+                    (
+                        spec.cache_token,
+                        spec.long_edge,
+                        spec.long_edge,
+                    )
+                )
                 rows = self._connection.execute(
-                    """
+                    f"""
                     SELECT cache_key, file_name, source_size, source_mtime_ns,
                            cover_path, cover_size, cover_mtime_ns,
                            thumbnail_size, frame_width, frame_height
                       FROM entries
                      WHERE source_path = ? AND item_kind = ?
                        AND family_token = ? AND format_version = ?
+                       {entry_clause}
                      ORDER BY CASE WHEN thumbnail_size = ? THEN -1 ELSE 0 END,
                      CASE
                          WHEN MAX(frame_width, frame_height) >= ? THEN 0 ELSE 1
@@ -206,16 +240,8 @@ class ThumbnailDiskCache:
                          THEN MAX(frame_width, frame_height)
                          ELSE -MAX(frame_width, frame_height)
                      END ASC
-                    """,
-                    (
-                        self._normalize_path(item.path),
-                        item.kind.value,
-                        spec.family_token,
-                        self.format_version,
-                        spec.cache_token,
-                        spec.long_edge,
-                        spec.long_edge,
-                    ),
+                    """,  # nosec B608: entry_clause is a fixed internal fragment.
+                    tuple(parameters),
                 ).fetchall()
             except sqlite3.DatabaseError as exc:
                 self.last_error = str(exc)

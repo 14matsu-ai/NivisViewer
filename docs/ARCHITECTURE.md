@@ -67,7 +67,10 @@ ApplicationController
    │  └─ ImageCache
    ├─ Viewer command dispatcher
    ├─ FullscreenChromeController
+   ├─ ViewerPageNavigationController
+   ├─ ViewerPageSlider
    └─ ViewerWidget
+      ├─ ViewerCanvasPointerController
       └─ MouseGestureRecognizer
 ```
 
@@ -97,20 +100,23 @@ ApplicationController
 - `SidebarLayoutController`: お気に入り、フォルダツリー、履歴のWidgetを再利用し、上下分割、逆順、タブ、単独表示を切り替える
 - `FolderTreeSyncController`: 現在フォルダへの有限回・generation付き同期と、自動展開／ユーザー展開の区別を管理する
 - `BrowserItemDiscovery`: サブフォルダ、ZIP/CBZ/RAR/CBR/7z/CB7、対応画像を列挙し、列挙時のmtimeとファイルサイズをBrowserItemへ保存する。画像のデコードや書庫の展開は行わない
-- `BrowserItemModel`: BrowserItemの表示名、絶対パス、種類、元項目のmtime、ファイルサイズ、表示アイコンをQt Model/Viewへ公開し、BrowserSortPolicyで保持リストを並べ替える
+- `BrowserItemModel`: BrowserItemの表示名、絶対パス、種類、Viewerで開けるか、preview生成可能か、preview種別・状態、元項目のmtime、ファイルサイズ、表示アイコンをQt Model/Viewへ公開し、BrowserSortPolicyで保持リストを並べ替える
 - `BrowserSortPolicy`: QtやMetadataStoreに依存せず、自然順、更新日時、種類、サイズ、昇降順、フォルダ優先を一元管理
 - `BrowserThumbnailScheduler`: viewport、gridSize、スクロール位置から可視行、選択行、通常時は前後1画面の先読み行を計画
 - `BrowserThumbnailProvider`: 最大2スレッドの専用`QThreadPool`で画像、画像フォルダ、ZIP/CBZ/RAR/CBR/7z/CB7のサムネイルを生成し、メモリLRUキャッシュを管理
 - `ThumbnailDiskCache`: SQLiteインデックスとWebPまたはPNGファイルによるポータブルな永続サムネイルキャッシュ
 - `SettingsDialog`: Viewerの開き方、見開き表示、Browserのサムネイルとディスクキャッシュ、マウス操作割り当て、外部書庫backend選択、WinRAR／7-Zipの自動検出／明示パスを編集
-- `ViewerWindow`: 閲覧メニュー、ダイアログ、入力、ViewerWidgetへの描画、ページ移動、全画面などウィンドウ固有UIを管理し、キー・メニュー・マウス入力を共通コマンドへdispatch
-- `FullscreenChromeController`: 全画面時の上下端検出とmenu／slider／statusのoverlay表示、自動非表示、通常配置への復元を担当
+- `ViewerWindow`: 閲覧メニュー、ダイアログ、入力、ViewerWidgetへの描画、全画面などウィンドウ固有UIを管理し、キー・メニュー・マウス入力を共通コマンドへdispatch
+- `ViewerPageNavigationController`: 通常／全画面slider、canvas click、メニューからの論理1ページ移動と固定表示単位移動を一元化し、本を開く責務を持たない
+- `ViewerPageSlider`: focused page indexを0始まりで表示し、angleDelta／pixelDeltaを累積してwheelを1ノッチ1論理ページへ変換し、処理済みeventをconsumeする
+- `FullscreenChromeController`: 全画面時の上下端検出、BottomRevealStrip、menu／slider／statusのoverlay表示、自動非表示、通常配置への復元を担当
 - `BookSession`: 現在のパス、ImageSource、PageModel、ImageCache、読み込み世代、外部書庫の非同期prepare→commit、ソース切替と終了を管理
 - `ConfigManager`: 実行ファイル基準の`config.json`を読み書きし、メタデータDBやキャッシュの配置基準も提供するポータブル設定管理
 - `ImageSource`: フォルダ、単体画像の親フォルダ、ZIP/CBZ、外部backend書庫を共通化する画像供給層
-- `PageModel`: 論理ページ順と単ページ／見開きの表示単位を管理する非GUIモデル
+- `PageModel`: focused page identity、logical page anchor、固定DisplayUnit、sliding single-page navigationを管理する非GUIモデル
 - `ImageCache`: セッション専用`QThreadPool`で画像を非同期デコードし、LRU形式で保持するキャッシュ
 - `ViewerWidget`: 渡された画像の描画、拡大縮小、パン、クリックやホイール入力、追加ボタン検出、ジェスチャー軌跡オーバーレイを担当
+- `ViewerCanvasPointerController`: 左クリックをダブルクリック間隔まで保留し、single click、pan、double click、modifier、overlay、drop、gesture、BookSession generationを排他的に判定
 - `MouseGestureRecognizer`: QtやGUI状態に依存せず、移動量をU/D/L/Rへ量子化して連続方向を圧縮
 - `PageThumbnailProvider`: QImageからQtアイコンへの変換を担当し、ViewerWindowのページ一覧とBrowserWindowの一覧で利用
 
@@ -141,7 +147,7 @@ BrowserWindow
 └─ DisplaySettings
 ```
 
-並び替えキーは`name`、`modified_time`、`item_type`、`file_size`です。名前はnatsortによる大文字小文字を過度に区別しない自然順とし、同一判定時は絶対パスで安定化します。更新日時とサイズが同じ項目、および同じ種類の項目は名前の自然順を二次順序にします。種類はフォルダ、書庫、PDF、画像、その他の順です。未対応形式も設定に従って`other`として保持しますが、NivisViewerのthumbnail decodeやViewer openへ渡しません。
+並び替えキーは`name`、`modified_time`、`item_type`、`file_size`です。名前はnatsortによる大文字小文字を過度に区別しない自然順とし、同一判定時は絶対パスで安定化します。更新日時とサイズが同じ項目、および同じ種類の項目は名前の自然順を二次順序にします。種類はフォルダ、書庫、PDF、画像、その他の順です。未対応形式も設定に従って`other`として保持し、Viewer open可否とBrowser preview可否を別の能力として扱います。
 
 更新日時は列挙時に取得した元ファイルまたは元フォルダ自身の`st_mtime_ns`だけを使います。サイズはファイル自身の`st_size`で、フォルダを再帰走査しません。stat失敗時は`None`として安全な既定値で比較します。MetadataStoreの`metadata_updated_at`、サムネイル生成日時、キャッシュ時刻は並び替えへ混ぜません。更新操作は再列挙するため最新のファイルシステム情報を取得しますが、並び替えだけで`os.stat()`を繰り返しません。
 
@@ -427,7 +433,7 @@ ViewerWindow
 
 FolderTreeSyncControllerはフォルダ移動のcommit後に起動し、`off`、`select_current`、`focus_current`を扱います。QFileSystemModelの遅延読み込みに対して有限回の再試行と独立generationを持ち、旧要求を適用しません。プログラム選択中はツリーの`currentChanged`から再navigateしないためBrowser履歴を増やしません。自動で展開したancestorとユーザーが手動展開した枝を別集合で追跡し、focus_currentで閉じるのは現在ancestorではない自動展開枝だけです。
 
-FullscreenChromeControllerはfullscreen、UI非表示設定、上下overlay、pointer領域、popup／modal、slider、mouse button、timer generation、window-local cursorを単一の`reconcile_state()`で調停します。通常menu barとstatus barはQMainWindow配下のまま全画面中は常に隠し、fullscreen専用menu/statusをoverlayへ表示するため、後続の`menuBar()`／`statusBar()`呼び出しで通常UIが再生成・残留しません。上端／下端の既定8 logical px（4～32）で該当側だけを表示し、離れた次のevent loop（設定範囲0～3000ms、既定0ms）で隠します。cursorはViewerWindow配下だけへBlankCursorを設定し、600～1000msのidle、mouse move、edge UI、popup、slider、fullscreen解除、window終了を同じControllerで管理します。
+FullscreenChromeControllerはfullscreen、UI非表示設定、上下overlay、pointer領域、popup／modal、slider、mouse button、timer generation、window-local cursorを単一の`reconcile_state()`で調停します。通常menu barとstatus barはQMainWindow配下のまま全画面中は常に隠し、fullscreen専用menu/statusをoverlayへ表示するため、後続の`menuBar()`／`statusBar()`呼び出しで通常UIが再生成・残留しません。上端は既定8 logical px（4～32）、下端は操作しやすい既定28 logical px（12～64）です。下端全幅の透明な`BottomRevealStrip`をbottom overlayと重ね、strip、overlay、その全child、slider handle、popup／modalをactive hover unionとして扱うためdead zoneを作りません。領域外では次のevent loop（設定範囲0～3000ms、既定0ms）で隠します。cursorはViewerWindow配下だけへBlankCursorを設定し、600～1000msのidle、mouse move、edge UI、popup、slider、fullscreen解除、window終了を同じControllerで管理します。
 
 ### Sprint 16のExplorer型操作と高密度タイトル
 
@@ -458,6 +464,30 @@ cleanupは欠損record、孤立file、任意の未使用期間、per-variant、p
 `ExternalDropOpenController`はViewerWindow、ViewerWidget、central widget、通常control、fullscreen overlayのevent chainでlocal URLだけを受理します。子Widgetのdrag/dropはViewerWindowの共通処理へ転送し、複数pathの順序、重複排除、1件目reuse、2件目以降newを維持します。folder判定はworkerで行い、unsupported、HTTP、text commandはopen経路へ渡しません。
 
 `SettingsDialog`は各tabの内容だけを`QScrollArea(widgetResizable=True)`へ入れ、OK／Cancel／Applyの`QDialogButtonBox`をroot layout下部へ固定します。初回表示時はcurrent screenのavailable geometryの88%以内へ収めます。全画面UI／cursor、visibility、tree focus、thumbnail max edgeを含むcontrolはConfigManagerのdefault、normalizer、load、Apply、settings_changedの同じkeyへround-tripします。
+
+### Sprint 18追補のViewer入力境界
+
+```text
+ViewerWindow
+├─ FullscreenChromeController
+│  └─ BottomRevealStrip
+├─ ViewerPageNavigationController
+├─ ViewerPageSlider
+└─ ViewerWidget
+   └─ ViewerCanvasPointerController
+
+PageModel
+├─ focused page identity
+├─ logical page anchor
+├─ fixed DisplayUnit navigation
+└─ sliding single-page navigation
+```
+
+通常配置と全画面overlayは同じ`ViewerPageSlider`インスタンスを使います。slider wheelは専用Widget内でacceptされ、上方向を`previous_single_page`、下方向を`next_single_page`へ変換します。sliderから`ApplicationController.open_path()`、`open_adjacent_book()`、Browser navigationを呼ぶ経路はありません。プログラムによるfocused index同期には`QSignalBlocker`を使い、`valueChanged`の再入を防ぎます。
+
+矢印、Space、Backspace、Viewer canvas上の通常wheel、メニューの次／前は`next_display_unit`／`previous_display_unit`として従来の固定表示単位を進みます。slider wheelと設定既定のcanvas左クリックだけが論理1ページ移動です。見開きでは`[2,3] → [3,4] → [4,5]`のsliding spreadを許可し、RTLは画面上の並びだけを反転します。表紙単独は`[0] → [1,2]`、anchorまたは次ページが横長なら該当規則に従って単独表示し、末尾では現在の本の範囲にclampします。画像寸法の後着はfocused identityとsliding anchorを維持します。
+
+Viewer canvasのsingle clickはOSのdouble-click intervalまで保留します。drag threshold以上は、fit状態で実際にpanできない場合も`Panning`としてclickを破棄します。double clickはpending single clickを取消して全画面切替だけを実行します。modifier、overlay／edge trigger、popup／modal、drop、mouse gesture、focus out、Esc、Viewer終了、BookSession generationまたはfocused identity変更でもpending clickを破棄します。`viewer_canvas_left_click_action`は`next_single_page`、`next_display_unit`、`none`を選択でき、Applyは共有ConfigManager経由で既存Viewerへ即時反映されます。
 
 ### Sprint 17追補の入力状態とpage identity
 
@@ -497,6 +527,37 @@ PageModelは表示単位先頭とは別にfocused page identityを保持しま�
 FolderTreeは`currentChanged`、selection、hover、expanded、directoryLoadedからnavigateしません。左buttonのpressとreleaseが同じpath、drag threshold未満、非disclosure、非programmatic syncの場合だけ`navigationConfirmed`を発行します。file drag hoverはoverlay highlightだけを描き、drop成立時だけ既存`FileOperationCoordinator`へtarget pathを渡します。展開矢印は展開／折りたたみだけを行います。
 
 お気に入りはpress時にnavigateせず、同一項目上のreleaseから発生するsingle clickをdouble-click interval内で確定します。待機対象は`QModelIndex`ではなくpathで保持し、並べ替え後に再解決します。dragが成立した入力列ではclickを発生させません。`FavoriteRowMetrics`の行高は`max(fontMetrics.height(), icon_size) + padding_y * 2`だけで決まり、wrapなし、elideあり、行間隔と14～24pxのfolder iconを独立設定します。
+
+### Sprint 18の汎用ファイルプレビューとBrowser中央ドロップ
+
+```text
+BrowserThumbnailProvider
+└─ PreviewProviderRegistry
+   ├─ TextPreviewProvider
+   ├─ WindowsShellPreviewService
+   │  └─ IShellItemImageFactory
+   ├─ FFmpegThumbnailBackend (任意)
+   └─ ShellAssociatedIconProvider
+
+Explorer external drop
+└─ BrowserMainDropController
+   └─ PendingBrowserFocusRequest
+      └─ BrowserWindow scan generation
+```
+
+`BrowserItem`は`can_open`、`can_generate_preview`、`preview_kind`、拡張子、folder／supported属性、preview statusを分離します。テキストや動画などViewerで開けない項目でもBrowser previewは生成できます。`PreviewResultKind`は`READY`、`PENDING`、`NO_CONTENT`、`NOT_APPLICABLE`、`UNAVAILABLE`、`FAILED`、`CANCELLED`を区別し、警告バッジとtooltipは実際の`FAILED`だけに表示します。画像のないフォルダ、空テキスト、利用できないShell provider／codec／FFmpeg、PREFETCH miss、キャンセルは標準関連付けアイコンへ静かに戻り、同じgeneration内でdecodeや書庫探索を繰り返しません。
+
+`TextPreviewProvider`はBrowser workerで最大64 KiBだけを読み、BOM付きUTF-8、UTF-16 LE／BE、UTF-32 LE／BE、UTF-8、CP932の順で判定します。NULや過剰な制御文字を含む入力はbinaryとして扱います。内容はHTMLとして解釈せず、先頭行だけを固定paper frameへ`QPainter`で描画します。text render versionを永続cache fingerprintへ含め、PREFETCHではファイルを読みません。
+
+`WindowsShellPreviewService`はBrowserの直列worker lane内でSTAを初期化し、`IShellItemImageFactory::GetImage`を一度に1要求だけ実行します。PREFETCHは`THUMBNAILONLY | INCACHEONLY`、可視／選択要求はShell抽出を許可します。返された`HBITMAP`は独立した`QImage`へcopyしてnative handleを必ず解放します。Shell由来サムネイルはNivisViewerのディスクcacheへ保存せず、メモリcacheとWindows自身のcacheだけを利用します。関連付けアイコンはextension／folder、logical size×DPRの物理bucketで保持し、delegateへQImageを直接渡します。
+
+動画はWindows Shell cache、Windows Shell抽出、任意FFmpeg、関連付けアイコンの順に段階的に戻ります。FFmpegは自動取得・自動同梱せず、明示path、アプリ配下候補、PATHから既存実行ファイルだけを検出します。呼び出しは引数配列、`shell=False`、stdin無効、Windows console非表示、出力上限、timeout、cancel、terminate／killを持ちます。Shell由来は永続化せず、FFmpegで可視／選択要求から生成したframeだけを既存ポータブルcacheへ保存できます。
+
+Browser一覧中央への外部local-file dropはViewer openやファイル移動を既定動作にしません。`BrowserMainDropController`がworkerでfile／folderを判定し、folderならそこへ移動、fileなら親folderへ移動して同一親のdrop項目をpathで複数選択し、primaryをcurrent・中央表示にします。異なる親が混在する場合は先頭親groupだけを使い、件数をstatusへ通知します。scan中は`PendingBrowserFocusRequest`がfolder、paths、primary、scan generation、request IDを保持し、各batchと正常完了でpathを再解決します。他のnavigation、新しいdrop、終了、旧generationでは要求を破棄します。内部NivisViewer dragをfolder／tree／favoriteへ落とす既存copy／move経路は維持します。
+
+`browser_external_drop_behavior=focus_only`が既定です。`focus_and_open`ではfocus確定後、primaryがNivisViewer対応項目の場合だけ既存`open_viewer_behavior`に従って開きます。自動選択は一覧へkeyboard focusを移さず、Viewerを前面へ出し直しません。
+
+Viewer画像領域の通常の左クリックは`next_one_page()`へ接続し、論理ページを1ページだけ進めます。矢印キー、ホイール、メニューの前／次ページは従来どおり`PageModel.next()`／`previous()`による表示単位移動で、見開きでは通常2ページずつ進みます。
 
 ### Viewer最優先の画像作業調整
 

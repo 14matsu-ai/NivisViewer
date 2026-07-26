@@ -31,6 +31,7 @@ class PageModel:
         self.treat_wide_image_as_single = True
         self._size_cache: dict[int, tuple[int, int] | None] = {}
         self._focused_page_identity: str | None = None
+        self._sliding_spread = False
 
     @property
     def total_pages(self) -> int:
@@ -45,6 +46,14 @@ class PageModel:
     def focused_page_identity(self) -> str | None:
         return self._focused_page_identity
 
+    @property
+    def logical_page_anchor(self) -> int:
+        return self.current_index
+
+    @property
+    def sliding_spread(self) -> bool:
+        return self._sliding_spread
+
     def set_source(self, source: ImageSource, selected_image: str | None = None) -> None:
         image_ids = source.list_images()
         self.set_prepared_source(source, image_ids, selected_image)
@@ -58,6 +67,7 @@ class PageModel:
         self.source = source
         self.image_ids = list(image_ids)
         self._size_cache.clear()
+        self._sliding_spread = False
 
         if not self.image_ids:
             self.current_index = 0
@@ -82,6 +92,7 @@ class PageModel:
         self.current_index = 0
         self._size_cache.clear()
         self._focused_page_identity = None
+        self._sliding_spread = False
 
     def update_options(
         self,
@@ -99,6 +110,7 @@ class PageModel:
             self.single_first_page = single_first_page
         if treat_wide_image_as_single is not None:
             self.treat_wide_image_as_single = treat_wide_image_as_single
+        self._sliding_spread = False
         self.current_index = self.spread_start_for_index(self.focused_index)
 
     def image_id_at(self, index: int) -> str | None:
@@ -172,7 +184,11 @@ class PageModel:
             self._size_cache[index] = size
             focused = self.focused_index
             if focused >= 0:
-                self.current_index = self.spread_start_for_index(focused)
+                self.current_index = (
+                    focused
+                    if self._sliding_spread
+                    else self.spread_start_for_index(focused)
+                )
         return previous != self.current_index
 
     def is_wide_image(self, index: int) -> bool:
@@ -271,6 +287,7 @@ class PageModel:
             return
         target = max(0, min(index, self.total_pages - 1))
         self._focused_page_identity = self.page_identity(target)
+        self._sliding_spread = False
         self.current_index = self.spread_start_for_index(target)
 
     def go_to_raw_index(self, index: int) -> None:
@@ -278,22 +295,40 @@ class PageModel:
             target = max(0, min(index, self.total_pages - 1))
             self.current_index = target
             self._focused_page_identity = self.page_identity(target)
+            self._sliding_spread = self.view_mode == "spread"
+
+    def go_to_focused_page_index(self, index: int) -> None:
+        """Make *index* the logical anchor without snapping to a fixed spread."""
+
+        self.go_to_raw_index(index)
+
+    def next_single(self) -> None:
+        if self.total_pages and self.focused_index < self.total_pages - 1:
+            self.go_to_raw_index(min(self.total_pages - 1, self.focused_index + 1))
+
+    def previous_single(self) -> None:
+        if self.total_pages and self.focused_index > 0:
+            self.go_to_raw_index(max(0, self.focused_index - 1))
 
     def next(self) -> None:
         if self.total_pages:
             self.current_index = self.next_index_from(self.current_index)
             self._focused_page_identity = self.page_identity(self.current_index)
+            self._sliding_spread = False
 
     def previous(self) -> None:
         if self.total_pages:
             self.current_index = self.previous_index_from(self.current_index)
             self._focused_page_identity = self.page_identity(self.current_index)
+            self._sliding_spread = False
 
     def first(self) -> None:
         self.current_index = 0
         self._focused_page_identity = self.page_identity(0)
+        self._sliding_spread = False
 
     def last(self) -> None:
         if self.total_pages:
             self.current_index = self.spread_start_for_index(self.total_pages - 1)
             self._focused_page_identity = self.page_identity(self.total_pages - 1)
+            self._sliding_spread = False

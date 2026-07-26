@@ -76,7 +76,22 @@
     - 追補：wide-imageのexact open identityと遅延寸法後の再配置
     - 追補：folder treeのclick-confirmed navigation
     - 追補：FavoriteRowMetricsによる高密度お気に入り行
-21. 後続候補：ファイル操作と項目表示の拡張
+21. Sprint 18：汎用ファイルプレビューとBrowser中央ドロップ（完了）
+    - `PreviewResultKind`による静かな未生成と実失敗の分離
+    - 高DPIのWindows関連付けアイコンとShellサムネイル
+    - UTF-8／UTF-16／UTF-32／CP932の安全なテキストプレビュー
+    - Windows Shell優先と任意FFmpeg fallbackによる動画サムネイル
+    - Viewer open可否とBrowser preview可否の能力分離
+    - 外部drop項目の親フォルダ移動、path基準複数選択、中央表示
+    - `focus_only`／`focus_and_open`設定とscan generation連携
+    - Viewer左クリックの論理1ページ送りと従来の表示単位操作の共存
+22. Sprint 18追補：Viewer入力と全画面下部UIの分離（完了）
+    - fullscreen page-slider wheel isolation
+    - larger bottom reveal target
+    - configurable one-page canvas click
+    - sliding spread navigation
+    - pan／double-click／overlay／dropとの入力排他
+23. 後続候補：ファイル操作と項目表示の拡張
     - Browser一覧からツリー／お気に入りへのドラッグ＆ドロップ
     - Ctrl＝コピー、Shift＝移動等のWindows型操作
     - 衝突時のスキップ／別名／上書き選択UI
@@ -86,9 +101,9 @@
     - 再帰的なサブフォルダ表示
     - PDFパスワード入力、PDF目次
     - 画像中央クロップ／余白除去、Viewerメモリ予算調整
-22. 後続候補：レート／タグ編集UIと検索
+24. 後続候補：レート／タグ編集UIと検索
     - 基本ナビゲーションとファイル操作の安定後に着手
     - ZipPla `{zpi$...}` の明示的な読み取り互換
     - タグ・レート検索と絞り込み
     - サムネイル上のレート／タグ表示
-23. 公開前ライセンス監査、コード署名の将来検討
+25. 公開前ライセンス監査、コード署名の将来検討

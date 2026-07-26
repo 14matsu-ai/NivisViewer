@@ -629,6 +629,9 @@ def test_favorite_actual_release_navigation_and_double_click_once(
     )
     window.show()
     qapp.processEvents()
+    window.activateWindow()
+    window.favorite_view.setFocus()
+    qapp.processEvents()
     calls: list[str] = []
     window.navigate_to = lambda path, **_kwargs: calls.append(str(path)) or True
     window._favorite_click_timer.setInterval(1)
@@ -639,7 +642,7 @@ def test_favorite_actual_release_navigation_and_double_click_once(
         Qt.MouseButton.LeftButton,
         pos=point,
     )
-    QTest.qWait(5)
+    QTest.qWait(30)
     assert calls == [str(folder)]
     calls.clear()
     QTest.mouseDClick(
@@ -652,7 +655,7 @@ def test_favorite_actual_release_navigation_and_double_click_once(
         Qt.MouseButton.LeftButton,
         pos=point,
     )
-    QTest.qWait(5)
+    QTest.qWait(30)
     assert calls == [str(folder)]
     window.close()
     qapp.processEvents()

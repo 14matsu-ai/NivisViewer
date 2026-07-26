@@ -44,6 +44,21 @@ class BrowserItem:
     hidden: bool = False
     system: bool = False
     openable_by_nivisviewer: bool = True
+    can_generate_preview: bool = True
+    preview_kind: str = ""
+    preview_status: str = "pending"
+
+    @property
+    def can_open(self) -> bool:
+        return self.openable_by_nivisviewer
+
+    @property
+    def is_folder(self) -> bool:
+        return self.kind is BrowserItemKind.FOLDER
+
+    @property
+    def is_supported(self) -> bool:
+        return self.openable_by_nivisviewer
 
 
 @dataclass(frozen=True)
@@ -105,6 +120,8 @@ def browser_item_from_scan_entry(entry: BrowserScanEntry) -> BrowserItem:
         hidden=entry.hidden,
         system=entry.system,
         openable_by_nivisviewer=entry.openable_by_nivisviewer,
+        can_generate_preview=entry.can_generate_preview,
+        preview_kind=entry.preview_kind,
     )
 
 
@@ -120,6 +137,9 @@ class BrowserItemModel(QAbstractListModel):
     SystemRole = PathRole + 8
     OpenableRole = PathRole + 9
     ThumbnailErrorRole = PathRole + 10
+    PreviewKindRole = PathRole + 11
+    CanGeneratePreviewRole = PathRole + 12
+    PreviewStatusRole = PathRole + 13
 
     _KIND_LABELS = {
         BrowserItemKind.FOLDER: "フォルダ",
@@ -140,6 +160,7 @@ class BrowserItemModel(QAbstractListModel):
         self._thumbnail_images: dict[str, QImage] = {}
         self._low_resolution_thumbnails: set[str] = set()
         self._thumbnail_errors: dict[str, str] = {}
+        self._preview_statuses: dict[str, str] = {}
         self._fallback_icons: dict[BrowserItemKind, QIcon] = {}
         self._row_by_key: dict[str, int] = {}
 
@@ -171,6 +192,15 @@ class BrowserItemModel(QAbstractListModel):
             return item.openable_by_nivisviewer
         if role == self.ThumbnailErrorRole:
             return self._thumbnail_errors.get(self._key(item.path))
+        if role == self.PreviewKindRole:
+            return item.preview_kind
+        if role == self.CanGeneratePreviewRole:
+            return item.can_generate_preview
+        if role == self.PreviewStatusRole:
+            return self._preview_statuses.get(
+                self._key(item.path),
+                item.preview_status,
+            )
         if role == self.PathRole:
             return str(item.path)
         if role == self.KindRole:
@@ -195,6 +225,7 @@ class BrowserItemModel(QAbstractListModel):
         self._thumbnail_images.clear()
         self._low_resolution_thumbnails.clear()
         self._thumbnail_errors.clear()
+        self._preview_statuses.clear()
         self._scan_generation = None
         self._rebuild_row_index()
         self.endResetModel()
@@ -208,6 +239,7 @@ class BrowserItemModel(QAbstractListModel):
         self._thumbnail_images.clear()
         self._low_resolution_thumbnails.clear()
         self._thumbnail_errors.clear()
+        self._preview_statuses.clear()
         self._row_by_key.clear()
         self._scan_generation = int(generation)
         self.endResetModel()
@@ -348,6 +380,19 @@ class BrowserItemModel(QAbstractListModel):
         )
         return True
 
+    def set_preview_status(self, path: str | Path, status: str) -> bool:
+        row = self.row_for_path(path)
+        if row < 0:
+            return False
+        key = self._key(self._items[row].path)
+        normalized = str(status)
+        if self._preview_statuses.get(key) == normalized:
+            return False
+        self._preview_statuses[key] = normalized
+        index = self.index(row, 0)
+        self.dataChanged.emit(index, index, [self.PreviewStatusRole])
+        return True
+
     def clear_thumbnails(self) -> None:
         if (
             not self._icons
@@ -359,6 +404,7 @@ class BrowserItemModel(QAbstractListModel):
         self._thumbnail_images.clear()
         self._low_resolution_thumbnails.clear()
         self._thumbnail_errors.clear()
+        self._preview_statuses.clear()
         if self._items:
             self.dataChanged.emit(
                 self.index(0, 0),

@@ -21,6 +21,15 @@ from .image_source import ARCHIVE_EXTENSIONS, PDF_EXTENSIONS, SUPPORTED_EXTENSIO
 DEFAULT_SCAN_BATCH_SIZE = 128
 _TEMPORARY_SUFFIXES = (".tmp", ".part", ".crdownload")
 _RETIRED_SCANNERS: set[BrowserDirectoryScanner] = set()
+_TEXT_PREVIEW_EXTENSIONS = {
+    ".txt", ".md", ".log", ".ini", ".cfg", ".conf", ".json", ".yaml",
+    ".yml", ".toml", ".xml", ".csv", ".py", ".js", ".ts", ".css",
+    ".html", ".htm", ".bat", ".cmd", ".ps1",
+}
+_VIDEO_PREVIEW_EXTENSIONS = {
+    ".mp4", ".m4v", ".mkv", ".avi", ".mov", ".wmv", ".webm", ".mpg",
+    ".mpeg", ".mts", ".m2ts", ".ts", ".flv", ".ogv", ".3gp",
+}
 
 
 class BrowserScanStatus(str, Enum):
@@ -52,6 +61,8 @@ class BrowserScanEntry:
     hidden: bool = False
     system: bool = False
     openable_by_nivisviewer: bool = True
+    can_generate_preview: bool = True
+    preview_kind: str = ""
 
 
 @dataclass(frozen=True)
@@ -104,6 +115,7 @@ def scan_entry_from_dir_entry(
     try:
         if entry.is_dir(follow_symlinks=False):
             item_kind = "folder"
+            preview_kind = "folder_cover"
             supported = True
             is_directory = True
         elif entry.is_file(follow_symlinks=False):
@@ -114,18 +126,31 @@ def scan_entry_from_dir_entry(
                     and not is_supported_archive_candidate(name)
                 ):
                     item_kind = "other"
+                    preview_kind = "windows_shell"
                     supported = False
                 else:
                     item_kind = "archive"
+                    preview_kind = "archive"
                     supported = True
             elif suffix in SUPPORTED_EXTENSIONS:
                 item_kind = "image"
+                preview_kind = "image"
                 supported = True
             elif suffix in PDF_EXTENSIONS:
                 item_kind = "pdf"
+                preview_kind = "pdf"
                 supported = True
+            elif suffix in _TEXT_PREVIEW_EXTENSIONS:
+                item_kind = "other"
+                preview_kind = "text"
+                supported = False
+            elif suffix in _VIDEO_PREVIEW_EXTENSIONS:
+                item_kind = "other"
+                preview_kind = "video"
+                supported = False
             else:
                 item_kind = "other"
+                preview_kind = "windows_shell"
                 supported = False
             is_directory = False
         else:
@@ -161,6 +186,8 @@ def scan_entry_from_dir_entry(
         hidden=hidden,
         system=system,
         openable_by_nivisviewer=supported,
+        can_generate_preview=True,
+        preview_kind=preview_kind,
     )
 
 

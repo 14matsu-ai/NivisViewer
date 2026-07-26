@@ -479,7 +479,7 @@ def test_pdf_viewer_async_open_spread_render_and_history(
             time.sleep(0.005)
         assert isinstance(window.book_session.source, PdfImageSource)
         assert window.model.total_pages == 3
-        assert window.slider.maximum() == 3
+        assert window.slider.maximum() == 2
         assert controller.metadata_store.list_history()[0].item_type == "pdf"
 
         window.set_view_mode("spread")

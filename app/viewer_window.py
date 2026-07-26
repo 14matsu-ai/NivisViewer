@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QByteArray, QEvent, QSize, QThreadPool, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QByteArray, QEvent, QPoint, QSize, QThreadPool, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -26,7 +26,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
-    QSlider,
     QStatusBar,
     QVBoxLayout,
     QWidget,
@@ -55,6 +54,8 @@ from .pdf_image_source import PdfImageSource
 from .performance_trace import performance_trace
 from .thumbnail_provider import PageThumbnailProvider
 from . import viewer_commands as commands
+from .viewer_page_navigation import ViewerPageNavigationController
+from .viewer_page_slider import ViewerPageSlider
 from .viewer_widget import ViewerImage, ViewerWidget, calculate_spread_layout
 
 
@@ -125,6 +126,7 @@ class ViewerWindow(QMainWindow):
         self.book_session.async_open_failed.connect(self._on_async_book_open_failed)
         self._open_path_handler = open_path_handler
         self._drop_probe_workers: set[FolderDropProbe] = set()
+        self._drop_active = False
         self._adjacent_book_handler = adjacent_book_handler
         self._shutdown_prepared = False
         self._active_request_id = 0
@@ -164,9 +166,16 @@ class ViewerWindow(QMainWindow):
         self.fullscreen_auto_reveal_ui = bool(
             self.settings.get("fullscreen_auto_reveal_ui", True)
         )
-        self.fullscreen_edge_trigger_px = int(
-            self.settings.get("fullscreen_edge_trigger_px", 8)
+        self.fullscreen_top_edge_trigger_px = int(
+            self.settings.get(
+                "fullscreen_top_edge_trigger_px",
+                self.settings.get("fullscreen_edge_trigger_px", 8),
+            )
         )
+        self.fullscreen_bottom_edge_trigger_px = int(
+            self.settings.get("fullscreen_bottom_edge_trigger_px", 28)
+        )
+        self.fullscreen_edge_trigger_px = self.fullscreen_top_edge_trigger_px
         self.fullscreen_ui_hide_delay_ms = int(
             self.settings.get("fullscreen_ui_hide_delay_ms", 0)
         )
@@ -194,6 +203,12 @@ class ViewerWindow(QMainWindow):
         self.mouse_forward_button_action = commands.normalize_viewer_command(
             self.settings.get("mouse_forward_button_action")
         )
+        self.viewer_canvas_left_click_action = str(
+            self.settings.get(
+                "viewer_canvas_left_click_action",
+                commands.NEXT_SINGLE_PAGE,
+            )
+        )
         self.slideshow_timer = QTimer(self)
         self.slideshow_timer.setInterval(max(500, self.slideshow_interval_ms))
         self.slideshow_timer.timeout.connect(self._advance_slideshow)
@@ -202,6 +217,11 @@ class ViewerWindow(QMainWindow):
         self._pdf_render_timer.setInterval(180)
         self._pdf_render_timer.timeout.connect(self._rerender_pdf)
         self.image_cache.set_adjustments(brightness=self.brightness, contrast=self.contrast, gamma=self.gamma)
+        self.page_navigation = ViewerPageNavigationController(
+            self.model,
+            self._on_page_navigation_changed,
+            self,
+        )
 
         self._build_ui()
         self._connect_shortcuts()
@@ -251,6 +271,7 @@ class ViewerWindow(QMainWindow):
             self.activated.emit(self)
         elif event.type() == QEvent.Type.WindowDeactivate and hasattr(self, "viewer"):
             self.viewer.cancel_mouse_gesture()
+            self.viewer.cancel_pending_canvas_click()
         if (
             hasattr(self, "fullscreen_chrome")
             and event.type()
@@ -261,11 +282,8 @@ class ViewerWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.viewer = ViewerWidget(self)
-        self.slider = QSlider(Qt.Orientation.Horizontal, self)
-        self.slider.setMinimum(1)
-        self.slider.setMaximum(1)
-        self.slider.setValue(1)
-        self.slider.setEnabled(False)
+        self.slider = ViewerPageSlider(self)
+        self.slider.set_page_state(0, 0)
 
         central = QWidget(self)
         layout = QVBoxLayout(central)
@@ -306,15 +324,20 @@ class ViewerWindow(QMainWindow):
         self.viewer.fullscreenToggleRequested.connect(
             lambda: self.dispatch_command(commands.TOGGLE_FULLSCREEN)
         )
-        self.viewer.leftSideClicked.connect(self._on_left_side_clicked)
-        self.viewer.rightSideClicked.connect(self._on_right_side_clicked)
+        self.viewer.imageLeftClicked.connect(self._on_image_left_clicked)
         self.viewer.contextMenuRequested.connect(self._show_viewer_context_menu)
         self.viewer.gestureRecognized.connect(self._on_mouse_gesture)
         self.viewer.extraMouseButtonPressed.connect(self._on_extra_mouse_button)
         self.viewer.zoomChanged.connect(self._on_zoom_changed)
         self.viewer.viewportChanged.connect(self._schedule_pdf_rerender)
         self.viewer.contentPainted.connect(self._on_viewer_content_painted)
-        self.slider.valueChanged.connect(self._on_slider_changed)
+        self.slider.focusedPageRequested.connect(self._on_slider_changed)
+        self.slider.nextSinglePageRequested.connect(
+            self.page_navigation.next_single_page
+        )
+        self.slider.previousSinglePageRequested.connect(
+            self.page_navigation.previous_single_page
+        )
         self.fullscreen_chrome = FullscreenChromeController(
             self,
             viewer=self.viewer,
@@ -322,8 +345,17 @@ class ViewerWindow(QMainWindow):
             slider=self.slider,
             status_bar=self.status,
             auto_reveal=self.fullscreen_auto_reveal_ui,
-            edge_trigger_px=self.fullscreen_edge_trigger_px,
+            top_edge_trigger_px=self.fullscreen_top_edge_trigger_px,
+            bottom_edge_trigger_px=self.fullscreen_bottom_edge_trigger_px,
             hide_delay_ms=self.fullscreen_ui_hide_delay_ms,
+        )
+        self.slider.wheelInteraction.connect(
+            self.fullscreen_chrome.show_bottom
+        )
+        self.viewer.set_canvas_input_context(
+            context_provider=self._canvas_context_token,
+            click_allowed=self._canvas_click_allowed,
+            press_flags=self._canvas_press_flags,
         )
         self.viewer.set_auto_hide_cursor(False)
         drop_targets = (
@@ -331,6 +363,7 @@ class ViewerWindow(QMainWindow):
             central,
             self.fullscreen_chrome.top_overlay,
             self.fullscreen_chrome.bottom_overlay,
+            self.fullscreen_chrome.bottom_reveal_strip,
             self.fullscreen_chrome.fullscreen_menu_bar,
             self.fullscreen_chrome.fullscreen_status_bar,
             self.menuBar(),
@@ -755,10 +788,34 @@ class ViewerWindow(QMainWindow):
             )
             fullscreen_chrome_changed = True
         if "fullscreen_edge_trigger_px" in changed:
-            self.fullscreen_edge_trigger_px = max(
+            self.fullscreen_top_edge_trigger_px = max(
                 4, min(32, int(changed["fullscreen_edge_trigger_px"]))
             )
+            self.fullscreen_edge_trigger_px = self.fullscreen_top_edge_trigger_px
             fullscreen_chrome_changed = True
+        if "fullscreen_top_edge_trigger_px" in changed:
+            self.fullscreen_top_edge_trigger_px = max(
+                4, min(32, int(changed["fullscreen_top_edge_trigger_px"]))
+            )
+            self.fullscreen_edge_trigger_px = self.fullscreen_top_edge_trigger_px
+            fullscreen_chrome_changed = True
+        if "fullscreen_bottom_edge_trigger_px" in changed:
+            self.fullscreen_bottom_edge_trigger_px = max(
+                12, min(64, int(changed["fullscreen_bottom_edge_trigger_px"]))
+            )
+            fullscreen_chrome_changed = True
+        if "viewer_canvas_left_click_action" in changed:
+            action = str(changed["viewer_canvas_left_click_action"])
+            self.viewer_canvas_left_click_action = (
+                action
+                if action
+                in {
+                    commands.NEXT_SINGLE_PAGE,
+                    commands.NEXT_DISPLAY_UNIT,
+                    "none",
+                }
+                else commands.NEXT_SINGLE_PAGE
+            )
         if "fullscreen_ui_hide_delay_ms" in changed:
             self.fullscreen_ui_hide_delay_ms = max(
                 0, min(3000, int(changed["fullscreen_ui_hide_delay_ms"]))
@@ -767,7 +824,8 @@ class ViewerWindow(QMainWindow):
         if fullscreen_chrome_changed:
             self.fullscreen_chrome.configure(
                 auto_reveal=self.fullscreen_auto_reveal_ui,
-                edge_trigger_px=self.fullscreen_edge_trigger_px,
+                top_edge_trigger_px=self.fullscreen_top_edge_trigger_px,
+                bottom_edge_trigger_px=self.fullscreen_bottom_edge_trigger_px,
                 hide_delay_ms=self.fullscreen_ui_hide_delay_ms,
             )
             self.fullscreen_chrome.reevaluate_visibility()
@@ -868,6 +926,7 @@ class ViewerWindow(QMainWindow):
         *,
         folder_snapshot: FolderListingSnapshot | None = None,
     ) -> bool:
+        self.viewer.cancel_pending_canvas_click()
         self._active_open_trace_id = (
             self._next_open_trace_id
             or performance_trace.begin("viewer.open_path.started", str(path))
@@ -1079,6 +1138,12 @@ class ViewerWindow(QMainWindow):
         self.book_session.notify_page_changed()
         self._refresh_view()
         return True
+
+    def _on_page_navigation_changed(self, previous_index: int) -> None:
+        self.viewer.cancel_pending_canvas_click()
+        self._record_page_history(previous_index)
+        self.book_session.notify_page_changed()
+        self._refresh_view()
 
     def go_back_in_page_history(self) -> None:
         if self.model.total_pages <= 0 or not self._page_history_back:
@@ -1765,11 +1830,89 @@ class ViewerWindow(QMainWindow):
         else:
             self.next_page()
 
+    def _on_image_left_clicked(self) -> None:
+        if self.viewer_canvas_left_click_action == commands.NEXT_SINGLE_PAGE:
+            self.page_navigation.next_single_page()
+        elif self.viewer_canvas_left_click_action == commands.NEXT_DISPLAY_UNIT:
+            self.next_page()
+
+    def _canvas_context_token(self) -> tuple[int, int, str | None]:
+        return (
+            id(self.book_session),
+            self.book_session.generation,
+            self.model.focused_page_identity,
+        )
+
+    def _canvas_click_allowed(self, global_position: QPoint) -> bool:
+        if self._shutdown_prepared or self._drop_active:
+            return False
+        if self.viewer.gesture_in_progress:
+            return False
+        popup = QApplication.activePopupWidget()
+        modal = QApplication.activeModalWidget()
+        if (
+            popup is not None
+            and (popup is self or self.isAncestorOf(popup))
+        ) or (
+            modal is not None
+            and (modal is self or self.isAncestorOf(modal))
+        ):
+            return False
+        if self.fullscreen_chrome.fullscreen:
+            if self.fullscreen_chrome.is_edge_trigger(global_position):
+                return False
+            for overlay in (
+                self.fullscreen_chrome.top_overlay,
+                self.fullscreen_chrome.bottom_overlay,
+                self.fullscreen_chrome.bottom_reveal_strip,
+            ):
+                if (
+                    overlay.isVisible()
+                    and overlay.rect().contains(
+                        overlay.mapFromGlobal(global_position)
+                    )
+                ):
+                    return False
+        return self.viewer.rect().contains(
+            self.viewer.mapFromGlobal(global_position)
+        )
+
+    def _canvas_press_flags(self, global_position: QPoint) -> dict[str, bool]:
+        fullscreen = self.fullscreen_chrome.fullscreen
+        edge_trigger = (
+            fullscreen
+            and self.fullscreen_chrome.is_edge_trigger(global_position)
+        )
+        overlay = False
+        if fullscreen:
+            overlay = any(
+                widget.isVisible()
+                and widget.rect().contains(
+                    widget.mapFromGlobal(global_position)
+                )
+                for widget in (
+                    self.fullscreen_chrome.top_overlay,
+                    self.fullscreen_chrome.bottom_overlay,
+                    self.fullscreen_chrome.bottom_reveal_strip,
+                )
+            )
+        return {
+            "fullscreen": fullscreen,
+            "overlay": overlay,
+            "edge_trigger": edge_trigger,
+            "mouse_gesture": self.viewer.gesture_in_progress,
+            "drop_active": self._drop_active,
+        }
+
     def dispatch_command(self, command: str) -> bool:
         normalized = commands.normalize_viewer_command(command)
         handlers: dict[str, Callable[[], None]] = {
             commands.PREVIOUS_PAGE: self.previous_page,
             commands.NEXT_PAGE: self.next_page,
+            commands.PREVIOUS_DISPLAY_UNIT: self.previous_page,
+            commands.NEXT_DISPLAY_UNIT: self.next_page,
+            commands.PREVIOUS_SINGLE_PAGE: self.previous_one_page,
+            commands.NEXT_SINGLE_PAGE: self.next_one_page,
             commands.FIRST_PAGE: self.first_page,
             commands.LAST_PAGE: self.last_page,
             commands.PREVIOUS_BOOK: self.open_previous_book,
@@ -1799,6 +1942,7 @@ class ViewerWindow(QMainWindow):
             self.dispatch_command(self.mouse_forward_button_action)
 
     def _handle_escape(self) -> None:
+        self.viewer.cancel_pending_canvas_click()
         if self.viewer.cancel_mouse_gesture():
             return
         self.exit_fullscreen()
@@ -1905,6 +2049,8 @@ class ViewerWindow(QMainWindow):
         super().dropEvent(event)
 
     def _handle_drop_event(self, event: QDropEvent) -> bool:
+        self.viewer.cancel_pending_canvas_click()
+        self._drop_active = True
         local_paths = ExternalDropOpenController.local_paths(event.mimeData())
         paths = ExternalDropOpenController.paths(event.mimeData())
         if local_paths:
@@ -1933,8 +2079,10 @@ class ViewerWindow(QMainWindow):
                 worker.signals.finished.connect(finished)
                 QThreadPool.globalInstance().start(worker)
             event.acceptProposedAction()
+            self._drop_active = False
             return True
         event.ignore()
+        self._drop_active = False
         return False
 
     def _dispatch_dropped_paths(self, paths: tuple[str, ...]) -> None:
@@ -1954,13 +2102,10 @@ class ViewerWindow(QMainWindow):
             )
 
     def _update_slider(self) -> None:
-        total = max(1, self.model.total_pages)
-        self.slider.blockSignals(True)
-        self.slider.setEnabled(self.model.total_pages > 0)
-        self.slider.setMinimum(1)
-        self.slider.setMaximum(total)
-        self.slider.setValue(min(total, self.model.focused_index + 1))
-        self.slider.blockSignals(False)
+        self.slider.set_page_state(
+            self.model.total_pages,
+            self.model.focused_index,
+        )
 
     def _update_status(self) -> None:
         if self._status_override_message is not None:
@@ -2025,7 +2170,7 @@ class ViewerWindow(QMainWindow):
         return f"{value:.1f} {unit}"
 
     def _on_slider_changed(self, value: int) -> None:
-        self._go_to_index_with_history(value - 1)
+        self.page_navigation.go_to_focused_page_index(value)
 
     def _on_zoom_changed(self, zoom: float) -> None:
         self.fit_mode = "manual_zoom"
@@ -2214,12 +2359,12 @@ class ViewerWindow(QMainWindow):
             self._sync_actions()
 
     def next_page(self) -> None:
-        moved = self._go_to_model_move_with_history(self.model.next)
+        moved = self.page_navigation.next_display_unit()
         if not moved and self.auto_open_adjacent_book:
             self.open_next_book()
 
     def previous_page(self) -> None:
-        moved = self._go_to_model_move_with_history(self.model.previous)
+        moved = self.page_navigation.previous_display_unit()
         if not moved and self.auto_open_adjacent_book:
             self.open_previous_book()
 
@@ -2232,18 +2377,10 @@ class ViewerWindow(QMainWindow):
             self.previous_page()
 
     def next_one_page(self) -> None:
-        if self.model.total_pages <= 0:
-            return
-        moved = self._go_to_index_with_history(self.model.current_index + 1, raw=True)
-        if not moved and self.auto_open_adjacent_book:
-            self.open_next_book()
+        self.page_navigation.next_single_page()
 
     def previous_one_page(self) -> None:
-        if self.model.total_pages <= 0:
-            return
-        moved = self._go_to_index_with_history(self.model.current_index - 1, raw=True)
-        if not moved and self.auto_open_adjacent_book:
-            self.open_previous_book()
+        self.page_navigation.previous_single_page()
 
     def go_to_page_dialog(self) -> None:
         if self.model.total_pages <= 0:
@@ -2263,12 +2400,12 @@ class ViewerWindow(QMainWindow):
     def first_page(self) -> None:
         self.slideshow_timer.stop()
         self._sync_actions()
-        self._go_to_model_move_with_history(self.model.first)
+        self.page_navigation.first_page()
 
     def last_page(self) -> None:
         self.slideshow_timer.stop()
         self._sync_actions()
-        self._go_to_model_move_with_history(self.model.last)
+        self.page_navigation.last_page()
 
     def toggle_fullscreen(self) -> None:
         if self.isFullScreen():
@@ -2309,6 +2446,7 @@ class ViewerWindow(QMainWindow):
         self.fullscreen_chrome.shutdown()
         self._cancel_interactive_open()
         self.viewer.cancel_mouse_gesture()
+        self.viewer.cancel_pending_canvas_click()
         self.slideshow_timer.stop()
         self._pdf_render_timer.stop()
         self._save_current_reading_position()
