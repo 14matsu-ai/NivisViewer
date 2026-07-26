@@ -6,7 +6,6 @@ from PySide6.QtCore import QPoint, QRect, QSize, QTimer, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QContextMenuEvent,
-    QCursor,
     QImage,
     QMouseEvent,
     QPainter,
@@ -142,11 +141,6 @@ class ViewerWidget(QWidget):
         self.magnifier_enabled = False
         self.magnifier_zoom = 2.0
         self.magnifier_size = 220
-        self.auto_hide_cursor = False
-        self._cursor_hidden = False
-        self._cursor_timer = QTimer(self)
-        self._cursor_timer.setSingleShot(True)
-        self._cursor_timer.timeout.connect(self._hide_cursor)
 
         self._spread = DisplaySpread(0, tuple(), True)
         self._images: list[ViewerImage] = []
@@ -200,13 +194,10 @@ class ViewerWidget(QWidget):
         self.update()
 
     def set_auto_hide_cursor(self, enabled: bool) -> None:
-        self.auto_hide_cursor = enabled
-        if enabled:
-            self._show_cursor_temporarily()
-        else:
-            self._cursor_timer.stop()
-            self.unsetCursor()
-            self._cursor_hidden = False
+        # FullscreenChromeController owns cursor idling. Keep this method only
+        # as a source-compatible normal-cursor reset for older integrations.
+        del enabled
+        self.unsetCursor()
 
     def set_mouse_gesture_options(
         self,
@@ -441,26 +432,15 @@ class ViewerWidget(QWidget):
 
     def leaveEvent(self, event) -> None:  # type: ignore[override]
         self._mouse_pos = None
-        self._cursor_timer.stop()
-        self.unsetCursor()
-        self._cursor_hidden = False
         if self.magnifier_enabled:
             self.update()
         super().leaveEvent(event)
 
     def _show_cursor_temporarily(self) -> None:
-        if not self.auto_hide_cursor:
-            return
-        if self._cursor_hidden:
-            self.unsetCursor()
-            self._cursor_hidden = False
-        self._cursor_timer.start(1500)
+        return
 
     def _hide_cursor(self) -> None:
-        if not self.auto_hide_cursor:
-            return
-        self.setCursor(QCursor(Qt.CursorShape.BlankCursor))
-        self._cursor_hidden = True
+        return
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         if event.button() in {

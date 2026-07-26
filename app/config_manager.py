@@ -47,6 +47,9 @@ class ConfigManager(QObject):
         "browser_filename_display": "one_line",
         "browser_filename_gap": 0,
         "browser_filename_padding_y": 0,
+        "browser_show_hidden_items": True,
+        "browser_show_unsupported_files": True,
+        "browser_show_system_items": False,
         "last_browser_path": "",
         "browser_sidebar_visible": True,
         "browser_sidebar_width": 280,
@@ -55,8 +58,13 @@ class ConfigManager(QObject):
         "browser_show_favorites": True,
         "browser_show_folder_tree": True,
         "browser_show_history": True,
+        "favorite_row_padding_y": 1,
+        "favorite_row_spacing": 0,
+        "favorite_icon_size": 16,
         "folder_tree_sync_mode": "focus_current",
         "folder_tree_collapse_unrelated": True,
+        "folder_tree_focus_rebase": True,
+        "folder_tree_context_ancestor_levels": 3,
         "clear_browser_filter_on_navigation": False,
         "browser_window_geometry": "",
         "auto_open_adjacent_book": False,
@@ -214,8 +222,14 @@ class ConfigManager(QObject):
             "browser_show_folder_tree",
             "browser_show_history",
             "folder_tree_collapse_unrelated",
+            "folder_tree_focus_rebase",
             "clear_browser_filter_on_navigation",
             "fullscreen_auto_reveal_ui",
+            "hide_ui_in_fullscreen",
+            "hide_cursor_in_fullscreen",
+            "browser_show_hidden_items",
+            "browser_show_unsupported_files",
+            "browser_show_system_items",
         ):
             if not isinstance(normalized.get(key), bool):
                 normalized[key] = cls.DEFAULTS[key]
@@ -359,6 +373,30 @@ class ConfigManager(QObject):
             normalized["folder_tree_sync_mode"] = cls.DEFAULTS[
                 "folder_tree_sync_mode"
             ]
+        normalized["folder_tree_context_ancestor_levels"] = cls._clamped_int(
+            normalized.get("folder_tree_context_ancestor_levels"),
+            default=int(cls.DEFAULTS["folder_tree_context_ancestor_levels"]),
+            minimum=0,
+            maximum=12,
+        )
+        normalized["favorite_row_padding_y"] = cls._clamped_int(
+            normalized.get("favorite_row_padding_y"),
+            default=int(cls.DEFAULTS["favorite_row_padding_y"]),
+            minimum=0,
+            maximum=8,
+        )
+        normalized["favorite_row_spacing"] = cls._clamped_int(
+            normalized.get("favorite_row_spacing"),
+            default=int(cls.DEFAULTS["favorite_row_spacing"]),
+            minimum=0,
+            maximum=8,
+        )
+        normalized["favorite_icon_size"] = cls._clamped_int(
+            normalized.get("favorite_icon_size"),
+            default=int(cls.DEFAULTS["favorite_icon_size"]),
+            minimum=14,
+            maximum=24,
+        )
         normalized["fullscreen_edge_trigger_px"] = cls._clamped_int(
             normalized.get("fullscreen_edge_trigger_px"),
             default=int(cls.DEFAULTS["fullscreen_edge_trigger_px"]),

@@ -237,7 +237,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
             item = index.data(BrowserItemModel.ItemRole)
             if not isinstance(item, BrowserItem):
                 return
-            profile = self.profile
+            if item.hidden:
+                painter.setOpacity(0.62)
             cell = option.rect
             thumbnail_rect = self.grid_metrics.thumbnail_frame_rect(cell)
             dpr = max(0.5, painter.device().devicePixelRatioF())
@@ -258,6 +259,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
                 )
             else:
                 icon = index.data(Qt.ItemDataRole.DecorationRole)
+                if item.kind is BrowserItemKind.OTHER or not isinstance(icon, QIcon):
+                    icon = self.shell_icon_provider.icon_for(item)
                 self._paint_fallback_icon(painter, thumbnail_rect, icon, option)
             if bool(index.data(BrowserItemModel.ThumbnailLowResolutionRole)):
                 color = option.palette.highlight().color()
@@ -271,7 +274,10 @@ class BrowserItemDelegate(QStyledItemDelegate):
                     )
                 )
             self._paint_type_icon(painter, thumbnail_rect, item)
+            if index.data(BrowserItemModel.ThumbnailErrorRole):
+                self._paint_error_badge(painter, thumbnail_rect)
             self._paint_title(painter, option, thumbnail_rect, item.display_name)
+            painter.setOpacity(1.0)
             self._paint_interaction_frame(
                 painter,
                 option,
@@ -434,6 +440,24 @@ class BrowserItemDelegate(QStyledItemDelegate):
             badge_target,
             pixmap,
             QRectF(0, 0, pixmap.width(), pixmap.height()),
+        )
+
+    @staticmethod
+    def _paint_error_badge(painter: QPainter, thumbnail_rect: QRect) -> None:
+        size = 16
+        badge = QRect(
+            thumbnail_rect.right() - size - 4,
+            thumbnail_rect.top() + 4,
+            size,
+            size,
+        )
+        painter.setPen(QPen(QColor(255, 255, 255), 1))
+        painter.setBrush(QColor(190, 40, 40, 225))
+        painter.drawEllipse(badge)
+        painter.drawText(
+            badge,
+            int(Qt.AlignmentFlag.AlignCenter),
+            "!",
         )
 
     @staticmethod

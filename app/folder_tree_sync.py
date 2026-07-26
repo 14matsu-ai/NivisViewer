@@ -28,6 +28,8 @@ class FolderTreeSyncController(QObject):
         self._target: Path | None = None
         self._mode = "focus_current"
         self._collapse_unrelated = True
+        self._focus_rebase = True
+        self._context_ancestor_levels = 3
         self._retry_count = 0
         self._auto_expanded: set[str] = set()
         self._user_expanded: set[str] = set()
@@ -49,11 +51,18 @@ class FolderTreeSyncController(QObject):
         *,
         mode: str,
         collapse_unrelated: bool,
+        focus_rebase: bool = True,
+        context_ancestor_levels: int = 3,
     ) -> int:
         self.generation += 1
         self._target = Path(path)
         self._mode = mode if mode in TREE_SYNC_MODES else "focus_current"
         self._collapse_unrelated = bool(collapse_unrelated)
+        self._focus_rebase = bool(focus_rebase)
+        self._context_ancestor_levels = max(
+            0,
+            min(12, int(context_ancestor_levels)),
+        )
         self._retry_count = 0
         if self._mode == "off":
             self._target = None
@@ -64,6 +73,17 @@ class FolderTreeSyncController(QObject):
     def cancel(self) -> None:
         self.generation += 1
         self._target = None
+
+    def show_full_tree(self, *, keep_current: bool = True) -> None:
+        """Restore the model root without navigating or taking keyboard focus."""
+
+        self.tree.setRootIndex(QModelIndex())
+        if not keep_current:
+            return
+        index = self.tree.currentIndex()
+        if index.isValid():
+            self.tree.scrollTo(index, QTreeView.ScrollHint.PositionAtCenter)
+            self.tree.horizontalScrollBar().setValue(0)
 
     def _attempt(self, generation: int) -> None:
         if generation != self.generation or self._target is None:
@@ -85,7 +105,23 @@ class FolderTreeSyncController(QObject):
             for ancestor in ancestor_indexes
         }
         self.applying = True
+        set_programmatic_sync = getattr(
+            self.tree,
+            "set_programmatic_sync",
+            None,
+        )
+        if callable(set_programmatic_sync):
+            set_programmatic_sync(True)
         try:
+            if self._mode == "focus_current" and self._focus_rebase:
+                rebase_index = self._focused_root_index(
+                    index,
+                    ancestor_indexes,
+                    self._context_ancestor_levels,
+                )
+                self.tree.setRootIndex(rebase_index)
+            else:
+                self.tree.setRootIndex(QModelIndex())
             if (
                 self._mode == "focus_current"
                 and self._collapse_unrelated
@@ -105,11 +141,29 @@ class FolderTreeSyncController(QObject):
             self.tree.setCurrentIndex(index)
             if self._mode == "focus_current":
                 self.tree.scrollTo(index, QTreeView.ScrollHint.PositionAtCenter)
+                self.tree.horizontalScrollBar().setValue(0)
             else:
                 self.tree.scrollTo(index, QTreeView.ScrollHint.EnsureVisible)
         finally:
+            if callable(set_programmatic_sync):
+                set_programmatic_sync(False)
             self.applying = False
         self._target = None
+
+    @staticmethod
+    def _focused_root_index(
+        current: QModelIndex,
+        ancestors_nearest_first: list[QModelIndex],
+        levels: int,
+    ) -> QModelIndex:
+        # Context count includes the current folder, matching the UI example:
+        # levels=3 shows root/current-grandparent -> parent -> current.
+        parent_steps = max(0, int(levels) - 1)
+        if parent_steps == 0 or not ancestors_nearest_first:
+            return current
+        return ancestors_nearest_first[
+            min(parent_steps - 1, len(ancestors_nearest_first) - 1)
+        ]
 
     def _on_directory_loaded(self, _path: str) -> None:
         if self._target is not None and self._mode != "off":

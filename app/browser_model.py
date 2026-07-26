@@ -29,6 +29,7 @@ class BrowserItemKind(str, Enum):
     ARCHIVE = "archive"
     IMAGE = "image"
     PDF = "pdf"
+    OTHER = "other"
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,10 @@ class BrowserItem:
     modified_at: float | None
     file_size: int | None = None
     modified_time_ns: int | None = None
+    extension: str = ""
+    hidden: bool = False
+    system: bool = False
+    openable_by_nivisviewer: bool = True
 
 
 @dataclass(frozen=True)
@@ -96,6 +101,10 @@ def browser_item_from_scan_entry(entry: BrowserScanEntry) -> BrowserItem:
         modified_at=modified_at,
         file_size=entry.file_size,
         modified_time_ns=entry.modified_time_ns,
+        extension=entry.extension,
+        hidden=entry.hidden,
+        system=entry.system,
+        openable_by_nivisviewer=entry.openable_by_nivisviewer,
     )
 
 
@@ -107,12 +116,17 @@ class BrowserItemModel(QAbstractListModel):
     ModifiedTimeRole = PathRole + 4
     ThumbnailImageRole = PathRole + 5
     ThumbnailLowResolutionRole = PathRole + 6
+    HiddenRole = PathRole + 7
+    SystemRole = PathRole + 8
+    OpenableRole = PathRole + 9
+    ThumbnailErrorRole = PathRole + 10
 
     _KIND_LABELS = {
         BrowserItemKind.FOLDER: "フォルダ",
         BrowserItemKind.ARCHIVE: "書庫",
         BrowserItemKind.IMAGE: "画像",
         BrowserItemKind.PDF: "PDF",
+        BrowserItemKind.OTHER: "その他",
     }
 
     def __init__(self, parent=None) -> None:
@@ -125,6 +139,7 @@ class BrowserItemModel(QAbstractListModel):
         self._icons: dict[str, QIcon] = {}
         self._thumbnail_images: dict[str, QImage] = {}
         self._low_resolution_thumbnails: set[str] = set()
+        self._thumbnail_errors: dict[str, str] = {}
         self._fallback_icons: dict[BrowserItemKind, QIcon] = {}
         self._row_by_key: dict[str, int] = {}
 
@@ -148,6 +163,14 @@ class BrowserItemModel(QAbstractListModel):
             return image
         if role == self.ThumbnailLowResolutionRole:
             return self._key(item.path) in self._low_resolution_thumbnails
+        if role == self.HiddenRole:
+            return item.hidden
+        if role == self.SystemRole:
+            return item.system
+        if role == self.OpenableRole:
+            return item.openable_by_nivisviewer
+        if role == self.ThumbnailErrorRole:
+            return self._thumbnail_errors.get(self._key(item.path))
         if role == self.PathRole:
             return str(item.path)
         if role == self.KindRole:
@@ -159,7 +182,8 @@ class BrowserItemModel(QAbstractListModel):
         if role == self.ModifiedTimeRole:
             return item.modified_time_ns
         if role == int(Qt.ItemDataRole.ToolTipRole):
-            return str(item.path)
+            error = self._thumbnail_errors.get(self._key(item.path))
+            return str(item.path) if not error else f"{item.path}\n{error}"
         return None
 
     def set_items(self, items: tuple[BrowserItem, ...] | list[BrowserItem]) -> None:
@@ -170,6 +194,7 @@ class BrowserItemModel(QAbstractListModel):
         self._icons.clear()
         self._thumbnail_images.clear()
         self._low_resolution_thumbnails.clear()
+        self._thumbnail_errors.clear()
         self._scan_generation = None
         self._rebuild_row_index()
         self.endResetModel()
@@ -182,6 +207,7 @@ class BrowserItemModel(QAbstractListModel):
         self._icons.clear()
         self._thumbnail_images.clear()
         self._low_resolution_thumbnails.clear()
+        self._thumbnail_errors.clear()
         self._row_by_key.clear()
         self._scan_generation = int(generation)
         self.endResetModel()
@@ -282,6 +308,7 @@ class BrowserItemModel(QAbstractListModel):
             self._low_resolution_thumbnails.add(key)
         else:
             self._low_resolution_thumbnails.discard(key)
+        self._thumbnail_errors.pop(key, None)
         index = self.index(row, 0)
         self.dataChanged.emit(
             index,
@@ -290,18 +317,58 @@ class BrowserItemModel(QAbstractListModel):
         )
         return True
 
+    def set_thumbnail_error(self, path: str | Path, message: str) -> bool:
+        row = self.row_for_path(path)
+        if row < 0:
+            return False
+        item = self._items[row]
+        key = self._key(item.path)
+        self._thumbnail_errors[key] = str(message)
+        index = self.index(row, 0)
+        self.dataChanged.emit(
+            index,
+            index,
+            [self.ThumbnailErrorRole, int(Qt.ItemDataRole.ToolTipRole)],
+        )
+        return True
+
+    def clear_thumbnail_error(self, path: str | Path) -> bool:
+        row = self.row_for_path(path)
+        if row < 0:
+            return False
+        key = self._key(self._items[row].path)
+        if key not in self._thumbnail_errors:
+            return False
+        self._thumbnail_errors.pop(key, None)
+        index = self.index(row, 0)
+        self.dataChanged.emit(
+            index,
+            index,
+            [self.ThumbnailErrorRole, int(Qt.ItemDataRole.ToolTipRole)],
+        )
+        return True
+
     def clear_thumbnails(self) -> None:
-        if not self._icons:
-            if not self._thumbnail_images:
-                return
+        if (
+            not self._icons
+            and not self._thumbnail_images
+            and not self._thumbnail_errors
+        ):
+            return
         self._icons.clear()
         self._thumbnail_images.clear()
         self._low_resolution_thumbnails.clear()
+        self._thumbnail_errors.clear()
         if self._items:
             self.dataChanged.emit(
                 self.index(0, 0),
                 self.index(len(self._items) - 1, 0),
-                [int(Qt.ItemDataRole.DecorationRole)],
+                [
+                    int(Qt.ItemDataRole.DecorationRole),
+                    self.ThumbnailImageRole,
+                    self.ThumbnailLowResolutionRole,
+                    self.ThumbnailErrorRole,
+                ],
             )
 
     def item_at(self, index_or_row: QModelIndex | int) -> BrowserItem | None:

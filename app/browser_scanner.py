@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import stat
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -11,6 +10,11 @@ from typing import Callable
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
 from .archive_backend import EXTERNAL_ARCHIVE_EXTENSIONS, is_supported_archive_candidate
+from .browser_visibility import (
+    LEGACY_SUPPORTED_ITEMS_POLICY,
+    BrowserVisibilityPolicy,
+    filesystem_visibility_flags,
+)
 from .image_source import ARCHIVE_EXTENSIONS, PDF_EXTENSIONS, SUPPORTED_EXTENSIONS
 
 
@@ -34,6 +38,7 @@ class BrowserScanRequest:
     path: str
     generation: int
     batch_size: int = DEFAULT_SCAN_BATCH_SIZE
+    visibility_policy: BrowserVisibilityPolicy = LEGACY_SUPPORTED_ITEMS_POLICY
 
 
 @dataclass(frozen=True)
@@ -43,6 +48,10 @@ class BrowserScanEntry:
     item_kind: str
     modified_time_ns: int | None
     file_size: int | None
+    extension: str = ""
+    hidden: bool = False
+    system: bool = False
+    openable_by_nivisviewer: bool = True
 
 
 @dataclass(frozen=True)
@@ -78,23 +87,25 @@ class BrowserScanError:
 
 def scan_entry_from_dir_entry(
     entry: os.DirEntry[str],
+    visibility_policy: BrowserVisibilityPolicy = LEGACY_SUPPORTED_ITEMS_POLICY,
 ) -> BrowserScanEntry | None:
     name = entry.name
-    if name.startswith((".", "~$")) or name.endswith(_TEMPORARY_SUFFIXES):
+    if name in {".", ".."} or name.startswith("~$") or name.endswith(_TEMPORARY_SUFFIXES):
         return None
 
+    attributes = 0
     try:
         entry_stat = entry.stat(follow_symlinks=False)
         attributes = getattr(entry_stat, "st_file_attributes", 0)
-        hidden_attribute = getattr(stat, "FILE_ATTRIBUTE_HIDDEN", 0x2)
-        if attributes & hidden_attribute:
-            return None
     except OSError:
         entry_stat = None
+    hidden, system = filesystem_visibility_flags(name, attributes)
 
     try:
         if entry.is_dir(follow_symlinks=False):
             item_kind = "folder"
+            supported = True
+            is_directory = True
         elif entry.is_file(follow_symlinks=False):
             suffix = Path(name).suffix.lower()
             if suffix in ARCHIVE_EXTENSIONS:
@@ -102,17 +113,31 @@ def scan_entry_from_dir_entry(
                     suffix in EXTERNAL_ARCHIVE_EXTENSIONS
                     and not is_supported_archive_candidate(name)
                 ):
-                    return None
-                item_kind = "archive"
+                    item_kind = "other"
+                    supported = False
+                else:
+                    item_kind = "archive"
+                    supported = True
             elif suffix in SUPPORTED_EXTENSIONS:
                 item_kind = "image"
+                supported = True
             elif suffix in PDF_EXTENSIONS:
                 item_kind = "pdf"
+                supported = True
             else:
-                return None
+                item_kind = "other"
+                supported = False
+            is_directory = False
         else:
             return None
     except OSError:
+        return None
+    if not visibility_policy.allows(
+        hidden=hidden,
+        system=system,
+        supported=supported,
+        is_directory=is_directory,
+    ):
         return None
 
     if entry_stat is None:
@@ -132,6 +157,10 @@ def scan_entry_from_dir_entry(
             if item_kind == "folder" or entry_stat is None
             else entry_stat.st_size
         ),
+        extension=Path(name).suffix.casefold(),
+        hidden=hidden,
+        system=system,
+        openable_by_nivisviewer=supported,
     )
 
 
@@ -161,7 +190,10 @@ def scan_directory(
                         total_count,
                         cancelled=True,
                     )
-                scanned = scan_entry_from_dir_entry(entry)
+                scanned = scan_entry_from_dir_entry(
+                    entry,
+                    request.visibility_policy,
+                )
                 if scanned is None:
                     continue
                 batch.append(scanned)

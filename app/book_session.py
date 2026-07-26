@@ -31,6 +31,9 @@ class BookOpened:
     selected_image: str | None
     total_pages: int
     generation: int
+    requested_page_identity: str | None = None
+    resolved_page_index: int = -1
+    display_unit_indices: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -289,6 +292,15 @@ class BookSession(QObject):
             selected_image=selected_image,
             total_pages=self.model.total_pages,
             generation=self.generation,
+            requested_page_identity=(
+                new_source.page_identity(selected_image)
+                if selected_image is not None
+                else None
+            ),
+            resolved_page_index=self.model.focused_index,
+            display_unit_indices=tuple(
+                slot.page_index for slot in self.model.spread_at().slots
+            ),
         )
         self.book_opened.emit(opened)
         return opened
@@ -443,6 +455,15 @@ class BookSession(QObject):
             selected_image=result.selected_image,
             total_pages=self.model.total_pages,
             generation=result.generation,
+            requested_page_identity=(
+                result.source.page_identity(result.selected_image)
+                if result.selected_image is not None
+                else None
+            ),
+            resolved_page_index=self.model.focused_index,
+            display_unit_indices=tuple(
+                slot.page_index for slot in self.model.spread_at().slots
+            ),
         )
         self.book_opened.emit(opened)
         self.async_opened.emit(opened)

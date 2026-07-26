@@ -75,6 +75,9 @@ class ThumbnailDiskCache:
         self._connection: sqlite3.Connection | None = None
         self._pending_accesses: dict[str, float] = {}
         self._saves_since_cleanup = 0
+        self._cached_usage_bytes = 0
+        self._cached_entry_count = 0
+        self._cached_last_cleanup = 0.0
         self._encoder, self._extension = self._select_encoder()
         self.format_version = (
             f"{CACHE_SCHEMA_VERSION}-{self._encoder.lower()}-q90-alpha-lossless"
@@ -371,6 +374,8 @@ class ThumbnailDiskCache:
                 self._saves_since_cleanup += 1
                 if self._saves_since_cleanup >= self.cleanup_interval:
                     self.prune(remove_orphans=True)
+                else:
+                    self._refresh_cached_statistics()
                 return True
             except (OSError, sqlite3.DatabaseError, ValueError) as exc:
                 self.last_error = str(exc)
@@ -383,15 +388,27 @@ class ThumbnailDiskCache:
 
     def usage_bytes(self) -> int:
         with self._lock:
-            if not self.enabled or self._connection is None:
-                return 0
-            try:
-                value = self._connection.execute(
-                    "SELECT COALESCE(SUM(byte_size), 0) FROM entries"
-                ).fetchone()[0]
-                return max(0, int(value))
-            except sqlite3.DatabaseError:
-                return 0
+            return self._cached_usage_bytes if self.enabled else 0
+
+    def statistics(self) -> dict[str, object]:
+        with self._lock:
+            last_cleanup_display = (
+                time.strftime(
+                    "%Y-%m-%d %H:%M:%S",
+                    time.localtime(self._cached_last_cleanup),
+                )
+                if self._cached_last_cleanup > 0
+                else "未実行"
+            )
+            return {
+                "usage_bytes": self._cached_usage_bytes if self.enabled else 0,
+                "entry_count": self._cached_entry_count if self.enabled else 0,
+                "last_cleanup": self._cached_last_cleanup,
+                "last_cleanup_display": last_cleanup_display,
+                "limit_bytes": self.limit_bytes,
+                "max_unused_days": self.max_unused_days,
+                "encoder": self._encoder,
+            }
 
     def cleanup_if_due(self, *, force: bool = False) -> int:
         with self._lock:
@@ -410,6 +427,8 @@ class ThumbnailDiskCache:
                 ("last_cleanup", str(now)),
             )
             self._connection.commit()
+            self._cached_last_cleanup = now
+            self._refresh_cached_statistics()
             return removed
 
     def flush_accesses(self) -> None:
@@ -568,6 +587,7 @@ class ThumbnailDiskCache:
 
                 self._connection.commit()
                 self._saves_since_cleanup = 0
+                self._refresh_cached_statistics()
                 return removed
             except (OSError, sqlite3.DatabaseError) as exc:
                 self.last_error = str(exc)
@@ -591,6 +611,8 @@ class ThumbnailDiskCache:
                 self._connection.commit()
                 self._pending_accesses.clear()
                 self._saves_since_cleanup = 0
+                self._cached_usage_bytes = 0
+                self._cached_entry_count = 0
             except (OSError, sqlite3.DatabaseError) as exc:
                 self.last_error = str(exc)
                 return False
@@ -626,10 +648,12 @@ class ThumbnailDiskCache:
                 self._connection.execute("PRAGMA user_version=0")
                 self._connection.commit()
                 self._create_schema()
+                self._refresh_cached_statistics()
                 return True
             if user_version not in (0, CACHE_SCHEMA_VERSION):
                 raise sqlite3.DatabaseError("unsupported thumbnail cache version")
             self._create_schema()
+            self._refresh_cached_statistics()
             return True
         except (OSError, sqlite3.DatabaseError) as exc:
             self.last_error = str(exc)
@@ -648,6 +672,7 @@ class ThumbnailDiskCache:
             )
             self._connection.execute("PRAGMA synchronous=NORMAL")
             self._create_schema()
+            self._refresh_cached_statistics()
             return True
         except (OSError, sqlite3.DatabaseError) as exc:
             self.last_error = str(exc)
@@ -736,6 +761,30 @@ class ThumbnailDiskCache:
         assert self._connection is not None
         self._remove_entries_without_commit(entries)
         self._connection.commit()
+        self._refresh_cached_statistics()
+
+    def _refresh_cached_statistics(self) -> None:
+        if self._connection is None:
+            self._cached_usage_bytes = 0
+            self._cached_entry_count = 0
+            self._cached_last_cleanup = 0.0
+            return
+        try:
+            count, total = self._connection.execute(
+                "SELECT COUNT(*), COALESCE(SUM(byte_size), 0) FROM entries"
+            ).fetchone()
+            cleanup = self._connection.execute(
+                "SELECT value FROM maintenance WHERE key = 'last_cleanup'"
+            ).fetchone()
+            self._cached_entry_count = max(0, int(count))
+            self._cached_usage_bytes = max(0, int(total))
+            self._cached_last_cleanup = (
+                float(cleanup[0]) if cleanup is not None else 0.0
+            )
+        except (sqlite3.DatabaseError, TypeError, ValueError):
+            self._cached_usage_bytes = 0
+            self._cached_entry_count = 0
+            self._cached_last_cleanup = 0.0
 
     def _remove_entries_without_commit(
         self,

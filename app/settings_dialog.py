@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal, Slot
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -106,6 +108,7 @@ class SettingsDialog(QDialog):
         parent: QWidget | None = None,
         *,
         cache_usage_getter: Callable[[], int] | None = None,
+        cache_statistics_getter: Callable[[], dict[str, object]] | None = None,
         seven_zip_locator: SevenZipLocator | None = None,
         winrar_locator: WinRARLocator | None = None,
         file_registration_service: WindowsFileRegistrationService | None = None,
@@ -116,6 +119,8 @@ class SettingsDialog(QDialog):
         self.resize(620, 680)
         self.config = config_manager
         self._cache_usage_getter = cache_usage_getter
+        self._cache_statistics_getter = cache_statistics_getter
+        self._last_save_error_reported: str | None = None
         self._seven_zip_locator = seven_zip_locator or SevenZipLocator()
         self._winrar_locator = winrar_locator or WinRARLocator()
         self._file_registration_service = file_registration_service
@@ -139,12 +144,16 @@ class SettingsDialog(QDialog):
         self.load_current_values()
 
     def _build_ui(self) -> None:
-        tabs = QTabWidget(self)
-        tabs.addTab(self._build_viewer_tab(), "Viewer")
-        tabs.addTab(self._build_browser_tab(), "Browser")
-        tabs.addTab(self._build_archive_tab(), "書庫")
-        tabs.addTab(self._build_mouse_tab(), "Mouse")
-        tabs.addTab(self._build_windows_tab(), "Windows連携")
+        self.tabs = QTabWidget(self)
+        self._scroll_areas: list[QScrollArea] = []
+        self.tabs.addTab(self._scrollable_tab(self._build_viewer_tab()), "Viewer")
+        self.tabs.addTab(self._scrollable_tab(self._build_browser_tab()), "Browser")
+        self.tabs.addTab(self._scrollable_tab(self._build_archive_tab()), "書庫")
+        self.tabs.addTab(self._scrollable_tab(self._build_mouse_tab()), "Mouse")
+        self.tabs.addTab(
+            self._scrollable_tab(self._build_windows_tab()),
+            "Windows連携",
+        )
 
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -159,8 +168,19 @@ class SettingsDialog(QDialog):
             apply_button.clicked.connect(self.apply_settings)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(tabs, 1)
+        layout.addWidget(self.tabs, 1)
         layout.addWidget(self.button_box)
+
+    def _scrollable_tab(self, content: QWidget) -> QScrollArea:
+        scroll = QScrollArea(self)
+        scroll.setObjectName("settings_scroll_area")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        scroll.setWidget(content)
+        self._scroll_areas.append(scroll)
+        return scroll
 
     def _build_windows_tab(self) -> QWidget:
         tab = QWidget(self)
@@ -256,6 +276,16 @@ class SettingsDialog(QDialog):
 
         fullscreen_group = QGroupBox("全画面UI", tab)
         fullscreen_form = QFormLayout(fullscreen_group)
+        self.fullscreen_hide_ui_checkbox = QCheckBox(
+            "全画面時にUIを隠す",
+            fullscreen_group,
+        )
+        fullscreen_form.addRow(self.fullscreen_hide_ui_checkbox)
+        self.fullscreen_hide_cursor_checkbox = QCheckBox(
+            "全画面時にカーソルを隠す",
+            fullscreen_group,
+        )
+        fullscreen_form.addRow(self.fullscreen_hide_cursor_checkbox)
         self.fullscreen_auto_reveal_checkbox = QCheckBox(
             "全画面時、画面端でUIを表示",
             fullscreen_group,
@@ -440,6 +470,24 @@ class SettingsDialog(QDialog):
         self.browser_filename_padding_y_spin.setRange(0, 16)
         self.browser_filename_padding_y_spin.setSuffix(" px")
         list_form.addRow("ファイル名上下余白:", self.browser_filename_padding_y_spin)
+        self.browser_show_hidden_checkbox = QCheckBox(
+            "隠しファイルとフォルダを表示",
+            list_group,
+        )
+        list_form.addRow(self.browser_show_hidden_checkbox)
+        self.browser_show_unsupported_checkbox = QCheckBox(
+            "非対応ファイルも表示",
+            list_group,
+        )
+        list_form.addRow(self.browser_show_unsupported_checkbox)
+        self.browser_show_system_checkbox = QCheckBox(
+            "保護されたシステム項目を表示",
+            list_group,
+        )
+        self.browser_show_system_checkbox.setToolTip(
+            "Windowsの保護されたシステム項目を表示します。操作時は注意してください。"
+        )
+        list_form.addRow(self.browser_show_system_checkbox)
 
         cache_group = QGroupBox("サムネイル", tab)
         form = QFormLayout(cache_group)
@@ -574,6 +622,42 @@ class SettingsDialog(QDialog):
             sidebar_group,
         )
         sidebar_form.addRow(self.folder_tree_collapse_checkbox)
+        self.folder_tree_focus_rebase_checkbox = QCheckBox(
+            "現在フォルダを基準にツリーの表示ルートを絞る",
+            sidebar_group,
+        )
+        sidebar_form.addRow(self.folder_tree_focus_rebase_checkbox)
+        self.folder_tree_ancestor_levels_spin = QSpinBox(sidebar_group)
+        self.folder_tree_ancestor_levels_spin.setRange(0, 12)
+        sidebar_form.addRow(
+            "現在フォルダの上位階層:",
+            self.folder_tree_ancestor_levels_spin,
+        )
+        self.favorite_row_padding_spin = QSpinBox(sidebar_group)
+        self.favorite_row_padding_spin.setRange(0, 8)
+        sidebar_form.addRow(
+            "お気に入り上下余白:",
+            self.favorite_row_padding_spin,
+        )
+        self.favorite_row_spacing_spin = QSpinBox(sidebar_group)
+        self.favorite_row_spacing_spin.setRange(0, 8)
+        sidebar_form.addRow(
+            "お気に入り行間隔:",
+            self.favorite_row_spacing_spin,
+        )
+        self.favorite_icon_size_spin = QSpinBox(sidebar_group)
+        self.favorite_icon_size_spin.setRange(14, 24)
+        sidebar_form.addRow(
+            "お気に入りアイコン:",
+            self.favorite_icon_size_spin,
+        )
+        tree_focus_note = QLabel(
+            "深いフォルダでインデントが増えすぎないよう、現在フォルダから"
+            "指定した階層だけ上をツリーの表示基準にします。",
+            sidebar_group,
+        )
+        tree_focus_note.setWordWrap(True)
+        sidebar_form.addRow(tree_focus_note)
         layout.addWidget(sidebar_group)
         layout.addStretch(1)
         return tab
@@ -636,6 +720,12 @@ class SettingsDialog(QDialog):
         self.wide_single_checkbox.setChecked(
             bool(self.config.get("treat_wide_image_as_single", True))
         )
+        self.fullscreen_hide_ui_checkbox.setChecked(
+            bool(self.config.get("hide_ui_in_fullscreen", False))
+        )
+        self.fullscreen_hide_cursor_checkbox.setChecked(
+            bool(self.config.get("hide_cursor_in_fullscreen", False))
+        )
         self.fullscreen_auto_reveal_checkbox.setChecked(
             bool(self.config.get("fullscreen_auto_reveal_ui", True))
         )
@@ -678,6 +768,15 @@ class SettingsDialog(QDialog):
         self.browser_filename_padding_y_spin.setValue(
             int(self.config.get("browser_filename_padding_y", 0))
         )
+        self.browser_show_hidden_checkbox.setChecked(
+            bool(self.config.get("browser_show_hidden_items", True))
+        )
+        self.browser_show_unsupported_checkbox.setChecked(
+            bool(self.config.get("browser_show_unsupported_files", True))
+        )
+        self.browser_show_system_checkbox.setChecked(
+            bool(self.config.get("browser_show_system_items", False))
+        )
         self._sync_browser_grid_preset()
         self._select_data(
             self.browser_sort_key_combo,
@@ -715,6 +814,21 @@ class SettingsDialog(QDialog):
         )
         self.folder_tree_collapse_checkbox.setChecked(
             bool(self.config.get("folder_tree_collapse_unrelated", True))
+        )
+        self.folder_tree_focus_rebase_checkbox.setChecked(
+            bool(self.config.get("folder_tree_focus_rebase", True))
+        )
+        self.folder_tree_ancestor_levels_spin.setValue(
+            int(self.config.get("folder_tree_context_ancestor_levels", 3))
+        )
+        self.favorite_row_padding_spin.setValue(
+            int(self.config.get("favorite_row_padding_y", 1))
+        )
+        self.favorite_row_spacing_spin.setValue(
+            int(self.config.get("favorite_row_spacing", 0))
+        )
+        self.favorite_icon_size_spin.setValue(
+            int(self.config.get("favorite_icon_size", 16))
         )
         self._sync_browser_spacing_controls(
             self.browser_spacing_preset_checkbox.isChecked()
@@ -924,6 +1038,10 @@ class SettingsDialog(QDialog):
             "gap": self.gap_spin.value(),
             "single_first_page": self.single_first_checkbox.isChecked(),
             "treat_wide_image_as_single": self.wide_single_checkbox.isChecked(),
+            "hide_ui_in_fullscreen": self.fullscreen_hide_ui_checkbox.isChecked(),
+            "hide_cursor_in_fullscreen": (
+                self.fullscreen_hide_cursor_checkbox.isChecked()
+            ),
             "fullscreen_auto_reveal_ui": (
                 self.fullscreen_auto_reveal_checkbox.isChecked()
             ),
@@ -964,6 +1082,15 @@ class SettingsDialog(QDialog):
             "browser_filename_padding_y": (
                 self.browser_filename_padding_y_spin.value()
             ),
+            "browser_show_hidden_items": (
+                self.browser_show_hidden_checkbox.isChecked()
+            ),
+            "browser_show_unsupported_files": (
+                self.browser_show_unsupported_checkbox.isChecked()
+            ),
+            "browser_show_system_items": (
+                self.browser_show_system_checkbox.isChecked()
+            ),
             "browser_sidebar_layout": str(
                 self.browser_sidebar_layout_combo.currentData()
             ),
@@ -973,6 +1100,15 @@ class SettingsDialog(QDialog):
             "folder_tree_collapse_unrelated": (
                 self.folder_tree_collapse_checkbox.isChecked()
             ),
+            "folder_tree_focus_rebase": (
+                self.folder_tree_focus_rebase_checkbox.isChecked()
+            ),
+            "folder_tree_context_ancestor_levels": (
+                self.folder_tree_ancestor_levels_spin.value()
+            ),
+            "favorite_row_padding_y": self.favorite_row_padding_spin.value(),
+            "favorite_row_spacing": self.favorite_row_spacing_spin.value(),
+            "favorite_icon_size": self.favorite_icon_size_spin.value(),
             "thumbnail_disk_cache_enabled": self.disk_cache_checkbox.isChecked(),
             "thumbnail_cache_limit_mb": self.cache_limit_spin.value(),
             "thumbnail_cache_max_unused_days": (
@@ -1002,6 +1138,7 @@ class SettingsDialog(QDialog):
         requested_winrar = str(values.pop("winrar_executable", "") or "")
         requested_path = str(values.pop("seven_zip_executable", "") or "")
         changed = self.config.apply(values, save=True)
+        self._report_save_error()
         current_winrar = str(self.config.get("winrar_executable", "") or "")
         if requested_winrar == current_winrar:
             self.redetect_winrar()
@@ -1052,6 +1189,8 @@ class SettingsDialog(QDialog):
             changed = self.config.apply(values, save=True)
             if changed:
                 self.settings_applied.emit(changed)
+            if self._report_save_error():
+                return
             self._start_winrar_probe(
                 requested_winrar,
                 apply_on_success=True,
@@ -1067,6 +1206,8 @@ class SettingsDialog(QDialog):
             changed = self.config.apply(values, save=True)
             if changed:
                 self.settings_applied.emit(changed)
+            if self._report_save_error():
+                return
             self._start_seven_zip_probe(
                 requested_path,
                 apply_on_success=True,
@@ -1074,6 +1215,8 @@ class SettingsDialog(QDialog):
             )
             return
         self.apply_settings()
+        if self.config.last_error:
+            return
         super().accept()
 
     def reject(self) -> None:  # type: ignore[override]
@@ -1089,6 +1232,16 @@ class SettingsDialog(QDialog):
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            maximum_height = max(420, int(available.height() * 0.88))
+            maximum_width = max(520, int(available.width() * 0.9))
+            self.setMaximumHeight(maximum_height)
+            self.resize(
+                min(maximum_width, max(520, self.width())),
+                min(maximum_height, max(480, self.height())),
+            )
         if not self._initial_probe_started:
             self._initial_probe_started = True
             self.redetect_winrar()
@@ -1277,12 +1430,53 @@ class SettingsDialog(QDialog):
         self.cache_usage_label.setText("削除処理を要求しました。")
 
     def refresh_cache_usage(self) -> None:
+        if self._cache_statistics_getter is not None:
+            try:
+                stats = self._cache_statistics_getter()
+            except Exception:
+                stats = {}
+            if stats:
+                used = max(0, int(stats.get("usage_bytes", 0)))
+                entries = max(0, int(stats.get("entry_count", 0)))
+                growth = max(0, int(stats.get("session_growth_bytes", 0)))
+                last_cleanup = str(stats.get("last_cleanup_display", "未実行"))
+                self.cache_usage_label.setText(
+                    f"{self._format_bytes(used)} / {entries}件"
+                    f"（今回 +{self._format_bytes(growth)}）"
+                )
+                self.cache_usage_label.setToolTip(
+                    "\n".join(
+                        (
+                            f"最後の整理: {last_cleanup}",
+                            f"memory hit: {int(stats.get('memory_hit', 0))}",
+                            f"disk hit: {int(stats.get('disk_hit', 0))}",
+                            f"generated: {int(stats.get('generated', 0))}",
+                            f"disk saved: {int(stats.get('disk_saved', 0))}",
+                            f"prefetch skipped: {int(stats.get('prefetch_skipped', 0))}",
+                        )
+                    )
+                )
+                return
         try:
             used = max(0, int(self._cache_usage_getter())) if self._cache_usage_getter else 0
         except Exception:
             self.cache_usage_label.setText("取得できません")
             return
         self.cache_usage_label.setText(self._format_bytes(used))
+
+    def _report_save_error(self) -> bool:
+        error = self.config.last_error
+        if not error:
+            self._last_save_error_reported = None
+            return False
+        if error != self._last_save_error_reported:
+            self._last_save_error_reported = error
+            QMessageBox.warning(
+                self,
+                "設定を保存できません",
+                f"設定ファイルへ保存できませんでした。\n{error}",
+            )
+        return True
 
     def _sync_gap_enabled(self, joined: bool) -> None:
         self.gap_spin.setEnabled(not joined)

@@ -94,6 +94,8 @@ class FolderListingSnapshot:
     image_ids: tuple[str, ...]
     selected_image: str
     fingerprints: tuple[tuple[str, int | None, int | None], ...] = ()
+    generation: int = 0
+    sort_identity: str = "name:ascending"
 
 
 class ImageSourceError(RuntimeError):
@@ -126,6 +128,22 @@ class ImageSource(ABC):
     def logical_size(self, image_id: str) -> tuple[int, int] | None:
         return None
 
+    def page_identity(self, image_id: str) -> str:
+        return str(image_id)
+
+    def index_for_identity(self, identity: str) -> int:
+        target = str(identity)
+        for index, image_id in enumerate(self.list_images()):
+            if self.page_identity(image_id) == target:
+                return index
+        return -1
+
+    def path_for_index(self, index: int) -> str | None:
+        images = self.list_images()
+        if 0 <= int(index) < len(images):
+            return images[int(index)]
+        return None
+
     def open_qimage(self, image_id: str) -> QImage | None:
         return None
 
@@ -150,13 +168,14 @@ class FolderImageSource(ImageSource):
         self._image_snapshot = (
             tuple(image_snapshot) if image_snapshot is not None else None
         )
+        self._listed_images: tuple[str, ...] | None = self._image_snapshot
         self._size_cache: dict[str, tuple[int, int]] = {}
         if not self.source_path.is_dir():
             raise ImageSourceError(f"フォルダが見つかりません: {self.source_path}")
 
     def list_images(self) -> list[str]:
-        if self._image_snapshot is not None:
-            return list(self._image_snapshot)
+        if self._listed_images is not None:
+            return list(self._listed_images)
         try:
             iterator = self.source_path.rglob("*") if self.recursive else self.source_path.iterdir()
             files = [
@@ -167,14 +186,35 @@ class FolderImageSource(ImageSource):
         except OSError as exc:
             raise ImageSourceError(f"フォルダを読み込めません: {self.source_path}") from exc
 
-        return [
+        listed = tuple(
             str(path)
             for path in natsorted(
                 files,
                 key=lambda item: str(item.relative_to(self.source_path)),
                 reverse=self.sort_descending,
             )
-        ]
+        )
+        self._listed_images = listed
+        return list(listed)
+
+    @staticmethod
+    def _path_identity(path: str | Path) -> str:
+        return os.path.normcase(
+            os.path.abspath(os.path.normpath(os.fspath(path)))
+        ).casefold()
+
+    def page_identity(self, image_id: str) -> str:
+        return self._path_identity(image_id)
+
+    def index_for_identity(self, identity: str) -> int:
+        target = self._path_identity(identity)
+        for index, image_id in enumerate(self.list_images()):
+            if self._path_identity(image_id) == target:
+                return index
+        return -1
+
+    def index_for_path(self, path: str | Path) -> int:
+        return self.index_for_identity(os.fspath(path))
 
     def open_image(self, image_id: str) -> Image.Image:
         try:
@@ -488,20 +528,37 @@ def create_image_source(
 
     if target.is_file() and suffix in SUPPORTED_EXTENSIONS:
         snapshot_paths: tuple[str, ...] | None = None
+        selected_from_snapshot: str | None = None
         if (
             folder_snapshot is not None
             and not recursive_folder
-            and folder_snapshot.folder.absolute() == target.parent.absolute()
-            and str(target) in folder_snapshot.image_ids
+            and _path_identity_key(folder_snapshot.folder)
+            == _path_identity_key(target.parent)
         ):
-            snapshot_paths = folder_snapshot.image_ids
+            target_key = _path_identity_key(target)
+            selected_from_snapshot = next(
+                (
+                    image_id
+                    for image_id in folder_snapshot.image_ids
+                    if _path_identity_key(image_id) == target_key
+                ),
+                None,
+            )
+            if selected_from_snapshot is not None:
+                snapshot_paths = folder_snapshot.image_ids
         source = FolderImageSource(
             target.parent,
             recursive=recursive_folder,
             sort_descending=sort_descending,
             image_snapshot=snapshot_paths,
         )
-        selected_image = str(target)
+        selected_image = selected_from_snapshot or str(target)
         return source, selected_image
 
     raise ImageSourceError(f"対応していない形式です: {target}")
+
+
+def _path_identity_key(path: str | Path) -> str:
+    return os.path.normcase(
+        os.path.abspath(os.path.normpath(os.fspath(path)))
+    ).casefold()
