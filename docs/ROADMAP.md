@@ -91,19 +91,26 @@
     - configurable one-page canvas click
     - sliding spread navigation
     - pan／double-click／overlay／dropとの入力排他
-23. 後続候補：ファイル操作と項目表示の拡張
-    - Browser一覧からツリー／お気に入りへのドラッグ＆ドロップ
-    - Ctrl＝コピー、Shift＝移動等のWindows型操作
-    - 衝突時のスキップ／別名／上書き選択UI
-    - バイト単位進捗、転送速度、残り時間、最近使った移動先
+23. Sprint 19：Explorer型ファイル操作の完成（完了）
+    - Qt非依存FileOperationPlanと非同期preflight
+    - file／folder衝突の一括解決、skip／keep both／replace／merge
+    - 4 MiB chunk copy、byte進捗、速度、ETA、安全な一時出力
+    - ApplicationController所有の直列FileOperationQueue
+    - 非モーダル進捗パネルとBrowser終了後のfallback
+    - 最近使ったコピー／移動先とお気に入り／指定先メニュー
+    - Viewer使用中のsource／replace destination解放
+24. 後続候補：ファイル操作と項目表示の拡張
     - ファイル操作履歴と安全に可能なrename／moveのUndo
+    - pause／resume、失敗項目の再試行
+    - 右ドラッグ後のcopy／moveメニュー
+    - ネットワーク転送再開
     - フォルダ／画像／書庫・PDF等の種類フィルタ
     - 再帰的なサブフォルダ表示
     - PDFパスワード入力、PDF目次
     - 画像中央クロップ／余白除去、Viewerメモリ予算調整
-24. 後続候補：レート／タグ編集UIと検索
+25. 後続候補：レート／タグ編集UIと検索
     - 基本ナビゲーションとファイル操作の安定後に着手
     - ZipPla `{zpi$...}` の明示的な読み取り互換
     - タグ・レート検索と絞り込み
     - サムネイル上のレート／タグ表示
-25. 公開前ライセンス監査、コード署名の将来検討
+26. 公開前ライセンス監査、コード署名の将来検討

@@ -101,7 +101,11 @@ from .browser_visibility import BrowserVisibilityPolicy
 from .archive_backend_registry import ArchiveBackendRegistry
 from .bookmark_model import BookmarkModel
 from .config_manager import ConfigManager
+from .destination_history import DestinationHistoryStore
+from .file_conflict_dialog import ConflictResolutionDialog
 from .file_operation_coordinator import FileOperationCoordinator
+from .file_operation_panel import FileOperationPanel
+from .file_operation_plan import ConflictResolution, FileOperationPlan
 from .file_operation_service import (
     FileCollisionPolicy,
     FileOperationKind,
@@ -225,6 +229,11 @@ class BrowserWindow(QMainWindow):
         self.file_operation_coordinator.operation_completed.connect(
             self._on_file_operation_completed
         )
+        self.file_operation_coordinator.conflicts_required.connect(
+            self._on_file_operation_conflicts_required
+        )
+        self.destination_history = DestinationHistoryStore(self.config)
+        self._conflict_dialogs: dict[str, ConflictResolutionDialog] = {}
         self.discovery = discovery or BrowserItemDiscovery()
         # The scanner is intentionally not a QObject child: a running
         # QThreadPool must not be destroyed synchronously with this window.
@@ -433,6 +442,7 @@ class BrowserWindow(QMainWindow):
         )
         self._favorite_click_timer = QTimer(self)
         self._favorite_click_timer.setSingleShot(True)
+        self._favorite_click_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._favorite_click_timer.setInterval(
             QApplication.styleHints().mouseDoubleClickInterval()
         )
@@ -1119,7 +1129,10 @@ class BrowserWindow(QMainWindow):
         destination: str | Path | None = None,
         new_name: str | None = None,
     ) -> bool:
-        if self.file_operation_coordinator.busy:
+        if (
+            self.file_operation_coordinator.busy
+            and self.file_operation_coordinator.queue is None
+        ):
             self._show_temporary_status("別のファイル操作を実行中です")
             return False
         if operation in {
@@ -1158,6 +1171,65 @@ class BrowserWindow(QMainWindow):
             self._show_temporary_status("ファイル操作を開始できません")
             return False
         return True
+
+    def _on_file_operation_conflicts_required(
+        self,
+        plan: FileOperationPlan,
+    ) -> None:
+        if (
+            self._shutdown_prepared
+            or plan.request_id not in self._file_operation_requests
+            or self.file_operation_coordinator.queue is None
+        ):
+            if self.file_operation_coordinator.queue is not None:
+                self.file_operation_coordinator.queue.cancel(plan.operation_id)
+            return
+        dialog = ConflictResolutionDialog(plan, self)
+        self._conflict_dialogs[plan.operation_id] = dialog
+        dialog.resolved.connect(self._resolve_file_operation_conflicts)
+        dialog.finished.connect(
+            lambda _result, operation_id=plan.operation_id: (
+                self._conflict_dialogs.pop(operation_id, None)
+            )
+        )
+        dialog.open()
+
+    def _resolve_file_operation_conflicts(
+        self,
+        operation_id: str,
+        resolutions: dict[str, ConflictResolution],
+        apply_to_same_kind: bool,
+    ) -> None:
+        queue = self.file_operation_coordinator.queue
+        if queue is None:
+            return
+        plan_dialog = self._conflict_dialogs.get(operation_id)
+        plan = plan_dialog.plan if plan_dialog is not None else None
+        replace_destinations = (
+            tuple(
+                conflict.destination_path
+                for conflict in plan.conflicts
+                if conflict.destination_path
+                and resolutions.get(
+                    conflict.conflict_id,
+                    ConflictResolution.SKIP,
+                )
+                is ConflictResolution.REPLACE
+            )
+            if plan is not None
+            else ()
+        )
+        if (
+            replace_destinations
+            and not self._confirm_and_close_affected_viewers(replace_destinations)
+        ):
+            queue.cancel(operation_id)
+            return
+        queue.resolve_conflicts(
+            operation_id,
+            resolutions,
+            apply_to_same_kind=apply_to_same_kind,
+        )
 
     def _confirm_and_close_affected_viewers(
         self,
@@ -1233,6 +1305,52 @@ class BrowserWindow(QMainWindow):
         )
         return self._absolute_browser_path(selected) if selected else None
 
+    def _populate_destination_menu(
+        self,
+        menu: QMenu,
+        operation: FileOperationKind,
+    ) -> None:
+        menu.clear()
+        recent_menu = menu.addMenu("最近使った移動先")
+        recent = self.destination_history.entries()
+        if not recent:
+            empty = recent_menu.addAction("（履歴なし）")
+            empty.setEnabled(False)
+        for entry in recent:
+            action = recent_menu.addAction(entry.display_label)
+            action.setToolTip(entry.path)
+            action.triggered.connect(
+                lambda _checked=False, path=entry.path, kind=operation: (
+                    self.copy_selected_to(path)
+                    if kind is FileOperationKind.COPY
+                    else self.move_selected_to(path)
+                )
+            )
+        favorite_menu = menu.addMenu("お気に入り")
+        favorite_entries = tuple(getattr(self.folder_bookmark_model, "entries", ()))
+        if not favorite_entries:
+            empty = favorite_menu.addAction("（お気に入りなし）")
+            empty.setEnabled(False)
+        for entry in favorite_entries:
+            action = favorite_menu.addAction(entry.display_name)
+            action.setToolTip(entry.path)
+            action.triggered.connect(
+                lambda _checked=False, path=entry.path, kind=operation: (
+                    self.copy_selected_to(path)
+                    if kind is FileOperationKind.COPY
+                    else self.move_selected_to(path)
+                )
+            )
+        menu.addSeparator()
+        specified = menu.addAction("指定先...")
+        specified.triggered.connect(
+            lambda _checked=False, kind=operation: (
+                self.copy_selected_to()
+                if kind is FileOperationKind.COPY
+                else self.move_selected_to()
+            )
+        )
+
     def _set_file_clipboard(self, paths: tuple[str, ...], *, cut: bool) -> None:
         self._clipboard_paths = paths
         self._clipboard_cut = cut
@@ -1264,7 +1382,9 @@ class BrowserWindow(QMainWindow):
         if self._shutdown_prepared:
             return
         self._active_file_operation_id = request.request_id
-        self.cancel_operation_button.setVisible(True)
+        self.cancel_operation_button.setVisible(
+            self.file_operation_coordinator.queue is None
+        )
         self.cancel_operation_button.setEnabled(True)
         self._update_file_action_states()
         self.statusBar().showMessage(
@@ -1347,17 +1467,25 @@ class BrowserWindow(QMainWindow):
                     for item in result.failures
                 }
             )
-            QMessageBox.warning(
-                self,
-                "ファイル操作の一部を完了できませんでした",
-                f"成功: {success_count}件\n失敗: {failure_count}件\n"
-                f"エラー種別: {', '.join(codes)}\n"
-                "同名項目は上書きせずスキップします。",
-            )
+            if self.file_operation_coordinator.queue is None:
+                QMessageBox.warning(
+                    self,
+                    "ファイル操作の一部を完了できませんでした",
+                    f"成功: {success_count}件\n失敗: {failure_count}件\n"
+                    f"エラー種別: {', '.join(codes)}\n"
+                    "同名項目は上書きせずスキップします。",
+                )
         else:
             completion_message = (
                 f"{self._operation_label(result.operation)}が完了しました"
             )
+
+        if (
+            request.destination_directory
+            and result.operation in {FileOperationKind.COPY, FileOperationKind.MOVE}
+            and result.successes
+        ):
+            self.destination_history.record(request.destination_directory)
 
         if self.current_path is None:
             self._show_temporary_status(completion_message)
@@ -1757,7 +1885,10 @@ class BrowserWindow(QMainWindow):
         if self._shutdown_prepared:
             return
         self._shutdown_prepared = True
-        if self._active_file_operation_id is not None:
+        if (
+            self._owns_file_operation_coordinator
+            and self._active_file_operation_id is not None
+        ):
             self.file_operation_coordinator.cancel()
         if self._owns_file_operation_coordinator:
             self.file_operation_coordinator.close()
@@ -2340,6 +2471,10 @@ class BrowserWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
+        guard = getattr(self, "_application_close_guard", None)
+        if callable(guard) and not guard(self):
+            event.ignore()
+            return
         self.prepare_shutdown()
         self.closing.emit(self)
         super().closeEvent(event)
@@ -2691,9 +2826,27 @@ class BrowserWindow(QMainWindow):
         self.paste_action.triggered.connect(self.paste_items)
         file_menu.addSeparator()
         self.copy_to_action = file_menu.addAction("指定先へコピー...")
-        self.copy_to_action.triggered.connect(self.copy_selected_to)
+        self.copy_to_action.triggered.connect(
+            lambda _checked=False: self.copy_selected_to()
+        )
         self.move_to_action = file_menu.addAction("指定先へ移動...")
-        self.move_to_action.triggered.connect(self.move_selected_to)
+        self.move_to_action.triggered.connect(
+            lambda _checked=False: self.move_selected_to()
+        )
+        self.copy_destination_menu = file_menu.addMenu("コピー先")
+        self.move_destination_menu = file_menu.addMenu("移動先")
+        self.copy_destination_menu.aboutToShow.connect(
+            lambda: self._populate_destination_menu(
+                self.copy_destination_menu,
+                FileOperationKind.COPY,
+            )
+        )
+        self.move_destination_menu.aboutToShow.connect(
+            lambda: self._populate_destination_menu(
+                self.move_destination_menu,
+                FileOperationKind.MOVE,
+            )
+        )
         file_menu.addSeparator()
         self.rename_action = file_menu.addAction("名前の変更")
         self.rename_action.triggered.connect(self.rename_selected_item)
@@ -2809,6 +2962,10 @@ class BrowserWindow(QMainWindow):
         self.cancel_operation_button.clicked.connect(self.cancel_file_operation)
         self.cancel_operation_button.setVisible(False)
         self.statusBar().addPermanentWidget(self.cancel_operation_button)
+        self.file_operation_panel = FileOperationPanel(self)
+        if self.file_operation_coordinator.queue is not None:
+            self.file_operation_panel.bind(self.file_operation_coordinator.queue)
+            self.statusBar().addPermanentWidget(self.file_operation_panel, 1)
         QApplication.clipboard().changed.connect(
             self._on_system_clipboard_changed
         )
@@ -3372,7 +3529,10 @@ class BrowserWindow(QMainWindow):
         selected_count = len(
             self.list_view.selectionModel().selectedIndexes()
         )
-        busy = self.file_operation_coordinator.busy
+        busy = (
+            self.file_operation_coordinator.busy
+            and self.file_operation_coordinator.queue is None
+        )
         has_selection = selected_count > 0
         self.rename_action.setEnabled(selected_count == 1 and not busy)
         self.recycle_action.setEnabled(has_selection and not busy)
@@ -3682,7 +3842,10 @@ class BrowserWindow(QMainWindow):
             )
             self.list_view.setCurrentIndex(index)
         selection_count = len(self.selected_file_operation_paths())
-        busy = self.file_operation_coordinator.busy
+        busy = (
+            self.file_operation_coordinator.busy
+            and self.file_operation_coordinator.queue is None
+        )
         menu = QMenu(self)
         unsupported = bool(
             item is not None
@@ -3851,7 +4014,10 @@ class BrowserWindow(QMainWindow):
         copy_here_action = menu.addAction("選択項目をここへコピー")
         move_here_action = menu.addAction("選択項目をここへ移動")
         has_selection = bool(self.selected_file_operation_paths())
-        busy = self.file_operation_coordinator.busy
+        busy = (
+            self.file_operation_coordinator.busy
+            and self.file_operation_coordinator.queue is None
+        )
         copy_here_action.setEnabled(has_selection and not busy and entry.exists is not False)
         move_here_action.setEnabled(has_selection and not busy and entry.exists is not False)
         move_up_action.setEnabled(index.row() > 0)
@@ -3896,7 +4062,10 @@ class BrowserWindow(QMainWindow):
         copy_here_action = menu.addAction("選択項目をここへコピー")
         move_here_action = menu.addAction("選択項目をここへ移動")
         has_selection = bool(self.selected_file_operation_paths())
-        busy = self.file_operation_coordinator.busy
+        busy = (
+            self.file_operation_coordinator.busy
+            and self.file_operation_coordinator.queue is None
+        )
         copy_here_action.setEnabled(index.isValid() and has_selection and not busy)
         move_here_action.setEnabled(index.isValid() and has_selection and not busy)
         selected = menu.exec(self.folder_tree.viewport().mapToGlobal(position))

@@ -559,6 +559,30 @@ Browser一覧中央への外部local-file dropはViewer openやファイル移�
 
 Viewer画像領域の通常の左クリックは`next_one_page()`へ接続し、論理ページを1ページだけ進めます。矢印キー、ホイール、メニューの前／次ページは従来どおり`PageModel.next()`／`previous()`による表示単位移動で、見開きでは通常2ページずつ進みます。
 
+### Sprint 19のExplorer型ファイル操作
+
+```text
+ApplicationController
+└─ FileOperationQueue（アプリ共通・直列）
+   ├─ FileOperationPlanner（Qt非依存の事前計画）
+   │  └─ FileOperationPlan / FileConflict
+   ├─ ConflictResolutionDialog（Model/View）
+   └─ FileOperationService
+      └─ ChunkedFileCopier
+```
+
+コピー／移動はGUIスレッドでファイルを列挙せず、worker上の`FileOperationPlanner`が絶対パス化、重複と親子選択の整理、同一／子孫移動の拒否、ファイル・フォルダ件数とbyte数、空き容量、衝突を先に確定します。再解析ポイントとsymlinkは再帰しません。状態は`PREPARING`、`WAITING_FOR_CONFLICTS`、`READY`、`RUNNING`、`CANCELLING`、`COMPLETED`、`FAILED`、`CANCELLED`を区別し、衝突待ちを含めてアプリ全体で一度に1操作だけ進めます。
+
+衝突はfile/file、directory/directory、file/directory、directory/file、case-only、same-path、移動先欠損／読み取り専用、無効名に分類します。既定はskipです。`ConflictResolutionDialog`は全衝突を1つのscroll可能なtableへ表示し、skip、両方残す、replace、folder merge、同種への一括適用、全体cancelを選べます。replace対象をViewerが使用中の場合は、実行前に該当Viewerだけを閉じてhandle解放を待ちます。copy元を閲覧中のViewerは閉じません。
+
+通常ファイルは4 MiB単位の`ChunkedFileCopier`で読み、byte進捗、速度、ETAを最大約75 ms間隔で通知します。出力は移動先と同じ親の一時名へ完成させ、metadataを反映してからrename／`os.replace`で公開します。replace失敗またはcancelでは既存の移動先を保護し、一時物を除去します。folder mergeは同名folder全体を先に削除せず、子項目ごとに同じ規則を適用します。同一volume moveはrenameを優先し、`EXDEV`だけをcopy後deleteへ切り替えます。copy完了後の元削除だけが失敗した場合はpartial successとして元を残します。
+
+`FileOperationQueue`はBrowserのpaste、指定先、tree／favorite dropを同じpreflightへ通します。`FileOperationPanel`は非モーダルに項目／byte進捗とcancelを表示し、成功時は自動的に隠れ、失敗情報は残します。Browserを閉じてもViewerが残る場合、または最後のウィンドウで「続行」を選んだ場合は最小の操作パネルを表示します。最後のウィンドウを閉じる際は続行、cancelして終了、終了中止を選択でき、shutdownは冪等でworkerを危険に強制停止しません。
+
+成功したcopy／moveの移動先だけを`DestinationHistoryStore`へ最大15件保存します。この履歴はconfig内のポータブルデータで、メニュー表示時に同期statを行いません。MetadataStore、Browser履歴、選択復元、cache無効化は成功項目だけへ適用します。
+
+将来のUndoは、現在の短期表示履歴をそのまま逆実行するのではなく、実行前後のidentityと成功した原子的手順だけを記録する専用journalを`FileOperationQueue`へ接続します。pause／resume、再試行、ネットワーク転送再開も今回のcancel境界とは分離して後続実装とします。
+
 ### Viewer最優先の画像作業調整
 
 ApplicationControllerは`ImageWorkCoordinator`を1つ所有し、すべてのViewerWindowのImageCacheとBrowserThumbnailProviderへ共有注入します。通常の最大画像worker数は2で、1枠をViewer専用、1枠をBrowser専用とします。Viewer専用枠をBrowserへ貸し出さないため、Browser background decodeだけで全枠を占有しません。Browser枠は最大1件だけ実行します。

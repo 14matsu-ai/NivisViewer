@@ -55,6 +55,7 @@ class ViewerCanvasPointerController(QObject):
         self._pending_global_position = QPoint()
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.timeout.connect(self._confirm_single_click)
 
     @property
@@ -145,7 +146,9 @@ class ViewerCanvasPointerController(QObject):
         self._pending_context = press.context_token
         self._pending_global_position = QPoint(global_position)
         self.state = ViewerCanvasPointerState.PENDING_SINGLE_CLICK
-        self._timer.start(max(1, QApplication.doubleClickInterval()))
+        interval = max(1, QApplication.doubleClickInterval())
+        scheduling_margin = min(10, max(0, interval // 4))
+        self._timer.start(max(1, interval - scheduling_margin))
         return True
 
     def double_click(
