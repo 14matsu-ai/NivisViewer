@@ -8,11 +8,14 @@ from typing import Callable
 
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
-from natsort import natsorted
 
-from .archive_backend import (
-    EXTERNAL_ARCHIVE_EXTENSIONS,
-    is_supported_archive_candidate,
+from .adjacent_book_search import (
+    AdjacentBookSearchRequest,
+    AdjacentBookSearchResult,
+    AdjacentBookSearchService,
+    AdjacentBookSearchStatus,
+    lexical_absolute,
+    path_key as adjacent_path_key,
 )
 from .archive_backend_registry import ArchiveBackendRegistry
 from .browser_window import BrowserWindow
@@ -23,13 +26,13 @@ from .file_operation_panel import FileOperationPanel
 from .file_operation_queue import FileOperationQueue
 from .image_source import (
     ARCHIVE_EXTENSIONS,
-    BOOK_FILE_EXTENSIONS,
     FolderImageSource,
     FolderListingSnapshot,
     SUPPORTED_EXTENSIONS,
 )
 from .image_work_coordinator import ImageWorkCoordinator
 from .metadata_store import MetadataStore
+from .path_availability import PathAvailabilityService
 from .pdfium_service import PdfiumService
 from .performance_trace import performance_trace
 from .single_instance import InstanceMessage
@@ -58,6 +61,8 @@ class ApplicationController(QObject):
         window_factory: WindowFactory = ViewerWindow,
         browser_window_factory: BrowserWindowFactory = BrowserWindow,
         pdfium_service: PdfiumService | None = None,
+        adjacent_book_search_service: AdjacentBookSearchService | None = None,
+        path_availability_service: PathAvailabilityService | None = None,
         file_registration_service=None,
     ) -> None:
         super().__init__(parent if parent is not None else application)
@@ -72,6 +77,12 @@ class ApplicationController(QObject):
             config_manager=self.config,
         )
         self.pdfium_service = pdfium_service or PdfiumService()
+        self.adjacent_book_search = (
+            adjacent_book_search_service or AdjacentBookSearchService(self)
+        )
+        self.path_availability_service = (
+            path_availability_service or PathAvailabilityService(self)
+        )
         self.image_work_coordinator = ImageWorkCoordinator(self, max_workers=2)
         self.file_registration_service = file_registration_service
         self.config.settings_changed.connect(self._on_controller_settings_changed)
@@ -88,6 +99,13 @@ class ApplicationController(QObject):
         self._active_viewer: ViewerWindow | None = None
         self._browser_window: BrowserWindow | None = None
         self._shutdown = False
+        self._adjacent_request_sequence = 0
+        self._adjacent_generation = 0
+        self._adjacent_request_by_window: dict[int, int] = {}
+        self._adjacent_context: dict[
+            int,
+            tuple[weakref.ReferenceType[ViewerWindow], int, int, str],
+        ] = {}
         self._operation_fallback_panel: FileOperationPanel | None = None
         self._operation_conflict_dialog: ConflictResolutionDialog | None = None
         self._continue_operations_without_main_window = False
@@ -101,6 +119,9 @@ class ApplicationController(QObject):
         )
         self.file_operation_queue.conflicts_required.connect(
             self._on_background_conflicts_required
+        )
+        self.adjacent_book_search.result_ready.connect(
+            self._on_adjacent_book_search_result
         )
 
     @property
@@ -170,12 +191,16 @@ class ApplicationController(QObject):
             pdfium_service=self.pdfium_service,
             file_registration_service=self.file_registration_service,
             image_work_coordinator=self.image_work_coordinator,
+            path_availability_service=self.path_availability_service,
             restore_initial_location=self._restore_on_start,
         )
         self._browser_window = window
         window._application_close_guard = self._allow_window_close
         self._quit_requested = False
         window.closing.connect(self._on_browser_closing)
+        window.directory_scan_committed.connect(
+            self.adjacent_book_search.invalidate
+        )
         window.destroyed.connect(
             lambda _object=None, window_id=id(window): self._on_browser_destroyed(window_id)
         )
@@ -291,25 +316,43 @@ class ApplicationController(QObject):
     def open_adjacent_book(self, window: object, direction: int) -> str:
         if not isinstance(window, ViewerWindow) or window not in self._viewer_windows:
             return "unavailable"
-        current = self._book_navigation_path(window)
-        candidates = self._book_candidates(window)
-        if current is None or not candidates:
+        current = self._book_navigation_path_lexical(window)
+        if current is None:
             return "unavailable"
-
-        current_key = str(current.resolve()).casefold()
-        keys = [str(path.resolve()).casefold() for path in candidates]
-        try:
-            current_index = keys.index(current_key)
-        except ValueError:
+        self._cancel_adjacent_search(window)
+        self._adjacent_request_sequence += 1
+        self._adjacent_generation += 1
+        request_id = self._adjacent_request_sequence
+        generation = self._adjacent_generation
+        parent = lexical_absolute(os.path.dirname(current))
+        browser = self.get_browser_window()
+        snapshot = (
+            browser.adjacent_book_snapshot(parent)
+            if browser is not None
+            else None
+        )
+        request = AdjacentBookSearchRequest(
+            request_id=request_id,
+            current_book_path=current,
+            direction=-1 if direction < 0 else 1,
+            loop=bool(self.settings.get("loop_book_navigation", False)),
+            browser_snapshot=snapshot,
+            generation=generation,
+        )
+        self._adjacent_request_by_window[id(window)] = request_id
+        self._adjacent_context[request_id] = (
+            weakref.ref(window),
+            generation,
+            request.direction,
+            adjacent_path_key(current),
+        )
+        window.show_adjacent_book_searching(request.direction)
+        if not self.adjacent_book_search.search(request):
+            self._adjacent_request_by_window.pop(id(window), None)
+            self._adjacent_context.pop(request_id, None)
+            window.complete_adjacent_book_search(request.direction, "unavailable")
             return "unavailable"
-
-        next_index = current_index + direction
-        if not (0 <= next_index < len(candidates)):
-            if bool(self.settings.get("loop_book_navigation", False)):
-                next_index %= len(candidates)
-            else:
-                return "boundary"
-        return "opened" if self._open_path_in_viewer(window, candidates[next_index], bring_to_front=False) else "error"
+        return "searching"
 
     def bring_window_to_front_once(self, window: QWidget) -> None:
         window.show()
@@ -349,6 +392,8 @@ class ApplicationController(QObject):
             self._operation_fallback_panel.close()
             self._operation_fallback_panel = None
         self.archive_backend_registry.close()
+        self.adjacent_book_search.close()
+        self.path_availability_service.close()
         self.pdfium_service.shutdown()
         self.image_work_coordinator.shutdown()
         self.config.save()
@@ -384,6 +429,7 @@ class ApplicationController(QObject):
         bring_to_front: bool = True,
         folder_snapshot: FolderListingSnapshot | None = None,
     ) -> bool:
+        self._cancel_adjacent_search(window, clear_status=True)
         self._active_viewer = window
         browser = self.get_browser_window()
         pending = (
@@ -463,6 +509,7 @@ class ApplicationController(QObject):
 
     def _on_viewer_closing(self, window: object) -> None:
         if isinstance(window, ViewerWindow):
+            self._cancel_adjacent_search(window)
             self._unregister_viewer(window, save_window_state=window is self._active_viewer)
 
     def _on_viewer_destroyed(self, window_id: int) -> None:
@@ -572,6 +619,7 @@ class ApplicationController(QObject):
         self._operation_fallback_panel.show()
 
     def _on_background_file_operation_completed(self, _result: object) -> None:
+        self.adjacent_book_search.invalidate()
         if self.file_operation_queue.busy:
             return
         if self._operation_fallback_panel is not None:
@@ -684,50 +732,65 @@ class ApplicationController(QObject):
         return target, "folder" if target.is_dir() else "unknown"
 
     @staticmethod
-    def _book_navigation_path(window: ViewerWindow) -> Path | None:
+    def _book_navigation_path_lexical(window: ViewerWindow) -> str | None:
         current_path = window.book_session.current_path
         if current_path is None:
             return None
-        if current_path.is_file() and current_path.suffix.lower() in SUPPORTED_EXTENSIONS:
-            return current_path.parent
-        return current_path
+        current = lexical_absolute(current_path)
+        if os.path.splitext(current)[1].lower() in SUPPORTED_EXTENSIONS:
+            return lexical_absolute(os.path.dirname(current))
+        return current
 
-    def _book_candidates(self, window: ViewerWindow) -> list[Path]:
-        current = self._book_navigation_path(window)
-        if current is None:
-            return []
-        parent = current.parent
-        if not parent.exists():
-            return []
+    def _cancel_adjacent_search(
+        self,
+        window: ViewerWindow,
+        *,
+        clear_status: bool = False,
+    ) -> None:
+        request_id = self._adjacent_request_by_window.pop(id(window), None)
+        if request_id is None:
+            return
+        self._adjacent_context.pop(request_id, None)
+        self.adjacent_book_search.cancel(request_id)
+        if clear_status:
+            window.complete_adjacent_book_search(1, "opened")
 
-        candidates: list[Path] = []
-        try:
-            siblings = tuple(parent.iterdir())
-        except OSError:
-            return []
-        for path in siblings:
-            if path.is_dir():
-                try:
-                    has_images = any(
-                        child.is_file() and child.suffix.lower() in SUPPORTED_EXTENSIONS
-                        for child in path.iterdir()
-                    )
-                except OSError:
-                    has_images = False
-                if has_images:
-                    candidates.append(path)
-            elif path.is_file() and path.suffix.lower() in BOOK_FILE_EXTENSIONS:
-                if (
-                    path.suffix.lower() in EXTERNAL_ARCHIVE_EXTENSIONS
-                    and not is_supported_archive_candidate(path.name)
-                ):
-                    continue
-                candidates.append(path.parent if path.suffix.lower() in SUPPORTED_EXTENSIONS else path)
-
-        unique: dict[str, Path] = {}
-        for path in candidates:
-            unique[str(path.resolve()).casefold()] = path
-        return natsorted(unique.values(), key=lambda item: item.name.casefold())
+    def _on_adjacent_book_search_result(
+        self,
+        result: AdjacentBookSearchResult,
+    ) -> None:
+        context = self._adjacent_context.pop(result.request_id, None)
+        if context is None or self._shutdown:
+            return
+        window_ref, generation, direction, expected_current_key = context
+        window = window_ref()
+        if (
+            window is None
+            or window not in self._viewer_windows
+            or result.generation != generation
+            or self._adjacent_request_by_window.get(id(window))
+            != result.request_id
+        ):
+            return
+        self._adjacent_request_by_window.pop(id(window), None)
+        current = self._book_navigation_path_lexical(window)
+        if current is None or adjacent_path_key(current) != expected_current_key:
+            return
+        if (
+            result.status is AdjacentBookSearchStatus.FOUND
+            and result.candidate_path
+        ):
+            opened = self._open_path_in_viewer(
+                window,
+                result.candidate_path,
+                bring_to_front=False,
+            )
+            window.complete_adjacent_book_search(
+                direction,
+                "opened" if opened else "error",
+            )
+            return
+        window.complete_adjacent_book_search(direction, result.status.value)
 
     @staticmethod
     def _path_key(path: str | Path) -> str:

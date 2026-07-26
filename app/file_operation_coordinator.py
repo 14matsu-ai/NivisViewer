@@ -4,6 +4,7 @@ from PySide6.QtCore import QObject, Signal, Slot
 
 from .file_operation_service import (
     FileOperationKind,
+    FileOperationItemState,
     FileOperationRequest,
     FileOperationResult,
     FileOperationService,
@@ -76,12 +77,38 @@ class FileOperationCoordinator(QObject):
 
     @Slot(object)
     def _on_completed(self, result: FileOperationResult) -> None:
-        if (
-            self.metadata_store is not None
-            and result.operation in {FileOperationKind.RENAME, FileOperationKind.MOVE}
-        ):
-            for item in result.successes:
-                if item.source_path and item.destination_path:
+        if self.metadata_store is not None:
+            for item in result.effective_items:
+                operation = item.operation or result.operation
+                if not item.destination_path:
+                    continue
+                if item.replaced_existing and item.destination_published:
+                    if operation is FileOperationKind.COPY:
+                        self.metadata_store.apply_copy_replace_metadata(
+                            item.destination_path
+                        )
+                    elif (
+                        operation is FileOperationKind.MOVE
+                        and item.success
+                        and item.source_removed
+                        and item.state is FileOperationItemState.MOVED
+                        and item.source_path
+                    ):
+                        self.metadata_store.apply_move_replace_metadata(
+                            item.source_path,
+                            item.destination_path,
+                        )
+                    elif operation is FileOperationKind.MOVE and item.source_path:
+                        self.metadata_store.apply_partial_move_replace_metadata(
+                            item.source_path,
+                            item.destination_path,
+                        )
+                    continue
+                if (
+                    operation in {FileOperationKind.RENAME, FileOperationKind.MOVE}
+                    and item.success
+                    and item.source_path
+                ):
                     self.metadata_store.relocate_tree(
                         item.source_path,
                         item.destination_path,

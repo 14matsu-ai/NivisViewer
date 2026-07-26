@@ -100,6 +100,11 @@ from .browser_thumbnail_scheduler import (
 )
 from .browser_visibility import BrowserVisibilityPolicy
 from .archive_backend_registry import ArchiveBackendRegistry
+from .adjacent_book_search import (
+    AdjacentBookBrowserSnapshot,
+    AdjacentBookSnapshotEntry,
+    path_key as adjacent_path_key,
+)
 from .bookmark_model import BookmarkModel
 from .config_manager import ConfigManager
 from .destination_history import DestinationHistoryStore
@@ -130,6 +135,7 @@ from .history_model import HistoryModel
 from .image_work_coordinator import ImageWorkCoordinator
 from .image_source import FolderListingSnapshot
 from .metadata_store import MetadataStore
+from .path_availability import PathAvailabilityService
 from .performance_trace import performance_trace
 from .settings_dialog import SettingsDialog
 from .sidebar_layout import SidebarLayoutController
@@ -177,6 +183,7 @@ class _PendingDirectoryScan:
 class BrowserWindow(QMainWindow):
     activated = Signal(object)
     closing = Signal(object)
+    directory_scan_committed = Signal(str)
 
     def __init__(
         self,
@@ -194,6 +201,7 @@ class BrowserWindow(QMainWindow):
         pdfium_service=None,
         file_registration_service=None,
         image_work_coordinator: ImageWorkCoordinator | None = None,
+        path_availability_service: PathAvailabilityService | None = None,
         restore_initial_location: bool = True,
     ) -> None:
         super().__init__()
@@ -223,6 +231,12 @@ class BrowserWindow(QMainWindow):
         self.pdfium_service = pdfium_service
         self.file_registration_service = file_registration_service
         self.image_work_coordinator = image_work_coordinator
+        self._owns_path_availability_service = (
+            path_availability_service is None
+        )
+        self.path_availability_service = (
+            path_availability_service or PathAvailabilityService(self)
+        )
         self._owns_file_operation_coordinator = file_operation_coordinator is None
         self.file_operation_coordinator = (
             file_operation_coordinator
@@ -496,6 +510,32 @@ class BrowserWindow(QMainWindow):
     def items(self) -> tuple[BrowserItem, ...]:
         return self.item_model.items
 
+    def adjacent_book_snapshot(
+        self,
+        parent_path: str | Path,
+    ) -> AdjacentBookBrowserSnapshot | None:
+        """Return committed model data without querying the filesystem."""
+        if (
+            self.current_path is None
+            or self._pending_scan is not None
+            or adjacent_path_key(self.current_path)
+            != adjacent_path_key(parent_path)
+        ):
+            return None
+        return AdjacentBookBrowserSnapshot(
+            parent_folder=str(self.current_path),
+            scan_generation=self._scan_generation,
+            entries=tuple(
+                AdjacentBookSnapshotEntry(
+                    absolute_path=str(item.path),
+                    item_kind=item.kind.value,
+                    extension=item.extension,
+                    natural_sort_identity=item.display_name.casefold(),
+                )
+                for item in self.items
+            ),
+        )
+
     def show_initial(self) -> None:
         self.show()
 
@@ -700,6 +740,7 @@ class BrowserWindow(QMainWindow):
         self._apply_pending_browser_focus(final=True)
 
         self._pending_scan = None
+        self.directory_scan_committed.emit(str(pending.path))
         self._update_status()
         if self._first_paint_pending_generation != pending.generation:
             self._schedule_thumbnail_requests()
@@ -1475,31 +1516,55 @@ class BrowserWindow(QMainWindow):
         self._update_file_action_states()
 
         if result.operation in {FileOperationKind.RENAME, FileOperationKind.MOVE}:
-            for item in result.successes:
+            relocation_items = tuple(
+                item
+                for item in result.items
+                if item.success and item.child_results
+            ) or result.effective_items
+            for item in relocation_items:
                 if item.source_path and item.destination_path:
-                    self.navigation_history.relocate_tree(
-                        item.source_path,
-                        item.destination_path,
-                    )
+                    if item.success:
+                        self.navigation_history.relocate_tree(
+                            item.source_path,
+                            item.destination_path,
+                        )
 
         if result.operation is FileOperationKind.MOVE and self._clipboard_cut:
-            succeeded = {
-                self._path_key(item.source_path)
-                for item in result.successes
+            top_level = {
+                self._path_key(item.source_path): item
+                for item in result.items
                 if item.source_path
             }
-            remaining = tuple(
-                path
-                for path in self._clipboard_paths
-                if self._path_key(path) not in succeeded
-            )
+            remaining_list: list[str] = []
+            for path in self._clipboard_paths:
+                item = top_level.get(self._path_key(path))
+                if item is None:
+                    remaining_list.append(path)
+                elif item.success:
+                    continue
+                elif item.child_results and item.retry_source_paths:
+                    remaining_list.extend(item.retry_source_paths)
+                else:
+                    remaining_list.append(path)
+            remaining = tuple(dict.fromkeys(remaining_list))
             if remaining:
                 self._set_file_clipboard(remaining, cut=True)
             else:
                 self.clear_file_clipboard()
 
-        success_count = len(result.successes)
-        failure_count = len(result.failures)
+        effective_items = result.effective_items
+        success_count = sum(item.success for item in effective_items)
+        failure_count = sum(not item.success for item in effective_items)
+        root_cleanup_failures = sum(
+            bool(
+                item.child_results
+                and not item.success
+                and item.source_root_removed is False
+                and all(child.success for child in item.leaf_results())
+            )
+            for item in result.items
+        )
+        failure_count += root_cleanup_failures
         if result.cancelled:
             completion_message = (
                 f"{self._operation_label(result.operation)}をキャンセルしました"
@@ -1507,7 +1572,8 @@ class BrowserWindow(QMainWindow):
         elif failure_count:
             skipped_count = sum(
                 item.state is FileOperationItemState.SKIPPED
-                for item in result.failures
+                for item in effective_items
+                if not item.success
             )
             source_remaining_count = sum(
                 item.state
@@ -1516,7 +1582,8 @@ class BrowserWindow(QMainWindow):
                     FileOperationItemState.SOURCE_REMOVAL_FAILED,
                     FileOperationItemState.DESTINATION_PUBLISHED_SOURCE_REMAINS,
                 }
-                for item in result.failures
+                for item in effective_items
+                if not item.success
             )
             completion_message = (
                 f"{self._operation_label(result.operation)}完了: "
@@ -1528,7 +1595,8 @@ class BrowserWindow(QMainWindow):
             codes = sorted(
                 {
                     item.error_code or "unknown"
-                    for item in result.failures
+                    for item in effective_items
+                    if not item.success
                 }
             )
             if self.file_operation_coordinator.queue is None:
@@ -1547,7 +1615,7 @@ class BrowserWindow(QMainWindow):
         if (
             request.destination_directory
             and result.operation in {FileOperationKind.COPY, FileOperationKind.MOVE}
-            and result.successes
+            and any(item.destination_published for item in effective_items)
         ):
             self.destination_history.record(request.destination_directory)
 
@@ -1556,21 +1624,23 @@ class BrowserWindow(QMainWindow):
             return
 
         current_key = self._path_key(self.current_path)
+        top_level_items = result.items
         successful_sources = {
             self._path_key(item.source_path)
-            for item in result.successes
-            if item.source_path
+            for item in (*top_level_items, *effective_items)
+            if item.success and item.source_path
         }
         destination_paths = tuple(
             item.destination_path
-            for item in result.successes
-            if item.destination_path
+            for item in (*top_level_items, *effective_items)
+            if item.destination_published
+            and item.destination_path
             and self._path_key(Path(item.destination_path).parent) == current_key
         )
         source_is_current = any(
             item.source_path
             and self._path_key(Path(item.source_path).parent) == current_key
-            for item in result.successes
+            for item in (*top_level_items, *effective_items)
         )
         destination_is_current = bool(destination_paths)
         should_refresh = (
@@ -1829,7 +1899,11 @@ class BrowserWindow(QMainWindow):
         entry = self.bookmark_model.entry_at(index)
         if entry is None:
             return
-        if not entry.exists:
+        availability = self.bookmark_model.data(
+            index,
+            self.bookmark_model.AvailabilityRole,
+        )
+        if availability == "missing":
             self.statusBar().showMessage("ブックマーク先が見つかりません", 3000)
             return
         if entry.item_type == "folder":
@@ -1847,7 +1921,11 @@ class BrowserWindow(QMainWindow):
         entry = self.history_model.entry_at(index)
         if entry is None:
             return
-        if not entry.exists:
+        availability = self.history_model.data(
+            index,
+            self.history_model.AvailabilityRole,
+        )
+        if availability == "missing":
             self.statusBar().showMessage("履歴の項目が見つかりません", 3000)
             return
         if self._open_path_handler is not None:
@@ -1989,6 +2067,8 @@ class BrowserWindow(QMainWindow):
             self.archive_backend_registry.close()
         if self._owns_pdfium_service:
             self.pdfium_service.shutdown()
+        if self._owns_path_availability_service:
+            self.path_availability_service.close()
 
     def _run_idle_cache_cleanup(self) -> None:
         if not self._shutdown_prepared:
@@ -2614,7 +2694,11 @@ class BrowserWindow(QMainWindow):
             self._on_folder_tree_sync_finished
         )
 
-        self.bookmark_model = BookmarkModel(self.metadata_store, self)
+        self.bookmark_model = BookmarkModel(
+            self.metadata_store,
+            self,
+            availability_service=self.path_availability_service,
+        )
         self.bookmark_view = QListView(self)
         self.bookmark_view.setModel(self.bookmark_model)
         self.bookmark_view.activated.connect(self.open_bookmark)
@@ -2627,6 +2711,7 @@ class BrowserWindow(QMainWindow):
         self.folder_bookmark_model = FolderBookmarkModel(
             self.metadata_store,
             self,
+            availability_service=self.path_availability_service,
         )
         self.favorite_view = ExplorerListView(self)
         self.favorite_view.setObjectName("folder_favorite_view")
@@ -2662,7 +2747,11 @@ class BrowserWindow(QMainWindow):
         )
         self.favorite_view.paths_dropped.connect(self._on_favorite_paths_dropped)
 
-        self.history_model = HistoryModel(self.metadata_store, self)
+        self.history_model = HistoryModel(
+            self.metadata_store,
+            self,
+            availability_service=self.path_availability_service,
+        )
         self.history_view = QListView(self)
         self.history_view.setModel(self.history_model)
         self.history_view.activated.connect(self.open_history)

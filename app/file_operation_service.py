@@ -93,6 +93,25 @@ class FileOperationItemResult:
     copied_bytes: int = 0
     expected_bytes: int | None = None
     residual_source_paths: tuple[str, ...] = ()
+    operation: FileOperationKind | None = None
+    replaced_existing: bool = False
+    destination_existed_before: bool = False
+    child_results: tuple[FileOperationItemResult, ...] = ()
+    published_destination_paths: tuple[str, ...] = ()
+    moved_source_paths: tuple[str, ...] = ()
+    skipped_source_paths: tuple[str, ...] = ()
+    failed_source_paths: tuple[str, ...] = ()
+    retry_source_paths: tuple[str, ...] = ()
+    source_root_removed: bool | None = None
+    partially_completed: bool = False
+
+    def leaf_results(self) -> tuple[FileOperationItemResult, ...]:
+        if not self.child_results:
+            return (self,)
+        leaves: list[FileOperationItemResult] = []
+        for child in self.child_results:
+            leaves.extend(child.leaf_results())
+        return tuple(leaves)
 
 
 @dataclass(frozen=True)
@@ -110,6 +129,13 @@ class FileOperationResult:
     @property
     def failures(self) -> tuple[FileOperationItemResult, ...]:
         return tuple(item for item in self.items if not item.success)
+
+    @property
+    def effective_items(self) -> tuple[FileOperationItemResult, ...]:
+        items: list[FileOperationItemResult] = []
+        for item in self.items:
+            items.extend(item.leaf_results())
+        return tuple(items)
 
 
 @dataclass(frozen=True)
@@ -327,10 +353,16 @@ class FileOperationService:
                     None,
                     FileOperationErrorCode.CANCELLED,
                     "操作がキャンセルされました",
+                    operation=request.operation,
                 )
                 was_cancelled = True
             except BaseException as exc:
-                item = self._exception_failure(source, None, exc)
+                item = self._exception_failure(
+                    source,
+                    None,
+                    exc,
+                    operation=request.operation,
+                )
             item = replace(
                 item,
                 copied_bytes=max(0, bytes_completed - item_start_bytes),
@@ -659,12 +691,30 @@ class FileOperationService:
         except _OperationCancelled:
             raise
         except _SourceDeleteFailed as exc:
-            return self._source_removal_failure(source, destination, str(exc))
+            return self._source_removal_failure(
+                source,
+                destination,
+                str(exc),
+                operation=request.operation,
+            )
         except BaseException as exc:
-            return self._exception_failure(source, destination, exc)
+            return self._exception_failure(
+                source,
+                destination,
+                exc,
+                operation=request.operation,
+            )
         if request.operation is FileOperationKind.MOVE:
-            return self._move_postcondition(source, destination)
-        return self._copy_success(source, destination)
+            return self._move_postcondition(
+                source,
+                destination,
+                operation=request.operation,
+            )
+        return self._copy_success(
+            source,
+            destination,
+            operation=request.operation,
+        )
 
     def _replace_transfer(
         self,
@@ -673,6 +723,7 @@ class FileOperationService:
         destination: str,
         cancelled: Event,
     ) -> FileOperationItemResult:
+        destination_existed_before = os.path.lexists(destination)
         try:
             if request.operation is FileOperationKind.COPY:
                 self._copy_atomic_replace(source, destination, cancelled)
@@ -681,12 +732,42 @@ class FileOperationService:
         except _OperationCancelled:
             raise
         except _SourceDeleteFailed as exc:
-            return self._source_removal_failure(source, destination, str(exc))
+            return self._source_removal_failure(
+                source,
+                destination,
+                str(exc),
+                operation=request.operation,
+                replaced_existing=True,
+                destination_existed_before=destination_existed_before,
+            )
         except BaseException as exc:
-            return self._exception_failure(source, destination, exc)
+            return replace(
+                self._exception_failure(
+                    source,
+                    destination,
+                    exc,
+                    operation=request.operation,
+                ),
+                replaced_existing=False,
+                destination_existed_before=destination_existed_before,
+            )
         if request.operation is FileOperationKind.MOVE:
-            return self._move_postcondition(source, destination)
-        return self._copy_success(source, destination)
+            return replace(
+                self._move_postcondition(
+                    source,
+                    destination,
+                    operation=request.operation,
+                ),
+                replaced_existing=True,
+                destination_existed_before=destination_existed_before,
+            )
+        return self._copy_success(
+            source,
+            destination,
+            operation=request.operation,
+            replaced_existing=True,
+            destination_existed_before=destination_existed_before,
+        )
 
     def _merge_transfer(
         self,
@@ -695,30 +776,26 @@ class FileOperationService:
         destination: str,
         cancelled: Event,
     ) -> FileOperationItemResult:
-        try:
-            self._copy_directory_merge(
-                source,
-                destination,
-                cancelled,
-                move=request.operation is FileOperationKind.MOVE,
-                request=request,
-            )
-            if request.operation is FileOperationKind.MOVE:
-                try:
-                    os.rmdir(source)
-                except OSError as exc:
-                    return self._source_removal_failure(
-                        source,
-                        destination,
-                        f"コピー後にコピー元を削除できませんでした: {exc}",
-                    )
-        except _OperationCancelled:
-            raise
-        except BaseException as exc:
-            return self._exception_failure(source, destination, exc)
-        if request.operation is FileOperationKind.MOVE:
-            return self._move_postcondition(source, destination)
-        return self._copy_success(source, destination)
+        children = self._copy_directory_merge(
+            source,
+            destination,
+            cancelled,
+            move=request.operation is FileOperationKind.MOVE,
+            request=request,
+        )
+        root_remove_error: str | None = None
+        if request.operation is FileOperationKind.MOVE and os.path.lexists(source):
+            try:
+                os.rmdir(source)
+            except OSError as exc:
+                root_remove_error = str(exc)
+        return self._aggregate_merge_result(
+            source,
+            destination,
+            request.operation,
+            children,
+            root_remove_error=root_remove_error,
+        )
 
     def _recycle_item(self, source: str) -> FileOperationItemResult:
         result = self.recycle_bin.recycle(source)
@@ -789,7 +866,15 @@ class FileOperationService:
             else:
                 try:
                     os.mkdir(destination)
-                    item = FileOperationItemResult(None, destination, True)
+                    item = FileOperationItemResult(
+                        None,
+                        destination,
+                        True,
+                        operation=request.operation,
+                        destination_exists_after=True,
+                        destination_published=True,
+                        published_destination_paths=(destination,),
+                    )
                 except BaseException as exc:
                     item = self._exception_failure(None, destination, exc)
         if progress is not None:
@@ -907,74 +992,304 @@ class FileOperationService:
         *,
         move: bool,
         request: FileOperationRequest,
-    ) -> None:
-        with os.scandir(source) as entries:
-            for entry in entries:
-                if cancelled.is_set():
-                    raise _OperationCancelled
-                child_source = entry.path
-                child_destination = os.path.join(destination, entry.name)
-                if self._is_reparse_path(child_source):
-                    raise OSError(
-                        errno.ELOOP,
-                        "再解析ポイントはマージできません",
-                        child_source,
-                    )
-                is_directory = entry.is_dir(follow_symlinks=False)
-                if not os.path.lexists(child_destination):
-                    if move:
-                        try:
-                            os.rename(child_source, child_destination)
-                            continue
-                        except OSError as exc:
-                            if exc.errno != errno.EXDEV:
-                                raise
-                    self._copy_atomic(child_source, child_destination, cancelled)
-                    if move:
-                        self._remove_source(child_source)
-                    continue
-                resolution = self._collision_resolution(request, child_destination)
-                if (
-                    is_directory
-                    and os.path.isdir(child_destination)
-                    and resolution == FileCollisionPolicy.MERGE.value
-                ):
-                    self._copy_directory_merge(
+    ) -> tuple[FileOperationItemResult, ...]:
+        results: list[FileOperationItemResult] = []
+        try:
+            with os.scandir(source) as scanned:
+                entries = tuple(scanned)
+        except BaseException as exc:
+            return (
+                self._exception_failure(
+                    source,
+                    destination,
+                    exc,
+                    operation=request.operation,
+                ),
+            )
+        for entry in entries:
+            child_source = entry.path
+            child_destination = os.path.join(destination, entry.name)
+            if cancelled.is_set():
+                results.append(
+                    self._failure(
                         child_source,
                         child_destination,
-                        cancelled,
-                        move=move,
-                        request=request,
+                        FileOperationErrorCode.CANCELLED,
+                        "操作がキャンセルされました",
+                        operation=request.operation,
                     )
-                    if move:
-                        try:
-                            os.rmdir(child_source)
-                        except OSError:
-                            pass
-                elif resolution == FileCollisionPolicy.REPLACE.value:
-                    if move:
-                        self._move_replace(child_source, child_destination, cancelled)
-                    else:
-                        self._copy_atomic_replace(
-                            child_source, child_destination, cancelled
-                        )
-                elif resolution in {
-                    FileCollisionPolicy.RENAME.value,
-                    FileCollisionPolicy.KEEP_BOTH.value,
-                }:
-                    generated = generate_copy_name(
-                        entry.name,
-                        self._directory_names(destination),
-                        is_directory=is_directory,
+                )
+                break
+            try:
+                result = self._merge_child(
+                    request,
+                    child_source,
+                    child_destination,
+                    entry.is_dir(follow_symlinks=False),
+                    cancelled,
+                    move=move,
+                )
+            except _OperationCancelled:
+                result = self._failure(
+                    child_source,
+                    child_destination,
+                    FileOperationErrorCode.CANCELLED,
+                    "操作がキャンセルされました",
+                    operation=request.operation,
+                )
+            except BaseException as exc:
+                result = self._exception_failure(
+                    child_source,
+                    child_destination,
+                    exc,
+                    operation=request.operation,
+                )
+            results.append(result)
+            if result.state is FileOperationItemState.CANCELLED:
+                break
+        return tuple(results)
+
+    def _merge_child(
+        self,
+        request: FileOperationRequest,
+        child_source: str,
+        child_destination: str,
+        is_directory: bool,
+        cancelled: Event,
+        *,
+        move: bool,
+    ) -> FileOperationItemResult:
+        if self._is_reparse_path(child_source):
+            return self._failure(
+                child_source,
+                child_destination,
+                FileOperationErrorCode.IO_ERROR,
+                "再解析ポイントはマージできません",
+                operation=request.operation,
+            )
+        if not os.path.lexists(child_destination):
+            try:
+                if move:
+                    self._move_safe(child_source, child_destination, cancelled)
+                    return self._move_postcondition(
+                        child_source,
+                        child_destination,
+                        operation=request.operation,
                     )
-                    if generated is not None:
-                        target = os.path.join(destination, generated)
-                        if move:
-                            self._move_safe(child_source, target, cancelled)
-                        else:
-                            self._copy_atomic(child_source, target, cancelled)
-                elif resolution == FileCollisionPolicy.CANCEL.value:
-                    raise _OperationCancelled
+                self._copy_atomic(child_source, child_destination, cancelled)
+                return self._copy_success(
+                    child_source,
+                    child_destination,
+                    operation=request.operation,
+                )
+            except _SourceDeleteFailed as exc:
+                return self._source_removal_failure(
+                    child_source,
+                    child_destination,
+                    str(exc),
+                    operation=request.operation,
+                )
+        resolution = self._collision_resolution(request, child_destination)
+        if (
+            is_directory
+            and os.path.isdir(child_destination)
+            and resolution == FileCollisionPolicy.MERGE.value
+        ):
+            children = self._copy_directory_merge(
+                child_source,
+                child_destination,
+                cancelled,
+                move=move,
+                request=request,
+            )
+            remove_error: str | None = None
+            if move and os.path.lexists(child_source):
+                try:
+                    os.rmdir(child_source)
+                except OSError as exc:
+                    remove_error = str(exc)
+            return self._aggregate_merge_result(
+                child_source,
+                child_destination,
+                request.operation,
+                children,
+                root_remove_error=remove_error,
+            )
+        if resolution == FileCollisionPolicy.REPLACE.value:
+            return self._replace_transfer(
+                request,
+                child_source,
+                child_destination,
+                cancelled,
+            )
+        if resolution in {
+            FileCollisionPolicy.RENAME.value,
+            FileCollisionPolicy.KEEP_BOTH.value,
+        }:
+            generated = generate_copy_name(
+                os.path.basename(child_source),
+                self._directory_names(os.path.dirname(child_destination)),
+                is_directory=is_directory,
+            )
+            if generated is None:
+                return self._failure(
+                    child_source,
+                    child_destination,
+                    FileOperationErrorCode.COLLISION,
+                    "衝突しない名前を生成できません",
+                    operation=request.operation,
+                )
+            target = os.path.join(os.path.dirname(child_destination), generated)
+            try:
+                if move:
+                    self._move_safe(child_source, target, cancelled)
+                    return self._move_postcondition(
+                        child_source,
+                        target,
+                        operation=request.operation,
+                    )
+                self._copy_atomic(child_source, target, cancelled)
+                return self._copy_success(
+                    child_source,
+                    target,
+                    operation=request.operation,
+                )
+            except _SourceDeleteFailed as exc:
+                return self._source_removal_failure(
+                    child_source,
+                    target,
+                    str(exc),
+                    operation=request.operation,
+                )
+        if resolution == FileCollisionPolicy.CANCEL.value:
+            raise _OperationCancelled
+        return self._failure(
+            child_source,
+            child_destination,
+            FileOperationErrorCode.COLLISION,
+            "同名項目があるためスキップしました",
+            operation=request.operation,
+        )
+
+    def _aggregate_merge_result(
+        self,
+        source: str,
+        destination: str,
+        operation: FileOperationKind,
+        child_results: tuple[FileOperationItemResult, ...],
+        *,
+        root_remove_error: str | None,
+    ) -> FileOperationItemResult:
+        leaves: list[FileOperationItemResult] = []
+        for child in child_results:
+            leaves.extend(child.leaf_results())
+        published = tuple(
+            item.destination_path
+            for item in leaves
+            if item.destination_published and item.destination_path
+        )
+        moved = tuple(
+            item.source_path
+            for item in leaves
+            if item.success
+            and item.state is FileOperationItemState.MOVED
+            and item.source_path
+        )
+        skipped = tuple(
+            item.source_path
+            for item in leaves
+            if item.state is FileOperationItemState.SKIPPED and item.source_path
+        )
+        failed = tuple(
+            item.source_path
+            for item in leaves
+            if not item.success
+            and item.state is not FileOperationItemState.SKIPPED
+            and item.source_path
+        )
+        source_exists = os.path.lexists(source)
+        destination_exists = os.path.lexists(destination)
+        residual = self._residual_source_paths(source)
+        retry = self._immediate_residual_paths(source)
+        cancelled = any(
+            item.state is FileOperationItemState.CANCELLED for item in leaves
+        )
+        if operation is FileOperationKind.MOVE:
+            complete = (
+                all(item.success for item in leaves)
+                and not source_exists
+                and not residual
+                and not skipped
+                and not failed
+                and not cancelled
+            )
+            state = (
+                FileOperationItemState.MOVED
+                if complete
+                else (
+                    FileOperationItemState.CANCELLED
+                    if cancelled and not published
+                    else FileOperationItemState.DESTINATION_PUBLISHED_SOURCE_REMAINS
+                    if destination_exists and source_exists
+                    else FileOperationItemState.SOURCE_REMOVAL_FAILED
+                    if root_remove_error
+                    else FileOperationItemState.FAILED
+                )
+            )
+        else:
+            complete = (
+                all(item.success for item in leaves)
+                and not skipped
+                and not failed
+                and not cancelled
+            )
+            state = (
+                FileOperationItemState.COPIED
+                if complete
+                else FileOperationItemState.CANCELLED
+                if cancelled and not published
+                else FileOperationItemState.FAILED
+            )
+        partial = bool(published or moved) and not complete
+        if complete:
+            code = None
+            message = None
+        elif partial:
+            code = FileOperationErrorCode.PARTIAL_SUCCESS.value
+            message = (
+                "フォルダの一部だけを処理しました"
+                + (f": {root_remove_error}" if root_remove_error else "")
+            )
+        elif cancelled:
+            code = FileOperationErrorCode.CANCELLED.value
+            message = "操作がキャンセルされました"
+        else:
+            code = FileOperationErrorCode.IO_ERROR.value
+            message = root_remove_error or "フォルダを統合できませんでした"
+        return FileOperationItemResult(
+            source,
+            destination,
+            complete,
+            code,
+            message,
+            partial,
+            state=state,
+            destination_exists_after=destination_exists,
+            source_exists_after=source_exists,
+            destination_published=bool(published) or destination_exists,
+            source_removed=not source_exists,
+            residual_source_paths=residual,
+            operation=operation,
+            destination_existed_before=True,
+            child_results=child_results,
+            published_destination_paths=published,
+            moved_source_paths=moved,
+            skipped_source_paths=skipped,
+            failed_source_paths=failed,
+            retry_source_paths=retry,
+            source_root_removed=not source_exists,
+            partially_completed=partial,
+        )
 
     def _move_safe(self, source: str, destination: str, cancelled: Event) -> None:
         if cancelled.is_set():
@@ -1158,6 +1473,8 @@ class FileOperationService:
         destination: str | None,
         code: FileOperationErrorCode,
         message: str,
+        *,
+        operation: FileOperationKind | None = None,
     ) -> FileOperationItemResult:
         state = (
             FileOperationItemState.CANCELLED
@@ -1183,12 +1500,17 @@ class FileOperationService:
                 os.path.lexists(destination) if destination else None
             ),
             source_exists_after=(os.path.lexists(source) if source else None),
+            operation=operation,
         )
 
     @staticmethod
     def _copy_success(
         source: str,
         destination: str,
+        *,
+        operation: FileOperationKind | None = FileOperationKind.COPY,
+        replaced_existing: bool = False,
+        destination_existed_before: bool = False,
     ) -> FileOperationItemResult:
         return FileOperationItemResult(
             source,
@@ -1199,6 +1521,10 @@ class FileOperationService:
             source_exists_after=os.path.lexists(source),
             destination_published=os.path.lexists(destination),
             source_removed=False,
+            operation=operation,
+            replaced_existing=replaced_existing,
+            destination_existed_before=destination_existed_before,
+            published_destination_paths=(destination,),
         )
 
     @classmethod
@@ -1206,6 +1532,8 @@ class FileOperationService:
         cls,
         source: str,
         destination: str,
+        *,
+        operation: FileOperationKind | None = FileOperationKind.MOVE,
     ) -> FileOperationItemResult:
         source_exists = os.path.lexists(source)
         destination_exists = os.path.lexists(destination)
@@ -1219,6 +1547,10 @@ class FileOperationService:
                 source_exists_after=False,
                 destination_published=True,
                 source_removed=True,
+                operation=operation,
+                published_destination_paths=(destination,),
+                moved_source_paths=(source,),
+                source_root_removed=True,
             )
         state = (
             FileOperationItemState.DESTINATION_PUBLISHED_SOURCE_REMAINS
@@ -1242,6 +1574,12 @@ class FileOperationService:
             destination_published=destination_exists,
             source_removed=not source_exists,
             residual_source_paths=cls._residual_source_paths(source),
+            operation=operation,
+            published_destination_paths=((destination,) if destination_exists else ()),
+            failed_source_paths=((source,) if source else ()),
+            retry_source_paths=cls._immediate_residual_paths(source),
+            source_root_removed=not source_exists,
+            partially_completed=destination_exists,
         )
 
     @classmethod
@@ -1250,6 +1588,10 @@ class FileOperationService:
         source: str,
         destination: str,
         message: str,
+        *,
+        operation: FileOperationKind | None = FileOperationKind.MOVE,
+        replaced_existing: bool = False,
+        destination_existed_before: bool = False,
     ) -> FileOperationItemResult:
         source_exists = os.path.lexists(source)
         destination_exists = os.path.lexists(destination)
@@ -1266,6 +1608,14 @@ class FileOperationService:
             destination_published=destination_exists,
             source_removed=not source_exists,
             residual_source_paths=cls._residual_source_paths(source),
+            operation=operation,
+            replaced_existing=replaced_existing,
+            destination_existed_before=destination_existed_before,
+            published_destination_paths=((destination,) if destination_exists else ()),
+            failed_source_paths=((source,) if source_exists else ()),
+            retry_source_paths=cls._immediate_residual_paths(source),
+            source_root_removed=not source_exists,
+            partially_completed=destination_exists,
         )
 
     @staticmethod
@@ -1283,12 +1633,26 @@ class FileOperationService:
             pass
         return tuple(residual)
 
+    @staticmethod
+    def _immediate_residual_paths(source: str) -> tuple[str, ...]:
+        if not os.path.lexists(source):
+            return ()
+        if not os.path.isdir(source):
+            return (source,)
+        try:
+            with os.scandir(source) as entries:
+                return tuple(entry.path for entry in entries)
+        except OSError:
+            return (source,)
+
     @classmethod
     def _exception_failure(
         cls,
         source: str | None,
         destination: str | None,
         error: BaseException,
+        *,
+        operation: FileOperationKind | None = None,
     ) -> FileOperationItemResult:
         if isinstance(error, FileNotFoundError):
             code = FileOperationErrorCode.NOT_FOUND
@@ -1301,4 +1665,10 @@ class FileOperationService:
             code = FileOperationErrorCode.IN_USE
         else:
             code = FileOperationErrorCode.IO_ERROR
-        return cls._failure(source, destination, code, str(error))
+        return cls._failure(
+            source,
+            destination,
+            code,
+            str(error),
+            operation=operation,
+        )

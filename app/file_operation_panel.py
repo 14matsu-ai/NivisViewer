@@ -138,9 +138,10 @@ class FileOperationPanel(QWidget):
             self.current_file_progress.setRange(0, 0)
 
     def show_result(self, result: FileOperationResult) -> None:
-        failures = len(result.failures)
+        items = result.effective_items
+        failures = sum(not item.success for item in items)
         skipped = sum(
-            item.state is FileOperationItemState.SKIPPED for item in result.items
+            item.state is FileOperationItemState.SKIPPED for item in items
         )
         source_remaining = sum(
             item.state
@@ -149,23 +150,24 @@ class FileOperationPanel(QWidget):
                 FileOperationItemState.SOURCE_REMOVAL_FAILED,
                 FileOperationItemState.DESTINATION_PUBLISHED_SOURCE_REMAINS,
             }
-            for item in result.items
+            for item in items
         )
         self.details_view.setPlainText(
             "\n".join(
                 f"{item.source_path or item.destination_path or '(不明)'}: "
                 f"{item.error_message or item.error_code or '失敗'}"
-                for item in result.failures
+                for item in items
+                if not item.success
             )
         )
-        self.details_button.setVisible(bool(result.failures))
+        self.details_button.setVisible(bool(failures))
         self.cancel_button.setEnabled(False)
         if result.cancelled:
             self.summary_label.setText("キャンセルしました")
             self._hide_timer.start(3000)
         elif failures:
             summary = (
-                f"完了: 成功 {len(result.successes)} / "
+                f"完了: 成功 {sum(item.success for item in items)} / "
                 f"スキップ {skipped} / 失敗 {max(0, failures - skipped)}"
             )
             if source_remaining:

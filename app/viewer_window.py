@@ -1489,6 +1489,21 @@ class ViewerWindow(QMainWindow):
         elif result == "unavailable":
             self._set_status_override("移動できる書庫がありません", 2500)
 
+    def show_adjacent_book_searching(self, direction: int) -> None:
+        label = "前" if direction < 0 else "次"
+        self._set_status_override(f"{label}の本を検索中…")
+
+    def complete_adjacent_book_search(self, direction: int, result: str) -> None:
+        if result == "opened":
+            self._status_override_token += 1
+            self._status_override_message = None
+            self._update_status()
+        elif result == "boundary":
+            message = "前の書庫はありません" if direction < 0 else "次の書庫はありません"
+            self._set_status_override(message, 2500)
+        elif result in {"unavailable", "error"}:
+            self._set_status_override("移動できる書庫がありません", 2500)
+
     def _bookmark_pages(self) -> list[int]:
         if not self._current_book_key:
             return []
