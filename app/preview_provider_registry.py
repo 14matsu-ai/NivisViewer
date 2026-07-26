@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from threading import Event
@@ -8,7 +8,6 @@ from threading import Event
 from .browser_model import BrowserItem, BrowserItemKind
 from .browser_thumbnail_scheduler import ThumbnailPriority
 from .ffmpeg_thumbnail_backend import (
-    FFMPEG_PREVIEW_RENDER_VERSION,
     FFmpegLocator,
     FFmpegThumbnailBackend,
     VIDEO_PREVIEW_EXTENSIONS,
@@ -21,6 +20,10 @@ from .text_preview_provider import (
 )
 from .thumbnail_render import ThumbnailRenderSpec
 from .windows_shell_preview import WindowsShellPreviewService
+from .video_thumbnail_policy import (
+    VideoThumbnailFrameMode,
+    VideoThumbnailPolicy,
+)
 
 
 class BrowserPreviewKind(str, Enum):
@@ -187,7 +190,14 @@ class PreviewProviderRegistry:
                 bool(self._settings.get("video_thumbnail_enabled", True))
                 and backend in {"auto", "ffmpeg"}
             ):
-                return FFMPEG_PREVIEW_RENDER_VERSION
+                return VideoThumbnailPolicy.cache_variant(
+                    str(
+                        self._settings.get(
+                            "video_thumbnail_frame_mode",
+                            "smart",
+                        )
+                    )
+                )
             return "__preview_disabled__"
         if capability.preview_kind is BrowserPreviewKind.WINDOWS_SHELL:
             return "__shell_memory_only__"
@@ -211,14 +221,26 @@ class PreviewProviderRegistry:
         ).casefold()
         if backend == "disabled":
             return PreviewResult(PreviewResultKind.NOT_APPLICABLE)
-        if backend in {"auto", "windows_shell"}:
+        frame_mode = str(
+            self._settings.get("video_thumbnail_frame_mode", "smart")
+        ).casefold()
+        if frame_mode == VideoThumbnailFrameMode.WINDOWS_SHELL.value:
+            backend = "windows_shell"
+        shell_result = PreviewResult(PreviewResultKind.UNAVAILABLE)
+        use_shell_placeholder = bool(
+            self._settings.get("video_thumbnail_shell_placeholder", True)
+        )
+        if backend in {"auto", "windows_shell"} or use_shell_placeholder:
             shell_result = self._shell_preview(
                 item,
                 spec,
                 priority=priority,
                 cancel_token=cancel_token,
             )
-            if shell_result.kind is PreviewResultKind.READY:
+            if (
+                shell_result.kind is PreviewResultKind.READY
+                and backend == "windows_shell"
+            ):
                 return shell_result
             if (
                 backend == "windows_shell"
@@ -236,7 +258,19 @@ class PreviewProviderRegistry:
             executable = self.ffmpeg_locator.locate(explicit)
             ffmpeg = FFmpegThumbnailBackend(executable)
             self.ffmpeg_backend = ffmpeg
-        return ffmpeg.generate(item.path, spec, cancel_token)
+        if hasattr(ffmpeg, "policy"):
+            ffmpeg.policy = VideoThumbnailPolicy(frame_mode)
+        final_result = ffmpeg.generate(item.path, spec, cancel_token)
+        if final_result.ready:
+            if use_shell_placeholder and shell_result.ready:
+                return replace(
+                    final_result,
+                    provisional_image=shell_result.image,
+                )
+            return final_result
+        if shell_result.ready:
+            return shell_result
+        return final_result
 
     def _shell_preview(
         self,

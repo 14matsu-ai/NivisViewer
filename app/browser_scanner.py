@@ -16,6 +16,7 @@ from .browser_visibility import (
     filesystem_visibility_flags,
 )
 from .image_source import ARCHIVE_EXTENSIONS, PDF_EXTENSIONS, SUPPORTED_EXTENSIONS
+from .performance_trace import performance_trace
 
 
 DEFAULT_SCAN_BATCH_SIZE = 128
@@ -42,12 +43,20 @@ class BrowserScanStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class BrowserScanPriority(int, Enum):
+    BACKGROUND = -100
+    REFRESH = 0
+    INTERACTIVE_NAVIGATION = 100
+
+
 @dataclass(frozen=True)
 class BrowserScanRequest:
     path: str
     generation: int
     batch_size: int = DEFAULT_SCAN_BATCH_SIZE
     visibility_policy: BrowserVisibilityPolicy = LEGACY_SUPPORTED_ITEMS_POLICY
+    priority: BrowserScanPriority = BrowserScanPriority.INTERACTIVE_NAVIGATION
+    trace_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -207,8 +216,26 @@ def scan_directory(
             0,
             cancelled=True,
         )
+    if request.trace_id:
+        performance_trace.mark(
+            request.trace_id,
+            "scanner.path_check.begin",
+            request.path,
+        )
     try:
+        if request.trace_id:
+            performance_trace.mark(
+                request.trace_id,
+                "scanner.scandir.begin",
+                request.path,
+            )
         with os.scandir(target) as entries:
+            if request.trace_id:
+                performance_trace.mark(
+                    request.trace_id,
+                    "scanner.path_check.complete",
+                    request.path,
+                )
             for entry in entries:
                 if cancelled.is_set():
                     return BrowserScanCompleted(
@@ -226,6 +253,12 @@ def scan_directory(
                 batch.append(scanned)
                 total_count += 1
                 if len(batch) >= batch_size:
+                    if request.trace_id and total_count == len(batch):
+                        performance_trace.mark(
+                            request.trace_id,
+                            "scanner.first_batch.created",
+                            str(total_count),
+                        )
                     emit_batch(
                         BrowserScanBatch(
                             request.path,
@@ -242,6 +275,12 @@ def scan_directory(
                             cancelled=True,
                         )
     except FileNotFoundError as exc:
+        if request.trace_id:
+            performance_trace.mark(
+                request.trace_id,
+                "scanner.path_check.complete",
+                BrowserScanStatus.NOT_FOUND.value,
+            )
         return BrowserScanError(
             request.path,
             request.generation,
@@ -249,6 +288,12 @@ def scan_directory(
             f"フォルダを読み込めません: {request.path} ({exc})",
         )
     except NotADirectoryError as exc:
+        if request.trace_id:
+            performance_trace.mark(
+                request.trace_id,
+                "scanner.path_check.complete",
+                BrowserScanStatus.NOT_DIRECTORY.value,
+            )
         return BrowserScanError(
             request.path,
             request.generation,
@@ -256,6 +301,12 @@ def scan_directory(
             f"フォルダを読み込めません: {request.path} ({exc})",
         )
     except PermissionError as exc:
+        if request.trace_id:
+            performance_trace.mark(
+                request.trace_id,
+                "scanner.path_check.complete",
+                BrowserScanStatus.ACCESS_DENIED.value,
+            )
         return BrowserScanError(
             request.path,
             request.generation,
@@ -263,6 +314,12 @@ def scan_directory(
             f"フォルダを読み込めません: {request.path} ({exc})",
         )
     except OSError as exc:
+        if request.trace_id:
+            performance_trace.mark(
+                request.trace_id,
+                "scanner.path_check.complete",
+                BrowserScanStatus.IO_ERROR.value,
+            )
         return BrowserScanError(
             request.path,
             request.generation,
@@ -271,6 +328,12 @@ def scan_directory(
         )
     else:
         if batch and not cancelled.is_set():
+            if request.trace_id and total_count == len(batch):
+                performance_trace.mark(
+                    request.trace_id,
+                    "scanner.first_batch.created",
+                    str(total_count),
+                )
             emit_batch(
                 BrowserScanBatch(
                     request.path,
@@ -302,6 +365,12 @@ class _BrowserScanWorker(QRunnable):
 
     @Slot()
     def run(self) -> None:
+        if self.request.trace_id:
+            performance_trace.mark(
+                self.request.trace_id,
+                "scanner.worker.begin",
+                self.request.path,
+            )
         result = scan_directory(
             self.request,
             self.cancelled,
@@ -338,7 +407,13 @@ class BrowserDirectoryScanner(QObject):
         with self._lock:
             self._cancel_events[request.generation] = cancelled
             self._workers[request.generation] = worker
-        self._pool.start(worker)
+        if request.trace_id:
+            performance_trace.mark(
+                request.trace_id,
+                "scanner.request.registered",
+                request.path,
+            )
+        self._pool.start(worker, int(request.priority))
         return True
 
     def cancel(self, generation: int) -> None:

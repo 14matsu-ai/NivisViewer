@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import json
 import os
 from pathlib import Path
 import shutil
@@ -15,6 +16,11 @@ from .file_preview import PreviewResult, PreviewResultKind, PreviewSource
 from .thumbnail_render import (
     ThumbnailRenderSpec,
     render_pil_thumbnail,
+)
+from .video_thumbnail_policy import (
+    VideoMetadata,
+    VideoThumbnailFrameMode,
+    VideoThumbnailPolicy,
 )
 
 
@@ -37,7 +43,7 @@ VIDEO_PREVIEW_EXTENSIONS = frozenset(
         ".3gp",
     }
 )
-FFMPEG_PREVIEW_RENDER_VERSION = "ffmpeg-v1"
+FFMPEG_PREVIEW_RENDER_VERSION = "ffmpeg-v2"
 
 
 class FFmpegLocator:
@@ -80,10 +86,12 @@ class FFmpegThumbnailBackend:
         *,
         timeout_seconds: float = 12.0,
         process_factory: Callable[..., subprocess.Popen] = subprocess.Popen,
+        frame_mode: str = "smart",
     ) -> None:
         self.executable = Path(executable) if executable else None
         self.timeout_seconds = max(0.05, min(60.0, float(timeout_seconds)))
         self._process_factory = process_factory
+        self.policy = VideoThumbnailPolicy(frame_mode)
         self.last_command: tuple[str, ...] = ()
 
     @property
@@ -105,17 +113,61 @@ class FFmpegThumbnailBackend:
         if not self.available:
             return PreviewResult(PreviewResultKind.UNAVAILABLE)
         source = Path(path)
+        if self.policy.mode is VideoThumbnailFrameMode.WINDOWS_SHELL:
+            return PreviewResult(PreviewResultKind.NOT_APPLICABLE)
+        metadata = self._probe_metadata(source, cancel_token)
         edge = max(32, min(2048, int(spec.long_edge)))
         filter_graph = (
-            "thumbnail=100,"
+            "scale=trunc(iw*sar):ih,"
             f"scale={edge}:{edge}:force_original_aspect_ratio=decrease"
         )
+        candidates: list[tuple[float, Image.Image]] = []
+        for timestamp in self.policy.candidate_timestamps(metadata.duration):
+            if cancel_token is not None and cancel_token.is_set():
+                return PreviewResult(PreviewResultKind.CANCELLED)
+            decoded = self._extract_frame(
+                source,
+                timestamp,
+                filter_graph,
+                cancel_token,
+            )
+            if isinstance(decoded, PreviewResult):
+                if decoded.kind is PreviewResultKind.CANCELLED:
+                    return decoded
+                continue
+            candidates.append((timestamp, decoded))
+        selected = self.policy.select(candidates)
+        if selected is None:
+            return PreviewResult(PreviewResultKind.UNAVAILABLE)
+        try:
+            rendered = self.policy.render(selected.image, spec, metadata)
+        except Exception as exc:
+            return PreviewResult.failed(f"動画フレームを読み込めません: {exc}")
+        if rendered is None or rendered.isNull():
+            return PreviewResult.failed("動画フレームを描画できません")
+        return PreviewResult.ready_image(
+            rendered,
+            source=PreviewSource.FFMPEG,
+            persist_to_disk=True,
+            entry_path=VideoThumbnailPolicy.cache_variant(self.policy.mode),
+        )
+
+    def _extract_frame(
+        self,
+        source: Path,
+        timestamp: float,
+        filter_graph: str,
+        cancel_token: Event | None,
+    ) -> Image.Image | PreviewResult:
         command = (
             str(self.executable),
             "-hide_banner",
             "-loglevel",
             "error",
             "-nostdin",
+            "-ss",
+            f"{max(0.0, float(timestamp)):.3f}",
+            "-noautorotate",
             "-i",
             str(source),
             "-vf",
@@ -184,17 +236,108 @@ class FFmpegThumbnailBackend:
             return PreviewResult(PreviewResultKind.UNAVAILABLE)
         try:
             with Image.open(BytesIO(output)) as image:
-                rendered, _crop = render_pil_thumbnail(image, spec)
+                return image.convert("RGBA")
         except Exception as exc:
             return PreviewResult.failed(f"動画フレームを読み込めません: {exc}")
-        if rendered is None or rendered.isNull():
-            return PreviewResult.failed("動画フレームを描画できません")
-        return PreviewResult.ready_image(
-            rendered,
-            source=PreviewSource.FFMPEG,
-            persist_to_disk=True,
-            entry_path=FFMPEG_PREVIEW_RENDER_VERSION,
-        )
+
+    def _probe_metadata(
+        self,
+        source: Path,
+        cancel_token: Event | None,
+    ) -> VideoMetadata:
+        if self._process_factory is not subprocess.Popen or self.executable is None:
+            return VideoMetadata()
+        probe = self.executable.with_name("ffprobe.exe")
+        executable = probe if probe.is_file() else shutil.which("ffprobe")
+        if not executable:
+            return VideoMetadata()
+        command = [
+            str(executable),
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,sample_aspect_ratio,display_aspect_ratio:stream_tags=rotate:format=duration",
+            "-of",
+            "json",
+            str(source),
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                creationflags=(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    if os.name == "nt"
+                    else 0
+                ),
+            )
+            started = monotonic()
+            output = b""
+            while True:
+                if cancel_token is not None and cancel_token.is_set():
+                    self._terminate_process(process)
+                    return VideoMetadata()
+                remaining = min(4.0, self.timeout_seconds) - (
+                    monotonic() - started
+                )
+                if remaining <= 0:
+                    self._terminate_process(process)
+                    return VideoMetadata()
+                try:
+                    output, _error = process.communicate(
+                        timeout=min(0.1, remaining)
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            data = json.loads(output[: 1024 * 1024] or b"{}")
+            stream = (data.get("streams") or [{}])[0]
+            duration = (data.get("format") or {}).get("duration")
+            return VideoMetadata(
+                duration=self._safe_float(duration),
+                width=self._safe_int(stream.get("width")),
+                height=self._safe_int(stream.get("height")),
+                sample_aspect_ratio=self._parse_ratio(
+                    stream.get("sample_aspect_ratio")
+                ),
+                display_aspect_ratio=self._parse_ratio(
+                    stream.get("display_aspect_ratio")
+                ),
+                rotation=self._safe_int((stream.get("tags") or {}).get("rotate")) or 0,
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            return VideoMetadata()
+
+    @staticmethod
+    def _parse_ratio(value: object) -> float | None:
+        text = str(value or "")
+        separator = ":" if ":" in text else "/"
+        try:
+            left, right = text.split(separator, 1)
+            denominator = float(right)
+            result = float(left) / denominator
+        except (ValueError, ZeroDivisionError):
+            return None
+        return result
+
+    @staticmethod
+    def _safe_float(value: object) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _safe_int(value: object) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen) -> None:

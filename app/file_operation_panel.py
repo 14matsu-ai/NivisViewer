@@ -12,7 +12,11 @@ from PySide6.QtWidgets import (
 )
 
 from .file_operation_plan import FileOperationState
-from .file_operation_service import FileOperationProgress, FileOperationResult
+from .file_operation_service import (
+    FileOperationItemState,
+    FileOperationProgress,
+    FileOperationResult,
+)
 
 
 class FileOperationPanel(QWidget):
@@ -135,6 +139,18 @@ class FileOperationPanel(QWidget):
 
     def show_result(self, result: FileOperationResult) -> None:
         failures = len(result.failures)
+        skipped = sum(
+            item.state is FileOperationItemState.SKIPPED for item in result.items
+        )
+        source_remaining = sum(
+            item.state
+            in {
+                FileOperationItemState.COPIED_SOURCE_REMAINS,
+                FileOperationItemState.SOURCE_REMOVAL_FAILED,
+                FileOperationItemState.DESTINATION_PUBLISHED_SOURCE_REMAINS,
+            }
+            for item in result.items
+        )
         self.details_view.setPlainText(
             "\n".join(
                 f"{item.source_path or item.destination_path or '(不明)'}: "
@@ -148,9 +164,13 @@ class FileOperationPanel(QWidget):
             self.summary_label.setText("キャンセルしました")
             self._hide_timer.start(3000)
         elif failures:
-            self.summary_label.setText(
-                f"完了: 成功 {len(result.successes)} / 失敗 {failures}"
+            summary = (
+                f"完了: 成功 {len(result.successes)} / "
+                f"スキップ {skipped} / 失敗 {max(0, failures - skipped)}"
             )
+            if source_remaining:
+                summary += f"（元項目残留 {source_remaining}）"
+            self.summary_label.setText(summary)
         else:
             self.summary_label.setText("完了")
             self._hide_timer.start(2500)

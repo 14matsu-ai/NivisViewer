@@ -673,6 +673,22 @@ class SettingsDialog(QDialog):
             "動画バックエンド:",
             self.video_thumbnail_backend_combo,
         )
+        self.video_thumbnail_frame_mode_combo = QComboBox(preview_group)
+        self.video_thumbnail_frame_mode_combo.addItem("代表フレーム（推奨）", "smart")
+        self.video_thumbnail_frame_mode_combo.addItem("再生時間の1/3", "one_third")
+        self.video_thumbnail_frame_mode_combo.addItem(
+            "Windows Shellの選択",
+            "windows_shell",
+        )
+        preview_form.addRow(
+            "動画フレーム:",
+            self.video_thumbnail_frame_mode_combo,
+        )
+        self.video_thumbnail_shell_placeholder_checkbox = QCheckBox(
+            "FFmpeg結果までShell画像を一時表示する",
+            preview_group,
+        )
+        preview_form.addRow(self.video_thumbnail_shell_placeholder_checkbox)
         self.ffmpeg_path_edit = QLineEdit(preview_group)
         ffmpeg_path_row = QWidget(preview_group)
         ffmpeg_path_layout = QHBoxLayout(ffmpeg_path_row)
@@ -999,6 +1015,13 @@ class SettingsDialog(QDialog):
             self.video_thumbnail_backend_combo,
             self.config.get("video_thumbnail_backend", "auto"),
         )
+        self._select_data(
+            self.video_thumbnail_frame_mode_combo,
+            self.config.get("video_thumbnail_frame_mode", "smart"),
+        )
+        self.video_thumbnail_shell_placeholder_checkbox.setChecked(
+            bool(self.config.get("video_thumbnail_shell_placeholder", True))
+        )
         self.ffmpeg_path_edit.setText(
             str(self.config.get("ffmpeg_executable", "") or "")
         )
@@ -1289,6 +1312,12 @@ class SettingsDialog(QDialog):
             "video_thumbnail_enabled": self.video_thumbnail_checkbox.isChecked(),
             "video_thumbnail_backend": str(
                 self.video_thumbnail_backend_combo.currentData() or "auto"
+            ),
+            "video_thumbnail_frame_mode": str(
+                self.video_thumbnail_frame_mode_combo.currentData() or "smart"
+            ),
+            "video_thumbnail_shell_placeholder": (
+                self.video_thumbnail_shell_placeholder_checkbox.isChecked()
             ),
             "ffmpeg_executable": self.ffmpeg_path_edit.text().strip().strip('"'),
             "browser_external_drop_behavior": str(
