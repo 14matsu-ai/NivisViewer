@@ -111,7 +111,20 @@
     - interactive scanner priorityとlatest generation wins
     - first list paint後のtree sync／thumbnail開始
     - DEBUG／テスト限定の区間performance trace
-26. 後続候補：ファイル操作と項目表示の拡張
+26. Stability Sprint：Repository Review P1修正（完了）
+    - 前後の本探索をBrowser snapshot再利用付きworkerへ分離
+    - 履歴／ブックマークpaint時の同期path probeを除去
+    - PDF shutdown／document close control barrierとpending cancellation
+    - folder merge MOVEのchild単位結果とresidual cut state
+    - COPY／MOVE／partial置換のtransactional MetadataStore方針
+27. 後続P2候補：安定性と責務分割
+    - startup／recent pathの非同期probe
+    - diagnosticsのcached PDF availability
+    - shutdown時processEvents再入除去
+    - worker lifetime整理
+    - Windowクラスの段階的分割
+    - 公開前ライセンス監査
+28. 後続候補：ファイル操作と項目表示の拡張
     - ファイル操作履歴と安全に可能なrename／moveのUndo
     - pause／resume、失敗項目の再試行
     - 右ドラッグ後のcopy／moveメニュー
@@ -120,9 +133,9 @@
     - 再帰的なサブフォルダ表示
     - PDFパスワード入力、PDF目次
     - 画像中央クロップ／余白除去、Viewerメモリ予算調整
-27. 後続候補：レート／タグ編集UIと検索
+29. 後続候補：レート／タグ編集UIと検索
     - 基本ナビゲーションとファイル操作の安定後に着手
     - ZipPla `{zpi$...}` の明示的な読み取り互換
     - タグ・レート検索と絞り込み
     - サムネイル上のレート／タグ表示
-28. 公開前ライセンス監査、コード署名の将来検討
+30. 公開前ライセンス監査、コード署名の将来検討

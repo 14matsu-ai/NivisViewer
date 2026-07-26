@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import monotonic
 
 from PIL import Image
 from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidget
 
 from app.application_controller import ApplicationController
@@ -31,6 +33,16 @@ def close_controller(controller: ApplicationController, qapp: QApplication) -> N
         browser.close()
     qapp.processEvents()
     controller.shutdown()
+
+
+def wait_until(qapp: QApplication, predicate, timeout: float = 2.0) -> bool:
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
+        qapp.processEvents()
+        if predicate():
+            return True
+        QTest.qWait(5)
+    return bool(predicate())
 
 
 def test_start_creates_browser_and_shares_config(
@@ -430,8 +442,11 @@ def test_loop_book_navigation_setting_wraps_to_first_book(
 
     result = controller.open_adjacent_book(viewer, 1)
 
-    assert result == "opened"
-    assert viewer.book_session.current_path == first.parent
+    assert result == "searching"
+    assert wait_until(
+        qapp,
+        lambda: viewer.book_session.current_path == first.parent,
+    )
     close_controller(controller, qapp)
 
 
@@ -448,7 +463,11 @@ def test_book_navigation_stops_at_edge_when_loop_is_disabled(
 
     result = controller.open_adjacent_book(viewer, -1)
 
-    assert result == "boundary"
+    assert result == "searching"
+    assert wait_until(
+        qapp,
+        lambda: viewer.status.currentMessage() == "前の書庫はありません",
+    )
     assert viewer.book_session.current_path == first
     close_controller(controller, qapp)
 
@@ -472,11 +491,10 @@ def test_book_candidates_use_natural_order_and_adjacent_open_stays_in_background
 
     monkeypatch.setattr(controller, "_open_path_in_viewer", capture_open)
 
-    names = [path.name for path in controller._book_candidates(viewer)]
     result = controller.open_adjacent_book(viewer, 1)
 
-    assert names == ["book1", "book2.zip", "book10.cbz"]
-    assert result == "opened"
+    assert result == "searching"
+    assert wait_until(qapp, lambda: bool(opened))
     assert opened == [(tmp_path / "books" / "book2.zip", False)]
     close_controller(controller, qapp)
 
@@ -500,16 +518,13 @@ def test_book_candidates_include_external_archives_and_hide_later_rar_volumes(
     controller = make_controller(tmp_path, qapp)
     viewer = controller.open_path(first)
 
-    names = [path.name for path in controller._book_candidates(viewer)]
-
-    assert names == [
-        "book1",
-        "book2.rar",
-        "book3.cbr",
-        "book4.7z",
-        "book5.cb7",
-        "series.part1.rar",
-    ]
+    opened: list[Path] = []
+    controller._open_path_in_viewer = (
+        lambda _window, path, **_kwargs: opened.append(Path(path)) or True
+    )
+    assert controller.open_adjacent_book(viewer, 1) == "searching"
+    assert wait_until(qapp, lambda: bool(opened))
+    assert opened == [tmp_path / "books" / "book2.rar"]
     close_controller(controller, qapp)
 
 
@@ -523,7 +538,11 @@ def test_missing_current_book_is_unavailable_without_exception(
     viewer = controller.open_path(first)
     viewer.book_session.current_path = tmp_path / "books" / "missing.zip"
 
-    assert controller.open_adjacent_book(viewer, 1) == "unavailable"
+    assert controller.open_adjacent_book(viewer, 1) == "searching"
+    assert wait_until(
+        qapp,
+        lambda: viewer.status.currentMessage() == "移動できる書庫がありません",
+    )
     close_controller(controller, qapp)
 
 

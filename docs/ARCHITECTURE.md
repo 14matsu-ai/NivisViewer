@@ -656,6 +656,119 @@ Pillow fallbackは先頭frameへ固定し、EXIF transposeを一度だけ適用�
 - BrowserWindowを閉じてもViewerWindowが残っていればアプリを継続する
 - BrowserWindowと全ViewerWindowの両方がなくなったときだけ、ApplicationControllerが終了を一度要求する
 
+## Stability Sprint: Repository Review P1 fixes
+
+```text
+ApplicationController
+├─ AdjacentBookSearchService
+├─ PathAvailabilityService
+├─ PdfiumService
+└─ FileOperationQueue
+```
+
+### AdjacentBookSearchService
+
+```text
+AdjacentBookSearchService
+├─ Browser snapshot reuse
+├─ asynchronous filesystem search
+├─ lexical path keys
+└─ generation cancellation
+```
+
+前／次の本の要求は、GUI threadではcurrent pathの字句的な絶対化、request
+ID／generationの発行、Browser snapshotの取得、worker登録だけを行う。
+`exists()`、`is_dir()`、`is_file()`、`resolve()`、`iterdir()`、`stat()`、
+`scandir()`は候補探索のGUI経路では呼ばない。Browserが同じ親フォルダの
+commit済み一覧を保持している場合はpath、item kind、extension、自然順identity、
+scan generationをsnapshotとして再利用する。画像を含む兄弟folderかどうかなど
+snapshotだけで確定できない情報はworkerが確認する。
+
+候補cacheのfingerprintもworkerだけが取得する。Browser rescan、ファイル操作完了、
+明示invalidateでcacheを無効化できる。最新request generationだけを対象Viewerへ
+適用し、逆方向の連続操作、直接open、Viewer close、Application shutdown後の結果を
+破棄する。実行中のOS I/Oは強制停止しない。
+
+### Cached path availability
+
+```text
+HistoryModel / BookmarkModel / FolderBookmarkModel
+└─ cached availability state
+   └─ PathAvailabilityService asynchronous probe
+```
+
+MetadataStoreの`HistoryEntry`と`BrowserBookmark`は純粋データであり、property参照で
+ファイルシステムへ問い合わせない。Modelの`data()`は`UNKNOWN`、`CHECKING`、
+`AVAILABLE`、`MISSING`、`UNAVAILABLE`、`ERROR`のcacheだけを読む。paint、scroll、
+tooltip、accessibility roleの評価を契機にprobeを増やさない。同一lexical pathの
+pending probeはdeduplicateし、model generationが一致する結果だけをGUI threadで
+反映する。切断UNCや取り外し媒体は`UNAVAILABLE`として`MISSING`と区別し、一時的な
+確認失敗によって履歴やブックマークを自動削除しない。
+
+### PdfiumService lifecycle
+
+```text
+PdfiumService
+├─ RUNNING
+├─ SHUTTING_DOWN
+├─ pending cancellation
+├─ close-all control barrier
+└─ STOPPED
+```
+
+shutdown開始後は新規open／renderを受理せず、未開始jobのFutureをcancelledで必ず
+完了する。実行中の最大1件は危険に停止せず、その直後に通常render priorityとは
+独立したclose-all control barrierを実行する。全documentをworker threadでclose
+した後にworkerを停止し、そこで初めて`STOPPED`へ遷移する。`close_document()`も
+同documentの未開始renderをcancelし、無関係なpending renderより先にhandle解放を
+行う。shutdownとcloseの多重要求は冪等とする。
+
+### Merge MOVE result contract
+
+```text
+FileOperationService
+└─ MergeMoveResult
+   ├─ child results
+   ├─ published destinations
+   └─ residual sources
+```
+
+folder mergeは各childについてoperation kind、state、置換有無、destination公開、
+source削除、bytes、errorを`FileOperationItemResult`へ記録する。root resultは
+`child_results`、`published_destination_paths`、`moved_source_paths`、
+`residual_source_paths`、`skipped_source_paths`、`failed_source_paths`、
+再貼り付け用の`retry_source_paths`、source root削除結果を集約する。
+`rmdir()`失敗は握り潰さない。
+
+merge MOVEの完全成功は、全childが完全MOVED、source root不存在、residual／skip／
+failureなしの場合だけである。部分成功時のcut bufferは移動済みchildを除外し、
+残留する直下項目だけを再構成する。MetadataStoreとBrowser navigationのpath更新も
+完全成功したchild単位で適用する。
+
+### Replacement metadata policy
+
+```text
+MetadataStore
+├─ copy replace reset
+├─ move replace transactional relocation
+└─ partial move replacement policy
+```
+
+実schemaの分類は次のとおり。
+
+- 内容依存：`library_items`のfile size、mtime、identity、rating、comment、
+  `reading_history`のreading position／open history／page count、`item_tags`
+- path指向：`browser_bookmarks`のlabel、item type、sort order、created time
+- 共有語彙：`tags`。作品との結び付きは`item_tags`側の内容依存情報
+
+COPY＋REPLACEはdestinationの旧内容依存metadataだけをtransactionでresetし、
+source metadataを変更・複製しない。destination path bookmarkは維持する。
+完全なMOVE＋REPLACEはdestination旧内容をresetした後、source内容metadataを
+destinationへtransaction内でrelocateする。destination bookmarkを優先し、
+source bookmarkは競合がない場合だけ移す。destination公開後にsourceが残った
+partial MOVEはCOPY＋REPLACE相当としてdestinationをresetし、source metadataを
+元pathに維持する。skip、cancel、publish失敗ではDBを変更しない。
+
 ## 次の構成
 
 次段階では既存ImageSourceとPDFのtarget-aware renderingを踏まえてPageSource抽象化を進めます。基本操作と対応形式の安定後にMetadataStoreのレート／タグAPIへ編集UI、検索、絞り込み、サムネイル上の表示を接続します。ZipPlaの`{zpi$...}`は明示的な読み取り互換から始め、元ファイルへ自動的に書き戻さない境界を維持します。

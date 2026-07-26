@@ -1,27 +1,19 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from PySide6.QtCore import (
-    QAbstractListModel,
-    QModelIndex,
-    QObject,
-    QRunnable,
-    QThreadPool,
-    Qt,
-    Signal,
-    Slot,
-)
+from PySide6.QtCore import QAbstractListModel, QModelIndex, QObject, Qt, Slot
 from PySide6.QtGui import QColor
 
 from .metadata_store import MetadataStore
+from .path_availability import (
+    PathAvailability,
+    PathAvailabilityResult,
+    PathAvailabilityService,
+    path_key,
+)
 from .shell_icon_provider import ShellAssociatedIconProvider
-
-
-_FOLDER_PROBE_POOL = QThreadPool()
-_FOLDER_PROBE_POOL.setMaxThreadCount(1)
 
 
 @dataclass(frozen=True)
@@ -30,32 +22,14 @@ class FolderBookmarkItem:
     path: str
     exists: bool | None
     sort_order: int
-
-
-class _FolderProbeSignals(QObject):
-    finished = Signal(int, str, bool)
-
-
-class _FolderProbe(QRunnable):
-    def __init__(self, generation: int, path: str) -> None:
-        super().__init__()
-        self.generation = generation
-        self.path = path
-        self.signals = _FolderProbeSignals()
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            exists = Path(self.path).is_dir()
-        except OSError:
-            exists = False
-        self.signals.finished.emit(self.generation, self.path, exists)
+    availability: PathAvailability = PathAvailability.UNKNOWN
 
 
 class FolderBookmarkModel(QAbstractListModel):
     EntryRole = int(Qt.ItemDataRole.UserRole) + 1
     PathRole = EntryRole + 1
     ExistsRole = PathRole + 1
+    AvailabilityRole = ExistsRole + 1
 
     def __init__(
         self,
@@ -63,15 +37,24 @@ class FolderBookmarkModel(QAbstractListModel):
         parent: QObject | None = None,
         *,
         shell_icon_provider: ShellAssociatedIconProvider | None = None,
+        availability_service: PathAvailabilityService | None = None,
     ) -> None:
         super().__init__(parent)
         self.metadata_store = metadata_store
         self.shell_icon_provider = (
             shell_icon_provider or ShellAssociatedIconProvider()
         )
+        self._owns_availability_service = availability_service is None
+        self.availability_service = (
+            availability_service or PathAvailabilityService(self)
+        )
         self._entries: list[FolderBookmarkItem] = []
         self._row_by_path: dict[str, int] = {}
         self._probe_generation = 0
+        self._pending_requests: dict[int, tuple[int, str]] = {}
+        self.availability_service.result_ready.connect(self._on_probe_finished)
+        if self._owns_availability_service:
+            self.destroyed.connect(lambda *_args: self.availability_service.close())
         if metadata_store is not None:
             metadata_store.bookmarks_changed.connect(self.refresh)
         self.refresh()
@@ -88,13 +71,31 @@ class FolderBookmarkModel(QAbstractListModel):
         if entry is None:
             return None
         if role == int(Qt.ItemDataRole.DisplayRole):
-            suffix = " — 見つかりません" if entry.exists is False else ""
+            if entry.availability is PathAvailability.CHECKING:
+                suffix = " — 確認中"
+            elif entry.availability is PathAvailability.MISSING:
+                suffix = " — 見つかりません"
+            elif entry.availability in {
+                PathAvailability.UNAVAILABLE,
+                PathAvailability.ERROR,
+            }:
+                suffix = " — 現在確認できません"
+            else:
+                suffix = ""
             return f"{entry.label}{suffix}"
         if role == int(Qt.ItemDataRole.ToolTipRole):
             return entry.path
         if role == int(Qt.ItemDataRole.DecorationRole):
             return self.shell_icon_provider.icon_for_extension("", folder=True)
-        if role == int(Qt.ItemDataRole.ForegroundRole) and entry.exists is False:
+        if (
+            role == int(Qt.ItemDataRole.ForegroundRole)
+            and entry.availability
+            in {
+                PathAvailability.MISSING,
+                PathAvailability.UNAVAILABLE,
+                PathAvailability.ERROR,
+            }
+        ):
             return QColor("#888888")
         if role == self.EntryRole:
             return entry
@@ -102,6 +103,8 @@ class FolderBookmarkModel(QAbstractListModel):
             return entry.path
         if role == self.ExistsRole:
             return entry.exists
+        if role == self.AvailabilityRole:
+            return entry.availability.value
         return None
 
     def entry_at(
@@ -114,7 +117,7 @@ class FolderBookmarkModel(QAbstractListModel):
         return None
 
     def row_for_path(self, path: str | Path) -> int:
-        return self._row_by_path.get(self._path_key(path), -1)
+        return self._row_by_path.get(path_key(path), -1)
 
     def refresh(self) -> None:
         bookmarks = (
@@ -124,6 +127,7 @@ class FolderBookmarkModel(QAbstractListModel):
         )
         self._probe_generation += 1
         generation = self._probe_generation
+        self._pending_requests.clear()
         self.beginResetModel()
         self._entries = [
             FolderBookmarkItem(
@@ -131,41 +135,71 @@ class FolderBookmarkModel(QAbstractListModel):
                 path=entry.path,
                 exists=None,
                 sort_order=entry.sort_order,
+                availability=PathAvailability.UNKNOWN,
             )
             for entry in bookmarks
         ]
         self._row_by_path = {
-            self._path_key(entry.path): row
+            path_key(entry.path): row
             for row, entry in enumerate(self._entries)
         }
         self.endResetModel()
-        for entry in self._entries:
-            worker = _FolderProbe(generation, entry.path)
-            worker.signals.finished.connect(self._on_probe_finished)
-            _FOLDER_PROBE_POOL.start(worker)
+        for row, entry in enumerate(self._entries):
+            request_id = self.availability_service.probe(entry.path)
+            if request_id:
+                self._entries[row] = replace(
+                    entry,
+                    availability=PathAvailability.CHECKING,
+                )
+                self._pending_requests[request_id] = (
+                    generation,
+                    path_key(entry.path),
+                )
 
-    @Slot(int, str, bool)
-    def _on_probe_finished(self, generation: int, path: str, exists: bool) -> None:
-        if generation != self._probe_generation:
+    def refresh_availability(self) -> None:
+        self.availability_service.invalidate()
+        self._probe_generation += 1
+        generation = self._probe_generation
+        self._pending_requests.clear()
+        for row, entry in enumerate(self._entries):
+            self._entries[row] = replace(
+                entry,
+                exists=None,
+                availability=PathAvailability.CHECKING,
+            )
+            request_id = self.availability_service.probe(entry.path, force=True)
+            if request_id:
+                self._pending_requests[request_id] = (
+                    generation,
+                    path_key(entry.path),
+                )
+        if self._entries:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(self._entries) - 1, 0),
+            )
+
+    @Slot(object)
+    def _on_probe_finished(self, result: PathAvailabilityResult) -> None:
+        pending = self._pending_requests.pop(result.request_id, None)
+        if pending is None:
             return
-        row = self.row_for_path(path)
+        generation, key = pending
+        if generation != self._probe_generation or key != result.path_key:
+            return
+        row = self._row_by_path.get(key, -1)
         if row < 0:
             return
         entry = self._entries[row]
-        self._entries[row] = replace(entry, exists=bool(exists))
-        index = self.index(row, 0)
-        self.dataChanged.emit(
-            index,
-            index,
-            [
-                int(Qt.ItemDataRole.DisplayRole),
-                int(Qt.ItemDataRole.ForegroundRole),
-                self.ExistsRole,
-            ],
+        exists = (
+            True
+            if result.state is PathAvailability.AVAILABLE
+            else False if result.state is PathAvailability.MISSING else None
         )
-
-    @staticmethod
-    def _path_key(path: str | Path) -> str:
-        return os.path.normcase(
-            os.path.abspath(os.path.normpath(os.fspath(path)))
-        ).casefold()
+        self._entries[row] = replace(
+            entry,
+            exists=exists,
+            availability=result.state,
+        )
+        index = self.index(row, 0)
+        self.dataChanged.emit(index, index)
