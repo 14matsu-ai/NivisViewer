@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QByteArray, QEvent, QSize, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QByteArray, QEvent, QSize, QThreadPool, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -36,6 +36,7 @@ from .archive_backend import EXTERNAL_ARCHIVE_EXTENSIONS
 from .archive_backend_registry import ArchiveBackendRegistry
 from .book_session import AsyncBookOpenFailed, BookOpened, BookSession
 from .config_manager import ConfigManager
+from .drag_drop import ExternalDropOpenController, FolderDropProbe
 from .fullscreen_chrome import FullscreenChromeController
 from .image_cache import CachedImage, PRELOAD_RADIUS
 from .image_work_coordinator import ImageWorkCoordinator
@@ -122,6 +123,7 @@ class ViewerWindow(QMainWindow):
         self.book_session.async_opened.connect(self._on_async_book_opened)
         self.book_session.async_open_failed.connect(self._on_async_book_open_failed)
         self._open_path_handler = open_path_handler
+        self._drop_probe_workers: set[FolderDropProbe] = set()
         self._adjacent_book_handler = adjacent_book_handler
         self._shutdown_prepared = False
         self._active_request_id = 0
@@ -165,7 +167,7 @@ class ViewerWindow(QMainWindow):
             self.settings.get("fullscreen_edge_trigger_px", 8)
         )
         self.fullscreen_ui_hide_delay_ms = int(
-            self.settings.get("fullscreen_ui_hide_delay_ms", 900)
+            self.settings.get("fullscreen_ui_hide_delay_ms", 0)
         )
         self.show_page_list = bool(self.settings.get("show_page_list", False))
         self.thumbnail_size = int(self.settings.get("thumbnail_size", 96))
@@ -248,6 +250,12 @@ class ViewerWindow(QMainWindow):
             self.activated.emit(self)
         elif event.type() == QEvent.Type.WindowDeactivate and hasattr(self, "viewer"):
             self.viewer.cancel_mouse_gesture()
+        if (
+            hasattr(self, "fullscreen_chrome")
+            and event.type()
+            in {QEvent.Type.Resize, QEvent.Type.ScreenChangeInternal}
+        ):
+            QTimer.singleShot(0, self.fullscreen_chrome.reevaluate_visibility)
         return handled
 
     def _build_ui(self) -> None:
@@ -727,7 +735,7 @@ class ViewerWindow(QMainWindow):
             fullscreen_chrome_changed = True
         if "fullscreen_ui_hide_delay_ms" in changed:
             self.fullscreen_ui_hide_delay_ms = max(
-                300, min(3000, int(changed["fullscreen_ui_hide_delay_ms"]))
+                0, min(3000, int(changed["fullscreen_ui_hide_delay_ms"]))
             )
             fullscreen_chrome_changed = True
         if fullscreen_chrome_changed:
@@ -736,6 +744,7 @@ class ViewerWindow(QMainWindow):
                 edge_trigger_px=self.fullscreen_edge_trigger_px,
                 hide_delay_ms=self.fullscreen_ui_hide_delay_ms,
             )
+            self.fullscreen_chrome.reevaluate_visibility()
         if (
             {
                 "archive_backend_preference",
@@ -1549,6 +1558,8 @@ class ViewerWindow(QMainWindow):
         self.bookmark_menu.addAction(clear_action)
 
     def _refresh_view(self) -> None:
+        if hasattr(self, "fullscreen_chrome"):
+            self.fullscreen_chrome.reevaluate_visibility()
         self._active_request_id += 1
         spread = self.model.spread_at()
         self._visible_page_indexes = tuple(slot.page_index for slot in spread.slots)
@@ -1824,28 +1835,42 @@ class ViewerWindow(QMainWindow):
         )
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # type: ignore[override]
-        if self._local_path_from_drop(event):
+        if ExternalDropOpenController.local_paths(event.mimeData()):
             event.acceptProposedAction()
             return
         super().dragEnterEvent(event)
 
     def dropEvent(self, event: QDropEvent) -> None:  # type: ignore[override]
-        path = self._local_path_from_drop(event)
-        if path:
-            self._request_open_path(path)
+        local_paths = ExternalDropOpenController.local_paths(event.mimeData())
+        paths = ExternalDropOpenController.paths(event.mimeData())
+        if local_paths:
+            if len(paths) == len(local_paths):
+                self._dispatch_dropped_paths(paths)
+            else:
+                worker = FolderDropProbe(local_paths)
+                self._drop_probe_workers.add(worker)
+
+                def finished(folders: tuple[str, ...]) -> None:
+                    self._drop_probe_workers.discard(worker)
+                    if self._shutdown_prepared:
+                        return
+                    allowed = set(paths) | set(folders)
+                    self._dispatch_dropped_paths(
+                        tuple(path for path in local_paths if path in allowed)
+                    )
+
+                worker.signals.finished.connect(finished)
+                QThreadPool.globalInstance().start(worker)
             event.acceptProposedAction()
             return
         super().dropEvent(event)
 
-    @staticmethod
-    def _local_path_from_drop(event: QDragEnterEvent | QDropEvent) -> str:
-        mime_data = event.mimeData()
-        if not mime_data.hasUrls():
-            return ""
-        for url in mime_data.urls():
-            if url.isLocalFile():
-                return url.toLocalFile()
-        return ""
+    def _dispatch_dropped_paths(self, paths: tuple[str, ...]) -> None:
+        for offset, path in enumerate(paths):
+            if self._open_path_handler is not None:
+                self._open_path_handler(path, offset > 0, self)
+            elif offset == 0:
+                self.open_path(path)
 
     def _update_slider(self) -> None:
         total = max(1, self.model.total_pages)
@@ -1986,6 +2011,7 @@ class ViewerWindow(QMainWindow):
         self._sync_actions()
         if self.model.total_pages:
             self._refresh_view()
+        self.fullscreen_chrome.reevaluate_visibility()
 
     def toggle_view_mode(self) -> None:
         self.set_view_mode("single" if self.view_mode == "spread" else "spread")
@@ -1997,6 +2023,7 @@ class ViewerWindow(QMainWindow):
         self._sync_actions()
         if self.model.total_pages:
             self._refresh_view()
+        self.fullscreen_chrome.reevaluate_visibility()
 
     def toggle_reading_direction(self) -> None:
         self.set_reading_direction("ltr" if self.reading_direction == "rtl" else "rtl")
@@ -2007,6 +2034,7 @@ class ViewerWindow(QMainWindow):
         self.model.update_options(single_first_page=checked)
         if self.model.total_pages:
             self._refresh_view()
+        self.fullscreen_chrome.reevaluate_visibility()
 
     def set_treat_wide_image_as_single(self, checked: bool) -> None:
         self.treat_wide_image_as_single = checked
@@ -2014,6 +2042,7 @@ class ViewerWindow(QMainWindow):
         self.model.update_options(treat_wide_image_as_single=checked)
         if self.model.total_pages:
             self._refresh_view()
+        self.fullscreen_chrome.reevaluate_visibility()
 
     def set_split_wide_image(self, checked: bool) -> None:
         self.split_wide_image = checked
@@ -2021,6 +2050,7 @@ class ViewerWindow(QMainWindow):
         self._sync_actions()
         if self.model.total_pages:
             self._refresh_view()
+        self.fullscreen_chrome.reevaluate_visibility()
 
     def set_smooth_scaling(self, checked: bool) -> None:
         self.smooth_scaling = checked
@@ -2044,6 +2074,7 @@ class ViewerWindow(QMainWindow):
         self._sync_actions()
         self._update_status()
         self._rerender_pdf()
+        self.fullscreen_chrome.reevaluate_visibility()
 
     def zoom_in(self) -> None:
         self.viewer.set_manual_zoom(self.viewer.manual_zoom * 1.15)
@@ -2184,6 +2215,7 @@ class ViewerWindow(QMainWindow):
             self.status.setVisible(True)
         self.page_list_dock.setVisible(show_chrome and self.show_page_list)
         self._apply_cursor_visibility_policy()
+        self.fullscreen_chrome.reevaluate_visibility()
 
     def _apply_cursor_visibility_policy(self) -> None:
         self.viewer.set_auto_hide_cursor(self.isFullScreen() and self.hide_cursor_in_fullscreen)

@@ -103,7 +103,7 @@ def test_fullscreen_trigger_and_delay_are_clamped() -> None:
     )
 
     assert controller.edge_trigger_px == 4
-    assert controller.hide_delay_ms == 300
+    assert controller.hide_delay_ms == 50
     controller.configure(
         auto_reveal=True,
         edge_trigger_px=100,

@@ -95,7 +95,7 @@ class FullscreenChromeController(QObject):
     ) -> None:
         self.auto_reveal = bool(auto_reveal)
         self.edge_trigger_px = max(4, min(32, int(edge_trigger_px)))
-        self.hide_delay_ms = max(300, min(3000, int(hide_delay_ms)))
+        self.hide_delay_ms = max(0, min(3000, int(hide_delay_ms)))
         self._hide_timer.setInterval(self.hide_delay_ms)
         if self.active and not self.auto_reveal:
             self.hide_overlays()
@@ -153,7 +153,17 @@ class FullscreenChromeController(QObject):
 
     def schedule_hide(self) -> None:
         if self.active:
+            self._hide_timer.stop()
             self._hide_timer.start(self.hide_delay_ms)
+
+    def reevaluate_visibility(self) -> None:
+        """Re-check chrome after viewer state/layout changes."""
+        self._hide_timer.stop()
+        if not self.active:
+            return
+        if self._pointer_in_reveal_area(QCursor.pos()):
+            return
+        self.schedule_hide()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
         if not hasattr(self, "top_overlay"):
@@ -232,7 +242,8 @@ class FullscreenChromeController(QObject):
 
     def _hide_if_idle(self) -> None:
         if not self.active or self._interaction_blocks_hide():
-            self.schedule_hide()
+            if self.hide_delay_ms:
+                self.schedule_hide()
             return
         global_position = QCursor.pos()
         if self._pointer_in_reveal_area(global_position):

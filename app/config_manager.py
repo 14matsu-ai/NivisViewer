@@ -30,7 +30,7 @@ class ConfigManager(QObject):
         "hide_cursor_in_fullscreen": False,
         "fullscreen_auto_reveal_ui": True,
         "fullscreen_edge_trigger_px": 8,
-        "fullscreen_ui_hide_delay_ms": 900,
+        "fullscreen_ui_hide_delay_ms": 0,
         "show_page_list": False,
         "thumbnail_size": 180,
         "thumbnail_frame_ratio": "portrait_1_sqrt2",
@@ -44,6 +44,9 @@ class ConfigManager(QObject):
         "browser_item_spacing_mode": "preset",
         "browser_item_spacing": 2,
         "browser_cell_padding": 0,
+        "browser_filename_display": "one_line",
+        "browser_filename_gap": 0,
+        "browser_filename_padding_y": 0,
         "last_browser_path": "",
         "browser_sidebar_visible": True,
         "browser_sidebar_width": 280,
@@ -74,6 +77,7 @@ class ConfigManager(QObject):
         "join_spread_pages": False,
         "thumbnail_disk_cache_enabled": True,
         "thumbnail_cache_limit_mb": 512,
+        "thumbnail_cache_max_unused_days": 0,
         "pdf_render_base_dpi": 96,
         "pdf_render_annotations": True,
         "archive_backend_preference": "auto",
@@ -229,6 +233,26 @@ class ConfigManager(QObject):
             minimum=96,
             maximum=384,
         )
+        if normalized.get("browser_filename_display") not in {
+            "hidden",
+            "one_line",
+            "two_lines",
+        }:
+            normalized["browser_filename_display"] = cls.DEFAULTS[
+                "browser_filename_display"
+            ]
+        normalized["browser_filename_gap"] = cls._clamped_int(
+            normalized.get("browser_filename_gap"),
+            default=0,
+            minimum=0,
+            maximum=32,
+        )
+        normalized["browser_filename_padding_y"] = cls._clamped_int(
+            normalized.get("browser_filename_padding_y"),
+            default=0,
+            minimum=0,
+            maximum=16,
+        )
         if normalized.get("thumbnail_frame_ratio") not in {
             "square_1_1",
             "landscape_3_2",
@@ -344,7 +368,7 @@ class ConfigManager(QObject):
         normalized["fullscreen_ui_hide_delay_ms"] = cls._clamped_int(
             normalized.get("fullscreen_ui_hide_delay_ms"),
             default=int(cls.DEFAULTS["fullscreen_ui_hide_delay_ms"]),
-            minimum=300,
+            minimum=0,
             maximum=3000,
         )
         behavior = normalized.get("open_viewer_behavior")
@@ -396,6 +420,15 @@ class ConfigManager(QObject):
             default=int(cls.DEFAULTS["thumbnail_cache_limit_mb"]),
             minimum=128,
             maximum=4096,
+        )
+        unused_days = cls._clamped_int(
+            normalized.get("thumbnail_cache_max_unused_days"),
+            default=0,
+            minimum=0,
+            maximum=3650,
+        )
+        normalized["thumbnail_cache_max_unused_days"] = (
+            unused_days if unused_days == 0 or unused_days >= 7 else 7
         )
         normalized["pdf_render_base_dpi"] = cls._clamped_int(
             normalized.get("pdf_render_base_dpi"),

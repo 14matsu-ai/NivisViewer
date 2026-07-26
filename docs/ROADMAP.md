@@ -57,7 +57,14 @@
     - multi-resolution cache selectionとprogressive replacement
     - WebP／PNG encoding quality review
     - fractional-DPIでのphysical pixel snapping
-19. 後続候補：ファイル操作と項目表示の拡張
+19. Sprint 16：Explorer型D&Dとキャッシュ保持制御（完了）
+    - BrowserGridMetricsによる高密度filename配置
+    - 通常file dragとShift rubber bandを分離したExplorer型選択
+    - Viewer、folder item、tree、favoriteへのlocal path drop
+    - 同一volume move／異なるvolume copyと修飾キーoverride
+    - 全画面chromeの0ms非表示と状態変更後の再評価
+    - thumbnail cacheのvariant最大2、source最大4、age cleanup
+20. 後続候補：ファイル操作と項目表示の拡張
     - Browser一覧からツリー／お気に入りへのドラッグ＆ドロップ
     - Ctrl＝コピー、Shift＝移動等のWindows型操作
     - 衝突時のスキップ／別名／上書き選択UI
@@ -67,9 +74,9 @@
     - 再帰的なサブフォルダ表示
     - PDFパスワード入力、PDF目次
     - 画像中央クロップ／余白除去、Viewerメモリ予算調整
-20. 後続候補：レート／タグ編集UIと検索
+21. 後続候補：レート／タグ編集UIと検索
     - 基本ナビゲーションとファイル操作の安定後に着手
     - ZipPla `{zpi$...}` の明示的な読み取り互換
     - タグ・レート検索と絞り込み
     - サムネイル上のレート／タグ表示
-21. 公開前ライセンス監査、コード署名の将来検討
+22. 公開前ライセンス監査、コード署名の将来検討

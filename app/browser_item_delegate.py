@@ -7,6 +7,7 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QImage, QPainter, 
 from PySide6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
 from .browser_model import BrowserItem, BrowserItemKind, BrowserItemModel
+from .browser_grid_metrics import build_browser_grid_metrics
 from .browser_sort import BrowserDisplayDensity
 from .shell_icon_provider import ShellAssociatedIconProvider
 from .thumbnail_render import (
@@ -139,6 +140,10 @@ class BrowserItemDelegate(QStyledItemDelegate):
         density: BrowserDisplayDensity = BrowserDisplayDensity.STANDARD,
         frame_ratio_id: str = "portrait_1_sqrt2",
         cell_padding: int = 0,
+        filename_display: str = "one_line",
+        filename_gap: int = 0,
+        filename_padding_y: int = 0,
+        item_spacing: int = 0,
         shell_icon_provider: ShellAssociatedIconProvider | None = None,
     ) -> None:
         super().__init__(parent)
@@ -146,6 +151,10 @@ class BrowserItemDelegate(QStyledItemDelegate):
         self.density = density
         self.frame_ratio_id = frame_ratio_id
         self.cell_padding = max(0, min(12, int(cell_padding)))
+        self.filename_display = filename_display
+        self.filename_gap = max(0, min(32, int(filename_gap)))
+        self.filename_padding_y = max(0, min(16, int(filename_padding_y)))
+        self.item_spacing = max(0, min(32, int(item_spacing)))
         self.shell_icon_provider = (
             shell_icon_provider or ShellAssociatedIconProvider()
         )
@@ -156,18 +165,29 @@ class BrowserItemDelegate(QStyledItemDelegate):
 
     @property
     def cell_size(self) -> QSize:
-        profile = self.profile
-        frame = self.frame_size
-        return QSize(
-            frame.width() + profile.horizontal_margin + self.cell_padding * 2,
-            frame.height() + profile.vertical_margin + self.cell_padding * 2,
-        )
+        return self.grid_metrics.cell_size
 
     @property
     def frame_size(self) -> QSize:
         return frame_size_from_long_edge(
             self.thumbnail_size,
             self.frame_ratio_id,
+        )
+
+    @property
+    def grid_metrics(self):
+        font = QFont()
+        font.setPointSize(self.profile.font_size)
+        return build_browser_grid_metrics(
+            thumbnail_size=self.thumbnail_size,
+            frame_ratio_id=self.frame_ratio_id,
+            font_height=QFontMetrics(font).height(),
+            filename_display=self.filename_display,
+            filename_gap=self.filename_gap,
+            filename_padding_y=self.filename_padding_y,
+            horizontal_margin=self.profile.horizontal_margin,
+            cell_padding=self.cell_padding,
+            item_spacing=self.item_spacing,
         )
 
     def configure(
@@ -177,6 +197,10 @@ class BrowserItemDelegate(QStyledItemDelegate):
         density: BrowserDisplayDensity,
         frame_ratio_id: str | None = None,
         cell_padding: int | None = None,
+        filename_display: str | None = None,
+        filename_gap: int | None = None,
+        filename_padding_y: int | None = None,
+        item_spacing: int | None = None,
     ) -> None:
         self.thumbnail_size = int(thumbnail_size)
         self.density = density
@@ -184,6 +208,14 @@ class BrowserItemDelegate(QStyledItemDelegate):
             self.frame_ratio_id = frame_ratio_id
         if cell_padding is not None:
             self.cell_padding = max(0, min(12, int(cell_padding)))
+        if filename_display is not None:
+            self.filename_display = filename_display
+        if filename_gap is not None:
+            self.filename_gap = max(0, min(32, int(filename_gap)))
+        if filename_padding_y is not None:
+            self.filename_padding_y = max(0, min(16, int(filename_padding_y)))
+        if item_spacing is not None:
+            self.item_spacing = max(0, min(32, int(item_spacing)))
 
     def sizeHint(
         self,
@@ -207,11 +239,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
                 return
             profile = self.profile
             cell = option.rect
-            thumbnail_rect = thumbnail_rect_for_cell(
-                cell,
-                self.frame_size,
-                self.cell_padding,
-            )
+            thumbnail_rect = self.grid_metrics.thumbnail_frame_rect(cell)
             dpr = max(0.5, painter.device().devicePixelRatioF())
             snapped_frame = snap_logical_rect_to_physical_pixels(
                 QRectF(thumbnail_rect),
@@ -244,7 +272,11 @@ class BrowserItemDelegate(QStyledItemDelegate):
                 )
             self._paint_type_icon(painter, thumbnail_rect, item)
             self._paint_title(painter, option, thumbnail_rect, item.display_name)
-            self._paint_interaction_frame(painter, option, thumbnail_rect)
+            self._paint_interaction_frame(
+                painter,
+                option,
+                self.grid_metrics.selection_rect(cell),
+            )
         finally:
             painter.restore()
 
@@ -332,6 +364,9 @@ class BrowserItemDelegate(QStyledItemDelegate):
         title: str,
     ) -> None:
         profile = self.profile
+        grid = self.grid_metrics
+        if grid.title_lines == 0:
+            return
         font = QFont(option.font)
         font.setPointSize(profile.font_size)
         painter.setFont(font)
@@ -341,22 +376,21 @@ class BrowserItemDelegate(QStyledItemDelegate):
             else option.palette.text().color()
         )
         metrics = QFontMetrics(font)
-        title_top = thumbnail_rect.bottom() + max(4, profile.spacing // 2)
-        title_rect = QRect(
-            option.rect.left() + max(3, profile.spacing // 2),
-            title_top,
-            option.rect.width() - max(6, profile.spacing),
-            max(1, option.rect.bottom() - title_top),
-        )
+        title_rect = grid.title_rect(option.rect)
         if option.state & QStyle.StateFlag.State_Selected:
             selected_background = option.palette.highlight().color()
             selected_background.setAlpha(96)
             painter.fillRect(title_rect.adjusted(-2, 0, 2, 0), selected_background)
-        lines = elided_title_lines(
-            metrics,
-            title,
-            title_rect.width(),
-            profile.title_lines,
+        lines = (
+            (
+                metrics.elidedText(
+                    title.replace("\n", " "),
+                    Qt.TextElideMode.ElideMiddle,
+                    title_rect.width(),
+                ),
+            )
+            if grid.title_lines == 1
+            else elided_title_lines(metrics, title, title_rect.width(), 2)
         )
         y = title_rect.top()
         for line in lines:
@@ -406,7 +440,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
     def _paint_interaction_frame(
         painter: QPainter,
         option: QStyleOptionViewItem,
-        thumbnail_rect: QRect,
+        selection_rect: QRect,
     ) -> None:
         dpr = max(0.5, painter.device().devicePixelRatioF())
 
@@ -419,14 +453,14 @@ class BrowserItemDelegate(QStyledItemDelegate):
         if selected:
             painter.setPen(QPen(option.palette.highlight().color(), 2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(snapped(thumbnail_rect.adjusted(1, 1, -2, -2)))
+            painter.drawRect(snapped(selection_rect))
         elif hovered:
             color = option.palette.highlight().color()
             color.setAlpha(170)
             painter.setPen(QPen(color, 1))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(snapped(thumbnail_rect.adjusted(1, 1, -2, -2)))
+            painter.drawRect(snapped(selection_rect))
         if focused:
             painter.setPen(QPen(option.palette.highlightedText().color(), 1))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(snapped(thumbnail_rect.adjusted(4, 4, -5, -5)))
+            painter.drawRect(snapped(selection_rect.adjusted(3, 3, -3, -3)))

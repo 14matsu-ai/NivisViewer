@@ -98,6 +98,7 @@ _RETIRED_SETTINGS_POOLS: set[QThreadPool] = set()
 class SettingsDialog(QDialog):
     settings_applied = Signal(object)
     cache_clear_requested = Signal()
+    cache_cleanup_requested = Signal()
 
     def __init__(
         self,
@@ -268,7 +269,7 @@ class SettingsDialog(QDialog):
             self.fullscreen_edge_trigger_spin,
         )
         self.fullscreen_hide_delay_spin = QSpinBox(fullscreen_group)
-        self.fullscreen_hide_delay_spin.setRange(300, 3000)
+        self.fullscreen_hide_delay_spin.setRange(0, 3000)
         self.fullscreen_hide_delay_spin.setSingleStep(100)
         self.fullscreen_hide_delay_spin.setSuffix(" ms")
         fullscreen_form.addRow(
@@ -426,6 +427,19 @@ class SettingsDialog(QDialog):
             "セル内余白:",
             self.browser_cell_padding_spin,
         )
+        self.browser_filename_display_combo = QComboBox(list_group)
+        self.browser_filename_display_combo.addItem("非表示", "hidden")
+        self.browser_filename_display_combo.addItem("1行", "one_line")
+        self.browser_filename_display_combo.addItem("2行", "two_lines")
+        list_form.addRow("ファイル名:", self.browser_filename_display_combo)
+        self.browser_filename_gap_spin = QSpinBox(list_group)
+        self.browser_filename_gap_spin.setRange(0, 32)
+        self.browser_filename_gap_spin.setSuffix(" px")
+        list_form.addRow("画像との間隔:", self.browser_filename_gap_spin)
+        self.browser_filename_padding_y_spin = QSpinBox(list_group)
+        self.browser_filename_padding_y_spin.setRange(0, 16)
+        self.browser_filename_padding_y_spin.setSuffix(" px")
+        list_form.addRow("ファイル名上下余白:", self.browser_filename_padding_y_spin)
 
         cache_group = QGroupBox("サムネイル", tab)
         form = QFormLayout(cache_group)
@@ -482,13 +496,45 @@ class SettingsDialog(QDialog):
         self.cache_limit_spin.setSuffix(" MB")
         form.addRow("キャッシュ最大容量:", self.cache_limit_spin)
 
+        self.cache_unused_days_combo = QComboBox(cache_group)
+        for label, days in (
+            ("使用しない", 0),
+            ("30日", 30),
+            ("90日（推奨）", 90),
+            ("180日", 180),
+            ("365日", 365),
+            ("カスタム", -1),
+        ):
+            self.cache_unused_days_combo.addItem(label, days)
+        self.cache_unused_days_spin = QSpinBox(cache_group)
+        self.cache_unused_days_spin.setRange(7, 3650)
+        self.cache_unused_days_spin.setSuffix(" 日")
+        self.cache_unused_days_combo.currentIndexChanged.connect(
+            lambda _index: self.cache_unused_days_spin.setEnabled(
+                int(self.cache_unused_days_combo.currentData()) == -1
+            )
+        )
+        form.addRow("未使用期間の整理:", self.cache_unused_days_combo)
+        form.addRow("カスタム日数:", self.cache_unused_days_spin)
+        cleanup_warning = QLabel(
+            "短い期間では再生成とSSD書き込みが増える可能性があります。",
+            cache_group,
+        )
+        cleanup_warning.setWordWrap(True)
+        form.addRow(cleanup_warning)
+
         self.cache_usage_label = QLabel(cache_group)
         self.clear_cache_button = QPushButton("キャッシュを削除", cache_group)
         self.clear_cache_button.clicked.connect(self.request_cache_clear)
+        self.cleanup_cache_button = QPushButton("今すぐ整理", cache_group)
+        self.cleanup_cache_button.clicked.connect(
+            self.cache_cleanup_requested.emit
+        )
         usage_row = QWidget(cache_group)
         usage_layout = QHBoxLayout(usage_row)
         usage_layout.setContentsMargins(0, 0, 0, 0)
         usage_layout.addWidget(self.cache_usage_label, 1)
+        usage_layout.addWidget(self.cleanup_cache_button)
         usage_layout.addWidget(self.clear_cache_button)
         form.addRow("現在の使用量:", usage_row)
 
@@ -597,7 +643,7 @@ class SettingsDialog(QDialog):
             int(self.config.get("fullscreen_edge_trigger_px", 8))
         )
         self.fullscreen_hide_delay_spin.setValue(
-            int(self.config.get("fullscreen_ui_hide_delay_ms", 900))
+            int(self.config.get("fullscreen_ui_hide_delay_ms", 0))
         )
         self.thumbnail_size_spin.setValue(int(self.config.get("thumbnail_size", 180)))
         self._select_data(
@@ -621,6 +667,16 @@ class SettingsDialog(QDialog):
                 "browser_display_density",
                 BrowserDisplayDensity.STANDARD.value,
             ),
+        )
+        self._select_data(
+            self.browser_filename_display_combo,
+            self.config.get("browser_filename_display", "one_line"),
+        )
+        self.browser_filename_gap_spin.setValue(
+            int(self.config.get("browser_filename_gap", 0))
+        )
+        self.browser_filename_padding_y_spin.setValue(
+            int(self.config.get("browser_filename_padding_y", 0))
         )
         self._sync_browser_grid_preset()
         self._select_data(
@@ -668,6 +724,15 @@ class SettingsDialog(QDialog):
         )
         self.cache_limit_spin.setValue(
             int(self.config.get("thumbnail_cache_limit_mb", 512))
+        )
+        unused_days = int(self.config.get("thumbnail_cache_max_unused_days", 0))
+        preset_index = self.cache_unused_days_combo.findData(unused_days)
+        if preset_index < 0:
+            preset_index = self.cache_unused_days_combo.findData(-1)
+        self.cache_unused_days_combo.setCurrentIndex(preset_index)
+        self.cache_unused_days_spin.setValue(max(7, unused_days or 90))
+        self.cache_unused_days_spin.setEnabled(
+            int(self.cache_unused_days_combo.currentData()) == -1
         )
         self._select_data(
             self.archive_backend_combo,
@@ -892,6 +957,13 @@ class SettingsDialog(QDialog):
             ),
             "browser_item_spacing": self.browser_item_spacing_spin.value(),
             "browser_cell_padding": self.browser_cell_padding_spin.value(),
+            "browser_filename_display": str(
+                self.browser_filename_display_combo.currentData()
+            ),
+            "browser_filename_gap": self.browser_filename_gap_spin.value(),
+            "browser_filename_padding_y": (
+                self.browser_filename_padding_y_spin.value()
+            ),
             "browser_sidebar_layout": str(
                 self.browser_sidebar_layout_combo.currentData()
             ),
@@ -903,6 +975,11 @@ class SettingsDialog(QDialog):
             ),
             "thumbnail_disk_cache_enabled": self.disk_cache_checkbox.isChecked(),
             "thumbnail_cache_limit_mb": self.cache_limit_spin.value(),
+            "thumbnail_cache_max_unused_days": (
+                self.cache_unused_days_spin.value()
+                if int(self.cache_unused_days_combo.currentData()) == -1
+                else int(self.cache_unused_days_combo.currentData())
+            ),
             "archive_backend_preference": str(
                 self.archive_backend_combo.currentData() or "auto"
             ),

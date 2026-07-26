@@ -427,7 +427,25 @@ ViewerWindow
 
 FolderTreeSyncControllerはフォルダ移動のcommit後に起動し、`off`、`select_current`、`focus_current`を扱います。QFileSystemModelの遅延読み込みに対して有限回の再試行と独立generationを持ち、旧要求を適用しません。プログラム選択中はツリーの`currentChanged`から再navigateしないためBrowser履歴を増やしません。自動で展開したancestorとユーザーが手動展開した枝を別集合で追跡し、focus_currentで閉じるのは現在ancestorではない自動展開枝だけです。
 
-FullscreenChromeControllerは`hide_ui_in_fullscreen`時にmenu bar、page slider、status barをViewer上の上下overlayへ一時移設します。上端／下端の既定8 logical px（4～32）で該当側だけを表示し、離れてから既定900ms（300～3000）で隠します。overlayの表示・非表示はcentral layoutを変更しないため画像のサイズ、ズーム、パン、ページを動かしません。ポップアップ、メニュー、slider drag、UI上のボタン操作、子modalの間は隠さず、端へのhoverだけではViewerWidgetからfocusを奪いません。全画面解除時は各Widgetを通常のQMainWindow配置へ戻します。
+FullscreenChromeControllerは`hide_ui_in_fullscreen`時にmenu bar、page slider、status barをViewer上の上下overlayへ一時移設します。上端／下端の既定8 logical px（4～32）で該当側だけを表示し、離れた次のevent loop（設定範囲0～3000ms、既定0ms）で隠します。overlayの表示・非表示はcentral layoutを変更しないため画像のサイズ、ズーム、パン、ページを動かしません。ポップアップ、メニュー、slider drag、UI上のボタン操作、子modalの間は隠さず、端へのhoverだけではViewerWidgetからfocusを奪いません。全画面解除時は各Widgetを通常のQMainWindow配置へ戻します。
+
+### Sprint 16のExplorer型操作と高密度タイトル
+
+`BrowserGridMetrics`はthumbnail frame、title、selection、cell、delegate sizeHint、QListView gridSize、item spacing、cell padding、thumbnail-title gapをlogical pixelで一元計算します。ファイル名はhidden／one_line／two_linesを選択でき、高さはfont metricsの0／1／2行分と明示paddingだけです。セル下端に追加marginを置きません。one_lineは拡張子を残しやすいmiddle elideを使い、完全名はtooltipとstatusで確認できます。
+
+`ExplorerSelectionController`と`ExplorerListView`は通常の項目左ドラッグをファイルdragにし、空白からのrubber bandはShift押下時だけ許可します。単クリック、Ctrl追加／解除、Shift anchor範囲はQtのExtendedSelectionを維持し、drag開始にはOSのstartDragDistanceとstartDragTimeを使います。`FileDragController`は`text/uri-list`とUTF-8 JSONの`application/x-nivisviewer-paths+json`を生成し、絶対ローカルpath、重複排除、256件上限を適用します。
+
+Browser一覧のfolder item、folder tree、favorite itemへのdropは既存`FileOperationCoordinator`へcopy／move要求を渡します。同一Windows volumeまたは同一UNC shareはmove、異なる／不明volumeはcopy、Ctrlはcopy、Shiftはmoveです。自分自身、子孫、同じfolderへのmoveを開始前に拒否します。Browser空白の対応fileはViewerで開き、単一folderは非同期folder probe後にnavigateします。favorite空白のfolder dropもworkerで種類確認してからMetadataStoreへ登録するため、GUI threadで同期statせず履歴を増やしません。favorite内部dragはsort_order更新です。
+
+`ExternalDropOpenController`はViewerWindowへのlocal file URLを検証し、対応画像、書庫、PDF、folder候補だけを重複排除して扱います。複数dropでは1件目をdrop先Viewerへ、残りを別Viewerへ要求し、永続`open_viewer_behavior`を変更しません。HTTP／HTTPSや相対command文字列は受理しません。
+
+FullscreenChromeControllerの既定hide delayは0msです。cursorがoverlayとedge triggerから離れた次のevent loopで隠しますが、popup／menu、slider drag、mouse button、modal、overlay hover中は維持します。見開き、綴じ方向、fit、page、resize、screen、設定、overlay構築の変更時は古いtimerを止め、現在pointer位置から表示状態を再評価します。
+
+### ThumbnailCacheRetentionPolicy
+
+ディスクcacheはsource fingerprint、archive entry、ratio、crop、smart crop、encoder、render policyをrender variantとして、1 variantにつき最大2解像度、同一source／entry全体で最大4派生を保持します。3個目／5個目の保存時は現在保存中とBrowser memory／pendingで保護された要求を残し、inactive familyと最終利用が古いentryを先に削除します。全bucketは生成せず、可視要求の解像度だけをon-demand保存します。
+
+cleanupは欠損record、孤立file、任意の未使用期間、per-variant、per-item、global LRUの各制限を適用し、容量超過時は90%まで減らします。cache hitのaccess時刻は従来どおり遅延flushです。未使用期間は0（無効）または7～3650日で、起動後のworker、前回から24時間経過、設定変更、手動「今すぐ整理」でGUI外実行します。短期間設定は再生成とSSD書き込みを増やす可能性があるため設定画面に警告します。
 
 ### Viewer最優先の画像作業調整
 

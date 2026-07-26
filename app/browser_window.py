@@ -19,6 +19,7 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     QTimer,
+    QThreadPool,
     QUrl,
     Signal,
 )
@@ -103,6 +104,13 @@ from .file_operation_service import (
     FileOperationRequest,
     FileOperationResult,
 )
+from .drag_drop import (
+    FolderDropProbe,
+    choose_drop_operation,
+    is_invalid_drop_target,
+    is_lexically_supported_viewer_path,
+)
+from .explorer_list_view import ExplorerListView, PathDropTreeView
 from .folder_bookmark_model import FolderBookmarkModel
 from .folder_tree_sync import FolderTreeSyncController
 from .history_model import HistoryModel
@@ -222,6 +230,9 @@ class BrowserWindow(QMainWindow):
                 self.config.thumbnail_cache_dir,
                 enabled=False,
                 limit_mb=int(self.settings.get("thumbnail_cache_limit_mb", 512)),
+                max_unused_days=int(
+                    self.settings.get("thumbnail_cache_max_unused_days", 0)
+                ),
             )
             thumbnail_provider = BrowserThumbnailProvider(
                 self,
@@ -269,6 +280,7 @@ class BrowserWindow(QMainWindow):
         self._operation_refresh_generation: int | None = None
         self._operation_completion_message: str | None = None
         self._file_operation_requests: dict[int, FileOperationRequest] = {}
+        self._drop_probe_workers: set[FolderDropProbe] = set()
         self._file_operation_selection_before: dict[
             int, tuple[tuple[str, ...], int | None]
         ] = {}
@@ -320,6 +332,15 @@ class BrowserWindow(QMainWindow):
         )
         self.browser_cell_padding = max(
             0, min(12, int(self.settings.get("browser_cell_padding", 0)))
+        )
+        self.browser_filename_display = str(
+            self.settings.get("browser_filename_display", "one_line")
+        )
+        self.browser_filename_gap = max(
+            0, min(32, int(self.settings.get("browser_filename_gap", 0)))
+        )
+        self.browser_filename_padding_y = max(
+            0, min(16, int(self.settings.get("browser_filename_padding_y", 0)))
         )
         self.browser_sidebar_layout = str(
             self.settings.get(
@@ -378,6 +399,7 @@ class BrowserWindow(QMainWindow):
         self._scan_batch_timer.timeout.connect(self._flush_pending_scan_batch)
 
         self._build_ui()
+        QTimer.singleShot(1000, self, self._run_idle_cache_cleanup)
         self.config.settings_changed.connect(self.apply_settings)
         self._restore_window_state()
         if restore_initial_location:
@@ -1628,6 +1650,10 @@ class BrowserWindow(QMainWindow):
         if self._owns_pdfium_service:
             self.pdfium_service.shutdown()
 
+    def _run_idle_cache_cleanup(self) -> None:
+        if not self._shutdown_prepared:
+            self.thumbnail_provider.cleanup_caches_async(force=False)
+
     def apply_settings(self, changed: dict[str, object]) -> None:
         list_keys = {
             "thumbnail_size",
@@ -1642,6 +1668,9 @@ class BrowserWindow(QMainWindow):
             "browser_item_spacing_mode",
             "browser_item_spacing",
             "browser_cell_padding",
+            "browser_filename_display",
+            "browser_filename_gap",
+            "browser_filename_padding_y",
         }
         list_changed = bool(list_keys.intersection(changed))
         view_state = self._capture_list_view_state() if list_changed else None
@@ -1671,6 +1700,16 @@ class BrowserWindow(QMainWindow):
         if "browser_cell_padding" in changed:
             self.browser_cell_padding = max(
                 0, min(12, int(changed["browser_cell_padding"]))
+            )
+        if "browser_filename_display" in changed:
+            self.browser_filename_display = str(changed["browser_filename_display"])
+        if "browser_filename_gap" in changed:
+            self.browser_filename_gap = max(
+                0, min(32, int(changed["browser_filename_gap"]))
+            )
+        if "browser_filename_padding_y" in changed:
+            self.browser_filename_padding_y = max(
+                0, min(16, int(changed["browser_filename_padding_y"]))
             )
         if {
             "browser_sort_key",
@@ -1756,6 +1795,9 @@ class BrowserWindow(QMainWindow):
             "browser_item_spacing_mode",
             "browser_item_spacing",
             "browser_cell_padding",
+            "browser_filename_display",
+            "browser_filename_gap",
+            "browser_filename_padding_y",
         }.intersection(changed):
             self._apply_list_view_geometry()
 
@@ -1826,6 +1868,10 @@ class BrowserWindow(QMainWindow):
         if "thumbnail_cache_limit_mb" in changed:
             self.thumbnail_provider.set_disk_cache_limit_mb(
                 int(changed["thumbnail_cache_limit_mb"])
+            )
+        if "thumbnail_cache_max_unused_days" in changed:
+            self.thumbnail_provider.set_disk_cache_max_unused_days(
+                int(changed["thumbnail_cache_max_unused_days"])
             )
         if (
             {
@@ -1900,15 +1946,21 @@ class BrowserWindow(QMainWindow):
             density=self.browser_display_density,
             frame_ratio_id=self.thumbnail_frame_ratio,
             cell_padding=self.browser_cell_padding,
+            filename_display=self.browser_filename_display,
+            filename_gap=self.browser_filename_gap,
+            filename_padding_y=self.browser_filename_padding_y,
+            item_spacing=(
+                self.item_delegate.profile.spacing
+                if self.browser_item_spacing_mode == "preset"
+                else self.browser_item_spacing
+            ),
         )
         self.list_view.setIconSize(QSize(self.thumbnail_size, self.thumbnail_size))
-        self.list_view.setGridSize(self.item_delegate.cell_size)
-        self.list_view.setSpacing(
-            self.item_delegate.profile.spacing
-            if self.browser_item_spacing_mode == "preset"
-            else self.browser_item_spacing
+        self.list_view.setGridSize(self.item_delegate.grid_metrics.grid_size)
+        self.list_view.setSpacing(self.item_delegate.grid_metrics.item_spacing)
+        self.list_view.setWordWrap(
+            self.item_delegate.grid_metrics.title_lines > 1
         )
-        self.list_view.setWordWrap(self.item_delegate.profile.title_lines > 1)
         self.list_view.viewport().update()
 
     def _on_list_current_changed(
@@ -1969,6 +2021,9 @@ class BrowserWindow(QMainWindow):
         )
         dialog.cache_clear_requested.connect(
             self.thumbnail_provider.clear_all_caches_async
+        )
+        dialog.cache_cleanup_requested.connect(
+            lambda: self.thumbnail_provider.cleanup_caches_async(force=True)
         )
         self.thumbnail_provider.cache_cleared.connect(dialog.refresh_cache_usage)
         dialog.exec()
@@ -2092,7 +2147,7 @@ class BrowserWindow(QMainWindow):
         )
         self.file_system_model.setRootPath("")
 
-        self.folder_tree = QTreeView(self)
+        self.folder_tree = PathDropTreeView(self)
         self.folder_tree.setModel(self.file_system_model)
         self.folder_tree.setRootIndex(QModelIndex())
         self.folder_tree.setHeaderHidden(True)
@@ -2102,6 +2157,7 @@ class BrowserWindow(QMainWindow):
         self.folder_tree.customContextMenuRequested.connect(
             self._show_folder_tree_context_menu
         )
+        self.folder_tree.paths_dropped.connect(self._on_tree_paths_dropped)
         for column in range(1, self.file_system_model.columnCount()):
             self.folder_tree.hideColumn(column)
         self.folder_tree.selectionModel().currentChanged.connect(self._on_tree_current_changed)
@@ -2125,7 +2181,7 @@ class BrowserWindow(QMainWindow):
             self.metadata_store,
             self,
         )
-        self.favorite_view = QListView(self)
+        self.favorite_view = ExplorerListView(self)
         self.favorite_view.setObjectName("folder_favorite_view")
         self.favorite_view.setModel(self.folder_bookmark_model)
         self.favorite_view.activated.connect(self.open_folder_bookmark)
@@ -2135,6 +2191,7 @@ class BrowserWindow(QMainWindow):
         self.favorite_view.customContextMenuRequested.connect(
             self._show_folder_bookmark_context_menu
         )
+        self.favorite_view.paths_dropped.connect(self._on_favorite_paths_dropped)
 
         self.history_model = HistoryModel(self.metadata_store, self)
         self.history_view = QListView(self)
@@ -2178,7 +2235,7 @@ class BrowserWindow(QMainWindow):
             }
         )
 
-        self.list_view = QListView(self)
+        self.list_view = ExplorerListView(self)
         self.list_view.setModel(self.item_model)
         self.item_delegate = BrowserItemDelegate(
             self.list_view,
@@ -2186,6 +2243,10 @@ class BrowserWindow(QMainWindow):
             density=self.browser_display_density,
             frame_ratio_id=self.thumbnail_frame_ratio,
             cell_padding=self.browser_cell_padding,
+            filename_display=self.browser_filename_display,
+            filename_gap=self.browser_filename_gap,
+            filename_padding_y=self.browser_filename_padding_y,
+            item_spacing=0,
         )
         self.list_view.setItemDelegate(self.item_delegate)
         self.list_view.setViewMode(QListView.ViewMode.IconMode)
@@ -2220,6 +2281,7 @@ class BrowserWindow(QMainWindow):
         )
         self.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_view.customContextMenuRequested.connect(self._show_context_menu)
+        self.list_view.paths_dropped.connect(self._on_browser_paths_dropped)
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.splitter.addWidget(self.sidebar)
@@ -3057,6 +3119,140 @@ class BrowserWindow(QMainWindow):
         return os.path.normcase(
             os.path.abspath(os.path.normpath(os.fspath(path)))
         ).casefold()
+
+    def _on_browser_paths_dropped(
+        self,
+        paths: tuple[str, ...],
+        index: QModelIndex,
+        modifiers: Qt.KeyboardModifier,
+        _source: object,
+    ) -> None:
+        item = self.item_model.item_at(index)
+        if item is not None and item.kind is BrowserItemKind.FOLDER:
+            self._start_drop_operation(paths, item.path, modifiers)
+            return
+        supported = tuple(
+            path
+            for path in paths
+            if Path(path).suffix
+            and is_lexically_supported_viewer_path(path)
+        )
+        if supported and len(supported) == len(paths):
+            self._open_dropped_paths(supported)
+            return
+        if len(paths) == 1:
+            self._probe_dropped_folders(
+                paths,
+                lambda folders: (
+                    self.navigate_to(folders[0], record_history=True)
+                    if len(folders) == 1
+                    else None
+                ),
+            )
+
+    def _on_favorite_paths_dropped(
+        self,
+        paths: tuple[str, ...],
+        index: QModelIndex,
+        modifiers: Qt.KeyboardModifier,
+        source: object,
+    ) -> None:
+        entry = self.folder_bookmark_model.entry_at(index)
+        if source is self.favorite_view and self.metadata_store is not None:
+            ordered = [
+                item.path
+                for item in self.folder_bookmark_model.entries
+                if self._path_key(item.path)
+                not in {self._path_key(path) for path in paths}
+            ]
+            target_row = index.row() if index.isValid() else len(ordered)
+            for offset, path in enumerate(paths):
+                ordered.insert(min(len(ordered), target_row + offset), path)
+            self.metadata_store.reorder_folder_bookmarks(ordered)
+            return
+        if entry is not None:
+            self._start_drop_operation(paths, entry.path, modifiers)
+            return
+        self._probe_dropped_folders(paths, self._add_dropped_folder_bookmarks)
+
+    def _on_tree_paths_dropped(
+        self,
+        paths: tuple[str, ...],
+        index: QModelIndex,
+        modifiers: Qt.KeyboardModifier,
+        _source: object,
+    ) -> None:
+        if not index.isValid():
+            return
+        self._start_drop_operation(
+            paths,
+            self.file_system_model.filePath(index),
+            modifiers,
+        )
+
+    def _start_drop_operation(
+        self,
+        paths: tuple[str, ...],
+        destination: str | Path,
+        modifiers: Qt.KeyboardModifier,
+    ) -> bool:
+        if not paths or any(
+            is_invalid_drop_target(path, destination) for path in paths
+        ):
+            self._show_temporary_status("この場所にはドロップできません")
+            return False
+        operation_name = choose_drop_operation(paths, destination, modifiers)
+        operation = (
+            FileOperationKind.MOVE
+            if operation_name == "move"
+            else FileOperationKind.COPY
+        )
+        if (
+            operation is FileOperationKind.MOVE
+            and all(
+                self._same_path(Path(path).parent, Path(destination))
+                for path in paths
+            )
+        ):
+            self._show_temporary_status("同じフォルダへの移動は行いません")
+            return False
+        return self._start_file_operation(
+            operation,
+            sources=paths,
+            destination=destination,
+        )
+
+    def _open_dropped_paths(self, paths: tuple[str, ...]) -> None:
+        if self._open_path_handler is None:
+            return
+        for offset, path in enumerate(paths):
+            self._invoke_open_path_handler(path, offset > 0, None)
+
+    def _probe_dropped_folders(
+        self,
+        paths: tuple[str, ...],
+        callback: Callable[[tuple[str, ...]], object],
+    ) -> None:
+        worker = FolderDropProbe(paths)
+        self._drop_probe_workers.add(worker)
+
+        def finished(folders: tuple[str, ...]) -> None:
+            self._drop_probe_workers.discard(worker)
+            if not self._shutdown_prepared:
+                callback(folders)
+
+        worker.signals.finished.connect(finished)
+        QThreadPool.globalInstance().start(worker)
+
+    def _add_dropped_folder_bookmarks(self, folders: tuple[str, ...]) -> None:
+        if self.metadata_store is None:
+            return
+        added = 0
+        for folder in folders:
+            if self.metadata_store.add_folder_bookmark(folder):
+                added += 1
+        if added:
+            self._show_temporary_status(f"{added}件をお気に入りへ追加しました")
 
     def _show_context_menu(self, position: QPoint) -> None:
         index = self.list_view.indexAt(position)
