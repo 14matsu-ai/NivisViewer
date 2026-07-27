@@ -158,6 +158,7 @@ from .windows_filename import (
 BrowserOpenHandler = Callable[..., object]
 AffectedViewersHandler = Callable[[tuple[str, ...]], tuple[object, ...]]
 CloseAffectedViewersHandler = Callable[[tuple[object, ...]], bool | None]
+FolderNavigationHandler = Callable[[object, int], str]
 _THUMBNAIL_LOG = logging.getLogger("nivisviewer.thumbnail")
 _FILE_OPERATION_LOG = logging.getLogger("nivisviewer.file_operation")
 
@@ -211,6 +212,7 @@ class BrowserWindow(QMainWindow):
         image_work_coordinator: ImageWorkCoordinator | None = None,
         path_availability_service: PathAvailabilityService | None = None,
         system_file_opener: SystemFileOpener | None = None,
+        folder_navigation_handler: FolderNavigationHandler | None = None,
         restore_initial_location: bool = True,
     ) -> None:
         super().__init__()
@@ -225,6 +227,7 @@ class BrowserWindow(QMainWindow):
         self._open_path_handler = open_path_handler
         self._affected_viewers_handler = affected_viewers_handler
         self._close_affected_viewers_handler = close_affected_viewers_handler
+        self._folder_navigation_handler = folder_navigation_handler
         self._owns_archive_backend_registry = archive_backend_registry is None
         self.archive_backend_registry = (
             archive_backend_registry
@@ -358,6 +361,15 @@ class BrowserWindow(QMainWindow):
                 "browser_external_drop_behavior",
                 "focus_only",
             )
+        )
+        self.browser_folder_gestures_enabled = bool(
+            self.settings.get("browser_folder_gestures_enabled", True)
+        )
+        self.mouse_gesture_show_trail = bool(
+            self.settings.get("mouse_gesture_show_trail", True)
+        )
+        self.mouse_gesture_min_distance = int(
+            self.settings.get("mouse_gesture_min_distance", 36)
         )
         self._file_operation_selection_before: dict[
             int, tuple[tuple[str, ...], int | None]
@@ -545,6 +557,8 @@ class BrowserWindow(QMainWindow):
                     item_kind=item.kind.value,
                     extension=item.extension,
                     natural_sort_identity=item.display_name.casefold(),
+                    modified_time_ns=item.modified_time_ns,
+                    file_size=item.file_size,
                 )
                 for item in self.items
             ),
@@ -964,6 +978,19 @@ class BrowserWindow(QMainWindow):
         ):
             return False
         return True
+
+    def _on_browser_folder_gesture(self, pattern: str) -> None:
+        if not self.browser_folder_gestures_enabled:
+            return
+        if pattern == "U":
+            self.go_up()
+        elif pattern == "D":
+            self.refresh_current_folder()
+        elif pattern in {"L", "R"} and self._folder_navigation_handler is not None:
+            self._folder_navigation_handler(
+                self,
+                -1 if pattern == "L" else 1,
+            )
 
     def focus_address_bar(self) -> None:
         self.address_bar.setFocus(Qt.FocusReason.ShortcutFocusReason)
@@ -2193,6 +2220,29 @@ class BrowserWindow(QMainWindow):
             self.thumbnail_provider.cleanup_caches_async(force=False)
 
     def apply_settings(self, changed: dict[str, object]) -> None:
+        if "browser_folder_gestures_enabled" in changed:
+            self.browser_folder_gestures_enabled = bool(
+                changed["browser_folder_gestures_enabled"]
+            )
+        if "mouse_gesture_show_trail" in changed:
+            self.mouse_gesture_show_trail = bool(
+                changed["mouse_gesture_show_trail"]
+            )
+        if "mouse_gesture_min_distance" in changed:
+            self.mouse_gesture_min_distance = max(
+                12,
+                min(200, int(changed["mouse_gesture_min_distance"])),
+            )
+        if {
+            "browser_folder_gestures_enabled",
+            "mouse_gesture_show_trail",
+            "mouse_gesture_min_distance",
+        }.intersection(changed):
+            self.list_view.set_folder_gesture_options(
+                enabled=self.browser_folder_gestures_enabled,
+                show_trail=self.mouse_gesture_show_trail,
+                min_distance=self.mouse_gesture_min_distance,
+            )
         list_keys = {
             "thumbnail_size",
             "thumbnail_frame_ratio",
@@ -2926,6 +2976,14 @@ class BrowserWindow(QMainWindow):
 
         self.list_view = ExplorerListView(self)
         self.list_view.setModel(self.item_model)
+        self.list_view.set_folder_gesture_options(
+            enabled=self.browser_folder_gestures_enabled,
+            show_trail=self.mouse_gesture_show_trail,
+            min_distance=self.mouse_gesture_min_distance,
+        )
+        self.list_view.folderGestureRecognized.connect(
+            self._on_browser_folder_gesture
+        )
         self.list_view.paintCompleted.connect(self._on_list_paint_completed)
         self.item_delegate = BrowserItemDelegate(
             self.list_view,
@@ -4215,6 +4273,8 @@ class BrowserWindow(QMainWindow):
             self._show_temporary_status(f"{added}件をお気に入りへ追加しました")
 
     def _show_context_menu(self, position: QPoint) -> None:
+        if self.list_view.consume_folder_gesture_context_menu_suppression():
+            return
         index = self.list_view.indexAt(position)
         item = self.item_model.item_at(index)
         if item is not None and not self.list_view.selectionModel().isSelected(index):

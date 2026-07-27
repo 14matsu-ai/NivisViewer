@@ -248,6 +248,11 @@ def test_mouse_settings_are_shown_applied_and_disableable(
     dialog = SettingsDialog(config)
 
     assert dialog.mouse_gestures_checkbox.isChecked()
+    assert (
+        dialog.mouse_gestures_checkbox.text()
+        == "Viewer画像表示領域でマウスジェスチャーを使用する"
+    )
+    assert dialog.browser_folder_gestures_checkbox.isChecked()
     assert dialog.mouse_gesture_trail_checkbox.isChecked()
     assert dialog.mouse_gesture_distance_spin.value() == 36
     assert dialog.gesture_down_combo.currentData() == "close_viewer"
@@ -256,6 +261,7 @@ def test_mouse_settings_are_shown_applied_and_disableable(
     assert dialog.mouse_forward_action_combo.currentData() == "next_book"
 
     dialog.mouse_gestures_checkbox.setChecked(False)
+    dialog.browser_folder_gestures_checkbox.setChecked(False)
     dialog.mouse_gesture_distance_spin.setValue(88)
     dialog.gesture_down_combo.setCurrentIndex(
         dialog.gesture_down_combo.findData("next_page")
@@ -264,12 +270,42 @@ def test_mouse_settings_are_shown_applied_and_disableable(
     changed = dialog.apply_settings()
 
     assert changed["mouse_gestures_enabled"] is False
+    assert changed["browser_folder_gestures_enabled"] is False
     assert changed["mouse_gesture_min_distance"] == 88
     assert changed["mouse_gesture_bindings"]["D"] == "next_page"
     assert changed["mouse_back_button_action"] == ""
     assert not dialog.gesture_down_combo.isEnabled()
     restored = ConfigManager(config.path).load()
     assert restored["mouse_gesture_bindings"]["D"] == "next_page"
+    assert restored["browser_folder_gestures_enabled"] is False
+    dialog.reject()
+
+
+def test_mouse_settings_preserve_saved_partial_and_multistroke_bindings(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    config = make_config(tmp_path)
+    config.apply(
+        {
+            "mouse_gesture_bindings": {
+                "U": "next_page",
+                "DR": "last_page",
+            }
+        }
+    )
+    dialog = SettingsDialog(config)
+
+    assert dialog.gesture_up_combo.currentData() == "next_page"
+    assert dialog.gesture_down_combo.currentData() == ""
+
+    changed = dialog.apply_settings()
+
+    assert "mouse_gesture_bindings" not in changed
+    assert config.get("mouse_gesture_bindings") == {
+        "U": "next_page",
+        "DR": "last_page",
+    }
     dialog.reject()
 
 

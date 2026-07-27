@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import QEvent, QPointF, Qt
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtGui import QContextMenuEvent, QMouseEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -57,6 +57,42 @@ def send_extra_button(
         button,
         buttons,
         Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(widget, event)
+
+
+def send_right_gesture_event(
+    widget,
+    event_type: QEvent.Type,
+    position: QPointF,
+    *,
+    pressed: bool,
+) -> QMouseEvent:
+    event = QMouseEvent(
+        event_type,
+        position,
+        position,
+        (
+            Qt.MouseButton.NoButton
+            if event_type == QEvent.Type.MouseMove
+            else Qt.MouseButton.RightButton
+        ),
+        (
+            Qt.MouseButton.RightButton
+            if pressed
+            else Qt.MouseButton.NoButton
+        ),
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(widget, event)
+    return event
+
+
+def send_context_menu_event(widget, position) -> None:
+    event = QContextMenuEvent(
+        QContextMenuEvent.Reason.Mouse,
+        position,
+        widget.mapToGlobal(position),
     )
     QApplication.sendEvent(widget, event)
 
@@ -146,7 +182,7 @@ def test_back_with_deleted_selection_continues_without_selection(
     qapp.processEvents()
 
 
-def test_go_up_selects_previous_child_and_can_go_back(
+def test_up_gesture_selects_previous_child_and_can_go_back(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
@@ -155,7 +191,7 @@ def test_go_up_selects_previous_child_and_can_go_back(
     child.mkdir(parents=True)
     window = make_window(tmp_path, child, qapp)
 
-    assert window.go_up()
+    window._on_browser_folder_gesture("U")
     finish_scan(window, qapp)
 
     assert window.current_path == parent.absolute()
@@ -197,6 +233,235 @@ def test_refresh_preserves_history_selection_scroll_and_updates_items(
         window.list_view.gridSize().height()
     )
     assert window.statusBar().currentMessage() == "フォルダを更新しました"
+    window.close()
+    qapp.processEvents()
+
+
+def test_browser_folder_gesture_starts_on_item_and_blank_viewport_only(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "gestures"
+    image = folder / "item.jpg"
+    write_image(image)
+    window = make_window(tmp_path, folder, qapp)
+    gestures: list[str] = []
+    window.list_view.folderGestureRecognized.disconnect()
+    window.list_view.folderGestureRecognized.connect(gestures.append)
+    item_index = window.item_model.index(
+        window.item_model.row_for_path(image),
+        0,
+    )
+    item_point = window.list_view.visualRect(item_index).center()
+    blank_point = window.list_view.viewport().rect().bottomRight() - QPointF(
+        12,
+        12,
+    ).toPoint()
+    assert not window.list_view.indexAt(blank_point).isValid()
+
+    for point in (item_point, blank_point):
+        start = QPointF(point)
+        end = start + QPointF(70, 0)
+        send_right_gesture_event(
+            window.list_view.viewport(),
+            QEvent.Type.MouseButtonPress,
+            start,
+            pressed=True,
+        )
+        send_right_gesture_event(
+            window.list_view.viewport(),
+            QEvent.Type.MouseMove,
+            end,
+            pressed=True,
+        )
+        send_right_gesture_event(
+            window.list_view.viewport(),
+            QEvent.Type.MouseButtonRelease,
+            end,
+            pressed=False,
+        )
+
+    send_right_gesture_event(
+        window,
+        QEvent.Type.MouseButtonPress,
+        QPointF(20, 20),
+        pressed=True,
+    )
+    send_right_gesture_event(
+        window,
+        QEvent.Type.MouseButtonRelease,
+        QPointF(90, 20),
+        pressed=False,
+    )
+
+    assert gestures == ["R", "R"]
+    window.close()
+    qapp.processEvents()
+
+
+def test_browser_gesture_dispatches_only_once_on_release(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "gestures"
+    folder.mkdir()
+    window = make_window(tmp_path, folder, qapp)
+    refreshes: list[bool] = []
+    navigations: list[bool] = []
+    adjacent_requests: list[int] = []
+    window._folder_navigation_handler = (
+        lambda _window, direction: adjacent_requests.append(direction)
+        or "searching"
+    )
+    monkeypatch.setattr(
+        window,
+        "refresh_current_folder",
+        lambda: refreshes.append(True) or True,
+    )
+    monkeypatch.setattr(
+        window,
+        "go_up",
+        lambda: navigations.append(True) or True,
+    )
+    start = QPointF(60, 40)
+    send_right_gesture_event(
+        window.list_view.viewport(),
+        QEvent.Type.MouseMove,
+        start + QPointF(15, 10),
+        pressed=False,
+    )
+    assert adjacent_requests == []
+
+    send_right_gesture_event(
+        window.list_view.viewport(),
+        QEvent.Type.MouseButtonPress,
+        start,
+        pressed=True,
+    )
+    for offset in (45, 70, 95):
+        send_right_gesture_event(
+            window.list_view.viewport(),
+            QEvent.Type.MouseMove,
+            start + QPointF(0, offset),
+            pressed=True,
+        )
+        assert refreshes == []
+        assert navigations == []
+    send_right_gesture_event(
+        window.list_view.viewport(),
+        QEvent.Type.MouseButtonRelease,
+        start + QPointF(0, 95),
+        pressed=False,
+    )
+
+    assert refreshes == [True]
+    assert navigations == []
+    window.close()
+    qapp.processEvents()
+
+
+def test_browser_gesture_setting_is_independent_and_keeps_context_menu(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "gestures"
+    folder.mkdir()
+    window = make_window(tmp_path, folder, qapp)
+    menus: list[object] = []
+    gestures: list[str] = []
+    window.list_view.customContextMenuRequested.disconnect()
+    window.list_view.customContextMenuRequested.connect(menus.append)
+    window.list_view.folderGestureRecognized.connect(gestures.append)
+    window.config.apply({"mouse_gestures_enabled": False})
+
+    assert window.list_view.browser_folder_gestures_enabled
+
+    window.config.apply({"browser_folder_gestures_enabled": False})
+    QTest.mouseClick(
+        window.list_view.viewport(),
+        Qt.MouseButton.RightButton,
+        pos=QPointF(40, 40).toPoint(),
+    )
+    send_context_menu_event(
+        window.list_view.viewport(),
+        QPointF(40, 40).toPoint(),
+    )
+
+    assert not window.list_view.browser_folder_gestures_enabled
+    assert gestures == []
+    assert len(menus) == 1
+    window.close()
+    qapp.processEvents()
+
+
+def test_plain_browser_right_click_keeps_menu_and_gesture_suppresses_once(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "gestures"
+    folder.mkdir()
+    window = make_window(tmp_path, folder, qapp)
+    menus: list[object] = []
+    window.list_view.customContextMenuRequested.disconnect()
+    window.list_view.customContextMenuRequested.connect(menus.append)
+    point = QPointF(40, 40)
+
+    QTest.mouseClick(
+        window.list_view.viewport(),
+        Qt.MouseButton.RightButton,
+        pos=point.toPoint(),
+    )
+    send_context_menu_event(window.list_view.viewport(), point.toPoint())
+
+    assert len(menus) == 1
+    assert not window.list_view.consume_folder_gesture_context_menu_suppression()
+
+    send_right_gesture_event(
+        window.list_view.viewport(),
+        QEvent.Type.MouseButtonPress,
+        point,
+        pressed=True,
+    )
+    send_right_gesture_event(
+        window.list_view.viewport(),
+        QEvent.Type.MouseMove,
+        point + QPointF(70, 0),
+        pressed=True,
+    )
+    send_right_gesture_event(
+        window.list_view.viewport(),
+        QEvent.Type.MouseButtonRelease,
+        point + QPointF(70, 0),
+        pressed=False,
+    )
+
+    assert window.list_view.consume_folder_gesture_context_menu_suppression()
+    assert not window.list_view.consume_folder_gesture_context_menu_suppression()
+    window.close()
+    qapp.processEvents()
+
+
+def test_refresh_gesture_clears_missing_selection_without_adding_history(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "refresh"
+    selected = folder / "selected.jpg"
+    write_image(selected)
+    write_image(folder / "remaining.jpg")
+    window = make_window(tmp_path, folder, qapp)
+    index = window.item_model.index(window.item_model.row_for_path(selected), 0)
+    window.list_view.setCurrentIndex(index)
+    history_size = len(window.navigation_history)
+    selected.unlink()
+
+    window._on_browser_folder_gesture("D")
+    finish_scan(window, qapp)
+
+    assert len(window.navigation_history) == history_size
+    assert window.item_model.row_for_path(selected) < 0
+    assert not window.list_view.currentIndex().isValid()
     window.close()
     qapp.processEvents()
 

@@ -37,6 +37,7 @@ from .drag_drop import (
     paths_from_mime_data,
 )
 from .folder_tree_pointer import FolderTreePointerController, FolderTreePointerState
+from .mouse_gesture import MouseGestureRecognizer
 
 
 class ExplorerListView(QListView):
@@ -47,6 +48,7 @@ class ExplorerListView(QListView):
     itemPressCaptured = Signal(str)
     itemReleaseConfirmed = Signal(str)
     paintCompleted = Signal()
+    folderGestureRecognized = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -58,6 +60,19 @@ class ExplorerListView(QListView):
         self._drag_started = False
         self._drop_in_progress = False
         self._notify_after_next_paint = False
+        self.browser_folder_gestures_enabled = True
+        self.mouse_gesture_show_trail = True
+        self.mouse_gesture_min_distance = 36
+        self._folder_gesture_recognizer = MouseGestureRecognizer(
+            max(
+                self.mouse_gesture_min_distance,
+                QApplication.startDragDistance(),
+            ),
+            axis_dominance_ratio=1.2,
+        )
+        self._folder_gesture_trail: list[QPoint] = []
+        self._folder_gesture_right_button_down = False
+        self._suppress_folder_gesture_context_menu = False
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
         # All source drags are created by start_path_drag(). Qt's standard
@@ -78,6 +93,19 @@ class ExplorerListView(QListView):
         return self._drag_started
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if (
+            event.button() == Qt.MouseButton.RightButton
+            and self.browser_folder_gestures_enabled
+        ):
+            point = event.position().toPoint()
+            self._suppress_folder_gesture_context_menu = False
+            self._folder_gesture_right_button_down = True
+            self._folder_gesture_recognizer.begin((point.x(), point.y()))
+            self._folder_gesture_trail = (
+                [point] if self.mouse_gesture_show_trail else []
+            )
+            event.accept()
+            return
         if event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event)
             return
@@ -103,6 +131,18 @@ class ExplorerListView(QListView):
         event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if (
+            self._folder_gesture_right_button_down
+            and self._folder_gesture_recognizer.active
+            and event.buttons() & Qt.MouseButton.RightButton
+        ):
+            point = event.position().toPoint()
+            self._folder_gesture_recognizer.update((point.x(), point.y()))
+            if self.mouse_gesture_show_trail:
+                self._folder_gesture_trail.append(point)
+                self.viewport().update()
+            event.accept()
+            return
         if not event.buttons() & Qt.MouseButton.LeftButton:
             super().mouseMoveEvent(event)
             return
@@ -139,6 +179,22 @@ class ExplorerListView(QListView):
         event.accept()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if (
+            event.button() == Qt.MouseButton.RightButton
+            and self._folder_gesture_right_button_down
+        ):
+            point = event.position().toPoint()
+            pattern = self._folder_gesture_recognizer.finish(
+                (point.x(), point.y())
+            )
+            self._folder_gesture_right_button_down = False
+            self._folder_gesture_trail.clear()
+            self.viewport().update()
+            if pattern:
+                self._suppress_folder_gesture_context_menu = True
+                self.folderGestureRecognized.emit(pattern)
+            event.accept()
+            return
         if event.button() != Qt.MouseButton.LeftButton:
             super().mouseReleaseEvent(event)
             return
@@ -188,12 +244,20 @@ class ExplorerListView(QListView):
         event.accept()
 
     def focusOutEvent(self, event: QFocusEvent) -> None:  # type: ignore[override]
+        self._cancel_folder_gesture()
         self._hide_rubber_band()
         self.pointer_controller.reset()
         self._drag_started = False
         super().focusOutEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
+        if (
+            event.key() == Qt.Key.Key_Escape
+            and self._folder_gesture_recognizer.active
+        ):
+            self._cancel_folder_gesture()
+            event.accept()
+            return
         if (
             event.key() == Qt.Key.Key_Escape
             and self.pointer_controller.state is not BrowserPointerState.IDLE
@@ -441,9 +505,77 @@ class ExplorerListView(QListView):
 
     def paintEvent(self, event: QPaintEvent) -> None:  # type: ignore[override]
         super().paintEvent(event)
+        if (
+            self.mouse_gesture_show_trail
+            and self.browser_folder_gestures_enabled
+            and self._folder_gesture_right_button_down
+            and self._folder_gesture_recognizer.pattern
+            and len(self._folder_gesture_trail) >= 2
+        ):
+            painter = QPainter(self.viewport())
+            pen = QPen(QColor(120, 205, 255, 150))
+            pen.setWidthF(max(2.0, 3.0 * self.devicePixelRatioF()))
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            for start, end in zip(
+                self._folder_gesture_trail,
+                self._folder_gesture_trail[1:],
+            ):
+                painter.drawLine(start, end)
         if self._notify_after_next_paint:
             self._notify_after_next_paint = False
             self.paintCompleted.emit()
+
+    def set_folder_gesture_options(
+        self,
+        *,
+        enabled: bool,
+        show_trail: bool,
+        min_distance: int,
+    ) -> None:
+        self._cancel_folder_gesture()
+        self.browser_folder_gestures_enabled = bool(enabled)
+        self.mouse_gesture_show_trail = bool(show_trail)
+        self.mouse_gesture_min_distance = max(
+            12,
+            min(200, int(min_distance)),
+        )
+        self._folder_gesture_recognizer = MouseGestureRecognizer(
+            max(
+                self.mouse_gesture_min_distance,
+                QApplication.startDragDistance(),
+            ),
+            axis_dominance_ratio=1.2,
+        )
+
+    @property
+    def folder_gesture_in_progress(self) -> bool:
+        return (
+            self._folder_gesture_right_button_down
+            and bool(self._folder_gesture_recognizer.pattern)
+        )
+
+    @property
+    def folder_gesture_trail(self) -> tuple[QPoint, ...]:
+        return tuple(self._folder_gesture_trail)
+
+    def consume_folder_gesture_context_menu_suppression(self) -> bool:
+        suppressed = self._suppress_folder_gesture_context_menu
+        self._suppress_folder_gesture_context_menu = False
+        return suppressed
+
+    def _cancel_folder_gesture(self) -> None:
+        changed = (
+            self._folder_gesture_right_button_down
+            or self._folder_gesture_recognizer.active
+            or bool(self._folder_gesture_trail)
+        )
+        self._folder_gesture_right_button_down = False
+        self._folder_gesture_recognizer.cancel()
+        self._folder_gesture_trail.clear()
+        if changed:
+            self.viewport().update()
 
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
         return super().eventFilter(watched, event)

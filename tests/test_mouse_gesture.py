@@ -29,6 +29,24 @@ def test_diagonal_uses_larger_axis_and_tie_prefers_horizontal() -> None:
     assert recognizer.finish((14, 28)) == "RD"
 
 
+def test_optional_axis_dominance_rejects_ambiguous_diagonal() -> None:
+    recognizer = MouseGestureRecognizer(10, axis_dominance_ratio=1.2)
+    recognizer.begin((0, 0))
+
+    assert recognizer.update((11, 10)) == ""
+    assert recognizer.update((12, 10)) == "R"
+    assert recognizer.finish((12, 22)) == "RD"
+
+
+def test_axis_dominance_does_not_remove_multiple_strokes() -> None:
+    recognizer = MouseGestureRecognizer(10, axis_dominance_ratio=1.2)
+    recognizer.begin((0, 0))
+
+    assert recognizer.update((20, 0)) == "R"
+    assert recognizer.update((20, -20)) == "RU"
+    assert recognizer.finish((0, -20)) == "RUL"
+
+
 def test_repeated_direction_is_compressed() -> None:
     recognizer = MouseGestureRecognizer(10)
     recognizer.begin((0, 0))

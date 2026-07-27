@@ -10,6 +10,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from .adjacent_book_search import (
+    SIBLING_FOLDERS,
     AdjacentBookSearchRequest,
     AdjacentBookSearchResult,
     AdjacentBookSearchService,
@@ -119,7 +120,7 @@ class ApplicationController(QObject):
         self._adjacent_request_by_window: dict[int, int] = {}
         self._adjacent_context: dict[
             int,
-            tuple[weakref.ReferenceType[ViewerWindow], int, int, str],
+            tuple[weakref.ReferenceType[object], int, int, str, str],
         ] = {}
         self._operation_fallback_panel: FileOperationPanel | None = None
         self._operation_conflict_dialog: ConflictResolutionDialog | None = None
@@ -220,6 +221,7 @@ class ApplicationController(QObject):
             file_registration_service=self.file_registration_service,
             image_work_coordinator=self.image_work_coordinator,
             path_availability_service=self.path_availability_service,
+            folder_navigation_handler=self.handle_browser_folder_navigation,
             restore_initial_location=self._restore_on_start,
         )
         self._browser_window = window
@@ -386,12 +388,61 @@ class ApplicationController(QObject):
             generation,
             request.direction,
             adjacent_path_key(current),
+            "book",
         )
         window.show_adjacent_book_searching(request.direction)
         if not self.adjacent_book_search.search(request):
             self._adjacent_request_by_window.pop(id(window), None)
             self._adjacent_context.pop(request_id, None)
             window.complete_adjacent_book_search(request.direction, "unavailable")
+            return "unavailable"
+        return "searching"
+
+    def handle_browser_folder_navigation(
+        self,
+        window: object,
+        direction: int,
+    ) -> str:
+        if (
+            self._shutdown
+            or not isinstance(window, BrowserWindow)
+            or window is not self._browser_window
+            or window.current_path is None
+        ):
+            return "unavailable"
+        current_folder = lexical_absolute(window.current_path)
+        parent = lexical_absolute(os.path.dirname(current_folder))
+        if adjacent_path_key(parent) == adjacent_path_key(current_folder):
+            return "boundary"
+
+        self._cancel_adjacent_search(window)
+        self._adjacent_request_sequence += 1
+        self._adjacent_generation += 1
+        request_id = self._adjacent_request_sequence
+        generation = self._adjacent_generation
+        request = AdjacentBookSearchRequest(
+            request_id=request_id,
+            current_book_path=current_folder,
+            direction=-1 if direction < 0 else 1,
+            loop=False,
+            browser_snapshot=None,
+            generation=generation,
+            candidate_mode=SIBLING_FOLDERS,
+            sort_key=window.browser_sort_key.value,
+            sort_order=window.browser_sort_order.value,
+            folders_first=window.browser_folders_first,
+        )
+        self._adjacent_request_by_window[id(window)] = request_id
+        self._adjacent_context[request_id] = (
+            weakref.ref(window),
+            generation,
+            request.direction,
+            adjacent_path_key(current_folder),
+            "browser_folder",
+        )
+        if not self.adjacent_book_search.search(request):
+            self._adjacent_request_by_window.pop(id(window), None)
+            self._adjacent_context.pop(request_id, None)
             return "unavailable"
         return "searching"
 
@@ -599,6 +650,7 @@ class ApplicationController(QObject):
 
     def _on_browser_closing(self, window: object) -> None:
         if isinstance(window, BrowserWindow) and window is self._browser_window:
+            self._cancel_adjacent_search(window)
             self._unregister_browser(window)
             if self.file_operation_queue.busy:
                 self._show_operation_fallback()
@@ -870,16 +922,21 @@ class ApplicationController(QObject):
 
     def _cancel_adjacent_search(
         self,
-        window: ViewerWindow,
+        window: object,
         *,
         clear_status: bool = False,
     ) -> None:
         request_id = self._adjacent_request_by_window.pop(id(window), None)
         if request_id is None:
             return
-        self._adjacent_context.pop(request_id, None)
+        context = self._adjacent_context.pop(request_id, None)
         self.adjacent_book_search.cancel(request_id)
-        if clear_status:
+        if (
+            clear_status
+            and isinstance(window, ViewerWindow)
+            and context is not None
+            and context[4] == "book"
+        ):
             window.complete_adjacent_book_search(1, "opened")
 
     def _on_adjacent_book_search_result(
@@ -889,24 +946,40 @@ class ApplicationController(QObject):
         context = self._adjacent_context.pop(result.request_id, None)
         if context is None or self._shutdown:
             return
-        window_ref, generation, direction, expected_current_key = context
+        window_ref, generation, direction, expected_current_key, operation = (
+            context
+        )
         window = window_ref()
-        if (
-            window is None
-            or window not in self._viewer_windows
-            or result.generation != generation
-            or self._adjacent_request_by_window.get(id(window))
-            != result.request_id
-        ):
+        if window is None or result.generation != generation:
+            return
+        if self._adjacent_request_by_window.get(id(window)) != result.request_id:
             return
         self._adjacent_request_by_window.pop(id(window), None)
-        current = self._book_navigation_path_lexical(window)
+
+        if operation == "book":
+            if (
+                not isinstance(window, ViewerWindow)
+                or window not in self._viewer_windows
+            ):
+                return
+            current = self._book_navigation_path_lexical(window)
+        else:
+            if (
+                not isinstance(window, BrowserWindow)
+                or window is not self._browser_window
+                or window.current_path is None
+            ):
+                return
+            current = lexical_absolute(window.current_path)
         if current is None or adjacent_path_key(current) != expected_current_key:
             return
         if (
             result.status is AdjacentBookSearchStatus.FOUND
             and result.candidate_path
         ):
+            if operation == "browser_folder":
+                window.navigate_to(result.candidate_path)
+                return
             opened = self._open_path_in_viewer(
                 window,
                 result.candidate_path,
@@ -917,7 +990,8 @@ class ApplicationController(QObject):
                 "opened" if opened else "error",
             )
             return
-        window.complete_adjacent_book_search(direction, result.status.value)
+        if operation == "book":
+            window.complete_adjacent_book_search(direction, result.status.value)
 
     @staticmethod
     def _path_key(path: str | Path) -> str:

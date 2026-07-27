@@ -13,7 +13,19 @@ from .archive_backend import (
     EXTERNAL_ARCHIVE_EXTENSIONS,
     is_supported_archive_candidate,
 )
+from .browser_model import BrowserItemKind
+from .browser_sort import (
+    BrowserSortKey,
+    BrowserSortOrder,
+    BrowserSortPolicy,
+    normalize_browser_sort_key,
+    normalize_browser_sort_order,
+)
 from .image_source import BOOK_FILE_EXTENSIONS, SUPPORTED_EXTENSIONS
+
+
+ADJACENT_BOOKS = "books"
+SIBLING_FOLDERS = "sibling_folders"
 
 
 class AdjacentBookSearchStatus(StrEnum):
@@ -30,6 +42,8 @@ class AdjacentBookSnapshotEntry:
     item_kind: str
     extension: str
     natural_sort_identity: str
+    modified_time_ns: int | None = None
+    file_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -47,6 +61,10 @@ class AdjacentBookSearchRequest:
     loop: bool
     browser_snapshot: AdjacentBookBrowserSnapshot | None
     generation: int
+    candidate_mode: str = ADJACENT_BOOKS
+    sort_key: str = BrowserSortKey.NAME.value
+    sort_order: str = BrowserSortOrder.ASCENDING.value
+    folders_first: bool = True
 
 
 @dataclass(frozen=True)
@@ -65,6 +83,20 @@ class _FileSystemEntry:
     is_directory: bool
     is_file: bool
     extension: str
+    modified_time_ns: int | None = None
+    file_size: int | None = None
+
+    @property
+    def display_name(self) -> str:
+        return self.name
+
+    @property
+    def kind(self) -> BrowserItemKind:
+        return (
+            BrowserItemKind.FOLDER
+            if self.is_directory
+            else BrowserItemKind.OTHER
+        )
 
 
 @dataclass(frozen=True)
@@ -77,6 +109,7 @@ class _CacheEntry:
 class _WorkerOutcome:
     result: AdjacentBookSearchResult
     parent_key: str
+    cache_variant: tuple[str, str, str, bool]
     fingerprint: int | None
     candidates: tuple[str, ...] | None
 
@@ -87,13 +120,23 @@ class AdjacentBookFileSystem:
     def directory_fingerprint(self, path: str) -> int | None:
         return int(os.stat(path).st_mtime_ns)
 
-    def scandir(self, path: str) -> tuple[_FileSystemEntry, ...]:
+    def scandir(
+        self,
+        path: str,
+        *,
+        include_metadata: bool = False,
+    ) -> tuple[_FileSystemEntry, ...]:
         result: list[_FileSystemEntry] = []
         with os.scandir(path) as entries:
             for entry in entries:
                 try:
                     is_directory = entry.is_dir(follow_symlinks=False)
                     is_file = entry.is_file(follow_symlinks=False)
+                    stat = (
+                        entry.stat(follow_symlinks=False)
+                        if include_metadata
+                        else None
+                    )
                 except OSError:
                     continue
                 result.append(
@@ -103,6 +146,14 @@ class AdjacentBookFileSystem:
                         is_directory=is_directory,
                         is_file=is_file,
                         extension=os.path.splitext(entry.name)[1].lower(),
+                        modified_time_ns=(
+                            stat.st_mtime_ns if stat is not None else None
+                        ),
+                        file_size=(
+                            stat.st_size
+                            if stat is not None and is_file
+                            else None
+                        ),
                     )
                 )
         return tuple(result)
@@ -229,7 +280,19 @@ class _SearchWorker(QRunnable):
             )
 
     def _from_filesystem(self, parent: str) -> tuple[str, ...]:
-        return self._collect_candidates(self.filesystem.scandir(parent))
+        include_metadata = (
+            self.request.candidate_mode == SIBLING_FOLDERS
+            and normalize_browser_sort_key(self.request.sort_key)
+            is BrowserSortKey.MODIFIED_TIME
+        )
+        return self._collect_candidates(
+            self.filesystem.scandir(
+                parent,
+                include_metadata=include_metadata,
+            )
+            if include_metadata
+            else self.filesystem.scandir(parent)
+        )
 
     def _from_snapshot(
         self,
@@ -242,6 +305,8 @@ class _SearchWorker(QRunnable):
                 is_directory=entry.item_kind == "folder",
                 is_file=entry.item_kind != "folder",
                 extension=entry.extension.lower(),
+                modified_time_ns=entry.modified_time_ns,
+                file_size=entry.file_size,
             )
             for entry in snapshot.entries
         )
@@ -251,6 +316,21 @@ class _SearchWorker(QRunnable):
         self,
         entries: tuple[_FileSystemEntry, ...],
     ) -> tuple[str, ...]:
+        if self.request.candidate_mode == SIBLING_FOLDERS:
+            policy = BrowserSortPolicy(
+                sort_key=normalize_browser_sort_key(self.request.sort_key),
+                sort_order=normalize_browser_sort_order(
+                    self.request.sort_order
+                ),
+                folders_first=bool(self.request.folders_first),
+            )
+            return tuple(
+                entry.path
+                for entry in policy.sorted_items(
+                    entry for entry in entries if entry.is_directory
+                )
+            )
+
         candidates: dict[str, str] = {}
         for entry in entries:
             if self.cancelled.is_set():
@@ -298,6 +378,12 @@ class _SearchWorker(QRunnable):
                     error_code,
                 ),
                 parent_key,
+                (
+                    self.request.candidate_mode,
+                    str(self.request.sort_key),
+                    str(self.request.sort_order),
+                    bool(self.request.folders_first),
+                ),
                 fingerprint,
                 candidates,
             )
@@ -320,17 +406,27 @@ class AdjacentBookSearchService(QObject):
         self._pool.setMaxThreadCount(max(2, int(max_workers)))
         self._lock = Lock()
         self._cancel_events: dict[int, Event] = {}
-        self._cache: dict[str, _CacheEntry] = {}
+        self._cache: dict[
+            tuple[str, str, str, str, bool],
+            _CacheEntry,
+        ] = {}
         self._closed = False
 
     def search(self, request: AdjacentBookSearchRequest) -> bool:
         parent_key = path_key(os.path.dirname(request.current_book_path))
+        cache_key = (
+            parent_key,
+            request.candidate_mode,
+            str(request.sort_key),
+            str(request.sort_order),
+            bool(request.folders_first),
+        )
         with self._lock:
             if self._closed:
                 return False
             cancelled = Event()
             self._cancel_events[request.request_id] = cancelled
-            cached = self._cache.get(parent_key)
+            cached = self._cache.get(cache_key)
         worker = _SearchWorker(request, self.filesystem, cached, cancelled)
         worker.signals.finished.connect(self._on_finished)
         self._pool.start(worker)
@@ -347,7 +443,10 @@ class AdjacentBookSearchService(QObject):
             if parent_path is None:
                 self._cache.clear()
             else:
-                self._cache.pop(path_key(parent_path), None)
+                parent_key = path_key(parent_path)
+                for key in tuple(self._cache):
+                    if key[0] == parent_key:
+                        self._cache.pop(key, None)
 
     def close(self) -> None:
         with self._lock:
@@ -376,7 +475,9 @@ class AdjacentBookSearchService(QObject):
                     AdjacentBookSearchStatus.ERROR,
                 }
             ):
-                self._cache[outcome.parent_key] = _CacheEntry(
+                self._cache[
+                    (outcome.parent_key, *outcome.cache_variant)
+                ] = _CacheEntry(
                     outcome.fingerprint,
                     outcome.candidates,
                 )

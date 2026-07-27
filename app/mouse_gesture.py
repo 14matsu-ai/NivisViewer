@@ -9,9 +9,20 @@ Point: TypeAlias = tuple[float, float]
 class MouseGestureRecognizer:
     """Recognize a compact U/D/L/R sequence without depending on Qt."""
 
-    def __init__(self, min_distance: int = 36, *, max_directions: int = 8) -> None:
+    def __init__(
+        self,
+        min_distance: int = 36,
+        *,
+        max_directions: int = 8,
+        axis_dominance_ratio: float | None = None,
+    ) -> None:
         self.min_distance = max(1, int(min_distance))
         self.max_directions = max(1, int(max_directions))
+        self.axis_dominance_ratio = (
+            None
+            if axis_dominance_ratio is None
+            else max(1.0, float(axis_dominance_ratio))
+        )
         self._active = False
         self._anchor: Point | None = None
         self._directions: list[str] = []
@@ -39,7 +50,17 @@ class MouseGestureRecognizer:
         if hypot(dx, dy) < self.min_distance:
             return self.pattern
 
-        if abs(dx) >= abs(dy):
+        horizontal = abs(dx)
+        vertical = abs(dy)
+        if (
+            self.axis_dominance_ratio is not None
+            and min(horizontal, vertical) > 0
+            and max(horizontal, vertical)
+            < min(horizontal, vertical) * self.axis_dominance_ratio
+        ):
+            return self.pattern
+
+        if horizontal >= vertical:
             direction = "R" if dx >= 0 else "L"
         else:
             direction = "D" if dy >= 0 else "U"

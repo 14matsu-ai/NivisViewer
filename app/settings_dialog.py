@@ -819,10 +819,10 @@ class SettingsDialog(QDialog):
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
 
-        gesture_group = QGroupBox("右クリックドラッグジェスチャー", tab)
+        gesture_group = QGroupBox("Viewer画像表示領域", tab)
         gesture_form = QFormLayout(gesture_group)
         self.mouse_gestures_checkbox = QCheckBox(
-            "マウスジェスチャーを使用する",
+            "Viewer画像表示領域でマウスジェスチャーを使用する",
             gesture_group,
         )
         self.mouse_gestures_checkbox.toggled.connect(self._sync_gesture_controls)
@@ -841,6 +841,24 @@ class SettingsDialog(QDialog):
         gesture_form.addRow("下へドラッグ (D):", self.gesture_down_combo)
         gesture_form.addRow("上へドラッグ (U):", self.gesture_up_combo)
 
+        browser_gesture_group = QGroupBox(
+            "Browserサムネイル一覧領域",
+            tab,
+        )
+        browser_gesture_layout = QVBoxLayout(browser_gesture_group)
+        self.browser_folder_gestures_checkbox = QCheckBox(
+            "Browserのサムネイル一覧でフォルダージェスチャーを使用する",
+            browser_gesture_group,
+        )
+        browser_gesture_layout.addWidget(self.browser_folder_gestures_checkbox)
+        browser_gesture_description = QLabel(
+            "上：上の階層へ移動　左：前のフォルダー　"
+            "右：次のフォルダー　下：フォルダーを更新",
+            browser_gesture_group,
+        )
+        browser_gesture_description.setWordWrap(True)
+        browser_gesture_layout.addWidget(browser_gesture_description)
+
         button_group = QGroupBox("マウス追加ボタン", tab)
         button_form = QFormLayout(button_group)
         self.mouse_back_action_combo = self._command_combo(button_group)
@@ -849,6 +867,7 @@ class SettingsDialog(QDialog):
         button_form.addRow("進む / XButton2:", self.mouse_forward_action_combo)
 
         layout.addWidget(gesture_group)
+        layout.addWidget(browser_gesture_group)
         layout.addWidget(button_group)
         layout.addStretch(1)
         return tab
@@ -1061,6 +1080,9 @@ class SettingsDialog(QDialog):
         )
         self.mouse_gestures_checkbox.setChecked(
             bool(self.config.get("mouse_gestures_enabled", True))
+        )
+        self.browser_folder_gestures_checkbox.setChecked(
+            bool(self.config.get("browser_folder_gestures_enabled", True))
         )
         self.mouse_gesture_trail_checkbox.setChecked(
             bool(self.config.get("mouse_gesture_show_trail", True))
@@ -1352,6 +1374,9 @@ class SettingsDialog(QDialog):
             "winrar_executable": self.winrar_path_edit.text().strip().strip('"'),
             "seven_zip_executable": self.seven_zip_path_edit.text().strip().strip('"'),
             "mouse_gestures_enabled": self.mouse_gestures_checkbox.isChecked(),
+            "browser_folder_gestures_enabled": (
+                self.browser_folder_gestures_checkbox.isChecked()
+            ),
             "mouse_gesture_show_trail": self.mouse_gesture_trail_checkbox.isChecked(),
             "mouse_gesture_min_distance": self.mouse_gesture_distance_spin.value(),
             "mouse_gesture_bindings": bindings,
