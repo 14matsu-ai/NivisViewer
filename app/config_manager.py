@@ -33,7 +33,9 @@ class ConfigManager(QObject):
         "fullscreen_top_edge_trigger_px": 8,
         "fullscreen_bottom_edge_trigger_px": 28,
         "fullscreen_ui_hide_delay_ms": 0,
+        "viewer_canvas_click_direction": "right_next",
         "viewer_canvas_left_click_action": "next_single_page",
+        "viewer_slider_wheel_single_page_enabled": False,
         "show_page_list": False,
         "thumbnail_size": 180,
         "thumbnail_frame_ratio": "portrait_1_sqrt2",
@@ -483,6 +485,13 @@ class ConfigManager(QObject):
             normalized["viewer_canvas_left_click_action"] = cls.DEFAULTS[
                 "viewer_canvas_left_click_action"
             ]
+        if normalized.get("viewer_canvas_click_direction") not in {
+            "right_next",
+            "left_next",
+        }:
+            normalized["viewer_canvas_click_direction"] = cls.DEFAULTS[
+                "viewer_canvas_click_direction"
+            ]
         normalized["fullscreen_ui_hide_delay_ms"] = cls._clamped_int(
             normalized.get("fullscreen_ui_hide_delay_ms"),
             default=int(cls.DEFAULTS["fullscreen_ui_hide_delay_ms"]),
@@ -500,6 +509,7 @@ class ConfigManager(QObject):
             "mouse_gestures_enabled",
             "mouse_gesture_show_trail",
             "browser_folder_gestures_enabled",
+            "viewer_slider_wheel_single_page_enabled",
             "join_spread_pages",
             "single_first_page",
             "treat_wide_image_as_single",

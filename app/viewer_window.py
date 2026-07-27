@@ -234,6 +234,15 @@ class ViewerWindow(QMainWindow):
                 commands.NEXT_SINGLE_PAGE,
             )
         )
+        self.viewer_canvas_click_direction = str(
+            self.settings.get("viewer_canvas_click_direction", "right_next")
+        )
+        self.viewer_slider_wheel_single_page_enabled = bool(
+            self.settings.get(
+                "viewer_slider_wheel_single_page_enabled",
+                False,
+            )
+        )
         self.slideshow_timer = QTimer(self)
         self.slideshow_timer.setInterval(max(500, self.slideshow_interval_ms))
         self.slideshow_timer.timeout.connect(self._advance_slideshow)
@@ -349,7 +358,8 @@ class ViewerWindow(QMainWindow):
         self.viewer.fullscreenToggleRequested.connect(
             lambda: self.dispatch_command(commands.TOGGLE_FULLSCREEN)
         )
-        self.viewer.imageLeftClicked.connect(self._on_image_left_clicked)
+        self.viewer.leftSideClicked.connect(self._on_left_side_clicked)
+        self.viewer.rightSideClicked.connect(self._on_right_side_clicked)
         self.viewer.contextMenuRequested.connect(self._show_viewer_context_menu)
         self.viewer.gestureRecognized.connect(self._on_mouse_gesture)
         self.viewer.extraMouseButtonPressed.connect(self._on_extra_mouse_button)
@@ -363,6 +373,8 @@ class ViewerWindow(QMainWindow):
         self.slider.previousSinglePageRequested.connect(
             self.page_navigation.previous_single_page
         )
+        self.slider.nextDisplayUnitRequested.connect(self.next_page)
+        self.slider.previousDisplayUnitRequested.connect(self.previous_page)
         self.fullscreen_chrome = FullscreenChromeController(
             self,
             viewer=self.viewer,
@@ -747,6 +759,12 @@ class ViewerWindow(QMainWindow):
             show_trail=self.mouse_gesture_show_trail,
             min_distance=self.mouse_gesture_min_distance,
         )
+        self.slider.set_single_page_wheel_enabled(
+            self.viewer_slider_wheel_single_page_enabled
+        )
+        self.viewer.set_canvas_side_click_enabled(
+            self.viewer_canvas_left_click_action != "none"
+        )
         self.model.update_options(
             view_mode=self.view_mode,
             reading_direction=self.reading_direction,
@@ -832,6 +850,23 @@ class ViewerWindow(QMainWindow):
                     "none",
                 }
                 else commands.NEXT_SINGLE_PAGE
+            )
+            self.viewer.set_canvas_side_click_enabled(
+                self.viewer_canvas_left_click_action != "none"
+            )
+        if "viewer_canvas_click_direction" in changed:
+            direction = str(changed["viewer_canvas_click_direction"])
+            self.viewer_canvas_click_direction = (
+                direction
+                if direction in {"right_next", "left_next"}
+                else "right_next"
+            )
+        if "viewer_slider_wheel_single_page_enabled" in changed:
+            self.viewer_slider_wheel_single_page_enabled = bool(
+                changed["viewer_slider_wheel_single_page_enabled"]
+            )
+            self.slider.set_single_page_wheel_enabled(
+                self.viewer_slider_wheel_single_page_enabled
             )
         if "fullscreen_ui_hide_delay_ms" in changed:
             self.fullscreen_ui_hide_delay_ms = max(
@@ -2030,22 +2065,31 @@ class ViewerWindow(QMainWindow):
         self._next_open_trace_id = int(trace_id)
 
     def _on_left_side_clicked(self) -> None:
-        if self.reading_direction == "rtl":
-            self.next_page()
-        else:
-            self.previous_page()
+        self._move_from_canvas_side("left")
 
     def _on_right_side_clicked(self) -> None:
-        if self.reading_direction == "rtl":
-            self.previous_page()
-        else:
-            self.next_page()
+        self._move_from_canvas_side("right")
 
-    def _on_image_left_clicked(self) -> None:
-        if self.viewer_canvas_left_click_action == commands.NEXT_SINGLE_PAGE:
-            self.page_navigation.next_single_page()
-        elif self.viewer_canvas_left_click_action == commands.NEXT_DISPLAY_UNIT:
-            self.next_page()
+    def _move_from_canvas_side(self, side: str) -> None:
+        action = self.viewer_canvas_left_click_action
+        if action == "none":
+            return
+        next_side = (
+            "right"
+            if self.viewer_canvas_click_direction == "right_next"
+            else "left"
+        )
+        forward = side == next_side
+        if action == commands.NEXT_SINGLE_PAGE:
+            if forward:
+                self.page_navigation.next_single_page()
+            else:
+                self.page_navigation.previous_single_page()
+        elif action == commands.NEXT_DISPLAY_UNIT:
+            if forward:
+                self.next_page()
+            else:
+                self.previous_page()
 
     def _canvas_context_token(self) -> tuple[int, int, str | None]:
         return (

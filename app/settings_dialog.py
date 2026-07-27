@@ -315,20 +315,41 @@ class SettingsDialog(QDialog):
         spread_form.addRow(self.single_first_checkbox)
         self.wide_single_checkbox = QCheckBox("横長画像を単独表示", spread_group)
         spread_form.addRow(self.wide_single_checkbox)
+        self.viewer_canvas_click_direction_combo = QComboBox(spread_group)
+        self.viewer_canvas_click_direction_combo.addItem(
+            "右側で次へ／左側で前へ",
+            "right_next",
+        )
+        self.viewer_canvas_click_direction_combo.addItem(
+            "左側で次へ／右側で前へ",
+            "left_next",
+        )
+        spread_form.addRow(
+            "左右クリックのページ送り方向:",
+            self.viewer_canvas_click_direction_combo,
+        )
         self.viewer_canvas_left_click_combo = QComboBox(spread_group)
         self.viewer_canvas_left_click_combo.addItem(
-            "1ページ進む",
+            "クリックでページ移動しない",
+            "none",
+        )
+        self.viewer_canvas_left_click_combo.addItem(
+            "1ページずつ移動",
             "next_single_page",
         )
         self.viewer_canvas_left_click_combo.addItem(
-            "見開き単位で進む",
+            "現在のページ送り単位で移動",
             "next_display_unit",
         )
-        self.viewer_canvas_left_click_combo.addItem("何もしない", "none")
         spread_form.addRow(
-            "画像表示領域を左クリックしたとき:",
+            "左右クリックのページ移動量:",
             self.viewer_canvas_left_click_combo,
         )
+        self.viewer_slider_wheel_single_page_checkbox = QCheckBox(
+            "シークバー上のマウスホイールで1ページずつ移動する",
+            spread_group,
+        )
+        spread_form.addRow(self.viewer_slider_wheel_single_page_checkbox)
 
         fullscreen_group = QGroupBox("全画面UI", tab)
         fullscreen_form = QFormLayout(fullscreen_group)
@@ -893,11 +914,23 @@ class SettingsDialog(QDialog):
             bool(self.config.get("treat_wide_image_as_single", True))
         )
         self._select_data(
+            self.viewer_canvas_click_direction_combo,
+            self.config.get("viewer_canvas_click_direction", "right_next"),
+        )
+        self._select_data(
             self.viewer_canvas_left_click_combo,
             self.config.get(
                 "viewer_canvas_left_click_action",
                 "next_single_page",
             ),
+        )
+        self.viewer_slider_wheel_single_page_checkbox.setChecked(
+            bool(
+                self.config.get(
+                    "viewer_slider_wheel_single_page_enabled",
+                    False,
+                )
+            )
         )
         self.fullscreen_hide_ui_checkbox.setChecked(
             bool(self.config.get("hide_ui_in_fullscreen", False))
@@ -1261,8 +1294,14 @@ class SettingsDialog(QDialog):
             "gap": self.gap_spin.value(),
             "single_first_page": self.single_first_checkbox.isChecked(),
             "treat_wide_image_as_single": self.wide_single_checkbox.isChecked(),
+            "viewer_canvas_click_direction": str(
+                self.viewer_canvas_click_direction_combo.currentData()
+            ),
             "viewer_canvas_left_click_action": str(
                 self.viewer_canvas_left_click_combo.currentData()
+            ),
+            "viewer_slider_wheel_single_page_enabled": (
+                self.viewer_slider_wheel_single_page_checkbox.isChecked()
             ),
             "hide_ui_in_fullscreen": self.fullscreen_hide_ui_checkbox.isChecked(),
             "hide_cursor_in_fullscreen": (

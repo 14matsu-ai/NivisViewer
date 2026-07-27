@@ -322,3 +322,28 @@ def test_cancel_does_not_save_mouse_settings(
 
     assert config.get("mouse_gestures_enabled") is True
     assert config.get("mouse_gesture_min_distance") == 36
+
+
+def test_viewer_canvas_click_controls_use_requested_labels(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    config = make_config(tmp_path)
+    dialog = SettingsDialog(config)
+
+    assert dialog.viewer_canvas_click_direction_combo.currentData() == "right_next"
+    assert dialog.viewer_canvas_left_click_combo.currentData() == "next_single_page"
+    assert not dialog.viewer_slider_wheel_single_page_checkbox.isChecked()
+    assert [
+        dialog.viewer_canvas_left_click_combo.itemText(index)
+        for index in range(dialog.viewer_canvas_left_click_combo.count())
+    ] == [
+        "クリックでページ移動しない",
+        "1ページずつ移動",
+        "現在のページ送り単位で移動",
+    ]
+    assert (
+        dialog.viewer_slider_wheel_single_page_checkbox.text()
+        == "シークバー上のマウスホイールで1ページずつ移動する"
+    )
+    dialog.reject()

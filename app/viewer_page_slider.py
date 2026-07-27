@@ -10,6 +10,8 @@ class ViewerPageSlider(QSlider):
 
     nextSinglePageRequested = Signal()
     previousSinglePageRequested = Signal()
+    nextDisplayUnitRequested = Signal()
+    previousDisplayUnitRequested = Signal()
     focusedPageRequested = Signal(int)
     wheelInteraction = Signal()
 
@@ -18,9 +20,14 @@ class ViewerPageSlider(QSlider):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(Qt.Orientation.Horizontal, parent)
+        self._single_page_wheel_enabled = False
         self._angle_remainder = 0
         self._pixel_remainder = 0
         self.valueChanged.connect(self.focusedPageRequested)
+
+    def set_single_page_wheel_enabled(self, enabled: bool) -> None:
+        self._single_page_wheel_enabled = bool(enabled)
+        self.reset_wheel_accumulator()
 
     def set_page_state(self, page_count: int, focused_index: int) -> None:
         count = max(0, int(page_count))
@@ -51,6 +58,7 @@ class ViewerPageSlider(QSlider):
             return
 
         direction = 0
+        steps = 0
         if vertical_pixel:
             if self._pixel_remainder and (
                 self._pixel_remainder > 0
@@ -59,7 +67,10 @@ class ViewerPageSlider(QSlider):
             self._pixel_remainder += vertical_pixel
             if abs(self._pixel_remainder) >= self._PIXEL_STEP:
                 direction = 1 if self._pixel_remainder > 0 else -1
-                self._pixel_remainder -= direction * self._PIXEL_STEP
+                steps = abs(self._pixel_remainder) // self._PIXEL_STEP
+                self._pixel_remainder -= (
+                    direction * self._PIXEL_STEP * steps
+                )
                 self._angle_remainder = 0
         elif vertical_angle:
             if self._angle_remainder and (
@@ -69,11 +80,21 @@ class ViewerPageSlider(QSlider):
             self._angle_remainder += vertical_angle
             if abs(self._angle_remainder) >= self._ANGLE_STEP:
                 direction = 1 if self._angle_remainder > 0 else -1
-                self._angle_remainder -= direction * self._ANGLE_STEP
+                steps = abs(self._angle_remainder) // self._ANGLE_STEP
+                self._angle_remainder -= (
+                    direction * self._ANGLE_STEP * steps
+                )
                 self._pixel_remainder = 0
 
-        if direction > 0:
-            self.previousSinglePageRequested.emit()
-        elif direction < 0:
-            self.nextSinglePageRequested.emit()
+        for _index in range(steps):
+            if direction > 0:
+                if self._single_page_wheel_enabled:
+                    self.previousSinglePageRequested.emit()
+                else:
+                    self.previousDisplayUnitRequested.emit()
+            elif direction < 0:
+                if self._single_page_wheel_enabled:
+                    self.nextSinglePageRequested.emit()
+                else:
+                    self.nextDisplayUnitRequested.emit()
         event.accept()

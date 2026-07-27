@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QTimer, Qt
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QTimer, Qt
 from PySide6.QtGui import QCursor, QMouseEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -66,6 +66,7 @@ class FullscreenChromeController(QObject):
         self._scheduled_hide_generation = 0
         self._cursor_timer_generation = 0
         self._scheduled_cursor_generation = 0
+        self._last_bottom_overlay_height = 1
 
         parent = window.centralWidget()
         if parent is None:
@@ -291,7 +292,11 @@ class FullscreenChromeController(QObject):
 
     def is_edge_trigger(self, global_position: QPoint) -> bool:
         self._update_pointer_state(global_position)
-        return self.pointer_in_top_trigger or self.pointer_in_bottom_trigger
+        return bool(
+            self.pointer_in_top_trigger
+            or self.pointer_in_bottom_trigger
+            or self.pointer_in_bottom_overlay
+        )
 
     def schedule_hide(self) -> None:
         if not self.fullscreen or not self.hide_ui_enabled:
@@ -367,12 +372,28 @@ class FullscreenChromeController(QObject):
     def _show_overlay(self, side: str) -> None:
         self._update_geometry()
         if side == "top":
+            if (
+                self.top_overlay_visible
+                and self.top_overlay.isVisible()
+                and not self.bottom_overlay_visible
+            ):
+                self._requested_overlay = "top"
+                self._invalidate_hide_timer()
+                return
             self.bottom_overlay.hide()
             self.top_overlay.show()
             self.top_overlay.raise_()
             self.top_overlay_visible = True
             self.bottom_overlay_visible = False
         else:
+            if (
+                self.bottom_overlay_visible
+                and self.bottom_overlay.isVisible()
+                and not self.top_overlay_visible
+            ):
+                self._requested_overlay = "bottom"
+                self._invalidate_hide_timer()
+                return
             self.top_overlay.hide()
             self.bottom_overlay.show()
             self.bottom_overlay.raise_()
@@ -425,6 +446,7 @@ class FullscreenChromeController(QObject):
         width = max(1, self.overlay_parent.width())
         top_height = max(1, self.top_overlay.sizeHint().height())
         bottom_height = max(1, self.bottom_overlay.sizeHint().height())
+        self._last_bottom_overlay_height = bottom_height
         self.top_overlay.setGeometry(0, 0, width, top_height)
         self.bottom_overlay.setGeometry(
             0,
@@ -521,11 +543,25 @@ class FullscreenChromeController(QObject):
                 self.top_overlay.mapFromGlobal(global_position)
             )
         )
-        self.pointer_in_bottom_overlay = bool(
-            self.bottom_overlay.isVisible()
-            and self.bottom_overlay.rect().contains(
-                self.bottom_overlay.mapFromGlobal(global_position)
-            )
+        self.pointer_in_bottom_overlay = self._pointer_in_bottom_hover_region(
+            global_position
+        )
+
+    def _pointer_in_bottom_hover_region(
+        self,
+        global_position: QPoint,
+    ) -> bool:
+        return self._bottom_hover_region_global().contains(global_position)
+
+    def _bottom_hover_region_global(self) -> QRect:
+        bottom_height = max(1, self._last_bottom_overlay_height)
+        local_top = max(0, self.overlay_parent.height() - bottom_height)
+        top_global = self.overlay_parent.mapToGlobal(QPoint(0, local_top)).y()
+        frame = self.window.frameGeometry()
+        top_global = min(top_global, frame.bottom())
+        return QRect(
+            QPoint(frame.left(), top_global),
+            QPoint(frame.right(), frame.bottom()),
         )
 
     def _pointer_in_reveal_area(self, global_position: QPoint) -> bool:

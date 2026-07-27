@@ -229,3 +229,21 @@ def test_saved_partial_mouse_bindings_are_not_filled_with_new_defaults(
         "U": "next_page",
         "DR": "last_page",
     }
+
+
+def test_viewer_canvas_side_and_slider_wheel_settings_are_normalized(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        '{"viewer_canvas_click_direction": "diagonal", '
+        '"viewer_canvas_left_click_action": "invalid", '
+        '"viewer_slider_wheel_single_page_enabled": "yes"}',
+        encoding="utf-8",
+    )
+
+    restored = ConfigManager(path).load()
+
+    assert restored["viewer_canvas_click_direction"] == "right_next"
+    assert restored["viewer_canvas_left_click_action"] == "next_single_page"
+    assert restored["viewer_slider_wheel_single_page_enabled"] is False

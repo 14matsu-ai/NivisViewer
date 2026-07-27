@@ -906,10 +906,9 @@ def test_viewer_left_click_moves_one_logical_page_but_next_is_display_unit(
     QTest.mouseClick(
         window.viewer,
         Qt.MouseButton.LeftButton,
-        pos=QPoint(window.viewer.width() // 2, window.viewer.height() // 2),
+        pos=QPoint(window.viewer.width() - 5, window.viewer.height() // 2),
     )
-    assert window.viewer.canvas_pointer.pending
-    QTest.qWait(QApplication.doubleClickInterval() + 250)
+    assert not window.viewer.canvas_pointer.pending
     assert window.model.current_index == 2
     assert window.model.focused_index == 2
     window.next_page()
