@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass
 from datetime import datetime
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, Signal
@@ -8,9 +10,11 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QTableView,
     QVBoxLayout,
 )
@@ -20,6 +24,69 @@ from .file_operation_plan import (
     FileConflict,
     FileOperationPlan,
 )
+
+
+@dataclass(frozen=True)
+class ConflictPresentationModel:
+    source_name: str
+    source_path: str
+    source_size: str
+    source_modified_time: str
+    destination_name: str
+    destination_path: str
+    destination_size: str
+    destination_modified_time: str
+    item_position: str
+    item_kind: str
+    selected_action: str
+
+    @classmethod
+    def from_conflict(
+        cls,
+        conflict: FileConflict,
+        *,
+        item_index: int,
+        total_count: int,
+        selected_action: ConflictResolution,
+    ) -> ConflictPresentationModel:
+        source_path = conflict.source_path or ""
+        destination_path = conflict.destination_path or ""
+        return cls(
+            source_name=os.path.basename(source_path) or "(不明)",
+            source_path=source_path or "(不明)",
+            source_size=cls._size_text(
+                conflict.source_size,
+                conflict.source_kind,
+            ),
+            source_modified_time=FileConflictTableModel._format_mtime(
+                conflict.source_mtime_ns
+            )
+            or "(不明)",
+            destination_name=os.path.basename(destination_path) or "(不明)",
+            destination_path=destination_path or "(不明)",
+            destination_size=cls._size_text(
+                conflict.destination_size,
+                conflict.destination_kind,
+            ),
+            destination_modified_time=FileConflictTableModel._format_mtime(
+                conflict.destination_mtime_ns
+            )
+            or "(不明)",
+            item_position=f"{max(1, item_index)} / {max(1, total_count)}",
+            item_kind=(
+                f"{conflict.source_kind or '不明'} → "
+                f"{conflict.destination_kind or '不明'}"
+            ),
+            selected_action=selected_action.value,
+        )
+
+    @staticmethod
+    def _size_text(size: int | None, kind: str | None) -> str:
+        if kind == "directory":
+            return "フォルダ（サイズ不明）"
+        if size is None:
+            return "(不明)"
+        return f"{size:,} bytes"
 
 
 class FileConflictTableModel(QAbstractTableModel):
@@ -173,8 +240,37 @@ class ConflictResolutionDialog(QDialog):
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
         self.table.setWordWrap(False)
+        self.table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.same_kind_checkbox = QCheckBox("同じ種類の衝突へ適用", self)
+        self.detail_labels: dict[str, QLabel] = {}
+        detail_layout = QGridLayout()
+        detail_rows = (
+            ("position", "現在の処理"),
+            ("source_name", "同名ファイル名"),
+            ("source_path", "コピー元／移動元"),
+            ("source_meta", "元のサイズ／更新日時"),
+            ("destination_path", "コピー先／移動先"),
+            ("destination_meta", "先のサイズ／更新日時"),
+            ("kind", "種別"),
+            ("action", "選択中の処理"),
+        )
+        for row, (key, caption) in enumerate(detail_rows):
+            caption_label = QLabel(caption, self)
+            value_label = QLabel("(不明)", self)
+            value_label.setObjectName(f"conflict_{key}_label")
+            value_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            value_label.setWordWrap(key in {"source_path", "destination_path"})
+            value_label.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Preferred,
+            )
+            detail_layout.addWidget(caption_label, row, 0)
+            detail_layout.addWidget(value_label, row, 1)
+            self.detail_labels[key] = value_label
+        detail_layout.setColumnStretch(1, 1)
 
         action_layout = QHBoxLayout()
         self.resolution_buttons: dict[ConflictResolution, QPushButton] = {}
@@ -209,12 +305,21 @@ class ConflictResolutionDialog(QDialog):
             )
         )
         layout.addWidget(self.table, 1)
+        layout.addLayout(detail_layout)
         layout.addLayout(action_layout)
         layout.addWidget(self.buttons)
         self.table.selectionModel().selectionChanged.connect(
-            lambda *_args: self._update_resolution_buttons()
+            lambda *_args: self._update_current_conflict()
         )
+        self.table.selectionModel().currentChanged.connect(
+            lambda *_args: self._update_current_conflict()
+        )
+        if self.model.rowCount() > 0:
+            first = self.model.index(0, 0)
+            self.table.setCurrentIndex(first)
+            self.table.selectRow(0)
         self._update_resolution_buttons()
+        self._update_details()
 
     @property
     def resolutions(self) -> dict[str, ConflictResolution]:
@@ -247,6 +352,46 @@ class ConflictResolutionDialog(QDialog):
             resolution,
             same_kind=self.same_kind_checkbox.isChecked(),
         )
+        self._update_details()
+
+    def _update_current_conflict(self) -> None:
+        self._update_resolution_buttons()
+        self._update_details()
+
+    def _update_details(self) -> None:
+        if not self.plan.conflicts:
+            return
+        row = self.table.currentIndex().row()
+        if not (0 <= row < len(self.plan.conflicts)):
+            selected = self.table.selectionModel().selectedRows()
+            row = selected[0].row() if selected else 0
+        conflict = self.plan.conflicts[row]
+        presentation = ConflictPresentationModel.from_conflict(
+            conflict,
+            item_index=row + 1,
+            total_count=len(self.plan.conflicts),
+            selected_action=self.model.resolutions[conflict.conflict_id],
+        )
+        values = {
+            "position": presentation.item_position,
+            "source_name": presentation.source_name,
+            "source_path": presentation.source_path,
+            "source_meta": (
+                f"{presentation.source_size} / "
+                f"{presentation.source_modified_time}"
+            ),
+            "destination_path": presentation.destination_path,
+            "destination_meta": (
+                f"{presentation.destination_size} / "
+                f"{presentation.destination_modified_time}"
+            ),
+            "kind": presentation.item_kind,
+            "action": presentation.selected_action,
+        }
+        for key, value in values.items():
+            label = self.detail_labels[key]
+            label.setText(value)
+            label.setToolTip(value)
 
     def _update_resolution_buttons(self) -> None:
         selected = tuple(

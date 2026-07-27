@@ -11,6 +11,7 @@ from threading import Event
 from typing import Iterable
 
 from .file_operation_service import FileOperationKind, FileOperationRequest
+from .file_operation_artifact import FileOperationArtifactPolicy
 from .windows_filename import validate_windows_filename
 
 
@@ -35,6 +36,7 @@ class FileConflictKind(str, Enum):
     DESTINATION_PARENT_MISSING = "destination_parent_missing"
     DESTINATION_READ_ONLY = "destination_read_only"
     INVALID_DESTINATION_NAME = "invalid_destination_name"
+    INTERNAL_STAGING_ARTIFACT = "internal_staging_artifact"
 
 
 class ConflictResolution(str, Enum):
@@ -160,6 +162,13 @@ class FileOperationPlanner:
                 return self._cancelled_plan(
                     request, operation_id, sources, destination_root
                 )
+            if FileOperationArtifactPolicy.is_internal_operation_artifact(source):
+                errors.append(
+                    "INTERNAL_STAGING_ARTIFACT: "
+                    "NivisViewerの未完了一時ファイルは通常の"
+                    f"ファイル操作対象にできません: {source}"
+                )
+                continue
             try:
                 item = self._inspect_source(source, destination_root, cancel, warnings)
             except FileNotFoundError:

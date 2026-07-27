@@ -27,7 +27,27 @@ class PdfiumServiceState(StrEnum):
     STOPPED = "stopped"
 
 
+class PdfAvailabilityState(StrEnum):
+    UNKNOWN = "unknown"
+    CHECKING = "checking"
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    ERROR = "error"
+    STOPPED = "stopped"
+
+
+@dataclass(frozen=True)
+class PdfAvailabilitySnapshot:
+    state: PdfAvailabilityState
+    backend_name: str | None = None
+    library_version: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    checked_at: float | None = None
+
+
 _CONTROL_CLOSE_PRIORITY = -10_000
+_CONTROL_AVAILABILITY_PRIORITY = -20_000
 
 
 @dataclass(order=True)
@@ -53,7 +73,12 @@ class _PendingJob:
 class PdfiumService:
     """Application-wide serialized gateway for every PDFium call."""
 
-    def __init__(self, backend: PdfBackend | None = None) -> None:
+    def __init__(
+        self,
+        backend: PdfBackend | None = None,
+        *,
+        auto_probe: bool = True,
+    ) -> None:
         self.backend = backend or PdfiumBackend()
         self._queue: PriorityQueue[_QueueItem] = PriorityQueue()
         self._lock = Lock()
@@ -65,12 +90,19 @@ class PdfiumService:
         self._shutdown_future: Future | None = None
         self._active_calls = 0
         self.maximum_concurrent_calls = 0
+        self._availability = PdfAvailabilitySnapshot(
+            PdfAvailabilityState.UNKNOWN,
+            backend_name=type(self.backend).__name__,
+        )
+        self._availability_future: Future | None = None
         self._worker = Thread(
             target=self._run,
             name="NivisViewer-Pdfium",
             daemon=True,
         )
         self._worker.start()
+        if auto_probe:
+            self.request_availability_probe()
 
     @property
     def state(self) -> PdfiumServiceState:
@@ -79,19 +111,91 @@ class PdfiumService:
 
     @property
     def is_available(self) -> bool:
-        checker = getattr(self.backend, "is_available", None)
-        if not callable(checker):
-            return self.state is PdfiumServiceState.RUNNING
+        return (
+            self.availability_snapshot.state
+            is PdfAvailabilityState.AVAILABLE
+        )
+
+    @property
+    def availability_snapshot(self) -> PdfAvailabilitySnapshot:
+        with self._lock:
+            return self._availability
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+    def request_availability_probe(self, *, force: bool = False) -> bool:
+        with self._lock:
+            if self._state is not PdfiumServiceState.RUNNING:
+                return False
+            if (
+                not force
+                and self._availability.state
+                in {
+                    PdfAvailabilityState.CHECKING,
+                    PdfAvailabilityState.AVAILABLE,
+                    PdfAvailabilityState.UNAVAILABLE,
+                }
+            ):
+                return False
+            self._availability = PdfAvailabilitySnapshot(
+                PdfAvailabilityState.CHECKING,
+                backend_name=type(self.backend).__name__,
+            )
+
+        def check() -> bool:
+            checker = getattr(self.backend, "is_available", None)
+            try:
+                available = (
+                    bool(checker())
+                    if callable(checker)
+                    else True
+                )
+            except PdfBackendError as exc:
+                snapshot = PdfAvailabilitySnapshot(
+                    PdfAvailabilityState.UNAVAILABLE
+                    if exc.code is PdfErrorCode.BACKEND_UNAVAILABLE
+                    else PdfAvailabilityState.ERROR,
+                    backend_name=type(self.backend).__name__,
+                    error_code=exc.code.value,
+                    error_message=exc.debug_message or exc.user_message,
+                    checked_at=time.monotonic(),
+                )
+            except Exception as exc:
+                snapshot = PdfAvailabilitySnapshot(
+                    PdfAvailabilityState.ERROR,
+                    backend_name=type(self.backend).__name__,
+                    error_code=type(exc).__name__,
+                    error_message=str(exc),
+                    checked_at=time.monotonic(),
+                )
+            else:
+                module = getattr(self.backend, "_pdfium_module", None)
+                version = getattr(module, "__version__", None)
+                snapshot = PdfAvailabilitySnapshot(
+                    PdfAvailabilityState.AVAILABLE
+                    if available
+                    else PdfAvailabilityState.UNAVAILABLE,
+                    backend_name=type(self.backend).__name__,
+                    library_version=str(version) if version is not None else None,
+                    checked_at=time.monotonic(),
+                )
+            with self._lock:
+                if self._state is PdfiumServiceState.RUNNING:
+                    self._availability = snapshot
+            return snapshot.state is PdfAvailabilityState.AVAILABLE
+
         future = self._submit(
             ("availability", self._next_sequence()),
-            int(PdfRenderPriority.DOCUMENT_OPEN),
-            checker,
+            _CONTROL_AVAILABILITY_PRIORITY,
+            check,
             deduplicate=False,
         )
-        try:
-            return bool(self._wait(future, None))
-        except PdfBackendError:
-            return False
+        with self._lock:
+            self._availability_future = future
+        return True
 
     def open_document(
         self,
@@ -198,6 +302,11 @@ class PdfiumService:
                 close_future = self._shutdown_future
             else:
                 self._state = PdfiumServiceState.SHUTTING_DOWN
+                self._availability = PdfAvailabilitySnapshot(
+                    PdfAvailabilityState.STOPPED,
+                    backend_name=type(self.backend).__name__,
+                    checked_at=time.monotonic(),
+                )
                 active_key = (
                     self._active_job.key
                     if self._active_job is not None
@@ -322,6 +431,11 @@ class PdfiumService:
                 if job.control == "shutdown_close_all":
                     with self._lock:
                         self._state = PdfiumServiceState.STOPPED
+                        self._availability = PdfAvailabilitySnapshot(
+                            PdfAvailabilityState.STOPPED,
+                            backend_name=type(self.backend).__name__,
+                            checked_at=time.monotonic(),
+                        )
                         self._closing_documents.clear()
                         self._active_job = None
                     return

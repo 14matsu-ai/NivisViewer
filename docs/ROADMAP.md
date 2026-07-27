@@ -117,14 +117,27 @@
     - PDF shutdown／document close control barrierとpending cancellation
     - folder merge MOVEのchild単位結果とresidual cut state
     - COPY／MOVE／partial置換のtransactional MetadataStore方針
-27. 後続P2候補：安定性と責務分割
+27. Stability Sprint P2：起動・診断・shutdownの安定化（完了）
     - startup／recent pathの非同期probe
     - diagnosticsのcached PDF availability
     - shutdown時processEvents再入除去
-    - worker lifetime整理
+    - FileOperationQueue、Windows Shell preview、PathAvailability worker lifetime整理
+    - ApplicationShutdownCoordinatorによる段階終了とshutdown snapshot
+28. Critical Follow-up：CUT、見開きPNG、関連付けopen、CUT表示（完了）
+    - internal CUTをSource of Truthとするphysical MOVE経路修正
+    - left／right独立slotとfocused-page first-frame gate
+    - Windows既定関連付けとapplication picker fallback
+    - path identityベースのExplorer風CUT半透明表示
+29. Critical File Operation Repair：一時artifact・衝突詳細・拡張子なし表示（完了）
+    - canonical staging lifecycleとnested temp artifact防止
+    - publish／cleanup事後条件とorphan artifact診断
+    - Planner／Browser／clipboard／D&Dでのinternal artifact拒否
+    - ConflictPresentationModelによるsource／destination詳細表示
+    - extensionless generic fileと通常`.tmp`の表示・外部open
+30. 後続候補：責務分割と公開前監査
     - Windowクラスの段階的分割
     - 公開前ライセンス監査
-28. 後続候補：ファイル操作と項目表示の拡張
+31. 後続候補：ファイル操作と項目表示の拡張
     - ファイル操作履歴と安全に可能なrename／moveのUndo
     - pause／resume、失敗項目の再試行
     - 右ドラッグ後のcopy／moveメニュー
@@ -133,9 +146,9 @@
     - 再帰的なサブフォルダ表示
     - PDFパスワード入力、PDF目次
     - 画像中央クロップ／余白除去、Viewerメモリ予算調整
-29. 後続候補：レート／タグ編集UIと検索
+32. 後続候補：レート／タグ編集UIと検索
     - 基本ナビゲーションとファイル操作の安定後に着手
     - ZipPla `{zpi$...}` の明示的な読み取り互換
     - タグ・レート検索と絞り込み
     - サムネイル上のレート／タグ表示
-30. 公開前ライセンス監査、コード署名の将来検討
+33. 公開前ライセンス監査、コード署名の将来検討

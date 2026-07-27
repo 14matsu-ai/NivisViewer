@@ -203,9 +203,9 @@ FileOperationCoordinator
 
 名前変更、コピー、移動、ごみ箱、新規フォルダ作成は最大1スレッドのFileOperationExecutorで直列実行します。workerはQtモデルやWidgetを変更せず、開始、処理済み件数、総件数、項目単位の成否、キャンセル状態をdataclassでGUIスレッドへ返します。単一の巨大ファイルを強制停止せず、ファイル間とディレクトリ項目間の安全な境界でキャンセルを確認します。BrowserWindow終了時は新しい結果を適用せず、実行中workerを無制限にwaitしません。
 
-ファイルコピーは`shutil.copy2()`、フォルダコピーはcopy2を使う再帰コピーにより、対象自身のmtimeを可能な範囲で維持します。コピーは同じ親の一時名へ完了させてからrenameし、キャンセルまたは失敗時はNivisViewerが作成した一時コピーだけを回収します。クロスボリューム移動はコピー完了前に元項目を削除せず、キャンセル時は確定済みコピーをロールバックして元を維持します。子の追加・削除で変化する親フォルダmtimeは通常のOS動作として許容します。MetadataStoreの更新日時を元ファイルmtimeへ書き戻しません。
+ファイルコピーは`ChunkedFileCopier`が4 MiB単位で読み、byte進捗を返します。出力は移動先と同じ親の一時名へ完成させ、flush／metadata反映後にrenameまたは`os.replace()`で公開します。クロスボリュームMOVEはdestination完成確認後だけsourceを削除し、source不存在を事後条件として検証します。キャンセルまたは失敗時はNivisViewerが作成した未公開一時物だけを回収し、元項目と既存destinationを保護します。子の追加・削除で変化する親フォルダmtimeは通常のOS動作として許容し、MetadataStoreの更新日時を元ファイルmtimeへ書き戻しません。
 
-同名項目は自動上書きしません。Sprint 10のBrowserWindowは複数衝突でダイアログを連続表示せず、既定ですべてスキップして終了時に件数とエラー種別を一度だけ通知します。FileOperationServiceには拡張子を維持した「`book - コピー.zip`」「`book - コピー (2).zip`」形式の別名生成と`FileCollisionPolicy.RENAME`を用意し、将来の衝突選択UIから利用できるようにしています。
+同名項目は自動上書きしません。現在は`FileOperationPlanner`が衝突をまとめ、1つの`ConflictResolutionDialog`でskip、両方残す、replace、folder merge、同種への一括適用、全体cancelを選択します。拡張子を維持した「`book - コピー.zip`」「`book - コピー (2).zip`」形式の別名生成も同じ計画・queue経路を通ります。
 
 通常のDeleteとコンテキストメニューの「ごみ箱へ移動」はWindows Shellの`SHFileOperationW`へ`FOF_ALLOWUNDO`、`FOF_NOCONFIRMATION`、`FOF_NOERRORUI`を指定します。NivisViewerが対象件数または単一名を一度確認するため、OS確認ダイアログを重ねません。Shell API失敗、キャンセル、API利用不能、操作後も元パスが残る場合は失敗として返し、`os.remove()`や`shutil.rmtree()`による永久削除へ切り替えません。Shift+Deleteと完全削除APIは未実装です。
 
@@ -219,7 +219,7 @@ BrowserNavigationHistoryもrename/move成功後だけフォルダパスと選択
 
 ### 可視範囲優先サムネイル
 
-BrowserThumbnailSchedulerは`ScrollPerPixel`のQListViewについて、viewport、gridSize、スクロール値、モデル件数から可視行を定数時間で近似します。優先順位はVISIBLE、SELECTED、PREFETCHです。可視範囲を先に要求し、その前後各2画面だけを先読みします。1万件でも要求数は可視範囲と限定先読みに収まり、全行の`visualRect()`走査や全件要求を行いません。
+BrowserThumbnailSchedulerは`ScrollPerPixel`のQListViewについて、viewport、gridSize、スクロール値、モデル件数から可視行を定数時間で近似します。優先順位はVISIBLE、SELECTED、PREFETCHです。可視範囲を先に要求し、その前後各1画面だけを先読みします。1万件でも要求数は可視範囲と限定先読みに収まり、全行の`visualRect()`走査や全件要求を行いません。
 
 ThumbnailProviderはQThreadPoolの優先度を使い、未開始の低優先度要求を可視要求が追い越せるようにします。同一パス・サイズ・generationのpendingは重複させず、queued要求は優先度を引き上げられます。高速スクロール中はselection以外をdisk-hit-onlyのPREFETCHとして扱い、未開始の旧PREFETCHを`tryTake()`可能な範囲で除外します。最後のスクロールから180ms後に可視範囲を再計算して前後1画面の先読みを再開します。PREFETCH missはdecodeも永続保存も行わず、VISIBLE／SELECTEDへ昇格した時だけ適切なDPR版を生成します。通常画像の実行中デコードは強制停止せず、外部7-Zip処理にはcancel tokenを渡します。完了結果はパスとthumbnail generationで安全にキャッシュ・照合します。
 
@@ -549,7 +549,7 @@ Explorer external drop
 
 `TextPreviewProvider`はBrowser workerで最大64 KiBだけを読み、BOM付きUTF-8、UTF-16 LE／BE、UTF-32 LE／BE、UTF-8、CP932の順で判定します。NULや過剰な制御文字を含む入力はbinaryとして扱います。内容はHTMLとして解釈せず、先頭行だけを固定paper frameへ`QPainter`で描画します。text render versionを永続cache fingerprintへ含め、PREFETCHではファイルを読みません。
 
-`WindowsShellPreviewService`はBrowserの直列worker lane内でSTAを初期化し、`IShellItemImageFactory::GetImage`を一度に1要求だけ実行します。PREFETCHは`THUMBNAILONLY | INCACHEONLY`、可視／選択要求はShell抽出を許可します。返された`HBITMAP`は独立した`QImage`へcopyしてnative handleを必ず解放します。Shell由来サムネイルはNivisViewerのディスクcacheへ保存せず、メモリcacheとWindows自身のcacheだけを利用します。関連付けアイコンはextension／folder、logical size×DPRの物理bucketで保持し、delegateへQImageを直接渡します。
+`WindowsShellPreviewService`は専用STA threadで`IShellItemImageFactory::GetImage`を一度に1要求だけ実行します。PREFETCHは`THUMBNAILONLY | INCACHEONLY`、可視／選択要求はShell抽出を許可します。返された`HBITMAP`は独立した`QImage`へcopyし、HBITMAP、COM interface、DCをnative側で解放します。shutdownは新規要求を拒否し、未開始要求をcancelしてsentinelを送り、短いbounded joinを行います。通常終了は`STOPPED`、応答しないnative callは強制停止せず`STUCK`と診断します。Shell由来サムネイルはNivisViewerのディスクcacheへ保存せず、メモリcacheとWindows自身のcacheだけを利用します。
 
 動画はWindows Shell cache、Windows Shell抽出、任意FFmpeg、関連付けアイコンの順に段階的に戻ります。FFmpegは自動取得・自動同梱せず、明示path、アプリ配下候補、PATHから既存実行ファイルだけを検出します。呼び出しは引数配列、`shell=False`、stdin無効、Windows console非表示、出力上限、timeout、cancel、terminate／killを持ちます。Shell由来は永続化せず、FFmpegで可視／選択要求から生成したframeだけを既存ポータブルcacheへ保存できます。
 
@@ -768,6 +768,197 @@ destinationへtransaction内でrelocateする。destination bookmarkを優先し
 source bookmarkは競合がない場合だけ移す。destination公開後にsourceが残った
 partial MOVEはCOPY＋REPLACE相当としてdestinationをresetし、source metadataを
 元pathに維持する。skip、cancel、publish失敗ではDBを変更しない。
+
+## Stability Sprint P2: startup, diagnostics, and deterministic shutdown
+
+### 現行コンポーネント
+
+```text
+ApplicationController
+├─ StartupRestoreCoordinator
+│  └─ PathAvailabilityService
+├─ ApplicationShutdownCoordinator
+├─ FileOperationQueue lifecycle
+├─ PdfiumService
+│  └─ cached PdfAvailabilitySnapshot
+└─ BrowserWindow
+   ├─ HistoryModel
+   ├─ BookmarkModel
+   └─ FolderBookmarkModel
+      └─ shared PathAvailabilityService
+
+PreviewProviderRegistry
+└─ WindowsShellPreviewService
+   └─ dedicated STA thread lifecycle
+```
+
+起動時はBrowserWindowを先に表示し、`last_open_path`を字句的に正規化してから
+`StartupRestoreCoordinator`が共有`PathAvailabilityService`へprobeを要求する。
+GUI threadは`exists()`、`is_dir()`、`is_file()`、`stat()`、`resolve()`で起動対象を
+確認しない。AVAILABLEだけを既存open経路へ渡し、MISSING、UNAVAILABLE、ERRORでは
+現在UIと設定値を維持して非モーダル通知する。`--no-restore`はprobeを発行せず、
+CLI／単一instanceからの明示openは進行中のrestore generationをcancelする。
+
+Viewerのrecentと場所表示も同じserviceを使用する。recentの失敗は現在の本を閉じず、
+履歴を自動削除しない。連続要求は最新generationだけを適用する。HistoryModel、
+BookmarkModel、FolderBookmarkModelはApplicationController所有の同一serviceを
+constructor injectionで共有し、paintではcached stateだけを読む。Modelごとの
+module-global poolは持たない。
+
+`PdfiumService`は`UNKNOWN`、`CHECKING`、`AVAILABLE`、`UNAVAILABLE`、`ERROR`、
+`STOPPED`の`PdfAvailabilitySnapshot`を保持する。初期probeと明示再確認だけを
+control priorityで実行し、診断ダイアログはcached snapshotを100 ms間隔で表示へ
+反映するだけである。ダイアログopenはPDF Future、Event、render queueを待たず、
+新しいrender jobやPDF document openを発行しない。
+
+### 設計原則とshutdown順序
+
+`FileOperationQueue`は`RUNNING`、`SHUTTING_DOWN`、`STOPPED`を持つ。shutdown開始後は
+enqueueと新しい衝突dialogを拒否し、待機項目をcancel、active項目へcancel tokenを
+通知する。完了は`shutdown_finished`、bounded timeoutは`shutdown_failed`で通知し、
+終了経路では`processEvents(AllEvents)`を使わない。最後のWindowでcancel終了を
+選んだ場合はcloseを一旦保留し、入力とD&Dを無効化してqueue完了後に一度だけcloseを
+再要求する。timeoutではworkerを強制停止せずWindowを維持する。
+
+ApplicationControllerの現行終了順は次のとおり。
+
+1. controllerをSHUTTING_DOWN相当にし、新規open／navigation／operationを拒否
+2. startup restoreをcancelし、Window入力を無効化
+3. FileOperationQueueの待機項目cancelとactive項目の安全な終了
+4. Viewer／BookSession、Browser scanner／thumbnail／previewの新規要求停止
+5. ArchiveBackendRegistryとAdjacentBookSearchをclose
+6. PathAvailabilityServiceを非ブロッキングにclose
+7. PdfiumServiceのpending cancel、close-all barrier、bounded join
+8. ImageWorkCoordinatorをshutdown
+9. ConfigManager save
+10. MetadataStore flush／close
+
+`ApplicationShutdownCoordinator`はこの後半を一度だけ実行する。開始時の
+`ApplicationShutdownSnapshot`はfile operation、PDF、Shell preview、path probe、
+thumbnailのpending件数を保持し、通常ログへ大量出力せず診断に利用できる。
+
+`WindowsShellPreviewService`は`RUNNING`、`SHUTTING_DOWN`、`STOPPED`、`STUCK`を
+区別する。未開始taskをcancel完了し、worker内でCOM interface、HBITMAP、DCを解放して
+`CoUninitialize`した後にbounded joinする。native Shell callが戻らない場合は
+強制停止せず`STUCK`と`last_shutdown_error`を残し、後着画像をUIへ適用しない。
+
+## Critical Follow-up: CUT、見開きslot、外部open
+
+```text
+InternalClipboardState
+├─ COPY
+├─ CUT
+├─ normalized absolute cut paths
+└─ operation request identity
+
+BrowserItemModel
+└─ path-based CutRole
+   └─ BrowserItemDelegate cut visual opacity
+
+ViewerDisplayUnit
+├─ left slot state
+└─ right slot state
+   ├─ EMPTY
+   ├─ LOADING
+   ├─ READY
+   ├─ FAILED
+   └─ CANCELLED
+
+SystemFileOpener
+├─ default Windows association
+└─ application picker fallback
+```
+
+NivisViewer内で開始したCUTは`InternalClipboardState`をoperation kindのSource of
+Truthとする。OS clipboardはURL転送に使うが、Qtから遅れて届くclipboard変更通知で
+CUTをCOPYへ上書きしない。COPY／CUTの切替、外部clipboard置換、完全MOVE、部分MOVE、
+終了時にpath集合を更新し、`BrowserItemModel.CutRole`は該当pathの行だけを再描画する。
+row番号や`QModelIndex`は保持しないため、sort、scan reset、別フォルダへの移動後も
+同じabsolute pathへCUT表示を復元できる。delegateはthumbnail、fallback icon、
+filename、type badgeを0.52 opacityで描き、selection／focus／hover／errorは通常濃度で
+後描画する。
+
+MOVEの完全成功条件は、destinationが公開済みかつsourceが物理的に不存在であること。
+同一volumeはrenameを優先し、`EXDEV`だけを一時copy、flush／fsync、publish、
+source削除の経路へfallbackする。destinationが完成してもsourceが残る場合は
+`DESTINATION_PUBLISHED_SOURCE_REMAINS`または`SOURCE_REMOVAL_FAILED`であり、
+完全成功とは扱わない。部分成功時は移動済みpathだけCUT集合から除外し、
+skip／failure／residual pathを再貼り付け候補として残す。
+
+`ViewerDisplayUnit`は表示順にleft／right（単独時はcenter）のslotを作り、各slotへ
+page identity、request id、image-cache generationを保持する。ready／failed結果は
+一致するslotだけを遷移させ、旧generationは適用しない。Browserから遅延寸法の
+選択ページを直接開いた際、初回frame gateのdecode中心は見開き先頭の
+`current_index`ではなく論理選択の`focused_index`とする。寸法確定で見開き先頭が
+補正されても選択ページをcacheから退避させず、最初のpaint後に相方とprefetchを
+開始する。decode failure、source unavailable、表示単位置換でもLOADINGを終了する。
+
+Browserのfolderは従来どおり内部navigationへ渡し、NivisViewer対応形式は内部Viewerへ
+渡す。`BrowserItem.openable_by_nivisviewer`がfalseの通常fileはdouble click、Enter、
+context openから`SystemFileOpener`へ一度だけ渡す。Windowsではwide-character Shell
+APIを使用し、関連付けがない場合だけapplication pickerへfallbackする。文字列結合した
+`cmd.exe`や`shell=True`は使用しない。対応拡張子の破損・access denied・decode errorは
+自動的に外部openせず、明示的な「既定のアプリで開く」だけを提供する。
+
+## Critical File Operation Repair: canonical staging lifecycle
+
+```text
+FileOperationArtifactPolicy
+├─ canonical staging name
+├─ internal artifact detection
+├─ nested artifact rejection / recovery derivation
+├─ atomic publish
+└─ orphan detection
+
+FileOperationService
+├─ stage
+├─ verify
+├─ publish
+├─ remove source
+└─ cleanup
+
+BrowserScanner
+├─ normal extensionless file
+└─ unconditional internal artifact exclusion
+
+ConflictPresentationModel
+├─ source details
+└─ destination details
+```
+
+ファイル／cross-volume MOVEのstagingは、必ず正規のfinal destinationから
+`.<final-name>.nivisviewer-<operation-id>-<item-id>.tmp`を一度だけ生成する。
+`FileOperationService`がstaging lifecycleを所有し、`ChunkedFileCopier`は指定された
+stagingへbyte-for-byteで書き、flush、fsync、size検証、metadata適用を行う。
+CopierはServiceから渡されたstagingを基準に別のstagingを生成しない。既存artifactを
+`create_staging_path()`へ渡した場合は、検証可能な層を剥がして元のfinalを復元してから
+新しいcanonical名を作るため、`.tmp.nivisviewer-...tmp`を生成しない。
+
+publishは`os.replace(staging, final)`で行い、finalが存在しstagingが存在しないことを
+事後条件とする。publish前のcancel／failureではartifactだけをcleanupしてsourceと既存
+finalを維持する。publish後にMOVE sourceが残った場合は部分成功であり、完成finalを
+削除せずCUT stateをsource側へ残す。cleanup失敗は`artifact_paths`と
+`cleanup_errors`を構造化結果へ保持し、操作パネルの詳細へ表示する。既存orphanは
+未回収データの可能性があるため自動削除せず、DEBUG診断へderived final、nested、
+size、mtime、final存在だけを記録する。
+
+内部artifact判定は`FileOperationArtifactPolicy`へ一元化する。BrowserScannerの列挙
+最上流、BrowserItemModel、Planner、Service、内部clipboard、D&D MIME、外部openの
+境界で常に除外／拒否する。show hidden／unsupported／systemを有効にしても表示しない。
+一方、suffixが空の`README`、`LICENSE`、日本語名、zero-byte file、および一般利用者の
+通常`.tmp`はartifactではない。unsupported generic itemとして表示し、Shell iconと
+`SystemFileOpener`を利用できる。
+
+`ConflictPresentationModel`は各衝突のsource／destination name、absolute path、size、
+mtime、file／folder kind、`1 / N`、現在actionを保持する。実dialogは選択行が変わる
+たびに全labelとtooltipを更新し、長いpath、日本語、空白、拡張子なしでもsourceと
+destinationを取り違えない。
+
+### 将来接続点
+
+応答しないUNC／Shell native callをprocess外へ隔離する構成、非モーダルな
+shutdown詳細パネル、SingleInstanceBrokerをshutdown coordinatorへ直接接続する処理、
+frozen版の異常終了snapshot永続化は未実装の接続点であり、現行機能として扱わない。
 
 ## 次の構成
 

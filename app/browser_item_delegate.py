@@ -225,6 +225,14 @@ class BrowserItemDelegate(QStyledItemDelegate):
         del option, index
         return self.cell_size
 
+    @staticmethod
+    def content_opacity(index: QModelIndex, item: BrowserItem) -> float:
+        if bool(index.data(BrowserItemModel.CutRole)):
+            return 0.52
+        if item.hidden:
+            return 0.62
+        return 1.0
+
     def paint(
         self,
         painter: QPainter,
@@ -237,8 +245,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
             item = index.data(BrowserItemModel.ItemRole)
             if not isinstance(item, BrowserItem):
                 return
-            if item.hidden:
-                painter.setOpacity(0.62)
+            painter.setOpacity(self.content_opacity(index, item))
             cell = option.rect
             thumbnail_rect = self.grid_metrics.thumbnail_frame_rect(cell)
             dpr = max(0.5, painter.device().devicePixelRatioF())

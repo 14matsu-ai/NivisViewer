@@ -3,15 +3,15 @@ from __future__ import annotations
 import os
 from collections import deque
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from threading import Event, Lock
-from time import monotonic
 
 from PySide6.QtCore import (
-    QCoreApplication,
     QEventLoop,
     QObject,
     QRunnable,
     QThreadPool,
+    QTimer,
     Signal,
     Slot,
 )
@@ -30,6 +30,12 @@ from .file_operation_service import (
     FileOperationResult,
     FileOperationService,
 )
+
+
+class FileOperationQueueState(StrEnum):
+    RUNNING = "running"
+    SHUTTING_DOWN = "shutting_down"
+    STOPPED = "stopped"
 
 
 @dataclass
@@ -132,6 +138,9 @@ class FileOperationQueue(QObject):
     operation_completed = Signal(object)
     state_changed = Signal(str, object)
     queue_changed = Signal()
+    shutdown_progress = Signal(object)
+    shutdown_finished = Signal()
+    shutdown_failed = Signal(str)
 
     def __init__(
         self,
@@ -153,6 +162,20 @@ class FileOperationQueue(QObject):
         )
         self._lock = Lock()
         self._closed = False
+        self._lifecycle = FileOperationQueueState.RUNNING
+        self._shutdown_emitted = False
+        self._shutdown_timer = QTimer(self)
+        self._shutdown_timer.setSingleShot(True)
+        self._shutdown_timer.timeout.connect(self._on_shutdown_timeout)
+
+    @property
+    def lifecycle(self) -> FileOperationQueueState:
+        with self._lock:
+            return self._lifecycle
+
+    @property
+    def is_shutting_down(self) -> bool:
+        return self.lifecycle is FileOperationQueueState.SHUTTING_DOWN
 
     @property
     def busy(self) -> bool:
@@ -328,34 +351,72 @@ class FileOperationQueue(QObject):
             return self._request_conflicts_locked(request)
 
     def close(self, *, cancel_running: bool = True) -> None:
+        self.begin_shutdown(cancel_active=cancel_running)
+
+    def begin_shutdown(
+        self,
+        *,
+        cancel_active: bool = True,
+        timeout_msecs: int = 10_000,
+    ) -> bool:
         with self._lock:
-            if self._closed:
-                return
+            if self._lifecycle is FileOperationQueueState.STOPPED:
+                return False
+            if self._lifecycle is FileOperationQueueState.SHUTTING_DOWN:
+                return False
+            self._lifecycle = FileOperationQueueState.SHUTTING_DOWN
             self._closed = True
             pending = tuple(self._pending)
             self._pending.clear()
             active = self._active
-        if cancel_running and active is not None and active.cancelled is not None:
+            if (
+                active is not None
+                and active.state is FileOperationState.WAITING_FOR_CONFLICTS
+            ):
+                active.state = FileOperationState.CANCELLED
+                self._active = None
+                active = None
+        if cancel_active and active is not None and active.cancelled is not None:
             active.cancelled.set()
         for entry in pending:
             entry.state = FileOperationState.CANCELLED
         self.queue_changed.emit()
+        self.shutdown_progress.emit(
+            {
+                "active": active.operation_id if active is not None else None,
+                "cancelled_waiting": len(pending),
+            }
+        )
+        if active is None:
+            self._finish_shutdown()
+        elif timeout_msecs > 0:
+            self._shutdown_timer.start(max(1, int(timeout_msecs)))
+        return True
 
     def wait_for_done(self, msecs: int = 5000) -> bool:
+        if not self.busy:
+            return True
         timeout = max(0, int(msecs))
-        deadline = monotonic() + timeout / 1000.0
-        while self.busy:
-            remaining = max(0, int((deadline - monotonic()) * 1000))
-            if remaining <= 0:
-                return False
-            self._pool.waitForDone(min(25, remaining))
-            application = QCoreApplication.instance()
-            if application is not None:
-                application.processEvents(
-                    QEventLoop.ProcessEventsFlag.AllEvents,
-                    min(25, remaining),
-                )
-        return True
+        if timeout <= 0:
+            return False
+        loop = QEventLoop()
+        timeout_timer = QTimer()
+        timeout_timer.setSingleShot(True)
+        poll_timer = QTimer()
+        poll_timer.setInterval(10)
+
+        def check_done() -> None:
+            if not self.busy:
+                loop.quit()
+
+        poll_timer.timeout.connect(check_done)
+        timeout_timer.timeout.connect(loop.quit)
+        poll_timer.start()
+        timeout_timer.start(timeout)
+        loop.exec(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        poll_timer.stop()
+        timeout_timer.stop()
+        return not self.busy
 
     def _start_next(self) -> None:
         with self._lock:
@@ -430,14 +491,25 @@ class FileOperationQueue(QObject):
                     self._active = None
             self._finish_result(result)
             self._start_next()
+            if self.is_shutting_down:
+                self._finish_shutdown()
             return
         self._start_execution(entry)
 
     def _start_execution(self, entry: _QueueEntry) -> None:
         with self._lock:
             if self._closed or self._active is not entry:
-                return
-            entry.state = FileOperationState.RUNNING
+                if self._active is entry:
+                    entry.state = FileOperationState.CANCELLED
+                    self._active = None
+                stopped = self._closed
+            else:
+                stopped = False
+                entry.state = FileOperationState.RUNNING
+        if stopped:
+            self._emit_state(entry)
+            self._finish_shutdown()
+            return
         self._emit_state(entry)
         self.operation_started.emit(entry.request)
         worker = _ExecutionWorker(self.service, entry.request, entry.cancelled or Event())
@@ -465,6 +537,8 @@ class FileOperationQueue(QObject):
         self._finish_result(result)
         self.queue_changed.emit()
         self._start_next()
+        if self.is_shutting_down:
+            self._finish_shutdown()
 
     def _finish_result(self, result: FileOperationResult) -> None:
         with self._lock:
@@ -475,6 +549,30 @@ class FileOperationQueue(QObject):
     def _emit_state(self, entry: _QueueEntry) -> None:
         if not self._closed:
             self.state_changed.emit(entry.operation_id, entry.state)
+
+    def _finish_shutdown(self) -> None:
+        with self._lock:
+            if (
+                self._lifecycle is FileOperationQueueState.STOPPED
+                or self._active is not None
+            ):
+                return
+            self._lifecycle = FileOperationQueueState.STOPPED
+            emit = not self._shutdown_emitted
+            self._shutdown_emitted = True
+        self._shutdown_timer.stop()
+        if emit:
+            self.shutdown_finished.emit()
+
+    def _on_shutdown_timeout(self) -> None:
+        with self._lock:
+            if self._lifecycle is not FileOperationQueueState.SHUTTING_DOWN:
+                return
+            active = self._active
+        operation_id = active.operation_id if active is not None else ""
+        self.shutdown_failed.emit(
+            f"ファイル操作の終了を待機中です: {operation_id}"
+        )
 
     def _contains_id_locked(self, operation_id: str) -> bool:
         return bool(

@@ -15,6 +15,7 @@ from .browser_sort import (
     normalize_browser_sort_key,
     normalize_browser_sort_order,
 )
+from .file_operation_artifact import FileOperationArtifactPolicy
 from .browser_scanner import BrowserScanEntry, scan_entry_from_dir_entry
 from .image_source import ARCHIVE_EXTENSIONS, PDF_EXTENSIONS, SUPPORTED_EXTENSIONS
 
@@ -140,6 +141,7 @@ class BrowserItemModel(QAbstractListModel):
     PreviewKindRole = PathRole + 11
     CanGeneratePreviewRole = PathRole + 12
     PreviewStatusRole = PathRole + 13
+    CutRole = PathRole + 14
 
     _KIND_LABELS = {
         BrowserItemKind.FOLDER: "フォルダ",
@@ -161,6 +163,7 @@ class BrowserItemModel(QAbstractListModel):
         self._low_resolution_thumbnails: set[str] = set()
         self._thumbnail_errors: dict[str, str] = {}
         self._preview_statuses: dict[str, str] = {}
+        self._cut_keys: frozenset[str] = frozenset()
         self._fallback_icons: dict[BrowserItemKind, QIcon] = {}
         self._row_by_key: dict[str, int] = {}
 
@@ -201,6 +204,8 @@ class BrowserItemModel(QAbstractListModel):
                 self._key(item.path),
                 item.preview_status,
             )
+        if role == self.CutRole:
+            return self._key(item.path) in self._cut_keys
         if role == self.PathRole:
             return str(item.path)
         if role == self.KindRole:
@@ -218,7 +223,13 @@ class BrowserItemModel(QAbstractListModel):
 
     def set_items(self, items: tuple[BrowserItem, ...] | list[BrowserItem]) -> None:
         self.beginResetModel()
-        self._source_items = list(items)
+        self._source_items = [
+            item
+            for item in items
+            if not FileOperationArtifactPolicy.is_internal_operation_artifact(
+                item.path
+            )
+        ]
         self._source_keys = {self._key(item.path) for item in self._source_items}
         self._items = self._sort_policy.sorted_items(self._source_items)
         self._icons.clear()
@@ -254,6 +265,10 @@ class BrowserItemModel(QAbstractListModel):
             return 0
         additions: list[BrowserItem] = []
         for entry in entries:
+            if FileOperationArtifactPolicy.is_internal_operation_artifact(
+                entry.path
+            ):
+                continue
             key = self._key(entry.path)
             if key in self._source_keys:
                 continue
@@ -416,6 +431,19 @@ class BrowserItemModel(QAbstractListModel):
                     self.ThumbnailErrorRole,
                 ],
             )
+
+    def set_cut_paths(self, paths: tuple[str | Path, ...] | list[str | Path]) -> bool:
+        cut_keys = frozenset(self._key(Path(path)) for path in paths)
+        changed_keys = self._cut_keys.symmetric_difference(cut_keys)
+        if not changed_keys:
+            return False
+        self._cut_keys = cut_keys
+        for key in changed_keys:
+            row = self._row_by_key.get(key, -1)
+            if row >= 0:
+                index = self.index(row, 0)
+                self.dataChanged.emit(index, index, [self.CutRole])
+        return True
 
     def item_at(self, index_or_row: QModelIndex | int) -> BrowserItem | None:
         row = index_or_row.row() if isinstance(index_or_row, QModelIndex) else index_or_row

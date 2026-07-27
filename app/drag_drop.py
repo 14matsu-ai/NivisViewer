@@ -9,6 +9,7 @@ from pathlib import Path, PureWindowsPath
 from PySide6.QtCore import QObject, QRunnable, QMimeData, QUrl, Qt, Signal, Slot
 
 from .image_source import ARCHIVE_EXTENSIONS, PDF_EXTENSIONS, SUPPORTED_EXTENSIONS
+from .file_operation_artifact import FileOperationArtifactPolicy
 
 
 NIVIS_PATHS_MIME = "application/x-nivisviewer-paths+json"
@@ -33,6 +34,8 @@ def normalize_local_paths(
         if not path.is_absolute():
             continue
         normalized = os.path.abspath(os.path.normpath(os.fspath(path)))
+        if FileOperationArtifactPolicy.is_internal_operation_artifact(normalized):
+            continue
         key = os.path.normcase(normalized).casefold()
         if key in seen:
             continue
