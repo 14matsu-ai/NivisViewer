@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 from PIL import Image
-from PySide6.QtCore import QPoint, QPointF, Qt
-from PySide6.QtGui import QWheelEvent
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt
+from PySide6.QtGui import QCursor, QMouseEvent, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMainWindow, QStatusBar, QVBoxLayout, QWidget
 
@@ -531,6 +531,149 @@ def test_hidden_bottom_overlay_uses_same_region_for_reveal_and_hover(
     assert controller._hide_timer is timer
     assert controller.bottom_overlay.isVisible()
     controller.set_active(False)
+    window.close()
+
+
+def test_fullscreen_screen_bottom_reveals_through_existing_mouse_event_path(
+    qapp,
+    monkeypatch,
+) -> None:
+    window = QMainWindow()
+    central = QWidget(window)
+    layout = QVBoxLayout(central)
+    viewer = QWidget(central)
+    slider = ViewerPageSlider(central)
+    layout.addWidget(viewer, 1)
+    layout.addWidget(slider)
+    window.setCentralWidget(central)
+    status = QStatusBar(window)
+    window.setStatusBar(status)
+    controller = FullscreenChromeController(
+        window,
+        viewer=viewer,
+        menu_bar=window.menuBar(),
+        slider=slider,
+        status_bar=status,
+        hide_delay_ms=20,
+    )
+    window.show()
+    controller.set_fullscreen_state(True, hide_ui=True, hide_cursor=False)
+    qapp.processEvents()
+
+    screen_geometry = QRect(window.screen().geometry())
+    shortened_frame = screen_geometry.adjusted(0, 0, 0, -1)
+    monkeypatch.setattr(window, "isFullScreen", lambda: True)
+    monkeypatch.setattr(
+        window,
+        "frameGeometry",
+        lambda: QRect(shortened_frame),
+    )
+    controller.hide_overlays()
+
+    region = controller._bottom_hover_region_global()
+    assert region.bottom() == screen_geometry.bottom() + 1
+    assert region.contains(
+        QPoint(region.center().x(), shortened_frame.bottom())
+    )
+    assert region.contains(
+        QPoint(region.center().x(), screen_geometry.bottom())
+    )
+    assert not region.contains(
+        QPoint(region.center().x(), region.bottom() + 1)
+    )
+
+    show_calls = 0
+    original_show = controller.bottom_overlay.show
+
+    def counted_show() -> None:
+        nonlocal show_calls
+        show_calls += 1
+        original_show()
+
+    monkeypatch.setattr(controller.bottom_overlay, "show", counted_show)
+    timer = controller._hide_timer
+    for x in (
+        screen_geometry.left(),
+        screen_geometry.center().x(),
+        screen_geometry.right() + 1,
+    ):
+        controller.hide_overlays()
+        point = QPoint(x, screen_geometry.bottom())
+        local = window.mapFromGlobal(point)
+        event = QMouseEvent(
+            QEvent.Type.MouseMove,
+            QPointF(local),
+            QPointF(point),
+            Qt.MouseButton.NoButton,
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(window, event)
+        assert controller.bottom_overlay.isVisible()
+        assert controller._pointer_in_reveal_area(point)
+        assert controller._hide_timer is timer
+
+    assert show_calls == 3
+    controller.set_active(False)
+    controller.shutdown()
+    window.close()
+
+
+def test_fullscreen_bottom_hover_keeps_existing_hide_timer_and_policies(
+    qapp,
+    monkeypatch,
+) -> None:
+    window = QMainWindow()
+    central = QWidget(window)
+    layout = QVBoxLayout(central)
+    viewer = QWidget(central)
+    slider = ViewerPageSlider(central)
+    layout.addWidget(viewer, 1)
+    layout.addWidget(slider)
+    window.setCentralWidget(central)
+    status = QStatusBar(window)
+    window.setStatusBar(status)
+    controller = FullscreenChromeController(
+        window,
+        viewer=viewer,
+        menu_bar=window.menuBar(),
+        slider=slider,
+        status_bar=status,
+        hide_delay_ms=20,
+    )
+    window.show()
+    controller.set_fullscreen_state(True, hide_ui=True, hide_cursor=False)
+    qapp.processEvents()
+
+    region = controller._bottom_hover_region_global()
+    edge = QPoint(region.center().x(), region.bottom())
+    controller.hide_overlays()
+    timer = controller._hide_timer
+    controller.process_pointer(edge)
+    controller.process_pointer(edge)
+    assert controller.bottom_overlay.isVisible()
+    assert controller._hide_timer is timer
+    assert not timer.isActive()
+
+    outside = QPoint(region.center().x(), region.top() - 1)
+    controller.process_pointer(outside)
+    assert timer.isActive()
+    monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: QPoint(outside)))
+    QTest.qWait(30)
+    qapp.processEvents()
+    assert not controller.bottom_overlay.isVisible()
+
+    controller.set_fullscreen_state(False, hide_ui=True, hide_cursor=False)
+    controller.process_pointer(edge)
+    assert not controller.bottom_overlay.isVisible()
+
+    controller.set_fullscreen_state(True, hide_ui=False, hide_cursor=False)
+    assert controller.top_overlay.isVisible()
+    assert controller.bottom_overlay.isVisible()
+    controller.process_pointer(edge)
+    assert not timer.isActive()
+    controller.set_active(False)
+    controller.shutdown()
     window.close()
 
 
