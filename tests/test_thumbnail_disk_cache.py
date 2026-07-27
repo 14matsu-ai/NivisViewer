@@ -9,6 +9,7 @@ from PySide6.QtGui import QColor, QImage
 
 from app.browser_model import BrowserItem, BrowserItemKind
 from app.thumbnail_disk_cache import ThumbnailDiskCache
+from app.thumbnail_render import ThumbnailRenderSpec
 
 
 def write_image(path: Path, *, color: str = "white") -> None:
@@ -60,6 +61,43 @@ def test_source_change_and_thumbnail_size_invalidate_entry(tmp_path: Path) -> No
 
     assert cache.get(make_item(source), 180) is None
     assert cache.get(make_item(source), 200) is None
+    cache.close()
+
+
+def test_browser_display_modes_do_not_share_disk_cache_variants(tmp_path: Path) -> None:
+    source = tmp_path / "日本語.webp"
+    write_image(source)
+    cache = ThumbnailDiskCache(tmp_path / "cache")
+    item = make_item(source)
+    fit = ThumbnailRenderSpec.from_settings(
+        180,
+        "square_1_1",
+        "letterbox",
+        browser_display_mode="fit",
+    )
+    crop = ThumbnailRenderSpec.from_settings(
+        180,
+        "square_1_1",
+        "letterbox",
+        browser_display_mode="center_crop",
+    )
+
+    assert fit.cache_token != crop.cache_token
+    assert fit.family_token != crop.family_token
+    legacy_fit = ThumbnailRenderSpec(
+        fit.frame_width,
+        fit.frame_height,
+        fit.frame_ratio_id,
+        fit.crop_mode,
+        quality_mode=fit.quality_mode,
+    )
+    assert fit.cache_token == legacy_fit.cache_token
+    assert fit.family_token == legacy_fit.family_token
+    assert cache.put(item, fit, thumbnail("red"))
+    assert cache.get_suitable(item, fit) is not None
+    assert cache.get_suitable(item, crop) is None
+    assert cache.put(item, crop, thumbnail("blue"))
+    assert cache.get_suitable(item, crop) is not None
     cache.close()
 
 

@@ -12,6 +12,7 @@ from app.browser_model import BrowserItem, BrowserItemKind
 from app.thumbnail_provider import BrowserThumbnailProvider
 from app.browser_thumbnail_scheduler import ThumbnailPriority
 from app.thumbnail_disk_cache import ThumbnailDiskCache
+from app.thumbnail_render import ThumbnailRenderSpec
 
 
 def write_image(path: Path, *, color: str = "white") -> None:
@@ -54,6 +55,46 @@ def test_loads_image_folder_and_archive_thumbnails_with_unicode_paths(
     assert folder_thumbnail.height() <= 120
     assert folder_thumbnail.pixelColor(0, 0).red() > folder_thumbnail.pixelColor(0, 0).blue()
     assert archive_thumbnail.pixelColor(0, 0).red() > archive_thumbnail.pixelColor(0, 0).blue()
+
+
+def test_center_crop_display_spec_uses_common_webp_folder_and_archive_paths(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "日本語の横長.webp"
+    image.parent.mkdir(parents=True, exist_ok=True)
+    with Image.new("RGB", (120, 40), "green") as source:
+        source.save(image, "WEBP")
+    folder = tmp_path / "表紙フォルダ"
+    folder.mkdir()
+    folder_cover = folder / "表紙.webp"
+    with Image.new("RGB", (40, 120), "blue") as source:
+        source.save(folder_cover, "WEBP")
+    archive = tmp_path / "日本語書庫.cbz"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.write(image, "画像/表紙.webp")
+    spec = ThumbnailRenderSpec.from_settings(
+        120,
+        "square_1_1",
+        "letterbox",
+        browser_display_mode="center_crop",
+    )
+
+    results = (
+        BrowserThumbnailProvider.load_thumbnail(
+            make_item(image, BrowserItemKind.IMAGE),
+            spec,
+        ),
+        BrowserThumbnailProvider.load_thumbnail(
+            make_item(folder, BrowserItemKind.FOLDER),
+            spec,
+        ),
+        BrowserThumbnailProvider.load_thumbnail(
+            make_item(archive, BrowserItemKind.ARCHIVE),
+            spec,
+        ),
+    )
+
+    assert all(result is not None and not result.isNull() for result in results)
 
 
 def test_corrupt_image_and_archive_fall_back_to_none(tmp_path: Path) -> None:

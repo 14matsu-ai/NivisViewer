@@ -38,6 +38,7 @@ class ConfigManager(QObject):
         "thumbnail_size": 180,
         "thumbnail_frame_ratio": "portrait_1_sqrt2",
         "thumbnail_crop_mode": "smart_crop",
+        "browser_thumbnail_display_mode": "fit",
         "thumbnail_quality_mode": "auto",
         "thumbnail_cache_max_edge": 1024,
         "text_preview_enabled": True,
@@ -339,6 +340,13 @@ class ConfigManager(QObject):
         }:
             normalized["thumbnail_crop_mode"] = cls.DEFAULTS[
                 "thumbnail_crop_mode"
+            ]
+        if normalized.get("browser_thumbnail_display_mode") not in {
+            "fit",
+            "center_crop",
+        }:
+            normalized["browser_thumbnail_display_mode"] = cls.DEFAULTS[
+                "browser_thumbnail_display_mode"
             ]
         if normalized.get("thumbnail_quality_mode") not in {
             "economy",

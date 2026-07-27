@@ -55,6 +55,11 @@ CROP_MODES = {
     "smart_crop": "スマートクリップ（自動検出）",
 }
 
+BROWSER_THUMBNAIL_DISPLAY_MODES = {
+    "fit": "全体表示",
+    "center_crop": "中央クロップ",
+}
+
 
 def quantize_thumbnail_size(size: int) -> int:
     value = max(THUMBNAIL_SIZE_BUCKETS[0], min(THUMBNAIL_SIZE_BUCKETS[-1], int(size)))
@@ -98,6 +103,7 @@ class ThumbnailRenderSpec:
     render_policy_version: int = THUMBNAIL_RENDER_POLICY_VERSION
     smart_crop_version: int = SMART_CROP_ALGORITHM_VERSION
     implementation_version: int = THUMBNAIL_IMPLEMENTATION_VERSION
+    browser_display_mode: str = "fit"
 
     @classmethod
     def from_settings(
@@ -109,6 +115,7 @@ class ThumbnailRenderSpec:
         device_pixel_ratio: float = 1.0,
         quality_mode: str = "economy",
         max_edge: int = 1024,
+        browser_display_mode: str = "fit",
     ) -> ThumbnailRenderSpec:
         ratio_id = (
             frame_ratio_id
@@ -120,6 +127,11 @@ class ThumbnailRenderSpec:
             quality_mode
             if quality_mode in THUMBNAIL_QUALITY_MARGINS
             else "auto"
+        )
+        normalized_display_mode = (
+            browser_display_mode
+            if browser_display_mode in BROWSER_THUMBNAIL_DISPLAY_MODES
+            else "fit"
         )
         required_edge = (
             max(1, int(thumbnail_size))
@@ -136,6 +148,7 @@ class ThumbnailRenderSpec:
             ratio_id,
             mode,
             quality_mode=normalized_quality,
+            browser_display_mode=normalized_display_mode,
         )
 
     @property
@@ -144,11 +157,17 @@ class ThumbnailRenderSpec:
 
     @property
     def cache_token(self) -> int:
+        display_variant = (
+            ""
+            if self.browser_display_mode == "fit"
+            else f"|browser-display:{self.browser_display_mode}"
+        )
         payload = (
             f"{self.frame_width}x{self.frame_height}|{self.frame_ratio_id}|"
             f"{self.crop_mode}|{self.quality_mode}|{self.encoder_format}|"
             f"{self.encoder_quality}|{self.render_policy_version}|"
             f"{self.smart_crop_version}|{self.implementation_version}"
+            f"{display_variant}"
         ).encode("utf-8")
         return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & (
             (1 << 63) - 1
@@ -157,11 +176,16 @@ class ThumbnailRenderSpec:
     @property
     def family_token(self) -> int:
         """Cache identity shared by compatible physical resolutions."""
+        display_variant = (
+            ""
+            if self.browser_display_mode == "fit"
+            else f"|browser-display:{self.browser_display_mode}"
+        )
         payload = (
             f"{self.frame_ratio_id}|{self.crop_mode}|{self.quality_mode}|"
             f"{self.encoder_format}|{self.encoder_quality}|"
             f"{self.render_policy_version}|{self.smart_crop_version}|"
-            f"{self.implementation_version}"
+            f"{self.implementation_version}{display_variant}"
         ).encode("utf-8")
         return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & (
             (1 << 63) - 1
@@ -178,6 +202,7 @@ class ThumbnailRenderPolicy:
     device_pixel_ratio: float = 1.0
     quality_mode: str = "auto"
     max_edge: int = 1024
+    browser_display_mode: str = "fit"
 
     @property
     def logical_frame_size(self) -> QSize:
@@ -206,6 +231,7 @@ class ThumbnailRenderPolicy:
             device_pixel_ratio=self.device_pixel_ratio,
             quality_mode=self.quality_mode,
             max_edge=self.max_edge,
+            browser_display_mode=self.browser_display_mode,
         )
 
     def diagnostics(self) -> ThumbnailRenderDiagnostics:

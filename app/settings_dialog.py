@@ -36,7 +36,11 @@ from .browser_sort import (
 from .browser_item_delegate import GRID_PRESET_THUMBNAIL_SIZES
 from .config_manager import ConfigManager
 from .ffmpeg_thumbnail_backend import FFmpegLocator
-from .thumbnail_render import CROP_MODES, FRAME_RATIOS
+from .thumbnail_render import (
+    BROWSER_THUMBNAIL_DISPLAY_MODES,
+    CROP_MODES,
+    FRAME_RATIOS,
+)
 from .seven_zip_locator import SevenZipInfo, SevenZipLocator
 from .viewer_commands import COMMAND_CHOICES
 from .winrar_locator import WinRARInfo, WinRARLocator
@@ -563,6 +567,18 @@ class SettingsDialog(QDialog):
             self.thumbnail_frame_ratio_combo.addItem(label, ratio_id)
         form.addRow("画像枠の比率:", self.thumbnail_frame_ratio_combo)
 
+        self.browser_thumbnail_display_mode_combo = QComboBox(cache_group)
+        for mode, label in BROWSER_THUMBNAIL_DISPLAY_MODES.items():
+            self.browser_thumbnail_display_mode_combo.addItem(label, mode)
+        self.browser_thumbnail_display_mode_combo.setToolTip(
+            "全体表示は画像全体を枠内へ収めます。"
+            "中央クロップは縦横比を保ったまま画像中央で枠を埋めます。"
+        )
+        form.addRow(
+            "Browser表示方式:",
+            self.browser_thumbnail_display_mode_combo,
+        )
+
         self.thumbnail_crop_mode_combo = QComboBox(cache_group)
         for mode, label in CROP_MODES.items():
             self.thumbnail_crop_mode_combo.addItem(label, mode)
@@ -900,6 +916,10 @@ class SettingsDialog(QDialog):
         self._select_data(
             self.thumbnail_crop_mode_combo,
             self.config.get("thumbnail_crop_mode", "smart_crop"),
+        )
+        self._select_data(
+            self.browser_thumbnail_display_mode_combo,
+            self.config.get("browser_thumbnail_display_mode", "fit"),
         )
         self._select_data(
             self.thumbnail_quality_mode_combo,
@@ -1245,6 +1265,9 @@ class SettingsDialog(QDialog):
             ),
             "thumbnail_crop_mode": str(
                 self.thumbnail_crop_mode_combo.currentData()
+            ),
+            "browser_thumbnail_display_mode": str(
+                self.browser_thumbnail_display_mode_combo.currentData()
             ),
             "thumbnail_quality_mode": str(
                 self.thumbnail_quality_mode_combo.currentData()
