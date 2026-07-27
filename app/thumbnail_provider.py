@@ -460,6 +460,10 @@ class BrowserThumbnailProvider(QObject):
         with self._pending_lock:
             return len(self._pending)
 
+    @property
+    def shell_preview_pending_count(self) -> int:
+        return self._preview_registry.shell_service.pending_count
+
     def wait_for_done(self, msecs: int = 5000) -> bool:
         if self._coordinator is not None:
             return self._coordinator.wait_for_browser(msecs)

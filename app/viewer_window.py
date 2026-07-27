@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Callable
 
@@ -51,12 +52,25 @@ from .image_source import (
 from .metadata_store import MetadataStore
 from .pdf_backend import PageRenderSpec
 from .pdf_image_source import PdfImageSource
+from .path_availability import (
+    PathAvailability,
+    PathAvailabilityResult,
+    PathAvailabilityService,
+    lexical_absolute,
+)
 from .performance_trace import performance_trace
 from .thumbnail_provider import PageThumbnailProvider
 from . import viewer_commands as commands
 from .viewer_page_navigation import ViewerPageNavigationController
 from .viewer_page_slider import ViewerPageSlider
+from .viewer_display_unit import (
+    ViewerDisplayUnit,
+    ViewerSlotState,
+)
 from .viewer_widget import ViewerImage, ViewerWidget, calculate_spread_layout
+
+
+_DISPLAY_LOG = logging.getLogger("nivisviewer.viewer.display_unit")
 
 
 class ViewerWindow(QMainWindow):
@@ -78,6 +92,7 @@ class ViewerWindow(QMainWindow):
         archive_backend_registry=None,
         pdfium_service=None,
         image_work_coordinator: ImageWorkCoordinator | None = None,
+        path_availability_service: PathAvailabilityService | None = None,
     ) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -100,6 +115,13 @@ class ViewerWindow(QMainWindow):
         else:
             self._owns_pdfium_service = False
         self.pdfium_service = pdfium_service
+        self._owns_path_availability_service = path_availability_service is None
+        self.path_availability_service = (
+            path_availability_service or PathAvailabilityService(self)
+        )
+        self.path_availability_service.result_ready.connect(
+            self._on_path_probe_result
+        )
         self.image_work_coordinator = image_work_coordinator
         self.book_session = book_session or BookSession(
             int(self.settings.get("cache_size", 10)),
@@ -131,11 +153,14 @@ class ViewerWindow(QMainWindow):
         self._shutdown_prepared = False
         self._active_request_id = 0
         self._visible_page_indexes: tuple[int, ...] = tuple()
+        self._display_unit = ViewerDisplayUnit.empty()
         self._page_history_back: list[int] = []
         self._page_history_forward: list[int] = []
         self._metadata_book_path = ""
         self._status_override_message: str | None = None
         self._status_override_token = 0
+        self._path_probe_generation = 0
+        self._pending_path_probe: tuple[int, int, str, str] | None = None
         self._awaiting_first_frame = False
         self._first_frame_image_id: str | None = None
         self._next_open_trace_id = 0
@@ -662,20 +687,12 @@ class ViewerWindow(QMainWindow):
         help_menu.addAction(about_action)
 
     def show_diagnostics(self) -> None:
-        from .diagnostics_dialog import DiagnosticsDialog, diagnostic_text
+        from .diagnostics_dialog import DiagnosticsDialog
 
-        pdf_available = None
-        try:
-            pdf_available = self.pdfium_service.is_available
-        except Exception:
-            pdf_available = False
         dialog = DiagnosticsDialog(
             self.config.base_dir,
             self,
-            text=diagnostic_text(
-                self.config.base_dir,
-                pdf_available=pdf_available,
-            ),
+            pdfium_service=self.pdfium_service,
         )
         dialog.exec()
 
@@ -1083,13 +1100,13 @@ class ViewerWindow(QMainWindow):
 
     @staticmethod
     def _metadata_item_type(path: Path) -> str:
-        if path.is_dir():
-            return "folder"
         if path.suffix.lower() in ARCHIVE_EXTENSIONS:
             return "archive"
         if path.suffix.lower() in PDF_EXTENSIONS:
             return "pdf"
-        return "image"
+        if path.suffix.lower() in SUPPORTED_EXTENSIONS:
+            return "image"
+        return "folder"
 
     def _clear_page_history(self) -> None:
         self._page_history_back.clear()
@@ -1199,14 +1216,16 @@ class ViewerWindow(QMainWindow):
         self.recent_menu.addAction(clear_action)
 
     def _open_recent_path(self, path: str) -> None:
-        if not Path(path).exists():
-            QMessageBox.warning(self, "履歴を開けません", f"パスが見つかりません:\n{path}")
-            recent = self.settings.get("recent_paths", [])
-            if isinstance(recent, list):
-                self.settings["recent_paths"] = [item for item in recent if item != path]
-                self._rebuild_recent_menu()
+        if self._shutdown_prepared:
             return
-        self._request_open_path(path)
+        display = lexical_absolute(path)
+        if (
+            self.path_availability_service.cached_state(display)
+            is PathAvailability.AVAILABLE
+        ):
+            self._request_open_path(display)
+            return
+        self._request_path_probe(display, "recent_book_open")
 
     def _clear_recent_paths(self) -> None:
         self.settings["recent_paths"] = []
@@ -1259,15 +1278,74 @@ class ViewerWindow(QMainWindow):
         )
 
     def open_current_location(self) -> None:
-        target: Path | None = None
+        if self._shutdown_prepared:
+            return
+        target: str | None = None
         if self._opened_path:
-            opened = Path(self._opened_path)
-            target = opened.parent if opened.is_file() else opened
+            target = self._location_target(self._opened_path)
         elif self._current_book_key:
-            current = Path(self._current_book_key)
-            target = current.parent if current.is_file() else current
-        if target is not None and target.exists():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+            target = self._location_target(self._current_book_key)
+        if target is None:
+            return
+        if (
+            self.path_availability_service.cached_state(target)
+            is PathAvailability.AVAILABLE
+        ):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(target))
+            return
+        self._request_path_probe(target, "reveal_location")
+
+    def _request_path_probe(self, path: str, purpose: str) -> None:
+        self._path_probe_generation += 1
+        generation = self._path_probe_generation
+        self._pending_path_probe = None
+        request_id = self.path_availability_service.request_probe(
+            path,
+            purpose,
+            generation,
+        )
+        if not request_id:
+            self._set_status_override("現在確認できません", 3000)
+            return
+        self._pending_path_probe = (request_id, generation, purpose, path)
+        self._set_status_override("場所を確認しています…")
+
+    def _on_path_probe_result(self, result: PathAvailabilityResult) -> None:
+        pending = self._pending_path_probe
+        if (
+            pending is None
+            or self._shutdown_prepared
+            or result.request_id != pending[0]
+            or result.path != pending[3]
+            or pending[1] != self._path_probe_generation
+        ):
+            return
+        _request_id, _generation, purpose, path = pending
+        self._pending_path_probe = None
+        if result.state is PathAvailability.AVAILABLE:
+            self._clear_status_override()
+            self._update_status()
+            if purpose == "recent_book_open":
+                self._request_open_path(path)
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+            return
+        message = {
+            PathAvailability.MISSING: "見つかりません",
+            PathAvailability.UNAVAILABLE: "現在アクセスできません",
+            PathAvailability.ERROR: "確認できません",
+        }.get(result.state, "確認できません")
+        self._set_status_override(message, 3000)
+
+    @staticmethod
+    def _location_target(path: str) -> str:
+        display = lexical_absolute(path)
+        if (
+            Path(display).suffix.casefold()
+            in SUPPORTED_EXTENSIONS | ARCHIVE_EXTENSIONS | PDF_EXTENSIONS
+        ):
+            return lexical_absolute(Path(display).parent)
+        return display
 
     def export_current_view(self) -> None:
         if self.model.total_pages <= 0:
@@ -1683,19 +1761,54 @@ class ViewerWindow(QMainWindow):
         spread = self.model.spread_at()
         self._visible_page_indexes = tuple(slot.page_index for slot in spread.slots)
         self.image_cache.set_render_spec(self._current_pdf_render_spec())
+        self._display_unit = self._display_unit.cancel_loading()
+        self._display_unit = ViewerDisplayUnit.create(
+            request_id=self._active_request_id,
+            generation=self.image_cache.generation,
+            focused_page_identity=self.model.focused_page_identity,
+            pages=(
+                (
+                    slot.page_index,
+                    self.model.page_identity(slot.page_index) or slot.image_id,
+                    slot.image_id,
+                )
+                for slot in spread.slots
+            ),
+        )
         first_frame_gate = (
             self._awaiting_first_frame
             and self._first_frame_image_id is not None
         )
-        self.image_cache.preload_around(
-            self.model.current_index,
-            radius=0 if first_frame_gate else PRELOAD_RADIUS,
-            visible_indexes=(
-                (self.model.current_index,)
-                if first_frame_gate
-                else self._visible_page_indexes
-            ),
+        request_center = (
+            self.model.focused_index if first_frame_gate else self.model.current_index
         )
+        gated_visible_indexes = (
+            (self.model.focused_index,)
+            if first_frame_gate
+            else self._visible_page_indexes
+        )
+        self.image_cache.preload_around(
+            request_center,
+            radius=0 if first_frame_gate else PRELOAD_RADIUS,
+            visible_indexes=gated_visible_indexes,
+        )
+        if _DISPLAY_LOG.isEnabledFor(logging.DEBUG):
+            _DISPLAY_LOG.debug(
+                "display unit request=%s generation=%s focused=%s slots=%r gate=%s",
+                self._display_unit.request_id,
+                self._display_unit.generation,
+                self._display_unit.focused_page_identity,
+                tuple(
+                    (
+                        slot.side,
+                        slot.page_index,
+                        slot.page_identity,
+                        slot.state.value,
+                    )
+                    for slot in self._display_unit.slots
+                ),
+                first_frame_gate,
+            )
         self._render_spread(spread, self._active_request_id)
 
     def _render_spread(self, spread, request_id: int) -> None:
@@ -1706,12 +1819,65 @@ class ViewerWindow(QMainWindow):
         for slot in spread.slots:
             cached = self.image_cache.get(slot.page_index)
             if cached is None:
-                pages.append(ViewerWidget.loading_page(slot.page_index, slot.image_id))
+                state = (
+                    ViewerSlotState.LOADING
+                    if self.image_cache.source is not None
+                    else ViewerSlotState.FAILED
+                )
+                self._display_unit = self._display_unit.transition(
+                    page_index=slot.page_index,
+                    image_id=slot.image_id,
+                    generation=self.image_cache.generation,
+                    state=state,
+                    error=(
+                        None
+                        if state is ViewerSlotState.LOADING
+                        else "画像ソースを利用できません。"
+                    ),
+                )
+                if state is ViewerSlotState.LOADING:
+                    pages.append(
+                        ViewerWidget.loading_page(slot.page_index, slot.image_id)
+                    )
+                else:
+                    pages.append(
+                        ViewerWidget.error_page(
+                            slot.page_index,
+                            slot.image_id,
+                            "画像ソースを利用できません。",
+                        )
+                    )
             elif cached.error:
-                pages.append(ViewerWidget.error_page(slot.page_index, slot.image_id, cached.error))
+                self._display_unit = self._display_unit.transition(
+                    page_index=slot.page_index,
+                    image_id=slot.image_id,
+                    generation=cached.generation,
+                    state=ViewerSlotState.FAILED,
+                    error=cached.error,
+                )
+                pages.append(
+                    ViewerWidget.error_page(
+                        slot.page_index,
+                        slot.image_id,
+                        cached.error,
+                    )
+                )
             elif cached.qimage is not None and cached.original_size is not None:
+                self._display_unit = self._display_unit.transition(
+                    page_index=slot.page_index,
+                    image_id=slot.image_id,
+                    generation=cached.generation,
+                    state=ViewerSlotState.READY,
+                )
                 pages.extend(self._viewer_images_for_cached(cached, split_allowed=spread.is_single))
             else:
+                self._display_unit = self._display_unit.transition(
+                    page_index=slot.page_index,
+                    image_id=slot.image_id,
+                    generation=cached.generation,
+                    state=ViewerSlotState.FAILED,
+                    error="画像を表示できません。",
+                )
                 pages.append(ViewerWidget.error_page(slot.page_index, slot.image_id, "画像を表示できません。"))
 
         self.viewer.set_pages(spread, pages)
@@ -1758,6 +1924,30 @@ class ViewerWindow(QMainWindow):
     def _on_cache_page_loaded(self, cached: CachedImage) -> None:
         if cached.generation != self.image_cache.generation:
             return
+        self._display_unit = self._display_unit.transition(
+            page_index=cached.page_index,
+            image_id=cached.image_id,
+            generation=cached.generation,
+            state=(
+                ViewerSlotState.FAILED
+                if cached.error
+                or cached.qimage is None
+                or cached.original_size is None
+                else ViewerSlotState.READY
+            ),
+            error=cached.error,
+        )
+        first_frame_result = (
+            self._awaiting_first_frame
+            and cached.image_id == self._first_frame_image_id
+        )
+        first_frame_failed = (
+            bool(cached.error)
+            or cached.qimage is None
+            or cached.original_size is None
+        )
+        if first_frame_result and first_frame_failed:
+            self._cancel_interactive_open()
         performance_trace.mark(
             self._active_open_trace_id,
             "viewer.result.arrived",
@@ -1767,7 +1957,13 @@ class ViewerWindow(QMainWindow):
             cached.page_index,
             cached.original_size,
         )
-        if repositioned:
+        spread = self.model.spread_at()
+        slot_identity_changed = tuple(
+            (slot.page_index, slot.image_id) for slot in spread.slots
+        ) != tuple(
+            (slot.page_index, slot.image_id) for slot in self._display_unit.slots
+        )
+        if repositioned or slot_identity_changed:
             self._update_page_list_thumbnail(cached)
             self._refresh_view()
             return
@@ -1783,7 +1979,7 @@ class ViewerWindow(QMainWindow):
             # pages. Browser work remains gated until contentPainted confirms
             # that the first frame actually reached the screen.
             self.image_cache.preload_around(
-                self.model.current_index,
+                self.model.focused_index,
                 radius=PRELOAD_RADIUS,
                 visible_indexes=self._visible_page_indexes,
             )
@@ -1824,7 +2020,7 @@ class ViewerWindow(QMainWindow):
             "viewer.first_paint.completed",
         )
         self.image_cache.preload_around(
-            self.model.current_index,
+            self.model.focused_index,
             radius=PRELOAD_RADIUS,
             visible_indexes=self._visible_page_indexes,
         )
@@ -2458,6 +2654,8 @@ class ViewerWindow(QMainWindow):
         if self._shutdown_prepared:
             return
         self._shutdown_prepared = True
+        self._path_probe_generation += 1
+        self._pending_path_probe = None
         self.fullscreen_chrome.shutdown()
         self._cancel_interactive_open()
         self.viewer.cancel_mouse_gesture()
@@ -2470,6 +2668,8 @@ class ViewerWindow(QMainWindow):
             self.archive_backend_registry.close()
         if self._owns_pdfium_service:
             self.pdfium_service.shutdown()
+        if self._owns_path_availability_service:
+            self.path_availability_service.close()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
         guard = getattr(self, "_application_close_guard", None)

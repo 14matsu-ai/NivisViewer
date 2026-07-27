@@ -156,6 +156,16 @@ class FileOperationPanel(QWidget):
             "\n".join(
                 f"{item.source_path or item.destination_path or '(不明)'}: "
                 f"{item.error_message or item.error_code or '失敗'}"
+                + (
+                    f"\n  未回収artifact: {', '.join(item.artifact_paths)}"
+                    if item.artifact_paths
+                    else ""
+                )
+                + (
+                    f"\n  cleanup: {'; '.join(item.cleanup_errors)}"
+                    if item.cleanup_errors
+                    else ""
+                )
                 for item in items
                 if not item.success
             )

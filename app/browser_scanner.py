@@ -16,11 +16,12 @@ from .browser_visibility import (
     filesystem_visibility_flags,
 )
 from .image_source import ARCHIVE_EXTENSIONS, PDF_EXTENSIONS, SUPPORTED_EXTENSIONS
+from .file_operation_artifact import FileOperationArtifactPolicy
 from .performance_trace import performance_trace
 
 
 DEFAULT_SCAN_BATCH_SIZE = 128
-_TEMPORARY_SUFFIXES = (".tmp", ".part", ".crdownload")
+_INCOMPLETE_DOWNLOAD_SUFFIXES = (".part", ".crdownload")
 _RETIRED_SCANNERS: set[BrowserDirectoryScanner] = set()
 _TEXT_PREVIEW_EXTENSIONS = {
     ".txt", ".md", ".log", ".ini", ".cfg", ".conf", ".json", ".yaml",
@@ -110,7 +111,14 @@ def scan_entry_from_dir_entry(
     visibility_policy: BrowserVisibilityPolicy = LEGACY_SUPPORTED_ITEMS_POLICY,
 ) -> BrowserScanEntry | None:
     name = entry.name
-    if name in {".", ".."} or name.startswith("~$") or name.endswith(_TEMPORARY_SUFFIXES):
+    if (
+        name in {".", ".."}
+        or name.startswith("~$")
+        or name.endswith(_INCOMPLETE_DOWNLOAD_SUFFIXES)
+    ):
+        return None
+    if FileOperationArtifactPolicy.is_internal_operation_artifact(name):
+        FileOperationArtifactPolicy.record_orphan(entry.path)
         return None
 
     attributes = 0

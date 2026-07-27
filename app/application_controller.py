@@ -36,6 +36,11 @@ from .path_availability import PathAvailabilityService
 from .pdfium_service import PdfiumService
 from .performance_trace import performance_trace
 from .single_instance import InstanceMessage
+from .startup_restore import StartupRestoreCoordinator
+from .application_shutdown import (
+    ApplicationShutdownCoordinator,
+    ApplicationShutdownSnapshot,
+)
 from .viewer_window import ViewerWindow
 
 
@@ -83,6 +88,15 @@ class ApplicationController(QObject):
         self.path_availability_service = (
             path_availability_service or PathAvailabilityService(self)
         )
+        self._applying_startup_restore = False
+        self.startup_restore = StartupRestoreCoordinator(
+            self.path_availability_service,
+            self._open_startup_restored_path,
+            self,
+        )
+        self.startup_restore.notification_requested.connect(
+            self._show_browser_status
+        )
         self.image_work_coordinator = ImageWorkCoordinator(self, max_workers=2)
         self.file_registration_service = file_registration_service
         self.config.settings_changed.connect(self._on_controller_settings_changed)
@@ -99,6 +113,7 @@ class ApplicationController(QObject):
         self._active_viewer: ViewerWindow | None = None
         self._browser_window: BrowserWindow | None = None
         self._shutdown = False
+        self.shutdown_coordinator = ApplicationShutdownCoordinator(self)
         self._adjacent_request_sequence = 0
         self._adjacent_generation = 0
         self._adjacent_request_by_window: dict[int, int] = {}
@@ -109,6 +124,7 @@ class ApplicationController(QObject):
         self._operation_fallback_panel: FileOperationPanel | None = None
         self._operation_conflict_dialog: ConflictResolutionDialog | None = None
         self._continue_operations_without_main_window = False
+        self._pending_close_window: weakref.ReferenceType[QWidget] | None = None
         self._quit_requested = False
         self._restore_on_start = True
         self.quit_when_last_viewer_closed = False
@@ -119,6 +135,12 @@ class ApplicationController(QObject):
         )
         self.file_operation_queue.conflicts_required.connect(
             self._on_background_conflicts_required
+        )
+        self.file_operation_queue.shutdown_finished.connect(
+            self._on_file_operation_shutdown_finished
+        )
+        self.file_operation_queue.shutdown_failed.connect(
+            self._on_file_operation_shutdown_failed
         )
         self.adjacent_book_search.result_ready.connect(
             self._on_adjacent_book_search_result
@@ -134,26 +156,30 @@ class ApplicationController(QObject):
         *,
         restore: bool = True,
     ) -> BrowserWindow:
-        self._shutdown = False
+        if self._shutdown:
+            raise RuntimeError("application is shutting down")
         self._restore_on_start = restore
         browser = self.show_browser_window()
-        path_to_open = initial_path
-        if restore and not path_to_open:
+        if initial_path:
+            self.startup_restore.cancel()
+            self.select_path_in_browser(initial_path)
+            self.open_path(initial_path)
+            return browser
+        if restore:
             last_path = self.settings.get("last_open_path", "")
             if (
                 bool(self.settings.get("reopen_last_on_start", False))
                 and isinstance(last_path, str)
                 and last_path
-                and Path(last_path).exists()
             ):
-                path_to_open = last_path
-        if path_to_open:
-            self.select_path_in_browser(path_to_open)
-            self.open_path(path_to_open)
+                self.startup_restore.start(last_path)
         return browser
 
     def handle_open_request(self, message: InstanceMessage) -> None:
         """Apply one startup/IPC request without changing persistent behavior."""
+        if self._shutdown:
+            return
+        self.startup_restore.cancel()
         self.show_browser_window()
         unique: dict[str, str] = {}
         for path in message.paths:
@@ -177,6 +203,8 @@ class ApplicationController(QObject):
                 continue
 
     def create_browser_window(self) -> BrowserWindow:
+        if self._shutdown:
+            raise RuntimeError("application is shutting down")
         existing = self.get_browser_window()
         if existing is not None:
             return existing
@@ -211,17 +239,23 @@ class ApplicationController(QObject):
         return self._browser_window
 
     def show_browser_window(self) -> BrowserWindow:
+        if self._shutdown:
+            raise RuntimeError("application is shutting down")
         window = self.get_browser_window() or self.create_browser_window()
         if not window.isVisible():
             window.show_initial()
         return window
 
     def select_path_in_browser(self, path: str | Path) -> None:
+        if self._shutdown:
+            return
         browser = self.get_browser_window()
         if browser is not None:
             browser.select_path(path)
 
     def create_viewer_window(self) -> ViewerWindow:
+        if self._shutdown:
+            raise RuntimeError("application is shutting down")
         window = self._window_factory(
             config_manager=self.config,
             metadata_store=self.metadata_store,
@@ -230,6 +264,7 @@ class ApplicationController(QObject):
             archive_backend_registry=self.archive_backend_registry,
             pdfium_service=self.pdfium_service,
             image_work_coordinator=self.image_work_coordinator,
+            path_availability_service=self.path_availability_service,
         )
         self._viewer_windows.append(window)
         window._application_close_guard = self._allow_window_close
@@ -264,6 +299,10 @@ class ApplicationController(QObject):
         open_in_new_window: bool | None = None,
         folder_snapshot: FolderListingSnapshot | None = None,
     ) -> ViewerWindow:
+        if self._shutdown:
+            raise RuntimeError("application is shutting down")
+        if not self._applying_startup_restore:
+            self.startup_restore.cancel()
         window = self._select_viewer_for_open(open_in_new_window)
         if not window.isVisible():
             window.show_initial()
@@ -314,6 +353,8 @@ class ApplicationController(QObject):
         return self.pdfium_service.flush(wait_seconds=2.0)
 
     def open_adjacent_book(self, window: object, direction: int) -> str:
+        if self._shutdown:
+            return "unavailable"
         if not isinstance(window, ViewerWindow) or window not in self._viewer_windows:
             return "unavailable"
         current = self._book_navigation_path_lexical(window)
@@ -376,29 +417,67 @@ class ApplicationController(QObject):
         if self._shutdown:
             return
         self._shutdown = True
+        self.startup_restore.cancel()
         active = self.get_active_viewer()
         if active is not None:
             self._save_standard_window_state(active)
         for window in tuple(self._viewer_windows):
-            window.prepare_shutdown()
+            window.setEnabled(False)
         browser = self.get_browser_window()
         if browser is not None:
-            browser.prepare_shutdown()
-        self.file_operation_coordinator.close()
+            browser.setEnabled(False)
+        snapshot = ApplicationShutdownSnapshot(
+            running_file_operations=int(
+                self.file_operation_queue.active_operation is not None
+            ),
+            queued_file_operations=len(self.file_operation_queue.queued_requests),
+            pending_pdf_jobs=self.pdfium_service.pending_count,
+            path_probe_pending=self.path_availability_service.pending_count,
+            thumbnail_pending=(
+                self._browser_window.thumbnail_provider.pending_count
+                if self._browser_window is not None
+                else 0
+            ),
+            shell_preview_pending=(
+                self._browser_window.thumbnail_provider.shell_preview_pending_count
+                if self._browser_window is not None
+                else 0
+            ),
+        )
         if self._operation_conflict_dialog is not None:
             self._operation_conflict_dialog.close()
             self._operation_conflict_dialog = None
         if self._operation_fallback_panel is not None:
             self._operation_fallback_panel.close()
             self._operation_fallback_panel = None
-        self.archive_backend_registry.close()
-        self.adjacent_book_search.close()
-        self.path_availability_service.close()
-        self.pdfium_service.shutdown()
-        self.image_work_coordinator.shutdown()
-        self.config.save()
-        self.metadata_store.flush()
-        self.metadata_store.close()
+        self.shutdown_coordinator.configure(
+            (
+                ("viewer_sessions", self._prepare_viewers_for_shutdown),
+                ("browser_workers", self._prepare_browser_for_shutdown),
+                ("archive_backends", self.archive_backend_registry.close),
+                ("adjacent_book_search", self.adjacent_book_search.close),
+                ("path_availability", self.path_availability_service.close),
+                ("pdfium", self.pdfium_service.shutdown),
+                ("image_workers", self.image_work_coordinator.shutdown),
+                ("config_save", self.config.save),
+                ("metadata_flush", self.metadata_store.flush),
+                ("metadata_close", self.metadata_store.close),
+            ),
+            snapshot=snapshot,
+        )
+        if self.file_operation_queue.lifecycle.value == "running":
+            self.file_operation_queue.begin_shutdown(cancel_active=True)
+        if not self.file_operation_queue.busy:
+            self.shutdown_coordinator.begin_shutdown()
+
+    def _prepare_viewers_for_shutdown(self) -> None:
+        for window in tuple(self._viewer_windows):
+            window.prepare_shutdown()
+
+    def _prepare_browser_for_shutdown(self) -> None:
+        browser = self.get_browser_window()
+        if browser is not None:
+            browser.prepare_shutdown()
 
     def _select_viewer_for_open(self, open_in_new_window: bool | None) -> ViewerWindow:
         if open_in_new_window is True:
@@ -596,9 +675,14 @@ class ApplicationController(QObject):
         if answer == QMessageBox.StandardButton.Cancel:
             return False
         if answer == QMessageBox.StandardButton.No:
-            self.file_operation_queue.cancel()
             self._continue_operations_without_main_window = False
-            return True
+            self._pending_close_window = weakref.ref(window)
+            window.setEnabled(False)
+            status_bar = getattr(window, "statusBar", None)
+            if callable(status_bar):
+                status_bar().showMessage("ファイル操作をキャンセルして終了しています…")
+            self.file_operation_queue.begin_shutdown(cancel_active=True)
+            return False
         self._continue_operations_without_main_window = True
         self._show_operation_fallback()
         return True
@@ -631,6 +715,31 @@ class ApplicationController(QObject):
         ):
             self._continue_operations_without_main_window = False
             QTimer.singleShot(0, self._evaluate_application_exit)
+
+    def _on_file_operation_shutdown_finished(self) -> None:
+        pending_ref = self._pending_close_window
+        self._pending_close_window = None
+        if self._shutdown:
+            self.shutdown_coordinator.begin_shutdown()
+        if pending_ref is None:
+            return
+        window = pending_ref()
+        if window is None:
+            return
+        window.setEnabled(True)
+        QTimer.singleShot(0, window.close)
+
+    def _on_file_operation_shutdown_failed(self, message: str) -> None:
+        pending_ref = self._pending_close_window
+        if pending_ref is None:
+            return
+        window = pending_ref()
+        if window is None:
+            return
+        window.setEnabled(True)
+        status_bar = getattr(window, "statusBar", None)
+        if callable(status_bar):
+            status_bar().showMessage(message, 5000)
 
     def _on_background_conflicts_required(self, plan: object) -> None:
         if self._browser_window is not None or self._shutdown:
@@ -729,7 +838,25 @@ class ApplicationController(QObject):
             return target.parent, "folder"
         if suffix in ARCHIVE_EXTENSIONS:
             return target, "archive"
-        return target, "folder" if target.is_dir() else "unknown"
+        return target, "folder"
+
+    def _open_startup_restored_path(self, path: str) -> bool:
+        if self._shutdown:
+            return False
+        self._applying_startup_restore = True
+        try:
+            self.select_path_in_browser(path)
+            self.open_path(path)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        finally:
+            self._applying_startup_restore = False
+        return True
+
+    def _show_browser_status(self, message: str) -> None:
+        browser = self.get_browser_window()
+        if browser is not None and not self._shutdown:
+            browser.statusBar().showMessage(message, 3000)
 
     @staticmethod
     def _book_navigation_path_lexical(window: ViewerWindow) -> str | None:

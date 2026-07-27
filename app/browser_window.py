@@ -26,6 +26,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
+    QClipboard,
     QDesktopServices,
     QKeyEvent,
     QKeySequence,
@@ -109,6 +110,7 @@ from .bookmark_model import BookmarkModel
 from .config_manager import ConfigManager
 from .destination_history import DestinationHistoryStore
 from .file_conflict_dialog import ConflictResolutionDialog
+from .file_operation_artifact import FileOperationArtifactPolicy
 from .file_operation_coordinator import FileOperationCoordinator
 from .file_operation_panel import FileOperationPanel
 from .file_operation_plan import ConflictResolution, FileOperationPlan
@@ -134,6 +136,10 @@ from .folder_tree_sync import FolderTreeSyncController
 from .history_model import HistoryModel
 from .image_work_coordinator import ImageWorkCoordinator
 from .image_source import FolderListingSnapshot
+from .internal_clipboard import (
+    InternalClipboardOperation,
+    InternalClipboardState,
+)
 from .metadata_store import MetadataStore
 from .path_availability import PathAvailabilityService
 from .performance_trace import performance_trace
@@ -142,6 +148,7 @@ from .sidebar_layout import SidebarLayoutController
 from .thumbnail_provider import BrowserThumbnailProvider
 from .thumbnail_disk_cache import ThumbnailDiskCache
 from .thumbnail_render import ThumbnailRenderPolicy, ThumbnailRenderSpec
+from .system_file_opener import SystemFileOpener
 from .windows_filename import (
     generate_numbered_name,
     validate_windows_filename,
@@ -152,6 +159,7 @@ BrowserOpenHandler = Callable[..., object]
 AffectedViewersHandler = Callable[[tuple[str, ...]], tuple[object, ...]]
 CloseAffectedViewersHandler = Callable[[tuple[object, ...]], bool | None]
 _THUMBNAIL_LOG = logging.getLogger("nivisviewer.thumbnail")
+_FILE_OPERATION_LOG = logging.getLogger("nivisviewer.file_operation")
 
 
 @dataclass(frozen=True)
@@ -202,6 +210,7 @@ class BrowserWindow(QMainWindow):
         file_registration_service=None,
         image_work_coordinator: ImageWorkCoordinator | None = None,
         path_availability_service: PathAvailabilityService | None = None,
+        system_file_opener: SystemFileOpener | None = None,
         restore_initial_location: bool = True,
     ) -> None:
         super().__init__()
@@ -231,6 +240,7 @@ class BrowserWindow(QMainWindow):
         self.pdfium_service = pdfium_service
         self.file_registration_service = file_registration_service
         self.image_work_coordinator = image_work_coordinator
+        self.system_file_opener = system_file_opener or SystemFileOpener()
         self._owns_path_availability_service = (
             path_availability_service is None
         )
@@ -327,6 +337,7 @@ class BrowserWindow(QMainWindow):
         self._last_scroll_time = 0.0
         self._file_operation_request_id = 0
         self._active_file_operation_id: int | None = None
+        self._internal_clipboard_state = InternalClipboardState()
         self._clipboard_paths: tuple[str, ...] = ()
         self._clipboard_cut = False
         self._setting_clipboard = False
@@ -968,7 +979,7 @@ class BrowserWindow(QMainWindow):
             self.navigate_to(item.path)
             return
         if not item.openable_by_nivisviewer or item.kind is BrowserItemKind.OTHER:
-            self._show_temporary_status("NivisViewerでは表示できません")
+            self._open_system_file(item.path)
             return
         if self._open_path_handler is not None:
             self._invoke_open_path_handler(
@@ -976,6 +987,26 @@ class BrowserWindow(QMainWindow):
                 open_in_new_window,
                 self._folder_snapshot_for_item(item),
             )
+
+    def _open_system_file(self, path: str | Path) -> bool:
+        result = self.system_file_opener.open_with_default_application(
+            path,
+            parent_hwnd=int(self.winId()),
+        )
+        if result.success:
+            self._show_temporary_status(
+                "NivisViewerでは表示できません。既定のアプリで開きました"
+            )
+            return True
+        self._show_temporary_status(
+            "NivisViewerでは表示できません。"
+            + (
+                f" {result.error_message}"
+                if result.error_message
+                else " 関連付けアプリで開けませんでした"
+            )
+        )
+        return False
 
     def _folder_snapshot_for_item(
         self,
@@ -1049,6 +1080,8 @@ class BrowserWindow(QMainWindow):
             if item is None:
                 continue
             path = str(self._absolute_browser_path(item.path))
+            if FileOperationArtifactPolicy.is_internal_operation_artifact(path):
+                continue
             key = self._path_key(path)
             if key in seen:
                 continue
@@ -1073,8 +1106,10 @@ class BrowserWindow(QMainWindow):
         return True
 
     def clear_file_clipboard(self) -> None:
+        self._internal_clipboard_state.clear()
         self._clipboard_paths = ()
         self._clipboard_cut = False
+        self.item_model.set_cut_paths(())
         self._update_file_action_states()
 
     def paste_items(self) -> bool:
@@ -1086,9 +1121,24 @@ class BrowserWindow(QMainWindow):
             return False
         operation = (
             FileOperationKind.MOVE
-            if self._clipboard_paths and self._clipboard_cut
+            if self._internal_clipboard_state.paths
+            and self._internal_clipboard_state.is_cut
             else FileOperationKind.COPY
         )
+        if _FILE_OPERATION_LOG.isEnabledFor(logging.DEBUG):
+            snapshot = self._internal_clipboard_state.snapshot
+            _FILE_OPERATION_LOG.debug(
+                "paste request kind=%s internal_cut=%s identity=%s "
+                "os_drop_effect=%s sources=%r destination=%s",
+                operation.value,
+                self._internal_clipboard_state.is_cut,
+                snapshot.request_identity if snapshot is not None else None,
+                InternalClipboardState.preferred_drop_effect(
+                    QApplication.clipboard().mimeData()
+                ),
+                sources,
+                self.current_path,
+            )
         if (
             operation is FileOperationKind.MOVE
             and all(
@@ -1218,6 +1268,19 @@ class BrowserWindow(QMainWindow):
         destination: str | Path | None = None,
         new_name: str | None = None,
     ) -> bool:
+        filtered_sources = tuple(
+            path
+            for path in sources
+            if not FileOperationArtifactPolicy.is_internal_operation_artifact(
+                path
+            )
+        )
+        if sources and not filtered_sources:
+            self._show_temporary_status(
+                "NivisViewerの未完了一時ファイルは操作できません"
+            )
+            return False
+        sources = filtered_sources
         if (
             self.file_operation_coordinator.busy
             and self.file_operation_coordinator.queue is None
@@ -1243,6 +1306,16 @@ class BrowserWindow(QMainWindow):
             new_name,
             FileCollisionPolicy.SKIP,
         )
+        if _FILE_OPERATION_LOG.isEnabledFor(logging.DEBUG):
+            _FILE_OPERATION_LOG.debug(
+                "operation boundary browser->coordinator request=%s kind=%s "
+                "sources=%r destination=%s internal_cut=%s",
+                request.request_id,
+                request.operation.value,
+                request.source_paths,
+                request.destination_directory,
+                self._internal_clipboard_state.is_cut,
+            )
         selected_paths = self.selected_file_operation_paths()
         current_row = (
             self.list_view.currentIndex().row()
@@ -1441,10 +1514,20 @@ class BrowserWindow(QMainWindow):
         )
 
     def _set_file_clipboard(self, paths: tuple[str, ...], *, cut: bool) -> None:
-        self._clipboard_paths = paths
-        self._clipboard_cut = cut
+        snapshot = self._internal_clipboard_state.replace(
+            paths,
+            (
+                InternalClipboardOperation.CUT
+                if cut
+                else InternalClipboardOperation.COPY
+            ),
+        )
+        self._clipboard_paths = snapshot.paths
+        self._clipboard_cut = snapshot.is_cut
+        self.item_model.set_cut_paths(snapshot.paths if snapshot.is_cut else ())
         mime = QMimeData()
-        mime.setUrls([QUrl.fromLocalFile(path) for path in paths])
+        mime.setUrls([QUrl.fromLocalFile(path) for path in snapshot.paths])
+        self._internal_clipboard_state.write_marker(mime)
         self._setting_clipboard = True
         try:
             QApplication.clipboard().setMimeData(mime)
@@ -1459,11 +1542,25 @@ class BrowserWindow(QMainWindow):
         paths = [
             url.toLocalFile()
             for url in mime.urls()
-            if url.isLocalFile() and url.toLocalFile()
+            if (
+                url.isLocalFile()
+                and url.toLocalFile()
+                and not FileOperationArtifactPolicy.is_internal_operation_artifact(
+                    url.toLocalFile()
+                )
+            )
         ]
         return tuple(paths)
 
-    def _on_system_clipboard_changed(self) -> None:
+    def _on_system_clipboard_changed(
+        self,
+        mode: QClipboard.Mode | None = None,
+    ) -> None:
+        if mode is not None and mode != QClipboard.Mode.Clipboard:
+            return
+        mime = QApplication.clipboard().mimeData()
+        if self._internal_clipboard_state.matches_mime(mime):
+            return
         if not self._setting_clipboard:
             self.clear_file_clipboard()
 
@@ -1551,6 +1648,23 @@ class BrowserWindow(QMainWindow):
                 self._set_file_clipboard(remaining, cut=True)
             else:
                 self.clear_file_clipboard()
+
+        if _FILE_OPERATION_LOG.isEnabledFor(logging.DEBUG):
+            for item in result.effective_items:
+                _FILE_OPERATION_LOG.debug(
+                    "operation result request=%s kind=%s source=%s destination=%s "
+                    "published=%s removed=%s source_exists_after=%s "
+                    "destination_exists_after=%s state=%s",
+                    result.request_id,
+                    result.operation.value,
+                    item.source_path,
+                    item.destination_path,
+                    item.destination_published,
+                    item.source_removed,
+                    item.source_exists_after,
+                    item.destination_exists_after,
+                    item.state.value,
+                )
 
         effective_items = result.effective_items
         success_count = sum(item.success for item in effective_items)
@@ -2046,6 +2160,7 @@ class BrowserWindow(QMainWindow):
         if self._shutdown_prepared:
             return
         self._shutdown_prepared = True
+        self.clear_file_clipboard()
         if (
             self._owns_file_operation_coordinator
             and self._active_file_operation_id is not None
@@ -4111,6 +4226,13 @@ class BrowserWindow(QMainWindow):
             if item is not None
             else None
         )
+        external_open_action = (
+            menu.addAction("既定のアプリで開く")
+            if item is not None
+            and item.kind is not BrowserItemKind.FOLDER
+            and not unsupported
+            else None
+        )
         new_action = (
             menu.addAction("新しいViewerWindowで開く")
             if item is not None
@@ -4176,9 +4298,12 @@ class BrowserWindow(QMainWindow):
         if open_action is not None and selected == open_action:
             if unsupported:
                 assert item is not None
-                QDesktopServices.openUrl(QUrl.fromLocalFile(str(item.path)))
+                self._open_system_file(item.path)
             else:
                 self.open_item(index)
+        elif external_open_action is not None and selected == external_open_action:
+            assert item is not None
+            self._open_system_file(item.path)
         elif new_action is not None and selected == new_action:
             self.open_item(index, open_in_new_window=True)
         elif (

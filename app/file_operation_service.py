@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import shutil
 import stat
@@ -13,8 +14,15 @@ from threading import Event
 from typing import Callable, Iterable
 
 from .chunked_file_copier import ChunkedFileCopier, CopyCancelled
+from .file_operation_artifact import (
+    ArtifactCleanupResult,
+    FileOperationArtifactPolicy,
+)
 from .windows_filename import generate_copy_name, validate_windows_filename
 from .windows_recycle_bin import RecycleBinAdapter, WindowsRecycleBin
+
+
+_LOG = logging.getLogger("nivisviewer.file_operation")
 
 
 class FileOperationKind(str, Enum):
@@ -46,6 +54,8 @@ class FileOperationErrorCode(str, Enum):
     API_UNAVAILABLE = "api_unavailable"
     CANCELLED = "cancelled"
     PARTIAL_SUCCESS = "partial_success"
+    INTERNAL_STAGING_ARTIFACT = "internal_staging_artifact"
+    ARTIFACT_CLEANUP_FAILED = "artifact_cleanup_failed"
     IO_ERROR = "io_error"
 
 
@@ -61,6 +71,20 @@ class FileOperationItemState(str, Enum):
     DESTINATION_PUBLISHED_SOURCE_REMAINS = (
         "destination_published_source_remains"
     )
+
+
+class FileOperationLifecycleState(str, Enum):
+    PLANNED = "planned"
+    STAGING_CREATED = "staging_created"
+    COPYING = "copying"
+    STAGING_COMPLETE = "staging_complete"
+    PUBLISHING = "publishing"
+    PUBLISHED = "published"
+    REMOVING_SOURCE = "removing_source"
+    COMPLETED = "completed"
+    PARTIAL_SOURCE_REMAINS = "partial_source_remains"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -104,6 +128,11 @@ class FileOperationItemResult:
     retry_source_paths: tuple[str, ...] = ()
     source_root_removed: bool | None = None
     partially_completed: bool = False
+    lifecycle_state: FileOperationLifecycleState = (
+        FileOperationLifecycleState.COMPLETED
+    )
+    artifact_paths: tuple[str, ...] = ()
+    cleanup_errors: tuple[str, ...] = ()
 
     def leaf_results(self) -> tuple[FileOperationItemResult, ...]:
         if not self.child_results:
@@ -203,6 +232,21 @@ class _SourceDeleteFailed(Exception):
     pass
 
 
+class _ArtifactOperationError(OSError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        artifact_path: str,
+        cleanup: ArtifactCleanupResult | None = None,
+        published: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.artifact_path = artifact_path
+        self.cleanup = cleanup
+        self.published = bool(published)
+
+
 class FileOperationService:
     def __init__(self, recycle_bin: RecycleBinAdapter | None = None) -> None:
         self.recycle_bin = recycle_bin or WindowsRecycleBin()
@@ -216,6 +260,14 @@ class FileOperationService:
         cancelled: Event | None = None,
         progress: ProgressCallback | None = None,
     ) -> FileOperationResult:
+        if _LOG.isEnabledFor(logging.DEBUG):
+            _LOG.debug(
+                "service execute request=%s kind=%s sources=%r destination=%s",
+                request.request_id,
+                request.operation.value,
+                request.source_paths,
+                request.destination_directory,
+            )
         cancel_event = cancelled or Event()
         if request.operation is FileOperationKind.CREATE_DIRECTORY:
             return self._create_directory(request, cancel_event, progress)
@@ -497,6 +549,14 @@ class FileOperationService:
         source: str,
         cancelled: Event,
     ) -> FileOperationItemResult:
+        if FileOperationArtifactPolicy.is_internal_operation_artifact(source):
+            return self._failure(
+                source,
+                None,
+                FileOperationErrorCode.INTERNAL_STAGING_ARTIFACT,
+                "NivisViewerの未完了一時ファイルは通常のファイル操作対象にできません。",
+                operation=request.operation,
+            )
         if not os.path.lexists(source):
             return self._failure(
                 source,
@@ -569,7 +629,11 @@ class FileOperationService:
             )
         try:
             if same_key:
-                temporary = self._temporary_sibling(source)
+                temporary = FileOperationArtifactPolicy.create_staging_path(
+                    source,
+                    request.operation_id if request is not None else None,
+                    uuid.uuid4().hex,
+                )
                 os.rename(source, temporary)
                 try:
                     os.rename(temporary, destination)
@@ -892,13 +956,18 @@ class FileOperationService:
             request_id=request.request_id,
         )
 
-    def _copy_atomic(self, source: str, destination: str, cancelled: Event) -> None:
-        temporary = self._temporary_sibling(destination)
+    def _copy_atomic(self, source: str, destination: str, cancelled: Event) -> bool:
+        temporary = FileOperationArtifactPolicy.create_staging_path(
+            destination,
+            uuid.uuid4().hex,
+            uuid.uuid4().hex,
+        )
+        published = False
         try:
             if os.path.isdir(source):
                 self._copy_directory(source, temporary, cancelled)
             else:
-                self.file_copier.copy(
+                self.file_copier.copy_to_staging(
                     source,
                     temporary,
                     cancelled=cancelled,
@@ -906,12 +975,45 @@ class FileOperationService:
                 )
             if cancelled.is_set():
                 raise _OperationCancelled
-            os.rename(temporary, destination)
+            if not os.path.lexists(temporary):
+                raise OSError("stagingの完成を確認できません")
+            os.replace(temporary, destination)
+            published = True
+            if (
+                not os.path.lexists(destination)
+                or os.path.lexists(temporary)
+            ):
+                raise OSError("publish後の事後条件を満たしていません")
+            return True
         except CopyCancelled as exc:
-            self._remove_temporary(temporary)
+            cleanup = FileOperationArtifactPolicy.cleanup_staging_path(temporary)
+            if not cleanup.removed:
+                raise _ArtifactOperationError(
+                    "キャンセル後にstagingを回収できません",
+                    artifact_path=temporary,
+                    cleanup=cleanup,
+                    published=published,
+                ) from exc
             raise _OperationCancelled from exc
-        except BaseException:
-            self._remove_temporary(temporary)
+        except _OperationCancelled as exc:
+            cleanup = FileOperationArtifactPolicy.cleanup_staging_path(temporary)
+            if not cleanup.removed:
+                raise _ArtifactOperationError(
+                    "キャンセル後にstagingを回収できません",
+                    artifact_path=temporary,
+                    cleanup=cleanup,
+                    published=published,
+                ) from exc
+            raise
+        except BaseException as exc:
+            cleanup = FileOperationArtifactPolicy.cleanup_staging_path(temporary)
+            if not cleanup.removed:
+                raise _ArtifactOperationError(
+                    f"publishに失敗し、stagingも回収できません: {exc}",
+                    artifact_path=temporary,
+                    cleanup=cleanup,
+                    published=published,
+                ) from exc
             raise
 
     def _copy_atomic_replace(
@@ -921,37 +1023,61 @@ class FileOperationService:
         cancelled: Event,
     ) -> None:
         if not os.path.isdir(source):
-            try:
-                self.file_copier.copy(
-                    source,
-                    destination,
-                    cancelled=cancelled,
-                    progress=self._byte_progress,
-                    replace=True,
-                )
-            except CopyCancelled as exc:
-                raise _OperationCancelled from exc
+            self._copy_atomic(source, destination, cancelled)
             return
-        temporary = self._temporary_sibling(destination)
-        backup = self._temporary_sibling(destination)
+        temporary = FileOperationArtifactPolicy.create_staging_path(
+            destination,
+            uuid.uuid4().hex,
+            uuid.uuid4().hex,
+        )
+        backup = FileOperationArtifactPolicy.create_staging_path(
+            destination,
+            uuid.uuid4().hex,
+            uuid.uuid4().hex,
+        )
+        published = False
         try:
             self._copy_directory(source, temporary, cancelled)
             if cancelled.is_set():
                 raise _OperationCancelled
-            os.rename(destination, backup)
+            os.replace(destination, backup)
             try:
-                os.rename(temporary, destination)
+                os.replace(temporary, destination)
+                published = True
             except BaseException:
-                os.rename(backup, destination)
+                os.replace(backup, destination)
                 raise
-            self._remove_temporary(backup)
-        except BaseException:
-            self._remove_temporary(temporary)
+            cleanup = FileOperationArtifactPolicy.cleanup_staging_path(backup)
+            if not cleanup.removed:
+                raise _ArtifactOperationError(
+                    "置換後のbackup artifactを回収できません",
+                    artifact_path=backup,
+                    cleanup=cleanup,
+                    published=True,
+                )
+            if (
+                not os.path.lexists(destination)
+                or os.path.lexists(temporary)
+            ):
+                raise OSError("置換publish後の事後条件を満たしていません")
+        except BaseException as exc:
+            temporary_cleanup = (
+                FileOperationArtifactPolicy.cleanup_staging_path(temporary)
+            )
             if os.path.lexists(backup) and not os.path.lexists(destination):
                 try:
-                    os.rename(backup, destination)
+                    os.replace(backup, destination)
                 except OSError:
                     pass
+            if isinstance(exc, _ArtifactOperationError):
+                raise
+            if not temporary_cleanup.removed:
+                raise _ArtifactOperationError(
+                    f"置換に失敗し、stagingも回収できません: {exc}",
+                    artifact_path=temporary,
+                    cleanup=temporary_cleanup,
+                    published=published,
+                ) from exc
             raise
 
     def _copy_directory(self, source: str, destination: str, cancelled: Event) -> None:
@@ -974,7 +1100,7 @@ class FileOperationService:
                     self._copy_directory(child_source, child_destination, cancelled)
                 else:
                     try:
-                        self.file_copier.copy(
+                        self.file_copier.copy_to_staging(
                             child_source,
                             child_destination,
                             cancelled=cancelled,
@@ -1298,20 +1424,58 @@ class FileOperationService:
             os.rename(source, destination)
             if os.path.lexists(source) or not os.path.lexists(destination):
                 raise OSError("移動後の事後条件を満たしていません")
+            if _LOG.isEnabledFor(logging.DEBUG):
+                _LOG.debug(
+                    "same-volume rename completed source=%s destination=%s "
+                    "source_exists=%s destination_exists=%s",
+                    source,
+                    destination,
+                    os.path.lexists(source),
+                    os.path.lexists(destination),
+                )
             return
         except OSError as exc:
             if exc.errno != errno.EXDEV:
                 raise
-        self._copy_atomic(source, destination, cancelled)
+        published = self._copy_atomic(source, destination, cancelled)
         if cancelled.is_set():
-            self._remove_temporary(destination)
-            raise _OperationCancelled
+            if published is not True and os.path.lexists(destination):
+                # A copier that does not return the explicit postcondition
+                # receipt may have left an unpublished output. Roll back only
+                # that unverified legacy boundary; production publishes return
+                # True after final-exists/staging-missing checks.
+                self._remove_source(destination)
+                raise _OperationCancelled
+            raise _SourceDeleteFailed(
+                "移動先は完成しましたが、キャンセルにより元項目を残しました"
+            )
         try:
+            if _LOG.isEnabledFor(logging.DEBUG):
+                _LOG.debug(
+                    "cross-volume source delete attempted source=%s destination=%s",
+                    source,
+                    destination,
+                )
             self._remove_source(source)
         except OSError as exc:
+            if _LOG.isEnabledFor(logging.DEBUG):
+                _LOG.debug(
+                    "cross-volume source delete failed source=%s destination=%s error=%r",
+                    source,
+                    destination,
+                    exc,
+                )
             raise _SourceDeleteFailed(
                 f"コピーは完了しましたがコピー元を削除できませんでした: {exc}"
             ) from exc
+        if _LOG.isEnabledFor(logging.DEBUG):
+            _LOG.debug(
+                "cross-volume source delete completed source=%s "
+                "source_exists=%s destination_exists=%s",
+                source,
+                os.path.lexists(source),
+                os.path.lexists(destination),
+            )
         if os.path.lexists(source):
             raise _SourceDeleteFailed(
                 "コピーは完了しましたがコピー元が残っています"
@@ -1340,11 +1504,32 @@ class FileOperationService:
         if cancelled.is_set():
             raise _OperationCancelled
         try:
+            if _LOG.isEnabledFor(logging.DEBUG):
+                _LOG.debug(
+                    "replace source delete attempted source=%s destination=%s",
+                    source,
+                    destination,
+                )
             self._remove_source(source)
         except OSError as exc:
+            if _LOG.isEnabledFor(logging.DEBUG):
+                _LOG.debug(
+                    "replace source delete failed source=%s destination=%s error=%r",
+                    source,
+                    destination,
+                    exc,
+                )
             raise _SourceDeleteFailed(
                 f"置換は完了しましたがコピー元を削除できませんでした: {exc}"
             ) from exc
+        if _LOG.isEnabledFor(logging.DEBUG):
+            _LOG.debug(
+                "replace source delete completed source=%s "
+                "source_exists=%s destination_exists=%s",
+                source,
+                os.path.lexists(source),
+                os.path.lexists(destination),
+            )
         if os.path.lexists(source):
             raise _SourceDeleteFailed(
                 "置換は完了しましたがコピー元が残っています"
@@ -1446,26 +1631,15 @@ class FileOperationService:
 
     @staticmethod
     def _temporary_sibling(path: str) -> str:
-        parent = os.path.dirname(path)
-        name = os.path.basename(path)
-        for _ in range(100):
-            candidate = os.path.join(
-                parent,
-                f".{name}.nivisviewer-{uuid.uuid4().hex}.tmp",
-            )
-            if not os.path.lexists(candidate):
-                return candidate
-        raise OSError("一時パスを作成できません")
+        return FileOperationArtifactPolicy.create_staging_path(
+            path,
+            uuid.uuid4().hex,
+            uuid.uuid4().hex,
+        )
 
     @staticmethod
     def _remove_temporary(path: str) -> None:
-        try:
-            if os.path.isdir(path):
-                shutil.rmtree(path)
-            elif os.path.lexists(path):
-                os.unlink(path)
-        except OSError:
-            pass
+        FileOperationArtifactPolicy.cleanup_staging_path(path)
 
     @staticmethod
     def _failure(
@@ -1501,6 +1675,11 @@ class FileOperationService:
             ),
             source_exists_after=(os.path.lexists(source) if source else None),
             operation=operation,
+            lifecycle_state=(
+                FileOperationLifecycleState.CANCELLED
+                if code is FileOperationErrorCode.CANCELLED
+                else FileOperationLifecycleState.FAILED
+            ),
         )
 
     @staticmethod
@@ -1525,6 +1704,7 @@ class FileOperationService:
             replaced_existing=replaced_existing,
             destination_existed_before=destination_existed_before,
             published_destination_paths=(destination,),
+            lifecycle_state=FileOperationLifecycleState.COMPLETED,
         )
 
     @classmethod
@@ -1551,6 +1731,7 @@ class FileOperationService:
                 published_destination_paths=(destination,),
                 moved_source_paths=(source,),
                 source_root_removed=True,
+                lifecycle_state=FileOperationLifecycleState.COMPLETED,
             )
         state = (
             FileOperationItemState.DESTINATION_PUBLISHED_SOURCE_REMAINS
@@ -1580,6 +1761,11 @@ class FileOperationService:
             retry_source_paths=cls._immediate_residual_paths(source),
             source_root_removed=not source_exists,
             partially_completed=destination_exists,
+            lifecycle_state=(
+                FileOperationLifecycleState.PARTIAL_SOURCE_REMAINS
+                if destination_exists and source_exists
+                else FileOperationLifecycleState.FAILED
+            ),
         )
 
     @classmethod
@@ -1616,6 +1802,7 @@ class FileOperationService:
             retry_source_paths=cls._immediate_residual_paths(source),
             source_root_removed=not source_exists,
             partially_completed=destination_exists,
+            lifecycle_state=FileOperationLifecycleState.PARTIAL_SOURCE_REMAINS,
         )
 
     @staticmethod
@@ -1663,12 +1850,50 @@ class FileOperationService:
             33,
         }:
             code = FileOperationErrorCode.IN_USE
+        elif isinstance(error, _ArtifactOperationError):
+            code = (
+                FileOperationErrorCode.ARTIFACT_CLEANUP_FAILED
+                if error.cleanup is not None and not error.cleanup.removed
+                else FileOperationErrorCode.IO_ERROR
+            )
         else:
             code = FileOperationErrorCode.IO_ERROR
-        return cls._failure(
+        result = cls._failure(
             source,
             destination,
             code,
             str(error),
             operation=operation,
+        )
+        if not isinstance(error, _ArtifactOperationError):
+            return result
+        destination_exists = bool(destination and os.path.lexists(destination))
+        source_exists = bool(source and os.path.lexists(source))
+        cleanup_errors = (
+            (error.cleanup.error_message or "staging cleanup failed",)
+            if error.cleanup is not None and not error.cleanup.removed
+            else ()
+        )
+        return replace(
+            result,
+            partial_success=bool(error.published and destination_exists),
+            state=(
+                FileOperationItemState.DESTINATION_PUBLISHED_SOURCE_REMAINS
+                if operation is FileOperationKind.MOVE
+                and destination_exists
+                and source_exists
+                else FileOperationItemState.FAILED
+            ),
+            destination_exists_after=destination_exists,
+            source_exists_after=source_exists,
+            destination_published=bool(error.published and destination_exists),
+            source_removed=not source_exists,
+            partially_completed=bool(error.published and destination_exists),
+            lifecycle_state=(
+                FileOperationLifecycleState.PARTIAL_SOURCE_REMAINS
+                if error.published and destination_exists and source_exists
+                else FileOperationLifecycleState.FAILED
+            ),
+            artifact_paths=(error.artifact_path,),
+            cleanup_errors=cleanup_errors,
         )
