@@ -153,6 +153,10 @@ class ViewerWidget(QWidget):
         self._pan = QPoint(0, 0)
         self._drag_start: QPoint | None = None
         self._press_position: QPoint | None = None
+        self._canvas_press_side: str | None = None
+        self._pending_canvas_click_side: str | None = None
+        self._pending_canvas_click_global = QPoint()
+        self._canvas_side_click_enabled = True
         self._drag_origin = QPoint(0, 0)
         self._mouse_pos: QPoint | None = None
         self._last_draw_layout: list[tuple[QRect, QPixmap]] = []
@@ -174,7 +178,7 @@ class ViewerWidget(QWidget):
             parent=self,
         )
         self.canvas_pointer.singleClickConfirmed.connect(
-            self.imageLeftClicked
+            self._confirm_canvas_single_click
         )
         self.canvas_pointer.doubleClickConfirmed.connect(
             self.fullscreenToggleRequested
@@ -195,7 +199,47 @@ class ViewerWidget(QWidget):
         self.canvas_pointer.cancel()
         self._press_position = None
         self._drag_start = None
+        self._canvas_press_side = None
+        self._pending_canvas_click_side = None
         self.unsetCursor()
+
+    def set_canvas_side_click_enabled(self, enabled: bool) -> None:
+        self._canvas_side_click_enabled = bool(enabled)
+        self.cancel_pending_canvas_click()
+
+    def canvas_click_side_at(self, local_position: QPoint) -> str | None:
+        if not self.rect().contains(local_position):
+            return None
+        x = local_position.x()
+        center_x = self.rect().center().x()
+        if x == center_x:
+            return None
+
+        layout = self._layout_for_current_images()
+        if len(layout.rects) == 2:
+            left_rect, right_rect = sorted(layout.rects, key=lambda rect: rect.x())
+            gap_start = left_rect.right() + 1
+            gap_end = right_rect.left() - 1
+            if gap_start <= gap_end and gap_start <= x <= gap_end:
+                return None
+        return "left" if x < center_x else "right"
+
+    def _confirm_canvas_single_click(self) -> None:
+        side = self.canvas_click_side_at(
+            self.mapFromGlobal(self._pending_canvas_click_global)
+        )
+        if side is None or side != self._pending_canvas_click_side:
+            self._pending_canvas_click_side = None
+            return
+        self._pending_canvas_click_side = None
+        self._emit_canvas_side_click(side)
+
+    def _emit_canvas_side_click(self, side: str) -> None:
+        if side == "left":
+            self.leftSideClicked.emit()
+        else:
+            self.rightSideClicked.emit()
+        self.imageLeftClicked.emit()
 
     def set_background_color(self, color: str) -> None:
         self.background_color = QColor(color)
@@ -443,7 +487,7 @@ class ViewerWidget(QWidget):
             self._press_position = position
             self._drag_start = position
             self._drag_origin = QPoint(self._pan)
-            self.canvas_pointer.begin(
+            allowed = self.canvas_pointer.begin(
                 local_position=position,
                 global_position=global_position,
                 button=event.button(),
@@ -453,6 +497,9 @@ class ViewerWidget(QWidget):
                 edge_trigger=bool(flags.get("edge_trigger", False)),
                 mouse_gesture=bool(flags.get("mouse_gesture", False)),
                 drop_active=bool(flags.get("drop_active", False)),
+            )
+            self._canvas_press_side = (
+                self.canvas_click_side_at(position) if allowed else None
             )
             event.accept()
             return
@@ -525,18 +572,49 @@ class ViewerWidget(QWidget):
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
-            self.canvas_pointer.release(
-                local_position=event.position().toPoint(),
-                global_position=event.globalPosition().toPoint(),
-            )
+            local_position = event.position().toPoint()
+            global_position = event.globalPosition().toPoint()
+            release_side = self.canvas_click_side_at(local_position)
+            if (
+                self._canvas_press_side is not None
+                and release_side == self._canvas_press_side
+            ):
+                self._pending_canvas_click_side = release_side
+                self._pending_canvas_click_global = QPoint(global_position)
+                self.canvas_pointer.release(
+                    local_position=local_position,
+                    global_position=global_position,
+                    immediate=self._canvas_side_click_enabled,
+                )
+            else:
+                self.canvas_pointer.cancel()
+                self._pending_canvas_click_side = None
             self._drag_start = None
             self._press_position = None
+            self._canvas_press_side = None
             self.unsetCursor()
             event.accept()
             return
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        side = self.canvas_click_side_at(event.position().toPoint())
+        if (
+            self._canvas_side_click_enabled
+            and side is not None
+            and event.button() == Qt.MouseButton.LeftButton
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and self._canvas_click_allowed(event.globalPosition().toPoint())
+        ):
+            self.canvas_pointer.cancel()
+            self._drag_start = None
+            self._press_position = None
+            self._canvas_press_side = None
+            self._pending_canvas_click_side = None
+            self.unsetCursor()
+            self._emit_canvas_side_click(side)
+            event.accept()
+            return
         if self.canvas_pointer.double_click(
             button=event.button(),
             modifiers=event.modifiers(),
@@ -544,6 +622,8 @@ class ViewerWidget(QWidget):
         ):
             self._drag_start = None
             self._press_position = None
+            self._canvas_press_side = None
+            self._pending_canvas_click_side = None
             self.unsetCursor()
             event.accept()
             return

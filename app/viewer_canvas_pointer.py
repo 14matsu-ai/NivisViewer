@@ -124,6 +124,7 @@ class ViewerCanvasPointerController(QObject):
         *,
         local_position: QPoint,
         global_position: QPoint,
+        immediate: bool = False,
     ) -> bool:
         press = self.press
         if press is None or self.state != ViewerCanvasPointerState.PRESSED:
@@ -145,6 +146,11 @@ class ViewerCanvasPointerController(QObject):
             return False
         self._pending_context = press.context_token
         self._pending_global_position = QPoint(global_position)
+        if immediate:
+            self._pending_context = None
+            self.state = ViewerCanvasPointerState.IDLE
+            self.singleClickConfirmed.emit()
+            return True
         self.state = ViewerCanvasPointerState.PENDING_SINGLE_CLICK
         interval = max(1, QApplication.doubleClickInterval())
         scheduling_margin = min(10, max(0, interval // 4))
