@@ -8,7 +8,9 @@ from pathlib import Path
 from threading import Event
 
 import pytest
-from PySide6.QtCore import QModelIndex
+from PySide6.QtCore import QModelIndex, Qt
+from PySide6.QtGui import QColor, QPalette
+from PySide6.QtWidgets import QStyleOptionViewItem
 
 from app.browser_model import BrowserItem, BrowserItemKind, BrowserItemModel
 from app.browser_scanner import BrowserScanRequest, scan_directory
@@ -24,7 +26,11 @@ from app.file_operation_artifact import (
     FileOperationArtifactPolicy,
     OrphanArtifactScanner,
 )
-from app.file_operation_plan import FileOperationPlanner, FileOperationState
+from app.file_operation_plan import (
+    ConflictResolution,
+    FileOperationPlanner,
+    FileOperationState,
+)
 from app.file_operation_service import (
     FileOperationErrorCode,
     FileOperationItemState,
@@ -577,5 +583,155 @@ def test_real_conflict_dialog_updates_all_detail_labels(
     assert dialog.detail_labels["source_name"].text() == "日本語 file.txt"
     assert dialog.detail_labels["source_path"].toolTip() == sources[1]
     dialog._apply(plan.conflicts[1].allowed_resolutions[1])
+    assert dialog.detail_labels["action"].text() == "keep_both"
+    dialog.close()
+
+
+def test_single_conflict_upper_table_renders_integer_roles_compactly(
+    tmp_path: Path,
+    qapp,
+) -> None:
+    source = tmp_path / "コピー元" / ("日本語 と空白のある非常に長い名前" * 4)
+    destination_folder = tmp_path / "コピー先"
+    source.parent.mkdir()
+    destination_folder.mkdir()
+    source.write_bytes(b"new")
+    destination = destination_folder / source.name
+    destination.write_bytes(b"old")
+    plan = FileOperationPlanner().prepare(
+        FileOperationRequest(
+            1,
+            FileOperationKind.COPY,
+            (str(source),),
+            str(destination_folder),
+        )
+    )
+    dialog = ConflictResolutionDialog(plan)
+    dark = dialog.palette()
+    dark.setColor(QPalette.ColorRole.Window, QColor("#202124"))
+    dark.setColor(QPalette.ColorRole.WindowText, QColor("#f1f3f4"))
+    dark.setColor(QPalette.ColorRole.Base, QColor("#171717"))
+    dark.setColor(QPalette.ColorRole.Text, QColor("#f1f3f4"))
+    dark.setColor(QPalette.ColorRole.Highlight, QColor("#245a83"))
+    dark.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    dialog.setPalette(dark)
+    dialog.show()
+    qapp.processEvents()
+
+    assert dialog.model.rowCount() == 1
+    assert dialog.model.headerData(
+        0,
+        Qt.Orientation.Horizontal,
+        int(Qt.ItemDataRole.DisplayRole),
+    ) == "コピー元"
+    displayed = [
+        dialog.model.data(
+            dialog.model.index(0, column),
+            int(Qt.ItemDataRole.DisplayRole),
+        )
+        for column in range(dialog.model.columnCount())
+    ]
+    assert displayed[0] == source.name
+    assert displayed[1] == destination.name
+    assert all(isinstance(text, str) and text for text in displayed)
+
+    option = QStyleOptionViewItem()
+    option.widget = dialog.table
+    dialog.table.itemDelegate().initStyleOption(
+        option,
+        dialog.model.index(0, 0),
+    )
+    assert option.text == source.name
+    assert dialog.table.geometry().width() > 0
+    assert dialog.table.viewport().geometry().height() > 0
+    assert dialog.table.rowHeight(0) > 0
+    expected_maximum = (
+        dialog.table.horizontalHeader().height()
+        + dialog.table.rowHeight(0)
+        + dialog.table.horizontalScrollBar().sizeHint().height()
+        + dialog.table.frameWidth() * 2
+        + 2
+    )
+    assert dialog.table.height() <= expected_maximum
+    assert dialog.table.height() < dialog.height() // 2
+    palette = dialog.table.viewport().palette()
+    assert (
+        palette.color(QPalette.ColorRole.Text)
+        != palette.color(QPalette.ColorRole.Base)
+    )
+    assert dialog.table.textElideMode() is Qt.TextElideMode.ElideMiddle
+    tooltip = dialog.model.data(
+        dialog.model.index(0, 0),
+        int(Qt.ItemDataRole.ToolTipRole),
+    )
+    assert str(source) in tooltip
+    assert str(destination) in tooltip
+    assert dialog.detail_labels["source_name"].text() == source.name
+    assert set(dialog.resolutions.values()) == {ConflictResolution.SKIP}
+    dialog._apply(ConflictResolution.KEEP_BOTH)
+    assert set(dialog.resolutions.values()) == {ConflictResolution.KEEP_BOTH}
+    dialog._apply(ConflictResolution.REPLACE)
+    assert set(dialog.resolutions.values()) == {ConflictResolution.REPLACE}
+    dialog.close()
+
+
+def test_multiple_conflict_upper_table_updates_visible_rows_and_apply_all(
+    tmp_path: Path,
+    qapp,
+) -> None:
+    source_folder = tmp_path / "source"
+    destination_folder = tmp_path / "destination"
+    source_folder.mkdir()
+    destination_folder.mkdir()
+    names = ("README", "日本語 file without suffix")
+    sources: list[Path] = []
+    for name in names:
+        source = source_folder / name
+        source.write_bytes(b"new")
+        (destination_folder / name).write_bytes(b"old")
+        sources.append(source)
+    plan = FileOperationPlanner().prepare(
+        FileOperationRequest(
+            1,
+            FileOperationKind.COPY,
+            tuple(str(path) for path in sources),
+            str(destination_folder),
+        )
+    )
+    dialog = ConflictResolutionDialog(plan)
+    dialog.show()
+    qapp.processEvents()
+
+    assert dialog.model.rowCount() == 2
+    for row, name in enumerate(names):
+        values = [
+            dialog.model.data(
+                dialog.model.index(row, column),
+                int(Qt.ItemDataRole.DisplayRole),
+            )
+            for column in range(dialog.model.columnCount())
+        ]
+        assert values[0] == name
+        assert values[1] == name
+        assert all(isinstance(text, str) and text for text in values)
+        option = QStyleOptionViewItem()
+        option.widget = dialog.table
+        dialog.table.itemDelegate().initStyleOption(
+            option,
+            dialog.model.index(row, 0),
+        )
+        assert option.text == name
+        assert dialog.table.visualRect(dialog.model.index(row, 0)).width() > 0
+
+    second = dialog.model.index(1, 0)
+    dialog.table.setCurrentIndex(second)
+    dialog.table.selectRow(1)
+    qapp.processEvents()
+    assert dialog.detail_labels["position"].text() == "2 / 2"
+    assert dialog.detail_labels["source_name"].text() == names[1]
+    assert dialog.detail_labels["source_path"].text() == str(sources[1])
+    dialog.same_kind_checkbox.setChecked(True)
+    dialog._apply(ConflictResolution.KEEP_BOTH)
+    assert set(dialog.resolutions.values()) == {ConflictResolution.KEEP_BOTH}
     assert dialog.detail_labels["action"].text() == "keep_both"
     dialog.close()

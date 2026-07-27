@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, Signal
-from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QAbstractScrollArea,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -116,8 +116,8 @@ class FileConflictTableModel(QAbstractTableModel):
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):  # noqa: N802
         if (
-            role is Qt.ItemDataRole.DisplayRole
-            and orientation is Qt.Orientation.Horizontal
+            role == Qt.ItemDataRole.DisplayRole
+            and orientation == Qt.Orientation.Horizontal
             and 0 <= section < len(self.HEADERS)
         ):
             return self.HEADERS[section]
@@ -127,27 +127,20 @@ class FileConflictTableModel(QAbstractTableModel):
         if not index.isValid() or not (0 <= index.row() < len(self.conflicts)):
             return None
         conflict = self.conflicts[index.row()]
-        if role is Qt.ItemDataRole.UserRole:
+        if role == Qt.ItemDataRole.UserRole:
             return conflict
-        if role is Qt.ItemDataRole.ToolTipRole:
+        if role == Qt.ItemDataRole.ToolTipRole:
             return (
                 f"{conflict.message}\n"
                 f"元: {conflict.source_path or ''}\n"
                 f"先: {conflict.destination_path or ''}"
             )
-        if (
-            role is Qt.ItemDataRole.ForegroundRole
-            and index.column() == 7
-            and self._resolutions[conflict.conflict_id]
-            is ConflictResolution.REPLACE
-        ):
-            return QColor("#c62828")
-        if role is not Qt.ItemDataRole.DisplayRole:
+        if role != Qt.ItemDataRole.DisplayRole:
             return None
         if index.column() == 0:
-            return conflict.source_path or ""
+            return os.path.basename(conflict.source_path or "") or "(不明)"
         if index.column() == 1:
-            return conflict.destination_path or ""
+            return os.path.basename(conflict.destination_path or "") or "(不明)"
         if index.column() == 2:
             return conflict.source_kind or ""
         if index.column() == 3:
@@ -241,6 +234,9 @@ class ConflictResolutionDialog(QDialog):
         self.table.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
         self.table.setWordWrap(False)
         self.table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.table.setSizeAdjustPolicy(
+            QAbstractScrollArea.SizeAdjustPolicy.AdjustToContentsOnFirstShow
+        )
         self.table.horizontalHeader().setStretchLastSection(True)
         self.same_kind_checkbox = QCheckBox("同じ種類の衝突へ適用", self)
         self.detail_labels: dict[str, QLabel] = {}
@@ -304,7 +300,7 @@ class ConflictResolutionDialog(QDialog):
                 self,
             )
         )
-        layout.addWidget(self.table, 1)
+        layout.addWidget(self.table, 0 if self.model.rowCount() == 1 else 1)
         layout.addLayout(detail_layout)
         layout.addLayout(action_layout)
         layout.addWidget(self.buttons)
@@ -318,8 +314,12 @@ class ConflictResolutionDialog(QDialog):
             first = self.model.index(0, 0)
             self.table.setCurrentIndex(first)
             self.table.selectRow(0)
+        self._configure_table_height()
         self._update_resolution_buttons()
         self._update_details()
+        if self.model.rowCount() == 1:
+            layout.activate()
+            self.resize(self.width(), self.sizeHint().height())
 
     @property
     def resolutions(self) -> dict[str, ConflictResolution]:
@@ -357,6 +357,27 @@ class ConflictResolutionDialog(QDialog):
     def _update_current_conflict(self) -> None:
         self._update_resolution_buttons()
         self._update_details()
+
+    def _configure_table_height(self) -> None:
+        if self.model.rowCount() != 1:
+            return
+        header_height = max(
+            self.table.horizontalHeader().sizeHint().height(),
+            self.table.horizontalHeader().height(),
+        )
+        row_height = max(
+            self.table.verticalHeader().defaultSectionSize(),
+            self.table.sizeHintForRow(0),
+        )
+        scrollbar_height = self.table.horizontalScrollBar().sizeHint().height()
+        frame = self.table.frameWidth() * 2
+        compact_height = header_height + row_height + scrollbar_height + frame
+        self.table.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.table.setMinimumHeight(compact_height)
+        self.table.setMaximumHeight(compact_height)
 
     def _update_details(self) -> None:
         if not self.plan.conflicts:
