@@ -374,6 +374,9 @@ class BrowserWindow(QMainWindow):
         self.thumbnail_crop_mode = str(
             self.settings.get("thumbnail_crop_mode", "smart_crop")
         )
+        self.browser_thumbnail_display_mode = str(
+            self.settings.get("browser_thumbnail_display_mode", "fit")
+        )
         self.thumbnail_quality_mode = str(
             self.settings.get("thumbnail_quality_mode", "auto")
         )
@@ -2194,6 +2197,7 @@ class BrowserWindow(QMainWindow):
             "thumbnail_size",
             "thumbnail_frame_ratio",
             "thumbnail_crop_mode",
+            "browser_thumbnail_display_mode",
             "thumbnail_quality_mode",
             "thumbnail_cache_max_edge",
             "browser_sort_key",
@@ -2262,6 +2266,7 @@ class BrowserWindow(QMainWindow):
                 "thumbnail_size",
                 "thumbnail_frame_ratio",
                 "thumbnail_crop_mode",
+                "browser_thumbnail_display_mode",
                 "thumbnail_quality_mode",
                 "thumbnail_cache_max_edge",
             }.intersection(changed)
@@ -2280,6 +2285,12 @@ class BrowserWindow(QMainWindow):
                 changed.get(
                     "thumbnail_crop_mode",
                     self.thumbnail_crop_mode,
+                )
+            )
+            new_display_mode = str(
+                changed.get(
+                    "browser_thumbnail_display_mode",
+                    self.browser_thumbnail_display_mode,
                 )
             )
             new_quality_mode = str(
@@ -2302,11 +2313,13 @@ class BrowserWindow(QMainWindow):
             )
             old_ratio = self.thumbnail_frame_ratio
             old_crop_mode = self.thumbnail_crop_mode
+            old_display_mode = self.browser_thumbnail_display_mode
             old_quality_mode = self.thumbnail_quality_mode
             old_max_edge = self.thumbnail_cache_max_edge
             self.thumbnail_size = new_size
             self.thumbnail_frame_ratio = new_ratio
             self.thumbnail_crop_mode = new_crop_mode
+            self.browser_thumbnail_display_mode = new_display_mode
             self.thumbnail_quality_mode = new_quality_mode
             self.thumbnail_cache_max_edge = new_max_edge
             new_spec = self._build_thumbnail_render_spec()
@@ -2319,6 +2332,7 @@ class BrowserWindow(QMainWindow):
                 policy_changed = (
                     old_ratio != new_ratio
                     or old_crop_mode != new_crop_mode
+                    or old_display_mode != new_display_mode
                     or old_quality_mode != new_quality_mode
                     or old_max_edge != new_max_edge
                 )
@@ -2563,6 +2577,7 @@ class BrowserWindow(QMainWindow):
             thumbnail_size=self.thumbnail_size,
             density=self.browser_display_density,
             frame_ratio_id=self.thumbnail_frame_ratio,
+            thumbnail_display_mode=self.browser_thumbnail_display_mode,
             cell_padding=self.browser_cell_padding,
             filename_display=self.browser_filename_display,
             filename_gap=self.browser_filename_gap,
@@ -2917,6 +2932,7 @@ class BrowserWindow(QMainWindow):
             thumbnail_size=self.thumbnail_size,
             density=self.browser_display_density,
             frame_ratio_id=self.thumbnail_frame_ratio,
+            thumbnail_display_mode=self.browser_thumbnail_display_mode,
             cell_padding=self.browser_cell_padding,
             filename_display=self.browser_filename_display,
             filename_gap=self.browser_filename_gap,
@@ -3505,6 +3521,7 @@ class BrowserWindow(QMainWindow):
             device_pixel_ratio=self._thumbnail_dpr,
             quality_mode=self.thumbnail_quality_mode,
             max_edge=self.thumbnail_cache_max_edge,
+            browser_display_mode=self.browser_thumbnail_display_mode,
         )
         spec = policy.render_spec()
         if _THUMBNAIL_LOG.isEnabledFor(logging.DEBUG):

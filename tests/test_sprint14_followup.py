@@ -635,7 +635,9 @@ def test_config_normalizes_thumbnail_ratio_and_crop_mode(tmp_path):
         {
             "thumbnail_frame_ratio": "bad",
             "thumbnail_crop_mode": "bad",
+            "browser_thumbnail_display_mode": "bad",
         }
     )
     assert config.get("thumbnail_frame_ratio") == "portrait_1_sqrt2"
     assert config.get("thumbnail_crop_mode") == "smart_crop"
+    assert config.get("browser_thumbnail_display_mode") == "fit"

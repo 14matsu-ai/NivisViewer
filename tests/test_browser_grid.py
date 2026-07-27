@@ -10,6 +10,7 @@ from app.browser_item_delegate import (
     BrowserItemDelegate,
     browser_item_type_key,
     quantize_thumbnail_size,
+    thumbnail_image_rects,
     thumbnail_rect_for_cell,
     type_badge_rect,
 )
@@ -105,6 +106,59 @@ def test_delegate_uses_fixed_cell_and_uniform_thumbnail_rect(qapp):
     )
     assert thumbnail.size() == QSize(127, 180)
     assert thumbnail.left() == (first.width() - 127) // 2
+
+
+def test_thumbnail_display_modes_keep_ratio_for_wide_tall_and_square_images(qapp):
+    frame = QRect(0, 0, 100, 100)
+    fit_wide_target, fit_wide_source = thumbnail_image_rects(
+        frame,
+        QSize(200, 100),
+        "fit",
+    )
+    crop_wide_target, crop_wide_source = thumbnail_image_rects(
+        frame,
+        QSize(200, 100),
+        "center_crop",
+    )
+    crop_tall_target, crop_tall_source = thumbnail_image_rects(
+        frame,
+        QSize(100, 200),
+        "center_crop",
+    )
+    crop_square_target, crop_square_source = thumbnail_image_rects(
+        frame,
+        QSize(100, 100),
+        "center_crop",
+    )
+
+    assert fit_wide_target.width() == 92
+    assert fit_wide_target.height() == 46
+    assert fit_wide_source == QRect(0, 0, 200, 100)
+    assert crop_wide_target.size() == QSize(98, 98)
+    assert crop_wide_source.toRect() == QRect(50, 0, 100, 100)
+    assert crop_tall_target.size() == QSize(98, 98)
+    assert crop_tall_source.toRect() == QRect(0, 50, 100, 100)
+    assert crop_square_target.size() == QSize(98, 98)
+    assert crop_square_source.toRect() == QRect(0, 0, 100, 100)
+
+
+def test_center_crop_delegate_fills_frame_from_image_center(qapp):
+    delegate = BrowserItemDelegate(thumbnail_display_mode="center_crop")
+    source = QImage(200, 100, QImage.Format.Format_RGB32)
+    source.fill(QColor("green"))
+    painter_image = QImage(100, 100, QImage.Format.Format_RGB32)
+    painter_image.fill(QColor("white"))
+    painter = QPainter(painter_image)
+    delegate._paint_thumbnail_image(
+        painter,
+        QRect(0, 0, 100, 100),
+        source,
+        enabled=True,
+    )
+    painter.end()
+
+    assert painter_image.pixelColor(2, 2) == QColor("green")
+    assert painter_image.pixelColor(97, 97) == QColor("green")
 
 
 def test_type_badges_distinguish_supported_item_types_and_are_bottom_left(tmp_path):
@@ -232,6 +286,34 @@ def test_ratio_and_crop_changes_use_2d_cache_generation(tmp_path, qapp):
     qapp.processEvents()
 
 
+def test_browser_display_mode_repaints_current_images_and_uses_new_cache_variant(
+    tmp_path,
+    qapp,
+):
+    window = make_window(tmp_path, qapp)
+    item = make_item(tmp_path / "一覧" / "日本語.webp", BrowserItemKind.IMAGE)
+    window.item_model.set_items([item])
+    image = QImage(200, 100, QImage.Format.Format_RGB32)
+    image.fill(QColor("green"))
+    assert window.item_model.set_thumbnail_image(item.path, image)
+    initial_generation = window.thumbnail_provider.generation
+    initial_token = window.thumbnail_render_spec.cache_token
+
+    window.config.apply({"browser_thumbnail_display_mode": "center_crop"})
+    qapp.processEvents()
+
+    assert window.item_delegate.thumbnail_display_mode == "center_crop"
+    assert window.thumbnail_render_spec.browser_display_mode == "center_crop"
+    assert window.thumbnail_render_spec.cache_token != initial_token
+    assert window.thumbnail_provider.generation == initial_generation + 1
+    assert isinstance(
+        window.item_model.index(0, 0).data(BrowserItemModel.ThumbnailImageRole),
+        QImage,
+    )
+    window.close()
+    qapp.processEvents()
+
+
 def test_ten_thousand_items_request_only_visible_and_prefetch_ranges(
     tmp_path, qapp
 ):
@@ -257,9 +339,14 @@ def test_ten_thousand_items_request_only_visible_and_prefetch_ranges(
     }
 
     provider.requests.clear()
+    window.config.apply({"browser_thumbnail_display_mode": "center_crop"})
     window._fast_scrolling = True
     window._request_visible_thumbnails()
     assert provider.requests
+    assert {
+        request_size.browser_display_mode
+        for _, request_size, _ in provider.requests
+    } == {"center_crop"}
     assert all(
         priority is not ThumbnailPriority.PREFETCH
         for _, _, priority in provider.requests

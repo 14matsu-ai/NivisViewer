@@ -896,7 +896,7 @@ class BrowserThumbnailProvider(QObject):
             if isinstance(size, ThumbnailRenderSpec):
                 variant = (
                     f"{size.frame_ratio_id}/{size.crop_mode}/"
-                    f"{size.encoder_format}"
+                    f"{size.browser_display_mode}/{size.encoder_format}"
                 )
                 self._generated_variants[variant] = (
                     self._generated_variants.get(variant, 0) + 1

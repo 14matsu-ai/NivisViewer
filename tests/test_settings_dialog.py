@@ -32,6 +32,7 @@ def test_current_values_are_shown_and_join_disables_gap(
             "thumbnail_size": 240,
             "thumbnail_frame_ratio": "landscape_16_9",
             "thumbnail_crop_mode": "center_crop",
+            "browser_thumbnail_display_mode": "center_crop",
             "thumbnail_quality_mode": "high",
             "thumbnail_cache_max_edge": 1536,
             "browser_display_density": "comfortable",
@@ -50,6 +51,10 @@ def test_current_values_are_shown_and_join_disables_gap(
     assert dialog.thumbnail_size_spin.value() == 240
     assert dialog.thumbnail_frame_ratio_combo.currentData() == "landscape_16_9"
     assert dialog.thumbnail_crop_mode_combo.currentData() == "center_crop"
+    assert (
+        dialog.browser_thumbnail_display_mode_combo.currentData()
+        == "center_crop"
+    )
     assert dialog.thumbnail_quality_mode_combo.currentData() == "high"
     assert dialog.thumbnail_cache_max_edge_spin.value() == 1536
     assert dialog.browser_display_density_combo.currentData() == "comfortable"
@@ -73,6 +78,9 @@ def test_apply_and_ok_persist_settings(tmp_path: Path, qapp: QApplication) -> No
     dialog.thumbnail_crop_mode_combo.setCurrentIndex(
         dialog.thumbnail_crop_mode_combo.findData("letterbox")
     )
+    dialog.browser_thumbnail_display_mode_combo.setCurrentIndex(
+        dialog.browser_thumbnail_display_mode_combo.findData("center_crop")
+    )
     dialog.thumbnail_quality_mode_combo.setCurrentIndex(
         dialog.thumbnail_quality_mode_combo.findData("economy")
     )
@@ -95,6 +103,7 @@ def test_apply_and_ok_persist_settings(tmp_path: Path, qapp: QApplication) -> No
     assert ConfigManager(config.path).load()["thumbnail_size"] == 260
     assert changed["thumbnail_frame_ratio"] == "portrait_2_3"
     assert changed["thumbnail_crop_mode"] == "letterbox"
+    assert changed["browser_thumbnail_display_mode"] == "center_crop"
     assert changed["thumbnail_quality_mode"] == "economy"
     assert changed["thumbnail_cache_max_edge"] == 768
     assert changed["browser_display_density"] == "compact"
@@ -105,7 +114,17 @@ def test_apply_and_ok_persist_settings(tmp_path: Path, qapp: QApplication) -> No
     dialog.join_spread_checkbox.setChecked(True)
     dialog.accept()
     assert dialog.result() == QDialog.DialogCode.Accepted
-    assert ConfigManager(config.path).load()["join_spread_pages"] is True
+    restored = ConfigManager(config.path).load()
+    assert restored["join_spread_pages"] is True
+    assert restored["browser_thumbnail_display_mode"] == "center_crop"
+    reopened_config = ConfigManager(config.path)
+    reopened_config.load()
+    reopened = SettingsDialog(reopened_config)
+    assert (
+        reopened.browser_thumbnail_display_mode_combo.currentData()
+        == "center_crop"
+    )
+    reopened.reject()
 
 
 def test_cancel_does_not_apply_changes(tmp_path: Path, qapp: QApplication) -> None:

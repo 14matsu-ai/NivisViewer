@@ -11,6 +11,7 @@ from .browser_grid_metrics import build_browser_grid_metrics
 from .browser_sort import BrowserDisplayDensity
 from .shell_icon_provider import ShellAssociatedIconProvider
 from .thumbnail_render import (
+    BROWSER_THUMBNAIL_DISPLAY_MODES,
     THUMBNAIL_SIZE_BUCKETS,
     frame_size_from_long_edge,
     quantize_thumbnail_size,
@@ -92,6 +93,70 @@ def thumbnail_rect_for_cell(
     )
 
 
+def thumbnail_image_rects(
+    thumbnail_rect: QRect,
+    image_size: QSize,
+    display_mode: str,
+    *,
+    device_pixel_ratio: float = 1.0,
+) -> tuple[QRectF, QRectF]:
+    """Return target/source rectangles for the Browser thumbnail paint."""
+    image_width = max(1, image_size.width())
+    image_height = max(1, image_size.height())
+    dpr = max(0.5, float(device_pixel_ratio))
+    if display_mode == "center_crop":
+        target = snap_logical_rect_to_physical_pixels(
+            QRectF(thumbnail_rect.adjusted(1, 1, -1, -1)),
+            dpr,
+        )
+        target_ratio = target.width() / max(1.0, target.height())
+        source_ratio = image_width / image_height
+        if source_ratio > target_ratio:
+            source_width = image_height * target_ratio
+            source = QRectF(
+                (image_width - source_width) / 2,
+                0.0,
+                source_width,
+                float(image_height),
+            )
+        else:
+            source_height = image_width / max(0.0001, target_ratio)
+            source = QRectF(
+                0.0,
+                (image_height - source_height) / 2,
+                float(image_width),
+                source_height,
+            )
+        return target, source
+
+    available = QRectF(thumbnail_rect.adjusted(4, 4, -4, -4))
+    source_ratio = image_width / image_height
+    target_ratio = available.width() / max(1.0, available.height())
+    if source_ratio > target_ratio:
+        width = available.width()
+        height = width / source_ratio
+    else:
+        height = available.height()
+        width = height * source_ratio
+    no_upscale = min(
+        1.0,
+        image_width / max(1.0, width * dpr),
+        image_height / max(1.0, height * dpr),
+    )
+    width *= no_upscale
+    height *= no_upscale
+    target = QRectF(
+        available.center().x() - width / 2,
+        available.center().y() - height / 2,
+        width,
+        height,
+    )
+    return (
+        snap_logical_rect_to_physical_pixels(target, dpr),
+        QRectF(0.0, 0.0, float(image_width), float(image_height)),
+    )
+
+
 def elided_title_lines(
     metrics: QFontMetrics,
     text: str,
@@ -139,6 +204,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
         thumbnail_size: int = 180,
         density: BrowserDisplayDensity = BrowserDisplayDensity.STANDARD,
         frame_ratio_id: str = "portrait_1_sqrt2",
+        thumbnail_display_mode: str = "fit",
         cell_padding: int = 0,
         filename_display: str = "one_line",
         filename_gap: int = 0,
@@ -150,6 +216,11 @@ class BrowserItemDelegate(QStyledItemDelegate):
         self.thumbnail_size = int(thumbnail_size)
         self.density = density
         self.frame_ratio_id = frame_ratio_id
+        self.thumbnail_display_mode = (
+            thumbnail_display_mode
+            if thumbnail_display_mode in BROWSER_THUMBNAIL_DISPLAY_MODES
+            else "fit"
+        )
         self.cell_padding = max(0, min(12, int(cell_padding)))
         self.filename_display = filename_display
         self.filename_gap = max(0, min(32, int(filename_gap)))
@@ -196,6 +267,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
         thumbnail_size: int,
         density: BrowserDisplayDensity,
         frame_ratio_id: str | None = None,
+        thumbnail_display_mode: str | None = None,
         cell_padding: int | None = None,
         filename_display: str | None = None,
         filename_gap: int | None = None,
@@ -206,6 +278,12 @@ class BrowserItemDelegate(QStyledItemDelegate):
         self.density = density
         if frame_ratio_id is not None:
             self.frame_ratio_id = frame_ratio_id
+        if thumbnail_display_mode is not None:
+            self.thumbnail_display_mode = (
+                thumbnail_display_mode
+                if thumbnail_display_mode in BROWSER_THUMBNAIL_DISPLAY_MODES
+                else "fit"
+            )
         if cell_padding is not None:
             self.cell_padding = max(0, min(12, int(cell_padding)))
         if filename_display is not None:
@@ -263,6 +341,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
                     thumbnail_rect,
                     thumbnail_image,
                     enabled=bool(option.state & QStyle.StateFlag.State_Enabled),
+                    display_mode=self.thumbnail_display_mode,
                 )
             else:
                 icon = index.data(Qt.ItemDataRole.DecorationRole)
@@ -350,45 +429,29 @@ class BrowserItemDelegate(QStyledItemDelegate):
                     point = thumbnail_rect.center() - scaled.rect().center()
                     painter.drawPixmap(point, scaled)
 
-    @staticmethod
     def _paint_thumbnail_image(
+        self,
         painter: QPainter,
         thumbnail_rect: QRect,
         image: QImage,
         *,
         enabled: bool,
+        display_mode: str | None = None,
     ) -> None:
-        available = QRectF(thumbnail_rect.adjusted(4, 4, -4, -4))
-        source_ratio = image.width() / max(1, image.height())
-        target_ratio = available.width() / max(1.0, available.height())
-        if source_ratio > target_ratio:
-            width = available.width()
-            height = width / source_ratio
-        else:
-            height = available.height()
-            width = height * source_ratio
         dpr = max(0.5, painter.device().devicePixelRatioF())
-        no_upscale = min(
-            1.0,
-            image.width() / max(1.0, width * dpr),
-            image.height() / max(1.0, height * dpr),
+        target, source = thumbnail_image_rects(
+            thumbnail_rect,
+            image.size(),
+            display_mode or self.thumbnail_display_mode,
+            device_pixel_ratio=dpr,
         )
-        width *= no_upscale
-        height *= no_upscale
-        target = QRectF(
-            available.center().x() - width / 2,
-            available.center().y() - height / 2,
-            width,
-            height,
-        )
-        target = snap_logical_rect_to_physical_pixels(target, dpr)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         if not enabled:
             painter.setOpacity(0.55)
         painter.drawImage(
             target,
             image,
-            QRectF(0.0, 0.0, float(image.width()), float(image.height())),
+            source,
         )
         if not enabled:
             painter.setOpacity(1.0)
