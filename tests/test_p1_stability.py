@@ -14,6 +14,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from app.adjacent_book_search import (
+    SIBLING_FOLDERS,
     AdjacentBookBrowserSnapshot,
     AdjacentBookFileSystem,
     AdjacentBookSearchRequest,
@@ -80,10 +81,12 @@ class _SlowAdjacentFileSystem(AdjacentBookFileSystem):
 class _CountingAdjacentFileSystem(AdjacentBookFileSystem):
     def __init__(self) -> None:
         self.parent_scans = 0
+        self.metadata_requests: list[bool] = []
 
-    def scandir(self, path: str):
+    def scandir(self, path: str, **kwargs):
         self.parent_scans += 1
-        return super().scandir(path)
+        self.metadata_requests.append(bool(kwargs.get("include_metadata", False)))
+        return super().scandir(path, **kwargs)
 
 
 def _controller(
@@ -265,6 +268,91 @@ def test_adjacent_search_natural_order_excludes_later_rar_parts(
     service.close()
 
 
+def test_sibling_folder_search_uses_browser_sort_and_excludes_files(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    parent = tmp_path / "folders"
+    parent.mkdir()
+    first = parent / "book1"
+    current = parent / "book2"
+    last = parent / "book10"
+    for folder in (first, current, last):
+        folder.mkdir()
+    (parent / "book3.jpg").write_bytes(b"not a folder")
+    filesystem = _CountingAdjacentFileSystem()
+    service = AdjacentBookSearchService(filesystem=filesystem)
+    results = []
+    service.result_ready.connect(results.append)
+
+    assert service.search(
+        AdjacentBookSearchRequest(
+            request_id=1,
+            current_book_path=str(current),
+            direction=1,
+            loop=False,
+            browser_snapshot=None,
+            generation=1,
+            candidate_mode=SIBLING_FOLDERS,
+            sort_key="name",
+            sort_order="ascending",
+        )
+    )
+    assert _wait_until(qapp, lambda: len(results) == 1)
+    assert results[0].status is AdjacentBookSearchStatus.FOUND
+    assert results[0].candidate_path == str(last)
+
+    assert service.search(
+        AdjacentBookSearchRequest(
+            request_id=2,
+            current_book_path=str(current),
+            direction=1,
+            loop=False,
+            browser_snapshot=None,
+            generation=2,
+            candidate_mode=SIBLING_FOLDERS,
+            sort_key="name",
+            sort_order="descending",
+        )
+    )
+    assert _wait_until(qapp, lambda: len(results) == 2)
+    assert results[1].status is AdjacentBookSearchStatus.FOUND
+    assert results[1].candidate_path == str(first)
+    assert filesystem.metadata_requests == [False, False]
+    service.close()
+
+
+def test_sibling_folder_search_never_wraps_at_boundary(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    parent = tmp_path / "folders"
+    parent.mkdir()
+    first = parent / "01"
+    second = parent / "02"
+    first.mkdir()
+    second.mkdir()
+    service = AdjacentBookSearchService()
+    results = []
+    service.result_ready.connect(results.append)
+
+    assert service.search(
+        AdjacentBookSearchRequest(
+            request_id=1,
+            current_book_path=str(first),
+            direction=-1,
+            loop=False,
+            browser_snapshot=None,
+            generation=1,
+            candidate_mode=SIBLING_FOLDERS,
+        )
+    )
+    assert _wait_until(qapp, lambda: bool(results))
+    assert results[0].status is AdjacentBookSearchStatus.BOUNDARY
+    assert results[0].candidate_path is None
+    service.close()
+
+
 def test_adjacent_cache_is_invalidatable(
     tmp_path: Path,
     qapp: QApplication,
@@ -343,6 +431,43 @@ def test_latest_adjacent_request_wins(
     QTest.qWait(50)
     qapp.processEvents()
     assert viewer.book_session.current_path == paths[0].parent
+    _close_controller(controller, qapp)
+
+
+def test_latest_sibling_folder_request_wins(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    paths = [
+        tmp_path / "folders" / name / "1.jpg"
+        for name in ("01", "02", "03")
+    ]
+    for path in paths:
+        _write_image(path)
+    filesystem = _SequencedAdjacentFileSystem()
+    service = AdjacentBookSearchService(filesystem=filesystem, max_workers=2)
+    controller = _controller(tmp_path, qapp, adjacent_service=service)
+    browser = controller.create_browser_window()
+    browser.set_current_folder(paths[1].parent)
+    assert browser.wait_for_scan()
+
+    assert (
+        controller.handle_browser_folder_navigation(browser, 1)
+        == "searching"
+    )
+    assert filesystem.first_started.wait(1)
+    assert (
+        controller.handle_browser_folder_navigation(browser, -1)
+        == "searching"
+    )
+    assert _wait_until(
+        qapp,
+        lambda: browser.current_path == paths[0].parent,
+    )
+    filesystem.release_first.set()
+    QTest.qWait(50)
+    qapp.processEvents()
+    assert browser.current_path == paths[0].parent
     _close_controller(controller, qapp)
 
 

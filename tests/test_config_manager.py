@@ -37,6 +37,7 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
         "D": "close_viewer",
         "U": "toggle_fullscreen",
     }
+    assert manager.data["browser_folder_gestures_enabled"] is True
     assert manager.data["mouse_back_button_action"] == "previous_book"
     assert manager.data["mouse_forward_button_action"] == "next_book"
 
@@ -211,3 +212,20 @@ def test_mouse_binding_defaults_are_not_shared(tmp_path: Path) -> None:
 
     assert second.data["mouse_gesture_bindings"]["D"] == "close_viewer"
     assert ConfigManager.DEFAULTS["mouse_gesture_bindings"]["D"] == "close_viewer"
+
+
+def test_saved_partial_mouse_bindings_are_not_filled_with_new_defaults(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        '{"mouse_gesture_bindings": {"U": "next_page", "DR": "last_page"}}',
+        encoding="utf-8",
+    )
+
+    restored = ConfigManager(path).load()
+
+    assert restored["mouse_gesture_bindings"] == {
+        "U": "next_page",
+        "DR": "last_page",
+    }

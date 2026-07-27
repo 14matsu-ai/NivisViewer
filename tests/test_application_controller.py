@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from time import monotonic
-
 from PIL import Image
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
@@ -525,6 +524,41 @@ def test_book_candidates_include_external_archives_and_hide_later_rar_volumes(
     assert controller.open_adjacent_book(viewer, 1) == "searching"
     assert wait_until(qapp, lambda: bool(opened))
     assert opened == [tmp_path / "books" / "book2.rar"]
+    close_controller(controller, qapp)
+
+
+def test_browser_folder_gesture_uses_browser_path_not_viewer_source(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    viewer_image = tmp_path / "viewer-source" / "1.jpg"
+    siblings = [
+        tmp_path / "browser-folders" / name
+        for name in ("01", "02", "10")
+    ]
+    write_image(viewer_image)
+    for folder in siblings:
+        folder.mkdir(parents=True)
+    (siblings[0].parent / "03.txt").write_text("file", encoding="utf-8")
+    controller = make_controller(tmp_path, qapp)
+    controller._restore_on_start = False
+    viewer = controller.open_path(viewer_image)
+    qapp.processEvents()
+    browser = controller.create_browser_window()
+    browser.set_current_folder(siblings[1])
+    assert browser.wait_for_scan()
+
+    browser.list_view.folderGestureRecognized.emit("L")
+
+    assert id(browser) in controller._adjacent_request_by_window
+    assert wait_until(qapp, lambda: browser.current_path == siblings[0])
+    assert viewer.book_session.current_path == viewer_image
+
+    browser.list_view.folderGestureRecognized.emit("L")
+    QTest.qWait(50)
+    qapp.processEvents()
+    assert browser.current_path == siblings[0]
+    assert viewer.book_session.current_path == viewer_image
     close_controller(controller, qapp)
 
 
