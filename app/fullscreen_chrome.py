@@ -558,10 +558,19 @@ class FullscreenChromeController(QObject):
         local_top = max(0, self.overlay_parent.height() - bottom_height)
         top_global = self.overlay_parent.mapToGlobal(QPoint(0, local_top)).y()
         frame = self.window.frameGeometry()
-        top_global = min(top_global, frame.bottom())
+        bottom_bounds = QRect(frame)
+        if self.window.isFullScreen():
+            screen = self.window.screen()
+            if screen is not None:
+                # QRect uses inclusive right/bottom coordinates, while
+                # Windows can round a high-DPI cursor at the physical edge
+                # to x + width / y + height. Include only that boundary pixel.
+                screen_edge = screen.geometry().adjusted(0, 0, 1, 1)
+                bottom_bounds = bottom_bounds.united(screen_edge)
+        top_global = min(top_global, bottom_bounds.bottom())
         return QRect(
-            QPoint(frame.left(), top_global),
-            QPoint(frame.right(), frame.bottom()),
+            QPoint(bottom_bounds.left(), top_global),
+            QPoint(bottom_bounds.right(), bottom_bounds.bottom()),
         )
 
     def _pointer_in_reveal_area(self, global_position: QPoint) -> bool:
