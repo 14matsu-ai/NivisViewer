@@ -9,7 +9,12 @@ from PIL import Image
 from PySide6.QtWidgets import QApplication
 
 from app.book_session import BookSession
-from app.image_source import FolderImageSource, ImageSource, ImageSourceError
+from app.image_source import (
+    FolderImageSource,
+    FolderListingSnapshot,
+    ImageSource,
+    ImageSourceError,
+)
 
 
 def write_image(path: Path, *, size: tuple[int, int] = (8, 12)) -> None:
@@ -252,4 +257,123 @@ def test_cancel_pending_open_releases_queued_worker_tracking(
     assert session._open_workers == {}
     assert opened_generations == [session.generation]
     assert failed_generations == []
+    session.shutdown()
+
+
+def test_async_folder_snapshot_avoids_directory_relisting(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "1.jpg"
+    selected = tmp_path / "2.jpg"
+    write_image(first)
+    write_image(selected)
+    snapshot = FolderListingSnapshot(
+        tmp_path,
+        (str(first), str(selected)),
+        str(selected),
+    )
+    original_iterdir = Path.iterdir
+
+    def reject_book_relisting(path: Path):
+        if path == tmp_path:
+            raise AssertionError("Browser snapshot must avoid folder relisting")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", reject_book_relisting)
+    session = BookSession()
+
+    session.open_book_async(selected, folder_snapshot=snapshot)
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+
+    assert session.current_path == selected
+    assert session.model.image_ids == [str(first), str(selected)]
+    assert session.model.focused_index == 1
+    assert session._open_workers == {}
+    session.shutdown()
+
+
+def test_running_stale_open_closes_source_and_cannot_replace_latest(
+    qapp: QApplication,
+) -> None:
+    first_started = threading.Event()
+    release_first = threading.Event()
+    first_source = BlockingImageSource(
+        Path("first"),
+        threading.Event(),
+        threading.Event(),
+    )
+    second_source = BlockingImageSource(
+        Path("second"),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def source_factory(
+        path: Path,
+        **_kwargs: object,
+    ) -> tuple[ImageSource, str | None]:
+        if path.name == "first":
+            first_started.set()
+            assert release_first.wait(2)
+            return first_source, None
+        return second_source, None
+
+    session = BookSession(source_factory=source_factory)
+    opened_paths: list[Path] = []
+    session.async_opened.connect(
+        lambda opened: opened_paths.append(opened.requested_path)
+    )
+
+    session.open_book_async("first")
+    assert first_started.wait(1)
+    session.open_book_async("second")
+    release_first.set()
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+
+    assert first_source.closed
+    assert not second_source.closed
+    assert session.source is second_source
+    assert session.current_path == Path("second")
+    assert opened_paths == [Path("second")]
+    assert session._open_workers == {}
+    session.shutdown()
+
+
+def test_async_open_failure_preserves_current_book_and_clears_tracking(
+    qapp: QApplication,
+) -> None:
+    current_source = BlockingImageSource(
+        Path("current"),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def source_factory(
+        path: Path,
+        **_kwargs: object,
+    ) -> tuple[ImageSource, str | None]:
+        if path.name == "broken":
+            raise ImageSourceError("broken source")
+        return current_source, None
+
+    session = BookSession(source_factory=source_factory)
+    session.open_book("current")
+    original_images = list(session.model.image_ids)
+    failures = []
+    session.async_open_failed.connect(failures.append)
+
+    session.open_book_async("broken")
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+
+    assert session.source is current_source
+    assert session.current_path == Path("current")
+    assert session.model.image_ids == original_images
+    assert len(failures) == 1
+    assert failures[0].message == "broken source"
+    assert session._open_workers == {}
     session.shutdown()

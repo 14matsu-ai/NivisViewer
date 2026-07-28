@@ -141,6 +141,8 @@ def test_failed_external_open_preserves_current_book_and_history(
         metadata_store=store,
     )
     assert window.open_path(folder)
+    assert window.book_session.wait_for_async(2000)
+    qapp.processEvents()
     original_source = window.book_session.source
     original_history = store.list_history()
 

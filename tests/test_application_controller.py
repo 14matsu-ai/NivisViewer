@@ -44,6 +44,11 @@ def wait_until(qapp: QApplication, predicate, timeout: float = 2.0) -> bool:
     return bool(predicate())
 
 
+def finish_viewer_open(qapp: QApplication, viewer) -> None:
+    assert viewer.book_session.wait_for_async(2000)
+    qapp.processEvents()
+
+
 def test_start_creates_browser_and_shares_config(
     tmp_path: Path,
     qapp: QApplication,
@@ -72,6 +77,7 @@ def test_start_passes_initial_path_to_open_processing(
 
     assert controller.get_browser_window() is browser
     assert window is not None
+    finish_viewer_open(qapp, window)
     assert window.book_session.current_path == image
     assert str(image) in window.model.image_ids
     close_controller(controller, qapp)
@@ -139,6 +145,7 @@ def test_viewer_file_request_reuses_source_window_even_when_always_new(
 
     source_window._request_open_path(image)
 
+    finish_viewer_open(qapp, source_window)
     assert controller.viewer_windows == (source_window,)
     assert source_window.book_session.current_path == image
     close_controller(controller, qapp)
@@ -158,6 +165,7 @@ def test_reuse_or_create_creates_then_reuses(
     first = controller.open_path(first_image)
     second = controller.open_path(second_image)
 
+    finish_viewer_open(qapp, first)
     assert second is first
     assert controller.viewer_windows == (first,)
     assert first.book_session.current_path == second_image
@@ -196,6 +204,8 @@ def test_two_viewers_hold_independent_books_and_sessions(
     first = controller.open_path(first_image, open_in_new_window=True)
     second = controller.open_path(second_image, open_in_new_window=True)
 
+    finish_viewer_open(qapp, first)
+    finish_viewer_open(qapp, second)
     assert first.book_session is not second.book_session
     assert first.book_session.current_path == first_image
     assert second.book_session.current_path == second_image
@@ -330,12 +340,16 @@ def test_active_viewer_book_changes_sync_browser_but_inactive_does_not(
     monkeypatch.setattr(browser, "select_path", lambda path: selected.append(str(path)))
     first = controller.open_path(first_image, open_in_new_window=True)
     second = controller.open_path(second_image, open_in_new_window=True)
+    finish_viewer_open(qapp, first)
+    finish_viewer_open(qapp, second)
     selected.clear()
 
     first.open_path(third_image)
+    finish_viewer_open(qapp, first)
     assert selected == []
 
     second.open_path(first_image)
+    finish_viewer_open(qapp, second)
     assert selected == [str(first_image)]
     close_controller(controller, qapp)
 
@@ -359,15 +373,18 @@ def test_viewer_sync_same_parent_does_not_add_browser_history_but_new_parent_doe
     browser = controller.create_browser_window()
     assert browser.wait_for_scan()
     viewer = controller.open_path(first)
+    finish_viewer_open(qapp, viewer)
     assert browser.wait_for_scan()
     after_first = len(browser.navigation_history)
 
     assert viewer.open_path(same_parent)
+    finish_viewer_open(qapp, viewer)
     assert browser.wait_for_scan()
     assert len(browser.navigation_history) == after_first
     assert browser.current_path == first.parent.absolute()
 
     assert viewer.open_path(different)
+    finish_viewer_open(qapp, viewer)
     assert browser.wait_for_scan()
     assert len(browser.navigation_history) == after_first + 1
     assert browser.current_path == different.parent.absolute()
@@ -442,6 +459,7 @@ def test_loop_book_navigation_setting_wraps_to_first_book(
     controller = make_controller(tmp_path, qapp)
     controller.config.apply({"loop_book_navigation": True})
     viewer = controller.open_path(last)
+    finish_viewer_open(qapp, viewer)
 
     result = controller.open_adjacent_book(viewer, 1)
 
@@ -463,6 +481,7 @@ def test_book_navigation_stops_at_edge_when_loop_is_disabled(
     write_image(last)
     controller = make_controller(tmp_path, qapp)
     viewer = controller.open_path(first)
+    finish_viewer_open(qapp, viewer)
 
     result = controller.open_adjacent_book(viewer, -1)
 
@@ -486,6 +505,7 @@ def test_book_candidates_use_natural_order_and_adjacent_open_stays_in_background
     (tmp_path / "books" / "book10.cbz").write_bytes(b"not-opened-by-this-test")
     controller = make_controller(tmp_path, qapp)
     viewer = controller.open_path(first)
+    finish_viewer_open(qapp, viewer)
     opened: list[tuple[Path, bool | None]] = []
 
     def capture_open(_window, path, *, bring_to_front=None):
@@ -520,6 +540,7 @@ def test_book_candidates_include_external_archives_and_hide_later_rar_volumes(
         (tmp_path / "books" / name).write_bytes(b"archive")
     controller = make_controller(tmp_path, qapp)
     viewer = controller.open_path(first)
+    finish_viewer_open(qapp, viewer)
 
     opened: list[Path] = []
     controller._open_path_in_viewer = (
@@ -547,7 +568,7 @@ def test_browser_folder_gesture_uses_browser_path_not_viewer_source(
     controller = make_controller(tmp_path, qapp)
     controller._restore_on_start = False
     viewer = controller.open_path(viewer_image)
-    qapp.processEvents()
+    finish_viewer_open(qapp, viewer)
     browser = controller.create_browser_window()
     browser.set_current_folder(siblings[1])
     assert browser.wait_for_scan()
@@ -574,6 +595,7 @@ def test_missing_current_book_is_unavailable_without_exception(
     write_image(first)
     controller = make_controller(tmp_path, qapp)
     viewer = controller.open_path(first)
+    finish_viewer_open(qapp, viewer)
     viewer.book_session.current_path = tmp_path / "books" / "missing.zip"
 
     assert controller.open_adjacent_book(viewer, 1) == "searching"

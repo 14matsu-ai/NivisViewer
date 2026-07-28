@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Thread, get_ident
 
 import pytest
 from PIL import Image
+from PySide6.QtWidgets import QApplication
 
 from app.archive_backend import (
     ArchiveBackendError,
@@ -15,6 +16,7 @@ from app.archive_backend import (
     MAX_IMAGE_ENTRY_BYTES,
 )
 from app.archive_backend_registry import ArchiveBackendRegistry
+from app.book_session import BookSession
 from app.image_source import (
     ImageSourceError,
     SevenZipImageSource,
@@ -115,6 +117,54 @@ def test_factory_routes_external_extensions_to_injected_backend(
     assert isinstance(source, SevenZipImageSource)
     assert selected is None
     source.close()
+
+
+def test_book_session_prepares_external_archive_off_gui_thread(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    archive = tmp_path / "book.rar"
+    archive.write_bytes(b"source")
+    backend = FakeBackend(
+        (
+            archive_entry("page2.png"),
+            archive_entry("page1.png"),
+        )
+    )
+    listing_threads: list[int] = []
+    original_list_entries = backend.list_entries
+
+    def counted_list_entries(
+        archive_path: str,
+        *,
+        cancel_token=None,
+    ) -> ArchiveListing:
+        listing_threads.append(get_ident())
+        return original_list_entries(archive_path, cancel_token=cancel_token)
+
+    backend.list_entries = counted_list_entries  # type: ignore[method-assign]
+    registry = ArchiveBackendRegistry(seven_zip_backend=backend)
+    session = BookSession(
+        source_factory=lambda path, **kwargs: create_image_source(
+            path,
+            archive_backend_registry=registry,
+            **kwargs,
+        )
+    )
+    gui_thread = get_ident()
+
+    session.open_book_async(archive)
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+
+    assert listing_threads
+    assert all(thread_id != gui_thread for thread_id in listing_threads)
+    assert backend.list_calls == 1
+    assert session.model.image_ids == ["page1.png", "page2.png"]
+    assert session.current_path == archive
+    assert session._open_workers == {}
+    session.shutdown()
+    registry.close()
 
 
 def test_backend_missing_and_no_images_are_distinct_errors(tmp_path: Path) -> None:

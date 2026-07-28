@@ -154,8 +154,12 @@ def _wait_for_viewer_terminal(
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         qapp.processEvents()
-        if window.viewer._images and all(
+        if (
+            not window.book_session._open_workers
+            and window.viewer._images
+            and all(
             not image.loading for image in window.viewer._images
+            )
         ):
             return
         QTest.qWait(5)
@@ -529,6 +533,7 @@ def test_png_visible_and_prefetch_reopen_and_rapid_navigation_finish(
     window.show()
     qapp.processEvents()
     assert window.open_path(folder / "005.png")
+    _wait_for_viewer_terminal(window, qapp)
     for page in (7, 9, 5, 9):
         window.model.go_to_index(page - 1)
         window._refresh_view()
