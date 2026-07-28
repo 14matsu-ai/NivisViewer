@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import logging
 import zipfile
 from pathlib import Path
 from threading import Event
 
 from PIL import Image
 from PySide6.QtGui import QImage
+from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import QApplication
 
 from app.browser_model import BrowserItem, BrowserItemKind
+from app.file_preview import PreviewResultKind
 from app.thumbnail_provider import BrowserThumbnailProvider
 from app.browser_thumbnail_scheduler import ThumbnailPriority
 from app.thumbnail_disk_cache import ThumbnailDiskCache
@@ -343,3 +346,142 @@ def test_pending_prefetch_can_be_cancelled_while_visible_work_runs(
     release.set()
     assert provider.wait_for_done(2000)
     provider.close()
+
+
+def test_loader_exception_finishes_once_clears_pending_and_can_retry(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+    caplog,
+) -> None:
+    image_path = tmp_path / "worker-error.jpg"
+    write_image(image_path)
+    item = make_item(image_path, BrowserItemKind.IMAGE)
+    calls = 0
+
+    def loader(_item: BrowserItem, _size: int) -> QImage:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("thumbnail loader failed")
+        return QImage(8, 8, QImage.Format.Format_RGBA8888)
+
+    provider = BrowserThumbnailProvider(loader=loader, max_workers=1)
+    finished_calls: list[tuple[object, ...]] = []
+    original_finished = provider._on_finished
+
+    def record_finished(*args) -> None:
+        finished_calls.append(args)
+        original_finished(*args)
+
+    monkeypatch.setattr(provider, "_on_finished", record_finished)
+    failures = QSignalSpy(provider.thumbnail_failed)
+    states = QSignalSpy(provider.preview_state_changed)
+    ready = QSignalSpy(provider.thumbnail_ready)
+    generation = provider.begin_generation()
+
+    with caplog.at_level(logging.ERROR, logger="nivisviewer.thumbnail"):
+        assert provider.request(item, 100, generation=generation)
+        assert provider.wait_for_done(2000)
+        qapp.processEvents()
+
+    assert len(finished_calls) == 1
+    assert provider.pending_count == 0
+    assert failures.count() == 1
+    assert states.count() == 1
+    assert states.at(0)[2] == PreviewResultKind.FAILED.value
+    assert ready.count() == 0
+    worker_errors = [
+        record
+        for record in caplog.records
+        if record.name == "nivisviewer.thumbnail"
+        and "thumbnail worker failed" in record.getMessage()
+    ]
+    assert len(worker_errors) == 1
+    assert worker_errors[0].exc_info is not None
+
+    assert provider.request(item, 100, generation=generation)
+    assert provider.wait_for_done(2000)
+    qapp.processEvents()
+
+    assert calls == 2
+    assert len(finished_calls) == 2
+    assert provider.pending_count == 0
+    assert failures.count() == 1
+    assert states.count() == 2
+    assert states.at(1)[2] == PreviewResultKind.READY.value
+    assert ready.count() == 1
+    provider.close()
+
+
+def test_loader_exception_from_stale_generation_is_not_applied(
+    tmp_path: Path,
+    qapp: QApplication,
+    caplog,
+) -> None:
+    image_path = tmp_path / "stale-error.jpg"
+    write_image(image_path)
+    item = make_item(image_path, BrowserItemKind.IMAGE)
+    started = Event()
+    release = Event()
+
+    def loader(_item: BrowserItem, _size: int) -> QImage:
+        started.set()
+        release.wait(2)
+        raise RuntimeError("stale thumbnail failed")
+
+    provider = BrowserThumbnailProvider(loader=loader, max_workers=1)
+    failures = QSignalSpy(provider.thumbnail_failed)
+    states = QSignalSpy(provider.preview_state_changed)
+    ready = QSignalSpy(provider.thumbnail_ready)
+    generation = provider.begin_generation()
+
+    with caplog.at_level(logging.ERROR, logger="nivisviewer.thumbnail"):
+        assert provider.request(item, 100, generation=generation)
+        assert started.wait(1)
+        provider.begin_generation()
+        release.set()
+        assert provider.wait_for_done(2000)
+        qapp.processEvents()
+
+    assert provider.pending_count == 0
+    assert failures.count() == 0
+    assert states.count() == 0
+    assert ready.count() == 0
+    provider.close()
+
+
+def test_loader_exception_after_shutdown_is_not_applied(
+    tmp_path: Path,
+    qapp: QApplication,
+    caplog,
+) -> None:
+    image_path = tmp_path / "shutdown-error.jpg"
+    write_image(image_path)
+    item = make_item(image_path, BrowserItemKind.IMAGE)
+    started = Event()
+    release = Event()
+
+    def loader(_item: BrowserItem, _size: int) -> QImage:
+        started.set()
+        release.wait(2)
+        raise RuntimeError("shutdown thumbnail failed")
+
+    provider = BrowserThumbnailProvider(loader=loader, max_workers=1)
+    failures = QSignalSpy(provider.thumbnail_failed)
+    states = QSignalSpy(provider.preview_state_changed)
+    ready = QSignalSpy(provider.thumbnail_ready)
+    generation = provider.begin_generation()
+
+    with caplog.at_level(logging.ERROR, logger="nivisviewer.thumbnail"):
+        assert provider.request(item, 100, generation=generation)
+        assert started.wait(1)
+        provider.close(wait_msecs=0)
+        release.set()
+        assert provider.wait_for_done(2000)
+        qapp.processEvents()
+
+    assert provider.pending_count == 0
+    assert failures.count() == 0
+    assert states.count() == 0
+    assert ready.count() == 0
