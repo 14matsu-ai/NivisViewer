@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import pytest
-from PySide6.QtCore import QEvent, QPointF, QSize, Qt
-from PySide6.QtGui import QImage, QMouseEvent, QPixmap
+from PySide6.QtCore import QEvent, QPoint, QPointF, QSize, Qt
+from PySide6.QtGui import QImage, QMouseEvent, QPixmap, QWheelEvent
 from PySide6.QtWidgets import QApplication
 
 from app.page_model import DisplaySpread, PageSlot
@@ -11,6 +11,116 @@ from app.viewer_widget import ViewerWidget, calculate_spread_layout
 
 def center_gap(layout) -> int:
     return layout.rects[1].left() - layout.rects[0].right() - 1
+
+
+def send_wheel_event(
+    widget: ViewerWidget,
+    *,
+    angle_x: int = 0,
+    angle_y: int = 0,
+    pixel_x: int = 0,
+    pixel_y: int = 0,
+    modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier,
+) -> QWheelEvent:
+    event = QWheelEvent(
+        QPointF(10, 10),
+        QPointF(widget.mapToGlobal(QPoint(10, 10))),
+        QPoint(pixel_x, pixel_y),
+        QPoint(angle_x, angle_y),
+        Qt.MouseButton.NoButton,
+        modifiers,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    event.ignore()
+    widget.wheelEvent(event)
+    return event
+
+
+@pytest.mark.parametrize(
+    ("angle_y", "expected_zoom"),
+    [(120, 1.15), (-120, 1 / 1.15)],
+)
+def test_viewer_ctrl_vertical_angle_zooms_and_accepts(
+    qapp: QApplication,
+    angle_y: int,
+    expected_zoom: float,
+) -> None:
+    widget = ViewerWidget()
+    zooms: list[float] = []
+    widget.zoomChanged.connect(zooms.append)
+
+    event = send_wheel_event(
+        widget,
+        angle_y=angle_y,
+        modifiers=Qt.KeyboardModifier.ControlModifier,
+    )
+
+    assert event.isAccepted()
+    assert widget.manual_zoom == pytest.approx(expected_zoom)
+    assert zooms == [pytest.approx(expected_zoom)]
+    widget.close()
+
+
+@pytest.mark.parametrize(
+    ("modifiers", "wheel_delta"),
+    [
+        (Qt.KeyboardModifier.ControlModifier, {}),
+        (Qt.KeyboardModifier.ControlModifier, {"angle_x": 120}),
+        (Qt.KeyboardModifier.ControlModifier, {"pixel_y": 40}),
+        (Qt.KeyboardModifier.NoModifier, {}),
+        (Qt.KeyboardModifier.NoModifier, {"angle_x": 120}),
+        (Qt.KeyboardModifier.NoModifier, {"pixel_y": 40}),
+        (Qt.KeyboardModifier.NoModifier, {"pixel_x": 40}),
+    ],
+)
+def test_viewer_wheel_without_vertical_angle_is_ignored_without_action(
+    qapp: QApplication,
+    modifiers: Qt.KeyboardModifier,
+    wheel_delta: dict[str, int],
+) -> None:
+    widget = ViewerWidget()
+    actions: list[str] = []
+    widget.zoomChanged.connect(lambda _zoom: actions.append("zoom"))
+    widget.nextRequested.connect(lambda: actions.append("next"))
+    widget.previousRequested.connect(lambda: actions.append("previous"))
+    initial_pan = QPoint(widget._pan)
+
+    event = send_wheel_event(
+        widget,
+        modifiers=modifiers,
+        **wheel_delta,
+    )
+
+    assert not event.isAccepted()
+    assert actions == []
+    assert widget.fit_mode == "fit_window"
+    assert widget.manual_zoom == 1.0
+    assert widget._pan == initial_pan
+    assert not hasattr(widget, "_angle_remainder")
+    assert not hasattr(widget, "_pixel_remainder")
+    widget.close()
+
+
+@pytest.mark.parametrize(
+    ("angle_y", "expected_action"),
+    [(-120, "next"), (120, "previous")],
+)
+def test_viewer_vertical_angle_navigates_once_and_accepts(
+    qapp: QApplication,
+    angle_y: int,
+    expected_action: str,
+) -> None:
+    widget = ViewerWidget()
+    actions: list[str] = []
+    widget.nextRequested.connect(lambda: actions.append("next"))
+    widget.previousRequested.connect(lambda: actions.append("previous"))
+
+    event = send_wheel_event(widget, angle_y=angle_y)
+
+    assert event.isAccepted()
+    assert actions == [expected_action]
+    widget.close()
 
 
 def test_clear_releases_images_from_last_draw_layout_and_can_repaint(
