@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import logging
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal, Slot
@@ -47,6 +48,9 @@ from .winrar_locator import WinRARInfo, WinRARLocator
 from .windows_file_registration import WindowsFileRegistrationService
 
 
+_LOGGER = logging.getLogger(__name__)
+
+
 class _SevenZipProbeSignals(QObject):
     completed = Signal(int, object)
 
@@ -66,7 +70,11 @@ class _SevenZipProbeWorker(QRunnable):
 
     @Slot()
     def run(self) -> None:
-        info = self.locator.locate(self.path, force=True)
+        try:
+            info = self.locator.locate(self.path, force=True)
+        except Exception as exc:
+            _LOGGER.exception("7-Zip probe failed")
+            info = SevenZipInfo(self.path, False, None, str(exc))
         try:
             self.signals.completed.emit(self.generation, info)
         except RuntimeError:
@@ -93,13 +101,20 @@ class _WinRARProbeWorker(QRunnable):
     @Slot()
     def run(self) -> None:
         try:
-            info = self.locator.locate(
-                self.path,
-                extension=".rar",
-                force=True,
-            )
-        except TypeError:
-            info = self.locator.locate(self.path, force=True)  # type: ignore[call-arg]
+            try:
+                info = self.locator.locate(
+                    self.path,
+                    extension=".rar",
+                    force=True,
+                )
+            except TypeError:
+                info = self.locator.locate(  # type: ignore[call-arg]
+                    self.path,
+                    force=True,
+                )
+        except Exception as exc:
+            _LOGGER.exception("WinRAR probe failed")
+            info = WinRARInfo(self.path, False, None, str(exc))
         try:
             self.signals.completed.emit(self.generation, info)
         except RuntimeError:
@@ -125,14 +140,18 @@ class _FFmpegProbeWorker(QRunnable):
 
     @Slot()
     def run(self) -> None:
-        result = self.locator.locate(self.path)
+        try:
+            result = self.locator.locate(self.path)
+        except Exception:
+            _LOGGER.exception("FFmpeg probe failed")
+            result = None
         try:
             self.signals.completed.emit(self.generation, result)
         except RuntimeError:
             pass
 
 
-_RETIRED_SETTINGS_POOLS: set[QThreadPool] = set()
+_RETIRED_SETTINGS_DIALOGS: set[QDialog] = set()
 
 
 class SettingsDialog(QDialog):
@@ -164,8 +183,9 @@ class SettingsDialog(QDialog):
         self._winrar_locator = winrar_locator or WinRARLocator()
         self._ffmpeg_locator = ffmpeg_locator or FFmpegLocator()
         self._file_registration_service = file_registration_service
-        self._probe_pool = QThreadPool()
+        self._probe_pool = QThreadPool(self)
         self._probe_pool.setMaxThreadCount(2)
+        self._probes_closed = False
         self._probe_generation = 0
         self._probe_workers: dict[int, _SevenZipProbeWorker] = {}
         self._pending_explicit_path: str | None = None
@@ -1511,9 +1531,22 @@ class SettingsDialog(QDialog):
         self.apply_settings()
         if self.config.last_error:
             return
-        super().accept()
+        self._complete_accept()
 
     def reject(self) -> None:  # type: ignore[override]
+        self._close_probe_workers()
+        super().reject()
+        self._delete_when_probes_finish()
+
+    def _complete_accept(self) -> None:
+        self._close_probe_workers()
+        super().accept()
+        self._delete_when_probes_finish()
+
+    def _close_probe_workers(self) -> None:
+        if self._probes_closed:
+            return
+        self._probes_closed = True
         self._probe_generation += 1
         self._winrar_probe_generation += 1
         self._ffmpeg_probe_generation += 1
@@ -1521,9 +1554,40 @@ class SettingsDialog(QDialog):
         self._accept_after_probe = False
         self._pending_winrar_path = None
         self._accept_after_winrar_probe = False
-        if not self._probe_pool.waitForDone(0):
-            _RETIRED_SETTINGS_POOLS.add(self._probe_pool)
-        super().reject()
+        for workers in (
+            self._probe_workers,
+            self._winrar_probe_workers,
+            self._ffmpeg_probe_workers,
+        ):
+            for generation, worker in tuple(workers.items()):
+                try:
+                    removed = self._probe_pool.tryTake(worker)
+                except RuntimeError:
+                    removed = False
+                if removed:
+                    workers.pop(generation, None)
+
+    def _probe_workers_idle(self) -> bool:
+        return not (
+            self._probe_workers
+            or self._winrar_probe_workers
+            or self._ffmpeg_probe_workers
+        )
+
+    def _delete_when_probes_finish(self) -> None:
+        if not self._probes_closed:
+            return
+        if self._probe_workers_idle():
+            _RETIRED_SETTINGS_DIALOGS.discard(self)
+            self.deleteLater()
+            return
+        self.setParent(None)
+        _RETIRED_SETTINGS_DIALOGS.add(self)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._close_probe_workers()
+        super().closeEvent(event)
+        self._delete_when_probes_finish()
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
@@ -1556,6 +1620,8 @@ class SettingsDialog(QDialog):
             self.redetect_ffmpeg()
 
     def redetect_ffmpeg(self) -> None:
+        if self._probes_closed:
+            return
         explicit = self.ffmpeg_path_edit.text().strip().strip('"')
         self._ffmpeg_probe_generation += 1
         generation = self._ffmpeg_probe_generation
@@ -1577,7 +1643,8 @@ class SettingsDialog(QDialog):
         executable: Path | None,
     ) -> None:
         self._ffmpeg_probe_workers.pop(generation, None)
-        if generation != self._ffmpeg_probe_generation:
+        self._delete_when_probes_finish()
+        if self._probes_closed or generation != self._ffmpeg_probe_generation:
             return
         self.ffmpeg_redetect_button.setEnabled(True)
         if executable is None:
@@ -1615,6 +1682,8 @@ class SettingsDialog(QDialog):
         apply_on_success: bool = False,
         accept_after: bool = False,
     ) -> None:
+        if self._probes_closed:
+            return
         self._winrar_probe_generation += 1
         generation = self._winrar_probe_generation
         self._pending_winrar_path = path if apply_on_success else None
@@ -1637,7 +1706,8 @@ class SettingsDialog(QDialog):
         info: WinRARInfo,
     ) -> None:
         self._winrar_probe_workers.pop(generation, None)
-        if generation != self._winrar_probe_generation:
+        self._delete_when_probes_finish()
+        if self._probes_closed or generation != self._winrar_probe_generation:
             return
         self.winrar_redetect_button.setEnabled(True)
         if info.available:
@@ -1702,6 +1772,8 @@ class SettingsDialog(QDialog):
         apply_on_success: bool = False,
         accept_after: bool = False,
     ) -> None:
+        if self._probes_closed:
+            return
         self._probe_generation += 1
         generation = self._probe_generation
         self._pending_explicit_path = path if apply_on_success else None
@@ -1724,9 +1796,8 @@ class SettingsDialog(QDialog):
         info: SevenZipInfo,
     ) -> None:
         self._probe_workers.pop(generation, None)
-        if not self._probe_workers:
-            _RETIRED_SETTINGS_POOLS.discard(self._probe_pool)
-        if generation != self._probe_generation:
+        self._delete_when_probes_finish()
+        if self._probes_closed or generation != self._probe_generation:
             return
         self.seven_zip_redetect_button.setEnabled(True)
         if info.available:
@@ -1753,7 +1824,7 @@ class SettingsDialog(QDialog):
             if changed:
                 self.settings_applied.emit(changed)
         if close_after and (pending is None or info.available):
-            super().accept()
+            self._complete_accept()
 
     def request_cache_clear(self, *, confirm: bool = True) -> None:
         if confirm:
