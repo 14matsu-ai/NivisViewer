@@ -389,18 +389,31 @@ def test_slider_wheel_at_book_edges_never_uses_adjacent_navigation(
 def test_normal_and_fullscreen_use_the_same_page_slider(
     tmp_path: Path,
     qapp,
+    monkeypatch,
 ) -> None:
     window, _pages = _viewer_with_pages(tmp_path, qapp)
     slider = window.slider
+    controller = window.fullscreen_chrome
+    monkeypatch.setattr(
+        controller,
+        "_apply_native_fullscreen_frame",
+        lambda _fullscreen: None,
+    )
 
-    window.showFullScreen()
-    window._apply_chrome_visibility()
+    controller.set_fullscreen_state(
+        True,
+        hide_ui=window.hide_ui_in_fullscreen,
+        hide_cursor=window.hide_cursor_in_fullscreen,
+    )
     qapp.processEvents()
-    assert window.fullscreen_chrome.slider is slider
-    assert slider.parent() is window.fullscreen_chrome.bottom_overlay
+    assert controller.slider is slider
+    assert slider.parent() is controller.bottom_overlay
 
-    window.showNormal()
-    window._apply_chrome_visibility()
+    controller.set_fullscreen_state(
+        False,
+        hide_ui=window.hide_ui_in_fullscreen,
+        hide_cursor=window.hide_cursor_in_fullscreen,
+    )
     qapp.processEvents()
     assert window.slider is slider
     window.close()
@@ -532,7 +545,7 @@ def test_fullscreen_wheel_filter_handles_only_current_window_bottom_region(
     qapp.processEvents()
     window_handle = window.windowHandle()
     assert window_handle is not None
-    region = controller._bottom_hover_region_global()
+    region = controller._bottom_wheel_region_global()
     calls: list[str] = []
     slider.nextDisplayUnitRequested.connect(lambda: calls.append("next"))
     process_calls = 0
@@ -595,6 +608,176 @@ def test_fullscreen_wheel_filter_handles_only_current_window_bottom_region(
     window.close()
 
 
+def test_bottom_wheel_region_uses_only_visible_overlay_geometry(
+    qapp,
+    monkeypatch,
+) -> None:
+    window = QMainWindow()
+    central = QWidget(window)
+    layout = QVBoxLayout(central)
+    viewer = QWidget(central)
+    slider = ViewerPageSlider(central)
+    layout.addWidget(viewer, 1)
+    layout.addWidget(slider)
+    window.setCentralWidget(central)
+    status = QStatusBar(window)
+    window.setStatusBar(status)
+    controller = FullscreenChromeController(
+        window,
+        viewer=viewer,
+        menu_bar=window.menuBar(),
+        slider=slider,
+        status_bar=status,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_apply_native_fullscreen_frame",
+        lambda _fullscreen: None,
+    )
+    window.resize(640, 480)
+    window.show()
+    controller.set_fullscreen_state(True, hide_ui=True, hide_cursor=False)
+    controller.show_bottom()
+    qapp.processEvents()
+    window_handle = window.windowHandle()
+    assert window_handle is not None
+    process_calls = 0
+    original_process = slider.process_wheel_delta
+
+    def counted_process(angle_delta: QPoint, pixel_delta: QPoint) -> bool:
+        nonlocal process_calls
+        process_calls += 1
+        return original_process(angle_delta, pixel_delta)
+
+    monkeypatch.setattr(slider, "process_wheel_delta", counted_process)
+    visible_region = controller._bottom_wheel_region_global()
+    overlay_region = QRect(
+        controller.bottom_overlay.mapToGlobal(QPoint(0, 0)),
+        controller.bottom_overlay.size(),
+    )
+    assert not visible_region.isEmpty()
+    assert visible_region.top() == overlay_region.top()
+    assert visible_region.contains(overlay_region.center())
+
+    viewer_center = viewer.mapToGlobal(viewer.rect().center())
+    assert not visible_region.contains(viewer_center)
+    viewer_qwindow_event = QWheelEvent(
+        QPointF(1, 1),
+        QPointF(viewer_center),
+        QPoint(),
+        QPoint(0, -120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    assert (
+        controller.eventFilter(window_handle, viewer_qwindow_event)
+        is False
+    )
+    assert process_calls == 0
+
+    physical_bottom = QPoint(
+        visible_region.center().x(),
+        visible_region.bottom(),
+    )
+    bottom_qwindow_event = QWheelEvent(
+        QPointF(1, 1),
+        QPointF(physical_bottom),
+        QPoint(),
+        QPoint(0, -120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    assert (
+        controller.eventFilter(window_handle, bottom_qwindow_event)
+        is True
+    )
+    assert bottom_qwindow_event.isAccepted()
+    assert process_calls == 1
+
+    hover_region = controller._bottom_hover_region_global()
+    controller.schedule_hide()
+    assert controller._hide_timer.isActive()
+    controller.hide_overlays()
+    assert not controller.bottom_overlay.isVisible()
+    assert controller._bottom_wheel_region_global().isEmpty()
+    assert controller._bottom_hover_region_global() == hover_region
+
+    for point in (hover_region.center(), physical_bottom):
+        hidden_qwindow_event = QWheelEvent(
+            QPointF(1, 1),
+            QPointF(point),
+            QPoint(),
+            QPoint(0, -120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.ScrollUpdate,
+            False,
+        )
+        hidden_qwindow_event.ignore()
+        assert (
+            controller.eventFilter(window_handle, hidden_qwindow_event)
+            is False
+        )
+        assert not hidden_qwindow_event.isAccepted()
+    assert process_calls == 1
+
+    hidden_widget_event = _wheel_event(
+        controller.bottom_overlay,
+        angle_y=-120,
+    )
+    hidden_widget_event.ignore()
+    assert (
+        controller.eventFilter(
+            controller.bottom_overlay,
+            hidden_widget_event,
+        )
+        is False
+    )
+    assert not hidden_widget_event.isAccepted()
+    assert process_calls == 1
+
+    controller.set_fullscreen_state(
+        True,
+        hide_ui=False,
+        hide_cursor=False,
+    )
+    qapp.processEvents()
+    assert controller.bottom_overlay.isVisible()
+    disabled_auto_hide_region = controller._bottom_wheel_region_global()
+    assert not disabled_auto_hide_region.isEmpty()
+    assert not disabled_auto_hide_region.contains(viewer_center)
+    disabled_auto_hide_bottom = QWheelEvent(
+        QPointF(1, 1),
+        QPointF(
+            disabled_auto_hide_region.center().x(),
+            disabled_auto_hide_region.bottom(),
+        ),
+        QPoint(),
+        QPoint(0, -120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    assert (
+        controller.eventFilter(
+            window_handle,
+            disabled_auto_hide_bottom,
+        )
+        is True
+    )
+    assert disabled_auto_hide_bottom.isAccepted()
+    assert process_calls == 2
+
+    controller.set_active(False)
+    controller.shutdown()
+    window.close()
+
+
 def test_bottom_overlay_wheel_accumulates_once_without_other_ui_capture(
     qapp,
 ) -> None:
@@ -635,6 +818,355 @@ def test_bottom_overlay_wheel_accumulates_once_without_other_ui_capture(
     controller.set_active(False)
     controller.shutdown()
     window.close()
+
+
+@pytest.mark.parametrize("single_page", [False, True])
+@pytest.mark.parametrize(
+    ("delta_name", "partial_delta"),
+    [("angle", -60), ("pixel", -20)],
+)
+def test_bottom_wheel_remainder_resets_when_pointer_leaves_region(
+    qapp,
+    monkeypatch,
+    single_page: bool,
+    delta_name: str,
+    partial_delta: int,
+) -> None:
+    window = QMainWindow()
+    central = QWidget(window)
+    layout = QVBoxLayout(central)
+    viewer = QWidget(central)
+    slider = ViewerPageSlider(central)
+    layout.addWidget(viewer, 1)
+    layout.addWidget(slider)
+    window.setCentralWidget(central)
+    status = QStatusBar(window)
+    window.setStatusBar(status)
+    controller = FullscreenChromeController(
+        window,
+        viewer=viewer,
+        menu_bar=window.menuBar(),
+        slider=slider,
+        status_bar=status,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_apply_native_fullscreen_frame",
+        lambda _fullscreen: None,
+    )
+    slider.set_single_page_wheel_enabled(single_page)
+    single_calls: list[str] = []
+    display_calls: list[str] = []
+    slider.nextSinglePageRequested.connect(
+        lambda: single_calls.append("next")
+    )
+    slider.nextDisplayUnitRequested.connect(
+        lambda: display_calls.append("next")
+    )
+    window.resize(640, 480)
+    window.show()
+    controller.set_fullscreen_state(True, hide_ui=True, hide_cursor=False)
+    controller.show_bottom()
+    qapp.processEvents()
+
+    wheel_kwargs = {f"{delta_name}_y": partial_delta}
+    _wheel(controller.bottom_overlay, **wheel_kwargs)
+    _wheel(controller.bottom_overlay, **wheel_kwargs)
+    assert single_calls == (["next"] if single_page else [])
+    assert display_calls == ([] if single_page else ["next"])
+
+    _wheel(controller.bottom_overlay, **wheel_kwargs)
+    if delta_name == "angle":
+        assert slider._angle_remainder == partial_delta
+        assert slider._pixel_remainder == 0
+    else:
+        assert slider._pixel_remainder == partial_delta
+        assert slider._angle_remainder == 0
+
+    region = controller._bottom_hover_region_global()
+    outside_global = QPoint(region.center().x(), region.top() - 1)
+    outside_local = viewer.mapFromGlobal(outside_global)
+    move_event = QMouseEvent(
+        QEvent.Type.MouseMove,
+        QPointF(outside_local),
+        QPointF(outside_global),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(viewer, move_event)
+    assert slider._angle_remainder == 0
+    assert slider._pixel_remainder == 0
+
+    _wheel(viewer, **wheel_kwargs)
+    assert single_calls == (["next"] if single_page else [])
+    assert display_calls == ([] if single_page else ["next"])
+    assert slider._angle_remainder == 0
+    assert slider._pixel_remainder == 0
+
+    _wheel(controller.bottom_overlay, **wheel_kwargs)
+    assert single_calls == (["next"] if single_page else [])
+    assert display_calls == ([] if single_page else ["next"])
+    _wheel(controller.bottom_overlay, **wheel_kwargs)
+    assert single_calls == (["next"] * 2 if single_page else [])
+    assert display_calls == ([] if single_page else ["next"] * 2)
+
+    controller.set_active(False)
+    controller.shutdown()
+    window.close()
+
+
+@pytest.mark.parametrize(
+    ("delta_name", "partial_delta"),
+    [("angle", -60), ("pixel", -20)],
+)
+def test_bottom_wheel_remainder_tracks_input_region_across_receivers(
+    qapp,
+    monkeypatch,
+    delta_name: str,
+    partial_delta: int,
+) -> None:
+    window = QMainWindow()
+    central = QWidget(window)
+    layout = QVBoxLayout(central)
+    viewer = QWidget(central)
+    slider = ViewerPageSlider(central)
+    layout.addWidget(viewer, 1)
+    layout.addWidget(slider)
+    window.setCentralWidget(central)
+    status = QStatusBar(window)
+    window.setStatusBar(status)
+    controller = FullscreenChromeController(
+        window,
+        viewer=viewer,
+        menu_bar=window.menuBar(),
+        slider=slider,
+        status_bar=status,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_apply_native_fullscreen_frame",
+        lambda _fullscreen: None,
+    )
+    window.resize(640, 480)
+    window.show()
+    controller.set_fullscreen_state(True, hide_ui=True, hide_cursor=False)
+    controller.show_bottom()
+    qapp.processEvents()
+    window_handle = window.windowHandle()
+    assert window_handle is not None
+    region = controller._bottom_hover_region_global()
+    calls: list[str] = []
+    slider.nextDisplayUnitRequested.connect(lambda: calls.append("next"))
+    process_calls = 0
+    original_process = slider.process_wheel_delta
+
+    def counted_process(angle_delta: QPoint, pixel_delta: QPoint) -> bool:
+        nonlocal process_calls
+        process_calls += 1
+        return original_process(angle_delta, pixel_delta)
+
+    monkeypatch.setattr(slider, "process_wheel_delta", counted_process)
+    wheel_kwargs = {f"{delta_name}_y": partial_delta}
+    _wheel(controller.bottom_overlay, **wheel_kwargs)
+
+    angle_delta = (
+        QPoint(0, partial_delta) if delta_name == "angle" else QPoint()
+    )
+    pixel_delta = (
+        QPoint(0, partial_delta) if delta_name == "pixel" else QPoint()
+    )
+    inside_event = QWheelEvent(
+        QPointF(1, 1),
+        QPointF(region.center().x(), region.bottom()),
+        pixel_delta,
+        angle_delta,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    assert controller.eventFilter(window_handle, inside_event) is True
+    assert inside_event.isAccepted()
+    assert process_calls == 2
+    assert calls == ["next"]
+
+    _wheel(controller.bottom_overlay, **wheel_kwargs)
+    outside_event = QWheelEvent(
+        QPointF(1, 1),
+        QPointF(region.center().x(), region.top() - 1),
+        pixel_delta,
+        angle_delta,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    assert controller.eventFilter(window_handle, outside_event) is False
+    assert process_calls == 3
+    assert calls == ["next"]
+    assert slider._angle_remainder == 0
+    assert slider._pixel_remainder == 0
+
+    controller.set_active(False)
+    controller.shutdown()
+    window.close()
+
+
+def test_hidden_bottom_overlay_does_not_claim_qwindow_then_viewer_wheel(
+    tmp_path: Path,
+    qapp,
+    monkeypatch,
+) -> None:
+    next_page_calls = 0
+    next_or_scroll_calls = 0
+    original_next_page = ViewerWindow.next_page
+    original_next_or_scroll = ViewerWindow.next_page_or_scroll
+
+    def counted_next_page(self: ViewerWindow) -> None:
+        nonlocal next_page_calls
+        next_page_calls += 1
+        original_next_page(self)
+
+    def counted_next_or_scroll(self: ViewerWindow) -> None:
+        nonlocal next_or_scroll_calls
+        next_or_scroll_calls += 1
+        original_next_or_scroll(self)
+
+    monkeypatch.setattr(ViewerWindow, "next_page", counted_next_page)
+    monkeypatch.setattr(
+        ViewerWindow,
+        "next_page_or_scroll",
+        counted_next_or_scroll,
+    )
+    window, _pages = _viewer_with_pages(tmp_path, qapp, page_count=5)
+    controller = window.fullscreen_chrome
+    monkeypatch.setattr(
+        controller,
+        "_apply_native_fullscreen_frame",
+        lambda _fullscreen: None,
+    )
+    window.slider.set_single_page_wheel_enabled(False)
+    controller.set_fullscreen_state(True, hide_ui=True, hide_cursor=False)
+    controller.show_bottom()
+    qapp.processEvents()
+    lower_calls: list[str] = []
+    lower_single_calls: list[str] = []
+    viewer_calls: list[str] = []
+    window.slider.nextDisplayUnitRequested.connect(
+        lambda: lower_calls.append("next")
+    )
+    window.slider.nextSinglePageRequested.connect(
+        lambda: lower_single_calls.append("next")
+    )
+    window.slider.previousSinglePageRequested.connect(
+        lambda: lower_single_calls.append("previous")
+    )
+    window.viewer.nextRequested.connect(
+        lambda: viewer_calls.append("next")
+    )
+    process_calls = 0
+    display_move_calls = 0
+    original_process = window.slider.process_wheel_delta
+    original_display_move = window.page_navigation.next_display_unit
+
+    def counted_process(angle_delta: QPoint, pixel_delta: QPoint) -> bool:
+        nonlocal process_calls
+        process_calls += 1
+        return original_process(angle_delta, pixel_delta)
+
+    def counted_display_move() -> bool:
+        nonlocal display_move_calls
+        display_move_calls += 1
+        return original_display_move()
+
+    monkeypatch.setattr(
+        window.slider,
+        "process_wheel_delta",
+        counted_process,
+    )
+    monkeypatch.setattr(
+        window.page_navigation,
+        "next_display_unit",
+        counted_display_move,
+    )
+
+    lower_event = _wheel(controller.bottom_overlay, angle_y=-120)
+    assert lower_event.isAccepted()
+    assert lower_calls == ["next"]
+    assert lower_single_calls == []
+    assert process_calls == 1
+    assert next_page_calls == 1
+    assert next_or_scroll_calls == 0
+    assert display_move_calls == 1
+
+    controller.schedule_hide()
+    assert controller._hide_timer.isActive()
+    controller.hide_overlays()
+    assert not controller.bottom_overlay.isVisible()
+    hidden_hover_region = controller._bottom_hover_region_global()
+    viewer_global = window.viewer.mapToGlobal(
+        window.viewer.rect().center()
+    )
+    assert not hidden_hover_region.contains(viewer_global)
+    viewer_local = window.viewer.mapFromGlobal(viewer_global)
+    move_event = QMouseEvent(
+        QEvent.Type.MouseMove,
+        QPointF(viewer_local),
+        QPointF(viewer_global),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(window.viewer, move_event)
+    assert not controller.bottom_overlay.isVisible()
+
+    window_handle = window.windowHandle()
+    assert window_handle is not None
+    qwindow_event = QWheelEvent(
+        QPointF(1, 1),
+        QPointF(hidden_hover_region.center()),
+        QPoint(),
+        QPoint(0, -120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    qwindow_event.ignore()
+    assert controller.eventFilter(window_handle, qwindow_event) is False
+    assert not qwindow_event.isAccepted()
+
+    viewer_event = QWheelEvent(
+        QPointF(viewer_local),
+        QPointF(viewer_global),
+        QPoint(),
+        QPoint(0, -120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    QApplication.sendEvent(window.viewer, viewer_event)
+    assert viewer_event.isAccepted()
+    assert process_calls == 1
+    assert lower_calls == ["next"]
+    assert lower_single_calls == []
+    assert viewer_calls == ["next"]
+    assert next_page_calls == 2
+    assert next_or_scroll_calls == 1
+    assert display_move_calls == 2
+    qapp.processEvents()
+    assert process_calls == 1
+    assert lower_calls == ["next"]
+    assert viewer_calls == ["next"]
+    assert next_page_calls == 2
+    assert next_or_scroll_calls == 1
+    assert display_move_calls == 2
+
+    controller.set_active(False)
+    window.close()
+    qapp.processEvents()
 
 
 @pytest.mark.parametrize("size", [(640, 480), (641, 479)])
