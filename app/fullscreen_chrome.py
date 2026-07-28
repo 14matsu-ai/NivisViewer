@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ctypes
+import sys
+
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QTimer, Qt
-from PySide6.QtGui import QCursor, QMouseEvent, QWheelEvent
+from PySide6.QtGui import QCursor, QMouseEvent, QPalette, QWheelEvent, QWindow
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -17,6 +20,11 @@ from app.viewer_page_slider import ViewerPageSlider
 
 
 CURSOR_IDLE_HIDE_MS = 800
+_DWMWA_WINDOW_CORNER_PREFERENCE = 33
+_DWMWCP_DEFAULT = 0
+_DWMWCP_DONOTROUND = 1
+_DWMWA_BORDER_COLOR = 34
+_DWM_COLOR_DEFAULT = 0xFFFFFFFF
 
 
 class FullscreenChromeController(QObject):
@@ -74,6 +82,7 @@ class FullscreenChromeController(QObject):
         if parent is None:
             raise ValueError("FullscreenChromeController requires a central widget")
         self.overlay_parent = parent
+        self.overlay_parent.setAutoFillBackground(True)
         self.top_overlay = QFrame(parent)
         self.top_overlay.setObjectName("fullscreen_top_chrome")
         self.top_overlay.setFrameShape(QFrame.Shape.NoFrame)
@@ -188,6 +197,7 @@ class FullscreenChromeController(QObject):
         self.hide_cursor_enabled = bool(hide_cursor)
         self._invalidate_hide_timer()
         self._invalidate_cursor_timer()
+        self._apply_native_fullscreen_frame(self.fullscreen)
         if self.fullscreen:
             self._attach_chrome()
             self._update_geometry()
@@ -312,6 +322,7 @@ class FullscreenChromeController(QObject):
 
     def reevaluate_visibility(self) -> None:
         self._invalidate_hide_timer()
+        self._apply_native_fullscreen_frame(self.fullscreen)
         cursor_position = QCursor.pos()
         if (
             (self.top_overlay_visible or self.bottom_overlay_visible)
@@ -326,6 +337,7 @@ class FullscreenChromeController(QObject):
         self._invalidate_hide_timer()
         self._invalidate_cursor_timer()
         self._set_cursor_hidden(False)
+        self._apply_native_fullscreen_frame(False)
         self.bottom_reveal_strip.hide()
         application = QApplication.instance()
         if application is not None:
@@ -350,13 +362,7 @@ class FullscreenChromeController(QObject):
             self.fullscreen
             and event_type == QEvent.Type.Wheel
             and isinstance(event, QWheelEvent)
-            and isinstance(watched, QWidget)
-            and (
-                watched is self.bottom_overlay
-                or self.bottom_overlay.isAncestorOf(watched)
-            )
-            and watched is not self.slider
-            and not self.slider.isAncestorOf(watched)
+            and self._is_bottom_wheel_target(watched, event)
             and isinstance(self.slider, ViewerPageSlider)
         ):
             handled = self.slider.process_wheel_delta(
@@ -392,6 +398,68 @@ class FullscreenChromeController(QObject):
         ):
             return True
         return False
+
+    def _is_bottom_wheel_target(
+        self,
+        watched: QObject,
+        event: QWheelEvent,
+    ) -> bool:
+        if isinstance(watched, QWidget):
+            if (
+                watched is self.slider
+                or self.slider.isAncestorOf(watched)
+            ):
+                return False
+            return bool(
+                watched is self.bottom_overlay
+                or self.bottom_overlay.isAncestorOf(watched)
+            )
+        if isinstance(watched, QWindow):
+            window_handle = self.window.windowHandle()
+            return bool(
+                watched is window_handle
+                and self._pointer_in_bottom_hover_region(
+                    event.globalPosition().toPoint()
+                )
+            )
+        return False
+
+    def _apply_native_fullscreen_frame(self, fullscreen: bool) -> None:
+        if sys.platform != "win32" or not self.window.isVisible():
+            return
+        try:
+            dwmapi = ctypes.windll.dwmapi
+        except (AttributeError, OSError):
+            return
+
+        window_id = int(self.window.winId())
+        corner_preference = ctypes.c_int(
+            _DWMWCP_DONOTROUND if fullscreen else _DWMWCP_DEFAULT
+        )
+        if fullscreen:
+            color = self.top_overlay.palette().color(
+                QPalette.ColorRole.Window
+            )
+            border_value = (
+                color.red()
+                | (color.green() << 8)
+                | (color.blue() << 16)
+            )
+        else:
+            border_value = _DWM_COLOR_DEFAULT
+        border_color = ctypes.c_uint32(border_value)
+        dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(window_id),
+            _DWMWA_WINDOW_CORNER_PREFERENCE,
+            ctypes.byref(corner_preference),
+            ctypes.sizeof(corner_preference),
+        )
+        dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(window_id),
+            _DWMWA_BORDER_COLOR,
+            ctypes.byref(border_color),
+            ctypes.sizeof(border_color),
+        )
 
     def _show_overlay(self, side: str) -> None:
         self._update_geometry()
