@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 import time
 import zipfile
@@ -238,6 +239,114 @@ def test_flush_and_close_are_idempotent(tmp_path: Path) -> None:
     store.flush()
     store.close()
     store.close()
+
+
+@pytest.mark.parametrize(
+    ("source_name", "item_type"),
+    (
+        ("folder-book", "folder"),
+        ("single-image.jpg", "image"),
+        ("book.zip", "archive"),
+        ("book.pdf", "pdf"),
+        ("missing.cbz", "archive"),
+        (r"\\offline-server\share\book", "folder"),
+    ),
+)
+def test_pending_flush_never_inspects_source_filesystem(
+    tmp_path: Path,
+    monkeypatch,
+    source_name: str,
+    item_type: str,
+) -> None:
+    database = tmp_path / "metadata.sqlite3"
+    source = Path(source_name)
+    if not source.is_absolute():
+        source = tmp_path / source
+    source_key = MetadataStore.normalize_path(source)
+    calls = {
+        "stat": 0,
+        "is_dir": 0,
+        "exists": 0,
+        "resolve": 0,
+        "os_stat": 0,
+    }
+    original_stat = Path.stat
+    original_is_dir = Path.is_dir
+    original_exists = Path.exists
+    original_resolve = Path.resolve
+    original_os_stat = os.stat
+
+    def is_source(path: object) -> bool:
+        try:
+            return MetadataStore.normalize_path(path) == source_key
+        except (TypeError, ValueError):
+            return False
+
+    def guarded_stat(path: Path, *args, **kwargs):
+        if is_source(path):
+            calls["stat"] += 1
+            raise AssertionError("metadata flush inspected source with Path.stat")
+        return original_stat(path, *args, **kwargs)
+
+    def guarded_is_dir(path: Path) -> bool:
+        if is_source(path):
+            calls["is_dir"] += 1
+            raise AssertionError("metadata flush inspected source with Path.is_dir")
+        return original_is_dir(path)
+
+    def guarded_exists(path: Path) -> bool:
+        if is_source(path):
+            calls["exists"] += 1
+            raise AssertionError("metadata flush inspected source with Path.exists")
+        return original_exists(path)
+
+    def guarded_resolve(path: Path, *args, **kwargs) -> Path:
+        if is_source(path):
+            calls["resolve"] += 1
+            raise AssertionError("metadata flush inspected source with Path.resolve")
+        return original_resolve(path, *args, **kwargs)
+
+    def guarded_os_stat(path: object, *args, **kwargs):
+        if is_source(path):
+            calls["os_stat"] += 1
+            raise AssertionError("metadata flush inspected source with os.stat")
+        return original_os_stat(path, *args, **kwargs)
+
+    store = MetadataStore(database)
+    monkeypatch.setattr(Path, "stat", guarded_stat)
+    monkeypatch.setattr(Path, "is_dir", guarded_is_dir)
+    monkeypatch.setattr(Path, "exists", guarded_exists)
+    monkeypatch.setattr(Path, "resolve", guarded_resolve)
+    monkeypatch.setattr("app.metadata_store.os.stat", guarded_os_stat)
+
+    store.update_reading_progress(
+        str(source),
+        page_index=2,
+        total_pages=4,
+        item_type=item_type,
+    )
+    store.flush()
+
+    assert calls == {
+        "stat": 0,
+        "is_dir": 0,
+        "exists": 0,
+        "resolve": 0,
+        "os_stat": 0,
+    }
+    progress = store.get_reading_progress(str(source))
+    history = store.list_history()
+    assert progress is not None and progress.page_index == 2
+    assert [
+        (entry.item_type, MetadataStore.normalize_path(entry.path))
+        for entry in history
+    ] == [(item_type, source_key)]
+    store.close()
+
+    reopened = MetadataStore(database)
+    restored = reopened.get_reading_progress(str(source))
+    assert restored is not None and restored.page_index == 2
+    reopened.close()
 
 
 def test_relative_and_trailing_separator_paths_share_one_key(

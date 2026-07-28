@@ -45,8 +45,12 @@ from .image_source import (
     ARCHIVE_EXTENSIONS,
     PDF_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
+    FolderImageSource,
     FolderListingSnapshot,
+    ImageSource,
     ImageSourceError,
+    SevenZipImageSource,
+    ZipImageSource,
     create_image_source,
 )
 from .metadata_store import MetadataStore
@@ -157,6 +161,7 @@ class ViewerWindow(QMainWindow):
         self._page_history_back: list[int] = []
         self._page_history_forward: list[int] = []
         self._metadata_book_path = ""
+        self._metadata_book_item_type = ""
         self._status_override_message: str | None = None
         self._status_override_token = 0
         self._path_probe_generation = 0
@@ -1036,6 +1041,7 @@ class ViewerWindow(QMainWindow):
                 self._set_status_override("表示可能な画像がありません", 5000)
             self.book_session.close_book()
             self._metadata_book_path = ""
+            self._metadata_book_item_type = ""
             self.viewer.clear()
             self._clear_page_history()
             self._rebuild_page_list()
@@ -1044,13 +1050,17 @@ class ViewerWindow(QMainWindow):
             return False
 
         self._metadata_book_path = str(opened.source_path)
+        self._metadata_book_item_type = self._metadata_item_type_for_source(
+            self.book_session.source,
+            opened.source_path,
+        )
         if opened.selected_image is None:
             self._restore_reading_position(self._metadata_book_path)
 
         if self.metadata_store is not None:
             self.metadata_store.record_book_opened(
                 self._metadata_book_path,
-                item_type=self._metadata_item_type(opened.source_path),
+                item_type=self._metadata_book_item_type,
                 start_page_index=self.model.focused_index,
                 total_pages=self.model.total_pages,
             )
@@ -1131,10 +1141,20 @@ class ViewerWindow(QMainWindow):
             self._metadata_book_path,
             page_index=self.model.focused_index,
             total_pages=self.model.total_pages,
+            item_type=self._metadata_book_item_type or None,
         )
 
     @staticmethod
-    def _metadata_item_type(path: Path) -> str:
+    def _metadata_item_type_for_source(
+        source: ImageSource | None,
+        path: Path,
+    ) -> str:
+        if isinstance(source, FolderImageSource):
+            return "folder"
+        if isinstance(source, PdfImageSource):
+            return "pdf"
+        if isinstance(source, (ZipImageSource, SevenZipImageSource)):
+            return "archive"
         if path.suffix.lower() in ARCHIVE_EXTENSIONS:
             return "archive"
         if path.suffix.lower() in PDF_EXTENSIONS:

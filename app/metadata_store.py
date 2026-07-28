@@ -56,6 +56,7 @@ class _PendingProgress:
     display_path: str
     page_index: int
     total_pages: int | None
+    item_type: str | None = None
 
 
 class MetadataStore(QObject):
@@ -151,15 +152,23 @@ class MetadataStore(QObject):
         *,
         page_index: int,
         total_pages: int | None,
+        item_type: str | None = None,
     ) -> None:
         with self._lock:
             if not self._available:
                 return
             display = self.display_path(path)
-            self._pending_progress[self.normalize_path(display)] = _PendingProgress(
+            normalized = self.normalize_path(display)
+            previous = self._pending_progress.get(normalized)
+            self._pending_progress[normalized] = _PendingProgress(
                 display_path=display,
                 page_index=self._clamp_page(page_index, total_pages),
                 total_pages=self._safe_total(total_pages),
+                item_type=(
+                    item_type
+                    if item_type is not None
+                    else previous.item_type if previous is not None else None
+                ),
             )
 
     def get_reading_progress(self, path: str) -> ReadingProgress | None:
@@ -278,7 +287,7 @@ class MetadataStore(QObject):
                 return
             try:
                 actual_type = item_type or self._infer_item_type(path)
-                item_id = self._ensure_bookmark_item(
+                item_id = self._ensure_library_item(
                     path,
                     item_type=actual_type,
                 )
@@ -944,46 +953,7 @@ class MetadataStore(QObject):
             return False
 
     def _ensure_library_item(self, path: str, *, item_type: str) -> int:
-        assert self._connection is not None
-        display = self.display_path(path)
-        normalized = self.normalize_path(display)
-        now = time.time()
-        file_size, source_mtime_ns = self._stat_source(display)
-        self._connection.execute(
-            """
-            INSERT INTO library_items (
-                normalized_path, display_path, item_type, file_size,
-                source_mtime_ns, identity_hint, rating, comment,
-                metadata_updated_at, created_at, last_verified_at
-            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, '', ?, ?, ?)
-            ON CONFLICT(normalized_path) DO UPDATE SET
-                display_path = excluded.display_path,
-                item_type = excluded.item_type,
-                file_size = excluded.file_size,
-                source_mtime_ns = excluded.source_mtime_ns,
-                last_verified_at = excluded.last_verified_at
-            """,
-            (
-                normalized,
-                display,
-                item_type,
-                file_size,
-                source_mtime_ns,
-                now,
-                now,
-                now,
-            ),
-        )
-        row = self._connection.execute(
-            "SELECT id FROM library_items WHERE normalized_path = ?",
-            (normalized,),
-        ).fetchone()
-        if row is None:
-            raise sqlite3.DatabaseError("library item was not created")
-        return int(row[0])
-
-    def _ensure_bookmark_item(self, path: str, *, item_type: str) -> int:
-        """Create the bookmark identity without a synchronous source stat."""
+        """Create or update a library identity without inspecting the source."""
         assert self._connection is not None
         display = self.display_path(path)
         normalized = self.normalize_path(display)
@@ -999,14 +969,21 @@ class MetadataStore(QObject):
                 display_path = excluded.display_path,
                 item_type = excluded.item_type
             """,
-            (normalized, display, item_type, now, now, 0.0),
+            (
+                normalized,
+                display,
+                item_type,
+                now,
+                now,
+                0.0,
+            ),
         )
         row = self._connection.execute(
             "SELECT id FROM library_items WHERE normalized_path = ?",
             (normalized,),
         ).fetchone()
         if row is None:
-            raise sqlite3.DatabaseError("bookmark library item was not created")
+            raise sqlite3.DatabaseError("library item was not created")
         return int(row[0])
 
     def _flush_pending_locked(self) -> bool:
@@ -1017,9 +994,23 @@ class MetadataStore(QObject):
         self._pending_progress.clear()
         now = time.time()
         for progress in pending:
+            item_type = progress.item_type
+            if item_type is None:
+                normalized = self.normalize_path(progress.display_path)
+                row = self._connection.execute(
+                    "SELECT item_type FROM library_items WHERE normalized_path = ?",
+                    (normalized,),
+                ).fetchone()
+                item_type = (
+                    str(row[0])
+                    if row is not None
+                    else self._infer_item_type_without_source_io(
+                        progress.display_path
+                    )
+                )
             item_id = self._ensure_library_item(
                 progress.display_path,
-                item_type=self._infer_item_type(progress.display_path),
+                item_type=item_type,
             )
             self._connection.execute(
                 """
@@ -1317,14 +1308,6 @@ class MetadataStore(QObject):
                 pass
 
     @staticmethod
-    def _stat_source(path: str) -> tuple[int | None, int | None]:
-        try:
-            stat_result = Path(path).stat()
-            return int(stat_result.st_size), int(stat_result.st_mtime_ns)
-        except OSError:
-            return None, None
-
-    @staticmethod
     def _safe_total(total_pages: int | None) -> int | None:
         if total_pages is None:
             return None
@@ -1355,6 +1338,17 @@ class MetadataStore(QObject):
         if suffix in SUPPORTED_EXTENSIONS:
             return "image"
         return "unknown"
+
+    @staticmethod
+    def _infer_item_type_without_source_io(path: str) -> str:
+        suffix = Path(path).suffix.lower()
+        if suffix in ARCHIVE_EXTENSIONS:
+            return "archive"
+        if suffix in PDF_EXTENSIONS:
+            return "pdf"
+        if suffix in SUPPORTED_EXTENSIONS:
+            return "image"
+        return "folder"
 
     @staticmethod
     def _normalize_tags(tags: Iterable[str]) -> list[tuple[str, str]]:

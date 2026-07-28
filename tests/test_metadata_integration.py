@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
 from PIL import Image
 from PySide6.QtWidgets import QApplication
 
@@ -289,6 +290,80 @@ def test_controller_shutdown_flushes_and_closes_store_idempotently(
     for viewer in tuple(controller.viewer_windows):
         viewer.close()
     qapp.processEvents()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ("book_switch", "viewer_close", "browser_close", "application_shutdown"),
+)
+def test_lifecycle_metadata_flush_does_not_probe_source(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+    operation: str,
+) -> None:
+    first_book = tmp_path / "first"
+    second_book = tmp_path / "second"
+    write_book(first_book, 3)
+    write_book(second_book, 3)
+    controller = make_controller(tmp_path, qapp)
+    controller.config.set("last_browser_path", str(tmp_path))
+    browser = (
+        controller.create_browser_window()
+        if operation == "browser_close"
+        else None
+    )
+    if browser is not None:
+        assert browser.wait_for_scan()
+    window = controller.open_path(first_book)
+    window.next_one_page()
+    source_key = MetadataStore.normalize_path(first_book)
+    calls = {"is_dir": 0}
+    original_infer = MetadataStore._infer_item_type
+
+    def guarded_infer(path: str) -> str:
+        if MetadataStore.normalize_path(path) == source_key:
+            calls["is_dir"] += 1
+            raise AssertionError("lifecycle flush inferred type from source")
+        return original_infer(path)
+
+    monkeypatch.setattr(
+        MetadataStore,
+        "_infer_item_type",
+        staticmethod(guarded_infer),
+    )
+
+    if operation == "book_switch":
+        assert window.open_path(second_book)
+    elif operation == "viewer_close":
+        window.close()
+        qapp.processEvents()
+    elif operation == "browser_close":
+        assert browser is not None
+        browser._application_close_guard = lambda _window: True
+        browser.close()
+        qapp.processEvents()
+    else:
+        controller.shutdown()
+
+    assert calls == {"is_dir": 0}
+    expected_before_controller_close = 0 if operation == "browser_close" else 1
+    assert (
+        persisted_page(controller.config.metadata_database_path, first_book)
+        == expected_before_controller_close
+    )
+
+    if operation != "application_shutdown":
+        close_controller(controller, qapp)
+        assert persisted_page(
+            controller.config.metadata_database_path,
+            first_book,
+        ) == 1
+        assert calls == {"is_dir": 0}
+    else:
+        for viewer in tuple(controller.viewer_windows):
+            viewer.close()
+        qapp.processEvents()
 
 
 def test_legacy_config_migrates_once_without_deleting_original_data(
