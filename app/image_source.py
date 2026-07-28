@@ -291,20 +291,26 @@ class ZipImageSource(ImageSource):
         except OSError as exc:
             raise ImageSourceError(f"書庫を開けません: {self.source_path}") from exc
         self._lock = threading.RLock()
+        self._listed_images: tuple[str, ...] | None = None
+        self._display_names: dict[str, str] = {}
 
     def list_images(self) -> list[str]:
-        self._display_names: dict[str, str] = {}
+        if self._listed_images is not None:
+            return list(self._listed_images)
         names = []
         for info in self._zip.infolist():
             if info.is_dir() or Path(info.filename).suffix.lower() not in SUPPORTED_EXTENSIONS:
                 continue
             names.append(info.filename)
             self._display_names[info.filename] = self._decode_display_name(info)
-        return natsorted(
-            names,
-            key=lambda name: self._display_names.get(name, name),
-            reverse=self.sort_descending,
+        self._listed_images = tuple(
+            natsorted(
+                names,
+                key=lambda name: self._display_names.get(name, name),
+                reverse=self.sort_descending,
+            )
         )
+        return list(self._listed_images)
 
     def open_image(self, image_id: str) -> Image.Image:
         try:

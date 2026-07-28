@@ -61,6 +61,11 @@ def _wait_until(qapp: QApplication, predicate, timeout: float = 2.0) -> bool:
     return bool(predicate())
 
 
+def _finish_viewer_open(qapp: QApplication, viewer) -> None:
+    assert viewer.book_session.wait_for_async(2000)
+    qapp.processEvents()
+
+
 def _write_image(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with Image.new("RGB", (8, 12), "white") as image:
@@ -229,6 +234,7 @@ def test_adjacent_open_returns_immediately_and_qtimer_runs(
     service = AdjacentBookSearchService(filesystem=filesystem)
     controller = _controller(tmp_path, qapp, adjacent_service=service)
     viewer = controller.open_path(first)
+    _finish_viewer_open(qapp, viewer)
     ticks: list[bool] = []
     QTimer.singleShot(0, lambda: ticks.append(True))
 
@@ -261,6 +267,7 @@ def test_adjacent_open_calls_no_gui_thread_filesystem_queries(
     service = AdjacentBookSearchService(filesystem=filesystem)
     controller = _controller(tmp_path, qapp, adjacent_service=service)
     viewer = controller.open_path(first)
+    _finish_viewer_open(qapp, viewer)
 
     def forbidden(*_args, **_kwargs):
         raise AssertionError("synchronous filesystem I/O on GUI thread")
@@ -522,6 +529,7 @@ def test_latest_adjacent_request_wins(
     service = AdjacentBookSearchService(filesystem=filesystem, max_workers=2)
     controller = _controller(tmp_path, qapp, adjacent_service=service)
     viewer = controller.open_path(paths[1])
+    _finish_viewer_open(qapp, viewer)
     assert controller.open_adjacent_book(viewer, 1) == "searching"
     assert filesystem.first_started.wait(1)
     assert controller.open_adjacent_book(viewer, -1) == "searching"

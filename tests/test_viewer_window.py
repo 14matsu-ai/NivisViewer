@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,7 @@ from PySide6.QtWidgets import QApplication
 from app.application_controller import ApplicationController
 from app.book_session import BookSession
 from app.config_manager import ConfigManager
+from app.image_source import ImageSource
 from app import viewer_commands as commands
 from app.viewer_window import ViewerWindow
 
@@ -23,6 +26,16 @@ def make_config(tmp_path: Path) -> ConfigManager:
     config = ConfigManager(tmp_path / "config.json")
     config.load()
     return config
+
+
+def finish_open(
+    window: ViewerWindow,
+    qapp: QApplication,
+    *,
+    timeout_ms: int = 3000,
+) -> None:
+    assert window.book_session.wait_for_async(timeout_ms)
+    qapp.processEvents()
 
 
 def test_shared_config_is_injected(tmp_path: Path, qapp: QApplication) -> None:
@@ -59,6 +72,7 @@ def test_open_path_displays_book(tmp_path: Path, qapp: QApplication) -> None:
     window = ViewerWindow(config_manager=make_config(tmp_path))
 
     assert window.open_path(image)
+    finish_open(window, qapp)
     assert window.book_session.current_path == image
     assert window.model.total_pages == 1
     assert window.slider.isEnabled()
@@ -82,6 +96,191 @@ def test_close_safely_shuts_down_book_session(
     assert session.image_cache.source is None
     assert session.model.total_pages == 0
     qapp.processEvents()
+
+
+@pytest.mark.parametrize("source_kind", ["folder", "zip"])
+def test_folder_and_zip_source_preparation_runs_off_gui_thread(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+    source_kind: str,
+) -> None:
+    folder = tmp_path / "book"
+    first = folder / "1.jpg"
+    second = folder / "2.jpg"
+    write_image(first)
+    write_image(second)
+    archive = tmp_path / "book.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.write(second, "2.jpg")
+        output.write(first, "1.jpg")
+    target = folder if source_kind == "folder" else archive
+    gui_thread = threading.get_ident()
+    stat_threads: list[int] = []
+    listing_threads: list[int] = []
+    original_stat = Path.stat
+    original_iterdir = Path.iterdir
+    original_infolist = zipfile.ZipFile.infolist
+    window = ViewerWindow(config_manager=make_config(tmp_path))
+
+    def counted_stat(path: Path, *args, **kwargs):
+        if str(path).startswith(str(tmp_path)):
+            stat_threads.append(threading.get_ident())
+        return original_stat(path, *args, **kwargs)
+
+    def counted_iterdir(path: Path):
+        if path == folder:
+            listing_threads.append(threading.get_ident())
+        return original_iterdir(path)
+
+    def counted_infolist(source: zipfile.ZipFile):
+        if Path(source.filename) == archive:
+            listing_threads.append(threading.get_ident())
+        return original_infolist(source)
+
+    monkeypatch.setattr(Path, "stat", counted_stat)
+    monkeypatch.setattr(Path, "iterdir", counted_iterdir)
+    monkeypatch.setattr(zipfile.ZipFile, "infolist", counted_infolist)
+
+    assert window.open_path(target)
+    assert window.book_session.current_path is None
+    finish_open(window, qapp)
+
+    assert window.book_session.current_path == target
+    assert window.model.image_ids == (
+        [str(first), str(second)]
+        if source_kind == "folder"
+        else ["1.jpg", "2.jpg"]
+    )
+    assert stat_threads
+    assert listing_threads
+    assert all(thread_id != gui_thread for thread_id in stat_threads)
+    assert all(thread_id != gui_thread for thread_id in listing_threads)
+    assert len(listing_threads) == 1
+    window.close()
+    qapp.processEvents()
+
+
+def test_open_returns_while_source_preparation_is_blocked_and_applies_on_gui(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+    factory_threads: list[int] = []
+    apply_threads: list[int] = []
+
+    class PreparedSource(ImageSource):
+        def __init__(self) -> None:
+            super().__init__(tmp_path / "book")
+            self.list_calls = 0
+
+        def list_images(self) -> list[str]:
+            self.list_calls += 1
+            return ["page.jpg"]
+
+        def open_image(self, _image_id: str) -> Image.Image:
+            return Image.new("RGB", (8, 12), "white")
+
+        def display_path(self, image_id: str) -> str:
+            return image_id
+
+    source = PreparedSource()
+
+    def source_factory(
+        _path: Path,
+        **_kwargs: object,
+    ):
+        factory_threads.append(threading.get_ident())
+        preparation_started.set()
+        assert release_preparation.wait(2)
+        return source, None
+
+    session = BookSession(source_factory=source_factory)
+    original_apply = session.model.set_prepared_source
+
+    def record_apply(*args, **kwargs):
+        apply_threads.append(threading.get_ident())
+        return original_apply(*args, **kwargs)
+
+    session.model.set_prepared_source = record_apply  # type: ignore[method-assign]
+    window = ViewerWindow(
+        config_manager=make_config(tmp_path),
+        book_session=session,
+    )
+    gui_thread = threading.get_ident()
+
+    assert window.open_path(tmp_path / "book")
+    assert preparation_started.wait(1)
+    assert session.current_path is None
+
+    release_preparation.set()
+    finish_open(window, qapp)
+
+    assert len(factory_threads) == 1
+    assert factory_threads[0] != gui_thread
+    assert apply_threads == [gui_thread]
+    assert source.list_calls >= 1
+    assert session.current_path == tmp_path / "book"
+    window.close()
+    qapp.processEvents()
+
+
+def test_close_during_source_preparation_discards_and_closes_result(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+
+    class ClosingSource(ImageSource):
+        def __init__(self) -> None:
+            super().__init__(tmp_path / "book")
+            self.closed = False
+
+        def list_images(self) -> list[str]:
+            return ["page.jpg"]
+
+        def open_image(self, _image_id: str) -> Image.Image:
+            return Image.new("RGB", (8, 12), "white")
+
+        def display_path(self, image_id: str) -> str:
+            return image_id
+
+        def close(self) -> None:
+            self.closed = True
+
+    source = ClosingSource()
+
+    def source_factory(
+        _path: Path,
+        **_kwargs: object,
+    ):
+        preparation_started.set()
+        assert release_preparation.wait(2)
+        return source, None
+
+    session = BookSession(source_factory=source_factory)
+    window = ViewerWindow(
+        config_manager=make_config(tmp_path),
+        book_session=session,
+    )
+    opened = []
+    session.async_opened.connect(opened.append)
+
+    assert window.open_path(tmp_path / "book")
+    assert preparation_started.wait(1)
+    window.close()
+    window.close()
+    release_preparation.set()
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+
+    assert source.closed
+    assert opened == []
+    assert session.source is None
+    assert session.current_path is None
+    assert session._open_workers == {}
 
 
 def test_closing_stale_window_does_not_roll_back_shared_setting(

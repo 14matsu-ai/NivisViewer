@@ -32,7 +32,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .archive_backend import EXTERNAL_ARCHIVE_EXTENSIONS
 from .archive_backend_registry import ArchiveBackendRegistry
 from .book_session import AsyncBookOpenFailed, BookOpened, BookSession
 from .config_manager import ConfigManager
@@ -48,7 +47,6 @@ from .image_source import (
     FolderImageSource,
     FolderListingSnapshot,
     ImageSource,
-    ImageSourceError,
     SevenZipImageSource,
     ZipImageSource,
     create_image_source,
@@ -998,33 +996,20 @@ class ViewerWindow(QMainWindow):
         self._save_current_reading_position()
         self._active_request_id += 1
         suffix = Path(path).suffix.lower()
-        if suffix in EXTERNAL_ARCHIVE_EXTENSIONS | PDF_EXTENSIONS:
-            self.book_session.open_book_async(
-                path,
-                recursive_folder=self.recursive_folder,
-                sort_descending=self.sort_descending,
-                trace_id=self._active_open_trace_id,
-                folder_snapshot=folder_snapshot,
-            )
+        self.book_session.open_book_async(
+            path,
+            recursive_folder=self.recursive_folder,
+            sort_descending=self.sort_descending,
+            trace_id=self._active_open_trace_id,
+            folder_snapshot=folder_snapshot,
+        )
+        if suffix in ARCHIVE_EXTENSIONS | PDF_EXTENSIONS:
             self._set_status_override(
                 "PDFを読み込んでいます…"
                 if suffix in PDF_EXTENSIONS
                 else "書庫を読み込んでいます…"
             )
-            return True
-        try:
-            opened = self.book_session.open_book(
-                path,
-                recursive_folder=self.recursive_folder,
-                sort_descending=self.sort_descending,
-                trace_id=self._active_open_trace_id,
-                folder_snapshot=folder_snapshot,
-            )
-        except ImageSourceError as exc:
-            self._cancel_interactive_open()
-            QMessageBox.critical(self, "読み込みエラー", str(exc))
-            return False
-        return self._finish_opened_book(opened, modal_on_empty=True)
+        return True
 
     def _finish_opened_book(
         self,

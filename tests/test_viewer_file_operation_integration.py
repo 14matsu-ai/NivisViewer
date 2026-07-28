@@ -39,6 +39,11 @@ def close_controller(
     controller.shutdown()
 
 
+def finish_viewer_open(qapp: QApplication, viewer) -> None:
+    assert viewer.book_session.wait_for_async(2000)
+    qapp.processEvents()
+
+
 def select_item(browser, path: Path) -> None:
     row = browser.item_model.row_for_path(path)
     assert row >= 0, (
@@ -64,6 +69,8 @@ def test_controller_detects_only_viewers_affected_by_path(
     controller = make_controller(tmp_path, qapp)
     first = controller.open_path(first_image, open_in_new_window=True)
     second = controller.open_path(second_image, open_in_new_window=True)
+    finish_viewer_open(qapp, first)
+    finish_viewer_open(qapp, second)
 
     assert controller.viewers_using_paths((str(first_image.parent),)) == (first,)
     assert controller.viewers_using_paths((str(first_image),)) == (first,)
@@ -86,6 +93,7 @@ def test_mutation_cancel_keeps_viewer_and_source_open(
     assert browser.wait_for_scan()
     qapp.processEvents()
     viewer = controller.open_path(image, open_in_new_window=True)
+    finish_viewer_open(qapp, viewer)
     monkeypatch.setattr(
         browser,
         "selected_file_operation_paths",
@@ -124,6 +132,8 @@ def test_continue_closes_only_affected_viewer_then_starts_mutation(
     browser = controller.create_browser_window()
     first = controller.open_path(first_image, open_in_new_window=True)
     second = controller.open_path(second_image, open_in_new_window=True)
+    finish_viewer_open(qapp, first)
+    finish_viewer_open(qapp, second)
     monkeypatch.setattr(
         browser,
         "selected_file_operation_paths",
@@ -166,6 +176,7 @@ def test_copy_does_not_request_viewer_close(
     controller = make_controller(tmp_path, qapp)
     browser = controller.create_browser_window()
     viewer = controller.open_path(image, open_in_new_window=True)
+    finish_viewer_open(qapp, viewer)
     monkeypatch.setattr(
         browser,
         "selected_file_operation_paths",

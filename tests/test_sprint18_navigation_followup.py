@@ -133,6 +133,8 @@ def _viewer_with_pages(
     )
     window = ViewerWindow(config_manager=config)
     assert window.open_path(pages[0])
+    assert window.book_session.wait_for_async(2000)
+    qapp.processEvents()
     window.resize(640, 480)
     window.show()
     qapp.processEvents()

@@ -108,7 +108,10 @@ def test_folder_loaded_bytes_supply_file_size_without_stat(
     source.close()
 
 
-def test_zip_lists_images_in_subfolders_and_ignores_other_files(tmp_path: Path) -> None:
+def test_zip_lists_images_in_subfolders_and_ignores_other_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     image1 = tmp_path / "1.jpg"
     image2 = tmp_path / "10.jpg"
     write_image(image1)
@@ -120,8 +123,19 @@ def test_zip_lists_images_in_subfolders_and_ignores_other_files(tmp_path: Path) 
         output.write(image1, "chapter/2/1.jpg")
 
     source = ZipImageSource(archive)
+    infolist_calls = 0
+    original_infolist = source._zip.infolist
+
+    def counted_infolist():
+        nonlocal infolist_calls
+        infolist_calls += 1
+        return original_infolist()
+
+    monkeypatch.setattr(source._zip, "infolist", counted_infolist)
     try:
         assert source.list_images() == ["chapter/2/1.jpg", "chapter/10.jpg"]
+        assert source.list_images() == ["chapter/2/1.jpg", "chapter/10.jpg"]
+        assert infolist_calls == 1
         with source.open_image("chapter/2/1.jpg") as image:
             assert image.size == (8, 12)
     finally:

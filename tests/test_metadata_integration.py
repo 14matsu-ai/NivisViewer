@@ -43,6 +43,11 @@ def close_controller(
     controller.shutdown()
 
 
+def finish_viewer_open(qapp: QApplication, window) -> None:
+    assert window.book_session.wait_for_async(2000)
+    qapp.processEvents()
+
+
 def persisted_page(database_path: Path, book_path: Path) -> int:
     with sqlite3.connect(database_path) as connection:
         row = connection.execute(
@@ -83,13 +88,15 @@ def test_only_successful_open_is_added_to_history(
     write_book(book, 2)
     controller = make_controller(tmp_path, qapp)
     window = controller.open_path(book)
+    finish_viewer_open(qapp, window)
     before = controller.metadata_store.list_history()
     monkeypatch.setattr(
         "app.viewer_window.QMessageBox.critical",
         lambda *_args, **_kwargs: None,
     )
 
-    assert window.open_path(tmp_path / "missing.zip") is False
+    assert window.open_path(tmp_path / "missing.zip")
+    finish_viewer_open(qapp, window)
     assert controller.metadata_store.list_history() == before
     close_controller(controller, qapp)
 
@@ -104,6 +111,7 @@ def test_progress_is_batched_then_flushed_when_switching_books(
     write_book(second_book)
     controller = make_controller(tmp_path, qapp)
     window = controller.open_path(first_book)
+    finish_viewer_open(qapp, window)
 
     window.next_one_page()
 
@@ -124,6 +132,7 @@ def test_viewer_close_flushes_latest_progress(
     controller = make_controller(tmp_path, qapp)
     controller.create_browser_window()
     window = controller.open_path(book)
+    finish_viewer_open(qapp, window)
     window.next_one_page()
 
     window.close()
@@ -141,12 +150,14 @@ def test_normal_reopen_restores_progress_and_clamps_to_page_count(
     write_book(book, 4)
     controller = make_controller(tmp_path, qapp)
     window = controller.open_path(book)
+    finish_viewer_open(qapp, window)
     window.next_one_page()
     window.next_one_page()
     window.prepare_shutdown()
 
     reopened = controller.create_viewer_window()
     assert reopened.open_path(book)
+    finish_viewer_open(qapp, reopened)
     assert reopened.model.current_index == 2
 
     controller.metadata_store.update_reading_progress(
@@ -159,6 +170,7 @@ def test_normal_reopen_restores_progress_and_clamps_to_page_count(
         page.unlink()
     clamped = controller.create_viewer_window()
     assert clamped.open_path(book)
+    finish_viewer_open(qapp, clamped)
     assert clamped.model.current_index == 1
     close_controller(controller, qapp)
 
@@ -178,6 +190,7 @@ def test_explicit_image_selection_wins_over_saved_folder_progress(
     )
 
     window = controller.open_path(pages[1])
+    finish_viewer_open(qapp, window)
 
     assert window.model.current_index == 1
     history = controller.metadata_store.list_history()
@@ -206,6 +219,7 @@ def test_history_tab_opens_viewer_at_saved_progress(
     viewer = controller.get_active_viewer()
 
     assert viewer is not None
+    finish_viewer_open(qapp, viewer)
     assert viewer.model.current_index == 2
     close_controller(controller, qapp)
 
@@ -220,7 +234,8 @@ def test_controller_open_notifies_browser_history_model(
     browser = controller.create_browser_window()
 
     assert browser.history_model.rowCount() == 0
-    controller.open_path(book)
+    viewer = controller.open_path(book)
+    finish_viewer_open(qapp, viewer)
 
     assert browser.history_model.rowCount() == 1
     assert Path(browser.history_model.entries[0].path) == book.absolute()
@@ -243,6 +258,7 @@ def test_restore_last_position_can_be_disabled(
     controller.config.apply({"restore_last_reading_position": False})
 
     window = controller.open_path(book)
+    finish_viewer_open(qapp, window)
 
     assert window.model.current_index == 0
     close_controller(controller, qapp)
@@ -257,6 +273,8 @@ def test_multiple_viewers_update_shared_database_without_corruption(
     controller = make_controller(tmp_path, qapp)
     first = controller.open_path(book, open_in_new_window=True)
     second = controller.open_path(book, open_in_new_window=True)
+    finish_viewer_open(qapp, first)
+    finish_viewer_open(qapp, second)
 
     first.next_one_page()
     second.next_one_page()
@@ -280,6 +298,7 @@ def test_controller_shutdown_flushes_and_closes_store_idempotently(
     write_book(book, 3)
     controller = make_controller(tmp_path, qapp)
     window = controller.open_path(book)
+    finish_viewer_open(qapp, window)
     window.next_one_page()
 
     controller.shutdown()
@@ -316,6 +335,7 @@ def test_lifecycle_metadata_flush_does_not_probe_source(
     if browser is not None:
         assert browser.wait_for_scan()
     window = controller.open_path(first_book)
+    finish_viewer_open(qapp, window)
     window.next_one_page()
     source_key = MetadataStore.normalize_path(first_book)
     calls = {"is_dir": 0}
