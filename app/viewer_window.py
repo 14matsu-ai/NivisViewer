@@ -1706,9 +1706,10 @@ class ViewerWindow(QMainWindow):
             return
         self._updating_page_list = True
         target_item = None
+        focused_index = self.model.focused_index
         for row in range(self.page_list.count()):
             item = self.page_list.item(row)
-            if item is not None and item.data(Qt.ItemDataRole.UserRole) == self.model.focused_index:
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == focused_index:
                 target_item = item
                 break
         if target_item is None:
