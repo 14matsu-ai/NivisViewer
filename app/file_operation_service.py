@@ -1036,6 +1036,7 @@ class FileOperationService:
             uuid.uuid4().hex,
         )
         published = False
+        rollback_error: OSError | None = None
         try:
             self._copy_directory(source, temporary, cancelled)
             if cancelled.is_set():
@@ -1045,7 +1046,10 @@ class FileOperationService:
                 os.replace(temporary, destination)
                 published = True
             except BaseException:
-                os.replace(backup, destination)
+                try:
+                    os.replace(backup, destination)
+                except OSError as exc:
+                    rollback_error = exc
                 raise
             cleanup = FileOperationArtifactPolicy.cleanup_staging_path(backup)
             if not cleanup.removed:
@@ -1067,8 +1071,28 @@ class FileOperationService:
             if os.path.lexists(backup) and not os.path.lexists(destination):
                 try:
                     os.replace(backup, destination)
-                except OSError:
-                    pass
+                except OSError as retry_error:
+                    rollback_error = retry_error
+            if (
+                os.path.lexists(backup)
+                and not os.path.lexists(destination)
+            ):
+                rollback_message = (
+                    f"backup復元に失敗しました: {rollback_error}"
+                    if rollback_error is not None
+                    else "backup復元後の事後条件を満たしていません"
+                )
+                rollback_cleanup = ArtifactCleanupResult(
+                    backup,
+                    False,
+                    rollback_message,
+                )
+                raise _ArtifactOperationError(
+                    f"置換publishに失敗し、backupを復元できません: {exc}",
+                    artifact_path=backup,
+                    cleanup=rollback_cleanup,
+                    published=published,
+                ) from (rollback_error or exc)
             if isinstance(exc, _ArtifactOperationError):
                 raise
             if not temporary_cleanup.removed:
