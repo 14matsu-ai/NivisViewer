@@ -28,6 +28,7 @@ class CachedImage:
     generation: int
     rendered_size: tuple[int, int] | None = None
     rendered_rotation: int = 0
+    render_spec_signature: tuple[object, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class _ImageLoadTask(QRunnable):
         generation: int,
         adjustments: tuple[float, float, float],
         render_spec: PageRenderSpec | None,
+        render_spec_signature: tuple[object, ...] | None,
         priority: int,
         trace_id: int = 0,
     ) -> None:
@@ -60,6 +62,7 @@ class _ImageLoadTask(QRunnable):
         self.generation = generation
         self.adjustments = adjustments
         self.render_spec = render_spec
+        self.render_spec_signature = render_spec_signature
         self.priority = priority
         self.trace_id = int(trace_id)
         self.signals = _ImageLoadSignals()
@@ -153,6 +156,7 @@ class _ImageLoadTask(QRunnable):
                     if self.render_spec is not None
                     else 0
                 ),
+                render_spec_signature=self.render_spec_signature,
             )
         except ImageSourceError as exc:
             cancelled = exc.code == PdfErrorCode.CANCELLED.value
@@ -163,6 +167,7 @@ class _ImageLoadTask(QRunnable):
                 original_size=None,
                 error=str(exc),
                 generation=self.generation,
+                render_spec_signature=self.render_spec_signature,
             )
         except Exception as exc:
             result = CachedImage(
@@ -172,6 +177,7 @@ class _ImageLoadTask(QRunnable):
                 original_size=None,
                 error=str(exc),
                 generation=self.generation,
+                render_spec_signature=self.render_spec_signature,
             )
         self.signals.loaded.emit(
             _ImageLoadResult(result, self.source, cancelled=cancelled)
@@ -289,6 +295,65 @@ class ImageCache(QObject):
             self._render_spec
         ):
             return False
+        requested_signatures = (
+            {
+                index: self._page_render_spec_signature(spec)
+                for index, spec in render_spec.items()
+            }
+            if isinstance(render_spec, dict)
+            else None
+        )
+        scalar_signature = (
+            None
+            if isinstance(render_spec, dict) or render_spec is None
+            else self._page_render_spec_signature(render_spec)
+        )
+        missing = object()
+
+        def artifact_spec_changed(
+            index: int,
+            artifact_signature: tuple[object, ...] | None,
+        ) -> bool:
+            requested_signature = (
+                requested_signatures.get(index, missing)
+                if requested_signatures is not None
+                else scalar_signature
+            )
+            return (
+                requested_signature is not missing
+                and artifact_signature != requested_signature
+            )
+
+        shared_spec_changed = False
+        if isinstance(render_spec, dict) and isinstance(self._render_spec, dict):
+            for index in self._wanted_indexes:
+                if index not in render_spec or index not in self._render_spec:
+                    continue
+                if (
+                    self._page_render_spec_signature(render_spec[index])
+                    != self._page_render_spec_signature(self._render_spec[index])
+                ):
+                    shared_spec_changed = True
+                    break
+        else:
+            shared_spec_changed = True
+
+        cached_spec_changed = any(
+            artifact_spec_changed(index, cached.render_spec_signature)
+            for index, cached in self._cache.items()
+        )
+        task_spec_changed = any(
+            generation == self.generation
+            and artifact_spec_changed(index, task.render_spec_signature)
+            for (generation, index), (task, _priority) in self._tasks.items()
+        )
+        if not (
+            shared_spec_changed
+            or cached_spec_changed
+            or task_spec_changed
+        ):
+            self._render_spec = render_spec
+            return False
         self._cancel_in_flight()
         self._render_spec = render_spec
         self.generation += 1
@@ -296,23 +361,30 @@ class ImageCache(QObject):
         return True
 
     @staticmethod
+    def _page_render_spec_signature(
+        render_spec: PageRenderSpec,
+    ) -> tuple[object, ...]:
+        return (
+            render_spec.target_pixel_size,
+            render_spec.rotation_degrees % 360,
+            render_spec.mode,
+            round(max(0.1, render_spec.device_pixel_ratio) * 4) / 4,
+        )
+
+    @staticmethod
     def _render_spec_signature(
         render_spec: PageRenderSpec | dict[int, PageRenderSpec] | None,
     ):
-        def signature(spec: PageRenderSpec):
-            return (
-                spec.target_pixel_size,
-                spec.rotation_degrees % 360,
-                spec.mode,
-                round(max(0.1, spec.device_pixel_ratio) * 4) / 4,
-            )
-
         if isinstance(render_spec, dict):
             return tuple(
-                (index, signature(spec))
+                (index, ImageCache._page_render_spec_signature(spec))
                 for index, spec in sorted(render_spec.items())
             )
-        return None if render_spec is None else signature(render_spec)
+        return (
+            None
+            if render_spec is None
+            else ImageCache._page_render_spec_signature(render_spec)
+        )
 
     def clear(self) -> None:
         self._cancel_in_flight()
@@ -360,10 +432,12 @@ class ImageCache(QObject):
                 cancel = getattr(source, "cancel_image_request", None)
                 if callable(cancel) and 0 <= index < len(self.image_ids):
                     cancel(self.image_ids[index])
-
-        for index in list(self._cache):
-            if index not in wanted:
-                del self._cache[index]
+                task_entry = self._tasks.get((generation, index))
+                if task_entry is not None:
+                    task, _priority = task_entry
+                    if self._try_take_task(task):
+                        self._tasks.pop((generation, index), None)
+                        self._in_flight.pop((generation, index), None)
 
         self.ensure_loaded(center_index)
         for index in visible_indexes:
@@ -415,6 +489,11 @@ class ImageCache(QObject):
             self.generation,
             self._adjustments,
             render_spec,
+            (
+                None
+                if render_spec is None
+                else self._page_render_spec_signature(render_spec)
+            ),
             priority,
             self._trace_id,
         )

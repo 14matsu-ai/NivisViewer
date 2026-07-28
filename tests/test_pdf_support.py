@@ -42,6 +42,7 @@ from app.pdfium_service import PdfiumService, PdfiumServiceState
 from app.thumbnail_provider import BrowserThumbnailProvider
 from app.browser_thumbnail_scheduler import ThumbnailPriority
 from app.viewer_widget import ViewerWidget
+from app.viewer_window import ViewerWindow
 
 
 class FakeBackend:
@@ -197,6 +198,58 @@ class CancellableBlockingRenderBackend(FakeBackend):
         super().close_document(document_id)
 
 
+def _open_many_page_pdf_window(
+    tmp_path,
+    qapp,
+    *,
+    settings: dict[str, object],
+):
+    pdf = tmp_path / "prefetch.pdf"
+    pdf.write_bytes(b"fake")
+    backend = FakeBackend()
+
+    def open_document(path, *, password=None, cancel_token=None):
+        backend.opened.append(str(path))
+        pages = tuple(
+            PdfPageInfo(index, 612, 792, 0, None)
+            for index in range(30)
+        )
+        return PdfDocumentInfo(
+            "prefetch-document",
+            str(path),
+            len(pages),
+            pages,
+            False,
+        )
+
+    backend.open_document = open_document
+    service = PdfiumService(backend)
+    source = PdfImageSource(pdf, pdfium_service=service)
+    session = BookSession(
+        source_factory=lambda _path, **_kwargs: (source, None),
+    )
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.apply(settings)
+    window = ViewerWindow(
+        config_manager=config,
+        book_session=session,
+        pdfium_service=service,
+    )
+    opened = session.open_book(pdf)
+    assert window._finish_opened_book(opened, modal_on_empty=False)
+    assert window.image_cache.wait_for_done(5000)
+    qapp.processEvents()
+    return window, session, service, backend
+
+
+def _close_measured_pdf_window(window, session, service, qapp) -> None:
+    window.close()
+    qapp.processEvents()
+    session.shutdown(wait_msecs=3000)
+    service.shutdown(wait_seconds=2)
+
+
 def test_pdf_extension_is_a_book_and_browser_item(tmp_path):
     (tmp_path / "日本語.PDF").write_bytes(b"not rendered")
     result = BrowserItemDiscovery().discover(tmp_path)
@@ -263,6 +316,210 @@ def test_image_cache_does_not_regenerate_inside_same_render_bucket(qapp):
     assert not cache.set_render_spec(PageRenderSpec(101, 101))
     assert cache.generation == generation
     assert cache.set_render_spec(PageRenderSpec(129, 129))
+
+
+def test_single_pdf_prefetch_survives_navigation_and_real_spec_changes_rerender(
+    tmp_path,
+    qapp,
+):
+    window, session, service, backend = _open_many_page_pdf_window(
+        tmp_path,
+        qapp,
+        settings={"view_mode": "single", "cache_size": 10},
+    )
+    try:
+        assert [request.page_index for request in backend.rendered] == [
+            0,
+            1,
+            2,
+            3,
+        ]
+        generation = window.image_cache.generation
+        movement_render_counts = []
+        for target, expected_prefetch in ((1, 4), (2, 5), (3, 6)):
+            assert window.image_cache.get(target) is not None
+            backend.rendered.clear()
+            window.model.go_to_index(target)
+            window._refresh_view()
+            assert window.image_cache.wait_for_done(5000)
+            qapp.processEvents()
+            assert all(
+                request.page_index != target
+                for request in backend.rendered
+            )
+            assert [request.page_index for request in backend.rendered] == [
+                expected_prefetch
+            ]
+            movement_render_counts.append(len(backend.rendered))
+            assert window.image_cache.generation == generation
+
+        assert movement_render_counts == [1, 1, 1]
+        backend.rendered.clear()
+        window.model.go_to_index(2)
+        window._refresh_view()
+        assert window.image_cache.wait_for_done(5000)
+        qapp.processEvents()
+        assert backend.rendered == []
+        assert window.image_cache.generation == generation
+
+        window.model.go_to_index(4)
+        window._refresh_view()
+        assert window.image_cache.wait_for_done(5000)
+        qapp.processEvents()
+        assert 0 in window.image_cache._cache
+        backend.rendered.clear()
+        window.model.go_to_index(0)
+        window._refresh_view()
+        assert window.image_cache.wait_for_done(5000)
+        qapp.processEvents()
+        assert backend.rendered == []
+        assert window.image_cache.generation == generation
+
+        retained_before_jump = set(window.image_cache._cache)
+        backend.rendered.clear()
+        window.model.go_to_index(20)
+        window._refresh_view()
+        assert window.image_cache.generation == generation
+        assert retained_before_jump.issubset(window.image_cache._cache)
+        assert window.image_cache.wait_for_done(5000)
+        qapp.processEvents()
+
+        backend.rendered.clear()
+        window.viewer.resize(900, 650)
+        window._refresh_view()
+        assert window.image_cache.wait_for_done(5000)
+        qapp.processEvents()
+        assert window.image_cache.generation == generation + 1
+        assert any(request.page_index == 20 for request in backend.rendered)
+        resized_sizes = {
+            (request.target_width_px, request.target_height_px)
+            for request in backend.rendered
+        }
+
+        backend.rendered.clear()
+        window.set_fit_mode("actual_size")
+        assert window.image_cache.wait_for_done(5000)
+        qapp.processEvents()
+        assert window.image_cache.generation == generation + 2
+        assert any(request.page_index == 20 for request in backend.rendered)
+        assert {
+            (request.target_width_px, request.target_height_px)
+            for request in backend.rendered
+        } != resized_sizes
+
+        backend.rendered.clear()
+        window.viewer.set_manual_zoom(1.5)
+        window._pdf_render_timer.stop()
+        window._rerender_pdf()
+        assert window.image_cache.wait_for_done(5000)
+        qapp.processEvents()
+        assert window.image_cache.generation == generation + 3
+        assert any(request.page_index == 20 for request in backend.rendered)
+    finally:
+        _close_measured_pdf_window(
+            window,
+            session,
+            service,
+            qapp,
+        )
+
+
+def test_spread_pdf_uses_prefetched_current_and_partner_without_rerender(
+    tmp_path,
+    qapp,
+):
+    window, session, service, backend = _open_many_page_pdf_window(
+        tmp_path,
+        qapp,
+        settings={
+            "view_mode": "spread",
+            "single_first_page": False,
+            "reading_direction": "ltr",
+        },
+    )
+    try:
+        assert window._visible_page_indexes == (0, 1)
+        assert [
+            (request.page_index, request.priority)
+            for request in backend.rendered
+        ] == [
+            (0, PdfRenderPriority.VIEWER_CURRENT),
+            (1, PdfRenderPriority.VIEWER_SPREAD_PARTNER),
+            (2, PdfRenderPriority.VIEWER_NEXT),
+            (3, PdfRenderPriority.VIEWER_NEXT),
+        ]
+        generation = window.image_cache.generation
+        backend.rendered.clear()
+        window.model.go_to_index(2)
+        window._refresh_view()
+        assert window.image_cache.wait_for_done(5000)
+        qapp.processEvents()
+
+        assert window._visible_page_indexes == (2, 3)
+        assert window.image_cache.generation == generation
+        assert all(
+            request.page_index not in {2, 3}
+            for request in backend.rendered
+        )
+        assert [request.page_index for request in backend.rendered] == [4, 5]
+
+        backend.rendered.clear()
+        window.set_reading_direction("rtl")
+        assert window.image_cache.wait_for_done(5000)
+        qapp.processEvents()
+        assert window._visible_page_indexes == (3, 2)
+        assert window.image_cache.generation == generation
+        assert backend.rendered == []
+    finally:
+        _close_measured_pdf_window(
+            window,
+            session,
+            service,
+            qapp,
+        )
+
+
+def test_disjoint_pdf_jump_validates_retained_cache_when_page_returns(
+    tmp_path,
+    qapp,
+):
+    window, session, service, backend = _open_many_page_pdf_window(
+        tmp_path,
+        qapp,
+        settings={"view_mode": "single", "cache_size": 20},
+    )
+    try:
+        original = window.image_cache.get(0)
+        assert original is not None
+        original_signature = original.render_spec_signature
+        generation = window.image_cache.generation
+
+        window.viewer.resize(900, 650)
+        window.model.go_to_index(20)
+        window._refresh_view()
+        assert window.image_cache.generation == generation
+        assert window.image_cache.get(0) is original
+        assert window.image_cache.wait_for_done(5000)
+        qapp.processEvents()
+
+        backend.rendered.clear()
+        window.model.go_to_index(0)
+        window._refresh_view()
+        assert window.image_cache.generation == generation + 1
+        assert window.image_cache.wait_for_done(5000)
+        qapp.processEvents()
+
+        assert any(request.page_index == 0 for request in backend.rendered)
+        rerendered = window.image_cache.get(0)
+        assert rerendered is not None
+        assert rerendered.render_spec_signature != original_signature
+    finally:
+        _close_measured_pdf_window(
+            window,
+            session,
+            service,
+            qapp,
+        )
 
 
 def test_pdf_book_switch_cancels_old_image_tasks_without_applying_error(
