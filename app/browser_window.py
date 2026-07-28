@@ -3336,10 +3336,9 @@ class BrowserWindow(QMainWindow):
         )
         history_menu.addAction(clear_history_action)
 
-        settings_menu = self.menuBar().addMenu("設定")
-        settings_action = QAction("環境設定...", self)
-        settings_action.triggered.connect(self.open_settings_dialog)
-        settings_menu.addAction(settings_action)
+        self.settings_action = QAction("環境設定…", self)
+        self.settings_action.triggered.connect(self.open_settings_dialog)
+        self.menuBar().addAction(self.settings_action)
 
         self.statusBar().showMessage("フォルダを選択してください。")
         self.cancel_operation_button = QPushButton("キャンセル", self)

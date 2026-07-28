@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QSignalBlocker, Qt, Signal
+from PySide6.QtCore import QPoint, QSignalBlocker, Qt, Signal
 from PySide6.QtGui import QWheelEvent
 from PySide6.QtWidgets import QSlider, QWidget
 
@@ -41,21 +41,27 @@ class ViewerPageSlider(QSlider):
         self._angle_remainder = 0
         self._pixel_remainder = 0
 
-    def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
-        self.wheelInteraction.emit()
-        vertical_angle = event.angleDelta().y()
-        vertical_pixel = event.pixelDelta().y()
+    def process_wheel_delta(
+        self,
+        angle_delta: QPoint,
+        pixel_delta: QPoint,
+    ) -> bool:
+        vertical_angle = angle_delta.y()
+        vertical_pixel = pixel_delta.y()
         horizontal_only = (
             vertical_angle == 0
             and vertical_pixel == 0
             and (
-                event.angleDelta().x() != 0
-                or event.pixelDelta().x() != 0
+                angle_delta.x() != 0
+                or pixel_delta.x() != 0
             )
         )
+        if not horizontal_only and vertical_angle == 0 and vertical_pixel == 0:
+            return False
+
+        self.wheelInteraction.emit()
         if horizontal_only:
-            event.accept()
-            return
+            return True
 
         direction = 0
         steps = 0
@@ -97,4 +103,11 @@ class ViewerPageSlider(QSlider):
                     self.nextSinglePageRequested.emit()
                 else:
                     self.nextDisplayUnitRequested.emit()
-        event.accept()
+        return True
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
+        handled = self.process_wheel_delta(
+            event.angleDelta(),
+            event.pixelDelta(),
+        )
+        event.setAccepted(handled)

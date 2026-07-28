@@ -346,7 +346,7 @@ class SettingsDialog(QDialog):
             self.viewer_canvas_left_click_combo,
         )
         self.viewer_slider_wheel_single_page_checkbox = QCheckBox(
-            "シークバー上のマウスホイールで1ページずつ移動する",
+            "下部UI上のマウスホイールで1ページずつ移動する",
             spread_group,
         )
         spread_form.addRow(self.viewer_slider_wheel_single_page_checkbox)

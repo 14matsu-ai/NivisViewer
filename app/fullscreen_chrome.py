@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QTimer, Qt
-from PySide6.QtGui import QCursor, QMouseEvent
+from PySide6.QtGui import QCursor, QMouseEvent, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from app.viewer_page_slider import ViewerPageSlider
 
 
 CURSOR_IDLE_HIDE_MS = 800
@@ -74,7 +76,8 @@ class FullscreenChromeController(QObject):
         self.overlay_parent = parent
         self.top_overlay = QFrame(parent)
         self.top_overlay.setObjectName("fullscreen_top_chrome")
-        self.top_overlay.setFrameShape(QFrame.Shape.StyledPanel)
+        self.top_overlay.setFrameShape(QFrame.Shape.NoFrame)
+        self.top_overlay.setAutoFillBackground(True)
         self.top_overlay.setAcceptDrops(True)
         self._top_layout = QVBoxLayout(self.top_overlay)
         self._top_layout.setContentsMargins(0, 0, 0, 0)
@@ -84,7 +87,8 @@ class FullscreenChromeController(QObject):
 
         self.bottom_overlay = QFrame(parent)
         self.bottom_overlay.setObjectName("fullscreen_bottom_chrome")
-        self.bottom_overlay.setFrameShape(QFrame.Shape.StyledPanel)
+        self.bottom_overlay.setFrameShape(QFrame.Shape.NoFrame)
+        self.bottom_overlay.setAutoFillBackground(True)
         self.bottom_overlay.setAcceptDrops(True)
         self._bottom_layout = QVBoxLayout(self.bottom_overlay)
         self._bottom_layout.setContentsMargins(4, 2, 4, 0)
@@ -342,6 +346,26 @@ class FullscreenChromeController(QObject):
             and isinstance(event, QMouseEvent)
         ):
             self.process_pointer(event.globalPosition().toPoint())
+        elif (
+            self.fullscreen
+            and event_type == QEvent.Type.Wheel
+            and isinstance(event, QWheelEvent)
+            and isinstance(watched, QWidget)
+            and (
+                watched is self.bottom_overlay
+                or self.bottom_overlay.isAncestorOf(watched)
+            )
+            and watched is not self.slider
+            and not self.slider.isAncestorOf(watched)
+            and isinstance(self.slider, ViewerPageSlider)
+        ):
+            handled = self.slider.process_wheel_delta(
+                event.angleDelta(),
+                event.pixelDelta(),
+            )
+            if handled:
+                event.accept()
+            return handled
         elif watched in self._filtered_widgets:
             if event_type == QEvent.Type.MouseButtonPress:
                 self.mouse_button_down = True
@@ -443,26 +467,40 @@ class FullscreenChromeController(QObject):
     def _update_geometry(self) -> None:
         if not self.fullscreen:
             return
-        width = max(1, self.overlay_parent.width())
-        top_height = max(1, self.top_overlay.sizeHint().height())
-        bottom_height = max(1, self.bottom_overlay.sizeHint().height())
+        parent_rect = self.overlay_parent.rect()
+        width = max(1, parent_rect.width())
+        top_height = min(
+            max(1, self.top_overlay.sizeHint().height()),
+            max(1, parent_rect.height()),
+        )
+        bottom_height = min(
+            max(1, self.bottom_overlay.sizeHint().height()),
+            max(1, parent_rect.height()),
+        )
         self._last_bottom_overlay_height = bottom_height
-        self.top_overlay.setGeometry(0, 0, width, top_height)
-        self.bottom_overlay.setGeometry(
-            0,
-            max(0, self.overlay_parent.height() - bottom_height),
+        top_geometry = QRect(
+            parent_rect.left(),
+            parent_rect.top(),
+            width,
+            top_height,
+        )
+        bottom_geometry = QRect(
+            parent_rect.left(),
+            parent_rect.top(),
             width,
             bottom_height,
         )
-        self.bottom_reveal_strip.setGeometry(
-            0,
-            max(
-                0,
-                self.overlay_parent.height() - self.bottom_edge_trigger_px,
-            ),
+        bottom_geometry.moveBottom(parent_rect.bottom())
+        reveal_geometry = QRect(
+            parent_rect.left(),
+            parent_rect.top(),
             width,
-            self.bottom_edge_trigger_px,
+            min(self.bottom_edge_trigger_px, max(1, parent_rect.height())),
         )
+        reveal_geometry.moveBottom(parent_rect.bottom())
+        self.top_overlay.setGeometry(top_geometry)
+        self.bottom_overlay.setGeometry(bottom_geometry)
+        self.bottom_reveal_strip.setGeometry(reveal_geometry)
         if self.bottom_reveal_strip.isVisible():
             self.bottom_reveal_strip.raise_()
             if self.bottom_overlay.isVisible():
