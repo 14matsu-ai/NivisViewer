@@ -644,10 +644,23 @@ def test_unsupported_viewer_drop_is_ignored_and_current_state_is_kept(
 def test_fullscreen_cursor_setting_applies_immediately_to_existing_viewer(
     tmp_path: Path,
     qapp,
+    monkeypatch,
 ) -> None:
     config = make_config(tmp_path)
     window = ViewerWindow(config_manager=config)
-    window.showFullScreen()
+    fullscreen_state = True
+    monkeypatch.setattr(
+        window,
+        "isFullScreen",
+        lambda: fullscreen_state,
+    )
+    monkeypatch.setattr(
+        window.fullscreen_chrome,
+        "_apply_native_fullscreen_frame",
+        lambda _fullscreen: None,
+    )
+    window.show()
+    window._apply_chrome_visibility()
     qapp.processEvents()
     config.apply(
         {
@@ -669,7 +682,8 @@ def test_fullscreen_cursor_setting_applies_immediately_to_existing_viewer(
     config.apply({"hide_cursor_in_fullscreen": False})
     assert not window.fullscreen_chrome.hide_cursor_enabled
     assert not window.fullscreen_chrome.cursor_hidden
-    window.showNormal()
+    fullscreen_state = False
+    window._apply_chrome_visibility()
     window.close()
     qapp.processEvents()
 

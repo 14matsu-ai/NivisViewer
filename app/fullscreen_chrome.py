@@ -203,6 +203,7 @@ class FullscreenChromeController(QObject):
             self._update_geometry()
             self._update_reveal_strip_visibility()
         else:
+            self._reset_bottom_wheel_accumulator()
             self.bottom_reveal_strip.hide()
             self.hide_overlays()
             self._restore_chrome()
@@ -336,6 +337,7 @@ class FullscreenChromeController(QObject):
     def shutdown(self) -> None:
         self._invalidate_hide_timer()
         self._invalidate_cursor_timer()
+        self._reset_bottom_wheel_accumulator()
         self._set_cursor_hidden(False)
         self._apply_native_fullscreen_frame(False)
         self.bottom_reveal_strip.hide()
@@ -357,21 +359,31 @@ class FullscreenChromeController(QObject):
             and event_type == QEvent.Type.MouseMove
             and isinstance(event, QMouseEvent)
         ):
-            self.process_pointer(event.globalPosition().toPoint())
+            global_position = event.globalPosition().toPoint()
+            self.process_pointer(global_position)
+            if not self._pointer_in_bottom_hover_region(global_position):
+                self._reset_bottom_wheel_accumulator()
         elif (
             self.fullscreen
             and event_type == QEvent.Type.Wheel
             and isinstance(event, QWheelEvent)
-            and self._is_bottom_wheel_target(watched, event)
-            and isinstance(self.slider, ViewerPageSlider)
         ):
-            handled = self.slider.process_wheel_delta(
-                event.angleDelta(),
-                event.pixelDelta(),
-            )
-            if handled:
-                event.accept()
-            return handled
+            if (
+                self._is_bottom_wheel_target(watched, event)
+                and isinstance(self.slider, ViewerPageSlider)
+            ):
+                handled = self.slider.process_wheel_delta(
+                    event.angleDelta(),
+                    event.pixelDelta(),
+                )
+                if handled:
+                    event.accept()
+                return handled
+            if not self._is_slider_wheel_target(watched):
+                self._reset_bottom_wheel_accumulator()
+            if watched is self.bottom_reveal_strip:
+                self.show_bottom()
+                return True
         elif watched in self._filtered_widgets:
             if event_type == QEvent.Type.MouseButtonPress:
                 self.mouse_button_down = True
@@ -399,16 +411,28 @@ class FullscreenChromeController(QObject):
             return True
         return False
 
+    def _reset_bottom_wheel_accumulator(self) -> None:
+        if isinstance(self.slider, ViewerPageSlider):
+            self.slider.reset_wheel_accumulator()
+
+    def _is_slider_wheel_target(self, watched: QObject) -> bool:
+        return bool(
+            isinstance(watched, QWidget)
+            and (
+                watched is self.slider
+                or self.slider.isAncestorOf(watched)
+            )
+        )
+
     def _is_bottom_wheel_target(
         self,
         watched: QObject,
         event: QWheelEvent,
     ) -> bool:
+        if not self.bottom_overlay.isVisible():
+            return False
         if isinstance(watched, QWidget):
-            if (
-                watched is self.slider
-                or self.slider.isAncestorOf(watched)
-            ):
+            if self._is_slider_wheel_target(watched):
                 return False
             return bool(
                 watched is self.bottom_overlay
@@ -418,7 +442,7 @@ class FullscreenChromeController(QObject):
             window_handle = self.window.windowHandle()
             return bool(
                 watched is window_handle
-                and self._pointer_in_bottom_hover_region(
+                and self._bottom_wheel_region_global().contains(
                     event.globalPosition().toPoint()
                 )
             )
@@ -677,6 +701,33 @@ class FullscreenChromeController(QObject):
         return QRect(
             QPoint(bottom_bounds.left(), top_global),
             QPoint(bottom_bounds.right(), bottom_bounds.bottom()),
+        )
+
+    def _bottom_wheel_region_global(self) -> QRect:
+        if not self.bottom_overlay.isVisible():
+            return QRect()
+        overlay_region = QRect(
+            self.bottom_overlay.mapToGlobal(QPoint(0, 0)),
+            self.bottom_overlay.size(),
+        )
+        bottom = max(
+            overlay_region.bottom(),
+            self.window.frameGeometry().bottom(),
+        )
+        left = overlay_region.left()
+        right = overlay_region.right()
+        if self.window.isFullScreen():
+            screen = self.window.screen()
+            if screen is not None:
+                # Preserve the existing high-DPI boundary allowance only
+                # while the visible overlay owns Wheel input.
+                screen_edge = screen.geometry().adjusted(0, 0, 1, 1)
+                left = min(left, screen_edge.left())
+                right = max(right, screen_edge.right())
+                bottom = max(bottom, screen_edge.bottom())
+        return QRect(
+            QPoint(left, overlay_region.top()),
+            QPoint(right, bottom),
         )
 
     def _pointer_in_reveal_area(self, global_position: QPoint) -> bool:
