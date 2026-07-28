@@ -393,6 +393,7 @@ class ViewerWidget(QWidget):
     def clear(self) -> None:
         self._spread = DisplaySpread(0, tuple(), True)
         self._images = []
+        self._last_draw_layout.clear()
         self._pan = QPoint(0, 0)
         self.update()
 

@@ -1,15 +1,90 @@
 from __future__ import annotations
 
 import pytest
-from PySide6.QtCore import QEvent, QPointF, Qt
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtCore import QEvent, QPointF, QSize, Qt
+from PySide6.QtGui import QImage, QMouseEvent, QPixmap
 from PySide6.QtWidgets import QApplication
 
+from app.page_model import DisplaySpread, PageSlot
 from app.viewer_widget import ViewerWidget, calculate_spread_layout
 
 
 def center_gap(layout) -> int:
     return layout.rects[1].left() - layout.rects[0].right() - 1
+
+
+def test_clear_releases_images_from_last_draw_layout_and_can_repaint(
+    qapp: QApplication,
+) -> None:
+    widget = ViewerWidget()
+    widget.resize(320, 240)
+    first_image = QImage(80, 120, QImage.Format.Format_ARGB32)
+    first_image.fill(Qt.GlobalColor.red)
+    second_image = QImage(90, 130, QImage.Format.Format_ARGB32)
+    second_image.fill(Qt.GlobalColor.green)
+    first_pages = [
+        ViewerWidget.from_qimage(0, "first", first_image, (80, 120)),
+        ViewerWidget.from_qimage(1, "second", second_image, (90, 130)),
+    ]
+    widget.set_rotation_angle(90)
+    widget.set_pages(
+        DisplaySpread(
+            0,
+            (PageSlot("first", 0), PageSlot("second", 1)),
+            False,
+        ),
+        first_pages,
+    )
+    widget.show()
+    qapp.processEvents()
+    widget.render(QPixmap(widget.size()))
+
+    old_pixmap_keys = {
+        page.pixmap.cacheKey()
+        for page in first_pages
+        if page.pixmap is not None
+    }
+    assert widget._last_draw_layout
+    assert all(
+        pixmap.cacheKey() not in old_pixmap_keys
+        for _rect, pixmap in widget._last_draw_layout
+    )
+
+    widget.clear()
+
+    assert widget._images == []
+    assert widget._spread.slots == ()
+    assert widget._last_draw_layout == []
+    assert widget.rotation_angle == 90
+    assert not any(
+        pixmap.cacheKey() in old_pixmap_keys
+        for _rect, pixmap in widget._last_draw_layout
+    )
+    assert isinstance(widget.sizeHint(), QSize)
+    assert isinstance(widget.minimumSizeHint(), QSize)
+    widget.render(QPixmap(widget.size()))
+
+    replacement_image = QImage(64, 96, QImage.Format.Format_ARGB32)
+    replacement_image.fill(Qt.GlobalColor.blue)
+    widget.set_rotation_angle(0)
+    replacement = ViewerWidget.from_qimage(
+        2,
+        "replacement",
+        replacement_image,
+        (64, 96),
+    )
+    widget.set_pages(
+        DisplaySpread(2, (PageSlot("replacement", 2),), True),
+        [replacement],
+    )
+    widget.render(QPixmap(widget.size()))
+
+    assert len(widget._last_draw_layout) == 1
+    assert widget._last_draw_layout[0][1].cacheKey() == replacement.pixmap.cacheKey()
+    widget.clear()
+    widget.clear()
+    assert widget._last_draw_layout == []
+    widget.close()
 
 
 def test_normal_spread_uses_configured_gap() -> None:
