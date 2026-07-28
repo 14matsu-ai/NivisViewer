@@ -199,3 +199,57 @@ def test_source_close_is_deferred_until_old_load_finishes(qapp: QApplication) ->
     assert sources["first"].closed
     assert delivered_pages == []
     session.shutdown()
+
+
+def test_cancel_pending_open_releases_queued_worker_tracking(
+    qapp: QApplication,
+) -> None:
+    running_started = threading.Event()
+    release_running = threading.Event()
+    factory_calls: list[str] = []
+
+    def source_factory(path: Path, **_kwargs: object) -> tuple[ImageSource, str | None]:
+        factory_calls.append(path.name)
+        if path.name == "running":
+            running_started.set()
+            assert release_running.wait(2)
+        source = BlockingImageSource(path, threading.Event(), threading.Event())
+        return source, None
+
+    session = BookSession(source_factory=source_factory)
+    opened_generations: list[int] = []
+    failed_generations: list[int] = []
+    session.async_opened.connect(
+        lambda opened: opened_generations.append(opened.generation)
+    )
+    session.async_open_failed.connect(
+        lambda failed: failed_generations.append(failed.generation)
+    )
+    running_generation = session.open_book_async("running")
+    assert running_started.wait(1)
+    queued_generation = session.open_book_async("queued")
+    assert set(session._open_workers) == {
+        running_generation,
+        queued_generation,
+    }
+
+    session.cancel_pending_open()
+    session.cancel_pending_open()
+
+    assert running_generation in session._open_workers
+    assert queued_generation not in session._open_workers
+    assert factory_calls == ["running"]
+
+    release_running.set()
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+    assert session._open_workers == {}
+
+    session.open_book_async("queued")
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+    assert factory_calls == ["running", "queued"]
+    assert session._open_workers == {}
+    assert opened_generations == [session.generation]
+    assert failed_generations == []
+    session.shutdown()
