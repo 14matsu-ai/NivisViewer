@@ -145,6 +145,58 @@ class FailingRenderBackend(FakeBackend):
         return super().render_page(request, cancel_token=cancel_token)
 
 
+class CancellableBlockingRenderBackend(FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_document_id: str | None = None
+        self.fail_document_ids: set[str] = set()
+        self.render_started = Event()
+        self.release_render = Event()
+        self.render_finished = Event()
+        self.lifecycle: list[tuple[str, str, int]] = []
+
+    def render_page(self, request, *, cancel_token=None):
+        with self._call():
+            self.rendered.append(request)
+            if (
+                request.document_id == self.block_document_id
+                and request.page_index == 0
+            ):
+                self.lifecycle.append(
+                    ("render-started", request.document_id, request.generation)
+                )
+                self.render_started.set()
+                assert self.release_render.wait(3)
+                try:
+                    if cancel_token is not None and cancel_token.is_set():
+                        raise PdfBackendError(PdfErrorCode.CANCELLED)
+                finally:
+                    self.lifecycle.append(
+                        ("render-finished", request.document_id, request.generation)
+                    )
+                    self.render_finished.set()
+            if request.document_id in self.fail_document_ids:
+                raise PdfBackendError(PdfErrorCode.RENDER_FAILED)
+            width, height = clamp_render_size(
+                request.target_width_px,
+                request.target_height_px,
+            )
+            return PdfRenderResult(
+                request.document_id,
+                request.page_index,
+                width,
+                height,
+                "RGBA",
+                bytes((10, 20, 30, 255)) * width * height,
+                request.generation,
+                request.purpose,
+            )
+
+    def close_document(self, document_id):
+        self.lifecycle.append(("document-closed", document_id, -1))
+        super().close_document(document_id)
+
+
 def test_pdf_extension_is_a_book_and_browser_item(tmp_path):
     (tmp_path / "日本語.PDF").write_bytes(b"not rendered")
     result = BrowserItemDiscovery().discover(tmp_path)
@@ -211,6 +263,285 @@ def test_image_cache_does_not_regenerate_inside_same_render_bucket(qapp):
     assert not cache.set_render_spec(PageRenderSpec(101, 101))
     assert cache.generation == generation
     assert cache.set_render_spec(PageRenderSpec(129, 129))
+
+
+def test_pdf_book_switch_cancels_old_image_tasks_without_applying_error(
+    tmp_path,
+    qapp,
+):
+    pdf_a = tmp_path / "A.pdf"
+    pdf_b = tmp_path / "B.pdf"
+    pdf_a.write_bytes(b"fake")
+    pdf_b.write_bytes(b"fake")
+    backend = CancellableBlockingRenderBackend()
+    service = PdfiumService(backend)
+    source_a = PdfImageSource(pdf_a, pdfium_service=service)
+    source_b = PdfImageSource(pdf_b, pdfium_service=service)
+    backend.block_document_id = source_a.document_id
+    sources = {
+        pdf_a: source_a,
+        pdf_b: source_b,
+    }
+    session = BookSession(
+        source_factory=lambda path, **_kwargs: (sources[Path(path)], None),
+    )
+    delivered = []
+    session.image_cache.pageLoaded.connect(delivered.append)
+    try:
+        session.open_book(pdf_a)
+        old_generation = session.image_cache.generation
+        session.image_cache.set_render_spec(
+            PageRenderSpec(64, 64, size_bucket=(64, 64))
+        )
+        old_generation = session.image_cache.generation
+        session.image_cache.preload_around(
+            0,
+            radius=1,
+            visible_indexes=(0,),
+        )
+        assert backend.render_started.wait(1)
+        assert (old_generation, 0) in session.image_cache._tasks
+        assert (old_generation, 1) in session.image_cache._tasks
+
+        session.open_book(pdf_b)
+        current_generation = session.image_cache.generation
+        assert current_generation != old_generation
+        assert (old_generation, 0) in session.image_cache._tasks
+        assert (old_generation, 1) not in session.image_cache._tasks
+        assert (old_generation, 1) not in session.image_cache._in_flight
+        assert source_a.document_id not in backend.closed
+        assert all(
+            not (
+                request.document_id == source_a.document_id
+                and request.page_index == 1
+            )
+            for request in backend.rendered
+        )
+        qapp.processEvents()
+        assert not source_a._closed.is_set()
+        assert (old_generation, 0) in session.image_cache._tasks
+
+        session.image_cache.preload_around(
+            0,
+            radius=0,
+            visible_indexes=(0,),
+        )
+        backend.release_render.set()
+        assert session.image_cache.wait_for_done(3000)
+        qapp.processEvents()
+        assert service.flush(wait_seconds=2)
+        qapp.processEvents()
+
+        assert backend.render_finished.is_set()
+        assert session.image_cache._tasks == {}
+        assert session.image_cache._in_flight == {}
+        assert all(cached.generation == current_generation for cached in delivered)
+        assert all(cached.error is None for cached in delivered)
+        current = session.image_cache.get(0)
+        assert current is not None
+        assert current.generation == current_generation
+        assert current.error is None
+        assert source_a.document_id in backend.closed
+        assert backend.lifecycle.index(
+            ("render-finished", source_a.document_id, old_generation)
+        ) < backend.lifecycle.index(
+            ("document-closed", source_a.document_id, -1)
+        )
+    finally:
+        backend.release_render.set()
+        session.shutdown(wait_msecs=3000)
+        service.shutdown(wait_seconds=2)
+
+
+def test_pdf_viewer_close_discards_late_cancelled_render(
+    tmp_path,
+    qapp,
+):
+    pdf = tmp_path / "close.pdf"
+    pdf.write_bytes(b"fake")
+    backend = CancellableBlockingRenderBackend()
+    service = PdfiumService(backend)
+    source = PdfImageSource(pdf, pdfium_service=service)
+    backend.block_document_id = source.document_id
+    session = BookSession(
+        source_factory=lambda _path, **_kwargs: (source, None),
+    )
+    delivered = []
+    session.image_cache.pageLoaded.connect(delivered.append)
+    try:
+        session.open_book(pdf)
+        generation = session.image_cache.generation
+        session.image_cache.set_render_spec(
+            PageRenderSpec(64, 64, size_bucket=(64, 64))
+        )
+        generation = session.image_cache.generation
+        session.image_cache.preload_around(
+            0,
+            radius=0,
+            visible_indexes=(0,),
+        )
+        assert backend.render_started.wait(1)
+
+        session.close_book()
+        assert (generation, 0) in session.image_cache._tasks
+        assert source.document_id not in backend.closed
+        qapp.processEvents()
+        assert not source._closed.is_set()
+        assert (generation, 0) in session.image_cache._tasks
+
+        backend.release_render.set()
+        assert session.image_cache.wait_for_done(3000)
+        qapp.processEvents()
+        assert service.flush(wait_seconds=2)
+        qapp.processEvents()
+
+        assert delivered == []
+        assert session.image_cache.source is None
+        assert session.image_cache._cache == {}
+        assert session.image_cache._tasks == {}
+        assert session.image_cache._in_flight == {}
+        assert backend.lifecycle.index(
+            ("render-finished", source.document_id, generation)
+        ) < backend.lifecycle.index(
+            ("document-closed", source.document_id, -1)
+        )
+    finally:
+        backend.release_render.set()
+        session.shutdown(wait_msecs=3000)
+        service.shutdown(wait_seconds=2)
+
+
+def test_current_generation_pdf_cancellation_is_not_cached_or_delivered(
+    tmp_path,
+    qapp,
+):
+    pdf = tmp_path / "cancel.pdf"
+    pdf.write_bytes(b"fake")
+    backend = CancellableBlockingRenderBackend()
+    service = PdfiumService(backend)
+    source = PdfImageSource(pdf, pdfium_service=service)
+    backend.block_document_id = source.document_id
+    cache = ImageCache()
+    delivered = []
+    cache.pageLoaded.connect(delivered.append)
+    try:
+        cache.set_source(source, source.list_images())
+        cache.set_render_spec(PageRenderSpec(64, 64, size_bucket=(64, 64)))
+        generation = cache.generation
+        cache.preload_around(0, radius=0, visible_indexes=(0,))
+        assert backend.render_started.wait(1)
+
+        source.cancel_image_request("pdf-page:0")
+        backend.release_render.set()
+        assert cache.wait_for_done(3000)
+        qapp.processEvents()
+
+        assert delivered == []
+        assert cache.get(0) is None
+        assert (generation, 0) not in cache._tasks
+        assert (generation, 0) not in cache._in_flight
+    finally:
+        backend.release_render.set()
+        cache.clear()
+        qapp.processEvents()
+        source.close()
+        service.shutdown(wait_seconds=2)
+
+
+@pytest.mark.parametrize("visible_indexes", [(0,), (0, 1)])
+def test_current_pdf_render_failure_remains_an_error_for_single_and_spread(
+    tmp_path,
+    qapp,
+    visible_indexes,
+):
+    pdf = tmp_path / "failure.pdf"
+    pdf.write_bytes(b"fake")
+    backend = CancellableBlockingRenderBackend()
+    service = PdfiumService(backend)
+    source = PdfImageSource(pdf, pdfium_service=service)
+    backend.fail_document_ids.add(source.document_id)
+    cache = ImageCache()
+    delivered = []
+    cache.pageLoaded.connect(delivered.append)
+    try:
+        cache.set_source(source, source.list_images())
+        cache.set_render_spec(PageRenderSpec(64, 64, size_bucket=(64, 64)))
+        cache.preload_around(
+            0,
+            radius=0,
+            visible_indexes=visible_indexes,
+        )
+        assert cache.wait_for_done(3000)
+        qapp.processEvents()
+
+        expected_pages = set(visible_indexes)
+        assert {cached.page_index for cached in delivered} == expected_pages
+        assert all(cached.error for cached in delivered)
+        assert all(cached.qimage is None for cached in delivered)
+        assert all(cache.get(index).error for index in expected_pages)
+    finally:
+        cache.clear()
+        qapp.processEvents()
+        source.close()
+        service.shutdown(wait_seconds=2)
+
+
+def test_pdf_switch_cycle_reopens_same_path_without_stale_tracking(
+    tmp_path,
+    qapp,
+):
+    pdf_a = tmp_path / "A.pdf"
+    pdf_b = tmp_path / "B.pdf"
+    pdf_a.write_bytes(b"fake")
+    pdf_b.write_bytes(b"fake")
+    backend = FakeBackend()
+    service = PdfiumService(backend)
+    sources_by_path = {
+        pdf_a: [
+            PdfImageSource(pdf_a, pdfium_service=service),
+            PdfImageSource(pdf_a, pdfium_service=service),
+        ],
+        pdf_b: [
+            PdfImageSource(pdf_b, pdfium_service=service),
+            PdfImageSource(pdf_b, pdfium_service=service),
+        ],
+    }
+
+    def source_factory(path, **_kwargs):
+        return sources_by_path[Path(path)].pop(0), None
+
+    session = BookSession(source_factory=source_factory)
+    document_ids = []
+    try:
+        for path in (pdf_a, pdf_b, pdf_a, pdf_b):
+            session.open_book(path)
+            document_ids.append(session.source.document_id)
+            session.image_cache.set_render_spec(
+                PageRenderSpec(64, 64, size_bucket=(64, 64))
+            )
+            session.image_cache.preload_around(
+                0,
+                radius=0,
+                visible_indexes=(0,),
+            )
+            assert session.image_cache.wait_for_done(3000)
+            qapp.processEvents()
+            cached = session.image_cache.get(0)
+            assert cached is not None
+            assert cached.error is None
+            assert cached.generation == session.image_cache.generation
+            assert session.image_cache._tasks == {}
+            assert session.image_cache._in_flight == {}
+
+        assert len(set(document_ids)) == 4
+        session.close_book()
+        qapp.processEvents()
+        assert service.flush(wait_seconds=2)
+        assert session.image_cache._tasks == {}
+        assert session.image_cache._in_flight == {}
+    finally:
+        session.shutdown(wait_msecs=3000)
+        service.shutdown(wait_seconds=2)
 
 
 @pytest.mark.parametrize(
@@ -281,6 +612,51 @@ def test_pdf_service_deduplicates_identical_pending_renders():
         assert len(backend.rendered) == 1
     finally:
         service.shutdown()
+
+
+def test_pdf_service_does_not_deduplicate_a_new_generation_onto_cancelled_future():
+    backend = CancellableBlockingRenderBackend()
+    backend.block_document_id = "doc"
+    service = PdfiumService(backend)
+    old_cancelled = Event()
+    second_submit_returned = Event()
+    original_submit = service._submit
+    submit_count = 0
+
+    def tracked_submit(*args, **kwargs):
+        nonlocal submit_count
+        future = original_submit(*args, **kwargs)
+        submit_count += 1
+        if submit_count == 2:
+            second_submit_returned.set()
+        return future
+
+    service._submit = tracked_submit
+    old_request = PdfRenderRequest("doc", 0, 64, 64, generation=1)
+    new_request = PdfRenderRequest("doc", 0, 64, 64, generation=2)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            old_future = executor.submit(
+                lambda: service.render_page(
+                    old_request,
+                    cancel_token=old_cancelled,
+                )
+            )
+            assert backend.render_started.wait(1)
+            new_future = executor.submit(service.render_page, new_request)
+            assert second_submit_returned.wait(1)
+            old_cancelled.set()
+            backend.release_render.set()
+            with pytest.raises(PdfBackendError) as exc_info:
+                old_future.result(timeout=2)
+            new_result = new_future.result(timeout=2)
+
+        assert exc_info.value.code is PdfErrorCode.CANCELLED
+        assert new_result.generation == 2
+        assert [request.generation for request in backend.rendered] == [1, 2]
+    finally:
+        backend.release_render.set()
+        service.shutdown(wait_seconds=2)
 
 
 def test_pdf_service_prioritizes_viewer_over_queued_thumbnail_and_keeps_fifo():
