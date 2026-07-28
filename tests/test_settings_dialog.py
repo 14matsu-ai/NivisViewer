@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Event
+from unittest.mock import Mock
 
 from PIL import Image
+from PySide6.QtCore import QCoreApplication, QEvent
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QApplication, QDialog
+from PySide6.QtWidgets import QApplication, QDialog, QWidget
 
 from app.browser_model import BrowserItem, BrowserItemKind
 from app.config_manager import ConfigManager
-from app.settings_dialog import SettingsDialog
+from app.seven_zip_locator import SevenZipInfo
+from app.settings_dialog import SettingsDialog, _RETIRED_SETTINGS_DIALOGS
 from app.thumbnail_disk_cache import ThumbnailDiskCache
 from app.thumbnail_provider import BrowserThumbnailProvider
 
@@ -17,6 +21,12 @@ def make_config(tmp_path: Path) -> ConfigManager:
     config = ConfigManager(tmp_path / "config.json")
     config.load()
     return config
+
+
+def flush_deferred_deletes(qapp: QApplication) -> None:
+    qapp.processEvents()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    qapp.processEvents()
 
 
 def test_current_values_are_shown_and_join_disables_gap(
@@ -347,3 +357,122 @@ def test_viewer_canvas_click_controls_use_requested_labels(
         == "下部UI上のマウスホイールで1ページずつ移動する"
     )
     dialog.reject()
+
+
+def test_repeated_close_deletes_each_dialog_from_parent(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    config = make_config(tmp_path)
+    parent = QWidget()
+
+    for _ in range(5):
+        dialog = SettingsDialog(config, parent)
+        assert len(parent.findChildren(SettingsDialog)) == 1
+
+        dialog.reject()
+        flush_deferred_deletes(qapp)
+
+        assert parent.findChildren(SettingsDialog) == []
+
+    parent.deleteLater()
+    flush_deferred_deletes(qapp)
+
+
+def test_close_takes_queued_probe_and_retires_running_probe(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    started = Event()
+    release = Event()
+
+    class BlockingLocator:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def locate(self, path: str, *, force: bool) -> SevenZipInfo:
+            self.calls += 1
+            started.set()
+            assert release.wait(5.0)
+            return SevenZipInfo(path, True, "old", None)
+
+    old_locator = BlockingLocator()
+    old_dialog = SettingsDialog(
+        make_config(tmp_path / "old"),
+        seven_zip_locator=old_locator,  # type: ignore[arg-type]
+    )
+    old_dialog._probe_pool.setMaxThreadCount(1)
+    old_dialog._start_seven_zip_probe("running.exe")
+    assert started.wait(2.0)
+    old_dialog._start_seven_zip_probe("queued.exe")
+    old_tracking = old_dialog._probe_workers
+    old_status_setter = Mock(wraps=old_dialog.seven_zip_status_label.setText)
+    old_dialog.seven_zip_status_label.setText = old_status_setter
+
+    old_dialog.reject()
+    old_dialog.reject()
+
+    assert old_locator.calls == 1
+    assert len(old_tracking) == 1
+    assert old_dialog.parent() is None
+    assert old_dialog in _RETIRED_SETTINGS_DIALOGS
+
+    class ReadyLocator:
+        def locate(self, path: str, *, force: bool) -> SevenZipInfo:
+            return SevenZipInfo(path, True, "new", None)
+
+    new_dialog = SettingsDialog(
+        make_config(tmp_path / "new"),
+        seven_zip_locator=ReadyLocator(),  # type: ignore[arg-type]
+    )
+    new_dialog._start_seven_zip_probe("new.exe")
+    assert new_dialog._probe_pool.waitForDone(2000)
+    qapp.processEvents()
+    assert new_dialog._probe_workers == {}
+    new_status = new_dialog.seven_zip_status_label.text()
+    assert "new.exe" in new_status
+
+    release.set()
+    assert old_dialog._probe_pool.waitForDone(2000)
+    qapp.processEvents()
+
+    assert old_tracking == {}
+    old_status_setter.assert_not_called()
+    assert new_dialog.seven_zip_status_label.text() == new_status
+    assert old_dialog not in _RETIRED_SETTINGS_DIALOGS
+
+    new_dialog.reject()
+    flush_deferred_deletes(qapp)
+
+
+def test_probe_exceptions_finish_and_clear_all_tracking(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    class RaisingLocator:
+        def locate(self, *_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("probe failed")
+
+    locator = RaisingLocator()
+    dialog = SettingsDialog(
+        make_config(tmp_path),
+        seven_zip_locator=locator,  # type: ignore[arg-type]
+        winrar_locator=locator,  # type: ignore[arg-type]
+        ffmpeg_locator=locator,  # type: ignore[arg-type]
+    )
+    dialog._start_seven_zip_probe("7z.exe")
+    dialog._start_winrar_probe("WinRAR.exe")
+    dialog.redetect_ffmpeg()
+
+    assert dialog._probe_pool.waitForDone(2000)
+    qapp.processEvents()
+
+    assert dialog._probe_workers == {}
+    assert dialog._winrar_probe_workers == {}
+    assert dialog._ffmpeg_probe_workers == {}
+    assert "probe failed" in dialog.seven_zip_status_label.text()
+    assert "probe failed" in dialog.winrar_status_label.text()
+    assert "見つかりません" in dialog.ffmpeg_status_label.text()
+
+    dialog.reject()
+    flush_deferred_deletes(qapp)
