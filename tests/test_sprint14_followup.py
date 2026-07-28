@@ -195,6 +195,28 @@ class OrderedSource(ImageSource):
         return image_id
 
 
+class QueuedLoadSource(ImageSource):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.ids = ["running.jpg", "queued.jpg"]
+        self.started: list[str] = []
+        self.running_started = Event()
+        self.release_running = Event()
+
+    def list_images(self) -> list[str]:
+        return list(self.ids)
+
+    def open_image(self, image_id: str) -> Image.Image:
+        self.started.append(image_id)
+        if image_id == "running.jpg":
+            self.running_started.set()
+            assert self.release_running.wait(2)
+        return Image.new("RGB", (8, 12), "white")
+
+    def display_path(self, image_id: str) -> str:
+        return image_id
+
+
 def test_image_cache_registers_logical_current_before_rtl_partner(qapp, tmp_path):
     coordinator = ImageWorkCoordinator(max_workers=2)
     source = OrderedSource(tmp_path)
@@ -206,6 +228,84 @@ def test_image_cache_registers_logical_current_before_rtl_partner(qapp, tmp_path
 
     assert source.started[0] == "page0.webp"
     assert all(thread is not main_thread() for thread in source.threads)
+    coordinator.shutdown()
+
+
+def test_image_cache_releases_queued_tracking_before_coordinator_clear(
+    qapp,
+    tmp_path,
+):
+    coordinator = ImageWorkCoordinator(max_workers=2)
+    source = QueuedLoadSource(tmp_path)
+    cache = ImageCache(image_work_coordinator=coordinator)
+    idle_sources: list[ImageSource] = []
+    delivered: list[str] = []
+    cache.sourceIdle.connect(idle_sources.append)
+    cache.pageLoaded.connect(lambda cached: delivered.append(cached.image_id))
+    cache.set_source(source, source.ids)
+    generation = cache.generation
+    cache.ensure_loaded(0)
+    assert source.running_started.wait(1)
+    cache.ensure_loaded(1)
+    assert set(cache._tasks) == {(generation, 0), (generation, 1)}
+
+    cache.clear()
+    cache.clear()
+    coordinator.shutdown(wait_msecs=0)
+
+    assert (generation, 0) in cache._tasks
+    assert (generation, 1) not in cache._tasks
+    assert source.started == ["running.jpg"]
+
+    source.release_running.set()
+    assert coordinator.wait_for_viewer(2000)
+    qapp.processEvents()
+    assert cache._tasks == {}
+    assert cache._in_flight == {}
+    assert idle_sources == [source]
+    assert delivered == []
+
+    cache.set_source(source, source.ids)
+    cache.ensure_loaded(1)
+    assert coordinator.wait_for_viewer(2000)
+    qapp.processEvents()
+    assert source.started == ["running.jpg", "queued.jpg"]
+    assert cache.get(1) is not None
+    coordinator.shutdown()
+
+
+def test_stale_running_image_load_does_not_remove_new_generation_task(
+    qapp,
+    tmp_path,
+):
+    coordinator = ImageWorkCoordinator(max_workers=2)
+    source = QueuedLoadSource(tmp_path)
+    cache = ImageCache(image_work_coordinator=coordinator)
+    delivered: list[str] = []
+    cache.pageLoaded.connect(lambda cached: delivered.append(cached.image_id))
+    cache.set_source(source, source.ids)
+    stale_generation = cache.generation
+    cache.ensure_loaded(0)
+    assert source.running_started.wait(1)
+    cache.ensure_loaded(1)
+
+    cache.clear()
+    cache.set_source(source, source.ids)
+    current_generation = cache.generation
+    cache.ensure_loaded(1)
+
+    assert (stale_generation, 0) in cache._tasks
+    assert (stale_generation, 1) not in cache._tasks
+    assert (current_generation, 1) in cache._tasks
+
+    source.release_running.set()
+    assert coordinator.wait_for_viewer(2000)
+    qapp.processEvents()
+    assert cache._tasks == {}
+    assert cache._in_flight == {}
+    assert source.started == ["running.jpg", "queued.jpg"]
+    assert delivered == ["queued.jpg"]
+    assert cache.get(1) is not None
     coordinator.shutdown()
 
 

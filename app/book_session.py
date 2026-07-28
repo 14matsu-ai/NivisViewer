@@ -338,9 +338,26 @@ class BookSession(QObject):
     def cancel_pending_open(self) -> None:
         cancelled = self._open_cancel
         self._open_cancel = None
-        if cancelled is not None:
-            cancelled.set()
-        self._open_pool.clear()
+        if cancelled is None:
+            return
+        cancelled.set()
+        queued_generation: int | None = None
+        queued_worker: _BookOpenWorker | None = None
+        for generation, worker in tuple(self._open_workers.items()):
+            if worker.cancelled is cancelled:
+                queued_generation = generation
+                queued_worker = worker
+                break
+        if queued_worker is None or queued_generation is None:
+            return
+        try:
+            removed = self._open_pool.tryTake(queued_worker)
+        except RuntimeError:
+            removed = False
+        if removed:
+            self._open_workers.pop(queued_generation, None)
+            if not self._open_workers:
+                _RETIRED_BOOK_OPEN_POOLS.discard(self._open_pool)
 
     def wait_for_async(self, msecs: int = 5000) -> bool:
         return self._open_pool.waitForDone(max(0, int(msecs)))

@@ -474,3 +474,10 @@ class ImageCache(QObject):
             cancel = getattr(source, "cancel_image_request", None)
             if callable(cancel):
                 cancel(self.image_ids[index])
+            task_entry = self._tasks.get((generation, index))
+            if task_entry is None:
+                continue
+            task, _priority = task_entry
+            if self._try_take_task(task):
+                self._tasks.pop((generation, index), None)
+                self._in_flight.pop((generation, index), None)
