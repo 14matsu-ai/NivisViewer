@@ -120,8 +120,24 @@ def test_stat_failure_keeps_supported_item_with_safe_metadata(
 
 def test_incremental_model_merges_batches_deduplicates_and_sorts(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     model = BrowserItemModel()
+    sort_calls = 0
+    original_sorted_items = type(model._sort_policy).sorted_items
+
+    def counted_sorted_items(policy, items):
+        nonlocal sort_calls
+        sort_calls += 1
+        return original_sorted_items(policy, items)
+
+    monkeypatch.setattr(
+        type(model._sort_policy),
+        "sorted_items",
+        counted_sorted_items,
+    )
+    resets: list[bool] = []
+    model.modelReset.connect(lambda: resets.append(True))
     model.begin_directory_scan(generation=4)
     first = BrowserItem(
         "book10.jpg",
@@ -149,8 +165,14 @@ def test_incremental_model_merges_batches_deduplicates_and_sorts(
         "book2.jpg",
         "book10.jpg",
     ]
+    resets_before_finish = len(resets)
+    sorts_before_finish = sort_calls
     assert model.finish_directory_scan(generation=4)
     assert len(model.items) == 3
+    assert len(resets) == resets_before_finish
+    assert sort_calls == sorts_before_finish
+    assert model.append_scan_batch([first], generation=4) == 0
+    assert not model.finish_directory_scan(generation=4)
 
 
 def test_incremental_model_ignores_old_generation_and_accepts_sort_change(

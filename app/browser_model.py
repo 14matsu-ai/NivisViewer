@@ -286,11 +286,7 @@ class BrowserItemModel(QAbstractListModel):
     def finish_directory_scan(self, *, generation: int) -> bool:
         if generation != self._scan_generation:
             return False
-        self.beginResetModel()
-        self._items = self._sort_policy.sorted_items(self._source_items)
-        self._rebuild_row_index()
         self._scan_generation = None
-        self.endResetModel()
         return True
 
     def cancel_directory_scan(self, *, generation: int) -> bool:

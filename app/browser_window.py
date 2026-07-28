@@ -764,13 +764,21 @@ class BrowserWindow(QMainWindow):
             self.item_model.finish_directory_scan(
                 generation=pending.generation
             )
-            self._restore_pending_scan_location(pending, final=True)
+            selected_path = pending.restore_location.selected_path
+            if (
+                selected_path
+                and self.item_model.row_for_path(selected_path) < 0
+            ):
+                self._restore_pending_scan_location(pending, final=True)
         self._apply_pending_browser_focus(final=True)
 
         self._pending_scan = None
         self.directory_scan_committed.emit(str(pending.path))
         self._update_status()
-        if self._first_paint_pending_generation != pending.generation:
+        if (
+            pending.refresh
+            and self._first_paint_pending_generation != pending.generation
+        ):
             self._schedule_thumbnail_requests()
         if pending.refresh:
             QTimer.singleShot(
@@ -883,6 +891,14 @@ class BrowserWindow(QMainWindow):
         final: bool,
     ) -> None:
         selected_path = pending.restore_location.selected_path
+        current_item = self.item_model.item_at(
+            self.list_view.currentIndex()
+        )
+        if current_item is not None and (
+            selected_path is None
+            or not self._same_path(current_item.path, Path(selected_path))
+        ):
+            return
         if (
             selected_path
             and self.item_model.row_for_path(selected_path) < 0
