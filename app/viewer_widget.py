@@ -445,17 +445,21 @@ class ViewerWidget(QWidget):
         self.viewportChanged.emit()
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
+        delta = event.angleDelta().y()
+        if delta == 0:
+            event.ignore()
+            return
+
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            delta = event.angleDelta().y()
             factor = 1.15 if delta > 0 else 1 / 1.15
             base = self._scale_for_current_mode() if self.fit_mode != "manual_zoom" else self.manual_zoom
             self.set_manual_zoom(base * factor)
             event.accept()
             return
 
-        if event.angleDelta().y() < 0:
+        if delta < 0:
             self.nextRequested.emit()
-        elif event.angleDelta().y() > 0:
+        else:
             self.previousRequested.emit()
         event.accept()
 
