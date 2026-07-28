@@ -5,7 +5,13 @@ from pathlib import Path
 import pytest
 from PIL import Image
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt
-from PySide6.QtGui import QCursor, QMouseEvent, QPalette, QWheelEvent
+from PySide6.QtGui import (
+    QCursor,
+    QMouseEvent,
+    QPalette,
+    QWheelEvent,
+    QWindow,
+)
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
@@ -498,7 +504,10 @@ def test_bottom_overlay_and_children_reuse_slider_wheel_path_once(
     window.close()
 
 
-def test_fullscreen_wheel_filter_ignores_non_widget_receiver(qapp) -> None:
+def test_fullscreen_wheel_filter_handles_only_current_window_bottom_region(
+    qapp,
+    monkeypatch,
+) -> None:
     window = QMainWindow()
     central = QWidget(window)
     layout = QVBoxLayout(central)
@@ -519,12 +528,42 @@ def test_fullscreen_wheel_filter_ignores_non_widget_receiver(qapp) -> None:
     window.resize(640, 480)
     window.show()
     controller.set_fullscreen_state(True, hide_ui=True, hide_cursor=False)
+    controller.show_bottom()
     qapp.processEvents()
     window_handle = window.windowHandle()
     assert window_handle is not None
-    event = QWheelEvent(
+    region = controller._bottom_hover_region_global()
+    calls: list[str] = []
+    slider.nextDisplayUnitRequested.connect(lambda: calls.append("next"))
+    process_calls = 0
+    original_process = slider.process_wheel_delta
+
+    def counted_process(angle_delta: QPoint, pixel_delta: QPoint) -> bool:
+        nonlocal process_calls
+        process_calls += 1
+        return original_process(angle_delta, pixel_delta)
+
+    monkeypatch.setattr(slider, "process_wheel_delta", counted_process)
+    for x in (region.left(), region.center().x(), region.right()):
+        event = QWheelEvent(
+            QPointF(1, 1),
+            QPointF(x, region.bottom()),
+            QPoint(),
+            QPoint(0, -120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.ScrollUpdate,
+            False,
+        )
+        assert controller.eventFilter(window_handle, event) is True
+        assert event.isAccepted()
+
+    assert calls == ["next"] * 3
+    assert process_calls == 3
+
+    above = QWheelEvent(
         QPointF(1, 1),
-        QPointF(1, 1),
+        QPointF(region.center().x(), region.top() - 1),
         QPoint(),
         QPoint(0, -120),
         Qt.MouseButton.NoButton,
@@ -532,11 +571,27 @@ def test_fullscreen_wheel_filter_ignores_non_widget_receiver(qapp) -> None:
         Qt.ScrollPhase.ScrollUpdate,
         False,
     )
+    assert controller.eventFilter(window_handle, above) is False
+    assert process_calls == 3
 
-    assert controller.eventFilter(window_handle, event) is False
+    other_window = QWindow()
+    other_window.create()
+    other_event = QWheelEvent(
+        QPointF(1, 1),
+        QPointF(region.center().x(), region.bottom()),
+        QPoint(),
+        QPoint(0, -120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    assert controller.eventFilter(other_window, other_event) is False
+    assert process_calls == 3
 
     controller.set_active(False)
     controller.shutdown()
+    other_window.destroy()
     window.close()
 
 
@@ -586,6 +641,7 @@ def test_bottom_overlay_wheel_accumulates_once_without_other_ui_capture(
 def test_fullscreen_overlays_are_flush_with_parent_edges(
     qapp,
     size: tuple[int, int],
+    monkeypatch,
 ) -> None:
     window = QMainWindow()
     central = QWidget(window)
@@ -604,6 +660,12 @@ def test_fullscreen_overlays_are_flush_with_parent_edges(
         slider=slider,
         status_bar=status,
     )
+    native_states: list[bool] = []
+    monkeypatch.setattr(
+        controller,
+        "_apply_native_fullscreen_frame",
+        native_states.append,
+    )
     window.resize(*size)
     window.show()
     controller.set_fullscreen_state(True, hide_ui=True, hide_cursor=False)
@@ -615,6 +677,11 @@ def test_fullscreen_overlays_are_flush_with_parent_edges(
     assert controller.top_overlay.autoFillBackground()
     assert controller.bottom_overlay.autoFillBackground()
     expected_background = window.palette().color(QPalette.ColorRole.Window)
+    assert central.autoFillBackground()
+    assert (
+        central.palette().color(QPalette.ColorRole.Window)
+        == expected_background
+    )
     assert (
         controller.top_overlay.palette().color(QPalette.ColorRole.Window)
         == expected_background
@@ -638,8 +705,10 @@ def test_fullscreen_overlays_are_flush_with_parent_edges(
     assert controller.bottom_overlay.geometry().bottom() == central.rect().bottom()
     assert controller.top_overlay.autoFillBackground()
     assert controller.bottom_overlay.autoFillBackground()
+    assert True in native_states
 
     controller.set_active(False)
+    assert native_states[-1] is False
     controller.shutdown()
     window.close()
 
