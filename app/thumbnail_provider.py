@@ -127,14 +127,26 @@ class _ThumbnailWorker(QRunnable):
                 image,
             )
 
-        result = _invoke_thumbnail_loader(
-            self.loader,
-            self.item,
-            self.size,
-            self.cancelled,
-            self.priority,
-            report_provisional,
-        )
+        try:
+            result = _invoke_thumbnail_loader(
+                self.loader,
+                self.item,
+                self.size,
+                self.cancelled,
+                self.priority,
+                report_provisional,
+            )
+        except Exception:
+            _THUMBNAIL_LOG.exception(
+                "thumbnail worker failed path=%s generation=%s",
+                self.item.path,
+                self.generation,
+            )
+            result = ThumbnailLoadResult(
+                None,
+                result_kind=PreviewResultKind.FAILED,
+                persist_to_disk=False,
+            )
         self.signals.finished.emit(
             str(self.item.path),
             self.generation,
