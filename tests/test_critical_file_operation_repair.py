@@ -32,6 +32,7 @@ from app.file_operation_plan import (
     FileOperationState,
 )
 from app.file_operation_service import (
+    FileCollisionPolicy,
     FileOperationErrorCode,
     FileOperationItemState,
     FileOperationKind,
@@ -242,6 +243,111 @@ def test_cleanup_failure_is_structured_and_source_is_not_removed(
     assert item.cleanup_errors == ("cleanup locked",)
     assert source.exists()
     assert not (destination_folder / source.name).exists()
+
+
+def test_directory_replace_publish_failure_restores_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source" / "book"
+    destination_root = tmp_path / "destination"
+    destination = destination_root / source.name
+    source.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    (source / "new.txt").write_text("new", encoding="utf-8")
+    (destination / "old.txt").write_text("old", encoding="utf-8")
+    original_replace = os.replace
+    backup_paths: list[Path] = []
+
+    def fail_publish(old, new):
+        old_path = Path(old)
+        new_path = Path(new)
+        if old_path == destination:
+            backup_paths.append(new_path)
+            return original_replace(old, new)
+        if new_path == destination and old_path != backup_paths[0]:
+            raise PermissionError("publish locked")
+        return original_replace(old, new)
+
+    monkeypatch.setattr("app.file_operation_service.os.replace", fail_publish)
+
+    result = FileOperationService().copy(
+        [source],
+        destination_root,
+        collision_policy=FileCollisionPolicy.REPLACE,
+    )
+    item = result.items[0]
+
+    assert not item.success
+    assert source.exists()
+    assert destination.exists()
+    assert (destination / "old.txt").read_text(encoding="utf-8") == "old"
+    assert not backup_paths[0].exists()
+    assert item.artifact_paths == ()
+    assert item.cleanup_errors == ()
+    assert FileOperationArtifactPolicy.find_orphans(destination_root) == ()
+
+
+def test_directory_replace_publish_and_rollback_failure_reports_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source" / "book"
+    destination_root = tmp_path / "destination"
+    destination = destination_root / source.name
+    source.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    (source / "new.txt").write_text("new", encoding="utf-8")
+    (destination / "old.txt").write_text("old", encoding="utf-8")
+    original_replace = os.replace
+    backup_paths: list[Path] = []
+    rollback_attempts = 0
+
+    def fail_publish_and_rollback(old, new):
+        nonlocal rollback_attempts
+        old_path = Path(old)
+        new_path = Path(new)
+        if old_path == destination:
+            backup_paths.append(new_path)
+            return original_replace(old, new)
+        if new_path == destination:
+            if backup_paths and old_path == backup_paths[0]:
+                rollback_attempts += 1
+                raise PermissionError("rollback locked")
+            raise PermissionError("publish locked")
+        return original_replace(old, new)
+
+    monkeypatch.setattr(
+        "app.file_operation_service.os.replace",
+        fail_publish_and_rollback,
+    )
+
+    result = FileOperationService().move(
+        [source],
+        destination_root,
+        collision_policy=FileCollisionPolicy.REPLACE,
+    )
+    item = result.items[0]
+    backup = backup_paths[0]
+
+    assert not item.success
+    assert item.error_code == FileOperationErrorCode.ARTIFACT_CLEANUP_FAILED.value
+    assert source.exists()
+    assert (source / "new.txt").read_text(encoding="utf-8") == "new"
+    assert not destination.exists()
+    assert backup.exists()
+    assert (backup / "old.txt").read_text(encoding="utf-8") == "old"
+    assert item.source_exists_after is True
+    assert item.destination_exists_after is False
+    assert item.destination_published is False
+    assert item.artifact_paths == (str(backup),)
+    assert item.cleanup_errors == (
+        "backup復元に失敗しました: rollback locked",
+    )
+    assert rollback_attempts == 2
+    assert FileOperationArtifactPolicy.find_orphans(destination_root) == (
+        str(backup),
+    )
 
 
 def test_cancel_during_copy_removes_staging_and_keeps_source(
