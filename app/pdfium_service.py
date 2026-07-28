@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import StrEnum
+import logging
 from queue import PriorityQueue
 from threading import Lock, Thread
 import time
@@ -19,6 +20,9 @@ from .pdf_backend import (
     is_cancelled,
 )
 from .pdfium_backend import PdfiumBackend
+
+
+_PDFIUM_LOG = logging.getLogger("nivisviewer.pdfium")
 
 
 class PdfiumServiceState(StrEnum):
@@ -88,6 +92,7 @@ class PdfiumService:
         self._active_job: _PendingJob | None = None
         self._closing_documents: set[str] = set()
         self._shutdown_future: Future | None = None
+        self.last_shutdown_error: str | None = None
         self._active_calls = 0
         self.maximum_concurrent_calls = 0
         self._availability = PdfAvailabilitySnapshot(
@@ -98,7 +103,7 @@ class PdfiumService:
         self._worker = Thread(
             target=self._run,
             name="NivisViewer-Pdfium",
-            daemon=True,
+            daemon=False,
         )
         self._worker.start()
         if auto_probe:
@@ -293,13 +298,17 @@ class PdfiumService:
             return False
         return True
 
-    def shutdown(self, *, wait_seconds: float = 0.5) -> None:
+    def shutdown(self, *, wait_seconds: float = 0.5) -> bool:
         cancelled: list[_PendingJob] = []
+        active_job: _PendingJob | None = None
+        already_stopped = False
         with self._lock:
             if self._state is PdfiumServiceState.STOPPED:
-                return
-            if self._state is PdfiumServiceState.SHUTTING_DOWN:
                 close_future = self._shutdown_future
+                already_stopped = True
+            elif self._state is PdfiumServiceState.SHUTTING_DOWN:
+                close_future = self._shutdown_future
+                active_job = self._active_job
             else:
                 self._state = PdfiumServiceState.SHUTTING_DOWN
                 self._availability = PdfAvailabilitySnapshot(
@@ -312,6 +321,7 @@ class PdfiumService:
                     if self._active_job is not None
                     else None
                 )
+                active_job = self._active_job
                 for key, job in tuple(self._pending.items()):
                     if key != active_key:
                         self._pending.pop(key, None)
@@ -336,14 +346,49 @@ class PdfiumService:
                         close_job.key,
                     )
                 )
-        self._cancel_jobs(cancelled, "PDF service is stopping")
+        if not already_stopped:
+            self._cancel_jobs(cancelled, "PDF service is stopping")
+            if active_job is not None:
+                self._request_job_cancel(active_job)
         timeout = max(0.0, float(wait_seconds))
+        deadline = time.monotonic() + timeout
         if close_future is not None:
             try:
                 close_future.result(timeout=timeout)
             except Exception:
                 pass
-        self._worker.join(timeout=timeout)
+        remaining = max(0.0, deadline - time.monotonic())
+        self._worker.join(timeout=remaining)
+        if self._worker.is_alive():
+            self._record_shutdown_error(
+                "PDFium worker did not stop before the shutdown timeout.",
+                log=True,
+            )
+            return False
+        if close_future is not None:
+            try:
+                close_future.result(timeout=0)
+            except BaseException as exc:
+                detail = getattr(exc, "debug_message", None) or str(exc)
+                self._record_shutdown_error(
+                    (
+                        "PDFium document close failed: "
+                        f"{type(exc).__name__}: {detail}"
+                    ),
+                    log=False,
+                )
+                return False
+        with self._lock:
+            stopped = self._state is PdfiumServiceState.STOPPED
+            if stopped:
+                self.last_shutdown_error = None
+        if not stopped:
+            self._record_shutdown_error(
+                "PDFium worker exited without completing shutdown.",
+                log=True,
+            )
+            return False
+        return True
 
     def _submit(
         self,
@@ -472,6 +517,7 @@ class PdfiumService:
     @classmethod
     def _cancel_jobs(cls, jobs: list[_PendingJob], message: str) -> None:
         for job in jobs:
+            cls._request_job_cancel(job)
             if not job.future.done():
                 job.future.set_exception(
                     PdfBackendError(
@@ -479,6 +525,22 @@ class PdfiumService:
                         debug_message=message,
                     )
                 )
+
+    @staticmethod
+    def _request_job_cancel(job: _PendingJob) -> None:
+        token = job.cancel_token
+        for method_name in ("set", "cancel"):
+            method = getattr(token, method_name, None)
+            if callable(method):
+                method()
+                return
+
+    def _record_shutdown_error(self, message: str, *, log: bool) -> None:
+        with self._lock:
+            repeated = self.last_shutdown_error == message
+            self.last_shutdown_error = message
+        if log and not repeated:
+            _PDFIUM_LOG.error(message)
 
     @staticmethod
     def _cancelled_future(message: str) -> Future:

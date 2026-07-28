@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import logging
 from pathlib import Path
 from threading import Event, Lock
 import time
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from PIL import Image
@@ -35,7 +38,7 @@ from app.pdf_backend import (
 )
 from app.pdf_image_source import PdfImageSource
 from app.pdfium_backend import PdfiumBackend
-from app.pdfium_service import PdfiumService
+from app.pdfium_service import PdfiumService, PdfiumServiceState
 from app.thumbnail_provider import BrowserThumbnailProvider
 from app.browser_thumbnail_scheduler import ThumbnailPriority
 from app.viewer_widget import ViewerWidget
@@ -425,9 +428,10 @@ def test_pdf_service_skips_cancelled_request_and_shutdown_is_idempotent():
         )
     assert exc_info.value.code is PdfErrorCode.CANCELLED
     assert not backend.rendered
-    service.shutdown()
-    service.shutdown()
+    assert service.shutdown()
+    assert service.shutdown()
     assert backend.close_all_count == 1
+    assert not service._worker.is_alive()
 
 
 def test_controller_shares_one_pdf_service_with_browser_and_viewers(
@@ -455,6 +459,135 @@ def test_controller_shares_one_pdf_service_with_browser_and_viewers(
         browser.close()
         qapp.processEvents()
         controller.shutdown()
+    assert backend.close_all_count == 1
+
+
+def test_browser_close_keeps_shared_pdf_service_running_for_viewer(
+    tmp_path,
+    qapp: QApplication,
+):
+    pdf = tmp_path / "browser-close.pdf"
+    pdf.write_bytes(b"fake")
+    backend = FakeBackend()
+    service = PdfiumService(backend)
+    shutdown = Mock(wraps=service.shutdown)
+    service.shutdown = shutdown
+    controller = ApplicationController(
+        qapp,
+        config_manager=ConfigManager(tmp_path / "config.json"),
+        pdfium_service=service,
+    )
+    browser = controller.create_browser_window()
+    viewer = controller.open_path(pdf, open_in_new_window=True)
+    try:
+        deadline = time.monotonic() + 3
+        while viewer.model.total_pages != 3 and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.005)
+        assert viewer.model.total_pages == 3
+        assert not browser._owns_pdfium_service
+        assert not viewer._owns_pdfium_service
+
+        assert viewer.image_cache.wait_for_done(3000)
+        qapp.processEvents()
+        backend.rendered.clear()
+        viewer.image_cache.set_render_spec(
+            PageRenderSpec(96, 96, size_bucket=(64, 64))
+        )
+        viewer.image_cache.preload_around(1, radius=0, visible_indexes=(1,))
+        deadline = time.monotonic() + 3
+        while viewer.image_cache.get(1) is None and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.005)
+        cached_before_close = viewer.image_cache.get(1)
+        assert cached_before_close is not None
+        assert cached_before_close.error is None
+        assert len(backend.rendered) == 1
+        assert shutdown.call_count == 0
+
+        browser.close()
+        qapp.processEvents()
+
+        assert controller.get_browser_window() is None
+        assert controller.viewer_windows == (viewer,)
+        assert service.state is PdfiumServiceState.RUNNING
+        assert shutdown.call_count == 0
+        assert backend.close_all_count == 0
+
+        backend.rendered.clear()
+        viewer.image_cache.set_render_spec(
+            PageRenderSpec(96, 96, size_bucket=(128, 128))
+        )
+        viewer.image_cache.preload_around(1, radius=0, visible_indexes=(1,))
+        deadline = time.monotonic() + 3
+        while viewer.image_cache.get(1) is None and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.005)
+        cached = viewer.image_cache.get(1)
+        assert cached is not None
+        assert cached.error is None
+        assert len(backend.rendered) == 1
+        assert backend.rendered[0].page_index == 1
+        assert service.state is PdfiumServiceState.RUNNING
+        assert shutdown.call_count == 0
+    finally:
+        viewer.close()
+        qapp.processEvents()
+        controller.shutdown()
+    assert shutdown.call_count == 1
+    assert backend.close_all_count == 1
+
+
+def test_viewer_close_keeps_shared_pdf_service_running_for_browser_preview(
+    tmp_path,
+    qapp: QApplication,
+):
+    pdf = tmp_path / "viewer-close.pdf"
+    pdf.write_bytes(b"fake")
+    backend = FakeBackend()
+    service = PdfiumService(backend)
+    shutdown = Mock(wraps=service.shutdown)
+    service.shutdown = shutdown
+    controller = ApplicationController(
+        qapp,
+        config_manager=ConfigManager(tmp_path / "config.json"),
+        pdfium_service=service,
+    )
+    browser = controller.create_browser_window()
+    viewer = controller.open_path(pdf, open_in_new_window=True)
+    try:
+        deadline = time.monotonic() + 3
+        while viewer.model.total_pages != 3 and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.005)
+        assert viewer.model.total_pages == 3
+
+        viewer.close()
+        qapp.processEvents()
+
+        assert controller.viewer_windows == ()
+        assert controller.get_browser_window() is browser
+        assert service.state is PdfiumServiceState.RUNNING
+        assert shutdown.call_count == 0
+        result = BrowserThumbnailProvider.load_thumbnail_result(
+            BrowserItem(
+                display_name=pdf.name,
+                path=pdf,
+                kind=BrowserItemKind.PDF,
+                modified_at=None,
+            ),
+            64,
+            pdfium_service=service,
+        )
+        assert result.image is not None
+        assert not result.image.isNull()
+        assert service.state is PdfiumServiceState.RUNNING
+        assert shutdown.call_count == 0
+    finally:
+        browser.close()
+        qapp.processEvents()
+        controller.shutdown()
+    assert shutdown.call_count == 1
     assert backend.close_all_count == 1
 
 
@@ -853,6 +986,54 @@ def test_pdfium_backend_v5_page_api_and_explicit_lifetimes(tmp_path):
     backend.close_document(info.document_id)
     backend.close_document(info.document_id)
     assert module.document_closed == 1
+
+
+def test_pdfium_backend_close_all_attempts_every_document_and_aggregates_errors(
+    caplog,
+):
+    attempts: list[str] = []
+
+    class ClosingDocument:
+        def __init__(self, name: str, *, fail: bool = False) -> None:
+            self.name = name
+            self.fail = fail
+
+        def close(self) -> None:
+            attempts.append(self.name)
+            if self.fail:
+                raise RuntimeError(f"close failed: {self.name}")
+
+    backend = PdfiumBackend(pdfium_module=FakePdfiumModule())
+    backend._documents = {
+        "first": SimpleNamespace(document=ClosingDocument("first", fail=True)),
+        "second": SimpleNamespace(document=ClosingDocument("second")),
+        "third": SimpleNamespace(document=ClosingDocument("third")),
+    }
+
+    with caplog.at_level(logging.ERROR, logger="nivisviewer.pdfium"):
+        with pytest.raises(PdfBackendError) as exc_info:
+            backend.close_all()
+
+    assert exc_info.value.code is PdfErrorCode.INTERNAL_ERROR
+    assert exc_info.value.debug_message is not None
+    assert "1" in exc_info.value.debug_message
+    assert attempts == ["first", "second", "third"]
+    assert backend._documents == {}
+    close_errors = [
+        record
+        for record in caplog.records
+        if record.name == "nivisviewer.pdfium"
+        and "PDF document close failed" in record.getMessage()
+    ]
+    assert len(close_errors) == 1
+
+    backend.close_all()
+    assert attempts == ["first", "second", "third"]
+    assert sum(
+        record.name == "nivisviewer.pdfium"
+        and "PDF document close failed" in record.getMessage()
+        for record in caplog.records
+    ) == 1
 
 
 def test_pdfium_backend_rejects_zero_pages_and_closes(tmp_path):

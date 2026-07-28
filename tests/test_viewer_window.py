@@ -103,6 +103,7 @@ def test_closing_stale_window_does_not_roll_back_shared_setting(
     for window in close_remaining:
         controller.close_viewer_window(window)
     qapp.processEvents()
+    controller.shutdown()
 
 
 def test_short_offscreen_show_and_close(tmp_path: Path, qapp: QApplication) -> None:

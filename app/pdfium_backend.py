@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+import logging
 import os
 from pathlib import Path
 from threading import RLock
@@ -20,6 +21,9 @@ from .pdf_backend import (
     is_cancelled,
     validate_page_size,
 )
+
+
+_PDFIUM_LOG = logging.getLogger("nivisviewer.pdfium")
 
 
 @dataclass
@@ -208,10 +212,25 @@ class PdfiumBackend:
 
     def close_all(self) -> None:
         with self._lock:
-            states = tuple(self._documents.values())
+            states = tuple(self._documents.items())
             self._documents.clear()
-        for state in states:
-            state.document.close()
+        failures = 0
+        for document_id, state in states:
+            try:
+                state.document.close()
+            except Exception:
+                failures += 1
+                _PDFIUM_LOG.exception(
+                    "PDF document close failed document_id=%s",
+                    document_id,
+                )
+        if failures:
+            raise PdfBackendError(
+                PdfErrorCode.INTERNAL_ERROR,
+                debug_message=(
+                    f"{failures} PDF document(s) could not be closed."
+                ),
+            )
 
     def _module(self):
         if self._pdfium_module is not None:
