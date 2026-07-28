@@ -130,6 +130,7 @@ class PdfRenderRequest:
         return (
             self.document_id,
             self.page_index,
+            self.generation,
             self.target_width_px,
             self.target_height_px,
             self.rotation_degrees % 360,

@@ -556,10 +556,11 @@ class PdfiumService:
     @staticmethod
     def _wait(future: Future, cancel_token):
         while not future.done():
-            if is_cancelled(cancel_token):
-                raise PdfBackendError(PdfErrorCode.CANCELLED)
             time.sleep(0.01)
-        return future.result()
+        result = future.result()
+        if is_cancelled(cancel_token):
+            raise PdfBackendError(PdfErrorCode.CANCELLED)
+        return result
 
     def _next_sequence(self) -> int:
         with self._lock:

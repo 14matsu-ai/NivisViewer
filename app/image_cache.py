@@ -9,8 +9,8 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 from PySide6.QtGui import QImage
 
 from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
-from .image_source import ImageSource
-from .pdf_backend import PageRenderSpec, PdfRenderPriority
+from .image_source import ImageSource, ImageSourceError
+from .pdf_backend import PageRenderSpec, PdfErrorCode, PdfRenderPriority
 from .performance_trace import performance_trace
 from .thumbnail_render import pil_to_qimage
 
@@ -34,6 +34,7 @@ class CachedImage:
 class _ImageLoadResult:
     cached: CachedImage
     source: ImageSource
+    cancelled: bool = False
 
 
 class _ImageLoadSignals(QObject):
@@ -70,6 +71,7 @@ class _ImageLoadTask(QRunnable):
             "viewer.worker.started",
             f"page={self.page_index}",
         )
+        cancelled = False
         try:
             qimage: QImage | None = None
             original_size: tuple[int, int] | None = None
@@ -152,6 +154,16 @@ class _ImageLoadTask(QRunnable):
                     else 0
                 ),
             )
+        except ImageSourceError as exc:
+            cancelled = exc.code == PdfErrorCode.CANCELLED.value
+            result = CachedImage(
+                page_index=self.page_index,
+                image_id=self.image_id,
+                qimage=None,
+                original_size=None,
+                error=str(exc),
+                generation=self.generation,
+            )
         except Exception as exc:
             result = CachedImage(
                 page_index=self.page_index,
@@ -161,7 +173,9 @@ class _ImageLoadTask(QRunnable):
                 error=str(exc),
                 generation=self.generation,
             )
-        self.signals.loaded.emit(_ImageLoadResult(result, self.source))
+        self.signals.loaded.emit(
+            _ImageLoadResult(result, self.source, cancelled=cancelled)
+        )
 
     @staticmethod
     def _pil_to_qimage(image: Image.Image) -> QImage:
@@ -257,6 +271,7 @@ class ImageCache(QObject):
         *,
         trace_id: int = 0,
     ) -> None:
+        self._cancel_in_flight()
         self.generation += 1
         self.source = source
         self.image_ids = list(image_ids)
@@ -437,6 +452,8 @@ class ImageCache(QObject):
         self._tasks.pop((cached.generation, cached.page_index), None)
         if not self.has_in_flight_for_source(result.source):
             self.sourceIdle.emit(result.source)
+        if result.cancelled:
+            return
         if cached.generation != self.generation:
             return
         if not (0 <= cached.page_index < len(self.image_ids)):
