@@ -245,6 +245,37 @@ def test_page_list_selection_resolves_focused_index_once(
     qapp.processEvents()
 
 
+def test_page_navigation_does_not_stat_displayed_folder_image(
+    tmp_path: Path,
+    qapp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window, pages = _viewer_with_pages(tmp_path, qapp, page_count=7)
+    assert window.image_cache.wait_for_done(2000)
+    qapp.processEvents()
+    page_keys = {
+        str(path.absolute()).casefold()
+        for path in pages
+    }
+    stat_calls: list[str] = []
+    original_stat = Path.stat
+
+    def counted_stat(path: Path, *args, **kwargs):
+        if str(path.absolute()).casefold() in page_keys:
+            stat_calls.append(str(path))
+        return original_stat(path, *args, **kwargs)
+
+    previous_index = window.model.focused_index
+    with monkeypatch.context() as guard:
+        guard.setattr(Path, "stat", counted_stat)
+        window.next_page()
+
+    assert window.model.focused_index != previous_index
+    assert stat_calls == []
+    window.close()
+    qapp.processEvents()
+
+
 def test_slider_angle_wheel_moves_one_page_and_is_accepted(qapp) -> None:
     slider = ViewerPageSlider()
     slider.set_single_page_wheel_enabled(True)
