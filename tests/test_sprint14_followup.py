@@ -339,6 +339,82 @@ def test_pending_viewer_prefetch_is_promoted_when_it_becomes_current(
     coordinator.shutdown()
 
 
+def test_jump_removes_old_queued_prefetch_before_new_nearby_work(
+    qapp,
+    tmp_path,
+):
+    class JumpSource(ImageSource):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.ids = [f"page{index}.jpg" for index in range(30)]
+            self.started: list[str] = []
+            self.cancelled: list[str] = []
+            self.current_started = Event()
+            self.release_current = Event()
+
+        def list_images(self) -> list[str]:
+            return list(self.ids)
+
+        def open_image(self, image_id: str) -> Image.Image:
+            self.started.append(image_id)
+            if image_id == "page0.jpg":
+                self.current_started.set()
+                assert self.release_current.wait(2)
+            return Image.new("RGB", (8, 12), "white")
+
+        def cancel_image_request(self, image_id: str) -> None:
+            self.cancelled.append(image_id)
+
+        def display_path(self, image_id: str) -> str:
+            return image_id
+
+    coordinator = ImageWorkCoordinator(max_workers=2)
+    source = JumpSource(tmp_path)
+    cache = ImageCache(image_work_coordinator=coordinator)
+    cache.set_source(source, source.ids)
+    cache.preload_around(0, radius=3, visible_indexes=(0,))
+    assert source.current_started.wait(1)
+    generation = cache.generation
+    assert {
+        (generation, index)
+        for index in range(4)
+    }.issubset(cache._tasks)
+
+    cache.preload_around(20, radius=3, visible_indexes=(20,))
+
+    assert (generation, 0) in cache._tasks
+    assert all(
+        (generation, index) not in cache._tasks
+        for index in (1, 2, 3)
+    )
+    assert all(
+        (generation, index) in cache._tasks
+        for index in range(17, 24)
+    )
+
+    source.release_current.set()
+    assert cache.wait_for_done(3000)
+    qapp.processEvents()
+
+    assert source.started == [
+        "page0.jpg",
+        "page20.jpg",
+        "page21.jpg",
+        "page22.jpg",
+        "page23.jpg",
+        "page17.jpg",
+        "page18.jpg",
+        "page19.jpg",
+    ]
+    assert all(
+        old_prefetch not in source.started
+        for old_prefetch in ("page1.jpg", "page2.jpg", "page3.jpg")
+    )
+    assert cache._tasks == {}
+    assert cache._in_flight == {}
+    coordinator.shutdown()
+
+
 def test_spread_displays_current_before_slow_partner(qapp, tmp_path):
     source = OrderedSource(tmp_path, block_partner=True)
     coordinator = ImageWorkCoordinator(max_workers=2)
