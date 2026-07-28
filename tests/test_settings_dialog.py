@@ -344,6 +344,6 @@ def test_viewer_canvas_click_controls_use_requested_labels(
     ]
     assert (
         dialog.viewer_slider_wheel_single_page_checkbox.text()
-        == "シークバー上のマウスホイールで1ページずつ移動する"
+        == "下部UI上のマウスホイールで1ページずつ移動する"
     )
     dialog.reject()

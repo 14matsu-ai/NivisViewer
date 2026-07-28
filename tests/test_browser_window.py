@@ -73,6 +73,40 @@ def test_show_folder_sidebar_and_settings_round_trip(
     assert config.get("browser_window_geometry")
 
 
+def test_settings_action_is_direct_and_triggers_existing_dialog_path_once(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "本棚"
+    folder.mkdir()
+    opened: list[BrowserWindow] = []
+    monkeypatch.setattr(
+        BrowserWindow,
+        "open_settings_dialog",
+        lambda window: opened.append(window),
+    )
+    window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    finish_scan(window, qapp)
+
+    actions = window.menuBar().actions()
+    settings_actions = [
+        action for action in actions if action.text() == "環境設定…"
+    ]
+    assert settings_actions == [window.settings_action]
+    assert window.settings_action.menu() is None
+    assert not any(
+        action.text() == "設定" and action.menu() is not None
+        for action in actions
+    )
+
+    window.settings_action.trigger()
+
+    assert opened == [window]
+    window.close()
+    qapp.processEvents()
+
+
 def test_item_activation_passes_image_and_archive_but_folder_navigates(
     tmp_path: Path,
     qapp: QApplication,

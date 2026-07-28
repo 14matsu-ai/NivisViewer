@@ -5,9 +5,16 @@ from pathlib import Path
 import pytest
 from PIL import Image
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt
-from PySide6.QtGui import QCursor, QMouseEvent, QWheelEvent
+from PySide6.QtGui import QCursor, QMouseEvent, QPalette, QWheelEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMainWindow, QStatusBar, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QLabel,
+    QMainWindow,
+    QStatusBar,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app.config_manager import ConfigManager
 from app.fullscreen_chrome import FullscreenChromeController
@@ -55,14 +62,14 @@ def _indexes(model: PageModel) -> list[int]:
     return sorted(slot.page_index for slot in model.spread_at().slots)
 
 
-def _wheel(
+def _wheel_event(
     target: QWidget,
     *,
     angle_y: int = 0,
     pixel_y: int = 0,
     angle_x: int = 0,
 ) -> QWheelEvent:
-    event = QWheelEvent(
+    return QWheelEvent(
         QPointF(10, 10),
         QPointF(target.mapToGlobal(QPoint(10, 10))),
         QPoint(0, pixel_y),
@@ -71,6 +78,21 @@ def _wheel(
         Qt.KeyboardModifier.NoModifier,
         Qt.ScrollPhase.ScrollUpdate,
         False,
+    )
+
+
+def _wheel(
+    target: QWidget,
+    *,
+    angle_y: int = 0,
+    pixel_y: int = 0,
+    angle_x: int = 0,
+) -> QWheelEvent:
+    event = _wheel_event(
+        target,
+        angle_y=angle_y,
+        pixel_y=pixel_y,
+        angle_x=angle_x,
     )
     QApplication.sendEvent(target, event)
     return event
@@ -377,6 +399,249 @@ def test_normal_and_fullscreen_use_the_same_page_slider(
     assert window.slider is slider
     window.close()
     qapp.processEvents()
+
+
+def test_bottom_overlay_and_children_reuse_slider_wheel_path_once(
+    qapp,
+    monkeypatch,
+) -> None:
+    window = QMainWindow()
+    central = QWidget(window)
+    layout = QVBoxLayout(central)
+    viewer = QWidget(central)
+    slider = ViewerPageSlider(central)
+    layout.addWidget(viewer, 1)
+    layout.addWidget(slider)
+    window.setCentralWidget(central)
+    status = QStatusBar(window)
+    window.setStatusBar(status)
+    controller = FullscreenChromeController(
+        window,
+        viewer=viewer,
+        menu_bar=window.menuBar(),
+        slider=slider,
+        status_bar=status,
+    )
+    child_label = QLabel("ページ", controller.fullscreen_status_bar)
+    controller.fullscreen_status_bar.addPermanentWidget(child_label)
+    slider.set_page_state(10, 5)
+    slider.set_single_page_wheel_enabled(True)
+    single_calls: list[str] = []
+    display_calls: list[str] = []
+    slider.nextSinglePageRequested.connect(
+        lambda: single_calls.append("next")
+    )
+    slider.nextDisplayUnitRequested.connect(
+        lambda: display_calls.append("next")
+    )
+    window.resize(640, 480)
+    window.show()
+    controller.set_fullscreen_state(True, hide_ui=True, hide_cursor=False)
+    controller.show_bottom()
+    qapp.processEvents()
+
+    slider_event = _wheel(slider, angle_y=-120)
+    assert slider_event.isAccepted()
+    assert single_calls == ["next"]
+
+    def unexpected_wheel_event(_event: QWheelEvent) -> None:
+        raise AssertionError("overlay wheel must not call slider.wheelEvent")
+
+    monkeypatch.setattr(slider, "wheelEvent", unexpected_wheel_event)
+    for target in (
+        controller.bottom_overlay,
+        controller.fullscreen_status_bar,
+        child_label,
+    ):
+        event = _wheel(target, angle_y=-120)
+        assert event.isAccepted()
+
+    assert single_calls == ["next"] * 4
+    assert display_calls == []
+    assert slider.value() == 5
+
+    horizontal_event = _wheel_event(
+        controller.bottom_overlay,
+        angle_x=120,
+    )
+    assert (
+        controller.eventFilter(
+            controller.bottom_overlay,
+            horizontal_event,
+        )
+        is True
+    )
+    assert horizontal_event.isAccepted()
+    assert single_calls == ["next"] * 4
+
+    slider_child = QWidget(slider)
+    child_event = QWheelEvent(
+        QPointF(1, 1),
+        QPointF(slider.mapToGlobal(QPoint(1, 1))),
+        QPoint(),
+        QPoint(0, -120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    assert controller.eventFilter(slider_child, child_event) is False
+    assert single_calls == ["next"] * 4
+
+    slider.set_single_page_wheel_enabled(False)
+    event = _wheel(controller.fullscreen_status_bar, angle_y=-120)
+    assert event.isAccepted()
+    assert display_calls == ["next"]
+
+    controller.set_active(False)
+    controller.shutdown()
+    window.close()
+
+
+def test_fullscreen_wheel_filter_ignores_non_widget_receiver(qapp) -> None:
+    window = QMainWindow()
+    central = QWidget(window)
+    layout = QVBoxLayout(central)
+    viewer = QWidget(central)
+    slider = ViewerPageSlider(central)
+    layout.addWidget(viewer, 1)
+    layout.addWidget(slider)
+    window.setCentralWidget(central)
+    status = QStatusBar(window)
+    window.setStatusBar(status)
+    controller = FullscreenChromeController(
+        window,
+        viewer=viewer,
+        menu_bar=window.menuBar(),
+        slider=slider,
+        status_bar=status,
+    )
+    window.resize(640, 480)
+    window.show()
+    controller.set_fullscreen_state(True, hide_ui=True, hide_cursor=False)
+    qapp.processEvents()
+    window_handle = window.windowHandle()
+    assert window_handle is not None
+    event = QWheelEvent(
+        QPointF(1, 1),
+        QPointF(1, 1),
+        QPoint(),
+        QPoint(0, -120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+
+    assert controller.eventFilter(window_handle, event) is False
+
+    controller.set_active(False)
+    controller.shutdown()
+    window.close()
+
+
+def test_bottom_overlay_wheel_accumulates_once_without_other_ui_capture(
+    qapp,
+) -> None:
+    window = QMainWindow()
+    central = QWidget(window)
+    layout = QVBoxLayout(central)
+    viewer = QWidget(central)
+    slider = ViewerPageSlider(central)
+    layout.addWidget(viewer, 1)
+    layout.addWidget(slider)
+    window.setCentralWidget(central)
+    status = QStatusBar(window)
+    window.setStatusBar(status)
+    controller = FullscreenChromeController(
+        window,
+        viewer=viewer,
+        menu_bar=window.menuBar(),
+        slider=slider,
+        status_bar=status,
+    )
+    calls: list[str] = []
+    slider.nextDisplayUnitRequested.connect(lambda: calls.append("next"))
+    window.resize(640, 480)
+    window.show()
+    controller.set_fullscreen_state(True, hide_ui=True, hide_cursor=False)
+    controller.show_bottom()
+    qapp.processEvents()
+
+    for _index in range(4):
+        event = _wheel(controller.bottom_overlay, pixel_y=-10)
+        assert event.isAccepted()
+    assert calls == ["next"]
+
+    _wheel(viewer, angle_y=-120)
+    _wheel(controller.top_overlay, angle_y=-120)
+    assert calls == ["next"]
+
+    controller.set_active(False)
+    controller.shutdown()
+    window.close()
+
+
+@pytest.mark.parametrize("size", [(640, 480), (641, 479)])
+def test_fullscreen_overlays_are_flush_with_parent_edges(
+    qapp,
+    size: tuple[int, int],
+) -> None:
+    window = QMainWindow()
+    central = QWidget(window)
+    layout = QVBoxLayout(central)
+    viewer = QWidget(central)
+    slider = ViewerPageSlider(central)
+    layout.addWidget(viewer, 1)
+    layout.addWidget(slider)
+    window.setCentralWidget(central)
+    status = QStatusBar(window)
+    window.setStatusBar(status)
+    controller = FullscreenChromeController(
+        window,
+        viewer=viewer,
+        menu_bar=window.menuBar(),
+        slider=slider,
+        status_bar=status,
+    )
+    window.resize(*size)
+    window.show()
+    controller.set_fullscreen_state(True, hide_ui=True, hide_cursor=False)
+    controller.show_bottom()
+    qapp.processEvents()
+
+    assert controller.top_overlay.frameWidth() == 0
+    assert controller.bottom_overlay.frameWidth() == 0
+    assert controller.top_overlay.autoFillBackground()
+    assert controller.bottom_overlay.autoFillBackground()
+    expected_background = window.palette().color(QPalette.ColorRole.Window)
+    assert (
+        controller.top_overlay.palette().color(QPalette.ColorRole.Window)
+        == expected_background
+    )
+    assert (
+        controller.bottom_overlay.palette().color(QPalette.ColorRole.Window)
+        == expected_background
+    )
+    assert expected_background.alpha() > 0
+    assert controller.top_overlay.geometry().top() == central.rect().top()
+    assert controller.bottom_overlay.geometry().bottom() == central.rect().bottom()
+    assert controller._top_layout.spacing() == 0
+    assert controller._bottom_layout.spacing() == 0
+
+    controller.hide_overlays()
+    controller.show_bottom()
+    window.resize(size[0] + 37, size[1] + 29)
+    qapp.processEvents()
+
+    assert controller.top_overlay.geometry().top() == central.rect().top()
+    assert controller.bottom_overlay.geometry().bottom() == central.rect().bottom()
+    assert controller.top_overlay.autoFillBackground()
+    assert controller.bottom_overlay.autoFillBackground()
+
+    controller.set_active(False)
+    controller.shutdown()
+    window.close()
 
 
 def test_fullscreen_has_separate_top_and_bottom_trigger_widths(qapp) -> None:
