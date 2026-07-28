@@ -8,6 +8,7 @@ from PIL import Image
 
 from app.image_source import (
     FolderImageSource,
+    FolderListingSnapshot,
     ImageSourceError,
     ZipImageSource,
     create_image_source,
@@ -46,6 +47,65 @@ def test_single_image_opens_parent_folder_and_returns_selection(tmp_path: Path) 
     assert source.source_path == tmp_path
     assert selected_image == str(selected)
     assert selected_image in source.list_images()
+
+
+def test_folder_snapshot_file_size_does_not_restat_image(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "1.jpg"
+    selected = tmp_path / "2.jpg"
+    write_image(first)
+    write_image(selected)
+    first_size = first.stat().st_size
+    selected_size = selected.stat().st_size
+    snapshot = FolderListingSnapshot(
+        tmp_path,
+        (str(first), str(selected)),
+        str(selected),
+        (
+            (str(first), first_size, first.stat().st_mtime_ns),
+            (str(selected), selected_size, selected.stat().st_mtime_ns),
+        ),
+    )
+    source, selected_image = create_image_source(
+        selected,
+        folder_snapshot=snapshot,
+    )
+
+    def unexpected_stat(*_args, **_kwargs):
+        raise AssertionError("snapshot file size must not be restated")
+
+    monkeypatch.setattr(Path, "stat", unexpected_stat)
+
+    assert selected_image == str(selected)
+    assert source.file_size(str(first)) == first_size
+    assert source.file_size(str(selected)) == selected_size
+    source.close()
+
+
+def test_folder_loaded_bytes_supply_file_size_without_stat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "page.jpg"
+    write_image(image_path)
+    expected_size = image_path.stat().st_size
+    source = FolderImageSource(
+        tmp_path,
+        image_snapshot=(str(image_path),),
+    )
+    assert source.file_size(str(image_path)) is None
+
+    def unexpected_stat(*_args, **_kwargs):
+        raise AssertionError("loaded byte count must not require stat")
+
+    monkeypatch.setattr(Path, "stat", unexpected_stat)
+    with source.open_image(str(image_path)):
+        pass
+
+    assert source.file_size(str(image_path)) == expected_size
+    source.close()
 
 
 def test_zip_lists_images_in_subfolders_and_ignores_other_files(tmp_path: Path) -> None:

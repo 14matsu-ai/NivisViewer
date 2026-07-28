@@ -161,6 +161,7 @@ class FolderImageSource(ImageSource):
         recursive: bool = False,
         sort_descending: bool = False,
         image_snapshot: tuple[str, ...] | None = None,
+        file_size_snapshot: tuple[tuple[str, int | None], ...] | None = None,
     ) -> None:
         super().__init__(folder_path)
         self.recursive = recursive
@@ -170,6 +171,11 @@ class FolderImageSource(ImageSource):
         )
         self._listed_images: tuple[str, ...] | None = self._image_snapshot
         self._size_cache: dict[str, tuple[int, int]] = {}
+        self._file_size_cache = {
+            self._path_identity(image_id): max(0, int(file_size))
+            for image_id, file_size in (file_size_snapshot or ())
+            if file_size is not None
+        }
         if not self.source_path.is_dir():
             raise ImageSourceError(f"フォルダが見つかりません: {self.source_path}")
 
@@ -222,6 +228,7 @@ class FolderImageSource(ImageSource):
             # potentially expensive pixel decoding.  On Windows this avoids
             # holding the source file open while a queued Viewer task runs.
             data = _read_image_file_bytes(image_id)
+            self._file_size_cache[self._path_identity(image_id)] = len(data)
             with Image.open(io.BytesIO(data)) as image:
                 image.seek(0)
                 prepared = ImageOps.exif_transpose(image)
@@ -238,6 +245,7 @@ class FolderImageSource(ImageSource):
             data = _read_image_file_bytes(image_id)
         except OSError:
             return None
+        self._file_size_cache[self._path_identity(image_id)] = len(data)
         image = _read_webp_qimage(data)
         if image is None:
             return None
@@ -264,10 +272,7 @@ class FolderImageSource(ImageSource):
         return str(Path(image_id))
 
     def file_size(self, image_id: str) -> int | None:
-        try:
-            return Path(image_id).stat().st_size
-        except OSError:
-            return None
+        return self._file_size_cache.get(self._path_identity(image_id))
 
 
 class ZipImageSource(ImageSource):
@@ -528,6 +533,7 @@ def create_image_source(
 
     if target.is_file() and suffix in SUPPORTED_EXTENSIONS:
         snapshot_paths: tuple[str, ...] | None = None
+        snapshot_file_sizes: tuple[tuple[str, int | None], ...] | None = None
         selected_from_snapshot: str | None = None
         if (
             folder_snapshot is not None
@@ -546,11 +552,17 @@ def create_image_source(
             )
             if selected_from_snapshot is not None:
                 snapshot_paths = folder_snapshot.image_ids
+                snapshot_file_sizes = tuple(
+                    (image_id, file_size)
+                    for image_id, file_size, _modified_time_ns
+                    in folder_snapshot.fingerprints
+                )
         source = FolderImageSource(
             target.parent,
             recursive=recursive_folder,
             sort_descending=sort_descending,
             image_snapshot=snapshot_paths,
+            file_size_snapshot=snapshot_file_sizes,
         )
         selected_image = selected_from_snapshot or str(target)
         return source, selected_image
