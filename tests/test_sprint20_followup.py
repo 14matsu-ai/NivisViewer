@@ -15,6 +15,7 @@ from PySide6.QtTest import QTest
 from app.browser_model import BrowserItem, BrowserItemKind
 from app.browser_scanner import (
     BrowserScanBatch,
+    BrowserScanCompleted,
     BrowserScanEntry,
     BrowserScanError,
     BrowserScanRequest,
@@ -421,6 +422,125 @@ def test_first_batch_paints_before_tree_sync_and_thumbnail_request(
         window._on_list_paint_completed()
         qapp.processEvents()
         assert calls == ["tree", "thumbnail"]
+    finally:
+        window.close()
+        qapp.processEvents()
+        store.close()
+
+
+@pytest.mark.parametrize("item_count", [20, 200, 1000])
+def test_incremental_scan_finish_does_not_reset_or_rerequest_thumbnails(
+    tmp_path,
+    qapp,
+    monkeypatch,
+    item_count: int,
+) -> None:
+    window, store, scanner, folder, _other = _favorite_window(tmp_path, qapp)
+    requested: list[str] = []
+    committed: list[str] = []
+    resets: list[bool] = []
+    location_restores: list[bool] = []
+    original_restore = window._restore_pending_scan_location
+
+    monkeypatch.setattr(
+        window.thumbnail_provider,
+        "request",
+        lambda item, *_args, **_kwargs: requested.append(str(item.path)) or False,
+    )
+
+    def record_restore(pending, *, final: bool) -> None:
+        location_restores.append(final)
+        original_restore(pending, final=final)
+
+    monkeypatch.setattr(
+        window,
+        "_restore_pending_scan_location",
+        record_restore,
+    )
+    window.directory_scan_committed.connect(committed.append)
+    window.item_model.modelReset.connect(lambda: resets.append(True))
+    try:
+        QTest.mouseClick(
+            window.favorite_view.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=_favorite_point(window),
+        )
+        assert len(scanner.requests) == 1
+        request = scanner.requests[-1]
+        entries = tuple(
+            BrowserScanEntry(
+                str(folder / f"{index:04}.jpg"),
+                f"{index:04}.jpg",
+                "image",
+                index,
+                index + 1,
+            )
+            for index in range(item_count)
+        )
+        split_at = max(1, item_count // 2)
+        scanner.batch_ready.emit(
+            BrowserScanBatch(
+                request.path,
+                request.generation,
+                entries[:split_at],
+            )
+        )
+
+        selected = window.item_model.index(min(5, split_at - 1), 0)
+        window.list_view.setCurrentIndex(selected)
+        selected_path = selected.data(window.item_model.PathRole)
+        scroll = window.list_view.verticalScrollBar()
+        scroll.setValue(min(3, scroll.maximum()))
+        scanner.batch_ready.emit(
+            BrowserScanBatch(
+                request.path,
+                request.generation,
+                entries[split_at:],
+            )
+        )
+        window._flush_pending_scan_batch()
+        current_after_batch = window.list_view.currentIndex()
+        assert current_after_batch.isValid()
+        assert (
+            current_after_batch.data(window.item_model.PathRole)
+            == selected_path
+        )
+        assert window.item_model.rowCount() == item_count
+        scroll.setValue(min(3, scroll.maximum()))
+        scroll_before_finish = scroll.value()
+        window._first_paint_pending_generation = None
+        qapp.processEvents()
+        window._thumbnail_request_timer.stop()
+        requested.clear()
+        window._request_visible_thumbnails()
+        requested_before_finish = tuple(requested)
+        assert requested_before_finish
+        assert len(set(requested_before_finish)) == len(
+            requested_before_finish
+        )
+        resets_before_finish = len(resets)
+        restores_before_finish = len(location_restores)
+
+        scanner.scan_completed.emit(
+            BrowserScanCompleted(
+                request.path,
+                request.generation,
+                item_count,
+            )
+        )
+        QTest.qWait(40)
+        qapp.processEvents()
+
+        current = window.list_view.currentIndex()
+        assert len(resets) == resets_before_finish
+        assert tuple(requested) == requested_before_finish
+        assert len(location_restores) == restores_before_finish
+        assert current.isValid()
+        assert current.data(window.item_model.PathRole) == selected_path
+        assert scroll.value() == scroll_before_finish
+        assert committed == [str(folder.absolute())]
+        assert window._pending_scan is None
+        assert "読み込み中" not in window.statusBar().currentMessage()
     finally:
         window.close()
         qapp.processEvents()
