@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from threading import Event
 import time
+from unittest.mock import Mock
 
 from PIL import Image
 from PySide6.QtCore import QModelIndex, QPoint, QPointF, Qt
@@ -42,6 +43,7 @@ from app.folder_tree_sync import FolderTreeSyncController
 from app.fullscreen_chrome import FullscreenChromeController
 from app.settings_dialog import SettingsDialog
 from app.metadata_store import MetadataStore
+from app.system_file_opener import SystemFileOpener
 from app.thumbnail_disk_cache import ThumbnailDiskCache
 from app.thumbnail_provider import BrowserThumbnailProvider
 from app.thumbnail_render import ThumbnailRenderSpec
@@ -508,7 +510,12 @@ def test_browser_window_shows_all_items_and_requests_generic_preview(
     (folder / "notes.txt").write_text("text", encoding="utf-8")
     config = make_config(tmp_path)
     config.set("last_browser_path", str(folder))
-    window = BrowserWindow(config_manager=config)
+    open_adapter = Mock()
+    open_adapter.open_default.return_value = 2
+    window = BrowserWindow(
+        config_manager=config,
+        system_file_opener=SystemFileOpener(open_adapter),
+    )
     window.resize(700, 500)
     window.show()
     assert window.wait_for_scan()
@@ -535,6 +542,11 @@ def test_browser_window_shows_all_items_and_requests_generic_preview(
     assert not other.openable_by_nivisviewer
     window.open_item(window.item_model.index(window.item_model.row_for_path(other.path), 0))
     assert "表示できません" in window.statusBar().currentMessage()
+    open_adapter.open_default.assert_called_once()
+    opened_path, parent_hwnd = open_adapter.open_default.call_args.args
+    assert opened_path == str(other.path.absolute())
+    assert isinstance(parent_hwnd, int)
+    open_adapter.open_picker.assert_not_called()
     window.close()
     qapp.processEvents()
 
