@@ -91,6 +91,7 @@ def test_create_and_close_viewer_updates_registration(
     assert controller.viewer_windows == ()
     assert controller.get_active_viewer() is None
     qapp.processEvents()
+    controller.shutdown()
 
 
 def test_reuse_active_reuses_active_viewer(tmp_path: Path, qapp: QApplication) -> None:
@@ -221,6 +222,7 @@ def test_last_viewer_requests_application_exit_once(
     assert exit_requests == [True]
     assert controller.viewer_windows == ()
     qapp.processEvents()
+    controller.shutdown()
 
 
 def test_browser_is_singleton_and_coexists_with_viewers(
@@ -285,6 +287,7 @@ def test_last_viewer_does_not_exit_while_browser_exists(
     browser.close()
     qapp.processEvents()
     assert exit_requests == [True]
+    controller.shutdown()
 
 
 def test_browser_close_keeps_application_alive_while_viewer_exists(
@@ -307,6 +310,7 @@ def test_browser_close_keeps_application_alive_while_viewer_exists(
     viewer.close()
     qapp.processEvents()
     assert exit_requests == [True]
+    controller.shutdown()
 
 
 def test_active_viewer_book_changes_sync_browser_but_inactive_does_not(

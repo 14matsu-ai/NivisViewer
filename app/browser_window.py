@@ -2227,7 +2227,11 @@ class BrowserWindow(QMainWindow):
         if self._owns_archive_backend_registry:
             self.archive_backend_registry.close()
         if self._owns_pdfium_service:
-            self.pdfium_service.shutdown()
+            if not self.pdfium_service.shutdown():
+                raise RuntimeError(
+                    self.pdfium_service.last_shutdown_error
+                    or "PDFium shutdown did not complete."
+                )
         if self._owns_path_availability_service:
             self.path_availability_service.close()
 

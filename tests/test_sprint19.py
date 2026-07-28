@@ -3,11 +3,12 @@ from __future__ import annotations
 import errno
 import os
 from pathlib import Path
+import sys
 from threading import Event
 from time import monotonic, sleep
 
 import pytest
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QTimer
 from PySide6.QtWidgets import QApplication
 
 from app.chunked_file_copier import ChunkedFileCopier, CopyCancelled
@@ -653,3 +654,27 @@ def test_file_operation_panel_keeps_partial_failure_details(
     assert panel.details_button.isVisible()
     assert "元を削除できません" in panel.details_view.toPlainText()
     panel.close()
+
+
+def test_file_operation_panel_disconnects_queue_callbacks_when_deleted(
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    queue = FileOperationQueue()
+    panel = FileOperationPanel()
+    panel.bind(queue)
+    unhandled: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        sys,
+        "excepthook",
+        lambda *args: unhandled.append(args),
+    )
+
+    panel.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    qapp.processEvents()
+    queue.queue_changed.emit()
+    qapp.processEvents()
+
+    assert unhandled == []
+    queue.close()

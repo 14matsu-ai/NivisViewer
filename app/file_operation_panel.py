@@ -65,24 +65,22 @@ class FileOperationPanel(QWidget):
         self.hide()
 
     def bind(self, queue) -> None:
-        queue.operation_preparing.connect(
-            lambda request: self.show_state(
-                request.operation.value, FileOperationState.PREPARING
-            )
-        )
-        queue.operation_started.connect(
-            lambda request: self.show_state(
-                request.operation.value, FileOperationState.RUNNING
-            )
-        )
+        self._queue = queue
+        queue.operation_preparing.connect(self._on_operation_preparing)
+        queue.operation_started.connect(self._on_operation_started)
         queue.operation_progress.connect(self.show_progress)
         queue.operation_completed.connect(self.show_result)
-        queue.queue_changed.connect(
-            lambda: self.queue_label.setText(
-                f"待機 {len(queue.queued_requests)}"
-            )
-        )
+        queue.queue_changed.connect(self._on_queue_changed)
         self.cancel_requested.connect(queue.cancel)
+
+    def _on_operation_preparing(self, request: FileOperationRequest) -> None:
+        self.show_state(request.operation.value, FileOperationState.PREPARING)
+
+    def _on_operation_started(self, request: FileOperationRequest) -> None:
+        self.show_state(request.operation.value, FileOperationState.RUNNING)
+
+    def _on_queue_changed(self) -> None:
+        self.queue_label.setText(f"待機 {len(self._queue.queued_requests)}")
 
     def show_state(self, operation: str, state: FileOperationState) -> None:
         self._hide_timer.stop()

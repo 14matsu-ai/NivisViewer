@@ -641,10 +641,12 @@ class _BlockingPdfBackend:
 def test_pdf_shutdown_cancels_pending_and_closes_after_active() -> None:
     backend = _BlockingPdfBackend()
     service = PdfiumService(backend)
+    active_cancel = Event()
     with ThreadPoolExecutor(max_workers=8) as executor:
         active = executor.submit(
             service.render_page,
             PdfRenderRequest("doc", 99, 8, 8),
+            cancel_token=active_cancel,
         )
         assert backend.started.wait(1)
         pending = [
@@ -654,27 +656,130 @@ def test_pdf_shutdown_cancels_pending_and_closes_after_active() -> None:
             )
             for index in range(6)
         ]
-        service.shutdown(wait_seconds=0)
+        assert not service.shutdown(wait_seconds=0)
         assert service.state is PdfiumServiceState.SHUTTING_DOWN
+        assert service.last_shutdown_error
+        assert active_cancel.is_set()
+        assert "close_all" not in backend.events
         backend.release.set()
-        active.result(timeout=2)
+        try:
+            active.result(timeout=2)
+        except PdfBackendError as exc:
+            assert exc.code is PdfErrorCode.CANCELLED
         for future in pending:
             with pytest.raises(PdfBackendError) as exc_info:
                 future.result(timeout=2)
             assert exc_info.value.code is PdfErrorCode.CANCELLED
-    service.shutdown(wait_seconds=2)
+    assert service.shutdown(wait_seconds=2)
     assert backend.rendered == [99]
     assert backend.events == ["render:doc:99", "close_all"]
     assert service.state is PdfiumServiceState.STOPPED
     assert not service._pending
     assert not service._worker.is_alive()
+    assert service.last_shutdown_error is None
+
+
+def test_pdf_shutdown_waits_for_running_worker_before_document_close() -> None:
+    backend = _BlockingPdfBackend()
+    service = PdfiumService(backend)
+    active_cancel = Event()
+    assert not service._worker.daemon
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        active = executor.submit(
+            service.render_page,
+            PdfRenderRequest("doc", 99, 8, 8),
+            cancel_token=active_cancel,
+        )
+        assert backend.started.wait(1)
+        queued_cancel = Event()
+        queued = executor.submit(
+            service.render_page,
+            PdfRenderRequest("doc", 1, 8, 8),
+            cancel_token=queued_cancel,
+        )
+        deadline = monotonic() + 1
+        while service.pending_count < 2 and monotonic() < deadline:
+            pass
+        assert service.pending_count == 2
+
+        shutdown = executor.submit(service.shutdown, wait_seconds=2)
+        assert active_cancel.wait(1)
+        assert queued_cancel.is_set()
+        assert not shutdown.done()
+        assert backend.events == ["render:doc:99"]
+        assert service.state is PdfiumServiceState.SHUTTING_DOWN
+        with pytest.raises(PdfBackendError) as exc_info:
+            service.render_page(PdfRenderRequest("doc", 2, 8, 8))
+        assert exc_info.value.code is PdfErrorCode.CANCELLED
+
+        backend.release.set()
+        assert shutdown.result(timeout=2)
+        try:
+            active.result(timeout=2)
+        except PdfBackendError as exc:
+            assert exc.code is PdfErrorCode.CANCELLED
+        with pytest.raises(PdfBackendError) as exc_info:
+            queued.result(timeout=2)
+        assert exc_info.value.code is PdfErrorCode.CANCELLED
+
+    assert backend.rendered == [99]
+    assert backend.events == ["render:doc:99", "close_all"]
+    assert service.state is PdfiumServiceState.STOPPED
+    assert service.pending_count == 0
+    assert not service._worker.is_alive()
+    assert service.shutdown(wait_seconds=0)
+    assert backend.events.count("close_all") == 1
+
+
+def test_pdf_shutdown_reports_document_close_failure_once() -> None:
+    class CloseFailureBackend(_BlockingPdfBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_attempts = 0
+
+        def close_all(self):
+            self.close_attempts += 1
+            raise PdfBackendError(
+                PdfErrorCode.INTERNAL_ERROR,
+                debug_message="one document failed to close",
+            )
+
+    backend = CloseFailureBackend()
+    service = PdfiumService(backend)
+    assert not service.shutdown(wait_seconds=2)
+    assert service.state is PdfiumServiceState.STOPPED
+    assert not service._worker.is_alive()
+    assert service.last_shutdown_error is not None
+    assert "PdfBackendError" in service.last_shutdown_error
+    assert "one document failed to close" in service.last_shutdown_error
+    assert backend.close_attempts == 1
+
+    assert not service.shutdown(wait_seconds=0)
+    assert backend.close_attempts == 1
+
+
+def test_application_pdf_shutdown_failure_is_not_treated_as_complete() -> None:
+    class FailedPdfiumService:
+        last_shutdown_error = "PDFium worker is still running."
+
+        def shutdown(self) -> bool:
+            return False
+
+    owner = type(
+        "ControllerOwner",
+        (),
+        {"pdfium_service": FailedPdfiumService()},
+    )()
+
+    with pytest.raises(RuntimeError, match="still running"):
+        ApplicationController._shutdown_pdfium_service(owner)
 
 
 def test_pdf_rejects_new_requests_after_shutdown() -> None:
     backend = _BlockingPdfBackend()
     backend.release.set()
     service = PdfiumService(backend)
-    service.shutdown(wait_seconds=2)
+    assert service.shutdown(wait_seconds=2)
     with pytest.raises(PdfBackendError) as exc_info:
         service.render_page(PdfRenderRequest("doc", 1, 8, 8))
     assert exc_info.value.code is PdfErrorCode.CANCELLED

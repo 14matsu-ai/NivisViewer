@@ -508,7 +508,7 @@ class ApplicationController(QObject):
                 ("archive_backends", self.archive_backend_registry.close),
                 ("adjacent_book_search", self.adjacent_book_search.close),
                 ("path_availability", self.path_availability_service.close),
-                ("pdfium", self.pdfium_service.shutdown),
+                ("pdfium", self._shutdown_pdfium_service),
                 ("image_workers", self.image_work_coordinator.shutdown),
                 ("config_save", self.config.save),
                 ("metadata_flush", self.metadata_store.flush),
@@ -529,6 +529,14 @@ class ApplicationController(QObject):
         browser = self.get_browser_window()
         if browser is not None:
             browser.prepare_shutdown()
+
+    def _shutdown_pdfium_service(self) -> None:
+        if self.pdfium_service.shutdown():
+            return
+        raise RuntimeError(
+            self.pdfium_service.last_shutdown_error
+            or "PDFium shutdown did not complete."
+        )
 
     def _select_viewer_for_open(self, open_in_new_window: bool | None) -> ViewerWindow:
         if open_in_new_window is True:
