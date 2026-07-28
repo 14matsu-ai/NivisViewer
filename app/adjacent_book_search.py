@@ -159,9 +159,18 @@ class AdjacentBookFileSystem:
         return tuple(result)
 
     def directory_contains_supported_image(self, path: str) -> bool:
-        for entry in self.scandir(path):
-            if entry.is_file and entry.extension in SUPPORTED_EXTENSIONS:
-                return True
+        with os.scandir(path) as entries:
+            for entry in entries:
+                try:
+                    is_supported_image = (
+                        entry.is_file(follow_symlinks=False)
+                        and os.path.splitext(entry.name)[1].lower()
+                        in SUPPORTED_EXTENSIONS
+                    )
+                except OSError:
+                    continue
+                if is_supported_image:
+                    return True
         return False
 
 

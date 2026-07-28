@@ -3,7 +3,10 @@ from __future__ import annotations
 import zipfile
 import os
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import PropertyMock, patch
 
+import pytest
 from PIL import Image
 from PySide6.QtCore import QItemSelectionModel, QSize
 from PySide6.QtWidgets import (
@@ -13,7 +16,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
 )
 
-from app.browser_model import BrowserItemKind
+from app.browser_model import BrowserItemKind, BrowserItemModel
 from app.browser_window import BrowserWindow
 from app.config_manager import ConfigManager
 from app.metadata_store import MetadataStore
@@ -36,6 +39,85 @@ def make_config(tmp_path: Path, folder: Path, *, thumbnail_size: int = 180) -> C
 def finish_scan(window: BrowserWindow, qapp: QApplication) -> None:
     assert window.wait_for_scan()
     qapp.processEvents()
+
+
+@pytest.mark.parametrize("item_count", [0, 1, 25])
+def test_status_count_uses_model_row_count_without_materializing_items(
+    tmp_path: Path,
+    qapp: QApplication,
+    item_count: int,
+) -> None:
+    folder = tmp_path / f"件数-{item_count}"
+    folder.mkdir()
+    for index in range(item_count):
+        write_image(folder / f"{index:03}.jpg")
+    window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    finish_scan(window, qapp)
+    if item_count > 1:
+        selection_model = window.list_view.selectionModel()
+        first = window.item_model.index(0, 0)
+        second = window.item_model.index(1, 0)
+        selection_model.setCurrentIndex(
+            first,
+            QItemSelectionModel.SelectionFlag.NoUpdate,
+        )
+        selection_model.select(
+            first,
+            QItemSelectionModel.SelectionFlag.Select,
+        )
+        selection_model.select(
+            second,
+            QItemSelectionModel.SelectionFlag.Select,
+        )
+
+    with patch.object(
+        BrowserItemModel,
+        "items",
+        new_callable=PropertyMock,
+        side_effect=AssertionError("status must not materialize all model items"),
+    ):
+        window._update_status(force=True)
+
+    assert f" — {item_count}件 — " in window.statusBar().currentMessage()
+    if item_count > 1:
+        assert "ほか1件" in window.statusBar().currentMessage()
+    window.close()
+    qapp.processEvents()
+
+
+def test_loading_status_uses_committed_row_count_without_materializing_items(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "読み込み中件数"
+    for index in range(3):
+        write_image(folder / f"{index}.jpg")
+    window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    finish_scan(window, qapp)
+    window._pending_scan = SimpleNamespace(
+        path=folder,
+        refresh=False,
+        committed=True,
+        buffered_entries=[object(), object()],
+    )
+
+    try:
+        with patch.object(
+            BrowserItemModel,
+            "items",
+            new_callable=PropertyMock,
+            side_effect=AssertionError(
+                "loading status must not materialize all model items"
+            ),
+        ):
+            window._update_status(force=True)
+        assert window.statusBar().currentMessage().endswith(
+            "読み込み中… 5項目"
+        )
+    finally:
+        window._pending_scan = None
+        window.close()
+        qapp.processEvents()
 
 
 def test_show_folder_sidebar_and_settings_round_trip(

@@ -89,6 +89,108 @@ class _CountingAdjacentFileSystem(AdjacentBookFileSystem):
         return super().scandir(path, **kwargs)
 
 
+class _FakeDirectoryEntry:
+    def __init__(
+        self,
+        name: str,
+        visited: list[str],
+        *,
+        is_file: bool = True,
+        error: OSError | None = None,
+    ) -> None:
+        self.name = name
+        self._visited = visited
+        self._is_file = is_file
+        self._error = error
+
+    def is_file(self, *, follow_symlinks: bool) -> bool:
+        assert follow_symlinks is False
+        self._visited.append(self.name)
+        if self._error is not None:
+            raise self._error
+        return self._is_file
+
+
+class _FakeScandir:
+    def __init__(self, entries: list[_FakeDirectoryEntry]) -> None:
+        self._entries = entries
+
+    def __enter__(self):
+        return iter(self._entries)
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> bool:
+        return False
+
+
+@pytest.mark.parametrize(
+    ("names", "expected", "visited_count"),
+    [
+        (["cover.JPG", "after.png"], True, 1),
+        (["readme.txt", "archive.zip", "last.png"], True, 3),
+        (["readme.txt", "archive.zip", "notes.md"], False, 3),
+    ],
+)
+def test_directory_image_presence_stops_at_first_supported_image(
+    monkeypatch,
+    names: list[str],
+    expected: bool,
+    visited_count: int,
+) -> None:
+    visited: list[str] = []
+    entries = [_FakeDirectoryEntry(name, visited) for name in names]
+    monkeypatch.setattr(
+        "app.adjacent_book_search.os.scandir",
+        lambda _path: _FakeScandir(entries),
+    )
+
+    assert AdjacentBookFileSystem().directory_contains_supported_image(
+        "candidate"
+    ) is expected
+    assert len(visited) == visited_count
+
+
+def test_directory_image_presence_skips_entry_errors_and_non_files(
+    monkeypatch,
+) -> None:
+    visited: list[str] = []
+    entries = [
+        _FakeDirectoryEntry(
+            "vanished.jpg",
+            visited,
+            error=FileNotFoundError("vanished"),
+        ),
+        _FakeDirectoryEntry("folder.PNG", visited, is_file=False),
+        _FakeDirectoryEntry("cover.PNG", visited),
+        _FakeDirectoryEntry("unvisited.jpg", visited),
+    ]
+    monkeypatch.setattr(
+        "app.adjacent_book_search.os.scandir",
+        lambda _path: _FakeScandir(entries),
+    )
+
+    assert AdjacentBookFileSystem().directory_contains_supported_image(
+        "candidate"
+    )
+    assert visited == ["vanished.jpg", "folder.PNG", "cover.PNG"]
+
+
+@pytest.mark.parametrize("error_type", [PermissionError, FileNotFoundError])
+def test_directory_image_presence_preserves_directory_open_errors(
+    monkeypatch,
+    error_type: type[OSError],
+) -> None:
+    def raise_directory_error(_path: str):
+        raise error_type("unavailable")
+
+    monkeypatch.setattr(
+        "app.adjacent_book_search.os.scandir",
+        raise_directory_error,
+    )
+
+    with pytest.raises(error_type):
+        AdjacentBookFileSystem().directory_contains_supported_image("candidate")
+
+
 def _controller(
     tmp_path: Path,
     qapp: QApplication,

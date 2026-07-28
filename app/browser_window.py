@@ -3750,7 +3750,7 @@ class BrowserWindow(QMainWindow):
                 len(pending.refresh_entries)
                 if pending.refresh
                 else (
-                    len(self.items) + len(pending.buffered_entries)
+                    self.item_model.rowCount() + len(pending.buffered_entries)
                     if pending.committed
                     else 0
                 )
@@ -3759,7 +3759,7 @@ class BrowserWindow(QMainWindow):
                 f"{pending.path} — 読み込み中… {count}項目"
             )
             return
-        count = len(self.items)
+        count = self.item_model.rowCount()
         selected = self.item_model.item_at(self.list_view.currentIndex())
         folder = str(self.current_path) if self.current_path is not None else ""
         sort_label = BROWSER_SORT_KEY_LABELS[self.browser_sort_key]
