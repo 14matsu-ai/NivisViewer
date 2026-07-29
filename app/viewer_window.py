@@ -73,6 +73,7 @@ from .viewer_widget import ViewerImage, ViewerWidget, calculate_spread_layout
 
 
 _DISPLAY_LOG = logging.getLogger("nivisviewer.viewer.display_unit")
+_PDF_PREFETCH_IDLE_GRACE_MS = 120
 
 
 class ViewerWindow(QMainWindow):
@@ -253,6 +254,16 @@ class ViewerWindow(QMainWindow):
         self._pdf_render_timer.setSingleShot(True)
         self._pdf_render_timer.setInterval(180)
         self._pdf_render_timer.timeout.connect(self._rerender_pdf)
+        self._pdf_prefetch_timer = QTimer(self)
+        self._pdf_prefetch_timer.setSingleShot(True)
+        self._pdf_prefetch_timer.setInterval(_PDF_PREFETCH_IDLE_GRACE_MS)
+        self._pdf_prefetch_timer.timeout.connect(self._start_deferred_pdf_prefetch)
+        self._pdf_prefetch_source: PdfImageSource | None = None
+        self._pdf_prefetch_generation = -1
+        self._pdf_prefetch_center = 0
+        self._pdf_prefetch_visible_indexes: tuple[int, ...] = tuple()
+        self._pdf_prefetch_direction = 0
+        self._last_pdf_prefetch_center: int | None = None
         self.image_cache.set_adjustments(brightness=self.brightness, contrast=self.contrast, gamma=self.gamma)
         self.page_navigation = ViewerPageNavigationController(
             self.model,
@@ -1851,11 +1862,18 @@ class ViewerWindow(QMainWindow):
             if first_frame_gate
             else self._visible_page_indexes
         )
-        self.image_cache.preload_around(
-            request_center,
-            radius=0 if first_frame_gate else PRELOAD_RADIUS,
-            visible_indexes=gated_visible_indexes,
-        )
+        if isinstance(self.image_cache.source, PdfImageSource):
+            self._prepare_deferred_pdf_prefetch(
+                request_center,
+                gated_visible_indexes,
+            )
+        else:
+            self._cancel_deferred_pdf_prefetch()
+            self.image_cache.preload_around(
+                request_center,
+                radius=0 if first_frame_gate else PRELOAD_RADIUS,
+                visible_indexes=gated_visible_indexes,
+            )
         if _DISPLAY_LOG.isEnabledFor(logging.DEBUG):
             _DISPLAY_LOG.debug(
                 "display unit request=%s generation=%s focused=%s slots=%r gate=%s",
@@ -1874,6 +1892,85 @@ class ViewerWindow(QMainWindow):
                 first_frame_gate,
             )
         self._render_spread(spread, self._active_request_id)
+
+    def _prepare_deferred_pdf_prefetch(
+        self,
+        center_index: int,
+        visible_indexes: tuple[int, ...],
+    ) -> None:
+        source = self.image_cache.source
+        if not isinstance(source, PdfImageSource):
+            return
+        self._pdf_prefetch_timer.stop()
+        if source is not self._pdf_prefetch_source:
+            direction = 0
+            self._last_pdf_prefetch_center = None
+        elif self._last_pdf_prefetch_center is None:
+            direction = 0
+        else:
+            delta = center_index - self._last_pdf_prefetch_center
+            normal_step = max(1, len(visible_indexes))
+            if delta == 0:
+                direction = self._pdf_prefetch_direction
+            elif abs(delta) <= normal_step:
+                direction = 1 if delta > 0 else -1
+            else:
+                direction = 0
+        self._pdf_prefetch_source = source
+        self._pdf_prefetch_generation = self.image_cache.generation
+        self._pdf_prefetch_center = center_index
+        self._pdf_prefetch_visible_indexes = tuple(visible_indexes)
+        self._pdf_prefetch_direction = direction
+        self._last_pdf_prefetch_center = center_index
+        self.image_cache.preload_around(
+            center_index,
+            radius=0,
+            visible_indexes=visible_indexes,
+            preferred_direction=direction,
+        )
+        self._arm_deferred_pdf_prefetch()
+
+    def _arm_deferred_pdf_prefetch(self) -> None:
+        if (
+            self._shutdown_prepared
+            or self._pdf_prefetch_timer.isActive()
+            or self.image_cache.source is not self._pdf_prefetch_source
+            or self.image_cache.generation != self._pdf_prefetch_generation
+        ):
+            return
+        if any(
+            self.image_cache.get(index) is None
+            for index in self._pdf_prefetch_visible_indexes
+        ):
+            return
+        self._pdf_prefetch_timer.start()
+
+    def _start_deferred_pdf_prefetch(self) -> None:
+        source = self._pdf_prefetch_source
+        center_index = self._pdf_prefetch_center
+        if (
+            self._shutdown_prepared
+            or source is None
+            or self.image_cache.source is not source
+            or self.image_cache.generation != self._pdf_prefetch_generation
+            or center_index
+            not in {self.model.current_index, self.model.focused_index}
+        ):
+            return
+        self.image_cache.preload_around(
+            center_index,
+            radius=PRELOAD_RADIUS,
+            visible_indexes=self._pdf_prefetch_visible_indexes,
+            preferred_direction=self._pdf_prefetch_direction,
+        )
+
+    def _cancel_deferred_pdf_prefetch(self) -> None:
+        self._pdf_prefetch_timer.stop()
+        self._pdf_prefetch_source = None
+        self._pdf_prefetch_generation = -1
+        self._pdf_prefetch_visible_indexes = tuple()
+        self._pdf_prefetch_direction = 0
+        self._last_pdf_prefetch_center = None
 
     def _render_spread(self, spread, request_id: int) -> None:
         if request_id != self._active_request_id:
@@ -2039,14 +2136,22 @@ class ViewerWindow(QMainWindow):
             and cached.image_id == self._first_frame_image_id
         ):
             # The logical current page has completed decoding, so the reserved
-            # Viewer lane may now continue with its spread partner and nearby
-            # pages. Browser work remains gated until contentPainted confirms
-            # that the first frame actually reached the screen.
-            self.image_cache.preload_around(
-                self.model.focused_index,
-                radius=PRELOAD_RADIUS,
-                visible_indexes=self._visible_page_indexes,
-            )
+            # Viewer lane may now continue with its spread partner. Nearby PDF
+            # pages wait for the idle grace; Browser work remains gated until
+            # contentPainted confirms that the first frame reached the screen.
+            if isinstance(self.image_cache.source, PdfImageSource):
+                self._prepare_deferred_pdf_prefetch(
+                    self.model.focused_index,
+                    self._visible_page_indexes,
+                )
+            else:
+                self.image_cache.preload_around(
+                    self.model.focused_index,
+                    radius=PRELOAD_RADIUS,
+                    visible_indexes=self._visible_page_indexes,
+                )
+        if cached.page_index in self._visible_page_indexes:
+            self._arm_deferred_pdf_prefetch()
         self._update_page_list_thumbnail(cached)
         self._render_spread(self.model.spread_at(), self._active_request_id)
 
@@ -2065,6 +2170,8 @@ class ViewerWindow(QMainWindow):
         self.interactive_open_cancelled.emit(self)
 
     def _on_viewer_content_painted(self, image_ids: object) -> None:
+        if isinstance(image_ids, tuple):
+            self._arm_deferred_pdf_prefetch()
         if (
             not self._awaiting_first_frame
             or not self._first_frame_image_id
@@ -2083,11 +2190,14 @@ class ViewerWindow(QMainWindow):
             self._active_open_trace_id,
             "viewer.first_paint.completed",
         )
-        self.image_cache.preload_around(
-            self.model.focused_index,
-            radius=PRELOAD_RADIUS,
-            visible_indexes=self._visible_page_indexes,
-        )
+        if isinstance(self.image_cache.source, PdfImageSource):
+            self._arm_deferred_pdf_prefetch()
+        else:
+            self.image_cache.preload_around(
+                self.model.focused_index,
+                radius=PRELOAD_RADIUS,
+                visible_indexes=self._visible_page_indexes,
+            )
         self.first_frame_ready.emit(self)
 
     def set_next_open_trace(self, trace_id: int) -> None:
@@ -2735,6 +2845,7 @@ class ViewerWindow(QMainWindow):
         self.viewer.cancel_pending_canvas_click()
         self.slideshow_timer.stop()
         self._pdf_render_timer.stop()
+        self._cancel_deferred_pdf_prefetch()
         self._save_current_reading_position()
         self.book_session.shutdown(wait_msecs=wait_msecs)
         if self._owns_archive_backend_registry:
