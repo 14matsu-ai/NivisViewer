@@ -513,6 +513,42 @@ def test_image_cache_byte_limit_prefers_current_and_spread_partner(qapp):
     assert cache._cache_bytes == one_mebibyte
 
 
+def test_image_cache_live_memory_budget_shrinks_with_lru_and_expands_in_place(
+    qapp,
+):
+    cache = ImageCache(cache_size=10)
+    entry_bytes = 32 * 1024 * 1024
+    cache._center_index = 2
+    cache._protected_indexes = {2, 3}
+    for index in (0, 3, 2):
+        qimage = Mock()
+        qimage.isNull.return_value = False
+        qimage.sizeInBytes.return_value = entry_bytes
+        cache._store_cached(
+            CachedImage(
+                page_index=index,
+                image_id=f"page{index}.pdf",
+                qimage=qimage,
+                original_size=(1, 1),
+                error=None,
+                generation=0,
+                rendered_size=(1, 1),
+            )
+        )
+
+    cache.set_cache_byte_budget_mib(64)
+
+    assert tuple(cache._cache) == (3, 2)
+    assert cache._cache_bytes == 2 * entry_bytes
+    assert cache.cache_byte_budget_mib == 64
+
+    before_expansion = tuple(cache._cache)
+    cache.set_cache_byte_budget_mib(512)
+
+    assert tuple(cache._cache) == before_expansion
+    assert cache.cache_byte_budget_mib == 512
+
+
 def test_image_cache_rejected_results_do_not_add_bytes(qapp, tmp_path):
     source = OrderedSource(tmp_path)
     cache = ImageCache()
@@ -735,6 +771,72 @@ def test_pending_viewer_prefetch_is_promoted_when_it_becomes_current(
 
     assert source.started[:2] == ["page0.webp", "page2.webp"]
     coordinator.shutdown()
+
+
+def test_folder_prefetch_uses_custom_display_units_without_pdf_idle_timer(
+    qapp,
+    tmp_path,
+):
+    source = OrderedSource(tmp_path)
+    source.ids = [f"page{index}.webp" for index in range(15)]
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.apply(
+        {
+            "view_mode": "single",
+            "viewer_prefetch_preset": "custom",
+            "viewer_prefetch_image_forward_units": 2,
+            "viewer_prefetch_image_backward_units": 1,
+        }
+    )
+    session = BookSession(
+        source_factory=lambda _path, **_kwargs: (source, None),
+    )
+    window = ViewerWindow(
+        config_manager=config,
+        book_session=session,
+    )
+    opened = session.open_book(tmp_path)
+    assert window._finish_opened_book(opened, modal_on_empty=False)
+    assert window.image_cache.wait_for_done(3000)
+    qapp.processEvents()
+
+    assert source.started == [
+        "page0.webp",
+        "page1.webp",
+        "page2.webp",
+    ]
+    assert not window._pdf_prefetch_timer.isActive()
+    assert window._configured_prefetch_indexes(
+        5,
+        (5,),
+        forward_units=2,
+        backward_units=1,
+        direction=1,
+    ) == (6, 7, 4)
+
+    source.started.clear()
+    window.model.go_to_index(5)
+    window._refresh_view()
+    assert window.image_cache.wait_for_done(3000)
+    qapp.processEvents()
+    assert source.started == [
+        "page5.webp",
+        "page6.webp",
+        "page4.webp",
+        "page7.webp",
+    ]
+
+    source.started.clear()
+    window.model.go_to_index(6)
+    window._refresh_view()
+    assert window.image_cache.wait_for_done(3000)
+    qapp.processEvents()
+    assert source.started == ["page8.webp"]
+
+    window.close()
+    qapp.processEvents()
+    session.shutdown(wait_msecs=3000)
 
 
 def test_jump_removes_old_queued_prefetch_before_new_nearby_work(

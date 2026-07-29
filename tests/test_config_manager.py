@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from app.config_manager import ConfigManager
 
 
@@ -40,6 +42,15 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
     assert manager.data["browser_folder_gestures_enabled"] is True
     assert manager.data["mouse_back_button_action"] == "previous_book"
     assert manager.data["mouse_forward_button_action"] == "next_book"
+    assert manager.viewer_prefetch_settings() == {
+        "preset": "standard",
+        "direction_priority_enabled": True,
+        "image_forward_units": 3,
+        "image_backward_units": 3,
+        "pdf_forward_units": 3,
+        "pdf_backward_units": 3,
+        "cache_memory_mib": 256,
+    }
 
 
 def test_partial_config_is_merged_with_defaults(tmp_path: Path) -> None:
@@ -51,6 +62,59 @@ def test_partial_config_is_merged_with_defaults(tmp_path: Path) -> None:
     assert loaded["view_mode"] == "single"
     assert loaded["reading_direction"] == ConfigManager.DEFAULTS["reading_direction"]
     assert loaded["cache_size"] == ConfigManager.DEFAULTS["cache_size"]
+    assert loaded["viewer_prefetch_preset"] == "standard"
+
+
+@pytest.mark.parametrize(
+    ("preset", "expected"),
+    tuple(ConfigManager.VIEWER_PREFETCH_PRESETS.items()),
+)
+def test_viewer_prefetch_presets_have_requested_values(
+    tmp_path: Path,
+    preset: str,
+    expected: dict[str, int],
+) -> None:
+    manager = ConfigManager(tmp_path / "config.json")
+    manager.load()
+
+    manager.apply({"viewer_prefetch_preset": preset})
+
+    resolved = manager.viewer_prefetch_settings()
+    assert resolved["preset"] == preset
+    assert {
+        key: resolved[key] for key in expected
+    } == expected
+
+
+def test_custom_viewer_prefetch_round_trip_and_clamping(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    manager = ConfigManager(path)
+    manager.load()
+    manager.apply(
+        {
+            "viewer_prefetch_preset": "custom",
+            "viewer_prefetch_direction_priority_enabled": False,
+            "viewer_prefetch_image_forward_units": -1,
+            "viewer_prefetch_image_backward_units": 21,
+            "viewer_prefetch_pdf_forward_units": 7,
+            "viewer_prefetch_pdf_backward_units": 8,
+            "viewer_cache_max_memory_mib": 99999,
+        },
+        save=True,
+    )
+
+    restored = ConfigManager(path)
+    restored.load()
+
+    assert restored.viewer_prefetch_settings() == {
+        "preset": "custom",
+        "direction_priority_enabled": False,
+        "image_forward_units": 0,
+        "image_backward_units": 20,
+        "pdf_forward_units": 7,
+        "pdf_backward_units": 8,
+        "cache_memory_mib": 4096,
+    }
 
 
 def test_corrupt_json_falls_back_to_defaults(tmp_path: Path) -> None:

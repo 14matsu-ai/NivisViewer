@@ -425,17 +425,19 @@ def test_pdf_jump_removes_old_queued_prefetch_before_new_current(
     generation = cache.generation
     cache.preload_around(
         10,
-        radius=3,
+        radius=0,
         visible_indexes=(10,),
         preferred_direction=1,
+        prefetch_indexes=(11, 12, 13, 9, 8, 7),
     )
     assert source.block_started.wait(1)
 
     cache.preload_around(
         20,
-        radius=3,
+        radius=0,
         visible_indexes=(20,),
         preferred_direction=0,
+        prefetch_indexes=(21, 19, 22, 18, 23, 17),
     )
 
     assert (generation, 10) in cache._tasks
@@ -630,9 +632,9 @@ def test_backward_pdf_navigation_rolls_previous_page_without_far_prefetch(
 
 
 @pytest.mark.parametrize(
-    ("settings", "immediate_pages"),
+    ("settings", "immediate_pages", "completed_pages"),
     (
-        ({"view_mode": "single"}, [0, 1]),
+        ({"view_mode": "single"}, [0, 1], [0, 1, 2, 3]),
         (
             {
                 "view_mode": "spread",
@@ -640,6 +642,7 @@ def test_backward_pdf_navigation_rolls_previous_page_without_far_prefetch(
                 "reading_direction": "ltr",
             },
             [0, 1, 2, 3],
+            list(range(8)),
         ),
     ),
 )
@@ -648,6 +651,7 @@ def test_pdf_idle_timer_eventually_completes_default_prefetch(
     qapp,
     settings,
     immediate_pages,
+    completed_pages,
 ):
     window, session, service, backend = _open_many_page_pdf_window(
         tmp_path,
@@ -678,15 +682,182 @@ def test_pdf_idle_timer_eventually_completes_default_prefetch(
         assert window.image_cache.wait_for_done(5000)
         qapp.processEvents()
 
-        assert [request.page_index for request in backend.rendered] == [
-            0,
-            1,
-            2,
-            3,
-        ]
+        assert [
+            request.page_index for request in backend.rendered
+        ] == completed_pages
         assert len(backend.rendered) - before_idle == (
-            2 if settings["view_mode"] == "single" else 0
+            len(completed_pages) - len(immediate_pages)
         )
+    finally:
+        _close_measured_pdf_window(
+            window,
+            session,
+            service,
+            qapp,
+        )
+
+
+@pytest.mark.parametrize(
+    ("preset", "expected_pages", "memory_mib"),
+    (
+        ("disabled", [0], 128),
+        ("memory_saver", [0, 1], 128),
+        ("standard", [0, 1, 2, 3], 256),
+        ("more", [0, 1, 2, 3, 4], 512),
+    ),
+)
+def test_pdf_prefetch_presets_control_display_unit_range_and_memory(
+    tmp_path,
+    qapp,
+    preset,
+    expected_pages,
+    memory_mib,
+):
+    window, session, service, backend = _open_many_page_pdf_window(
+        tmp_path,
+        qapp,
+        settings={
+            "view_mode": "single",
+            "viewer_prefetch_preset": preset,
+        },
+        complete_prefetch=False,
+    )
+    try:
+        if window._pdf_prefetch_timer.isActive():
+            _complete_deferred_pdf_prefetch(window, qapp)
+
+        assert [
+            request.page_index for request in backend.rendered
+        ] == expected_pages
+        assert window.image_cache.cache_byte_budget_mib == memory_mib
+        if preset == "disabled":
+            assert not window._pdf_prefetch_timer.isActive()
+    finally:
+        _close_measured_pdf_window(
+            window,
+            session,
+            service,
+            qapp,
+        )
+
+
+def test_disabled_pdf_prefetch_still_loads_spread_partner(
+    tmp_path,
+    qapp,
+):
+    window, session, service, backend = _open_many_page_pdf_window(
+        tmp_path,
+        qapp,
+        settings={
+            "view_mode": "spread",
+            "single_first_page": False,
+            "reading_direction": "ltr",
+            "viewer_prefetch_preset": "disabled",
+        },
+        complete_prefetch=False,
+    )
+    try:
+        assert [request.page_index for request in backend.rendered] == [0, 1]
+        assert not window._pdf_prefetch_timer.isActive()
+    finally:
+        _close_measured_pdf_window(
+            window,
+            session,
+            service,
+            qapp,
+        )
+
+
+def test_pdf_direction_priority_off_defers_nearest_background_work(
+    tmp_path,
+    qapp,
+):
+    window, session, service, backend = _open_many_page_pdf_window(
+        tmp_path,
+        qapp,
+        settings={
+            "view_mode": "single",
+            "viewer_prefetch_direction_priority_enabled": False,
+        },
+        complete_prefetch=False,
+    )
+    try:
+        assert [request.page_index for request in backend.rendered] == [0]
+        assert window._pdf_prefetch_timer.isActive()
+
+        window.model.go_to_index(10)
+        window._refresh_view()
+        assert window.image_cache.wait_for_done(5000)
+        qapp.processEvents()
+        window._pdf_prefetch_timer.stop()
+        assert backend.rendered[-1].page_index == 10
+
+        backend.rendered.clear()
+        window._start_deferred_pdf_prefetch()
+        assert window.image_cache.wait_for_done(5000)
+        qapp.processEvents()
+
+        assert [request.page_index for request in backend.rendered] == [
+            11,
+            9,
+            12,
+            8,
+            13,
+            7,
+        ]
+    finally:
+        _close_measured_pdf_window(
+            window,
+            session,
+            service,
+            qapp,
+        )
+
+
+def test_custom_pdf_forward_zero_disables_rolling_and_live_apply_is_non_destructive(
+    tmp_path,
+    qapp,
+):
+    window, session, service, backend = _open_many_page_pdf_window(
+        tmp_path,
+        qapp,
+        settings={"view_mode": "single"},
+        complete_prefetch=False,
+    )
+    try:
+        generation = window.image_cache.generation
+        current = window.image_cache.get(0)
+        window.config.apply(
+            {
+                "viewer_prefetch_preset": "custom",
+                "viewer_prefetch_pdf_forward_units": 0,
+                "viewer_prefetch_pdf_backward_units": 2,
+                "viewer_cache_max_memory_mib": 64,
+            }
+        )
+        qapp.processEvents()
+
+        assert window.image_cache.generation == generation
+        assert window.image_cache.get(0) is current
+        assert window.image_cache.cache_byte_budget_mib == 64
+        assert not window._pdf_prefetch_timer.isActive()
+
+        backend.rendered.clear()
+        window.model.go_to_index(8)
+        window._refresh_view()
+        assert window.image_cache.wait_for_done(5000)
+        qapp.processEvents()
+        assert [request.page_index for request in backend.rendered] == [8]
+
+        window._pdf_prefetch_timer.stop()
+        window._start_deferred_pdf_prefetch()
+        assert window.image_cache.wait_for_done(5000)
+        qapp.processEvents()
+        assert [request.page_index for request in backend.rendered] == [
+            8,
+            7,
+            6,
+        ]
     finally:
         _close_measured_pdf_window(
             window,
@@ -842,6 +1013,10 @@ def test_spread_pdf_uses_prefetched_current_and_partner_without_rerender(
             (1, PdfRenderPriority.VIEWER_SPREAD_PARTNER),
             (2, int(PdfRenderPriority.VIEWER_NEXT) + 2),
             (3, int(PdfRenderPriority.VIEWER_NEXT) + 4),
+            (4, int(PdfRenderPriority.VIEWER_NEXT) + 6),
+            (5, int(PdfRenderPriority.VIEWER_NEXT) + 8),
+            (6, int(PdfRenderPriority.VIEWER_NEXT) + 10),
+            (7, int(PdfRenderPriority.VIEWER_NEXT) + 12),
         ]
         generation = window.image_cache.generation
         backend.rendered.clear()
@@ -855,7 +1030,7 @@ def test_spread_pdf_uses_prefetched_current_and_partner_without_rerender(
             request.page_index not in {2, 3}
             for request in backend.rendered
         )
-        assert [request.page_index for request in backend.rendered] == [4, 5]
+        assert [request.page_index for request in backend.rendered] == [8, 9]
 
         backend.rendered.clear()
         window.set_reading_direction("rtl")

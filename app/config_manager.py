@@ -14,6 +14,37 @@ from .viewer_commands import normalize_viewer_command
 class ConfigManager(QObject):
     settings_changed = Signal(object)
 
+    VIEWER_PREFETCH_PRESETS: dict[str, dict[str, int]] = {
+        "disabled": {
+            "image_forward_units": 0,
+            "image_backward_units": 0,
+            "pdf_forward_units": 0,
+            "pdf_backward_units": 0,
+            "cache_memory_mib": 128,
+        },
+        "memory_saver": {
+            "image_forward_units": 2,
+            "image_backward_units": 1,
+            "pdf_forward_units": 1,
+            "pdf_backward_units": 0,
+            "cache_memory_mib": 128,
+        },
+        "standard": {
+            "image_forward_units": 3,
+            "image_backward_units": 3,
+            "pdf_forward_units": 3,
+            "pdf_backward_units": 3,
+            "cache_memory_mib": 256,
+        },
+        "more": {
+            "image_forward_units": 6,
+            "image_backward_units": 2,
+            "pdf_forward_units": 4,
+            "pdf_backward_units": 1,
+            "cache_memory_mib": 512,
+        },
+    }
+
     DEFAULTS: dict[str, Any] = {
         "last_open_path": "",
         "recent_paths": [],
@@ -119,6 +150,13 @@ class ConfigManager(QObject):
         "contrast": 1.0,
         "gamma": 1.0,
         "cache_size": 10,
+        "viewer_prefetch_preset": "standard",
+        "viewer_prefetch_direction_priority_enabled": True,
+        "viewer_prefetch_image_forward_units": 3,
+        "viewer_prefetch_image_backward_units": 3,
+        "viewer_prefetch_pdf_forward_units": 3,
+        "viewer_prefetch_pdf_backward_units": 3,
+        "viewer_cache_max_memory_mib": 256,
         "rotation_angle": 0,
         "slideshow_interval_ms": 3000,
         "background_color": "#000000",
@@ -501,6 +539,13 @@ class ConfigManager(QObject):
         behavior = normalized.get("open_viewer_behavior")
         if behavior not in {"reuse_active", "always_new", "reuse_or_create"}:
             normalized["open_viewer_behavior"] = "reuse_or_create"
+        if normalized.get("viewer_prefetch_preset") not in {
+            *cls.VIEWER_PREFETCH_PRESETS,
+            "custom",
+        }:
+            normalized["viewer_prefetch_preset"] = cls.DEFAULTS[
+                "viewer_prefetch_preset"
+            ]
         for key in (
             "bring_viewer_to_front_on_open",
             "loop_book_navigation",
@@ -515,6 +560,7 @@ class ConfigManager(QObject):
             "treat_wide_image_as_single",
             "thumbnail_disk_cache_enabled",
             "pdf_render_annotations",
+            "viewer_prefetch_direction_priority_enabled",
         ):
             if not isinstance(normalized.get(key), bool):
                 normalized[key] = cls.DEFAULTS[key]
@@ -544,6 +590,24 @@ class ConfigManager(QObject):
             minimum=0,
             maximum=100,
         )
+        for key in (
+            "viewer_prefetch_image_forward_units",
+            "viewer_prefetch_image_backward_units",
+            "viewer_prefetch_pdf_forward_units",
+            "viewer_prefetch_pdf_backward_units",
+        ):
+            normalized[key] = cls._clamped_int(
+                normalized.get(key),
+                default=int(cls.DEFAULTS[key]),
+                minimum=0,
+                maximum=20,
+            )
+        normalized["viewer_cache_max_memory_mib"] = cls._clamped_int(
+            normalized.get("viewer_cache_max_memory_mib"),
+            default=int(cls.DEFAULTS["viewer_cache_max_memory_mib"]),
+            minimum=64,
+            maximum=4096,
+        )
         normalized["thumbnail_cache_limit_mb"] = cls._clamped_int(
             normalized.get("thumbnail_cache_limit_mb"),
             default=int(cls.DEFAULTS["thumbnail_cache_limit_mb"]),
@@ -566,6 +630,41 @@ class ConfigManager(QObject):
             maximum=300,
         )
         return normalized
+
+    def viewer_prefetch_settings(self) -> dict[str, int | bool | str]:
+        preset = str(self.get("viewer_prefetch_preset", "standard"))
+        if preset == "custom":
+            values = {
+                "image_forward_units": int(
+                    self.get("viewer_prefetch_image_forward_units", 3)
+                ),
+                "image_backward_units": int(
+                    self.get("viewer_prefetch_image_backward_units", 3)
+                ),
+                "pdf_forward_units": int(
+                    self.get("viewer_prefetch_pdf_forward_units", 3)
+                ),
+                "pdf_backward_units": int(
+                    self.get("viewer_prefetch_pdf_backward_units", 3)
+                ),
+                "cache_memory_mib": int(
+                    self.get("viewer_cache_max_memory_mib", 256)
+                ),
+            }
+        else:
+            values = dict(
+                self.VIEWER_PREFETCH_PRESETS.get(
+                    preset,
+                    self.VIEWER_PREFETCH_PRESETS["standard"],
+                )
+            )
+        return {
+            "preset": preset,
+            "direction_priority_enabled": bool(
+                self.get("viewer_prefetch_direction_priority_enabled", True)
+            ),
+            **values,
+        }
 
     def _replace_data(self, values: dict[str, Any]) -> None:
         self.data.clear()
