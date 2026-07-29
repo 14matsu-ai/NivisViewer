@@ -117,6 +117,7 @@ class ConfigManager(QObject):
         "loop_book_navigation": False,
         "bring_viewer_to_front_on_open": True,
         "restore_last_reading_position": True,
+        "book_open_position": "first_page",
         "metadata_migration_v1_completed": False,
         "mouse_gestures_enabled": True,
         "mouse_gesture_show_trail": True,
@@ -545,6 +546,13 @@ class ConfigManager(QObject):
         }:
             normalized["viewer_prefetch_preset"] = cls.DEFAULTS[
                 "viewer_prefetch_preset"
+            ]
+        if normalized.get("book_open_position") not in {
+            "first_page",
+            "resume_last",
+        }:
+            normalized["book_open_position"] = cls.DEFAULTS[
+                "book_open_position"
             ]
         for key in (
             "bring_viewer_to_front_on_open",

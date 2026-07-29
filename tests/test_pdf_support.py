@@ -1848,6 +1848,49 @@ def test_pdf_viewer_async_open_spread_render_and_history(
     assert backend.close_all_count == 1
 
 
+def test_pdf_open_position_defaults_to_first_and_can_resume_saved_page(
+    tmp_path,
+    qapp: QApplication,
+):
+    pdf = tmp_path / "resume.pdf"
+    pdf.write_bytes(b"fake")
+    backend = FakeBackend()
+    service = PdfiumService(backend)
+    controller = ApplicationController(
+        qapp,
+        config_manager=ConfigManager(tmp_path / "config.json"),
+        pdfium_service=service,
+    )
+    controller.metadata_store.record_book_opened(
+        str(pdf),
+        item_type="pdf",
+        start_page_index=2,
+        total_pages=3,
+    )
+    first = controller.open_path(pdf, open_in_new_window=True)
+    try:
+        deadline = time.monotonic() + 3
+        while first.model.total_pages != 3 and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.005)
+        assert first.model.current_index == 0
+        assert controller.metadata_store.get_reading_progress(str(pdf)).page_index == 2
+
+        controller.config.apply({"book_open_position": "resume_last"})
+        assert first.model.current_index == 0
+        resumed = controller.open_path(pdf, open_in_new_window=True)
+        deadline = time.monotonic() + 3
+        while resumed.model.total_pages != 3 and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.005)
+        assert resumed.model.current_index == 2
+    finally:
+        for window in tuple(controller.viewer_windows):
+            window.close()
+        qapp.processEvents()
+        controller.shutdown()
+
+
 def test_closing_pdf_viewer_flushes_document_before_file_operation(
     tmp_path,
     qapp,

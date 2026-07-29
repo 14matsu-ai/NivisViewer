@@ -354,6 +354,19 @@ class SettingsDialog(QDialog):
         spread_form.addRow(self.single_first_checkbox)
         self.wide_single_checkbox = QCheckBox("横長画像を単独表示", spread_group)
         spread_form.addRow(self.wide_single_checkbox)
+        self.book_open_position_combo = QComboBox(spread_group)
+        self.book_open_position_combo.addItem(
+            "常に先頭ページから開く",
+            "first_page",
+        )
+        self.book_open_position_combo.addItem(
+            "前回閉じたページから再開",
+            "resume_last",
+        )
+        spread_form.addRow(
+            "書庫・PDF・フォルダーを開く位置:",
+            self.book_open_position_combo,
+        )
         self.viewer_canvas_click_direction_combo = QComboBox(spread_group)
         self.viewer_canvas_click_direction_combo.addItem(
             "右側で次へ／左側で前へ",
@@ -1017,6 +1030,10 @@ class SettingsDialog(QDialog):
             bool(self.config.get("treat_wide_image_as_single", True))
         )
         self._select_data(
+            self.book_open_position_combo,
+            self.config.get("book_open_position", "first_page"),
+        )
+        self._select_data(
             self.viewer_canvas_click_direction_combo,
             self.config.get("viewer_canvas_click_direction", "right_next"),
         )
@@ -1476,6 +1493,9 @@ class SettingsDialog(QDialog):
             "gap": self.gap_spin.value(),
             "single_first_page": self.single_first_checkbox.isChecked(),
             "treat_wide_image_as_single": self.wide_single_checkbox.isChecked(),
+            "book_open_position": str(
+                self.book_open_position_combo.currentData() or "first_page"
+            ),
             "viewer_canvas_click_direction": str(
                 self.viewer_canvas_click_direction_combo.currentData()
             ),

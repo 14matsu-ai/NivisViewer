@@ -161,7 +161,7 @@ def test_failed_external_open_preserves_current_book_and_history(
     qapp.processEvents()
 
 
-def test_successful_external_open_records_and_restores_clamped_position(
+def test_external_archive_open_position_can_resume_and_clamps_saved_progress(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
@@ -175,6 +175,7 @@ def test_successful_external_open_records_and_restores_clamped_position(
         total_pages=100,
     )
     window = make_window(tmp_path, ViewerBackend(pages=3), metadata_store=store)
+    window.config.apply({"book_open_position": "resume_last"})
 
     assert window.open_path(archive)
     assert window.book_session.wait_for_async(2000)

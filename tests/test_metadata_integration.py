@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +24,15 @@ def write_book(folder: Path, pages: int = 4) -> list[Path]:
             image.save(path)
         result.append(path)
     return result
+
+
+def write_zip_book(path: Path, pages: int = 4) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        for number in range(1, pages + 1):
+            output = BytesIO()
+            with Image.new("RGB", (8, 12), "white") as image:
+                image.save(output, format="PNG")
+            archive.writestr(f"{number}.png", output.getvalue())
 
 
 def make_controller(tmp_path: Path, qapp: QApplication) -> ApplicationController:
@@ -150,6 +161,7 @@ def test_normal_reopen_restores_progress_and_clamps_to_page_count(
     book = tmp_path / "restore"
     write_book(book, 4)
     controller = make_controller(tmp_path, qapp)
+    controller.config.apply({"book_open_position": "resume_last"})
     window = controller.open_path(book)
     finish_viewer_open(qapp, window)
     window.next_one_page()
@@ -189,6 +201,7 @@ def test_explicit_image_selection_wins_over_saved_folder_progress(
         start_page_index=3,
         total_pages=4,
     )
+    controller.config.apply({"book_open_position": "resume_last"})
 
     window = controller.open_path(pages[1])
     finish_viewer_open(qapp, window)
@@ -207,6 +220,7 @@ def test_history_tab_opens_viewer_at_saved_progress(
     book = tmp_path / "history-open"
     write_book(book, 4)
     controller = make_controller(tmp_path, qapp)
+    controller.config.apply({"book_open_position": "resume_last"})
     browser = controller.create_browser_window()
     controller.metadata_store.record_book_opened(
         str(book),
@@ -243,7 +257,7 @@ def test_controller_open_notifies_browser_history_model(
     close_controller(controller, qapp)
 
 
-def test_restore_last_position_can_be_disabled(
+def test_first_page_position_ignores_saved_progress(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
@@ -256,12 +270,67 @@ def test_restore_last_position_can_be_disabled(
         start_page_index=3,
         total_pages=4,
     )
-    controller.config.apply({"restore_last_reading_position": False})
+    controller.config.apply({"book_open_position": "first_page"})
 
     window = controller.open_path(book)
     finish_viewer_open(qapp, window)
 
     assert window.model.current_index == 0
+    close_controller(controller, qapp)
+
+
+def test_first_page_open_preserves_saved_progress_until_resume_is_selected(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    book = tmp_path / "open-position"
+    write_book(book, 4)
+    controller = make_controller(tmp_path, qapp)
+    controller.metadata_store.record_book_opened(
+        str(book),
+        item_type="folder",
+        start_page_index=3,
+        total_pages=4,
+    )
+
+    window = controller.open_path(book)
+    finish_viewer_open(qapp, window)
+    assert window.model.current_index == 0
+    assert controller.metadata_store.get_reading_progress(str(book)).page_index == 3
+
+    controller.config.apply({"book_open_position": "resume_last"})
+    assert window.model.current_index == 0
+
+    reopened = controller.create_viewer_window()
+    assert reopened.open_path(book)
+    finish_viewer_open(qapp, reopened)
+    assert reopened.model.current_index == 3
+    close_controller(controller, qapp)
+
+
+def test_zip_open_position_defaults_to_first_and_can_resume(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    archive = tmp_path / "open-position.zip"
+    write_zip_book(archive, 4)
+    controller = make_controller(tmp_path, qapp)
+    controller.metadata_store.record_book_opened(
+        str(archive),
+        item_type="archive",
+        start_page_index=2,
+        total_pages=4,
+    )
+
+    first = controller.open_path(archive, open_in_new_window=True)
+    finish_viewer_open(qapp, first)
+    assert first.model.current_index == 0
+    assert controller.metadata_store.get_reading_progress(str(archive)).page_index == 2
+
+    controller.config.apply({"book_open_position": "resume_last"})
+    resumed = controller.open_path(archive, open_in_new_window=True)
+    finish_viewer_open(qapp, resumed)
+    assert resumed.model.current_index == 2
     close_controller(controller, qapp)
 
 
