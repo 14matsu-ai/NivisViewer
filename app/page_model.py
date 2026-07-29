@@ -30,6 +30,7 @@ class PageModel:
         self.single_first_page = True
         self.treat_wide_image_as_single = True
         self._size_cache: dict[int, tuple[int, int] | None] = {}
+        self._spread_start_by_index: list[int] = []
         self._focused_page_identity: str | None = None
         self._sliding_spread = False
 
@@ -75,6 +76,7 @@ class PageModel:
         self.image_ids = list(image_ids)
         self._size_cache.clear()
         self._sliding_spread = False
+        self._rebuild_spread_boundaries()
 
         if not self.image_ids:
             self.current_index = 0
@@ -98,6 +100,7 @@ class PageModel:
         self.image_ids = []
         self.current_index = 0
         self._size_cache.clear()
+        self._spread_start_by_index = []
         self._focused_page_identity = None
         self._sliding_spread = False
 
@@ -118,6 +121,7 @@ class PageModel:
         if treat_wide_image_as_single is not None:
             self.treat_wide_image_as_single = treat_wide_image_as_single
         self._sliding_spread = False
+        self._rebuild_spread_boundaries()
         self.current_index = self.spread_start_for_index(self.focused_index)
 
     def image_id_at(self, index: int) -> str | None:
@@ -188,7 +192,10 @@ class PageModel:
     def set_image_size(self, index: int, size: tuple[int, int] | None) -> bool:
         previous = self.current_index
         if 0 <= index < self.total_pages:
+            was_wide = self._cached_size_is_wide(index)
             self._size_cache[index] = size
+            if was_wide != self._cached_size_is_wide(index):
+                self._rebuild_spread_boundaries()
             focused = self.focused_index
             if focused >= 0:
                 self.current_index = (
@@ -202,10 +209,19 @@ class PageModel:
         if not self.treat_wide_image_as_single:
             return False
         size = self.get_image_size(index)
+        return self._size_is_wide(size)
+
+    @staticmethod
+    def _size_is_wide(size: tuple[int, int] | None) -> bool:
         if size is None:
             return False
         width, height = size
         return height > 0 and width / height >= 1.25
+
+    def _cached_size_is_wide(self, index: int) -> bool:
+        if not self.treat_wide_image_as_single:
+            return False
+        return self._size_is_wide(self._size_cache.get(index))
 
     def is_single_at(self, index: int) -> bool:
         if self.view_mode == "single":
@@ -218,19 +234,34 @@ class PageModel:
         if self.total_pages == 0:
             return 0
         target_index = max(0, min(target_index, self.total_pages - 1))
+        if len(self._spread_start_by_index) != self.total_pages:
+            self._rebuild_spread_boundaries()
+        return self._spread_start_by_index[target_index]
+
+    def _rebuild_spread_boundaries(self) -> None:
+        total = self.total_pages
+        if total == 0:
+            self._spread_start_by_index = []
+            return
+        if self.view_mode == "single":
+            self._spread_start_by_index = list(range(total))
+            return
+
+        boundaries = [0] * total
         start = 0
-        while start < self.total_pages:
-            spread = self.spread_at(start)
-            covered = [slot.page_index for slot in spread.slots]
-            if target_index in covered:
-                return spread.start_index
-            next_start = self.next_index_from(start)
-            if next_start <= start:
-                break
-            if next_start > target_index:
-                return start
-            start = next_start
-        return target_index
+        while start < total:
+            unit_length = 1
+            if (
+                not self.is_single_at(start)
+                and start + 1 < total
+                and not self.is_wide_image(start + 1)
+            ):
+                unit_length = 2
+            stop = min(total, start + unit_length)
+            for page_index in range(start, stop):
+                boundaries[page_index] = start
+            start = stop
+        self._spread_start_by_index = boundaries
 
     def spread_at(self, start_index: int | None = None) -> DisplaySpread:
         if self.total_pages == 0:
@@ -272,22 +303,7 @@ class PageModel:
         start_index = self.spread_start_for_index(start_index)
         if start_index <= 0:
             return 0
-        if self.source is not None and self.source.load_sizes_lazily:
-            if self.view_mode == "single":
-                return start_index - 1
-            if self.single_first_page and start_index <= 2:
-                return 0
-            return max(1 if self.single_first_page else 0, start_index - 2)
-
-        probe = 0
-        previous = 0
-        while probe < start_index:
-            previous = probe
-            next_probe = self.next_index_from(probe)
-            if next_probe <= probe:
-                break
-            probe = next_probe
-        return previous
+        return self.spread_start_for_index(start_index - 1)
 
     def go_to_index(self, index: int) -> None:
         if not self.total_pages:
