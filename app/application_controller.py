@@ -4,6 +4,7 @@ import inspect
 import os
 import weakref
 from pathlib import Path
+from time import monotonic
 from typing import Callable
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -37,6 +38,7 @@ from .path_availability import PathAvailabilityService
 from .pdfium_service import PdfiumService
 from .performance_trace import performance_trace
 from .single_instance import InstanceMessage
+from .settings_dialog import SettingsDialog, _RETIRED_SETTINGS_DIALOGS
 from .startup_restore import StartupRestoreCoordinator
 from .application_shutdown import (
     ApplicationShutdownCoordinator,
@@ -131,6 +133,7 @@ class ApplicationController(QObject):
         self._quit_requested = False
         self._quit_committed = False
         self._exit_evaluation_suspended = 0
+        self._settings_probe_shutdown_timeout_msecs = 250
         self._restore_on_start = True
         self.quit_when_last_viewer_closed = False
         self.application.setQuitOnLastWindowClosed(False)
@@ -230,6 +233,7 @@ class ApplicationController(QObject):
         )
         self._browser_window = window
         window._application_close_guard = self._allow_window_close
+        window._settings_dialog_open_guard = lambda: not self._shutdown
         self._quit_requested = False
         window.closing.connect(self._on_browser_closing)
         window.directory_scan_committed.connect(
@@ -518,6 +522,7 @@ class ApplicationController(QObject):
                 (
                     ("viewer_sessions", self._prepare_viewers_for_shutdown),
                     ("browser_workers", self._prepare_browser_for_shutdown),
+                    ("settings_probes", self._shutdown_settings_probes),
                     ("archive_backends", self.archive_backend_registry.close),
                     ("adjacent_book_search", self.adjacent_book_search.close),
                     ("path_availability", self.path_availability_service.close),
@@ -559,6 +564,28 @@ class ApplicationController(QObject):
         browser = self.get_browser_window()
         if browser is not None:
             browser.prepare_shutdown()
+
+    def _shutdown_settings_probes(self) -> bool:
+        dialogs_by_id = {
+            id(dialog): dialog for dialog in tuple(_RETIRED_SETTINGS_DIALOGS)
+        }
+        browser = self.get_browser_window()
+        if browser is not None:
+            for dialog in browser.findChildren(SettingsDialog):
+                dialogs_by_id[id(dialog)] = dialog
+
+        deadline = (
+            monotonic()
+            + max(0, int(self._settings_probe_shutdown_timeout_msecs)) / 1000
+        )
+        all_done = True
+        for dialog in tuple(dialogs_by_id.values()):
+            remaining_msecs = max(0, int((deadline - monotonic()) * 1000))
+            if not dialog._prepare_application_shutdown(
+                wait_msecs=remaining_msecs
+            ):
+                all_done = False
+        return all_done
 
     def _shutdown_pdfium_service(self) -> None:
         if self.pdfium_service.shutdown():

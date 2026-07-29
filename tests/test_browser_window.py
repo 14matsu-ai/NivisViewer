@@ -4,7 +4,7 @@ import zipfile
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import PropertyMock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 import pytest
 from PIL import Image
@@ -187,6 +187,21 @@ def test_settings_action_is_direct_and_triggers_existing_dialog_path_once(
     assert opened == [window]
     window.close()
     qapp.processEvents()
+
+
+def test_settings_dialog_is_not_created_after_application_shutdown_starts(
+    monkeypatch,
+) -> None:
+    dialog_factory = Mock()
+    monkeypatch.setattr("app.browser_window.SettingsDialog", dialog_factory)
+    window = SimpleNamespace(
+        _shutdown_prepared=False,
+        _settings_dialog_open_guard=Mock(return_value=False),
+    )
+
+    BrowserWindow.open_settings_dialog(window)
+
+    dialog_factory.assert_not_called()
 
 
 def test_item_activation_passes_image_and_archive_but_folder_navigates(
