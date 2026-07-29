@@ -75,7 +75,6 @@ def main(arguments: list[str] | None = None) -> int:
         return 0 if success else 1
 
     config = ConfigManager(paths.config_path, writable=paths.writable)
-    config.load()
     metadata = MetadataStore(paths.metadata_path, initialize=paths.writable)
     controller = ApplicationController(
         application,
