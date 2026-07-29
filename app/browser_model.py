@@ -298,12 +298,14 @@ class BrowserItemModel(QAbstractListModel):
         if generation != self._scan_generation:
             return 0
         additions: list[BrowserItem] = []
+        addition_keys: list[str] = []
         for entry in entries:
             key = self._key(entry.path)
             if key in self._source_keys:
                 continue
             self._source_keys.add(key)
             additions.append(entry)
+            addition_keys.append(key)
         if not additions:
             return 0
         first = len(self._items)
@@ -311,8 +313,8 @@ class BrowserItemModel(QAbstractListModel):
         self.beginInsertRows(QModelIndex(), first, last)
         self._source_items.extend(additions)
         self._items.extend(additions)
-        for row, item in enumerate(additions, start=first):
-            self._row_by_key[self._key(item.path)] = row
+        for row, key in enumerate(addition_keys, start=first):
+            self._row_by_key[key] = row
         self.endInsertRows()
         return len(additions)
 

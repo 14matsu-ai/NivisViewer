@@ -63,6 +63,7 @@ class BrowserScanRequest:
     priority: BrowserScanPriority = BrowserScanPriority.INTERACTIVE_NAVIGATION
     trace_id: int = 0
     sort_policy: BrowserSortPolicy = BrowserSortPolicy()
+    include_progress_entries: bool = True
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,13 @@ class BrowserScanBatch:
     generation: int
     entries: tuple[BrowserScanEntry, ...]
     final_items_pending: bool = False
+    batch_count: int | None = None
+
+    @property
+    def item_count(self) -> int:
+        if self.batch_count is None:
+            return len(self.entries)
+        return max(0, int(self.batch_count))
 
 
 @dataclass(frozen=True)
@@ -234,6 +242,7 @@ def scan_directory(
     target = Path(request.path)
     batch_size = max(1, min(1024, int(request.batch_size)))
     batch: list[BrowserScanEntry] = []
+    batch_count = 0
     prepared_items: list[BrowserItem] = []
     total_count = 0
     if cancelled.is_set():
@@ -283,10 +292,12 @@ def scan_directory(
                     )
                 except ValueError:
                     continue
-                batch.append(scanned)
+                if request.include_progress_entries:
+                    batch.append(scanned)
+                batch_count += 1
                 total_count += 1
-                if len(batch) >= batch_size:
-                    if request.trace_id and total_count == len(batch):
+                if batch_count >= batch_size:
+                    if request.trace_id and total_count == batch_count:
                         performance_trace.mark(
                             request.trace_id,
                             "scanner.first_batch.created",
@@ -298,9 +309,11 @@ def scan_directory(
                             request.generation,
                             tuple(batch),
                             final_items_pending=True,
+                            batch_count=batch_count,
                         )
                     )
                     batch.clear()
+                    batch_count = 0
                     if cancelled.is_set():
                         return BrowserScanCompleted(
                             request.path,
@@ -361,8 +374,8 @@ def scan_directory(
             f"フォルダを読み込めません: {request.path} ({exc})",
         )
     else:
-        if batch and not cancelled.is_set():
-            if request.trace_id and total_count == len(batch):
+        if batch_count and not cancelled.is_set():
+            if request.trace_id and total_count == batch_count:
                 performance_trace.mark(
                     request.trace_id,
                     "scanner.first_batch.created",
@@ -374,6 +387,7 @@ def scan_directory(
                     request.generation,
                     tuple(batch),
                     final_items_pending=True,
+                    batch_count=batch_count,
                 )
             )
         if cancelled.is_set():
@@ -386,11 +400,17 @@ def scan_directory(
         ordered_items = tuple(
             request.sort_policy.sorted_items(prepared_items)
         )
+        if cancelled.is_set():
+            return BrowserScanCompleted(
+                request.path,
+                request.generation,
+                total_count,
+                cancelled=True,
+            )
         return BrowserScanCompleted(
             request.path,
             request.generation,
             total_count,
-            cancelled=cancelled.is_set(),
             prepared_items=ordered_items,
             sort_policy=request.sort_policy,
         )

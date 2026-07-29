@@ -95,8 +95,17 @@ class BrowserSortPolicy:
 
     def sorted_items(self, items: Iterable[BrowserItem]) -> list[BrowserItem]:
         source = list(items)
-        # Stable secondary ordering makes equal timestamps and sizes deterministic.
-        source.sort(key=self._natural_identity_key)
+        # Name sorting computes the natural key in the primary pass below.
+        # Pre-order only by path so equal case-insensitive names retain the
+        # existing deterministic path order without generating that expensive
+        # key twice. Other primary keys still need natural-name secondary order.
+        source.sort(
+            key=(
+                self._path_identity_key
+                if self.sort_key is BrowserSortKey.NAME
+                else self._natural_identity_key
+            )
+        )
 
         if self.folders_first:
             folders = [item for item in source if item.kind.value == "folder"]
@@ -123,3 +132,7 @@ class BrowserSortPolicy:
     @staticmethod
     def _natural_identity_key(item: BrowserItem) -> tuple[Any, str]:
         return _natural_key(item.display_name), str(item.path).casefold()
+
+    @staticmethod
+    def _path_identity_key(item: BrowserItem) -> str:
+        return str(item.path).casefold()

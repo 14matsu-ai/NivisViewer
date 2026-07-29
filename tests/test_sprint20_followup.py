@@ -480,6 +480,8 @@ def test_normal_and_favorite_large_folder_navigation_do_the_same_work(
             "navigate": 0,
             "scan": 0,
             "enumeration": 0,
+            "progress_items": 0,
+            "progress_entry_refs": 0,
             "worker_convert": 0,
             "worker_natural_key": 0,
             "worker_sort": 0,
@@ -520,6 +522,10 @@ def test_normal_and_favorite_large_folder_navigation_do_the_same_work(
             def counted_scandir(path):
                 metrics["enumeration"] += 1
                 return original_scandir(path)
+
+            def counted_progress_batch(batch):
+                metrics["progress_items"] += batch.item_count
+                metrics["progress_entry_refs"] += len(batch.entries)
 
             def counted_convert(scan_entry):
                 worker_threads.add(get_ident())
@@ -563,6 +569,7 @@ def test_normal_and_favorite_large_folder_navigation_do_the_same_work(
             patch.setattr(window, "navigate_to", counted_navigate)
             patch.setattr(scanner, "start", counted_start)
             patch.setattr(scanner_module.os, "scandir", counted_scandir)
+            scanner.batch_ready.connect(counted_progress_batch)
             patch.setattr(
                 browser_model_module,
                 "browser_item_from_scan_entry",
@@ -679,8 +686,10 @@ def test_normal_and_favorite_large_folder_navigation_do_the_same_work(
         "navigate": 1,
         "scan": 1,
         "enumeration": 1,
+        "progress_items": item_count,
+        "progress_entry_refs": 0,
         "worker_convert": item_count,
-        "worker_natural_key": item_count * 2,
+        "worker_natural_key": item_count,
         "worker_sort": 1,
         "gui_sort": 0,
         "snapshot": 0,
