@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
+from time import monotonic
 
 from PIL import Image, ImageEnhance
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
@@ -66,9 +68,16 @@ class _ImageLoadTask(QRunnable):
         self.priority = priority
         self.trace_id = int(trace_id)
         self.signals = _ImageLoadSignals()
+        self.finished = Event()
 
     @Slot()
     def run(self) -> None:
+        try:
+            self._run_load()
+        finally:
+            self.finished.set()
+
+    def _run_load(self) -> None:
         performance_trace.mark(
             self.trace_id,
             "viewer.worker.started",
@@ -266,6 +275,7 @@ class ImageCache(QObject):
         )
         if adjustments == self._adjustments:
             return
+        self._cancel_in_flight()
         self._adjustments = adjustments
         self.generation += 1
         self._cache.clear()
@@ -398,6 +408,21 @@ class ImageCache(QObject):
 
     def has_in_flight_for_source(self, source: ImageSource) -> bool:
         return any(active_source is source for active_source in self._in_flight.values())
+
+    def has_unfinished_tasks(self) -> bool:
+        return any(
+            not task.finished.is_set()
+            for task, _priority in self._tasks.values()
+        )
+
+    def wait_for_owned_tasks(self, msecs: int = 5000) -> bool:
+        tasks = tuple(task for task, _priority in self._tasks.values())
+        deadline = monotonic() + max(0, int(msecs)) / 1000
+        for task in tasks:
+            remaining = max(0.0, deadline - monotonic())
+            if not task.finished.wait(remaining):
+                return False
+        return True
 
     def wait_for_done(self, msecs: int = 5000) -> bool:
         if self._coordinator is not None:

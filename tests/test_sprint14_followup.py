@@ -217,6 +217,45 @@ class QueuedLoadSource(ImageSource):
         return image_id
 
 
+def test_adjustment_change_cancels_old_generation_without_running_queued_decode(
+    qapp,
+    tmp_path,
+):
+    coordinator = ImageWorkCoordinator(max_workers=2)
+    source = QueuedLoadSource(tmp_path)
+    cancelled: list[str] = []
+    source.cancel_image_request = cancelled.append
+    cache = ImageCache(image_work_coordinator=coordinator)
+    delivered: list[str] = []
+    cache.pageLoaded.connect(lambda cached: delivered.append(cached.image_id))
+    cache.set_source(source, source.ids)
+    stale_generation = cache.generation
+    cache.ensure_loaded(0)
+    assert source.running_started.wait(1)
+    cache.ensure_loaded(1)
+
+    cache.set_adjustments(brightness=1.1, contrast=1.0, gamma=1.0)
+    current_generation = cache.generation
+    cache.ensure_loaded(1)
+
+    assert cancelled == source.ids
+    assert (stale_generation, 0) in cache._tasks
+    assert (stale_generation, 1) not in cache._tasks
+    assert (current_generation, 1) in cache._tasks
+    assert source.started == ["running.jpg"]
+
+    source.release_running.set()
+    assert coordinator.wait_for_viewer(2000)
+    qapp.processEvents()
+
+    assert source.started == ["running.jpg", "queued.jpg"]
+    assert delivered == ["queued.jpg"]
+    assert cache.get(1) is not None
+    assert cache._tasks == {}
+    assert cache._in_flight == {}
+    coordinator.shutdown()
+
+
 def test_image_cache_registers_logical_current_before_rtl_partner(qapp, tmp_path):
     coordinator = ImageWorkCoordinator(max_workers=2)
     source = OrderedSource(tmp_path)

@@ -39,6 +39,13 @@ class PageModel:
 
     @property
     def focused_index(self) -> int:
+        if (
+            self._focused_page_identity is not None
+            and 0 <= self.current_index < self.total_pages
+            and self.page_identity(self.current_index)
+            == self._focused_page_identity
+        ):
+            return self.current_index
         resolved = self.index_for_identity(self._focused_page_identity)
         return resolved if resolved >= 0 else self.current_index
 

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from PIL import Image
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from app.application_controller import ApplicationController
@@ -76,6 +77,84 @@ def test_open_path_displays_book(tmp_path: Path, qapp: QApplication) -> None:
     assert window.book_session.current_path == image
     assert window.model.total_pages == 1
     assert window.slider.isEnabled()
+    window.close()
+    qapp.processEvents()
+
+
+def test_hidden_page_list_defers_all_items_until_first_visible(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    class ManyPageSource(ImageSource):
+        load_sizes_lazily = True
+
+        def __init__(self) -> None:
+            super().__init__(tmp_path / "book")
+            self.ids = [f"page-{index:04d}.jpg" for index in range(1000)]
+
+        def list_images(self) -> list[str]:
+            return list(self.ids)
+
+        def open_image(self, _image_id: str) -> Image.Image:
+            return Image.new("RGB", (8, 12), "white")
+
+        def display_path(self, image_id: str) -> str:
+            return image_id
+
+    source = ManyPageSource()
+    session = BookSession(
+        source_factory=lambda *_args, **_kwargs: (source, None),
+    )
+    window = ViewerWindow(
+        config_manager=make_config(tmp_path),
+        book_session=session,
+    )
+    item_counts_at_request: list[int] = []
+    original_preload = window.image_cache.preload_around
+
+    def record_preload(*args, **kwargs):
+        item_counts_at_request.append(window.page_list.count())
+        return original_preload(*args, **kwargs)
+
+    window.image_cache.preload_around = record_preload
+    assert window.open_path(tmp_path / "book")
+    finish_open(window, qapp)
+    assert window.image_cache.wait_for_done(2000)
+    qapp.processEvents()
+
+    assert item_counts_at_request
+    assert item_counts_at_request[0] == 0
+    assert window.page_list.count() == 0
+    assert window._page_list_dirty
+
+    rebuilds: list[None] = []
+    original_rebuild = window._rebuild_page_list
+
+    def counted_rebuild():
+        rebuilds.append(None)
+        original_rebuild()
+
+    window._rebuild_page_list = counted_rebuild
+    window.show()
+    qapp.processEvents()
+    window.set_page_list_visible(True)
+    qapp.processEvents()
+
+    assert window.page_list.count() == 1000
+    assert not window._page_list_dirty
+    assert window.page_list.currentItem() is not None
+    assert (
+        window.page_list.currentItem().data(Qt.ItemDataRole.UserRole)
+        == window.model.focused_index
+    )
+    assert not window.page_list.item(0).icon().isNull()
+    assert len(rebuilds) == 1
+
+    window.set_page_list_visible(False)
+    window.set_page_list_visible(True)
+    qapp.processEvents()
+    assert window.page_list.count() == 1000
+    assert len(rebuilds) == 1
     window.close()
     qapp.processEvents()
 

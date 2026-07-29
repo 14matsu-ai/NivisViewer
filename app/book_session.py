@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import inspect
+import logging
 from pathlib import Path
 from threading import Event
 from typing import Callable
@@ -22,6 +23,7 @@ from .performance_trace import performance_trace
 
 
 SourceFactory = Callable[..., tuple[ImageSource, str | None]]
+_LOG = logging.getLogger("nivisviewer.book_session")
 
 
 @dataclass(frozen=True)
@@ -113,7 +115,7 @@ class _BookOpenWorker(QRunnable):
                 f"pages={len(images)}",
             )
             if self.cancelled.is_set():
-                source.close()
+                self._close_source(source)
                 source = None
                 result = _PreparedBook(
                     self.requested_path,
@@ -135,7 +137,8 @@ class _BookOpenWorker(QRunnable):
                 )
         except ImageSourceError as exc:
             if source is not None:
-                source.close()
+                self._close_source(source)
+                source = None
             result = _PreparedBook(
                 self.requested_path,
                 None,
@@ -151,7 +154,8 @@ class _BookOpenWorker(QRunnable):
             )
         except Exception as exc:
             if source is not None:
-                source.close()
+                self._close_source(source)
+                source = None
             result = _PreparedBook(
                 self.requested_path,
                 None,
@@ -166,6 +170,16 @@ class _BookOpenWorker(QRunnable):
             )
             result.error.__cause__ = exc
         self.signals.completed.emit(result)
+
+    @staticmethod
+    def _close_source(source: ImageSource) -> None:
+        try:
+            source.close()
+        except Exception:
+            _LOG.exception(
+                "Prepared image source cleanup failed source=%s",
+                source.source_path,
+            )
 
 
 _RETIRED_BOOK_OPEN_POOLS: set[QThreadPool] = set()
@@ -385,15 +399,16 @@ class BookSession(QObject):
             return
         self._shutdown = True
         self.close_book()
-        if not self._open_pool.waitForDone(0):
+        if self._open_workers:
             _RETIRED_BOOK_OPEN_POOLS.add(self._open_pool)
-        if self.image_cache.wait_for_done(wait_msecs):
+        if self.image_cache.wait_for_owned_tasks(wait_msecs):
             for source in list(self._retired_sources.values()):
                 self._close_source(source)
             self._retired_sources.clear()
-        else:
+        if self._has_owned_async_work():
             self.setParent(None)
             _RETIRED_BOOK_SESSIONS.add(self)
+        self._maybe_finalize_shutdown()
 
     @Slot(object)
     def _on_async_prepared(self, result: _PreparedBook) -> None:
@@ -403,6 +418,7 @@ class BookSession(QObject):
         if self._shutdown or result.generation != self.generation:
             if result.source is not None:
                 self._close_source(result.source)
+            self._maybe_finalize_shutdown()
             return
         self._open_cancel = None
         if result.cancelled:
@@ -495,11 +511,20 @@ class BookSession(QObject):
         retired = self._retired_sources.pop(id(source), None)
         if retired is source:
             self._close_source(source)
-        if (
-            self._shutdown
-            and not self._retired_sources
-            and self.image_cache.wait_for_done(0)
-        ):
+        self._maybe_finalize_shutdown()
+
+    def _has_owned_async_work(self) -> bool:
+        return bool(
+            self._open_workers
+            or self._retired_sources
+            or self.image_cache.has_unfinished_tasks()
+        )
+
+    def _maybe_finalize_shutdown(self) -> None:
+        if not self._shutdown or self._has_owned_async_work():
+            return
+        _RETIRED_BOOK_OPEN_POOLS.discard(self._open_pool)
+        if self in _RETIRED_BOOK_SESSIONS:
             _RETIRED_BOOK_SESSIONS.discard(self)
             self.deleteLater()
 
