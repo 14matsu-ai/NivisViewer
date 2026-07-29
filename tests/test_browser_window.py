@@ -155,6 +155,27 @@ def test_show_folder_sidebar_and_settings_round_trip(
     assert config.get("browser_window_geometry")
 
 
+def test_browser_defers_thumbnail_disk_cache_open_until_a_worker_requests_it(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "先行表示"
+    folder.mkdir()
+    config = make_config(tmp_path, folder)
+
+    with patch("app.browser_window.ThumbnailDiskCache") as cache_type:
+        cache = cache_type.return_value
+        cache.enabled = False
+        window = BrowserWindow(config_manager=config)
+
+        assert cache_type.call_args.kwargs["enabled"] is False
+        assert window.thumbnail_provider.disk_cache is cache
+        assert not cache.set_enabled.called
+
+        window.close()
+        qapp.processEvents()
+
+
 def test_settings_action_is_direct_and_triggers_existing_dialog_path_once(
     tmp_path: Path,
     qapp: QApplication,

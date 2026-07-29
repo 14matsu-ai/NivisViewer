@@ -280,6 +280,10 @@ class BrowserWindow(QMainWindow):
         if thumbnail_provider is None:
             disk_cache = ThumbnailDiskCache(
                 self.config.thumbnail_cache_dir,
+                # Opening the SQLite index may include directory creation and
+                # aggregate queries.  The provider opens it on its worker when
+                # the first thumbnail is requested, so it must not delay the
+                # first Browser window paint.
                 enabled=False,
                 limit_mb=int(self.settings.get("thumbnail_cache_limit_mb", 512)),
                 max_unused_days=int(
