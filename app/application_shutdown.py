@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+import logging
 from typing import Callable, Iterable
 
 from PySide6.QtCore import QObject, Signal
+
+
+_LOG = logging.getLogger(__name__)
 
 
 class ApplicationShutdownState(StrEnum):
@@ -41,6 +45,10 @@ class ApplicationShutdownCoordinator(QObject):
         self._steps = list(steps)
         self._state = ApplicationShutdownState.RUNNING
         self._snapshot = ApplicationShutdownSnapshot()
+        self._next_step_index = 0
+        self._failed_step_index: int | None = None
+        self._failed_step_name: str | None = None
+        self._last_logged_failure: tuple[int, str] | None = None
 
     @property
     def state(self) -> ApplicationShutdownState:
@@ -49,6 +57,14 @@ class ApplicationShutdownCoordinator(QObject):
     @property
     def snapshot(self) -> ApplicationShutdownSnapshot:
         return self._snapshot
+
+    @property
+    def failed_step_index(self) -> int | None:
+        return self._failed_step_index
+
+    @property
+    def failed_step_name(self) -> str | None:
+        return self._failed_step_name
 
     def configure(
         self,
@@ -59,23 +75,58 @@ class ApplicationShutdownCoordinator(QObject):
         if self._state is not ApplicationShutdownState.RUNNING:
             return
         self._steps = list(steps)
+        self._next_step_index = 0
+        self._failed_step_index = None
+        self._failed_step_name = None
+        self._last_logged_failure = None
         if snapshot is not None:
             self._snapshot = snapshot
 
     def begin_shutdown(self) -> bool:
         if self._state is ApplicationShutdownState.STOPPED:
-            return False
+            return True
         if self._state is ApplicationShutdownState.SHUTTING_DOWN:
             return False
         self._state = ApplicationShutdownState.SHUTTING_DOWN
-        try:
-            for name, callback in self._steps:
-                self.phase_changed.emit(name)
-                callback()
-        except Exception as exc:
-            self._state = ApplicationShutdownState.TIMED_OUT
-            self.shutdown_failed.emit(str(exc))
-            return False
+        while self._next_step_index < len(self._steps):
+            step_index = self._next_step_index
+            name, callback = self._steps[step_index]
+            self.phase_changed.emit(name)
+            try:
+                result = callback()
+            except Exception as exc:
+                self._record_failure(step_index, name, str(exc))
+                return False
+            if result is False:
+                self._record_failure(
+                    step_index,
+                    name,
+                    f"Shutdown step '{name}' did not complete.",
+                )
+                return False
+            self._next_step_index += 1
+            self._failed_step_index = None
+            self._failed_step_name = None
         self._state = ApplicationShutdownState.STOPPED
         self.shutdown_finished.emit()
         return True
+
+    def _record_failure(
+        self,
+        step_index: int,
+        step_name: str,
+        message: str,
+    ) -> None:
+        self._state = ApplicationShutdownState.TIMED_OUT
+        self._failed_step_index = step_index
+        self._failed_step_name = step_name
+        failure = (step_index, message)
+        if failure != self._last_logged_failure:
+            _LOG.error(
+                "Application shutdown step failed step=%s index=%d error=%s",
+                step_name,
+                step_index,
+                message,
+            )
+            self._last_logged_failure = failure
+        self.shutdown_failed.emit(message)
