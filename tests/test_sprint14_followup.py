@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 from threading import Event, Lock, current_thread, main_thread
 from time import monotonic
+from unittest.mock import Mock
 import zipfile
 
 import pytest
@@ -20,7 +21,7 @@ from app.browser_model import BrowserItem, BrowserItemKind, BrowserItemModel
 from app.browser_sort import BrowserDisplayDensity
 from app.browser_thumbnail_scheduler import ThumbnailPriority
 from app.config_manager import ConfigManager
-from app.image_cache import ImageCache
+from app.image_cache import CachedImage, ImageCache, _ImageLoadResult
 from app.image_source import (
     FolderListingSnapshot,
     ImageSource,
@@ -28,6 +29,7 @@ from app.image_source import (
 )
 from app.image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
 from app.page_model import PageModel
+from app.pdf_backend import PageRenderSpec
 from app.shell_icon_provider import ShellAssociatedIconProvider
 from app.thumbnail_provider import BrowserThumbnailProvider
 from app.thumbnail_render import (
@@ -369,6 +371,216 @@ class QueuedLoadSource(ImageSource):
 
     def display_path(self, image_id: str) -> str:
         return image_id
+
+
+def _cached_qimage(
+    index: int,
+    width: int,
+    height: int,
+    *,
+    generation: int = 0,
+    image_id: str | None = None,
+    error: str | None = None,
+    render_spec_signature: tuple[object, ...] | None = None,
+) -> CachedImage:
+    qimage = None
+    original_size = None
+    if error is None:
+        qimage = QImage(width, height, QImage.Format.Format_RGBA8888)
+        qimage.fill(QColor("#f0f0f0"))
+        original_size = (width, height)
+    return CachedImage(
+        page_index=index,
+        image_id=image_id or f"page{index}.jpg",
+        qimage=qimage,
+        original_size=original_size,
+        error=error,
+        generation=generation,
+        rendered_size=original_size,
+        render_spec_signature=render_spec_signature,
+    )
+
+
+def test_image_cache_tracks_qimage_bytes_on_hit_replacement_and_clear(qapp):
+    cache = ImageCache(cache_size=10)
+    cache._cache_byte_budget = 512 * 1024 * 1024
+
+    cache._store_cached(_cached_qimage(0, 512, 512))
+    assert cache._cache_bytes == 512 * 512 * 4
+    assert cache._cache_entry_bytes == {0: 512 * 512 * 4}
+
+    assert cache.get(0) is not None
+    assert cache._cache_bytes == 512 * 512 * 4
+
+    cache._store_cached(_cached_qimage(0, 1920, 1080))
+    assert cache._cache_bytes == 1920 * 1080 * 4
+    assert cache._cache_entry_bytes == {0: 1920 * 1080 * 4}
+
+    cache.clear()
+    assert cache._cache == {}
+    assert cache._cache_entry_bytes == {}
+    assert cache._cache_bytes == 0
+
+
+def test_image_cache_enforces_count_and_byte_lru_limits(qapp):
+    count_limited = ImageCache(cache_size=2)
+    count_limited._cache_byte_budget = 512 * 1024 * 1024
+    count_limited._center_index = 2
+    for index in range(3):
+        count_limited._store_cached(_cached_qimage(index, 512, 512))
+    count_limited._enforce_limit()
+
+    assert tuple(count_limited._cache) == (1, 2)
+    assert count_limited._cache_bytes == 2 * 512 * 512 * 4
+
+    byte_limited = ImageCache(cache_size=10)
+    one_mebibyte = 512 * 512 * 4
+    byte_limited._cache_byte_budget = 2 * one_mebibyte
+    byte_limited._center_index = 2
+    byte_limited._store_cached(_cached_qimage(0, 512, 512))
+    byte_limited._store_cached(_cached_qimage(1, 512, 512))
+    assert byte_limited.get(0) is not None
+    byte_limited._store_cached(_cached_qimage(2, 512, 512))
+    byte_limited._enforce_limit()
+
+    assert tuple(byte_limited._cache) == (0, 2)
+    assert byte_limited._cache_bytes == 2 * one_mebibyte
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "expected_entries", "expected_bytes"),
+    (
+        (512, 512, 10, 10_485_760),
+        (1920, 1080, 10, 82_944_000),
+        (3840, 2160, 8, 265_420_800),
+        (7680, 4320, 2, 265_420_800),
+    ),
+)
+def test_image_cache_default_budget_bounds_synthetic_render_sizes(
+    qapp,
+    width,
+    height,
+    expected_entries,
+    expected_bytes,
+):
+    cache = ImageCache(cache_size=10)
+    cache._center_index = 9
+    image_bytes = width * height * 4
+    for index in range(10):
+        qimage = Mock()
+        qimage.isNull.return_value = False
+        qimage.sizeInBytes.return_value = image_bytes
+        cache._store_cached(
+            CachedImage(
+                page_index=index,
+                image_id=f"page{index}.pdf",
+                qimage=qimage,
+                original_size=(width, height),
+                error=None,
+                generation=0,
+                rendered_size=(width, height),
+            )
+        )
+        cache._enforce_limit()
+
+    assert len(cache._cache) == expected_entries
+    assert cache._cache_bytes == expected_bytes
+    assert cache._center_index in cache._cache
+
+
+def test_image_cache_byte_limit_prefers_current_and_spread_partner(qapp):
+    cache = ImageCache(cache_size=10)
+    one_mebibyte = 512 * 512 * 4
+    cache._cache_byte_budget = 2 * one_mebibyte
+    cache._center_index = 2
+    cache._protected_indexes = {2, 3}
+    cache._store_cached(_cached_qimage(2, 512, 512))
+    cache._store_cached(_cached_qimage(3, 512, 512))
+    cache._store_cached(_cached_qimage(1, 512, 512))
+    cache._enforce_limit()
+
+    assert tuple(cache._cache) == (2, 3)
+    assert cache._cache_bytes == 2 * one_mebibyte
+
+    cache._cache_byte_budget = one_mebibyte
+    cache._enforce_limit()
+    assert tuple(cache._cache) == (2,)
+    assert cache._cache_bytes == one_mebibyte
+
+    cache._cache_byte_budget = one_mebibyte // 2
+    cache._enforce_limit()
+    assert tuple(cache._cache) == (2,)
+    assert cache._cache_bytes == one_mebibyte
+
+
+def test_image_cache_rejected_results_do_not_add_bytes(qapp, tmp_path):
+    source = OrderedSource(tmp_path)
+    cache = ImageCache()
+    cache.set_source(source, source.ids)
+    generation = cache.generation
+
+    cache._on_loaded(
+        _ImageLoadResult(
+            _cached_qimage(0, 512, 512, generation=generation),
+            source,
+            cancelled=True,
+        )
+    )
+    cache._on_loaded(
+        _ImageLoadResult(
+            _cached_qimage(1, 512, 512, generation=generation - 1),
+            source,
+        )
+    )
+    cache._on_loaded(
+        _ImageLoadResult(
+            _cached_qimage(
+                2,
+                0,
+                0,
+                generation=generation,
+                image_id=source.ids[2],
+                error="decode failed",
+            ),
+            source,
+        )
+    )
+
+    assert tuple(cache._cache) == (2,)
+    assert cache._cache_entry_bytes == {2: 0}
+    assert cache._cache_bytes == 0
+
+
+def test_image_cache_render_spec_and_source_changes_reset_byte_tracking(
+    qapp,
+    tmp_path,
+):
+    cache = ImageCache()
+    first_spec = PageRenderSpec(1920, 1080, size_bucket=(1920, 1080))
+    second_spec = PageRenderSpec(3840, 2160, size_bucket=(3840, 2160))
+    assert cache.set_render_spec(first_spec)
+    first_signature = cache._page_render_spec_signature(first_spec)
+    cache._store_cached(
+        _cached_qimage(
+            0,
+            1920,
+            1080,
+            generation=cache.generation,
+            render_spec_signature=first_signature,
+        )
+    )
+
+    assert cache.set_render_spec(second_spec)
+    assert cache._cache == {}
+    assert cache._cache_entry_bytes == {}
+    assert cache._cache_bytes == 0
+
+    cache._store_cached(_cached_qimage(0, 512, 512))
+    source = OrderedSource(tmp_path)
+    cache.set_source(source, source.ids)
+    assert cache._cache == {}
+    assert cache._cache_entry_bytes == {}
+    assert cache._cache_bytes == 0
 
 
 def test_adjustment_change_cancels_old_generation_without_running_queued_decode(
