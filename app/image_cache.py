@@ -255,11 +255,12 @@ class ImageCache(QObject):
         self._in_flight: dict[tuple[int, int], ImageSource] = {}
         self._tasks: dict[
             tuple[int, int],
-            tuple[_ImageLoadTask, ImageWorkPriority],
+            tuple[_ImageLoadTask, int],
         ] = {}
         self._wanted_indexes: set[int] = set()
         self._protected_indexes: set[int] = set()
         self._center_index = 0
+        self._preferred_direction = 0
         self._thread_pool = QThreadPool(self)
         self._thread_pool.setMaxThreadCount(1)
         self._coordinator = image_work_coordinator
@@ -299,6 +300,7 @@ class ImageCache(QObject):
         self._wanted_indexes.clear()
         self._protected_indexes.clear()
         self._center_index = 0
+        self._preferred_direction = 0
         self._trace_id = int(trace_id)
 
     def set_render_spec(
@@ -409,6 +411,7 @@ class ImageCache(QObject):
         self._wanted_indexes.clear()
         self._protected_indexes.clear()
         self._center_index = 0
+        self._preferred_direction = 0
 
     def has_in_flight_for_source(self, source: ImageSource) -> bool:
         return any(active_source is source for active_source in self._in_flight.values())
@@ -445,6 +448,7 @@ class ImageCache(QObject):
         *,
         radius: int = PRELOAD_RADIUS,
         visible_indexes: tuple[int, ...] = tuple(),
+        preferred_direction: int = 0,
     ) -> None:
         if not self.image_ids:
             return
@@ -456,6 +460,11 @@ class ImageCache(QObject):
         self._wanted_indexes = wanted
         self._protected_indexes = set(visible_indexes)
         self._center_index = center_index
+        self._preferred_direction = (
+            max(-1, min(1, int(preferred_direction)))
+            if bool(getattr(self.source, "supports_target_rendering", False))
+            else 0
+        )
         for (generation, index), source in tuple(self._in_flight.items()):
             if generation == self.generation and index not in wanted:
                 cancel = getattr(source, "cancel_image_request", None)
@@ -472,7 +481,13 @@ class ImageCache(QObject):
         for index in visible_indexes:
             if index != center_index:
                 self.ensure_loaded(index)
-        for index in range(start, end + 1):
+        prefetch_indexes = range(start, end + 1)
+        if bool(getattr(self.source, "supports_target_rendering", False)):
+            prefetch_indexes = sorted(
+                prefetch_indexes,
+                key=self._pdf_prefetch_rank,
+            )
+        for index in prefetch_indexes:
             self.ensure_loaded(index)
 
         self._enforce_limit()
@@ -489,13 +504,15 @@ class ImageCache(QObject):
             work_priority = ImageWorkPriority.VIEWER_CURRENT
         elif page_index in self._protected_indexes:
             priority = int(PdfRenderPriority.VIEWER_SPREAD_PARTNER)
-            work_priority = ImageWorkPriority.VIEWER_SPREAD_PARTNER
+            work_priority = int(ImageWorkPriority.VIEWER_SPREAD_PARTNER)
+        elif bool(getattr(self.source, "supports_target_rendering", False)):
+            priority, work_priority = self._pdf_prefetch_priority(page_index)
         elif page_index > self._center_index:
             priority = int(PdfRenderPriority.VIEWER_NEXT)
-            work_priority = ImageWorkPriority.VIEWER_NEXT
+            work_priority = int(ImageWorkPriority.VIEWER_NEXT)
         else:
             priority = int(PdfRenderPriority.VIEWER_PREVIOUS)
-            work_priority = ImageWorkPriority.VIEWER_PREVIOUS
+            work_priority = int(ImageWorkPriority.VIEWER_PREVIOUS)
         existing = self._tasks.get(in_flight_key)
         if existing is not None:
             task, old_priority = existing
@@ -535,10 +552,30 @@ class ImageCache(QObject):
         self._tasks[in_flight_key] = (task, work_priority)
         self._start_task(task, work_priority)
 
+    def _pdf_prefetch_priority(self, page_index: int) -> tuple[int, int]:
+        rank = self._pdf_prefetch_rank(page_index)
+        return (
+            int(PdfRenderPriority.VIEWER_NEXT) + rank,
+            int(ImageWorkPriority.VIEWER_NEXT) - rank,
+        )
+
+    def _pdf_prefetch_rank(self, page_index: int) -> int:
+        distance = max(1, abs(page_index - self._center_index))
+        if self._preferred_direction:
+            in_preferred_direction = (
+                page_index - self._center_index
+            ) * self._preferred_direction > 0
+            return (
+                distance - 1
+                if in_preferred_direction
+                else PRELOAD_RADIUS + distance - 1
+            )
+        return (distance - 1) * 2 + int(page_index < self._center_index)
+
     def _start_task(
         self,
         task: _ImageLoadTask,
-        work_priority: ImageWorkPriority,
+        work_priority: int,
     ) -> None:
         if self._coordinator is not None:
             self._coordinator.start_viewer(task, work_priority)
