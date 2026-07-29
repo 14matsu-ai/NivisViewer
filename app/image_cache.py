@@ -18,6 +18,7 @@ from .thumbnail_render import pil_to_qimage
 
 
 PRELOAD_RADIUS = 3
+_DEFAULT_CACHE_BYTE_BUDGET = 256 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -248,6 +249,9 @@ class ImageCache(QObject):
         self.source: ImageSource | None = None
         self.image_ids: list[str] = []
         self._cache: OrderedDict[int, CachedImage] = OrderedDict()
+        self._cache_entry_bytes: dict[int, int] = {}
+        self._cache_bytes = 0
+        self._cache_byte_budget = _DEFAULT_CACHE_BYTE_BUDGET
         self._in_flight: dict[tuple[int, int], ImageSource] = {}
         self._tasks: dict[
             tuple[int, int],
@@ -278,7 +282,7 @@ class ImageCache(QObject):
         self._cancel_in_flight()
         self._adjustments = adjustments
         self.generation += 1
-        self._cache.clear()
+        self._clear_cache()
 
     def set_source(
         self,
@@ -291,7 +295,7 @@ class ImageCache(QObject):
         self.generation += 1
         self.source = source
         self.image_ids = list(image_ids)
-        self._cache.clear()
+        self._clear_cache()
         self._wanted_indexes.clear()
         self._protected_indexes.clear()
         self._center_index = 0
@@ -367,7 +371,7 @@ class ImageCache(QObject):
         self._cancel_in_flight()
         self._render_spec = render_spec
         self.generation += 1
-        self._cache.clear()
+        self._clear_cache()
         return True
 
     @staticmethod
@@ -401,7 +405,7 @@ class ImageCache(QObject):
         self.generation += 1
         self.source = None
         self.image_ids = []
-        self._cache.clear()
+        self._clear_cache()
         self._wanted_indexes.clear()
         self._protected_indexes.clear()
         self._center_index = 0
@@ -567,26 +571,72 @@ class ImageCache(QObject):
         if self._wanted_indexes and cached.page_index not in self._wanted_indexes:
             return
 
-        self._cache[cached.page_index] = cached
+        self._store_cached(cached)
         performance_trace.mark(
             self._trace_id,
             "image_cache.stored",
             f"page={cached.page_index}",
         )
-        self._cache.move_to_end(cached.page_index)
         self._enforce_limit()
         self.pageLoaded.emit(cached)
 
     def _enforce_limit(self) -> None:
         while len(self._cache) > self.cache_size:
-            evicted = False
-            for index in list(self._cache):
-                if index not in self._protected_indexes:
-                    del self._cache[index]
-                    evicted = True
-                    break
-            if not evicted:
+            candidate = self._oldest_evictable_index()
+            if candidate is None:
                 break
+            self._evict_cached(candidate)
+        while (
+            self._cache_bytes > self._cache_byte_budget
+            and len(self._cache) > 1
+        ):
+            candidate = self._oldest_evictable_index()
+            if candidate is None:
+                break
+            self._evict_cached(candidate)
+
+    def _oldest_evictable_index(self) -> int | None:
+        for index in self._cache:
+            if (
+                index != self._center_index
+                and index not in self._protected_indexes
+            ):
+                return index
+        for index in self._cache:
+            if index != self._center_index:
+                return index
+        return None
+
+    def _store_cached(self, cached: CachedImage) -> None:
+        index = cached.page_index
+        if index in self._cache:
+            self._cache.pop(index)
+            self._cache_bytes -= self._cache_entry_bytes.pop(index, 0)
+        estimated_bytes = self._estimate_cached_bytes(cached)
+        self._cache[index] = cached
+        self._cache_entry_bytes[index] = estimated_bytes
+        self._cache_bytes += estimated_bytes
+        self._cache.move_to_end(index)
+
+    def _evict_cached(self, index: int) -> None:
+        self._cache.pop(index, None)
+        self._cache_bytes -= self._cache_entry_bytes.pop(index, 0)
+        self._cache_bytes = max(0, self._cache_bytes)
+
+    def _clear_cache(self) -> None:
+        self._cache.clear()
+        self._cache_entry_bytes.clear()
+        self._cache_bytes = 0
+
+    @staticmethod
+    def _estimate_cached_bytes(cached: CachedImage) -> int:
+        image = cached.qimage
+        if image is None or image.isNull():
+            return 0
+        try:
+            return max(0, int(image.sizeInBytes()))
+        except (AttributeError, TypeError):
+            return max(0, int(image.bytesPerLine()) * int(image.height()))
 
     def _cancel_in_flight(self) -> None:
         for (generation, index), source in tuple(self._in_flight.items()):
