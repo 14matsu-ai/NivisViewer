@@ -214,37 +214,40 @@ def test_page_navigation_controller_never_opens_books() -> None:
     assert model.focused_index == 2
 
 
-def test_page_list_selection_resolves_focused_index_once(
+def test_page_list_selection_uses_focused_index_fast_path(
     tmp_path: Path,
     qapp,
     monkeypatch,
 ) -> None:
     window, _pages = _viewer_with_pages(tmp_path, qapp, page_count=5)
-    last_index = window.model.total_pages - 1
-    window.model.go_to_index(last_index)
-    resolve_calls = 0
-    original_index_for_identity = window.model.index_for_identity
+    try:
+        window.page_list_dock.show()
+        qapp.processEvents()
+        last_index = window.model.total_pages - 1
+        window.model.go_to_raw_index(last_index)
+        resolve_calls = 0
+        original_index_for_identity = window.model.index_for_identity
 
-    def counted_index_for_identity(identity: str | None) -> int:
-        nonlocal resolve_calls
-        resolve_calls += 1
-        return original_index_for_identity(identity)
+        def counted_index_for_identity(identity: str | None) -> int:
+            nonlocal resolve_calls
+            resolve_calls += 1
+            return original_index_for_identity(identity)
 
-    monkeypatch.setattr(
-        window.model,
-        "index_for_identity",
-        counted_index_for_identity,
-    )
+        monkeypatch.setattr(
+            window.model,
+            "index_for_identity",
+            counted_index_for_identity,
+        )
 
-    window._sync_page_list_selection()
+        window._sync_page_list_selection()
 
-    assert resolve_calls == 1
-    current_item = window.page_list.currentItem()
-    assert current_item is not None
-    assert current_item.data(Qt.ItemDataRole.UserRole) == last_index
-
-    window.close()
-    qapp.processEvents()
+        assert resolve_calls == 0
+        current_item = window.page_list.currentItem()
+        assert current_item is not None
+        assert current_item.data(Qt.ItemDataRole.UserRole) == last_index
+    finally:
+        window.close()
+        qapp.processEvents()
 
 
 def test_page_navigation_does_not_stat_displayed_folder_image(

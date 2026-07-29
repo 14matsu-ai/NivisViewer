@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import logging
 import threading
 import zipfile
 from pathlib import Path
 
 import pytest
 from PIL import Image
+from PySide6.QtCore import QObject
 from PySide6.QtWidgets import QApplication
 
-from app.book_session import BookSession
+from app.book_session import (
+    BookSession,
+    _RETIRED_BOOK_OPEN_POOLS,
+    _RETIRED_BOOK_SESSIONS,
+)
+from app.image_work_coordinator import ImageWorkCoordinator
 from app.image_source import (
     FolderImageSource,
     FolderListingSnapshot,
@@ -377,3 +384,128 @@ def test_async_open_failure_preserves_current_book_and_clears_tracking(
     assert failures[0].message == "broken source"
     assert session._open_workers == {}
     session.shutdown()
+
+
+def test_shutdown_uses_only_its_own_shared_pool_tracking(
+    qapp: QApplication,
+) -> None:
+    coordinator = ImageWorkCoordinator(max_workers=2)
+    running_started = threading.Event()
+    release_running = threading.Event()
+    source = BlockingImageSource(
+        Path("busy"),
+        running_started,
+        release_running,
+    )
+
+    idle_session = BookSession(image_work_coordinator=coordinator)
+    busy_session = BookSession(
+        source_factory=lambda *_args, **_kwargs: (source, None),
+        image_work_coordinator=coordinator,
+    )
+    busy_session.open_book("busy")
+    busy_session.image_cache.ensure_loaded(0)
+    assert running_started.wait(1)
+
+    idle_session.shutdown(wait_msecs=0)
+
+    assert idle_session not in _RETIRED_BOOK_SESSIONS
+    assert idle_session.image_cache._in_flight == {}
+
+    release_running.set()
+    assert coordinator.wait_for_viewer(2000)
+    qapp.processEvents()
+    busy_session.shutdown()
+    coordinator.shutdown()
+
+
+def test_cancelled_open_close_failure_still_completes_once(
+    qapp: QApplication,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    list_started = threading.Event()
+    release_list = threading.Event()
+
+    class CloseFailureSource(BlockingImageSource):
+        def __init__(self) -> None:
+            super().__init__(
+                Path("closing"),
+                threading.Event(),
+                threading.Event(),
+            )
+            self.close_attempts = 0
+
+        def list_images(self) -> list[str]:
+            list_started.set()
+            assert release_list.wait(2)
+            return ["page.png"]
+
+        def close(self) -> None:
+            self.close_attempts += 1
+            raise RuntimeError("close failed")
+
+    source = CloseFailureSource()
+    session = BookSession(
+        source_factory=lambda *_args, **_kwargs: (source, None),
+    )
+    failures = []
+    session.async_open_failed.connect(failures.append)
+
+    with caplog.at_level(logging.ERROR, logger="nivisviewer.book_session"):
+        session.open_book_async("closing")
+        assert list_started.wait(1)
+        session.cancel_pending_open()
+        release_list.set()
+        assert session.wait_for_async(2000)
+        qapp.processEvents()
+
+    assert source.close_attempts == 1
+    assert session._open_workers == {}
+    assert len(failures) == 1
+    assert failures[0].cancelled
+    assert sum(
+        record.name == "nivisviewer.book_session"
+        and "Prepared image source cleanup failed" in record.getMessage()
+        for record in caplog.records
+    ) == 1
+    session.shutdown()
+
+
+def test_shutdown_retains_running_open_until_owner_independent_cleanup(
+    qapp: QApplication,
+) -> None:
+    parent = QObject()
+    factory_started = threading.Event()
+    release_factory = threading.Event()
+    source = BlockingImageSource(
+        Path("running"),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def source_factory(*_args, **_kwargs):
+        factory_started.set()
+        assert release_factory.wait(2)
+        return source, None
+
+    session = BookSession(parent=parent, source_factory=source_factory)
+    session.open_book_async("running")
+    assert factory_started.wait(1)
+
+    session.shutdown(wait_msecs=0)
+    parent.deleteLater()
+    qapp.processEvents()
+
+    assert session.parent() is None
+    assert session in _RETIRED_BOOK_SESSIONS
+    assert session._open_pool in _RETIRED_BOOK_OPEN_POOLS
+    assert session._open_workers
+
+    release_factory.set()
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+
+    assert session._open_workers == {}
+    assert session not in _RETIRED_BOOK_SESSIONS
+    assert session._open_pool not in _RETIRED_BOOK_OPEN_POOLS
+    assert source.closed

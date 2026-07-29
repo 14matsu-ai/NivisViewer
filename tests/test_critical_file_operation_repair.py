@@ -350,6 +350,77 @@ def test_directory_replace_publish_and_rollback_failure_reports_backup(
     )
 
 
+def test_directory_replace_triple_failure_reports_every_remaining_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source" / "book"
+    destination_root = tmp_path / "destination"
+    destination = destination_root / source.name
+    source.mkdir(parents=True)
+    destination.mkdir(parents=True)
+    (source / "new.txt").write_text("new", encoding="utf-8")
+    (destination / "old.txt").write_text("old", encoding="utf-8")
+    original_replace = os.replace
+    original_cleanup = FileOperationArtifactPolicy.cleanup_staging_path
+    backup_paths: list[Path] = []
+    staging_paths: list[Path] = []
+
+    def fail_publish_and_rollback(old, new):
+        old_path = Path(old)
+        new_path = Path(new)
+        if old_path == destination:
+            backup_paths.append(new_path)
+            return original_replace(old, new)
+        if new_path == destination:
+            if backup_paths and old_path == backup_paths[0]:
+                raise PermissionError("rollback locked")
+            staging_paths.append(old_path)
+            raise PermissionError("publish locked")
+        return original_replace(old, new)
+
+    def fail_staging_cleanup(path):
+        target = Path(path)
+        if staging_paths and target == staging_paths[0]:
+            return ArtifactCleanupResult(
+                str(target),
+                False,
+                "staging cleanup locked",
+            )
+        return original_cleanup(path)
+
+    monkeypatch.setattr(
+        "app.file_operation_service.os.replace",
+        fail_publish_and_rollback,
+    )
+    monkeypatch.setattr(
+        FileOperationArtifactPolicy,
+        "cleanup_staging_path",
+        staticmethod(fail_staging_cleanup),
+    )
+
+    item = FileOperationService().move(
+        [source],
+        destination_root,
+        collision_policy=FileCollisionPolicy.REPLACE,
+    ).items[0]
+    backup = backup_paths[0]
+    staging = staging_paths[0]
+
+    assert not item.success
+    assert source.exists()
+    assert not destination.exists()
+    assert backup.exists()
+    assert staging.exists()
+    assert item.destination_exists_after is False
+    assert item.destination_published is False
+    assert item.artifact_paths == (str(backup), str(staging))
+    assert item.cleanup_errors == (
+        "backup復元に失敗しました: rollback locked",
+        "staging cleanup locked",
+    )
+
+
 def test_cancel_during_copy_removes_staging_and_keeps_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

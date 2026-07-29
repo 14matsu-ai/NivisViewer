@@ -65,6 +65,48 @@ def test_single_page_mode_advances_one_page_at_a_time() -> None:
     assert display_units(model) == [[0], [1], [2], [3]]
 
 
+def test_focused_index_uses_current_identity_fast_path_and_falls_back() -> None:
+    class CountingIdentitySource(ImageSource):
+        def __init__(self) -> None:
+            super().__init__(Path("counting"))
+            self.ids = [f"{index}.png" for index in range(1000)]
+            self.list_calls = 0
+            self.index_calls = 0
+
+        def list_images(self) -> list[str]:
+            self.list_calls += 1
+            return list(self.ids)
+
+        def index_for_identity(self, identity: str) -> int:
+            self.index_calls += 1
+            return super().index_for_identity(identity)
+
+        def open_image(self, _image_id: str) -> Image.Image:
+            return Image.new("RGB", (8, 12), "white")
+
+        def display_path(self, image_id: str) -> str:
+            return image_id
+
+    source = CountingIdentitySource()
+    model = PageModel()
+    model.update_options(view_mode="single")
+    model.set_prepared_source(source, list(source.ids))
+    model.go_to_raw_index(500)
+    source.list_calls = 0
+    source.index_calls = 0
+
+    model.next_single()
+
+    assert model.focused_index == 501
+    assert source.index_calls == 0
+    assert source.list_calls == 0
+
+    model._focused_page_identity = source.page_identity(source.ids[700])
+    assert model.focused_index == 700
+    assert source.index_calls == 1
+    assert source.list_calls == 1
+
+
 def test_spread_mode_keeps_cover_single() -> None:
     model = make_model([(800, 1200)] * 5)
 

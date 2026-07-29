@@ -206,14 +206,25 @@ class PdfiumBackend:
 
     def close_document(self, document_id: str) -> None:
         with self._lock:
-            state = self._documents.pop(document_id, None)
-        if state is not None:
+            state = self._documents.get(document_id)
+        if state is None:
+            return
+        try:
             state.document.close()
+        except PdfBackendError:
+            raise
+        except Exception as exc:
+            raise PdfBackendError(
+                PdfErrorCode.INTERNAL_ERROR,
+                debug_message=str(exc),
+            ) from exc
+        with self._lock:
+            if self._documents.get(document_id) is state:
+                self._documents.pop(document_id, None)
 
     def close_all(self) -> None:
         with self._lock:
             states = tuple(self._documents.items())
-            self._documents.clear()
         failures = 0
         for document_id, state in states:
             try:
@@ -224,6 +235,10 @@ class PdfiumBackend:
                     "PDF document close failed document_id=%s",
                     document_id,
                 )
+            else:
+                with self._lock:
+                    if self._documents.get(document_id) is state:
+                        self._documents.pop(document_id, None)
         if failures:
             raise PdfBackendError(
                 PdfErrorCode.INTERNAL_ERROR,

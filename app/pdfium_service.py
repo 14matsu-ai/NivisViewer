@@ -91,6 +91,7 @@ class PdfiumService:
         self._state = PdfiumServiceState.RUNNING
         self._active_job: _PendingJob | None = None
         self._closing_documents: set[str] = set()
+        self._document_close_errors: dict[str, BaseException] = {}
         self._shutdown_future: Future | None = None
         self.last_shutdown_error: str | None = None
         self._active_calls = 0
@@ -296,7 +297,8 @@ class PdfiumService:
             future.result(timeout=max(0.0, float(wait_seconds)))
         except Exception:
             return False
-        return True
+        with self._lock:
+            return not self._document_close_errors
 
     def shutdown(self, *, wait_seconds: float = 0.5) -> bool:
         cancelled: list[_PendingJob] = []
@@ -494,7 +496,11 @@ class PdfiumService:
         with self._lock:
             self._pending.pop(job.key, None)
             if job.control == "close_document" and len(job.key) > 1:
-                self._closing_documents.discard(str(job.key[1]))
+                document_id = str(job.key[1])
+                self._closing_documents.discard(document_id)
+                self._document_close_errors.pop(document_id, None)
+            elif job.control == "shutdown_close_all":
+                self._document_close_errors.clear()
         if not job.future.done():
             job.future.set_result(result)
 
@@ -502,7 +508,9 @@ class PdfiumService:
         with self._lock:
             self._pending.pop(job.key, None)
             if job.control == "close_document" and len(job.key) > 1:
-                self._closing_documents.discard(str(job.key[1]))
+                document_id = str(job.key[1])
+                self._closing_documents.discard(document_id)
+                self._document_close_errors[document_id] = exc
         if not job.future.done():
             job.future.set_exception(exc)
 

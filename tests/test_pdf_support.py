@@ -1621,6 +1621,33 @@ def test_pdfium_backend_v5_page_api_and_explicit_lifetimes(tmp_path):
     assert module.document_closed == 1
 
 
+def test_pdfium_backend_close_failure_keeps_document_for_retry():
+    class FlakyDocument:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        def close(self) -> None:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("close locked")
+
+    document = FlakyDocument()
+    backend = PdfiumBackend(pdfium_module=FakePdfiumModule())
+    backend._documents = {
+        "document": SimpleNamespace(document=document),
+    }
+
+    with pytest.raises(PdfBackendError) as exc_info:
+        backend.close_document("document")
+
+    assert exc_info.value.code is PdfErrorCode.INTERNAL_ERROR
+    assert "document" in backend._documents
+
+    backend.close_document("document")
+    assert backend._documents == {}
+    assert document.attempts == 2
+
+
 def test_pdfium_backend_close_all_attempts_every_document_and_aggregates_errors(
     caplog,
 ):
@@ -1637,8 +1664,9 @@ def test_pdfium_backend_close_all_attempts_every_document_and_aggregates_errors(
                 raise RuntimeError(f"close failed: {self.name}")
 
     backend = PdfiumBackend(pdfium_module=FakePdfiumModule())
+    first = ClosingDocument("first", fail=True)
     backend._documents = {
-        "first": SimpleNamespace(document=ClosingDocument("first", fail=True)),
+        "first": SimpleNamespace(document=first),
         "second": SimpleNamespace(document=ClosingDocument("second")),
         "third": SimpleNamespace(document=ClosingDocument("third")),
     }
@@ -1651,7 +1679,7 @@ def test_pdfium_backend_close_all_attempts_every_document_and_aggregates_errors(
     assert exc_info.value.debug_message is not None
     assert "1" in exc_info.value.debug_message
     assert attempts == ["first", "second", "third"]
-    assert backend._documents == {}
+    assert tuple(backend._documents) == ("first",)
     close_errors = [
         record
         for record in caplog.records
@@ -1660,13 +1688,45 @@ def test_pdfium_backend_close_all_attempts_every_document_and_aggregates_errors(
     ]
     assert len(close_errors) == 1
 
+    first.fail = False
     backend.close_all()
-    assert attempts == ["first", "second", "third"]
+    assert attempts == ["first", "second", "third", "first"]
+    assert backend._documents == {}
     assert sum(
         record.name == "nivisviewer.pdfium"
         and "PDF document close failed" in record.getMessage()
         for record in caplog.records
     ) == 1
+
+
+def test_pdf_service_flush_reports_async_close_failure_until_retry():
+    class FlakyCloseBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_attempts = 0
+
+        def close_document(self, document_id):
+            self.close_attempts += 1
+            if self.close_attempts == 1:
+                raise PdfBackendError(
+                    PdfErrorCode.INTERNAL_ERROR,
+                    debug_message="close locked",
+                )
+            super().close_document(document_id)
+
+    backend = FlakyCloseBackend()
+    service = PdfiumService(backend, auto_probe=False)
+    try:
+        service.close_document("document")
+        assert not service.flush(wait_seconds=2)
+        assert backend.close_attempts == 1
+
+        service.close_document("document", wait=True)
+        assert service.flush(wait_seconds=2)
+        assert backend.close_attempts == 2
+        assert backend.closed == ["document"]
+    finally:
+        assert service.shutdown(wait_seconds=2)
 
 
 def test_pdfium_backend_rejects_zero_pages_and_closes(tmp_path):

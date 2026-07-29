@@ -237,13 +237,23 @@ class _ArtifactOperationError(OSError):
         self,
         message: str,
         *,
-        artifact_path: str,
+        artifact_path: str | None = None,
+        artifact_paths: tuple[str, ...] = (),
         cleanup: ArtifactCleanupResult | None = None,
+        cleanups: tuple[ArtifactCleanupResult, ...] = (),
         published: bool = False,
     ) -> None:
         super().__init__(message)
-        self.artifact_path = artifact_path
-        self.cleanup = cleanup
+        paths = artifact_paths or (
+            (artifact_path,) if artifact_path is not None else ()
+        )
+        cleanup_results = cleanups or (
+            (cleanup,) if cleanup is not None else ()
+        )
+        self.artifact_paths = paths
+        self.cleanups = cleanup_results
+        self.artifact_path = paths[0] if paths else ""
+        self.cleanup = cleanup_results[0] if cleanup_results else None
         self.published = bool(published)
 
 
@@ -1087,10 +1097,16 @@ class FileOperationService:
                     False,
                     rollback_message,
                 )
+                artifact_paths = [backup]
+                cleanups = [rollback_cleanup]
+                if not temporary_cleanup.removed:
+                    cleanups.append(temporary_cleanup)
+                    if os.path.lexists(temporary):
+                        artifact_paths.append(temporary)
                 raise _ArtifactOperationError(
                     f"置換publishに失敗し、backupを復元できません: {exc}",
-                    artifact_path=backup,
-                    cleanup=rollback_cleanup,
+                    artifact_paths=tuple(artifact_paths),
+                    cleanups=tuple(cleanups),
                     published=published,
                 ) from (rollback_error or exc)
             if isinstance(exc, _ArtifactOperationError):
@@ -1893,10 +1909,15 @@ class FileOperationService:
             return result
         destination_exists = bool(destination and os.path.lexists(destination))
         source_exists = bool(source and os.path.lexists(source))
-        cleanup_errors = (
-            (error.cleanup.error_message or "staging cleanup failed",)
-            if error.cleanup is not None and not error.cleanup.removed
-            else ()
+        cleanup_errors = tuple(
+            cleanup.error_message or "staging cleanup failed"
+            for cleanup in error.cleanups
+            if not cleanup.removed
+        )
+        artifact_paths = tuple(
+            path
+            for path in dict.fromkeys(error.artifact_paths)
+            if os.path.lexists(path)
         )
         return replace(
             result,
@@ -1918,6 +1939,6 @@ class FileOperationService:
                 if error.published and destination_exists and source_exists
                 else FileOperationLifecycleState.FAILED
             ),
-            artifact_paths=(error.artifact_path,),
+            artifact_paths=artifact_paths,
             cleanup_errors=cleanup_errors,
         )

@@ -334,6 +334,7 @@ class ViewerWindow(QMainWindow):
         self.setStatusBar(self.status)
 
         self._updating_page_list = False
+        self._page_list_dirty = False
         self.page_list_filter = QLineEdit(self)
         self.page_list_filter.setPlaceholderText("ページ名で絞り込み")
         self.page_list_filter.textChanged.connect(lambda _text: self._rebuild_page_list())
@@ -1463,6 +1464,8 @@ class ViewerWindow(QMainWindow):
             return
         self.show_page_list = visible
         self._update_shared_setting("show_page_list", visible)
+        if visible and self._page_list_dirty:
+            self._rebuild_page_list()
         if hasattr(self, "page_list_action"):
             self._sync_actions()
 
@@ -1693,20 +1696,38 @@ class ViewerWindow(QMainWindow):
             self._go_to_index_with_history(page_index)
 
     def _rebuild_page_list(self) -> None:
+        if not self.page_list_dock.isVisible():
+            self._page_list_dirty = True
+            if self.page_list.count():
+                self._updating_page_list = True
+                try:
+                    self.page_list.clear()
+                finally:
+                    self._updating_page_list = False
+            return
+        self._page_list_dirty = False
         self._updating_page_list = True
-        self.page_list.clear()
-        filter_text = self.page_list_filter.text().casefold().strip()
-        for index, image_id in enumerate(self.model.image_ids):
-            label = f"{index + 1}: {Path(image_id).name}"
-            if filter_text and filter_text not in label.casefold():
-                continue
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, index)
-            self.page_list.addItem(item)
-        self._updating_page_list = False
+        try:
+            self.page_list.clear()
+            filter_text = self.page_list_filter.text().casefold().strip()
+            for index, image_id in enumerate(self.model.image_ids):
+                label = f"{index + 1}: {Path(image_id).name}"
+                if filter_text and filter_text not in label.casefold():
+                    continue
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, index)
+                self.page_list.addItem(item)
+        finally:
+            self._updating_page_list = False
+        for index in range(self.model.total_pages):
+            cached = self.image_cache.get(index)
+            if cached is not None:
+                self._update_page_list_thumbnail(cached)
         self._sync_page_list_selection()
 
     def _sync_page_list_selection(self) -> None:
+        if self._page_list_dirty:
+            return
         if self.model.total_pages <= 0:
             return
         self._updating_page_list = True
@@ -1725,6 +1746,8 @@ class ViewerWindow(QMainWindow):
         self._updating_page_list = False
 
     def _update_page_list_thumbnail(self, cached: CachedImage) -> None:
+        if self._page_list_dirty:
+            return
         if cached.qimage is None or cached.error:
             return
         item = None
