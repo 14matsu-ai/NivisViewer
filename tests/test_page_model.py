@@ -27,6 +27,10 @@ class MemoryImageSource(ImageSource):
         self.closed = True
 
 
+class LazyMemoryImageSource(MemoryImageSource):
+    load_sizes_lazily = True
+
+
 def make_model(
     sizes: list[tuple[int, int]],
     *,
@@ -155,6 +159,97 @@ def test_go_to_index_uses_start_of_containing_display_unit() -> None:
     model.go_to_index(4)
     assert model.current_index == 3
     assert logical_indexes(model) == [3, 4]
+
+
+def test_deep_spread_lookup_uses_constant_spread_at_calls() -> None:
+    for page_count in (100, 1000, 5000):
+        model = PageModel()
+        model.set_source(LazyMemoryImageSource([(800, 1200)] * page_count))
+        original_spread_at = model.spread_at
+        spread_at_calls = 0
+
+        def counting_spread_at(start_index: int | None = None):
+            nonlocal spread_at_calls
+            spread_at_calls += 1
+            return original_spread_at(start_index)
+
+        model.spread_at = counting_spread_at  # type: ignore[method-assign]
+
+        model.go_to_index(page_count - 1)
+        assert model.current_index == page_count - 1
+        assert spread_at_calls == 0
+
+        model.previous()
+        assert model.current_index == page_count - 3
+        assert spread_at_calls == 0
+
+        model.next()
+        assert model.current_index == page_count - 1
+        assert spread_at_calls == 1
+
+        spread_at_calls = 0
+        jump_target = page_count // 2 + 20
+        model.go_to_index(jump_target)
+        expected_start = jump_target if jump_target % 2 else jump_target - 1
+        assert model.current_index == expected_start
+        assert spread_at_calls == 0
+
+
+def test_spread_boundaries_rebuild_when_layout_inputs_change() -> None:
+    model = PageModel()
+    source = LazyMemoryImageSource([(800, 1200)] * 6)
+    model.set_source(source)
+
+    model.go_to_index(2)
+    assert model.current_index == 1
+
+    model.set_image_size(2, (1600, 900))
+    assert model.current_index == 2
+    assert logical_indexes(model) == [2]
+
+    model.set_image_size(2, (800, 1200))
+    assert model.current_index == 1
+    assert logical_indexes(model) == [1, 2]
+
+    model.update_options(view_mode="single")
+    assert model.current_index == 2
+    assert logical_indexes(model) == [2]
+
+    model.update_options(
+        view_mode="spread",
+        reading_direction="ltr",
+        single_first_page=False,
+    )
+    assert model.current_index == 2
+    assert [slot.page_index for slot in model.spread_at().slots] == [2, 3]
+
+    model.update_options(reading_direction="rtl")
+    assert model.current_index == 2
+    assert [slot.page_index for slot in model.spread_at().slots] == [3, 2]
+
+    replacement = LazyMemoryImageSource([(800, 1200)] * 5)
+    model.set_source(replacement)
+    model.go_to_index(4)
+    assert model.current_index == 4
+
+    shorter_ids = replacement.list_images()[:3]
+    model.set_prepared_source(replacement, shorter_ids)
+    model.go_to_index(2)
+    assert model.current_index == 2
+    assert len(model._spread_start_by_index) == 3
+
+
+def test_identity_fallback_uses_current_spread_after_rebuild() -> None:
+    model = PageModel()
+    model.set_source(LazyMemoryImageSource([(800, 1200)] * 8))
+    model.go_to_index(6)
+    assert model.current_index == 5
+
+    model._focused_page_identity = "missing-page"
+    model.update_options(reading_direction="ltr")
+
+    assert model.current_index == 5
+    assert logical_indexes(model) == [5, 6]
 
 
 def test_repeated_navigation_neither_skips_nor_duplicates_pages() -> None:
