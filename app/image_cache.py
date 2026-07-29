@@ -449,6 +449,7 @@ class ImageCache(QObject):
         radius: int = PRELOAD_RADIUS,
         visible_indexes: tuple[int, ...] = tuple(),
         preferred_direction: int = 0,
+        rolling_indexes: tuple[int, ...] = tuple(),
     ) -> None:
         if not self.image_ids:
             return
@@ -457,6 +458,11 @@ class ImageCache(QObject):
         end = min(len(self.image_ids) - 1, center_index + radius)
         wanted = set(range(start, end + 1))
         wanted.update(index for index in visible_indexes if 0 <= index < len(self.image_ids))
+        wanted.update(
+            index
+            for index in rolling_indexes
+            if 0 <= index < len(self.image_ids)
+        )
         self._wanted_indexes = wanted
         self._protected_indexes = set(visible_indexes)
         self._center_index = center_index
@@ -480,6 +486,9 @@ class ImageCache(QObject):
         self.ensure_loaded(center_index)
         for index in visible_indexes:
             if index != center_index:
+                self.ensure_loaded(index)
+        for index in rolling_indexes:
+            if index != center_index and index not in self._protected_indexes:
                 self.ensure_loaded(index)
         prefetch_indexes = range(start, end + 1)
         if bool(getattr(self.source, "supports_target_rendering", False)):
