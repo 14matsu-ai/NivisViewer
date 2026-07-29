@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from PySide6.QtGui import QImage
+
 from app.browser_model import (
     BrowserItem,
     BrowserItemDiscovery,
@@ -207,3 +209,92 @@ def test_incremental_model_ignores_old_generation_and_accepts_sort_change(
         "small.jpg",
     ]
     assert not model.finish_directory_scan(generation=7)
+
+
+def test_thumbnail_signature_tracks_ready_spec_and_avoids_duplicate_change(
+    tmp_path: Path,
+) -> None:
+    model = BrowserItemModel()
+    item = BrowserItem(
+        "page.jpg",
+        tmp_path / "page.jpg",
+        BrowserItemKind.IMAGE,
+        1.0,
+    )
+    model.set_items([item])
+    image = QImage(16, 16, QImage.Format.Format_RGB32)
+    image.fill(1)
+    changes: list[bool] = []
+    model.dataChanged.connect(lambda *_args: changes.append(True))
+
+    assert model.set_thumbnail_image(item.path, image, request_token=101)
+    assert model._has_compatible_thumbnail(item, 101)
+    assert not model._has_compatible_thumbnail(item, 202)
+    assert len(changes) == 1
+
+    assert not model.set_thumbnail_image(item.path, image, request_token=101)
+    assert len(changes) == 1
+
+    assert model.set_thumbnail_image(
+        item.path,
+        image,
+        low_resolution=True,
+        request_token=101,
+    )
+    assert not model._has_compatible_thumbnail(item, 101)
+
+    assert model.set_thumbnail_image(item.path, image, request_token=101)
+    assert model._has_compatible_thumbnail(item, 101)
+    assert model.set_thumbnail_error(item.path, "failed")
+    assert not model._has_compatible_thumbnail(item, 101)
+
+
+def test_refresh_retains_only_unchanged_ready_thumbnail_signatures(
+    tmp_path: Path,
+) -> None:
+    model = BrowserItemModel()
+    unchanged = BrowserItem(
+        "unchanged.jpg",
+        tmp_path / "unchanged.jpg",
+        BrowserItemKind.IMAGE,
+        1.0,
+    )
+    changed = BrowserItem(
+        "changed.jpg",
+        tmp_path / "changed.jpg",
+        BrowserItemKind.IMAGE,
+        1.0,
+    )
+    removed = BrowserItem(
+        "removed.jpg",
+        tmp_path / "removed.jpg",
+        BrowserItemKind.IMAGE,
+        1.0,
+    )
+    image = QImage(16, 16, QImage.Format.Format_RGB32)
+    image.fill(1)
+    model.set_items([unchanged, changed, removed])
+    for item in (unchanged, changed, removed):
+        assert model.set_thumbnail_image(item.path, image, request_token=101)
+
+    changed_after_refresh = BrowserItem(
+        changed.display_name,
+        changed.path,
+        changed.kind,
+        2.0,
+    )
+    model.set_items(
+        [unchanged, changed_after_refresh],
+        preserve_thumbnails=True,
+    )
+
+    assert model._has_compatible_thumbnail(unchanged, 101)
+    assert not model._has_compatible_thumbnail(changed_after_refresh, 101)
+    assert model.data(
+        model.index(model.row_for_path(changed.path), 0),
+        model.ThumbnailImageRole,
+    ) is None
+    assert model._key(removed.path) not in model._thumbnail_signatures
+
+    model.clear_thumbnails()
+    assert not model._has_compatible_thumbnail(unchanged, 101)

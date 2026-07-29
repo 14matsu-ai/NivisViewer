@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from PySide6.QtCore import QItemSelectionModel, QRect, QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import QListView, QStyle, QStyleOptionViewItem
@@ -20,6 +21,7 @@ from app.browser_thumbnail_scheduler import ThumbnailPriority
 from app.browser_window import BrowserWindow
 from app.config_manager import ConfigManager
 from app.thumbnail_provider import BrowserThumbnailProvider
+from app.thumbnail_render import ThumbnailRenderSpec
 
 
 class RecordingThumbnailProvider(BrowserThumbnailProvider):
@@ -352,6 +354,176 @@ def test_ten_thousand_items_request_only_visible_and_prefetch_ranges(
         for _, _, priority in provider.requests
     )
     assert provider.cancelled_prefetch == 1
+    window.close()
+    qapp.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("item_count", "expected_requests"),
+    [(20, 20), (200, 40), (1000, 40)],
+)
+def test_ready_thumbnails_are_not_requested_again(
+    tmp_path,
+    qapp,
+    monkeypatch,
+    item_count: int,
+    expected_requests: int,
+) -> None:
+    provider = RecordingThumbnailProvider()
+    window = make_window(tmp_path, qapp, provider=provider)
+    items = [
+        BrowserItem(
+            f"{index}.jpg",
+            tmp_path / "一覧" / f"{index}.jpg",
+            BrowserItemKind.IMAGE,
+            float(index),
+            file_size=index + 1,
+            modified_time_ns=index,
+        )
+        for index in range(item_count)
+    ]
+    window.item_model.set_items(items)
+    monkeypatch.setattr(
+        window,
+        "_visible_row_range",
+        lambda: (0, min(item_count - 1, 19)),
+    )
+    window._thumbnail_request_timer.stop()
+    provider.requests.clear()
+    changes: list[bool] = []
+    window.item_model.dataChanged.connect(lambda *_args: changes.append(True))
+
+    window._request_visible_thumbnails()
+    initial_paths = tuple(request[0] for request in provider.requests)
+    assert len(initial_paths) == expected_requests
+    assert len(set(initial_paths)) == expected_requests
+
+    image = QImage(16, 16, QImage.Format.Format_RGB32)
+    image.fill(QColor("green"))
+    for path in initial_paths:
+        window._on_thumbnail_ready(path, window._generation, image)
+    assert len(changes) == expected_requests
+
+    provider.requests.clear()
+    for _ in range(5):
+        window._request_visible_thumbnails()
+
+    assert provider.requests == []
+    assert len(changes) == expected_requests
+    window.close()
+    qapp.processEvents()
+
+
+def test_scroll_requests_only_new_items_and_does_not_request_ready_items_again(
+    tmp_path,
+    qapp,
+    monkeypatch,
+) -> None:
+    provider = RecordingThumbnailProvider()
+    window = make_window(tmp_path, qapp, provider=provider)
+    items = [
+        BrowserItem(
+            f"{index}.jpg",
+            tmp_path / "一覧" / f"{index}.jpg",
+            BrowserItemKind.IMAGE,
+            float(index),
+        )
+        for index in range(100)
+    ]
+    window.item_model.set_items(items)
+    visible_range = [0, 9]
+    monkeypatch.setattr(
+        window,
+        "_visible_row_range",
+        lambda: (visible_range[0], visible_range[1]),
+    )
+    image = QImage(16, 16, QImage.Format.Format_RGB32)
+    image.fill(QColor("blue"))
+
+    def request_and_apply() -> set[str]:
+        provider.requests.clear()
+        window._request_visible_thumbnails()
+        paths = {request[0] for request in provider.requests}
+        for path in paths:
+            window._on_thumbnail_ready(path, window._generation, image)
+        return paths
+
+    first_paths = request_and_apply()
+    assert len(first_paths) == 20
+
+    visible_range[:] = [40, 49]
+    second_paths = request_and_apply()
+    assert len(second_paths) == 30
+    assert first_paths.isdisjoint(second_paths)
+
+    visible_range[:] = [0, 9]
+    assert request_and_apply() == set()
+    window.close()
+    qapp.processEvents()
+
+
+def test_thumbnail_spec_fingerprint_and_unapplied_cache_require_requests(
+    tmp_path,
+    qapp,
+    monkeypatch,
+) -> None:
+    provider = RecordingThumbnailProvider()
+    window = make_window(tmp_path, qapp, provider=provider)
+    path = tmp_path / "一覧" / "page.jpg"
+    item = BrowserItem(
+        path.name,
+        path,
+        BrowserItemKind.IMAGE,
+        1.0,
+        file_size=10,
+        modified_time_ns=1,
+    )
+    window.item_model.set_items([item])
+    monkeypatch.setattr(window, "_visible_row_range", lambda: (0, 0))
+    image = QImage(16, 16, QImage.Format.Format_RGB32)
+    image.fill(QColor("green"))
+    window._on_thumbnail_ready(str(path), window._generation, image)
+
+    provider.requests.clear()
+    window._request_visible_thumbnails()
+    assert provider.requests == []
+
+    window.thumbnail_render_spec = ThumbnailRenderSpec.from_settings(
+        512,
+        window.thumbnail_frame_ratio,
+        window.thumbnail_crop_mode,
+        device_pixel_ratio=2.0,
+        quality_mode=window.thumbnail_quality_mode,
+        max_edge=window.thumbnail_cache_max_edge,
+        browser_display_mode=window.browser_thumbnail_display_mode,
+    )
+    window._generation = provider.begin_generation()
+    window._request_visible_thumbnails()
+    assert [request[0] for request in provider.requests] == [str(path)]
+    window._on_thumbnail_ready(str(path), window._generation, image)
+    provider.requests.clear()
+    window._request_visible_thumbnails()
+    assert provider.requests == []
+
+    updated_item = BrowserItem(
+        path.name,
+        path,
+        BrowserItemKind.IMAGE,
+        2.0,
+        file_size=20,
+        modified_time_ns=2,
+    )
+    window.item_model.set_items(
+        [updated_item],
+        preserve_thumbnails=True,
+    )
+    window._request_visible_thumbnails()
+    assert [request[0] for request in provider.requests] == [str(path)]
+
+    window.item_model.set_items([updated_item])
+    provider.requests.clear()
+    window._request_visible_thumbnails()
+    assert [request[0] for request in provider.requests] == [str(path)]
     window.close()
     qapp.processEvents()
 

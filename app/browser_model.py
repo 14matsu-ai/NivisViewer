@@ -160,6 +160,7 @@ class BrowserItemModel(QAbstractListModel):
         self._source_keys: set[str] = set()
         self._icons: dict[str, QIcon] = {}
         self._thumbnail_images: dict[str, QImage] = {}
+        self._thumbnail_signatures: dict[str, tuple[int, float | None]] = {}
         self._low_resolution_thumbnails: set[str] = set()
         self._thumbnail_errors: dict[str, str] = {}
         self._preview_statuses: dict[str, str] = {}
@@ -221,7 +222,12 @@ class BrowserItemModel(QAbstractListModel):
             return str(item.path) if not error else f"{item.path}\n{error}"
         return None
 
-    def set_items(self, items: tuple[BrowserItem, ...] | list[BrowserItem]) -> None:
+    def set_items(
+        self,
+        items: tuple[BrowserItem, ...] | list[BrowserItem],
+        *,
+        preserve_thumbnails: bool = False,
+    ) -> None:
         self.beginResetModel()
         self._source_items = [
             item
@@ -233,8 +239,12 @@ class BrowserItemModel(QAbstractListModel):
         self._source_keys = {self._key(item.path) for item in self._source_items}
         self._items = self._sort_policy.sorted_items(self._source_items)
         self._icons.clear()
-        self._thumbnail_images.clear()
-        self._low_resolution_thumbnails.clear()
+        if preserve_thumbnails:
+            self._retain_compatible_thumbnails()
+        else:
+            self._thumbnail_images.clear()
+            self._thumbnail_signatures.clear()
+            self._low_resolution_thumbnails.clear()
         self._thumbnail_errors.clear()
         self._preview_statuses.clear()
         self._scan_generation = None
@@ -248,6 +258,7 @@ class BrowserItemModel(QAbstractListModel):
         self._items = []
         self._icons.clear()
         self._thumbnail_images.clear()
+        self._thumbnail_signatures.clear()
         self._low_resolution_thumbnails.clear()
         self._thumbnail_errors.clear()
         self._preview_statuses.clear()
@@ -340,17 +351,36 @@ class BrowserItemModel(QAbstractListModel):
         image: QImage,
         *,
         low_resolution: bool = False,
+        request_token: int | None = None,
     ) -> bool:
         row = self.row_for_path(path)
         if row < 0 or image is None or image.isNull():
             return False
         item = self._items[row]
         key = self._key(item.path)
+        signature = (
+            (int(request_token), item.modified_at)
+            if request_token is not None
+            else None
+        )
+        if (
+            not low_resolution
+            and signature is not None
+            and key in self._thumbnail_images
+            and key not in self._low_resolution_thumbnails
+            and self._thumbnail_signatures.get(key) == signature
+        ):
+            return False
         self._thumbnail_images[key] = image.copy()
         if low_resolution:
             self._low_resolution_thumbnails.add(key)
+            self._thumbnail_signatures.pop(key, None)
         else:
             self._low_resolution_thumbnails.discard(key)
+            if signature is None:
+                self._thumbnail_signatures.pop(key, None)
+            else:
+                self._thumbnail_signatures[key] = signature
         self._thumbnail_errors.pop(key, None)
         index = self.index(row, 0)
         self.dataChanged.emit(
@@ -366,6 +396,7 @@ class BrowserItemModel(QAbstractListModel):
             return False
         item = self._items[row]
         key = self._key(item.path)
+        self._thumbnail_signatures.pop(key, None)
         self._thumbnail_errors[key] = str(message)
         index = self.index(row, 0)
         self.dataChanged.emit(
@@ -408,11 +439,13 @@ class BrowserItemModel(QAbstractListModel):
         if (
             not self._icons
             and not self._thumbnail_images
+            and not self._thumbnail_signatures
             and not self._thumbnail_errors
         ):
             return
         self._icons.clear()
         self._thumbnail_images.clear()
+        self._thumbnail_signatures.clear()
         self._low_resolution_thumbnails.clear()
         self._thumbnail_errors.clear()
         self._preview_statuses.clear()
@@ -427,6 +460,19 @@ class BrowserItemModel(QAbstractListModel):
                     self.ThumbnailErrorRole,
                 ],
             )
+
+    def _has_compatible_thumbnail(
+        self,
+        item: BrowserItem,
+        request_token: int,
+    ) -> bool:
+        key = self._key(item.path)
+        return (
+            key in self._thumbnail_images
+            and key not in self._low_resolution_thumbnails
+            and self._thumbnail_signatures.get(key)
+            == (int(request_token), item.modified_at)
+        )
 
     def set_cut_paths(self, paths: tuple[str | Path, ...] | list[str | Path]) -> bool:
         cut_keys = frozenset(self._key(Path(path)) for path in paths)
@@ -454,6 +500,24 @@ class BrowserItemModel(QAbstractListModel):
         self._row_by_key = {
             self._key(item.path): row for row, item in enumerate(self._items)
         }
+
+    def _retain_compatible_thumbnails(self) -> None:
+        items_by_key = {self._key(item.path): item for item in self._source_items}
+        retained_signatures = {
+            key: signature
+            for key, signature in self._thumbnail_signatures.items()
+            if (
+                key in self._thumbnail_images
+                and key not in self._low_resolution_thumbnails
+                and (item := items_by_key.get(key)) is not None
+                and signature[1] == item.modified_at
+            )
+        }
+        self._thumbnail_images = {
+            key: self._thumbnail_images[key] for key in retained_signatures
+        }
+        self._thumbnail_signatures = retained_signatures
+        self._low_resolution_thumbnails.clear()
 
     @staticmethod
     def _key(path: Path) -> str:

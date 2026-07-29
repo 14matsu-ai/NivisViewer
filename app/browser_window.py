@@ -749,7 +749,7 @@ class BrowserWindow(QMainWindow):
                 tuple(pending.refresh_entries)
             )
             self._generation = self.thumbnail_provider.begin_generation()
-            self.item_model.set_items(items)
+            self.item_model.set_items(items, preserve_thumbnails=True)
             if self._pending_browser_focus is None:
                 self._schedule_list_view_state_restore(state)
             self._restore_location(
@@ -3549,6 +3549,7 @@ class BrowserWindow(QMainWindow):
             fast_scrolling=self._fast_scrolling,
         )
         selected_set = set(selected_rows)
+        request_token = self.thumbnail_render_spec.cache_token
         set_fast_scroll = getattr(
             self.thumbnail_provider,
             "set_fast_scroll_suppressed",
@@ -3566,6 +3567,10 @@ class BrowserWindow(QMainWindow):
                 if (
                     item is None
                     or not item.can_generate_preview
+                    or self.item_model._has_compatible_thumbnail(
+                        item,
+                        request_token,
+                    )
                 ):
                     continue
                 effective_priority = priority
@@ -3694,7 +3699,12 @@ class BrowserWindow(QMainWindow):
             or qimage.isNull()
         ):
             return
-        self.item_model.set_thumbnail_image(path, qimage, low_resolution=False)
+        self.item_model.set_thumbnail_image(
+            path,
+            qimage,
+            low_resolution=False,
+            request_token=self.thumbnail_render_spec.cache_token,
+        )
 
     def _on_thumbnail_failed(
         self,
