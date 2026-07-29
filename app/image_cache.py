@@ -10,6 +10,7 @@ from PIL import Image, ImageEnhance
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 from PySide6.QtGui import QImage
 
+from .archive_backend import ArchiveErrorCode
 from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
 from .image_source import ImageSource, ImageSourceError
 from .pdf_backend import PageRenderSpec, PdfErrorCode, PdfRenderPriority
@@ -169,7 +170,10 @@ class _ImageLoadTask(QRunnable):
                 render_spec_signature=self.render_spec_signature,
             )
         except ImageSourceError as exc:
-            cancelled = exc.code == PdfErrorCode.CANCELLED.value
+            cancelled = exc.code in {
+                PdfErrorCode.CANCELLED.value,
+                ArchiveErrorCode.PROCESS_CANCELLED.value,
+            }
             result = CachedImage(
                 page_index=self.page_index,
                 image_id=self.image_id,
@@ -257,6 +261,7 @@ class ImageCache(QObject):
             tuple[int, int],
             tuple[_ImageLoadTask, int],
         ] = {}
+        self._cancel_requested_tasks: set[tuple[int, int]] = set()
         self._wanted_indexes: set[int] = set()
         self._protected_indexes: set[int] = set()
         self._center_index = 0
@@ -507,6 +512,12 @@ class ImageCache(QObject):
                     if self._try_take_task(task):
                         self._tasks.pop((generation, index), None)
                         self._in_flight.pop((generation, index), None)
+                    elif callable(cancel):
+                        # The same index can become wanted again before a
+                        # running archive/PDF request reports cancellation.
+                        self._cancel_requested_tasks.add(
+                            (generation, index)
+                        )
 
         self.ensure_loaded(center_index)
         for index in visible_indexes:
@@ -633,12 +644,26 @@ class ImageCache(QObject):
     @Slot(object)
     def _on_loaded(self, result: _ImageLoadResult) -> None:
         cached = result.cached
-        self._in_flight.pop((cached.generation, cached.page_index), None)
-        self._tasks.pop((cached.generation, cached.page_index), None)
+        task_key = (cached.generation, cached.page_index)
+        retry_cancelled = task_key in self._cancel_requested_tasks
+        self._cancel_requested_tasks.discard(task_key)
+        self._in_flight.pop(task_key, None)
+        self._tasks.pop(task_key, None)
+        if result.cancelled:
+            if (
+                retry_cancelled
+                and cached.generation == self.generation
+                and result.source is self.source
+                and 0 <= cached.page_index < len(self.image_ids)
+                and self.image_ids[cached.page_index] == cached.image_id
+                and cached.page_index in self._wanted_indexes
+            ):
+                self.ensure_loaded(cached.page_index)
+            if not self.has_in_flight_for_source(result.source):
+                self.sourceIdle.emit(result.source)
+            return
         if not self.has_in_flight_for_source(result.source):
             self.sourceIdle.emit(result.source)
-        if result.cancelled:
-            return
         if cached.generation != self.generation:
             return
         if not (0 <= cached.page_index < len(self.image_ids)):

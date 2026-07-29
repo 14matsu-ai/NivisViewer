@@ -12,6 +12,8 @@ from PySide6.QtWidgets import QApplication
 from app.archive_backend import ArchiveBackendError, ArchiveEntry, ArchiveErrorCode, ArchiveListing
 from app.archive_backend_registry import ArchiveBackendRegistry
 from app.config_manager import ConfigManager
+from app.image_cache import ImageCache
+from app.image_source import SevenZipImageSource
 from app.metadata_store import MetadataStore
 from app.viewer_window import ViewerWindow
 
@@ -230,3 +232,79 @@ def test_two_viewers_keep_external_sources_independent(
     first.close()
     second.close()
     qapp.processEvents()
+
+
+def test_rewanted_cancelled_archive_page_retries_without_error_delivery(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    archive = tmp_path / "rapid.7z"
+    archive.write_bytes(b"archive")
+
+    class RewantedCancelBackend(ViewerBackend):
+        def __init__(self) -> None:
+            super().__init__(pages=2)
+            self.first_read_started = Event()
+            self.cancel_observed = Event()
+            self.release_cancel_result = Event()
+
+        def read_entry(
+            self,
+            archive_path,
+            entry_path,
+            *,
+            cancel_token=None,
+            maximum_bytes=None,
+        ):
+            self.read_calls += 1
+            if self.read_calls == 1:
+                self.first_read_started.set()
+                while cancel_token is not None and not cancel_token.wait(0.01):
+                    pass
+                self.cancel_observed.set()
+                assert self.release_cancel_result.wait(3)
+                raise ArchiveBackendError(
+                    ArchiveErrorCode.PROCESS_CANCELLED
+                )
+            return image_bytes()
+
+    backend = RewantedCancelBackend()
+    source = SevenZipImageSource(archive, backend=backend)
+    cache = ImageCache()
+    delivered = []
+    cache.pageLoaded.connect(delivered.append)
+    try:
+        cache.set_source(source, source.list_images())
+        cache.preload_around(0, radius=0, visible_indexes=(0,))
+        assert backend.first_read_started.wait(1)
+
+        cache.preload_around(1, radius=0, visible_indexes=(1,))
+        assert backend.cancel_observed.wait(1)
+        cache.preload_around(0, radius=0, visible_indexes=(0,))
+        assert cache.get(0) is None
+
+        backend.release_cancel_result.set()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            qapp.processEvents()
+            if cache.get(0) is not None and not cache._tasks:
+                break
+            time.sleep(0.005)
+
+        assert cache.wait_for_done(2000)
+        qapp.processEvents()
+        assert backend.read_calls == 2
+        assert len(delivered) == 1
+        assert delivered[0].page_index == 0
+        assert delivered[0].error is None
+        assert cache.get(0) is not None
+        assert cache.get(0).error is None
+        assert cache._tasks == {}
+        assert cache._in_flight == {}
+        assert cache._cancel_requested_tasks == set()
+    finally:
+        backend.release_cancel_result.set()
+        cache.clear()
+        cache.wait_for_done(3000)
+        qapp.processEvents()
+        source.close()
