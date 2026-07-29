@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from PIL import Image
@@ -418,3 +419,20 @@ def test_legacy_config_migrates_once_without_deleting_original_data(
     assert len(second_history) == 1
     assert second_history[0].open_count == 1
     second.shutdown()
+
+
+def test_empty_legacy_migration_defers_config_save_until_shutdown(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+
+    with patch.object(config, "save") as save:
+        controller = ApplicationController(qapp, config_manager=config)
+
+        assert config.get("metadata_migration_v1_completed") is True
+        save.assert_not_called()
+
+        controller.shutdown()
+        save.assert_called_once()

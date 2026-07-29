@@ -930,6 +930,12 @@ class ApplicationController(QObject):
         migrated: set[str] = set()
         ordered_paths = list(reversed(recent_paths))
         ordered_paths.extend(path for path, _page in position_items)
+        if not ordered_paths:
+            # A fresh profile has no legacy records to transfer.  Persisting
+            # this marker here would add a synchronous config write before
+            # the first Browser paint; the normal shutdown save persists it.
+            self.config.apply({"metadata_migration_v1_completed": True})
+            return
         for raw_path in ordered_paths:
             canonical, item_type = self._legacy_book_target(raw_path)
             key = MetadataStore.normalize_path(canonical)
