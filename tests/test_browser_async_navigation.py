@@ -991,6 +991,7 @@ def test_prepared_result_avoids_gui_full_conversion_and_sort(
     try:
         assert window.navigate_to(target)
         request = scanner.requests[-1]
+        assert not request.include_progress_entries
         completed_items = tuple(
             BrowserItem(
                 f"{index:05}.jpg",

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import app.browser_sort as browser_sort_module
 from app.browser_model import BrowserItem, BrowserItemKind
 from app.browser_sort import (
     BrowserSortKey,
@@ -177,3 +178,74 @@ def test_missing_stat_values_do_not_raise(tmp_path: Path) -> None:
             ),
             values,
         ) == ["不明.jpg", "既知.jpg"]
+
+
+@pytest.mark.parametrize("sort_key", list(BrowserSortKey))
+def test_sort_generates_one_natural_key_per_item(
+    tmp_path: Path,
+    monkeypatch,
+    sort_key: BrowserSortKey,
+) -> None:
+    values = [
+        item(
+            tmp_path,
+            f"日本語の長い名前{index % 7}-章{30 - index}.jpg",
+            kind=(
+                BrowserItemKind.FOLDER
+                if index % 4 == 0
+                else BrowserItemKind.IMAGE
+            ),
+            modified_time_ns=index % 5,
+            file_size=index % 3,
+        )
+        for index in range(30)
+    ]
+    calls: list[str] = []
+    original_natural_key = browser_sort_module._natural_key
+
+    def counted_natural_key(value: str):
+        calls.append(value)
+        return original_natural_key(value)
+
+    monkeypatch.setattr(
+        browser_sort_module,
+        "_natural_key",
+        counted_natural_key,
+    )
+
+    BrowserSortPolicy(
+        sort_key,
+        BrowserSortOrder.DESCENDING,
+        folders_first=True,
+    ).sorted_items(values)
+
+    assert len(calls) == len(values)
+
+
+@pytest.mark.parametrize("order", list(BrowserSortOrder))
+def test_equal_natural_names_keep_path_order(
+    tmp_path: Path,
+    order: BrowserSortOrder,
+) -> None:
+    values = [
+        BrowserItem(
+            "BOOK1.jpg",
+            tmp_path / "z" / "BOOK1.jpg",
+            BrowserItemKind.IMAGE,
+            None,
+        ),
+        BrowserItem(
+            "book1.JPG",
+            tmp_path / "a" / "book1.JPG",
+            BrowserItemKind.IMAGE,
+            None,
+        ),
+    ]
+
+    ordered = BrowserSortPolicy(
+        BrowserSortKey.NAME,
+        order,
+        folders_first=False,
+    ).sorted_items(values)
+
+    assert [entry.path.parent.name for entry in ordered] == ["a", "z"]

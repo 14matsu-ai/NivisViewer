@@ -138,6 +138,34 @@ def test_empty_folder_completes_without_batches(tmp_path: Path) -> None:
     assert batches == []
 
 
+def test_count_only_progress_batches_do_not_retain_scan_entries(
+    tmp_path: Path,
+) -> None:
+    for index in range(5):
+        (tmp_path / f"長い日本語名{index}.jpg").write_bytes(
+            bytes([index]),
+        )
+    batches = []
+
+    result = scan_directory(
+        BrowserScanRequest(
+            str(tmp_path),
+            generation=4,
+            batch_size=2,
+            include_progress_entries=False,
+        ),
+        Event(),
+        batches.append,
+    )
+
+    assert isinstance(result, BrowserScanCompleted)
+    assert result.total_count == 5
+    assert result.prepared_items is not None
+    assert len(result.prepared_items) == 5
+    assert [batch.item_count for batch in batches] == [2, 2, 1]
+    assert all(batch.entries == () for batch in batches)
+
+
 def test_pre_cancelled_scan_is_not_an_error(tmp_path: Path) -> None:
     write_image(tmp_path / "1.jpg")
     cancelled = Event()
@@ -155,6 +183,38 @@ def test_pre_cancelled_scan_is_not_an_error(tmp_path: Path) -> None:
     assert result.status is BrowserScanStatus.CANCELLED
     assert result.generation == 9
     assert batches == []
+
+
+def test_cancel_during_sort_does_not_deliver_prepared_items(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    for index in range(3):
+        (tmp_path / f"{index}.txt").write_text(str(index), encoding="utf-8")
+    cancelled = Event()
+    original_sorted_items = BrowserSortPolicy.sorted_items
+
+    def cancel_after_sort(policy, items):
+        ordered = original_sorted_items(policy, items)
+        cancelled.set()
+        return ordered
+
+    monkeypatch.setattr(
+        BrowserSortPolicy,
+        "sorted_items",
+        cancel_after_sort,
+    )
+
+    result = scan_directory(
+        BrowserScanRequest(str(tmp_path), generation=10),
+        cancelled,
+        lambda _batch: None,
+    )
+
+    assert isinstance(result, BrowserScanCompleted)
+    assert result.cancelled
+    assert result.prepared_items is None
+    assert result.sort_policy is None
 
 
 def test_inaccessible_folder_returns_explicit_error(

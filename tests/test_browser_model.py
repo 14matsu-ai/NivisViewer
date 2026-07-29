@@ -240,11 +240,20 @@ def test_final_scan_appends_pre_sorted_remainder_without_reset_or_resort(
     )
 
     model.begin_final_directory_scan(items[:40], generation=11)
+    key_calls: list[Path] = []
+    original_key = model._key
+
+    def counted_key(path: Path) -> str:
+        key_calls.append(path)
+        return original_key(path)
+
+    monkeypatch.setattr(model, "_key", counted_key)
     assert model.append_final_directory_scan(
         items[40:],
         generation=11,
     ) == 60
 
+    assert len(key_calls) == 60
     assert resets == [True]
     assert inserts == [(40, 99)]
     assert model.items == tuple(items)

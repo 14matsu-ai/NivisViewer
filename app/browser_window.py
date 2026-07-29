@@ -657,6 +657,7 @@ class BrowserWindow(QMainWindow):
             ),
             trace_id=trace_id,
             sort_policy=self._current_browser_sort_policy(),
+            include_progress_entries=False,
         )
         self._pending_scan = _PendingDirectoryScan(
             path=target,
@@ -686,13 +687,13 @@ class BrowserWindow(QMainWindow):
         pending = self._matching_pending_scan(batch.generation, batch.path)
         if pending is None or self._shutdown_prepared:
             return
-        pending.scanned_count += len(batch.entries)
+        pending.scanned_count += batch.item_count
         if pending.trace_id and not pending.first_batch_arrived:
             pending.first_batch_arrived = True
             performance_trace.mark(
                 pending.trace_id,
                 "scanner.first_batch.gui_arrived",
-                str(len(batch.entries)),
+                str(batch.item_count),
             )
         if not batch.final_items_pending:
             if pending.refresh:
