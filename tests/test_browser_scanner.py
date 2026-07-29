@@ -4,9 +4,11 @@ import os
 from pathlib import Path
 from threading import Event
 
+import pytest
 from PIL import Image
 from PySide6.QtWidgets import QApplication
 
+from app.browser_model import browser_item_from_scan_entry
 from app.browser_scanner import (
     BrowserDirectoryScanner,
     BrowserScanCompleted,
@@ -16,6 +18,7 @@ from app.browser_scanner import (
     scan_directory,
     scan_entry_from_dir_entry,
 )
+from app.browser_sort import BrowserSortKey, BrowserSortOrder, BrowserSortPolicy
 
 
 def write_image(path: Path) -> None:
@@ -53,6 +56,72 @@ def test_scanner_emits_batches_with_generation_and_supported_kinds(
     assert all(Path(entry.path).is_absolute() for batch in batches for entry in batch.entries)
 
 
+@pytest.mark.parametrize(
+    "sort_policy",
+    [
+        BrowserSortPolicy(),
+        BrowserSortPolicy(
+            BrowserSortKey.NAME,
+            BrowserSortOrder.DESCENDING,
+            folders_first=False,
+        ),
+        BrowserSortPolicy(
+            BrowserSortKey.MODIFIED_TIME,
+            BrowserSortOrder.ASCENDING,
+            folders_first=True,
+        ),
+        BrowserSortPolicy(
+            BrowserSortKey.ITEM_TYPE,
+            BrowserSortOrder.DESCENDING,
+            folders_first=False,
+        ),
+        BrowserSortPolicy(
+            BrowserSortKey.FILE_SIZE,
+            BrowserSortOrder.DESCENDING,
+            folders_first=True,
+        ),
+    ],
+)
+def test_scan_completion_prepares_exact_existing_sort_policy_order(
+    tmp_path: Path,
+    sort_policy: BrowserSortPolicy,
+) -> None:
+    (tmp_path / "章10").mkdir()
+    (tmp_path / "章2").mkdir()
+    for name, payload in (
+        ("Book2.jpg", b"22"),
+        ("book10.JPG", b"1" * 10),
+        ("日本語3.png", b"333"),
+        ("日本語12.png", b"1" * 12),
+        ("同名2.cbz", b"cbz"),
+        ("同名10.zip", b"archive"),
+        ("note.txt", b"text"),
+    ):
+        (tmp_path / name).write_bytes(payload)
+    batches = []
+    request = BrowserScanRequest(
+        str(tmp_path),
+        generation=18,
+        batch_size=3,
+        sort_policy=sort_policy,
+    )
+
+    result = scan_directory(request, Event(), batches.append)
+
+    assert isinstance(result, BrowserScanCompleted)
+    assert result.sort_policy == sort_policy
+    assert result.prepared_items is not None
+    assert all(batch.final_items_pending for batch in batches)
+    scanned_items = [
+        browser_item_from_scan_entry(entry)
+        for batch in batches
+        for entry in batch.entries
+    ]
+    assert result.prepared_items == tuple(
+        sort_policy.sorted_items(scanned_items)
+    )
+
+
 def test_empty_folder_completes_without_batches(tmp_path: Path) -> None:
     batches = []
 
@@ -64,6 +133,8 @@ def test_empty_folder_completes_without_batches(tmp_path: Path) -> None:
 
     assert result == BrowserScanCompleted(str(tmp_path), 3, 0)
     assert result.status is BrowserScanStatus.EMPTY_DIRECTORY
+    assert result.prepared_items == ()
+    assert result.sort_policy == BrowserSortPolicy()
     assert batches == []
 
 

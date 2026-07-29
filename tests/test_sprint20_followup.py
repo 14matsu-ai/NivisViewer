@@ -3,7 +3,7 @@ from __future__ import annotations
 import errno
 import os
 from pathlib import Path
-from threading import Event
+from threading import Event, get_ident
 from time import perf_counter
 
 import pytest
@@ -37,6 +37,7 @@ from app.metadata_store import MetadataStore
 from app.performance_trace import performance_trace
 from app.preview_provider_registry import PreviewProviderRegistry
 from app.browser_thumbnail_scheduler import ThumbnailPriority
+from app.browser_sort import BrowserSortPolicy
 from app.file_preview import PreviewResult, PreviewSource
 from app.thumbnail_render import ThumbnailRenderSpec
 from app.video_thumbnail_policy import (
@@ -220,7 +221,6 @@ def test_slow_scanner_path_check_does_not_block_gui_timer(
     entered = Event()
     release = Event()
     import app.browser_scanner as scanner_module
-
     original_scandir = scanner_module.os.scandir
 
     def delayed_scandir(path):
@@ -437,6 +437,265 @@ def test_final_sorted_initial_batch_paints_before_tree_sync_and_thumbnail_reques
         window.close()
         qapp.processEvents()
         store.close()
+
+
+@pytest.mark.parametrize(
+    ("item_count", "expected_initial"),
+    [(20, 20), (200, 40), (1000, 40)],
+)
+def test_normal_and_favorite_large_folder_navigation_do_the_same_work(
+    tmp_path,
+    qapp,
+    monkeypatch,
+    item_count: int,
+    expected_initial: int,
+) -> None:
+    folder = tmp_path / f"large-{item_count}"
+    folder.mkdir()
+    for index in range(item_count):
+        (folder / f"{index:04}.txt").write_bytes(b"x")
+
+    import app.browser_scanner as scanner_module
+    import app.browser_model as browser_model_module
+    import app.browser_sort as browser_sort_module
+
+    original_scandir = scanner_module.os.scandir
+
+    def run_navigation(route: str) -> dict[str, int]:
+        route_root = tmp_path / route
+        route_root.mkdir()
+        store = MetadataStore(route_root / "metadata.sqlite3")
+        store.add_folder_bookmark(str(folder))
+        scanner = BrowserDirectoryScanner(max_workers=1)
+        window = BrowserWindow(
+            config_manager=_config(route_root),
+            metadata_store=store,
+            scanner=scanner,
+            restore_initial_location=False,
+        )
+        window.show()
+        qapp.processEvents()
+        window._thumbnail_request_timer.stop()
+        metrics = {
+            "navigate": 0,
+            "scan": 0,
+            "enumeration": 0,
+            "worker_convert": 0,
+            "worker_natural_key": 0,
+            "worker_sort": 0,
+            "gui_sort": 0,
+            "snapshot": 0,
+            "model_reset": 0,
+            "initial_batch": 0,
+            "remaining_append": 0,
+            "thumbnail_schedule": 0,
+            "thumbnail_request": 0,
+            "history_visit": 0,
+            "tree_sync": 0,
+            "config_save": 0,
+            "metadata_query_or_save": 0,
+        }
+        worker_threads: set[int] = set()
+
+        with monkeypatch.context() as patch:
+            original_navigate = window.navigate_to
+            original_start = scanner.start
+            original_convert = browser_model_module.browser_item_from_scan_entry
+            original_natural_key = browser_sort_module._natural_key
+            original_worker_sort = BrowserSortPolicy.sorted_items
+            original_gui_sort = window.item_model.sort_items
+            original_begin = window.item_model.begin_final_directory_scan
+            original_append = window.item_model.append_final_directory_scan
+            original_snapshot = window._folder_snapshot_for_item
+            original_history_visit = window.navigation_history.visit
+
+            def counted_navigate(*args, **kwargs):
+                metrics["navigate"] += 1
+                return original_navigate(*args, **kwargs)
+
+            def counted_start(request):
+                metrics["scan"] += 1
+                return original_start(request)
+
+            def counted_scandir(path):
+                metrics["enumeration"] += 1
+                return original_scandir(path)
+
+            def counted_convert(scan_entry):
+                worker_threads.add(get_ident())
+                metrics["worker_convert"] += 1
+                return original_convert(scan_entry)
+
+            def counted_worker_sort(policy, items):
+                worker_threads.add(get_ident())
+                metrics["worker_sort"] += 1
+                return original_worker_sort(policy, items)
+
+            def counted_natural_key(value):
+                worker_threads.add(get_ident())
+                metrics["worker_natural_key"] += 1
+                return original_natural_key(value)
+
+            def counted_gui_sort(items):
+                metrics["gui_sort"] += 1
+                return original_gui_sort(items)
+
+            def counted_begin(items, *, generation):
+                metrics["initial_batch"] += 1
+                return original_begin(items, generation=generation)
+
+            def counted_append(items, *, generation):
+                metrics["remaining_append"] += 1
+                return original_append(items, generation=generation)
+
+            def counted_snapshot(item):
+                metrics["snapshot"] += 1
+                return original_snapshot(item)
+
+            def counted_history_visit(location):
+                metrics["history_visit"] += 1
+                return original_history_visit(location)
+
+            def counted_metadata_call(*_args, **_kwargs):
+                metrics["metadata_query_or_save"] += 1
+                return None
+
+            patch.setattr(window, "navigate_to", counted_navigate)
+            patch.setattr(scanner, "start", counted_start)
+            patch.setattr(scanner_module.os, "scandir", counted_scandir)
+            patch.setattr(
+                browser_model_module,
+                "browser_item_from_scan_entry",
+                counted_convert,
+            )
+            patch.setattr(
+                BrowserSortPolicy,
+                "sorted_items",
+                counted_worker_sort,
+            )
+            patch.setattr(
+                browser_sort_module,
+                "_natural_key",
+                counted_natural_key,
+            )
+            patch.setattr(window.item_model, "sort_items", counted_gui_sort)
+            patch.setattr(
+                window.item_model,
+                "begin_final_directory_scan",
+                counted_begin,
+            )
+            patch.setattr(
+                window.item_model,
+                "append_final_directory_scan",
+                counted_append,
+            )
+            patch.setattr(window, "_folder_snapshot_for_item", counted_snapshot)
+            patch.setattr(
+                window.navigation_history,
+                "visit",
+                counted_history_visit,
+            )
+            patch.setattr(
+                window,
+                "_initial_scan_item_count",
+                lambda count: min(count, 40),
+            )
+            patch.setattr(
+                window,
+                "_visible_row_range",
+                lambda: (0, min(window.item_model.rowCount() - 1, 19)),
+            )
+            patch.setattr(
+                window,
+                "_sync_tree_to_path",
+                lambda _path: metrics.__setitem__(
+                    "tree_sync",
+                    metrics["tree_sync"] + 1,
+                ),
+            )
+            patch.setattr(
+                window,
+                "_schedule_thumbnail_requests",
+                lambda *_args, **_kwargs: metrics.__setitem__(
+                    "thumbnail_schedule",
+                    metrics["thumbnail_schedule"] + 1,
+                ),
+            )
+            patch.setattr(
+                window.thumbnail_provider,
+                "request",
+                lambda *_args, **_kwargs: metrics.__setitem__(
+                    "thumbnail_request",
+                    metrics["thumbnail_request"] + 1,
+                )
+                or False,
+            )
+            patch.setattr(
+                window.config,
+                "save",
+                lambda *_args, **_kwargs: metrics.__setitem__(
+                    "config_save",
+                    metrics["config_save"] + 1,
+                ),
+            )
+            patch.setattr(store, "list_folder_bookmarks", counted_metadata_call)
+            patch.setattr(store, "add_folder_bookmark", counted_metadata_call)
+            patch.setattr(store, "remove_folder_bookmark", counted_metadata_call)
+            patch.setattr(store, "reorder_folder_bookmarks", counted_metadata_call)
+            patch.setattr(store, "flush", counted_metadata_call)
+            window.item_model.modelReset.connect(
+                lambda: metrics.__setitem__(
+                    "model_reset",
+                    metrics["model_reset"] + 1,
+                )
+            )
+            gui_thread = get_ident()
+
+            if route == "favorite":
+                window._on_favorite_clicked(
+                    window.folder_bookmark_model.index(0, 0)
+                )
+            else:
+                window.navigate_to(folder)
+
+            assert window.wait_for_scan(5000)
+            window._on_list_paint_completed()
+            for _ in range(4):
+                qapp.processEvents()
+            assert window.item_model.rowCount() == item_count
+            assert worker_threads
+            assert gui_thread not in worker_threads
+            window._request_visible_thumbnails()
+
+        window.close()
+        qapp.processEvents()
+        store.close()
+        return metrics
+
+    normal = run_navigation("normal")
+    favorite = run_navigation("favorite")
+
+    expected = {
+        "navigate": 1,
+        "scan": 1,
+        "enumeration": 1,
+        "worker_convert": item_count,
+        "worker_natural_key": item_count * 2,
+        "worker_sort": 1,
+        "gui_sort": 0,
+        "snapshot": 0,
+        "model_reset": 1,
+        "initial_batch": 1,
+        "remaining_append": int(item_count > expected_initial),
+        "thumbnail_schedule": 1,
+        "thumbnail_request": expected_initial,
+        "history_visit": 1,
+        "tree_sync": 1,
+        "config_save": 0,
+        "metadata_query_or_save": 0,
+    }
+    assert normal == expected
+    assert favorite == expected
 
 
 @pytest.mark.parametrize(

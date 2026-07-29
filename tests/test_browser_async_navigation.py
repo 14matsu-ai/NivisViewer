@@ -9,7 +9,11 @@ import pytest
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication
 
-from app.browser_model import browser_item_from_scan_entry
+from app.browser_model import (
+    BrowserItem,
+    BrowserItemKind,
+    browser_item_from_scan_entry,
+)
 from app.browser_scanner import (
     BrowserDirectoryScanner,
     BrowserScanBatch,
@@ -286,6 +290,10 @@ def test_new_navigation_cancels_and_discards_old_generation(
             first_request.path,
             first_request.generation,
             1,
+            prepared_items=(
+                browser_item_from_scan_entry(entry(first / "old.jpg")),
+            ),
+            sort_policy=first_request.sort_policy,
         )
     )
     assert window.current_path != first.absolute()
@@ -294,6 +302,10 @@ def test_new_navigation_cancels_and_discards_old_generation(
             second_request.path,
             second_request.generation,
             1,
+            prepared_items=(
+                browser_item_from_scan_entry(entry(second / "new.jpg")),
+            ),
+            sort_policy=second_request.sort_policy,
         )
     )
 
@@ -329,8 +341,28 @@ def test_scan_finish_uses_latest_sort_settings(
             "browser_sort_order": "descending",
         }
     )
+    replacement = scanner.requests[-1]
+    assert replacement.generation != request.generation
+    assert request.generation in scanner.cancelled
     scanner.scan_completed.emit(
         BrowserScanCompleted(request.path, request.generation, 2)
+    )
+    scanner.batch_ready.emit(
+        BrowserScanBatch(
+            replacement.path,
+            replacement.generation,
+            (
+                entry(target / "book2.jpg"),
+                entry(target / "book10.jpg"),
+            ),
+        )
+    )
+    scanner.scan_completed.emit(
+        BrowserScanCompleted(
+            replacement.path,
+            replacement.generation,
+            2,
+        )
     )
 
     assert [item.display_name for item in window.items] == [
@@ -484,7 +516,13 @@ def test_identical_refresh_does_not_reset_restore_or_request_thumbnails(
         )
     )
     scanner.scan_completed.emit(
-        BrowserScanCompleted(request.path, request.generation, 1)
+        BrowserScanCompleted(
+            request.path,
+            request.generation,
+            1,
+            prepared_items=(item,),
+            sort_policy=request.sort_policy,
+        )
     )
 
     assert resets == []
@@ -575,6 +613,15 @@ def test_changed_refresh_replaces_once_and_preserves_existing_selection(
             request.path,
             request.generation,
             len(refreshed),
+            prepared_items=tuple(
+                request.sort_policy.sorted_items(
+                    [
+                        browser_item_from_scan_entry(value)
+                        for value in refreshed
+                    ]
+                )
+            ),
+            sort_policy=request.sort_policy,
         )
     )
 
@@ -893,7 +940,102 @@ def test_close_discards_private_scan_buffers(
     assert window._pending_scan is None
     assert pending.buffered_entries == []
     assert pending.refresh_entries == []
-    assert pending.remaining_items == []
+    assert pending.remaining_items == ()
+
+
+@pytest.mark.parametrize(
+    ("item_count", "expected_initial"),
+    [
+        (20, 20),
+        (200, 40),
+        (1000, 40),
+        (5000, 40),
+        (10_000, 40),
+    ],
+)
+def test_prepared_result_avoids_gui_full_conversion_and_sort(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+    item_count: int,
+    expected_initial: int,
+) -> None:
+    window, scanner = make_committed_window(tmp_path, qapp)
+    target = tmp_path / f"prepared-{item_count}"
+    target.mkdir()
+    resets: list[bool] = []
+    inserts: list[tuple[int, int]] = []
+    window.item_model.modelReset.connect(lambda: resets.append(True))
+    window.item_model.rowsInserted.connect(
+        lambda _parent, first, last: inserts.append((first, last))
+    )
+    monkeypatch.setattr(
+        window,
+        "_initial_scan_item_count",
+        lambda count: min(count, 40),
+    )
+    monkeypatch.setattr(
+        window,
+        "_items_from_scan_entries",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("prepared result must not convert on the GUI thread")
+        ),
+    )
+    monkeypatch.setattr(
+        window.item_model,
+        "sort_items",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("prepared result must not sort on the GUI thread")
+        ),
+    )
+    try:
+        assert window.navigate_to(target)
+        request = scanner.requests[-1]
+        completed_items = tuple(
+            BrowserItem(
+                f"{index:05}.jpg",
+                target / f"{index:05}.jpg",
+                BrowserItemKind.IMAGE,
+                1.0,
+                file_size=index + 1,
+                modified_time_ns=1_000_000_000,
+                extension=".jpg",
+            )
+            for index in range(item_count)
+        )
+
+        scanner.scan_completed.emit(
+            BrowserScanCompleted(
+                request.path,
+                request.generation,
+                item_count,
+                prepared_items=completed_items,
+                sort_policy=request.sort_policy,
+            )
+        )
+
+        assert resets == [True]
+        assert window.item_model.rowCount() == expected_initial
+        if item_count > expected_initial:
+            pending = window._pending_scan
+            assert pending is not None
+            assert pending.remaining_items is completed_items
+            assert pending.remaining_item_offset == expected_initial
+            assert (
+                window.items
+                + pending.remaining_items[pending.remaining_item_offset :]
+                == completed_items
+            )
+            window._scan_batch_timer.stop()
+            window._flush_pending_scan_batch()
+            assert inserts == [(expected_initial, item_count - 1)]
+        else:
+            assert window._pending_scan is None
+            assert inserts == []
+        assert window.items == completed_items
+    finally:
+        window.close()
+        qapp.processEvents()
 
 
 def test_initial_scan_count_is_bounded_by_viewport_prefetch_plan(
