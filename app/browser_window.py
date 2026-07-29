@@ -183,6 +183,7 @@ class _PendingDirectoryScan:
     committed: bool = False
     refresh_entries: list[BrowserScanEntry] = field(default_factory=list)
     buffered_entries: list[BrowserScanEntry] = field(default_factory=list)
+    remaining_items: list[BrowserItem] = field(default_factory=list)
     trace_id: int = 0
     navigation_source: str = "interactive"
     first_batch_arrived: bool = False
@@ -574,6 +575,15 @@ class BrowserWindow(QMainWindow):
             wait(max(0, int(msecs)))
         for _ in range(3):
             QCoreApplication.processEvents()
+        pending = self._pending_scan
+        if (
+            pending is not None
+            and pending.committed
+            and pending.remaining_items
+        ):
+            self._scan_batch_timer.stop()
+            self._flush_pending_scan_batch()
+            QCoreApplication.processEvents()
         return self._pending_scan is None
 
     def navigate_to(
@@ -677,41 +687,9 @@ class BrowserWindow(QMainWindow):
             )
         if pending.refresh:
             pending.refresh_entries.extend(batch.entries)
-            self._schedule_scan_status_update()
-            return
-
-        if not pending.committed:
-            self._commit_pending_scan(pending)
-            self._append_scan_entries(pending, batch.entries)
         else:
             pending.buffered_entries.extend(batch.entries)
-            if not self._scan_batch_timer.isActive():
-                self._scan_batch_timer.start()
         self._schedule_scan_status_update()
-        if self._first_paint_pending_generation != pending.generation:
-            self._schedule_thumbnail_requests()
-
-    def _append_scan_entries(
-        self,
-        pending: _PendingDirectoryScan,
-        entries: tuple[BrowserScanEntry, ...],
-    ) -> None:
-        previous_state = self._capture_list_view_state()
-        items = self._items_from_scan_entries(entries)
-        self.item_model.append_scan_batch(
-            items,
-            generation=pending.generation,
-        )
-        if pending.trace_id and not pending.first_batch_applied:
-            pending.first_batch_applied = True
-            performance_trace.mark(
-                pending.trace_id,
-                "browser.model.first_batch.applied",
-                str(len(entries)),
-            )
-        self._restore_list_view_state(previous_state)
-        self._restore_pending_scan_location(pending, final=False)
-        self._apply_pending_browser_focus(final=False)
 
     def _flush_pending_scan_batch(self) -> None:
         pending = self._pending_scan
@@ -719,14 +697,18 @@ class BrowserWindow(QMainWindow):
             pending is None
             or pending.refresh
             or not pending.committed
-            or not pending.buffered_entries
+            or not pending.remaining_items
         ):
             return
-        entries = tuple(pending.buffered_entries)
-        pending.buffered_entries.clear()
-        self._append_scan_entries(pending, entries)
-        self._schedule_scan_status_update()
-        self._schedule_thumbnail_requests()
+        remaining = tuple(pending.remaining_items)
+        pending.remaining_items.clear()
+        self.item_model.append_final_directory_scan(
+            remaining,
+            generation=pending.generation,
+        )
+        self.item_model.finish_directory_scan(generation=pending.generation)
+        self._restore_pending_scan_location(pending, final=True)
+        self._finish_pending_scan(pending)
 
     def _on_scan_completed(self, result: BrowserScanCompleted) -> None:
         pending = self._matching_pending_scan(result.generation, result.path)
@@ -738,6 +720,7 @@ class BrowserWindow(QMainWindow):
                 self.item_model.cancel_directory_scan(
                     generation=pending.generation
                 )
+            self._discard_pending_scan_buffers(pending)
             self._pending_scan = None
             self._pending_browser_focus = None
             self._update_status()
@@ -745,41 +728,65 @@ class BrowserWindow(QMainWindow):
 
         if pending.refresh:
             state = self._capture_list_view_state()
-            items = self._items_from_scan_entries(
-                tuple(pending.refresh_entries)
+            items = self.item_model.sort_items(
+                self._items_from_scan_entries(
+                    tuple(pending.refresh_entries)
+                )
             )
-            self._generation = self.thumbnail_provider.begin_generation()
-            self.item_model.set_items(items, preserve_thumbnails=True)
-            if self._pending_browser_focus is None:
-                self._schedule_list_view_state_restore(state)
-            self._restore_location(
-                pending.restore_location,
-                update_status=False,
-            )
+            if items != self.item_model.items:
+                self._generation = self.thumbnail_provider.begin_generation()
+                self.item_model.set_sorted_items(
+                    items,
+                    preserve_thumbnails=True,
+                )
+                if self._pending_browser_focus is None:
+                    self._schedule_list_view_state_restore(state)
+                self._restore_location(
+                    pending.restore_location,
+                    update_status=False,
+                )
         else:
-            if not pending.committed:
-                self._commit_pending_scan(pending)
+            items = self.item_model.sort_items(
+                self._items_from_scan_entries(
+                    tuple(pending.buffered_entries)
+                )
+            )
+            pending.buffered_entries.clear()
+            self._commit_pending_scan(pending)
+            initial_count = self._initial_scan_item_count(len(items))
+            initial_items = items[:initial_count]
+            pending.remaining_items.extend(items[initial_count:])
+            self.item_model.begin_final_directory_scan(
+                initial_items,
+                generation=pending.generation,
+            )
+            pending.first_batch_applied = True
+            if pending.trace_id:
+                performance_trace.mark(
+                    pending.trace_id,
+                    "browser.model.first_batch.applied",
+                    str(len(initial_items)),
+                )
+            self._restore_pending_scan_location(pending, final=False)
+            self._apply_pending_browser_focus(final=False)
             self._scan_batch_timer.stop()
-            self._flush_pending_scan_batch()
+            if pending.remaining_items:
+                self._scan_batch_timer.start()
+                self._schedule_scan_status_update()
+                return
             self.item_model.finish_directory_scan(
                 generation=pending.generation
             )
-            selected_path = pending.restore_location.selected_path
-            if (
-                selected_path
-                and self.item_model.row_for_path(selected_path) < 0
-            ):
-                self._restore_pending_scan_location(pending, final=True)
-        self._apply_pending_browser_focus(final=True)
+            self._restore_pending_scan_location(pending, final=True)
+        self._finish_pending_scan(pending)
 
+    def _finish_pending_scan(self, pending: _PendingDirectoryScan) -> None:
+        if self._pending_scan is not pending:
+            return
+        self._apply_pending_browser_focus(final=True)
         self._pending_scan = None
         self.directory_scan_committed.emit(str(pending.path))
         self._update_status()
-        if (
-            pending.refresh
-            and self._first_paint_pending_generation != pending.generation
-        ):
-            self._schedule_thumbnail_requests()
         if pending.refresh:
             QTimer.singleShot(
                 0,
@@ -789,7 +796,7 @@ class BrowserWindow(QMainWindow):
                     else None
                 ),
             )
-        if self._operation_refresh_generation == result.generation:
+        if self._operation_refresh_generation == pending.generation:
             self._operation_refresh_generation = None
             QTimer.singleShot(0, self._restore_file_operation_selection)
 
@@ -803,6 +810,7 @@ class BrowserWindow(QMainWindow):
             )
         else:
             self._rollback_pending_history(pending)
+        self._discard_pending_scan_buffers(pending)
         self._pending_scan = None
         self._pending_browser_focus = None
         self._scan_batch_timer.stop()
@@ -823,7 +831,6 @@ class BrowserWindow(QMainWindow):
         self.current_path = pending.path
         self.config.set("last_browser_path", str(pending.path))
         self._generation = self.thumbnail_provider.begin_generation()
-        self.item_model.begin_directory_scan(generation=pending.generation)
         self.list_view.clearSelection()
         self.list_view.setCurrentIndex(QModelIndex())
         if pending.record_history:
@@ -838,6 +845,32 @@ class BrowserWindow(QMainWindow):
         self._sync_address_bar()
         self._update_navigation_actions()
 
+    def _initial_scan_item_count(self, total_count: int) -> int:
+        count = max(0, int(total_count))
+        if count <= 0:
+            return 0
+        if count <= 40:
+            return count
+        viewport = self.list_view.viewport()
+        grid = self.list_view.gridSize()
+        visible_range = calculate_grid_visible_range(
+            row_count=count,
+            viewport_width=viewport.width(),
+            viewport_height=viewport.height(),
+            grid_width=grid.width(),
+            grid_height=grid.height(),
+            vertical_offset=0,
+        )
+        if visible_range is None:
+            return min(count, 1)
+        plan = build_thumbnail_request_plan(
+            row_count=count,
+            first_visible=visible_range[0],
+            last_visible=visible_range[1],
+            prefetch_screens=1,
+        )
+        return min(count, max(1, min(80, len(plan.requested_rows))))
+
     def _cancel_pending_scan(self, *, rollback_history: bool) -> None:
         pending = self._pending_scan
         if pending is None:
@@ -850,7 +883,14 @@ class BrowserWindow(QMainWindow):
             )
         elif rollback_history:
             self._rollback_pending_history(pending)
+        self._discard_pending_scan_buffers(pending)
         self._pending_scan = None
+
+    @staticmethod
+    def _discard_pending_scan_buffers(pending: _PendingDirectoryScan) -> None:
+        pending.refresh_entries.clear()
+        pending.buffered_entries.clear()
+        pending.remaining_items.clear()
 
     def _rollback_pending_history(self, pending: _PendingDirectoryScan) -> None:
         if pending.failure_history_revert == "forward":
@@ -1063,9 +1103,18 @@ class BrowserWindow(QMainWindow):
             or self.current_path is None
         ):
             return None
+        candidates = self.items
+        pending = self._pending_scan
+        if (
+            pending is not None
+            and pending.committed
+            and self._same_path(pending.path, self.current_path)
+            and pending.remaining_items
+        ):
+            candidates += tuple(pending.remaining_items)
         image_ids = tuple(
             str(candidate.path)
-            for candidate in self.items
+            for candidate in candidates
             if candidate.kind is BrowserItemKind.IMAGE
         )
         if str(item.path) not in image_ids:
@@ -1080,7 +1129,7 @@ class BrowserWindow(QMainWindow):
                     candidate.file_size,
                     candidate.modified_time_ns,
                 )
-                for candidate in self.items
+                for candidate in candidates
                 if candidate.kind is BrowserItemKind.IMAGE
             ),
             generation=self._scan_generation,
@@ -2325,6 +2374,14 @@ class BrowserWindow(QMainWindow):
             "browser_sort_order",
             "browser_folders_first",
         }.intersection(changed):
+            pending_scan = self._pending_scan
+            if (
+                pending_scan is not None
+                and pending_scan.committed
+                and pending_scan.remaining_items
+            ):
+                self._scan_batch_timer.stop()
+                self._flush_pending_scan_batch()
             self.item_model.configure_sort(
                 self.browser_sort_key,
                 self.browser_sort_order,
@@ -2541,8 +2598,23 @@ class BrowserWindow(QMainWindow):
             self.browser_external_drop_behavior = str(
                 changed["browser_external_drop_behavior"]
             )
-        if visibility_changed and self.current_path is not None:
-            self.refresh_current_folder()
+        if visibility_changed:
+            pending_scan = self._pending_scan
+            if pending_scan is not None:
+                self.navigate_to(
+                    pending_scan.path,
+                    record_history=pending_scan.record_history,
+                    restore_location=pending_scan.restore_location,
+                    force_reload=True,
+                    capture_current=False,
+                    failure_history_revert=(
+                        pending_scan.failure_history_revert
+                    ),
+                    navigation_source=pending_scan.navigation_source,
+                    trace_id=pending_scan.trace_id,
+                )
+            elif self.current_path is not None:
+                self.refresh_current_folder()
         if "thumbnail_disk_cache_enabled" in changed:
             self.thumbnail_provider.set_disk_cache_enabled(
                 bool(changed["thumbnail_disk_cache_enabled"])
@@ -3765,9 +3837,16 @@ class BrowserWindow(QMainWindow):
                 len(pending.refresh_entries)
                 if pending.refresh
                 else (
-                    self.item_model.rowCount() + len(pending.buffered_entries)
+                    self.item_model.rowCount()
+                    + len(
+                        getattr(
+                            pending,
+                            "remaining_items",
+                            pending.buffered_entries,
+                        )
+                    )
                     if pending.committed
-                    else 0
+                    else len(pending.buffered_entries)
                 )
             )
             self.statusBar().showMessage(

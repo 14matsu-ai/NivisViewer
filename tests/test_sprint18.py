@@ -713,7 +713,7 @@ class _FakeScanner(QObject):
         pass
 
 
-def test_browser_drop_focus_applies_incremental_batch_and_discards_stale(
+def test_browser_drop_focus_waits_for_final_scan_and_discards_stale(
     tmp_path: Path,
     qapp,
 ) -> None:
@@ -758,14 +758,16 @@ def test_browser_drop_focus_applies_incremental_batch_and_discards_stale(
         )
     )
     qapp.processEvents()
-    assert window.item_model.row_for_path(target) >= 0
-    assert window.list_view.currentIndex().isValid()
-    assert window.navigate_to(other)
-    assert window._pending_browser_focus is None
+    assert window.item_model.row_for_path(target) < 0
+    assert not window.list_view.currentIndex().isValid()
     scanner.scan_completed.emit(
         BrowserScanCompleted(scan.path, scan.generation, 1)
     )
     qapp.processEvents()
+    assert window.item_model.row_for_path(target) >= 0
+    assert window.list_view.currentIndex().isValid()
+    assert window.navigate_to(other)
+    assert window._pending_browser_focus is None
     assert window.current_path == folder.absolute()
     replacement = scanner.requests[-1]
     scanner.scan_completed.emit(
