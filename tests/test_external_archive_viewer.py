@@ -40,11 +40,13 @@ class ViewerBackend:
         self.pages = pages
         self.cancelled_seen = Event()
         self.read_calls = 0
+        self.list_calls = 0
 
     def is_available(self) -> bool:
         return self.failure is not ArchiveErrorCode.BACKEND_NOT_FOUND
 
     def list_entries(self, archive_path: str, *, cancel_token=None) -> ArchiveListing:
+        self.list_calls += 1
         if self.started is not None:
             self.started.set()
         if self.release is not None:
@@ -183,6 +185,64 @@ def test_external_archive_open_position_can_resume_and_clamps_saved_progress(
 
     assert window.model.current_index == 1
     assert store.list_history()[0].path == str(archive.absolute())
+    window.close()
+    store.close()
+    qapp.processEvents()
+
+
+def test_external_archive_page_navigation_does_not_reopen_or_restore_position(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    archive = tmp_path / "navigation.7z"
+    archive.write_bytes(b"archive")
+    backend = ViewerBackend(pages=4)
+    store = MetadataStore(tmp_path / "metadata.sqlite3")
+    window = make_window(tmp_path, backend, metadata_store=store)
+    window.config.apply({"book_open_position": "resume_last"})
+    restore_reads = 0
+    history_records = 0
+    original_progress = store.get_reading_progress
+    original_record = store.record_book_opened
+
+    def counted_progress(path: str):
+        nonlocal restore_reads
+        restore_reads += 1
+        return original_progress(path)
+
+    def counted_record(*args, **kwargs):
+        nonlocal history_records
+        history_records += 1
+        return original_record(*args, **kwargs)
+
+    monkeypatch.setattr(store, "get_reading_progress", counted_progress)
+    monkeypatch.setattr(store, "record_book_opened", counted_record)
+    assert window.open_path(archive)
+    assert window.book_session.wait_for_async(2000)
+    qapp.processEvents()
+    assert backend.list_calls == 1
+    assert restore_reads == 1
+    assert history_records == 1
+
+    opens = 0
+    original_open = window.book_session.open_book_async
+
+    def counted_open(*args, **kwargs):
+        nonlocal opens
+        opens += 1
+        return original_open(*args, **kwargs)
+
+    monkeypatch.setattr(window.book_session, "open_book_async", counted_open)
+    generation = window.image_cache.generation
+    window.next_one_page()
+    window.next_one_page()
+    window.previous_one_page()
+    assert opens == 0
+    assert backend.list_calls == 1
+    assert restore_reads == 1
+    assert history_records == 1
+    assert window.image_cache.generation == generation
     window.close()
     store.close()
     qapp.processEvents()
