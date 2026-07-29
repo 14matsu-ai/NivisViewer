@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from threading import Event, Lock
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
 from .archive_backend import EXTERNAL_ARCHIVE_EXTENSIONS, is_supported_archive_candidate
+from .browser_sort import BrowserSortPolicy
 from .browser_visibility import (
     LEGACY_SUPPORTED_ITEMS_POLICY,
     BrowserVisibilityPolicy,
@@ -18,6 +19,9 @@ from .browser_visibility import (
 from .image_source import ARCHIVE_EXTENSIONS, PDF_EXTENSIONS, SUPPORTED_EXTENSIONS
 from .file_operation_artifact import FileOperationArtifactPolicy
 from .performance_trace import performance_trace
+
+if TYPE_CHECKING:
+    from .browser_model import BrowserItem
 
 
 DEFAULT_SCAN_BATCH_SIZE = 128
@@ -58,6 +62,7 @@ class BrowserScanRequest:
     visibility_policy: BrowserVisibilityPolicy = LEGACY_SUPPORTED_ITEMS_POLICY
     priority: BrowserScanPriority = BrowserScanPriority.INTERACTIVE_NAVIGATION
     trace_id: int = 0
+    sort_policy: BrowserSortPolicy = BrowserSortPolicy()
 
 
 @dataclass(frozen=True)
@@ -80,6 +85,7 @@ class BrowserScanBatch:
     path: str
     generation: int
     entries: tuple[BrowserScanEntry, ...]
+    final_items_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -88,6 +94,16 @@ class BrowserScanCompleted:
     generation: int
     total_count: int
     cancelled: bool = False
+    prepared_items: tuple[BrowserItem, ...] | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    sort_policy: BrowserSortPolicy | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     @property
     def status(self) -> BrowserScanStatus:
@@ -213,9 +229,12 @@ def scan_directory(
     cancelled: Event,
     emit_batch: Callable[[BrowserScanBatch], None],
 ) -> BrowserScanCompleted | BrowserScanError:
+    from .browser_model import browser_item_from_scan_entry
+
     target = Path(request.path)
     batch_size = max(1, min(1024, int(request.batch_size)))
     batch: list[BrowserScanEntry] = []
+    prepared_items: list[BrowserItem] = []
     total_count = 0
     if cancelled.is_set():
         return BrowserScanCompleted(
@@ -258,6 +277,12 @@ def scan_directory(
                 )
                 if scanned is None:
                     continue
+                try:
+                    prepared_items.append(
+                        browser_item_from_scan_entry(scanned)
+                    )
+                except ValueError:
+                    continue
                 batch.append(scanned)
                 total_count += 1
                 if len(batch) >= batch_size:
@@ -272,6 +297,7 @@ def scan_directory(
                             request.path,
                             request.generation,
                             tuple(batch),
+                            final_items_pending=True,
                         )
                     )
                     batch.clear()
@@ -347,13 +373,26 @@ def scan_directory(
                     request.path,
                     request.generation,
                     tuple(batch),
+                    final_items_pending=True,
                 )
             )
+        if cancelled.is_set():
+            return BrowserScanCompleted(
+                request.path,
+                request.generation,
+                total_count,
+                cancelled=True,
+            )
+        ordered_items = tuple(
+            request.sort_policy.sorted_items(prepared_items)
+        )
         return BrowserScanCompleted(
             request.path,
             request.generation,
             total_count,
             cancelled=cancelled.is_set(),
+            prepared_items=ordered_items,
+            sort_policy=request.sort_policy,
         )
 
 
