@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import logging
 from pathlib import Path
 from threading import Event, Thread
 from time import monotonic, sleep
+from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import QTimer
@@ -698,7 +700,7 @@ def test_application_shutdown_coordinator_order_and_idempotency() -> None:
     order: list[str] = []
     coordinator = ApplicationShutdownCoordinator(
         steps=(
-            ("workers", lambda: order.append("workers")),
+            ("workers", lambda: order.append("workers") or True),
             ("metadata", lambda: order.append("metadata")),
             ("config", lambda: order.append("config")),
         )
@@ -706,18 +708,68 @@ def test_application_shutdown_coordinator_order_and_idempotency() -> None:
     finished: list[bool] = []
     coordinator.shutdown_finished.connect(lambda: finished.append(True))
     assert coordinator.begin_shutdown()
-    assert not coordinator.begin_shutdown()
+    assert coordinator.begin_shutdown()
     assert coordinator.state is ApplicationShutdownState.STOPPED
     assert order == ["workers", "metadata", "config"]
     assert finished == [True]
 
+    empty = ApplicationShutdownCoordinator()
+    assert empty.begin_shutdown()
+    assert empty.begin_shutdown()
+    assert empty.state is ApplicationShutdownState.STOPPED
 
-def test_application_shutdown_failure_stops_later_steps() -> None:
+
+def test_application_shutdown_false_stops_and_retries_from_failed_step() -> None:
     order: list[str] = []
+    blocked = True
+
+    def incomplete() -> bool:
+        order.append("incomplete")
+        return not blocked
+
+    coordinator = ApplicationShutdownCoordinator(
+        steps=(
+            ("first", lambda: order.append("first")),
+            ("incomplete", incomplete),
+            ("last", lambda: order.append("last")),
+        )
+    )
+    failures: list[str] = []
+    finished: list[bool] = []
+    coordinator.shutdown_failed.connect(failures.append)
+    coordinator.shutdown_finished.connect(lambda: finished.append(True))
+
+    assert not coordinator.begin_shutdown()
+    assert coordinator.state is ApplicationShutdownState.TIMED_OUT
+    assert coordinator.failed_step_index == 1
+    assert coordinator.failed_step_name == "incomplete"
+    assert order == ["first", "incomplete"]
+    assert finished == []
+
+    blocked = False
+    assert coordinator.begin_shutdown()
+    assert coordinator.state is ApplicationShutdownState.STOPPED
+    assert coordinator.failed_step_index is None
+    assert coordinator.failed_step_name is None
+    assert order == ["first", "incomplete", "incomplete", "last"]
+    assert len(failures) == 1
+    assert finished == [True]
+
+    assert coordinator.begin_shutdown()
+    assert order == ["first", "incomplete", "incomplete", "last"]
+    assert finished == [True]
+
+
+def test_application_shutdown_exception_is_retryable_and_logged_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    order: list[str] = []
+    blocked = True
 
     def fail() -> None:
         order.append("fail")
-        raise RuntimeError("blocked")
+        if blocked:
+            raise RuntimeError("blocked")
 
     coordinator = ApplicationShutdownCoordinator(
         steps=(
@@ -728,10 +780,127 @@ def test_application_shutdown_failure_stops_later_steps() -> None:
     )
     failures: list[str] = []
     coordinator.shutdown_failed.connect(failures.append)
-    assert not coordinator.begin_shutdown()
+    with caplog.at_level(logging.ERROR, logger="app.application_shutdown"):
+        assert not coordinator.begin_shutdown()
+        assert not coordinator.begin_shutdown()
+
     assert coordinator.state is ApplicationShutdownState.TIMED_OUT
-    assert order == ["first", "fail"]
-    assert failures == ["blocked"]
+    assert coordinator.failed_step_index == 1
+    assert coordinator.failed_step_name == "fail"
+    assert order == ["first", "fail", "fail"]
+    assert failures == ["blocked", "blocked"]
+    assert sum(
+        record.name == "app.application_shutdown"
+        and "Application shutdown step failed" in record.getMessage()
+        for record in caplog.records
+    ) == 1
+
+    blocked = False
+    assert coordinator.begin_shutdown()
+    assert order == ["first", "fail", "fail", "fail", "never"]
+    assert coordinator.state is ApplicationShutdownState.STOPPED
+
+
+def test_controller_shutdown_retries_image_step_and_defers_application_quit(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = ApplicationController(
+        qapp,
+        config_manager=ConfigManager(tmp_path / "config.json"),
+    )
+    original_image_coordinator = controller.image_work_coordinator
+    original_pdfium_shutdown = controller.pdfium_service.shutdown
+    original_metadata_close = controller.metadata_store.close
+    order: list[str] = []
+    image_worker_released = False
+    quit_calls: list[bool] = []
+    exit_requests: list[bool] = []
+
+    def image_shutdown() -> bool:
+        order.append("image")
+        return image_worker_released
+
+    monkeypatch.setattr(
+        controller,
+        "_prepare_viewers_for_shutdown",
+        lambda: order.append("viewers"),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_prepare_browser_for_shutdown",
+        lambda: order.append("browser"),
+    )
+    monkeypatch.setattr(
+        controller,
+        "image_work_coordinator",
+        SimpleNamespace(shutdown=image_shutdown),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_shutdown_pdfium_service",
+        lambda: order.append("pdfium"),
+    )
+    monkeypatch.setattr(
+        controller.config,
+        "save",
+        lambda: order.append("config"),
+    )
+    monkeypatch.setattr(
+        controller.metadata_store,
+        "flush",
+        lambda: order.append("metadata_flush"),
+    )
+    monkeypatch.setattr(
+        controller.metadata_store,
+        "close",
+        lambda: order.append("metadata_close"),
+    )
+    controller.application = SimpleNamespace(
+        quit=lambda: quit_calls.append(True)
+    )
+    controller.exit_requested.connect(lambda: exit_requests.append(True))
+
+    controller._request_application_exit()
+
+    assert controller._shutdown
+    assert not controller._shutdown_complete
+    assert not controller._quit_committed
+    assert controller.shutdown_coordinator.failed_step_name == "image_workers"
+    assert order == ["viewers", "browser", "pdfium", "image"]
+    assert quit_calls == []
+    assert exit_requests == []
+    with pytest.raises(RuntimeError):
+        controller.create_viewer_window()
+
+    image_worker_released = True
+    assert controller.shutdown()
+
+    assert controller._shutdown_complete
+    assert controller._quit_committed
+    assert order == [
+        "viewers",
+        "browser",
+        "pdfium",
+        "image",
+        "image",
+        "config",
+        "metadata_flush",
+        "metadata_close",
+    ]
+    assert quit_calls == [True]
+    assert exit_requests == [True]
+
+    assert controller.shutdown()
+    assert order.count("viewers") == 1
+    assert order.count("browser") == 1
+    assert order.count("pdfium") == 1
+    assert order.count("image") == 2
+    assert order.count("config") == 1
+    assert original_image_coordinator.shutdown()
+    assert original_pdfium_shutdown()
+    original_metadata_close()
 
 
 def test_controller_rejects_new_viewer_after_shutdown(

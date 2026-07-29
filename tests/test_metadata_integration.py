@@ -283,10 +283,12 @@ def test_multiple_viewers_update_shared_database_without_corruption(
     second.close()
     qapp.processEvents()
 
-    history = controller.metadata_store.list_history()
+    reopened = MetadataStore(controller.config.metadata_database_path)
+    history = reopened.list_history()
     assert len(history) == 1
     assert history[0].open_count == 2
     assert persisted_page(controller.config.metadata_database_path, book) == 2
+    reopened.close()
     close_controller(controller, qapp)
 
 
