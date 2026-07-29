@@ -261,6 +261,7 @@ class ImageCache(QObject):
         self._protected_indexes: set[int] = set()
         self._center_index = 0
         self._preferred_direction = 0
+        self._configured_prefetch_order = False
         self._thread_pool = QThreadPool(self)
         self._thread_pool.setMaxThreadCount(1)
         self._coordinator = image_work_coordinator
@@ -270,6 +271,17 @@ class ImageCache(QObject):
 
     def set_cache_size(self, cache_size: int) -> None:
         self.cache_size = max(1, int(cache_size))
+        self._enforce_limit()
+
+    @property
+    def cache_byte_budget_mib(self) -> int:
+        return self._cache_byte_budget // (1024 * 1024)
+
+    def set_cache_byte_budget_mib(self, memory_mib: int) -> None:
+        self._cache_byte_budget = max(
+            64,
+            min(4096, int(memory_mib)),
+        ) * 1024 * 1024
         self._enforce_limit()
 
     def set_adjustments(self, *, brightness: float, contrast: float, gamma: float) -> None:
@@ -301,6 +313,7 @@ class ImageCache(QObject):
         self._protected_indexes.clear()
         self._center_index = 0
         self._preferred_direction = 0
+        self._configured_prefetch_order = False
         self._trace_id = int(trace_id)
 
     def set_render_spec(
@@ -412,6 +425,7 @@ class ImageCache(QObject):
         self._protected_indexes.clear()
         self._center_index = 0
         self._preferred_direction = 0
+        self._configured_prefetch_order = False
 
     def has_in_flight_for_source(self, source: ImageSource) -> bool:
         return any(active_source is source for active_source in self._in_flight.values())
@@ -450,13 +464,24 @@ class ImageCache(QObject):
         visible_indexes: tuple[int, ...] = tuple(),
         preferred_direction: int = 0,
         rolling_indexes: tuple[int, ...] = tuple(),
+        prefetch_indexes: tuple[int, ...] | None = None,
     ) -> None:
         if not self.image_ids:
             return
 
         start = max(0, center_index - radius)
         end = min(len(self.image_ids) - 1, center_index + radius)
-        wanted = set(range(start, end + 1))
+        candidates = (
+            tuple(range(start, end + 1))
+            if prefetch_indexes is None
+            else tuple(
+                index
+                for index in prefetch_indexes
+                if 0 <= index < len(self.image_ids)
+            )
+        )
+        wanted = set(candidates)
+        wanted.add(center_index)
         wanted.update(index for index in visible_indexes if 0 <= index < len(self.image_ids))
         wanted.update(
             index
@@ -466,11 +491,11 @@ class ImageCache(QObject):
         self._wanted_indexes = wanted
         self._protected_indexes = set(visible_indexes)
         self._center_index = center_index
-        self._preferred_direction = (
-            max(-1, min(1, int(preferred_direction)))
-            if bool(getattr(self.source, "supports_target_rendering", False))
-            else 0
+        self._preferred_direction = max(
+            -1,
+            min(1, int(preferred_direction)),
         )
+        self._configured_prefetch_order = prefetch_indexes is not None
         for (generation, index), source in tuple(self._in_flight.items()):
             if generation == self.generation and index not in wanted:
                 cancel = getattr(source, "cancel_image_request", None)
@@ -490,13 +515,16 @@ class ImageCache(QObject):
         for index in rolling_indexes:
             if index != center_index and index not in self._protected_indexes:
                 self.ensure_loaded(index)
-        prefetch_indexes = range(start, end + 1)
-        if bool(getattr(self.source, "supports_target_rendering", False)):
-            prefetch_indexes = sorted(
-                prefetch_indexes,
+        ordered_candidates: tuple[int, ...] | list[int] = candidates
+        if (
+            prefetch_indexes is None
+            and bool(getattr(self.source, "supports_target_rendering", False))
+        ):
+            ordered_candidates = sorted(
+                candidates,
                 key=self._pdf_prefetch_rank,
             )
-        for index in prefetch_indexes:
+        for index in ordered_candidates:
             self.ensure_loaded(index)
 
         self._enforce_limit()
@@ -514,7 +542,10 @@ class ImageCache(QObject):
         elif page_index in self._protected_indexes:
             priority = int(PdfRenderPriority.VIEWER_SPREAD_PARTNER)
             work_priority = int(ImageWorkPriority.VIEWER_SPREAD_PARTNER)
-        elif bool(getattr(self.source, "supports_target_rendering", False)):
+        elif (
+            bool(getattr(self.source, "supports_target_rendering", False))
+            or self._configured_prefetch_order
+        ):
             priority, work_priority = self._pdf_prefetch_priority(page_index)
         elif page_index > self._center_index:
             priority = int(PdfRenderPriority.VIEWER_NEXT)
@@ -577,7 +608,7 @@ class ImageCache(QObject):
             return (
                 distance - 1
                 if in_preferred_direction
-                else PRELOAD_RADIUS + distance - 1
+                else len(self.image_ids) + distance - 1
             )
         return (distance - 1) * 2 + int(page_index < self._center_index)
 

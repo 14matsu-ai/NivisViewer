@@ -153,6 +153,85 @@ def test_cancel_does_not_apply_changes(tmp_path: Path, qapp: QApplication) -> No
     assert not config.path.exists()
 
 
+def test_viewer_prefetch_presets_and_custom_controls(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    config = make_config(tmp_path)
+    config.apply(
+        {
+            "viewer_prefetch_image_forward_units": 9,
+            "viewer_prefetch_image_backward_units": 8,
+            "viewer_prefetch_pdf_forward_units": 7,
+            "viewer_prefetch_pdf_backward_units": 6,
+            "viewer_cache_max_memory_mib": 768,
+        }
+    )
+    dialog = SettingsDialog(config)
+
+    assert [
+        dialog.prefetch_preset_combo.itemText(index)
+        for index in range(dialog.prefetch_preset_combo.count())
+    ] == ["無効", "省メモリ", "標準", "多め", "カスタム"]
+    assert dialog.prefetch_preset_combo.currentData() == "standard"
+    assert dialog.prefetch_direction_priority_checkbox.isChecked()
+    assert not dialog.prefetch_custom_group.isEnabled()
+    assert dialog.prefetch_image_forward_spin.value() == 3
+    assert dialog.prefetch_image_backward_spin.value() == 3
+    assert dialog.prefetch_pdf_forward_spin.value() == 3
+    assert dialog.prefetch_pdf_backward_spin.value() == 3
+    assert dialog.viewer_cache_memory_spin.value() == 256
+
+    more_index = dialog.prefetch_preset_combo.findData("more")
+    dialog.prefetch_preset_combo.setCurrentIndex(more_index)
+    assert dialog.prefetch_image_forward_spin.value() == 6
+    assert dialog.prefetch_image_backward_spin.value() == 2
+    assert dialog.prefetch_pdf_forward_spin.value() == 4
+    assert dialog.prefetch_pdf_backward_spin.value() == 1
+    assert dialog.viewer_cache_memory_spin.value() == 512
+    assert not dialog.prefetch_custom_group.isEnabled()
+
+    custom_index = dialog.prefetch_preset_combo.findData("custom")
+    dialog.prefetch_preset_combo.setCurrentIndex(custom_index)
+
+    assert dialog.prefetch_custom_group.isEnabled()
+    assert dialog.prefetch_image_forward_spin.value() == 9
+    assert dialog.prefetch_image_backward_spin.value() == 8
+    assert dialog.prefetch_pdf_forward_spin.value() == 7
+    assert dialog.prefetch_pdf_backward_spin.value() == 6
+    assert dialog.viewer_cache_memory_spin.value() == 768
+    dialog.reject()
+
+
+def test_custom_viewer_prefetch_applies_and_cancel_does_not_save(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    config = make_config(tmp_path)
+    dialog = SettingsDialog(config)
+    dialog.prefetch_preset_combo.setCurrentIndex(
+        dialog.prefetch_preset_combo.findData("custom")
+    )
+    dialog.prefetch_direction_priority_checkbox.setChecked(False)
+    dialog.prefetch_image_forward_spin.setValue(4)
+    dialog.prefetch_image_backward_spin.setValue(2)
+    dialog.prefetch_pdf_forward_spin.setValue(5)
+    dialog.prefetch_pdf_backward_spin.setValue(1)
+    dialog.viewer_cache_memory_spin.setValue(640)
+
+    changed = dialog.apply_settings()
+
+    assert changed["viewer_prefetch_preset"] == "custom"
+    assert changed["viewer_prefetch_direction_priority_enabled"] is False
+    assert config.viewer_prefetch_settings()["image_forward_units"] == 4
+    assert config.viewer_prefetch_settings()["pdf_backward_units"] == 1
+    assert config.viewer_prefetch_settings()["cache_memory_mib"] == 640
+
+    dialog.prefetch_image_forward_spin.setValue(20)
+    dialog.reject()
+    assert config.get("viewer_prefetch_image_forward_units") == 4
+
+
 def test_density_apply_does_not_request_cache_clear(
     tmp_path: Path,
     qapp: QApplication,

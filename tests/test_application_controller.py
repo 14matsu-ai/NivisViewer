@@ -619,6 +619,7 @@ def test_settings_changes_apply_to_existing_browser_and_viewer(
             "join_spread_pages": True,
             "gap": 37,
             "thumbnail_size": 230,
+            "viewer_prefetch_preset": "memory_saver",
         }
     )
     qapp.processEvents()
@@ -626,6 +627,10 @@ def test_settings_changes_apply_to_existing_browser_and_viewer(
     assert viewer.join_spread_pages is True
     assert viewer.viewer.join_spread_pages is True
     assert viewer.gap == 37
+    assert viewer.prefetch_preset == "memory_saver"
+    assert viewer.image_prefetch_forward_units == 2
+    assert viewer.pdf_prefetch_backward_units == 0
+    assert viewer.image_cache.cache_byte_budget_mib == 128
     assert browser.thumbnail_size == 230
     assert browser.list_view.iconSize().width() == 230
     close_controller(controller, qapp)

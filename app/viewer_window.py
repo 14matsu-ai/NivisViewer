@@ -38,7 +38,7 @@ from .config_manager import ConfigManager
 from .drag_drop import FolderDropProbe
 from .external_drop_open import ExternalDropOpenController
 from .fullscreen_chrome import FullscreenChromeController
-from .image_cache import CachedImage, PRELOAD_RADIUS
+from .image_cache import CachedImage
 from .image_work_coordinator import ImageWorkCoordinator
 from .image_source import (
     ARCHIVE_EXTENSIONS,
@@ -145,6 +145,7 @@ class ViewerWindow(QMainWindow):
         )
         self.model = self.book_session.model
         self.image_cache = self.book_session.image_cache
+        self._load_prefetch_settings()
         self.image_cache.pageLoaded.connect(self._on_cache_page_loaded)
         self.book_session.page_changed.connect(self._queue_metadata_progress)
         self.book_session.async_opened.connect(self._on_async_book_opened)
@@ -263,7 +264,10 @@ class ViewerWindow(QMainWindow):
         self._pdf_prefetch_center = 0
         self._pdf_prefetch_visible_indexes: tuple[int, ...] = tuple()
         self._pdf_prefetch_direction = 0
-        self._last_pdf_prefetch_center: int | None = None
+        self._last_preload_source: ImageSource | None = None
+        self._last_preload_generation = -1
+        self._last_preload_center: int | None = None
+        self._last_preload_direction = 0
         self.image_cache.set_adjustments(brightness=self.brightness, contrast=self.contrast, gamma=self.gamma)
         self.page_navigation = ViewerPageNavigationController(
             self.model,
@@ -938,9 +942,54 @@ class ViewerWindow(QMainWindow):
                 show_trail=self.mouse_gesture_show_trail,
                 min_distance=self.mouse_gesture_min_distance,
             )
+        prefetch_settings_changed = bool(
+            {
+                "viewer_prefetch_preset",
+                "viewer_prefetch_direction_priority_enabled",
+                "viewer_prefetch_image_forward_units",
+                "viewer_prefetch_image_backward_units",
+                "viewer_prefetch_pdf_forward_units",
+                "viewer_prefetch_pdf_backward_units",
+                "viewer_cache_max_memory_mib",
+            }.intersection(changed)
+        )
+        if prefetch_settings_changed:
+            self._load_prefetch_settings()
         self._sync_actions()
         if refresh and self.model.total_pages:
             self._refresh_view()
+        elif prefetch_settings_changed:
+            self._reapply_prefetch_settings()
+
+    def _load_prefetch_settings(self) -> None:
+        values = self.config.viewer_prefetch_settings()
+        self.prefetch_preset = str(values["preset"])
+        self.prefetch_direction_priority_enabled = bool(
+            values["direction_priority_enabled"]
+        )
+        self.image_prefetch_forward_units = int(values["image_forward_units"])
+        self.image_prefetch_backward_units = int(values["image_backward_units"])
+        self.pdf_prefetch_forward_units = int(values["pdf_forward_units"])
+        self.pdf_prefetch_backward_units = int(values["pdf_backward_units"])
+        self.viewer_cache_memory_mib = int(values["cache_memory_mib"])
+        self.image_cache.set_cache_byte_budget_mib(
+            self.viewer_cache_memory_mib
+        )
+
+    def _reapply_prefetch_settings(self) -> None:
+        if self._shutdown_prepared or not self.model.total_pages:
+            return
+        center = self.model.focused_index
+        visible_indexes = self._visible_page_indexes or tuple(
+            slot.page_index for slot in self.model.spread_at().slots
+        )
+        if isinstance(self.image_cache.source, PdfImageSource):
+            self.image_cache.set_render_spec(
+                self._current_pdf_render_spec()
+            )
+            self._prepare_deferred_pdf_prefetch(center, visible_indexes)
+        else:
+            self._preload_image_source(center, visible_indexes)
 
     def _sync_actions(self) -> None:
         self.single_action.setChecked(self.view_mode == "single")
@@ -1869,10 +1918,10 @@ class ViewerWindow(QMainWindow):
             )
         else:
             self._cancel_deferred_pdf_prefetch()
-            self.image_cache.preload_around(
+            self._preload_image_source(
                 request_center,
-                radius=0 if first_frame_gate else PRELOAD_RADIUS,
-                visible_indexes=gated_visible_indexes,
+                gated_visible_indexes,
+                immediate_only=first_frame_gate,
             )
         if _DISPLAY_LOG.isEnabledFor(logging.DEBUG):
             _DISPLAY_LOG.debug(
@@ -1902,26 +1951,15 @@ class ViewerWindow(QMainWindow):
         if not isinstance(source, PdfImageSource):
             return
         self._pdf_prefetch_timer.stop()
-        if source is not self._pdf_prefetch_source:
-            direction = 0
-            self._last_pdf_prefetch_center = None
-        elif self._last_pdf_prefetch_center is None:
-            direction = 0
-        else:
-            delta = center_index - self._last_pdf_prefetch_center
-            normal_step = max(1, len(visible_indexes))
-            if delta == 0:
-                direction = self._pdf_prefetch_direction
-            elif abs(delta) <= normal_step:
-                direction = 1 if delta > 0 else -1
-            else:
-                direction = 0
+        direction = self._navigation_prefetch_direction(
+            center_index,
+            visible_indexes,
+        )
         self._pdf_prefetch_source = source
         self._pdf_prefetch_generation = self.image_cache.generation
         self._pdf_prefetch_center = center_index
         self._pdf_prefetch_visible_indexes = tuple(visible_indexes)
         self._pdf_prefetch_direction = direction
-        self._last_pdf_prefetch_center = center_index
         rolling_indexes = self._next_pdf_rolling_indexes(
             center_index,
             direction,
@@ -1931,10 +1969,140 @@ class ViewerWindow(QMainWindow):
             center_index,
             radius=0,
             visible_indexes=visible_indexes,
-            preferred_direction=direction,
+            preferred_direction=(
+                direction
+                if self.prefetch_direction_priority_enabled
+                else 0
+            ),
             rolling_indexes=rolling_indexes,
+            prefetch_indexes=tuple(),
         )
         self._arm_deferred_pdf_prefetch()
+
+    def _navigation_prefetch_direction(
+        self,
+        center_index: int,
+        visible_indexes: tuple[int, ...],
+    ) -> int:
+        source = self.image_cache.source
+        generation = self.image_cache.generation
+        if (
+            source is not self._last_preload_source
+            or generation != self._last_preload_generation
+            or self._last_preload_center is None
+        ):
+            direction = 0
+        else:
+            delta = center_index - self._last_preload_center
+            normal_step = max(1, len(visible_indexes))
+            if delta == 0:
+                direction = self._last_preload_direction
+            elif abs(delta) <= normal_step:
+                direction = 1 if delta > 0 else -1
+            else:
+                direction = 0
+        self._last_preload_source = source
+        self._last_preload_generation = generation
+        self._last_preload_center = center_index
+        self._last_preload_direction = direction
+        return direction
+
+    def _display_units_from(
+        self,
+        center_index: int,
+        step: int,
+        count: int,
+    ) -> tuple[tuple[int, ...], ...]:
+        units: list[tuple[int, ...]] = []
+        start = self.model.spread_start_for_index(center_index)
+        for _ in range(max(0, count)):
+            next_start = (
+                self.model.next_index_from(start)
+                if step > 0
+                else self.model.previous_index_from(start)
+            )
+            if next_start == start:
+                break
+            units.append(
+                tuple(
+                    slot.page_index
+                    for slot in self.model.spread_at(next_start).slots
+                )
+            )
+            start = next_start
+        return tuple(units)
+
+    def _configured_prefetch_indexes(
+        self,
+        center_index: int,
+        visible_indexes: tuple[int, ...],
+        *,
+        forward_units: int,
+        backward_units: int,
+        direction: int,
+    ) -> tuple[int, ...]:
+        if self.prefetch_direction_priority_enabled and direction < 0:
+            forward_step, backward_step = -1, 1
+        else:
+            forward_step, backward_step = 1, -1
+        forward = self._display_units_from(
+            center_index,
+            forward_step,
+            forward_units,
+        )
+        backward = self._display_units_from(
+            center_index,
+            backward_step,
+            backward_units,
+        )
+        units = list(forward + backward)
+        if not self.prefetch_direction_priority_enabled or direction == 0:
+            units.sort(
+                key=lambda unit: min(
+                    abs(index - center_index) for index in unit
+                )
+            )
+        visible = set(visible_indexes)
+        indexes: list[int] = []
+        for unit in units:
+            for index in unit:
+                if index not in visible and index not in indexes:
+                    indexes.append(index)
+        return tuple(indexes)
+
+    def _preload_image_source(
+        self,
+        center_index: int,
+        visible_indexes: tuple[int, ...],
+        *,
+        immediate_only: bool = False,
+    ) -> None:
+        direction = self._navigation_prefetch_direction(
+            center_index,
+            visible_indexes,
+        )
+        prefetch_indexes = (
+            tuple()
+            if immediate_only
+            else self._configured_prefetch_indexes(
+                center_index,
+                visible_indexes,
+                forward_units=self.image_prefetch_forward_units,
+                backward_units=self.image_prefetch_backward_units,
+                direction=direction,
+            )
+        )
+        self.image_cache.preload_around(
+            center_index,
+            radius=0,
+            visible_indexes=visible_indexes,
+            preferred_direction=(
+                direction
+                if self.prefetch_direction_priority_enabled
+                else 0
+            ),
+            prefetch_indexes=prefetch_indexes,
+        )
 
     def _next_pdf_rolling_indexes(
         self,
@@ -1942,6 +2110,11 @@ class ViewerWindow(QMainWindow):
         direction: int,
         visible_indexes: tuple[int, ...],
     ) -> tuple[int, ...]:
+        if (
+            not self.prefetch_direction_priority_enabled
+            or self.pdf_prefetch_forward_units <= 0
+        ):
+            return tuple()
         if direction > 0:
             target_start = self.model.next_index_from(center_index)
         elif direction < 0:
@@ -1971,6 +2144,10 @@ class ViewerWindow(QMainWindow):
     def _arm_deferred_pdf_prefetch(self) -> None:
         if (
             self._shutdown_prepared
+            or (
+                self.pdf_prefetch_forward_units <= 0
+                and self.pdf_prefetch_backward_units <= 0
+            )
             or self._pdf_prefetch_timer.isActive()
             or self.image_cache.source is not self._pdf_prefetch_source
             or self.image_cache.generation != self._pdf_prefetch_generation
@@ -1979,6 +2156,14 @@ class ViewerWindow(QMainWindow):
         if any(
             self.image_cache.get(index) is None
             for index in self._pdf_prefetch_visible_indexes
+        ):
+            return
+        if not self._configured_prefetch_indexes(
+            self._pdf_prefetch_center,
+            self._pdf_prefetch_visible_indexes,
+            forward_units=self.pdf_prefetch_forward_units,
+            backward_units=self.pdf_prefetch_backward_units,
+            direction=self._pdf_prefetch_direction,
         ):
             return
         self._pdf_prefetch_timer.start()
@@ -1997,9 +2182,20 @@ class ViewerWindow(QMainWindow):
             return
         self.image_cache.preload_around(
             center_index,
-            radius=PRELOAD_RADIUS,
+            radius=0,
             visible_indexes=self._pdf_prefetch_visible_indexes,
-            preferred_direction=self._pdf_prefetch_direction,
+            preferred_direction=(
+                self._pdf_prefetch_direction
+                if self.prefetch_direction_priority_enabled
+                else 0
+            ),
+            prefetch_indexes=self._configured_prefetch_indexes(
+                center_index,
+                self._pdf_prefetch_visible_indexes,
+                forward_units=self.pdf_prefetch_forward_units,
+                backward_units=self.pdf_prefetch_backward_units,
+                direction=self._pdf_prefetch_direction,
+            ),
         )
 
     def _cancel_deferred_pdf_prefetch(self) -> None:
@@ -2008,7 +2204,6 @@ class ViewerWindow(QMainWindow):
         self._pdf_prefetch_generation = -1
         self._pdf_prefetch_visible_indexes = tuple()
         self._pdf_prefetch_direction = 0
-        self._last_pdf_prefetch_center = None
 
     def _render_spread(self, spread, request_id: int) -> None:
         if request_id != self._active_request_id:
@@ -2183,10 +2378,9 @@ class ViewerWindow(QMainWindow):
                     self._visible_page_indexes,
                 )
             else:
-                self.image_cache.preload_around(
+                self._preload_image_source(
                     self.model.focused_index,
-                    radius=PRELOAD_RADIUS,
-                    visible_indexes=self._visible_page_indexes,
+                    self._visible_page_indexes,
                 )
         if cached.page_index in self._visible_page_indexes:
             self._arm_deferred_pdf_prefetch()
@@ -2231,10 +2425,9 @@ class ViewerWindow(QMainWindow):
         if isinstance(self.image_cache.source, PdfImageSource):
             self._arm_deferred_pdf_prefetch()
         else:
-            self.image_cache.preload_around(
+            self._preload_image_source(
                 self.model.focused_index,
-                radius=PRELOAD_RADIUS,
-                visible_indexes=self._visible_page_indexes,
+                self._visible_page_indexes,
             )
         self.first_frame_ready.emit(self)
 
@@ -2635,12 +2828,27 @@ class ViewerWindow(QMainWindow):
         )
         dpr = max(1.0, float(self.viewer.devicePixelRatioF()))
         specs: dict[int, PageRenderSpec] = {}
-        first = max(0, self.model.current_index - PRELOAD_RADIUS)
-        last = min(
-            self.model.total_pages,
-            self.model.current_index + PRELOAD_RADIUS + 2,
+        span_units = max(
+            self.pdf_prefetch_forward_units,
+            self.pdf_prefetch_backward_units,
         )
-        for page_index in range(first, last):
+        spec_indexes = {
+            slot.page_index for slot in spread.slots
+        }
+        for unit in (
+            self._display_units_from(
+                self.model.current_index,
+                1,
+                span_units,
+            )
+            + self._display_units_from(
+                self.model.current_index,
+                -1,
+                span_units,
+            )
+        ):
+            spec_indexes.update(unit)
+        for page_index in sorted(spec_indexes):
             width, height = self.model.get_image_size(page_index) or (360, 520)
             if self.rotation_angle in {90, 270}:
                 width, height = height, width
