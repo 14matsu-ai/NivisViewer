@@ -493,7 +493,6 @@ class ImageCache(QObject):
             for index in rolling_indexes
             if 0 <= index < len(self.image_ids)
         )
-        self._wanted_indexes = wanted
         self._protected_indexes = set(visible_indexes)
         self._center_index = center_index
         self._preferred_direction = max(
@@ -501,30 +500,25 @@ class ImageCache(QObject):
             min(1, int(preferred_direction)),
         )
         self._configured_prefetch_order = prefetch_indexes is not None
-        for (generation, index), source in tuple(self._in_flight.items()):
-            if generation == self.generation and index not in wanted:
-                cancel = getattr(source, "cancel_image_request", None)
-                if callable(cancel) and 0 <= index < len(self.image_ids):
-                    cancel(self.image_ids[index])
-                task_entry = self._tasks.get((generation, index))
-                if task_entry is not None:
-                    task, _priority = task_entry
-                    if self._try_take_task(task):
-                        self._tasks.pop((generation, index), None)
-                        self._in_flight.pop((generation, index), None)
-                    elif callable(cancel):
-                        # The same index can become wanted again before a
-                        # running archive/PDF request reports cancellation.
-                        self._cancel_requested_tasks.add(
-                            (generation, index)
-                        )
+        self._wanted_indexes = self._limit_wanted_to_capacity(wanted)
+        self._cancel_unwanted_in_flight()
 
         self.ensure_loaded(center_index)
+        limited_after_current = self._limit_wanted_to_capacity(
+            self._wanted_indexes
+        )
+        if limited_after_current != self._wanted_indexes:
+            self._wanted_indexes = limited_after_current
+            self._cancel_unwanted_in_flight()
         for index in visible_indexes:
-            if index != center_index:
+            if index != center_index and index in self._wanted_indexes:
                 self.ensure_loaded(index)
         for index in rolling_indexes:
-            if index != center_index and index not in self._protected_indexes:
+            if (
+                index != center_index
+                and index not in self._protected_indexes
+                and index in self._wanted_indexes
+            ):
                 self.ensure_loaded(index)
         ordered_candidates: tuple[int, ...] | list[int] = candidates
         if (
@@ -536,9 +530,58 @@ class ImageCache(QObject):
                 key=self._pdf_prefetch_rank,
             )
         for index in ordered_candidates:
-            self.ensure_loaded(index)
+            if index in self._wanted_indexes:
+                self.ensure_loaded(index)
 
         self._enforce_limit()
+
+    def _limit_wanted_to_capacity(self, wanted: set[int]) -> set[int]:
+        known_costs = [
+            byte_cost
+            for byte_cost in self._cache_entry_bytes.values()
+            if byte_cost > 0
+        ]
+        if not known_costs:
+            return set(wanted)
+        entry_capacity = max(
+            1,
+            min(
+                self.cache_size,
+                self._cache_byte_budget // max(known_costs),
+            ),
+        )
+        required = {
+            index
+            for index in self._protected_indexes | {self._center_index}
+            if 0 <= index < len(self.image_ids)
+        }
+        entry_capacity = max(entry_capacity, len(required))
+        optional = sorted(
+            wanted - required,
+            key=self._pdf_prefetch_rank,
+        )
+        return required | set(
+            optional[: max(0, entry_capacity - len(required))]
+        )
+
+    def _cancel_unwanted_in_flight(self) -> None:
+        for (generation, index), source in tuple(self._in_flight.items()):
+            if generation != self.generation or index in self._wanted_indexes:
+                continue
+            cancel = getattr(source, "cancel_image_request", None)
+            if callable(cancel) and 0 <= index < len(self.image_ids):
+                cancel(self.image_ids[index])
+            task_entry = self._tasks.get((generation, index))
+            if task_entry is None:
+                continue
+            task, _priority = task_entry
+            if self._try_take_task(task):
+                self._tasks.pop((generation, index), None)
+                self._in_flight.pop((generation, index), None)
+            elif callable(cancel):
+                # The same index can become wanted again before a running
+                # archive/PDF request reports cancellation.
+                self._cancel_requested_tasks.add((generation, index))
 
     def ensure_loaded(self, page_index: int) -> None:
         if self.source is None or not (0 <= page_index < len(self.image_ids)):
@@ -674,6 +717,12 @@ class ImageCache(QObject):
             return
 
         self._store_cached(cached)
+        limited_wanted = self._limit_wanted_to_capacity(
+            self._wanted_indexes
+        )
+        if limited_wanted != self._wanted_indexes:
+            self._wanted_indexes = limited_wanted
+            self._cancel_unwanted_in_flight()
         performance_trace.mark(
             self._trace_id,
             "image_cache.stored",
@@ -698,15 +747,26 @@ class ImageCache(QObject):
             self._evict_cached(candidate)
 
     def _oldest_evictable_index(self) -> int | None:
-        for index in self._cache:
+        candidates = [
+            index
+            for index in self._cache
             if (
                 index != self._center_index
                 and index not in self._protected_indexes
-            ):
-                return index
-        for index in self._cache:
-            if index != self._center_index:
-                return index
+            )
+        ]
+        if candidates:
+            if not self._wanted_indexes:
+                return candidates[0]
+            for index in candidates:
+                if index not in self._wanted_indexes:
+                    return index
+            # Configured prefetch is submitted from nearest to farthest.  A
+            # byte-constrained cache must retain that priority instead of
+            # letting later, distant completions evict the next display unit.
+            return max(candidates, key=self._pdf_prefetch_rank)
+        # Every remaining entry belongs to the current display unit.  Keep the
+        # unit complete even when one unusually large spread exceeds budget.
         return None
 
     def _store_cached(self, cached: CachedImage) -> None:

@@ -21,7 +21,12 @@ from app.browser_model import BrowserItem, BrowserItemKind, BrowserItemModel
 from app.browser_sort import BrowserDisplayDensity
 from app.browser_thumbnail_scheduler import ThumbnailPriority
 from app.config_manager import ConfigManager
-from app.image_cache import CachedImage, ImageCache, _ImageLoadResult
+from app.image_cache import (
+    CachedImage,
+    ImageCache,
+    _ImageLoadResult,
+    _ImageLoadTask,
+)
 from app.image_source import (
     FolderListingSnapshot,
     ImageSource,
@@ -401,6 +406,49 @@ def _cached_qimage(
     )
 
 
+def _cached_image_with_byte_cost(
+    index: int,
+    byte_cost: int,
+    *,
+    generation: int = 0,
+) -> CachedImage:
+    qimage = Mock()
+    qimage.isNull.return_value = False
+    qimage.sizeInBytes.return_value = byte_cost
+    return CachedImage(
+        page_index=index,
+        image_id=f"page{index}.jpg",
+        qimage=qimage,
+        original_size=(1, 1),
+        error=None,
+        generation=generation,
+        rendered_size=(1, 1),
+    )
+
+
+def _install_synchronous_cache_loader(
+    cache: ImageCache,
+    byte_cost: int,
+) -> dict[int, int]:
+    decode_counts: dict[int, int] = {}
+
+    def ensure_loaded(index: int) -> None:
+        if index in cache._cache:
+            return
+        decode_counts[index] = decode_counts.get(index, 0) + 1
+        cache._store_cached(
+            _cached_image_with_byte_cost(
+                index,
+                byte_cost,
+                generation=cache.generation,
+            )
+        )
+        cache._enforce_limit()
+
+    cache.ensure_loaded = ensure_loaded  # type: ignore[method-assign]
+    return decode_counts
+
+
 def test_image_cache_tracks_qimage_bytes_on_hit_replacement_and_clear(qapp):
     cache = ImageCache(cache_size=10)
     cache._cache_byte_budget = 512 * 1024 * 1024
@@ -420,6 +468,196 @@ def test_image_cache_tracks_qimage_bytes_on_hit_replacement_and_clear(qapp):
     assert cache._cache == {}
     assert cache._cache_entry_bytes == {}
     assert cache._cache_bytes == 0
+
+
+@pytest.mark.parametrize(
+    ("image_format", "width", "height"),
+    (
+        (QImage.Format.Format_RGB888, 601, 800),
+        (QImage.Format.Format_RGB32, 601, 800),
+        (QImage.Format.Format_RGBA8888, 601, 800),
+    ),
+)
+def test_image_cache_byte_estimate_uses_qimage_stride(
+    qapp,
+    image_format,
+    width,
+    height,
+):
+    image = QImage(width, height, image_format)
+    cached = CachedImage(
+        page_index=0,
+        image_id="stride.png",
+        qimage=image,
+        original_size=(width, height),
+        error=None,
+        generation=0,
+    )
+
+    assert ImageCache._estimate_cached_bytes(cached) == (
+        image.bytesPerLine() * image.height()
+    )
+    assert ImageCache._estimate_cached_bytes(cached) == image.sizeInBytes()
+
+
+@pytest.mark.parametrize(
+    ("budget_mib", "byte_cost", "expected_entries"),
+    (
+        (128, 600 * 800 * 4, 10),
+        (128, 2400 * 3200 * 4, 4),
+        (128, 4000 * 6000 * 4, 1),
+        (256, 600 * 800 * 4, 10),
+        (256, 2400 * 3200 * 4, 8),
+        (256, 4000 * 6000 * 4, 2),
+        (512, 600 * 800 * 4, 10),
+        (512, 2400 * 3200 * 4, 10),
+        (512, 4000 * 6000 * 4, 5),
+    ),
+)
+def test_image_cache_presets_bound_large_image_retention(
+    qapp,
+    budget_mib,
+    byte_cost,
+    expected_entries,
+):
+    cache = ImageCache(cache_size=10)
+    cache._cache_byte_budget = budget_mib * 1024 * 1024
+    cache._center_index = 9
+    for index in range(10):
+        cache._store_cached(_cached_image_with_byte_cost(index, byte_cost))
+        cache._enforce_limit()
+
+    assert len(cache._cache) == expected_entries
+    assert cache._center_index in cache._cache
+    assert cache._cache_bytes == expected_entries * byte_cost
+
+
+def test_large_single_prefetch_retains_next_page_across_navigation(qapp):
+    cache = ImageCache(cache_size=10)
+    cache._cache_byte_budget = 256 * 1024 * 1024
+    source = Mock()
+    source.supports_target_rendering = False
+    image_ids = [f"page{index}.jpg" for index in range(12)]
+    cache.set_source(source, image_ids)
+    decode_counts = _install_synchronous_cache_loader(
+        cache,
+        4000 * 6000 * 4,
+    )
+
+    def navigate(
+        center: int,
+        direction: int,
+        prefetch: tuple[int, ...],
+    ) -> bool:
+        before = decode_counts.get(center, 0)
+        cache.preload_around(
+            center,
+            radius=0,
+            visible_indexes=(center,),
+            preferred_direction=direction,
+            prefetch_indexes=prefetch,
+        )
+        return decode_counts.get(center, 0) == before
+
+    assert not navigate(0, 0, (1, 2, 3))
+    assert tuple(cache._cache) == (0, 1)
+    assert navigate(1, 1, (2, 3, 4, 0))
+    assert navigate(2, 1, (3, 4, 5, 1, 0))
+    assert navigate(3, 1, (4, 5, 6, 2, 1, 0))
+    assert navigate(4, 1, (5, 6, 7, 3, 2, 1))
+    assert not navigate(3, -1, (2, 1, 0, 4, 5, 6))
+    assert navigate(2, -1, (1, 0, 3, 4, 5))
+    assert not navigate(3, 1, (4, 5, 6, 2, 1, 0))
+    assert navigate(4, 1, (5, 6, 7, 3, 2, 1))
+    assert decode_counts == {
+        0: 1,
+        1: 2,
+        2: 2,
+        3: 3,
+        4: 2,
+        5: 2,
+    }
+
+
+def test_large_spread_protects_current_pair_and_nearest_prefetch(qapp):
+    cache = ImageCache(cache_size=10)
+    cache._cache_byte_budget = 256 * 1024 * 1024
+    source = Mock()
+    source.supports_target_rendering = False
+    image_ids = [f"page{index}.jpg" for index in range(12)]
+    cache.set_source(source, image_ids)
+    _install_synchronous_cache_loader(cache, 4000 * 6000 * 3)
+
+    cache.preload_around(
+        0,
+        radius=0,
+        visible_indexes=(0, 1),
+        preferred_direction=1,
+        prefetch_indexes=(2, 3, 4, 5),
+    )
+
+    assert set(cache._cache) == {0, 1, 2}
+    assert cache._cache_bytes == 3 * 4000 * 6000 * 3
+
+
+def test_first_large_result_removes_distant_queued_prefetch(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    class LargeCostSource(ImageSource):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.ids = [f"page{index}.jpg" for index in range(8)]
+            self.started: list[str] = []
+            self.second_started = Event()
+            self.release_second = Event()
+
+        def list_images(self) -> list[str]:
+            return list(self.ids)
+
+        def open_image(self, image_id: str) -> Image.Image:
+            self.started.append(image_id)
+            if image_id == "page1.jpg":
+                self.second_started.set()
+                assert self.release_second.wait(2)
+            return Image.new("RGB", (1, 1), "white")
+
+        def display_path(self, image_id: str) -> str:
+            return image_id
+
+    def large_cost_qimage(_image):
+        qimage = Mock()
+        qimage.isNull.return_value = False
+        qimage.sizeInBytes.return_value = 4000 * 6000 * 4
+        return qimage
+
+    monkeypatch.setattr(
+        _ImageLoadTask,
+        "_pil_to_qimage",
+        staticmethod(large_cost_qimage),
+    )
+    source = LargeCostSource(tmp_path)
+    cache = ImageCache(cache_size=10)
+    cache._cache_byte_budget = 256 * 1024 * 1024
+    cache.set_source(source, source.ids)
+
+    cache.preload_around(
+        0,
+        radius=0,
+        visible_indexes=(0,),
+        preferred_direction=1,
+        prefetch_indexes=(1, 2, 3, 4, 5, 6),
+    )
+
+    try:
+        assert source.second_started.wait(1)
+        qapp.processEvents()
+    finally:
+        source.release_second.set()
+    assert _drain_events(qapp, lambda: not cache._tasks and not cache._in_flight)
+    assert source.started == ["page0.jpg", "page1.jpg"]
+    assert tuple(cache._cache) == (0, 1)
 
 
 def test_image_cache_enforces_count_and_byte_lru_limits(qapp):
@@ -504,13 +742,13 @@ def test_image_cache_byte_limit_prefers_current_and_spread_partner(qapp):
 
     cache._cache_byte_budget = one_mebibyte
     cache._enforce_limit()
-    assert tuple(cache._cache) == (2,)
-    assert cache._cache_bytes == one_mebibyte
+    assert tuple(cache._cache) == (2, 3)
+    assert cache._cache_bytes == 2 * one_mebibyte
 
     cache._cache_byte_budget = one_mebibyte // 2
     cache._enforce_limit()
-    assert tuple(cache._cache) == (2,)
-    assert cache._cache_bytes == one_mebibyte
+    assert tuple(cache._cache) == (2, 3)
+    assert cache._cache_bytes == 2 * one_mebibyte
 
 
 def test_image_cache_live_memory_budget_shrinks_with_lru_and_expands_in_place(
