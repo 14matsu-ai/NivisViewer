@@ -186,6 +186,7 @@ class SettingsDialog(QDialog):
         self._probe_pool = QThreadPool(self)
         self._probe_pool.setMaxThreadCount(2)
         self._probes_closed = False
+        self._delete_scheduled = False
         self._probe_generation = 0
         self._probe_workers: dict[int, _SevenZipProbeWorker] = {}
         self._pending_explicit_path: str | None = None
@@ -1579,10 +1580,30 @@ class SettingsDialog(QDialog):
             return
         if self._probe_workers_idle():
             _RETIRED_SETTINGS_DIALOGS.discard(self)
-            self.deleteLater()
+            if not self._delete_scheduled:
+                self._delete_scheduled = True
+                self.deleteLater()
             return
         self.setParent(None)
         _RETIRED_SETTINGS_DIALOGS.add(self)
+
+    def _prepare_application_shutdown(self, *, wait_msecs: int) -> bool:
+        if not self._probes_closed:
+            self.reject()
+        try:
+            pool_done = self._probe_pool.waitForDone(max(0, int(wait_msecs)))
+        except RuntimeError:
+            pool_done = self._probe_workers_idle()
+        if not pool_done:
+            return False
+        for workers in (
+            self._probe_workers,
+            self._winrar_probe_workers,
+            self._ffmpeg_probe_workers,
+        ):
+            workers.clear()
+        self._delete_when_probes_finish()
+        return self._probe_workers_idle()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._close_probe_workers()
@@ -1608,6 +1629,8 @@ class SettingsDialog(QDialog):
             self.redetect_ffmpeg()
 
     def browse_ffmpeg(self) -> None:
+        if self._probes_closed:
+            return
         start = self.ffmpeg_path_edit.text().strip()
         path, _selected_filter = QFileDialog.getOpenFileName(
             self,
@@ -1655,6 +1678,8 @@ class SettingsDialog(QDialog):
             self.ffmpeg_status_label.setText(f"FFmpeg：検出済み\n{executable}")
 
     def browse_winrar(self) -> None:
+        if self._probes_closed:
+            return
         start = self.winrar_path_edit.text().strip()
         path, _selected_filter = QFileDialog.getOpenFileName(
             self,
@@ -1745,6 +1770,8 @@ class SettingsDialog(QDialog):
             self.accept()
 
     def browse_seven_zip(self) -> None:
+        if self._probes_closed:
+            return
         start = self.seven_zip_path_edit.text().strip()
         path, _selected_filter = QFileDialog.getOpenFileName(
             self,

@@ -7,7 +7,7 @@ from unittest.mock import Mock
 from PIL import Image
 from PySide6.QtCore import QCoreApplication, QEvent
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QApplication, QDialog, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QWidget
 
 from app.browser_model import BrowserItem, BrowserItemKind
 from app.config_manager import ConfigManager
@@ -475,4 +475,82 @@ def test_probe_exceptions_finish_and_clear_all_tracking(
     assert "見つかりません" in dialog.ffmpeg_status_label.text()
 
     dialog.reject()
+    flush_deferred_deletes(qapp)
+
+
+def test_application_shutdown_waits_for_running_probe_and_finalizes_tracking(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    started = Event()
+    release = Event()
+
+    class BlockingLocator:
+        def locate(self, path: str, *, force: bool) -> SevenZipInfo:
+            started.set()
+            assert release.wait(5.0)
+            return SevenZipInfo(path, True, "ready", None)
+
+    dialog = SettingsDialog(
+        make_config(tmp_path),
+        seven_zip_locator=BlockingLocator(),  # type: ignore[arg-type]
+    )
+    dialog._start_seven_zip_probe("running.exe")
+    assert started.wait(2.0)
+    tracking = dialog._probe_workers
+    original_delete_later = dialog.deleteLater
+    delete_later = Mock()
+    dialog.deleteLater = delete_later
+
+    assert not dialog._prepare_application_shutdown(wait_msecs=0)
+    assert dialog._probes_closed
+    assert len(tracking) == 1
+    assert dialog in _RETIRED_SETTINGS_DIALOGS
+    assert not dialog._delete_scheduled
+
+    assert not dialog._prepare_application_shutdown(wait_msecs=0)
+    assert len(tracking) == 1
+    assert dialog in _RETIRED_SETTINGS_DIALOGS
+    delete_later.assert_not_called()
+
+    release.set()
+    assert dialog._probe_pool.waitForDone(2000)
+    assert dialog._prepare_application_shutdown(wait_msecs=0)
+    assert tracking == {}
+    assert dialog not in _RETIRED_SETTINGS_DIALOGS
+    delete_later.assert_called_once_with()
+
+    qapp.processEvents()
+    assert tracking == {}
+    delete_later.assert_called_once_with()
+
+    dialog.deleteLater = original_delete_later
+    original_delete_later()
+    flush_deferred_deletes(qapp)
+
+
+def test_shutdown_preparation_blocks_new_probes_and_file_pickers(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    dialog = SettingsDialog(make_config(tmp_path))
+    picker = Mock(return_value=("", ""))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", picker)
+
+    dialog.browse_ffmpeg()
+    assert picker.call_count == 1
+    assert dialog._prepare_application_shutdown(wait_msecs=0)
+
+    dialog.browse_ffmpeg()
+    dialog.browse_winrar()
+    dialog.browse_seven_zip()
+    dialog._start_seven_zip_probe("late.exe")
+    dialog._start_winrar_probe("late.exe")
+    dialog.redetect_ffmpeg()
+
+    assert picker.call_count == 1
+    assert dialog._probe_workers == {}
+    assert dialog._winrar_probe_workers == {}
+    assert dialog._ffmpeg_probe_workers == {}
     flush_deferred_deletes(qapp)

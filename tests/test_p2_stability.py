@@ -12,6 +12,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
+import app.application_controller as application_controller_module
 from app.application_controller import ApplicationController
 from app.application_shutdown import (
     ApplicationShutdownCoordinator,
@@ -901,6 +902,153 @@ def test_controller_shutdown_retries_image_step_and_defers_application_quit(
     assert original_image_coordinator.shutdown()
     assert original_pdfium_shutdown()
     original_metadata_close()
+
+
+def test_settings_probe_shutdown_uses_one_deadline_and_deduplicates_dialogs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeDialog:
+        def __init__(self, result: bool) -> None:
+            self.result = result
+            self.waits: list[int] = []
+
+        def _prepare_application_shutdown(self, *, wait_msecs: int) -> bool:
+            self.waits.append(wait_msecs)
+            return self.result
+
+    first = FakeDialog(False)
+    second = FakeDialog(True)
+    browser = SimpleNamespace(
+        findChildren=lambda _dialog_type: [first, second, first]
+    )
+    owner = SimpleNamespace(
+        _settings_probe_shutdown_timeout_msecs=250,
+        get_browser_window=lambda: browser,
+    )
+    times = iter((10.0, 10.0, 10.2))
+    monkeypatch.setattr(
+        application_controller_module,
+        "monotonic",
+        lambda: next(times),
+    )
+    application_controller_module._RETIRED_SETTINGS_DIALOGS.add(first)
+    try:
+        assert not ApplicationController._shutdown_settings_probes(owner)
+    finally:
+        application_controller_module._RETIRED_SETTINGS_DIALOGS.discard(first)
+
+    assert first.waits == [250]
+    assert len(second.waits) == 1
+    assert 0 <= second.waits[0] <= 50
+
+
+def test_controller_retries_settings_step_before_shutting_down_backends(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = ApplicationController(
+        qapp,
+        config_manager=ConfigManager(tmp_path / "config.json"),
+    )
+    order: list[str] = []
+    settings_ready = False
+
+    def tracked(name: str, callback):
+        def run():
+            order.append(name)
+            return callback()
+
+        return run
+
+    def settings_shutdown() -> bool:
+        order.append("settings")
+        return settings_ready
+
+    monkeypatch.setattr(
+        controller,
+        "_prepare_viewers_for_shutdown",
+        lambda: order.append("viewers"),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_prepare_browser_for_shutdown",
+        lambda: order.append("browser"),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_shutdown_settings_probes",
+        settings_shutdown,
+    )
+    monkeypatch.setattr(
+        controller.archive_backend_registry,
+        "close",
+        tracked("archive", controller.archive_backend_registry.close),
+    )
+    monkeypatch.setattr(
+        controller.adjacent_book_search,
+        "close",
+        tracked("adjacent", controller.adjacent_book_search.close),
+    )
+    monkeypatch.setattr(
+        controller.path_availability_service,
+        "close",
+        tracked("path", controller.path_availability_service.close),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_shutdown_pdfium_service",
+        tracked("pdfium", controller._shutdown_pdfium_service),
+    )
+    monkeypatch.setattr(
+        controller.image_work_coordinator,
+        "shutdown",
+        tracked("image", controller.image_work_coordinator.shutdown),
+    )
+    monkeypatch.setattr(
+        controller.config,
+        "save",
+        tracked("config", controller.config.save),
+    )
+    monkeypatch.setattr(
+        controller.metadata_store,
+        "flush",
+        tracked("metadata_flush", controller.metadata_store.flush),
+    )
+    monkeypatch.setattr(
+        controller.metadata_store,
+        "close",
+        tracked("metadata_close", controller.metadata_store.close),
+    )
+
+    assert not controller.shutdown()
+    assert controller.shutdown_coordinator.failed_step_name == "settings_probes"
+    assert not controller._shutdown_complete
+    assert order == ["viewers", "browser", "settings"]
+
+    settings_ready = True
+    assert controller.shutdown()
+    assert controller._shutdown_complete
+    assert order == [
+        "viewers",
+        "browser",
+        "settings",
+        "settings",
+        "archive",
+        "adjacent",
+        "path",
+        "pdfium",
+        "image",
+        "config",
+        "metadata_flush",
+        "metadata_close",
+        "metadata_flush",
+    ]
+
+    assert controller.shutdown()
+    assert order.count("viewers") == 1
+    assert order.count("browser") == 1
+    assert order.count("settings") == 2
 
 
 def test_controller_rejects_new_viewer_after_shutdown(

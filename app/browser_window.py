@@ -2706,6 +2706,11 @@ class BrowserWindow(QMainWindow):
         self.list_view.viewport().update()
 
     def open_settings_dialog(self) -> None:
+        shutdown_guard = getattr(self, "_settings_dialog_open_guard", None)
+        if self._shutdown_prepared or (
+            callable(shutdown_guard) and not shutdown_guard()
+        ):
+            return
         dialog = SettingsDialog(
             self.config,
             self,
