@@ -544,18 +544,27 @@ def test_continuous_pdf_navigation_defers_far_prefetch_until_idle(
     )
     try:
         window._pdf_prefetch_timer.stop()
-        assert [request.page_index for request in backend.rendered] == [0]
+        assert [request.page_index for request in backend.rendered] == [0, 1]
 
         for target in range(1, 6):
+            assert window.image_cache.get(target) is not None
             window.model.go_to_index(target)
             window._refresh_view()
             assert window.image_cache.wait_for_done(5000)
             qapp.processEvents()
             window._pdf_prefetch_timer.stop()
             assert [request.page_index for request in backend.rendered] == list(
-                range(target + 1)
+                range(target + 2)
             )
 
+        assert sum(
+            request.priority == PdfRenderPriority.VIEWER_CURRENT
+            for request in backend.rendered
+        ) == 1
+        assert sum(
+            request.priority >= PdfRenderPriority.VIEWER_NEXT
+            for request in backend.rendered
+        ) == 6
         before_idle = len(backend.rendered)
         window._start_deferred_pdf_prefetch()
         assert window.image_cache.wait_for_done(5000)
@@ -563,7 +572,7 @@ def test_continuous_pdf_navigation_defers_far_prefetch_until_idle(
 
         assert [
             request.page_index for request in backend.rendered[before_idle:]
-        ] == [6, 7, 8]
+        ] == [7, 8]
         backend.rendered.clear()
         window.model.go_to_index(6)
         window._refresh_view()
@@ -580,17 +589,57 @@ def test_continuous_pdf_navigation_defers_far_prefetch_until_idle(
         )
 
 
+def test_backward_pdf_navigation_rolls_previous_page_without_far_prefetch(
+    tmp_path,
+    qapp,
+):
+    window, session, service, backend = _open_many_page_pdf_window(
+        tmp_path,
+        qapp,
+        settings={"view_mode": "single", "cache_size": 10},
+        complete_prefetch=False,
+    )
+    try:
+        window._pdf_prefetch_timer.stop()
+        window.model.go_to_index(8)
+        window._refresh_view()
+        assert window.image_cache.wait_for_done(5000)
+        qapp.processEvents()
+        window._pdf_prefetch_timer.stop()
+        assert [
+            request.page_index for request in backend.rendered[-2:]
+        ] == [8, 9]
+
+        backend.rendered.clear()
+        window.model.go_to_index(7)
+        window._refresh_view()
+        assert window.image_cache.wait_for_done(5000)
+        qapp.processEvents()
+        window._pdf_prefetch_timer.stop()
+
+        assert [request.page_index for request in backend.rendered] == [7, 6]
+        assert backend.rendered[0].priority == PdfRenderPriority.VIEWER_CURRENT
+        assert backend.rendered[1].priority >= PdfRenderPriority.VIEWER_NEXT
+    finally:
+        _close_measured_pdf_window(
+            window,
+            session,
+            service,
+            qapp,
+        )
+
+
 @pytest.mark.parametrize(
     ("settings", "immediate_pages"),
     (
-        ({"view_mode": "single"}, [0]),
+        ({"view_mode": "single"}, [0, 1]),
         (
             {
                 "view_mode": "spread",
                 "single_first_page": False,
                 "reading_direction": "ltr",
             },
-            [0, 1],
+            [0, 1, 2, 3],
         ),
     ),
 )
@@ -610,6 +659,19 @@ def test_pdf_idle_timer_eventually_completes_default_prefetch(
         assert [
             request.page_index for request in backend.rendered
         ] == immediate_pages
+        assert backend.rendered[0].priority == PdfRenderPriority.VIEWER_CURRENT
+        visible_count = 1
+        if settings["view_mode"] == "spread":
+            assert (
+                backend.rendered[1].priority
+                == PdfRenderPriority.VIEWER_SPREAD_PARTNER
+            )
+            visible_count = 2
+        assert all(
+            request.priority >= PdfRenderPriority.VIEWER_NEXT
+            for request in backend.rendered[visible_count:]
+        )
+        before_idle = len(backend.rendered)
         timeout = QSignalSpy(window._pdf_prefetch_timer.timeout)
         assert window._pdf_prefetch_timer.isActive()
         assert timeout.wait(1000)
@@ -622,6 +684,9 @@ def test_pdf_idle_timer_eventually_completes_default_prefetch(
             2,
             3,
         ]
+        assert len(backend.rendered) - before_idle == (
+            2 if settings["view_mode"] == "single" else 0
+        )
     finally:
         _close_measured_pdf_window(
             window,

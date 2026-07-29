@@ -1922,13 +1922,51 @@ class ViewerWindow(QMainWindow):
         self._pdf_prefetch_visible_indexes = tuple(visible_indexes)
         self._pdf_prefetch_direction = direction
         self._last_pdf_prefetch_center = center_index
+        rolling_indexes = self._next_pdf_rolling_indexes(
+            center_index,
+            direction,
+            visible_indexes,
+        )
         self.image_cache.preload_around(
             center_index,
             radius=0,
             visible_indexes=visible_indexes,
             preferred_direction=direction,
+            rolling_indexes=rolling_indexes,
         )
         self._arm_deferred_pdf_prefetch()
+
+    def _next_pdf_rolling_indexes(
+        self,
+        center_index: int,
+        direction: int,
+        visible_indexes: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        if direction > 0:
+            target_start = self.model.next_index_from(center_index)
+        elif direction < 0:
+            target_start = self.model.previous_index_from(center_index)
+        else:
+            candidates: list[tuple[int, int, int]] = []
+            next_start = self.model.next_index_from(center_index)
+            if next_start != center_index:
+                candidates.append((abs(next_start - center_index), 0, next_start))
+            previous_start = self.model.previous_index_from(center_index)
+            if previous_start != center_index:
+                candidates.append(
+                    (abs(previous_start - center_index), 1, previous_start)
+                )
+            if not candidates:
+                return tuple()
+            target_start = min(candidates)[2]
+        if target_start == center_index:
+            return tuple()
+        visible = set(visible_indexes)
+        return tuple(
+            slot.page_index
+            for slot in self.model.spread_at(target_start).slots
+            if slot.page_index not in visible
+        )
 
     def _arm_deferred_pdf_prefetch(self) -> None:
         if (
