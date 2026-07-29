@@ -156,6 +156,7 @@ class ViewerWindow(QMainWindow):
         self._adjacent_book_handler = adjacent_book_handler
         self._shutdown_prepared = False
         self._active_request_id = 0
+        self._reload_page_index: int | None = None
         self._applied_display_request_id = 0
         self._visible_page_indexes: tuple[int, ...] = tuple()
         self._display_unit = ViewerDisplayUnit.empty()
@@ -1042,7 +1043,10 @@ class ViewerWindow(QMainWindow):
         path: str | Path,
         *,
         folder_snapshot: FolderListingSnapshot | None = None,
+        preserve_current_page: bool = False,
     ) -> bool:
+        if not preserve_current_page:
+            self._reload_page_index = None
         self.viewer.cancel_pending_canvas_click()
         self._active_open_trace_id = (
             self._next_open_trace_id
@@ -1101,14 +1105,40 @@ class ViewerWindow(QMainWindow):
             self.book_session.source,
             opened.source_path,
         )
-        if opened.selected_image is None:
-            self._restore_reading_position(self._metadata_book_path)
+        reload_page_index = self._reload_page_index
+        self._reload_page_index = None
+        configured_open_position = self._uses_configured_book_open_position(
+            opened
+        )
+        saved_page_index = (
+            self._saved_reading_position(self._metadata_book_path)
+            if configured_open_position
+            else None
+        )
+        if reload_page_index is not None:
+            self.model.go_to_index(
+                min(max(0, reload_page_index), self.model.total_pages - 1)
+            )
+        elif (
+            configured_open_position
+            and self._resumes_last_book_position()
+            and saved_page_index is not None
+        ):
+            self.model.go_to_index(saved_page_index)
 
         if self.metadata_store is not None:
             self.metadata_store.record_book_opened(
                 self._metadata_book_path,
                 item_type=self._metadata_book_item_type,
-                start_page_index=self.model.focused_index,
+                start_page_index=(
+                    saved_page_index
+                    if (
+                        configured_open_position
+                        and not self._resumes_last_book_position()
+                        and saved_page_index is not None
+                    )
+                    else self.model.focused_index
+                ),
                 total_pages=self.model.total_pages,
             )
 
@@ -1135,6 +1165,7 @@ class ViewerWindow(QMainWindow):
         self._finish_opened_book(opened, modal_on_empty=False)
 
     def _on_async_book_open_failed(self, failed: AsyncBookOpenFailed) -> None:
+        self._reload_page_index = None
         self._cancel_interactive_open()
         if self._shutdown_prepared or failed.cancelled:
             return
@@ -1143,25 +1174,34 @@ class ViewerWindow(QMainWindow):
             5000,
         )
 
-    def _restore_reading_position(self, book_key: str) -> None:
-        if not bool(self.settings.get("restore_last_reading_position", True)):
-            return
+    def _uses_configured_book_open_position(self, opened: BookOpened) -> bool:
+        return (
+            opened.selected_image is None
+            and self._metadata_book_item_type in {"folder", "archive", "pdf"}
+        )
+
+    def _resumes_last_book_position(self) -> bool:
+        return self.settings.get("book_open_position") == "resume_last"
+
+    def _saved_reading_position(self, book_key: str) -> int | None:
+        if self.model.total_pages <= 0:
+            return None
         if self.metadata_store is not None:
             progress = self.metadata_store.get_reading_progress(book_key)
             if progress is not None:
-                self.model.go_to_index(
-                    max(0, min(progress.page_index, self.model.total_pages - 1))
-                )
-                return
+                if progress.page_index < 0:
+                    return None
+                return min(progress.page_index, self.model.total_pages - 1)
         positions = self.settings.get("reading_positions", {})
         if not isinstance(positions, dict):
-            return
+            return None
         try:
             page_index = int(positions.get(book_key, 0))
         except (TypeError, ValueError):
-            return
-        if 0 <= page_index < self.model.total_pages:
-            self.model.go_to_index(page_index)
+            return None
+        if page_index < 0:
+            return None
+        return min(page_index, self.model.total_pages - 1)
 
     def _save_current_reading_position(self) -> None:
         if not self._current_book_key or self.model.total_pages <= 0:
@@ -1468,11 +1508,8 @@ class ViewerWindow(QMainWindow):
 
     def reload_current_book(self) -> None:
         if self._opened_path:
-            current_index = self.model.current_index
-            self.open_path(self._opened_path)
-            if self.model.total_pages > 0:
-                self.model.go_to_index(min(current_index, self.model.total_pages - 1))
-                self._refresh_view()
+            self._reload_page_index = self.model.focused_index
+            self.open_path(self._opened_path, preserve_current_page=True)
 
     def set_reopen_last_on_start(self, checked: bool) -> None:
         self.reopen_last_on_start = checked

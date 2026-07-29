@@ -203,6 +203,28 @@ def test_viewer_prefetch_presets_and_custom_controls(
     dialog.reject()
 
 
+def test_book_open_position_combo_defaults_and_applies_resume(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    config = make_config(tmp_path)
+    dialog = SettingsDialog(config)
+
+    assert [
+        dialog.book_open_position_combo.itemText(index)
+        for index in range(dialog.book_open_position_combo.count())
+    ] == ["常に先頭ページから開く", "前回閉じたページから再開"]
+    assert dialog.book_open_position_combo.currentData() == "first_page"
+
+    dialog.book_open_position_combo.setCurrentIndex(
+        dialog.book_open_position_combo.findData("resume_last")
+    )
+    changed = dialog.apply_settings()
+    assert changed["book_open_position"] == "resume_last"
+    assert config.get("book_open_position") == "resume_last"
+    dialog.reject()
+
+
 def test_custom_viewer_prefetch_applies_and_cancel_does_not_save(
     tmp_path: Path,
     qapp: QApplication,

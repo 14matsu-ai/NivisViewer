@@ -16,6 +16,7 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
     assert manager.data["loop_book_navigation"] is False
     assert manager.data["bring_viewer_to_front_on_open"] is True
     assert manager.data["restore_last_reading_position"] is True
+    assert manager.data["book_open_position"] == "first_page"
     assert manager.data["metadata_migration_v1_completed"] is False
     assert manager.metadata_database_path == tmp_path / "data" / "metadata.sqlite3"
     assert manager.data["last_browser_path"] == ""
@@ -63,6 +64,23 @@ def test_partial_config_is_merged_with_defaults(tmp_path: Path) -> None:
     assert loaded["reading_direction"] == ConfigManager.DEFAULTS["reading_direction"]
     assert loaded["cache_size"] == ConfigManager.DEFAULTS["cache_size"]
     assert loaded["viewer_prefetch_preset"] == "standard"
+    assert loaded["book_open_position"] == "first_page"
+
+
+@pytest.mark.parametrize("value", ["resume_last", "first_page"])
+def test_book_open_position_round_trips_and_unknown_values_fall_back(
+    tmp_path: Path,
+    value: str,
+) -> None:
+    path = tmp_path / "config.json"
+    manager = ConfigManager(path)
+    manager.load()
+    manager.apply({"book_open_position": value}, save=True)
+
+    assert ConfigManager(path).load()["book_open_position"] == value
+
+    path.write_text('{"book_open_position": "unknown"}', encoding="utf-8")
+    assert ConfigManager(path).load()["book_open_position"] == "first_page"
 
 
 @pytest.mark.parametrize(
