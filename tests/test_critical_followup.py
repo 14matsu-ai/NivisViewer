@@ -157,8 +157,16 @@ def _wait_for_viewer_terminal(
         if (
             not window.book_session._open_workers
             and window.viewer._images
+            and window._display_unit.slots
+            and window._applied_display_request_id
+            == window._display_unit.request_id
             and all(
-            not image.loading for image in window.viewer._images
+                slot.state
+                in {ViewerSlotState.READY, ViewerSlotState.FAILED}
+                for slot in window._display_unit.slots
+            )
+            and all(
+                not image.loading for image in window.viewer._images
             )
         ):
             return
@@ -490,6 +498,7 @@ def test_supported_file_stays_internal_and_explicit_external_open_is_available(
 def test_png_spreads_page_5_7_9_finish_both_slots(
     tmp_path: Path,
     qapp: QApplication,
+    request: pytest.FixtureRequest,
     reading_direction: str,
     single_first_page: bool,
 ) -> None:
@@ -506,6 +515,7 @@ def test_png_spreads_page_5_7_9_finish_both_slots(
         save=False,
     )
     window = ViewerWindow(config_manager=config)
+    request.addfinalizer(lambda: _close_viewer(window, qapp))
     window.show()
     qapp.processEvents()
     for page in (5, 7, 9):
@@ -518,18 +528,19 @@ def test_png_spreads_page_5_7_9_finish_both_slots(
             for slot in window._display_unit.slots
         )
         assert window.model.focused_index == page - 1
-    _close_viewer(window, qapp)
 
 
 def test_png_visible_and_prefetch_reopen_and_rapid_navigation_finish(
     tmp_path: Path,
     qapp: QApplication,
+    request: pytest.FixtureRequest,
 ) -> None:
     folder = tmp_path / "png"
     _make_png_pages(folder)
     config = ConfigManager(tmp_path / "viewer.json")
     config.load()
     window = ViewerWindow(config_manager=config)
+    request.addfinalizer(lambda: _close_viewer(window, qapp))
     window.show()
     qapp.processEvents()
     assert window.open_path(folder / "005.png")
@@ -545,18 +556,19 @@ def test_png_visible_and_prefetch_reopen_and_rapid_navigation_finish(
     window._refresh_view()
     _wait_for_viewer_terminal(window, qapp)
     assert all(not image.loading for image in window.viewer._images)
-    _close_viewer(window, qapp)
 
 
 def test_png_one_side_failure_ends_loading_and_partner_succeeds(
     tmp_path: Path,
     qapp: QApplication,
+    request: pytest.FixtureRequest,
 ) -> None:
     folder = tmp_path / "png"
     _make_png_pages(folder, corrupt_page=5)
     config = ConfigManager(tmp_path / "viewer.json")
     config.load()
     window = ViewerWindow(config_manager=config)
+    request.addfinalizer(lambda: _close_viewer(window, qapp))
     window.show()
     qapp.processEvents()
     assert window.open_path(folder / "005.png")
@@ -565,7 +577,6 @@ def test_png_one_side_failure_ends_loading_and_partner_succeeds(
     assert states[4] is ViewerSlotState.FAILED
     assert ViewerSlotState.READY in states.values()
     assert not window._awaiting_first_frame
-    _close_viewer(window, qapp)
 
 
 def test_display_unit_rejects_stale_generation_and_updates_one_slot_only() -> None:

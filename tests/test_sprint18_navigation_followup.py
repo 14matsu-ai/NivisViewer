@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import monotonic
 
 import pytest
 from PIL import Image
@@ -137,8 +138,31 @@ def _viewer_with_pages(
     qapp.processEvents()
     window.resize(640, 480)
     window.show()
-    qapp.processEvents()
+    _wait_for_applied_display(window, qapp)
     return window, pages
+
+
+def _wait_for_applied_display(
+    window: ViewerWindow,
+    qapp: QApplication,
+    *,
+    timeout: float = 3.0,
+) -> None:
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
+        qapp.processEvents()
+        if (
+            window.viewer._images
+            and window._display_unit.slots
+            and window._applied_display_request_id
+            == window._active_request_id
+            == window._display_unit.request_id
+        ):
+            return
+        QTest.qWait(5)
+    window.close()
+    qapp.processEvents()
+    pytest.fail("latest Viewer display unit was not applied")
 
 
 @pytest.mark.parametrize("direction", ["ltr", "rtl"])
@@ -1731,9 +1755,12 @@ def test_canvas_side_double_click_moves_twice_without_fullscreen(
 def test_canvas_gutter_double_click_toggles_fullscreen_without_page_move(
     tmp_path: Path,
     qapp,
+    request: pytest.FixtureRequest,
 ) -> None:
     window, _pages = _viewer_with_pages(tmp_path, qapp)
+    request.addfinalizer(lambda: (window.close(), qapp.processEvents()))
     window.next_page()
+    _wait_for_applied_display(window, qapp)
     before = window.model.focused_index
     layout = window.viewer._layout_for_current_images()
     left_rect, right_rect = sorted(layout.rects, key=lambda rect: rect.x())
@@ -1748,8 +1775,6 @@ def test_canvas_gutter_double_click_toggles_fullscreen_without_page_move(
 
     assert window.isFullScreen()
     assert window.model.focused_index == before
-    window.close()
-    qapp.processEvents()
 
 
 def test_canvas_disabled_side_double_click_keeps_fullscreen_contract(
@@ -1923,11 +1948,17 @@ def test_canvas_click_direction_reverses_immediately(
 def test_canvas_background_is_active_but_center_and_positive_gutter_are_not(
     tmp_path: Path,
     qapp,
+    request: pytest.FixtureRequest,
 ) -> None:
     old_interval = QApplication.doubleClickInterval()
+    request.addfinalizer(
+        lambda: QApplication.setDoubleClickInterval(old_interval)
+    )
     QApplication.setDoubleClickInterval(20)
     window, _pages = _viewer_with_pages(tmp_path, qapp)
+    request.addfinalizer(lambda: (window.close(), qapp.processEvents()))
     window.next_page()
+    _wait_for_applied_display(window, qapp)
     assert window.model.focused_index == 1
 
     center = QPoint(
@@ -1960,9 +1991,6 @@ def test_canvas_background_is_active_but_center_and_positive_gutter_are_not(
     )
     QTest.qWait(35)
     assert window.model.focused_index == 0
-    window.close()
-    qapp.processEvents()
-    QApplication.setDoubleClickInterval(old_interval)
 
 
 def test_joined_spread_adds_no_fixed_center_dead_zone(

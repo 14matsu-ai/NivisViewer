@@ -156,6 +156,7 @@ class ViewerWindow(QMainWindow):
         self._adjacent_book_handler = adjacent_book_handler
         self._shutdown_prepared = False
         self._active_request_id = 0
+        self._applied_display_request_id = 0
         self._visible_page_indexes: tuple[int, ...] = tuple()
         self._display_unit = ViewerDisplayUnit.empty()
         self._page_history_back: list[int] = []
@@ -2206,10 +2207,23 @@ class ViewerWindow(QMainWindow):
         self._pdf_prefetch_direction = 0
 
     def _render_spread(self, spread, request_id: int) -> None:
-        if request_id != self._active_request_id:
+        if (
+            self._shutdown_prepared
+            or request_id != self._active_request_id
+            or self._display_unit.request_id != request_id
+            or self._display_unit.generation != self.image_cache.generation
+            or tuple(
+                (slot.page_index, slot.image_id) for slot in spread.slots
+            )
+            != tuple(
+                (slot.page_index, slot.image_id)
+                for slot in self._display_unit.slots
+            )
+        ):
             return
 
         pages: list[ViewerImage] = []
+        target_is_terminal = True
         for slot in spread.slots:
             cached = self.image_cache.get(slot.page_index)
             if cached is None:
@@ -2230,9 +2244,7 @@ class ViewerWindow(QMainWindow):
                     ),
                 )
                 if state is ViewerSlotState.LOADING:
-                    pages.append(
-                        ViewerWidget.loading_page(slot.page_index, slot.image_id)
-                    )
+                    target_is_terminal = False
                 else:
                     pages.append(
                         ViewerWidget.error_page(
@@ -2274,7 +2286,15 @@ class ViewerWindow(QMainWindow):
                 )
                 pages.append(ViewerWidget.error_page(slot.page_index, slot.image_id, "画像を表示できません。"))
 
-        self.viewer.set_pages(spread, pages)
+        # A navigation target replaces the canvas only after every slot has
+        # reached a terminal state. Until then the last complete frame stays
+        # owned by ViewerWidget.
+        if (
+            target_is_terminal
+            and request_id != self._applied_display_request_id
+        ):
+            self.viewer.set_pages(spread, pages)
+            self._applied_display_request_id = request_id
         self._update_slider()
         self._update_status()
         self._sync_page_list_selection()
@@ -2316,7 +2336,10 @@ class ViewerWindow(QMainWindow):
         return [left_page, right_page]
 
     def _on_cache_page_loaded(self, cached: CachedImage) -> None:
-        if cached.generation != self.image_cache.generation:
+        if (
+            self._shutdown_prepared
+            or cached.generation != self.image_cache.generation
+        ):
             return
         self._display_unit = self._display_unit.transition(
             page_index=cached.page_index,
@@ -2360,14 +2383,22 @@ class ViewerWindow(QMainWindow):
         if repositioned or slot_identity_changed:
             self._update_page_list_thumbnail(cached)
             self._refresh_view()
+            if first_frame_result:
+                if isinstance(self.image_cache.source, PdfImageSource):
+                    self._prepare_deferred_pdf_prefetch(
+                        self.model.focused_index,
+                        self._visible_page_indexes,
+                    )
+                else:
+                    self._preload_image_source(
+                        self.model.focused_index,
+                        self._visible_page_indexes,
+                    )
             return
         if cached.page_index not in self._visible_page_indexes:
             self._update_page_list_thumbnail(cached)
             return
-        if (
-            self._awaiting_first_frame
-            and cached.image_id == self._first_frame_image_id
-        ):
+        if first_frame_result:
             # The logical current page has completed decoding, so the reserved
             # Viewer lane may now continue with its spread partner. Nearby PDF
             # pages wait for the idle grace; Browser work remains gated until

@@ -7,12 +7,14 @@ from pathlib import Path
 import pytest
 from PIL import Image
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QApplication
 
 from app.application_controller import ApplicationController
 from app.book_session import BookSession
 from app.config_manager import ConfigManager
-from app.image_source import ImageSource
+from app.image_cache import CachedImage
+from app.image_source import ImageSource, ImageSourceError, ZipImageSource
 from app import viewer_commands as commands
 from app.viewer_window import ViewerWindow
 
@@ -37,6 +39,47 @@ def finish_open(
 ) -> None:
     assert window.book_session.wait_for_async(timeout_ms)
     qapp.processEvents()
+
+
+class ControlledZipSource(ImageSource):
+    load_sizes_lazily = True
+
+    def __init__(self, path: Path, *, pages: int = 7) -> None:
+        super().__init__(path)
+        self.ids = [f"page-{index}.jpg" for index in range(pages)]
+        self.read_calls: list[str] = []
+        self.failures: set[str] = set()
+        self._blocks: dict[str, tuple[threading.Event, threading.Event]] = {}
+
+    def list_images(self) -> list[str]:
+        return list(self.ids)
+
+    def block(
+        self,
+        image_id: str,
+    ) -> tuple[threading.Event, threading.Event]:
+        started = threading.Event()
+        release = threading.Event()
+        self._blocks[image_id] = (started, release)
+        return started, release
+
+    def release_all(self) -> None:
+        for _started, release in tuple(self._blocks.values()):
+            release.set()
+
+    def open_image(self, image_id: str) -> Image.Image:
+        self.read_calls.append(image_id)
+        block = self._blocks.get(image_id)
+        if block is not None:
+            started, release = block
+            started.set()
+            assert release.wait(3)
+        if image_id in self.failures:
+            raise ImageSourceError(f"broken archive entry: {image_id}")
+        return Image.new("RGB", (80, 120), "white")
+
+    def display_path(self, image_id: str) -> str:
+        return f"{self.source_path}!/{image_id}"
 
 
 def test_shared_config_is_injected(tmp_path: Path, qapp: QApplication) -> None:
@@ -581,3 +624,259 @@ def test_mouse_settings_apply_to_existing_viewer_immediately(
     assert window.mouse_forward_button_action == "first_page"
     window.close()
     qapp.processEvents()
+
+
+def test_prefetched_zip_page_is_applied_once_without_reread_or_clear(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "zip-pages"
+    first = folder / "1.jpg"
+    second = folder / "2.jpg"
+    write_image(first)
+    write_image(second)
+    archive = tmp_path / "book.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.write(first, "1.jpg")
+        output.write(second, "2.jpg")
+
+    class CountingZipSource(ZipImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.decode_calls: list[str] = []
+
+        def open_image(self, image_id: str) -> Image.Image:
+            self.decode_calls.append(image_id)
+            return super().open_image(image_id)
+
+    source = CountingZipSource(archive)
+    config = make_config(tmp_path)
+    config.apply(
+        {
+            "view_mode": "single",
+            "viewer_prefetch_preset": "custom",
+            "viewer_prefetch_image_forward_units": 0,
+            "viewer_prefetch_image_backward_units": 0,
+        },
+        save=False,
+    )
+    session = BookSession(
+        source_factory=lambda _path, **_kwargs: (source, None),
+    )
+    window = ViewerWindow(config_manager=config, book_session=session)
+    applied: list[tuple[str, ...]] = []
+    cleared: list[None] = []
+    delivered: list[CachedImage] = []
+    try:
+        window.show()
+        opened = session.open_book(archive)
+        assert window._finish_opened_book(opened, modal_on_empty=False)
+        assert session.image_cache.wait_for_done(2000)
+        qapp.processEvents()
+        session.image_cache.preload_around(
+            0,
+            radius=0,
+            visible_indexes=(0,),
+            prefetch_indexes=(1,),
+        )
+        assert session.image_cache.wait_for_done(2000)
+        qapp.processEvents()
+        assert session.image_cache.get(1) is not None
+
+        source.decode_calls.clear()
+        session.image_cache.pageLoaded.connect(delivered.append)
+        original_set_pages = window.viewer.set_pages
+        original_clear = window.viewer.clear
+
+        def record_set_pages(spread, pages):
+            applied.append(tuple(image.image_id for image in pages))
+            original_set_pages(spread, pages)
+
+        def record_clear():
+            cleared.append(None)
+            original_clear()
+
+        window.viewer.set_pages = record_set_pages  # type: ignore[method-assign]
+        window.viewer.clear = record_clear  # type: ignore[method-assign]
+
+        window.next_page()
+
+        assert window.model.focused_index == 1
+        assert tuple(
+            image.image_id for image in window.viewer._images
+        ) == ("2.jpg",)
+        assert applied == [("2.jpg",)]
+        assert all(applied_unit for applied_unit in applied)
+        assert cleared == []
+        assert source.decode_calls == []
+        assert delivered == []
+        assert not window._pdf_prefetch_timer.isActive()
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    source = ControlledZipSource(tmp_path / "controlled.zip")
+    config = make_config(tmp_path)
+    config.apply(
+        {
+            "view_mode": "single",
+            "viewer_prefetch_preset": "custom",
+            "viewer_prefetch_image_forward_units": 0,
+            "viewer_prefetch_image_backward_units": 0,
+        },
+        save=False,
+    )
+    session = BookSession(
+        source_factory=lambda _path, **_kwargs: (source, None),
+    )
+    window = ViewerWindow(config_manager=config, book_session=session)
+    applied: list[tuple[str, ...]] = []
+    cleared: list[None] = []
+    try:
+        window.resize(640, 480)
+        window.show()
+        opened = session.open_book(source.source_path)
+        assert window._finish_opened_book(opened, modal_on_empty=False)
+        assert session.image_cache.wait_for_done(2000)
+        qapp.processEvents()
+        window.set_page_list_visible(True)
+        qapp.processEvents()
+        window.viewer.render(QPixmap(window.viewer.size()))
+        previous_ids = tuple(
+            image.image_id for image in window.viewer._images
+        )
+        previous_pixmap_keys = tuple(
+            image.pixmap.cacheKey()
+            for image in window.viewer._images
+            if image.pixmap is not None
+        )
+        assert previous_ids == ("page-0.jpg",)
+        assert previous_pixmap_keys
+
+        original_set_pages = window.viewer.set_pages
+        original_clear = window.viewer.clear
+
+        def record_set_pages(spread, pages):
+            applied.append(tuple(image.image_id for image in pages))
+            original_set_pages(spread, pages)
+
+        def record_clear():
+            cleared.append(None)
+            original_clear()
+
+        window.viewer.set_pages = record_set_pages  # type: ignore[method-assign]
+        window.viewer.clear = record_clear  # type: ignore[method-assign]
+
+        first_started, first_release = source.block("page-1.jpg")
+        window.next_page()
+        assert first_started.wait(2)
+        qapp.processEvents()
+        window.viewer.render(QPixmap(window.viewer.size()))
+
+        assert applied == []
+        assert cleared == []
+        assert tuple(
+            image.image_id for image in window.viewer._images
+        ) == previous_ids
+        assert tuple(
+            image.pixmap.cacheKey()
+            for image in window.viewer._images
+            if image.pixmap is not None
+        ) == previous_pixmap_keys
+        assert not any(image.loading for image in window.viewer._images)
+        assert window.slider.value() == 1
+        assert "2 / 7" in window.status.currentMessage()
+        assert window.page_list.currentItem() is not None
+        assert (
+            window.page_list.currentItem().data(Qt.ItemDataRole.UserRole)
+            == 1
+        )
+
+        first_release.set()
+        assert session.image_cache.wait_for_done(2000)
+        qapp.processEvents()
+        assert applied == [("page-1.jpg",)]
+        assert tuple(
+            image.image_id for image in window.viewer._images
+        ) == ("page-1.jpg",)
+
+        applied.clear()
+        rapid_started, rapid_release = source.block("page-2.jpg")
+        window.next_page()
+        assert rapid_started.wait(2)
+        for _index in range(3):
+            window.next_page()
+        qapp.processEvents()
+
+        assert window.model.focused_index == 5
+        assert applied == []
+        assert tuple(
+            image.image_id for image in window.viewer._images
+        ) == ("page-1.jpg",)
+
+        rapid_release.set()
+        assert session.image_cache.wait_for_done(3000)
+        qapp.processEvents()
+        assert applied == [("page-5.jpg",)]
+        assert tuple(
+            image.image_id for image in window.viewer._images
+        ) == ("page-5.jpg",)
+        assert not any(
+            image_id in {"page-2.jpg", "page-3.jpg", "page-4.jpg"}
+            for unit in applied
+            for image_id in unit
+        )
+
+        applied.clear()
+        window._on_cache_page_loaded(
+            CachedImage(
+                page_index=5,
+                image_id="page-5.jpg",
+                qimage=None,
+                original_size=None,
+                error="cancelled stale result",
+                generation=session.image_cache.generation - 1,
+            )
+        )
+        assert applied == []
+        assert tuple(
+            image.image_id for image in window.viewer._images
+        ) == ("page-5.jpg",)
+
+        source.failures.add("page-6.jpg")
+        window.next_page()
+        assert tuple(
+            image.image_id for image in window.viewer._images
+        ) == ("page-5.jpg",)
+        assert applied == []
+        assert session.image_cache.wait_for_done(2000)
+        qapp.processEvents()
+        assert applied == [("page-6.jpg",)]
+        assert len(window.viewer._images) == 1
+        assert window.viewer._images[0].error
+        assert window.viewer._images[0].pixmap is None
+        assert cleared == []
+
+        applied.clear()
+        window.prepare_shutdown(wait_msecs=3000)
+        window._on_cache_page_loaded(
+            CachedImage(
+                page_index=6,
+                image_id="page-6.jpg",
+                qimage=None,
+                original_size=None,
+                error="late result after viewer shutdown",
+                generation=session.image_cache.generation,
+            )
+        )
+        assert applied == []
+    finally:
+        source.release_all()
+        session.image_cache.wait_for_done(3000)
+        window.close()
+        qapp.processEvents()

@@ -915,12 +915,35 @@ def test_jump_removes_old_queued_prefetch_before_new_nearby_work(
     coordinator.shutdown()
 
 
-def test_spread_displays_current_before_slow_partner(qapp, tmp_path):
-    source = OrderedSource(tmp_path, block_partner=True)
+def test_spread_keeps_complete_previous_unit_until_slow_partner_is_ready(
+    qapp,
+    tmp_path,
+):
+    source = OrderedSource(tmp_path)
+    source.ids = [f"page{index}.webp" for index in range(4)]
+    target_partner_started = Event()
+    release_target_partner = Event()
+    original_open = source.open_qimage
+
+    def block_target_partner(image_id: str):
+        if image_id == "page3.webp":
+            target_partner_started.set()
+            assert release_target_partner.wait(3)
+        return original_open(image_id)
+
+    source.open_qimage = block_target_partner  # type: ignore[method-assign]
     coordinator = ImageWorkCoordinator(max_workers=2)
     config = ConfigManager(tmp_path / "config.json")
     config.load()
-    config.apply({"single_first_page": False})
+    config.apply(
+        {
+            "view_mode": "spread",
+            "single_first_page": False,
+            "viewer_prefetch_preset": "custom",
+            "viewer_prefetch_image_forward_units": 0,
+            "viewer_prefetch_image_backward_units": 0,
+        }
+    )
     session = BookSession(
         source_factory=lambda _path, **_kwargs: (source, None),
         image_work_coordinator=coordinator,
@@ -930,26 +953,72 @@ def test_spread_displays_current_before_slow_partner(qapp, tmp_path):
         book_session=session,
         image_work_coordinator=coordinator,
     )
-    first_frames: list[bool] = []
-    window.first_frame_ready.connect(lambda _window: first_frames.append(True))
     window.resize(640, 480)
     window.show()
-    assert window.open_path(tmp_path / "dummy.webp")
-    assert _drain_events(
-        qapp,
-        lambda: any(
-            image.image_id == "page0.webp" and image.pixmap is not None
+    try:
+        assert window.open_path(tmp_path / "dummy.webp")
+        assert _drain_events(
+            qapp,
+            lambda: len(window.viewer._images) == 2
+            and {
+                image.image_id for image in window.viewer._images
+            }
+            == {"page0.webp", "page1.webp"},
+        )
+        assert all(
+            image.pixmap is not None and not image.loading
             for image in window.viewer._images
-        ),
-    )
-    assert any(image.loading for image in window.viewer._images)
-    assert _drain_events(qapp, lambda: bool(first_frames))
-    assert source.partner_started.wait(2)
-    source.release_partner.set()
-    assert session.image_cache.wait_for_done(2000)
-    window.close()
-    qapp.processEvents()
-    coordinator.shutdown()
+        )
+        previous_images = tuple(window.viewer._images)
+        previous_pixmap_keys = tuple(
+            image.pixmap.cacheKey()
+            for image in previous_images
+            if image.pixmap is not None
+        )
+        applied: list[tuple[str, ...]] = []
+        original_set_pages = window.viewer.set_pages
+
+        def record_set_pages(spread, pages):
+            applied.append(tuple(image.image_id for image in pages))
+            original_set_pages(spread, pages)
+
+        window.viewer.set_pages = record_set_pages  # type: ignore[method-assign]
+        window.model.go_to_index(2)
+        window._refresh_view()
+        assert _drain_events(qapp, target_partner_started.is_set, timeout=2)
+        qapp.processEvents()
+
+        assert applied == []
+        assert tuple(window.viewer._images) == previous_images
+        assert tuple(
+            image.pixmap.cacheKey()
+            for image in window.viewer._images
+            if image.pixmap is not None
+        ) == previous_pixmap_keys
+        assert not any(image.loading for image in window.viewer._images)
+
+        release_target_partner.set()
+        assert session.image_cache.wait_for_done(2000)
+        assert _drain_events(
+            qapp,
+            lambda: len(window.viewer._images) == 2
+            and {
+                image.image_id for image in window.viewer._images
+            }
+            == {"page2.webp", "page3.webp"},
+        )
+        assert len(applied) == 1
+        assert set(applied[0]) == {"page2.webp", "page3.webp"}
+        assert all(
+            image.pixmap is not None and not image.loading
+            for image in window.viewer._images
+        )
+    finally:
+        release_target_partner.set()
+        session.image_cache.wait_for_done(3000)
+        window.close()
+        qapp.processEvents()
+        coordinator.shutdown()
 
 
 def test_webp_qimagereader_preserves_rgb_and_rgba(tmp_path):
