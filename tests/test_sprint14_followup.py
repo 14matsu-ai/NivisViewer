@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import logging
 from threading import Event, Lock, current_thread, main_thread
 from time import monotonic
 import zipfile
 
+import pytest
 from PIL import Image
 from PySide6.QtCore import QRect, QRunnable, Qt
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
@@ -49,6 +52,56 @@ class FunctionRunnable(QRunnable):
         self.function()
 
 
+class CancellableRunnable(QRunnable):
+    def __init__(self, *, block: bool = True) -> None:
+        super().__init__()
+        self.block = block
+        self.started = Event()
+        self.cancelled = Event()
+        self.release = Event()
+        self.finished = Event()
+        self.cancel_calls = 0
+        self.run_calls = 0
+        self.finished_calls = 0
+
+    def cancel(self) -> None:
+        self.cancel_calls += 1
+        self.cancelled.set()
+
+    def run(self) -> None:
+        self.run_calls += 1
+        self.started.set()
+        if self.block:
+            self.release.wait(2)
+        self.finished_calls += 1
+        self.finished.set()
+
+
+class FakeImageWorkPool:
+    def __init__(self, *, wait_result: bool = True) -> None:
+        self.wait_result = wait_result
+        self.started: list[QRunnable] = []
+        self.clear_calls = 0
+        self.wait_calls: list[int] = []
+
+    def start(self, runnable: QRunnable, _priority: int) -> None:
+        self.started.append(runnable)
+
+    def clear(self) -> None:
+        self.clear_calls += 1
+        self.started.clear()
+
+    def waitForDone(self, msecs: int) -> bool:
+        self.wait_calls.append(msecs)
+        return self.wait_result
+
+    def tryTake(self, runnable: QRunnable) -> bool:
+        if runnable not in self.started:
+            return False
+        self.started.remove(runnable)
+        return True
+
+
 def _drain_events(qapp, predicate, timeout: float = 3.0) -> bool:
     deadline = monotonic() + timeout
     while monotonic() < deadline:
@@ -56,6 +109,107 @@ def _drain_events(qapp, predicate, timeout: float = 3.0) -> bool:
         if predicate():
             return True
     return predicate()
+
+
+def test_image_work_shutdown_empty_is_successful_and_rejects_new_work() -> None:
+    coordinator = ImageWorkCoordinator(max_workers=2)
+
+    assert coordinator.shutdown(wait_msecs=0)
+    assert coordinator.shutdown(wait_msecs=0)
+    assert coordinator.last_shutdown_error is None
+    assert not coordinator.start_viewer(
+        FunctionRunnable(lambda: None),
+        ImageWorkPriority.VIEWER_CURRENT,
+    )
+    assert not coordinator.start_browser(
+        FunctionRunnable(lambda: None),
+        ImageWorkPriority.BROWSER_VISIBLE,
+    )
+
+
+def test_image_work_shutdown_cancels_queued_without_owner_bookkeeping() -> None:
+    coordinator = ImageWorkCoordinator(max_workers=2)
+    viewer_pool = FakeImageWorkPool()
+    browser_pool = FakeImageWorkPool()
+    coordinator._viewer_pool = viewer_pool
+    coordinator._browser_pool = browser_pool
+    worker = CancellableRunnable(block=False)
+    owner_tracking = {worker}
+
+    assert coordinator.start_viewer(
+        worker,
+        ImageWorkPriority.VIEWER_CURRENT,
+    )
+    assert coordinator.shutdown(wait_msecs=0)
+
+    assert worker.cancelled.is_set()
+    assert worker.cancel_calls == 1
+    assert worker.run_calls == 0
+    assert viewer_pool.clear_calls == 1
+    assert browser_pool.clear_calls == 1
+    assert viewer_pool.started == []
+    assert owner_tracking == {worker}
+
+
+@pytest.mark.parametrize("lane", ["viewer", "browser"])
+def test_image_work_shutdown_timeout_is_retryable_and_logged_once(
+    lane: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    coordinator = ImageWorkCoordinator(max_workers=2)
+    worker = CancellableRunnable()
+    if lane == "viewer":
+        assert coordinator.start_viewer(
+            worker,
+            ImageWorkPriority.VIEWER_CURRENT,
+        )
+    else:
+        assert coordinator.start_browser(
+            worker,
+            ImageWorkPriority.BROWSER_VISIBLE,
+        )
+    assert worker.started.wait(1)
+
+    with caplog.at_level(logging.ERROR, logger="app.image_work_coordinator"):
+        assert not coordinator.shutdown(wait_msecs=0)
+        assert not coordinator.shutdown(wait_msecs=0)
+
+    assert worker.cancelled.is_set()
+    assert worker.cancel_calls == 1
+    assert not worker.finished.is_set()
+    assert coordinator.last_shutdown_error is not None
+    assert lane in coordinator.last_shutdown_error
+    assert sum(
+        record.name == "app.image_work_coordinator"
+        and "Image worker shutdown timed out" in record.getMessage()
+        for record in caplog.records
+    ) == 1
+
+    worker.release.set()
+    assert worker.finished.wait(1)
+    assert coordinator.shutdown(wait_msecs=1000)
+    assert coordinator.last_shutdown_error is None
+    assert worker.finished_calls == 1
+
+
+def test_image_work_shutdown_succeeds_when_running_worker_exits_before_deadline() -> None:
+    coordinator = ImageWorkCoordinator(max_workers=2)
+    worker = CancellableRunnable()
+    assert coordinator.start_viewer(
+        worker,
+        ImageWorkPriority.VIEWER_CURRENT,
+    )
+    assert worker.started.wait(1)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        shutdown = executor.submit(coordinator.shutdown, wait_msecs=1000)
+        assert worker.cancelled.wait(1)
+        assert not shutdown.done()
+        worker.release.set()
+        assert shutdown.result(timeout=2)
+
+    assert worker.finished.is_set()
+    assert worker.finished_calls == 1
 
 
 def test_viewer_reserved_lane_runs_while_browser_lane_is_busy(qapp):
@@ -290,7 +444,7 @@ def test_image_cache_releases_queued_tracking_before_coordinator_clear(
 
     cache.clear()
     cache.clear()
-    coordinator.shutdown(wait_msecs=0)
+    assert not coordinator.shutdown(wait_msecs=0)
 
     assert (generation, 0) in cache._tasks
     assert (generation, 1) not in cache._tasks
@@ -303,14 +457,7 @@ def test_image_cache_releases_queued_tracking_before_coordinator_clear(
     assert cache._in_flight == {}
     assert idle_sources == [source]
     assert delivered == []
-
-    cache.set_source(source, source.ids)
-    cache.ensure_loaded(1)
-    assert coordinator.wait_for_viewer(2000)
-    qapp.processEvents()
-    assert source.started == ["running.jpg", "queued.jpg"]
-    assert cache.get(1) is not None
-    coordinator.shutdown()
+    assert coordinator.shutdown()
 
 
 def test_stale_running_image_load_does_not_remove_new_generation_task(
