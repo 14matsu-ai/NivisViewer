@@ -228,16 +228,34 @@ class BrowserItemModel(QAbstractListModel):
         *,
         preserve_thumbnails: bool = False,
     ) -> None:
-        self.beginResetModel()
-        self._source_items = [
+        self.set_sorted_items(
+            self.sort_items(items),
+            preserve_thumbnails=preserve_thumbnails,
+        )
+
+    def sort_items(
+        self,
+        items: tuple[BrowserItem, ...] | list[BrowserItem],
+    ) -> tuple[BrowserItem, ...]:
+        source_items = [
             item
             for item in items
             if not FileOperationArtifactPolicy.is_internal_operation_artifact(
                 item.path
             )
         ]
+        return tuple(self._sort_policy.sorted_items(source_items))
+
+    def set_sorted_items(
+        self,
+        items: tuple[BrowserItem, ...] | list[BrowserItem],
+        *,
+        preserve_thumbnails: bool = False,
+    ) -> None:
+        self.beginResetModel()
+        self._source_items = list(items)
         self._source_keys = {self._key(item.path) for item in self._source_items}
-        self._items = self._sort_policy.sorted_items(self._source_items)
+        self._items = list(self._source_items)
         self._icons.clear()
         if preserve_thumbnails:
             self._retain_compatible_thumbnails()
@@ -250,6 +268,53 @@ class BrowserItemModel(QAbstractListModel):
         self._scan_generation = None
         self._rebuild_row_index()
         self.endResetModel()
+
+    def begin_final_directory_scan(
+        self,
+        items: tuple[BrowserItem, ...] | list[BrowserItem],
+        *,
+        generation: int,
+    ) -> None:
+        self.beginResetModel()
+        self._source_items = list(items)
+        self._source_keys = {self._key(item.path) for item in self._source_items}
+        self._items = list(self._source_items)
+        self._icons.clear()
+        self._thumbnail_images.clear()
+        self._thumbnail_signatures.clear()
+        self._low_resolution_thumbnails.clear()
+        self._thumbnail_errors.clear()
+        self._preview_statuses.clear()
+        self._scan_generation = int(generation)
+        self._rebuild_row_index()
+        self.endResetModel()
+
+    def append_final_directory_scan(
+        self,
+        entries: tuple[BrowserItem, ...] | list[BrowserItem],
+        *,
+        generation: int,
+    ) -> int:
+        if generation != self._scan_generation:
+            return 0
+        additions: list[BrowserItem] = []
+        for entry in entries:
+            key = self._key(entry.path)
+            if key in self._source_keys:
+                continue
+            self._source_keys.add(key)
+            additions.append(entry)
+        if not additions:
+            return 0
+        first = len(self._items)
+        last = first + len(additions) - 1
+        self.beginInsertRows(QModelIndex(), first, last)
+        self._source_items.extend(additions)
+        self._items.extend(additions)
+        for row, item in enumerate(additions, start=first):
+            self._row_by_key[self._key(item.path)] = row
+        self.endInsertRows()
+        return len(additions)
 
     def begin_directory_scan(self, *, generation: int) -> None:
         self.beginResetModel()

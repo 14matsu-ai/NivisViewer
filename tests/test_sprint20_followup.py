@@ -346,6 +346,13 @@ def test_latest_favorite_generation_wins_and_stale_batch_is_discarded(
                 ),
             )
         )
+        scanner.scan_completed.emit(
+            BrowserScanCompleted(
+                second.path,
+                second.generation,
+                1,
+            )
+        )
         assert window.current_path == folder_b.absolute()
         assert window.item_model.row_for_path(fresh_path) >= 0
         assert window.item_model.row_for_path(stale_path) < 0
@@ -390,7 +397,7 @@ def test_same_favorite_folder_preserves_scroll_and_does_not_rescan(
         store.close()
 
 
-def test_first_batch_paints_before_tree_sync_and_thumbnail_request(
+def test_final_sorted_initial_batch_paints_before_tree_sync_and_thumbnail_request(
     tmp_path,
     qapp,
     monkeypatch,
@@ -419,6 +426,10 @@ def test_first_batch_paints_before_tree_sync_and_thumbnail_request(
             )
         )
         assert calls == []
+        scanner.scan_completed.emit(
+            BrowserScanCompleted(request.path, request.generation, 1)
+        )
+        assert calls == []
         window._on_list_paint_completed()
         qapp.processEvents()
         assert calls == ["tree", "thumbnail"]
@@ -428,37 +439,55 @@ def test_first_batch_paints_before_tree_sync_and_thumbnail_request(
         store.close()
 
 
-@pytest.mark.parametrize("item_count", [20, 200, 1000])
-def test_incremental_scan_finish_does_not_reset_or_rerequest_thumbnails(
+@pytest.mark.parametrize(
+    ("item_count", "expected_initial"),
+    [(20, 20), (200, 40), (1000, 40)],
+)
+def test_scan_finish_applies_stable_initial_range_then_appends_without_reset(
     tmp_path,
     qapp,
     monkeypatch,
     item_count: int,
+    expected_initial: int,
 ) -> None:
     window, store, scanner, folder, _other = _favorite_window(tmp_path, qapp)
     requested: list[str] = []
     committed: list[str] = []
     resets: list[bool] = []
-    location_restores: list[bool] = []
-    original_restore = window._restore_pending_scan_location
+    inserts: list[tuple[int, int]] = []
+    sort_calls = 0
+    original_sort_items = window.item_model.sort_items
+
+    def counted_sort_items(items):
+        nonlocal sort_calls
+        sort_calls += 1
+        return original_sort_items(items)
 
     monkeypatch.setattr(
         window.thumbnail_provider,
         "request",
         lambda item, *_args, **_kwargs: requested.append(str(item.path)) or False,
     )
-
-    def record_restore(pending, *, final: bool) -> None:
-        location_restores.append(final)
-        original_restore(pending, final=final)
-
     monkeypatch.setattr(
         window,
-        "_restore_pending_scan_location",
-        record_restore,
+        "_initial_scan_item_count",
+        lambda count: min(count, 40),
+    )
+    monkeypatch.setattr(
+        window,
+        "_visible_row_range",
+        lambda: (0, min(window.item_model.rowCount() - 1, 19)),
+    )
+    monkeypatch.setattr(
+        window.item_model,
+        "sort_items",
+        counted_sort_items,
     )
     window.directory_scan_committed.connect(committed.append)
     window.item_model.modelReset.connect(lambda: resets.append(True))
+    window.item_model.rowsInserted.connect(
+        lambda _parent, first, last: inserts.append((first, last))
+    )
     try:
         QTest.mouseClick(
             window.favorite_view.viewport(),
@@ -485,12 +514,9 @@ def test_incremental_scan_finish_does_not_reset_or_rerequest_thumbnails(
                 entries[:split_at],
             )
         )
-
-        selected = window.item_model.index(min(5, split_at - 1), 0)
-        window.list_view.setCurrentIndex(selected)
-        selected_path = selected.data(window.item_model.PathRole)
-        scroll = window.list_view.verticalScrollBar()
-        scroll.setValue(min(3, scroll.maximum()))
+        assert window.item_model.rowCount() == 0
+        assert requested == []
+        assert sort_calls == 0
         scanner.batch_ready.emit(
             BrowserScanBatch(
                 request.path,
@@ -498,28 +524,8 @@ def test_incremental_scan_finish_does_not_reset_or_rerequest_thumbnails(
                 entries[split_at:],
             )
         )
-        window._flush_pending_scan_batch()
-        current_after_batch = window.list_view.currentIndex()
-        assert current_after_batch.isValid()
-        assert (
-            current_after_batch.data(window.item_model.PathRole)
-            == selected_path
-        )
-        assert window.item_model.rowCount() == item_count
-        scroll.setValue(min(3, scroll.maximum()))
-        scroll_before_finish = scroll.value()
-        window._first_paint_pending_generation = None
-        qapp.processEvents()
-        window._thumbnail_request_timer.stop()
-        requested.clear()
-        window._request_visible_thumbnails()
-        requested_before_finish = tuple(requested)
-        assert requested_before_finish
-        assert len(set(requested_before_finish)) == len(
-            requested_before_finish
-        )
-        resets_before_finish = len(resets)
-        restores_before_finish = len(location_restores)
+        assert window.item_model.rowCount() == 0
+        assert sort_calls == 0
 
         scanner.scan_completed.emit(
             BrowserScanCompleted(
@@ -528,16 +534,43 @@ def test_incremental_scan_finish_does_not_reset_or_rerequest_thumbnails(
                 item_count,
             )
         )
-        QTest.qWait(40)
-        qapp.processEvents()
+        assert window.item_model.rowCount() == expected_initial
+        assert len(resets) == 1
+        assert sort_calls == 1
+        assert inserts == []
+        initial_paths = tuple(str(item.path) for item in window.items)
+        assert initial_paths == tuple(
+            str(folder / f"{index:04}.jpg")
+            for index in range(expected_initial)
+        )
+        assert committed == (
+            []
+            if item_count > expected_initial
+            else [str(folder.absolute())]
+        )
+        if item_count <= expected_initial:
+            assert window._pending_scan is None
+        else:
+            assert window._pending_scan is not None
 
-        current = window.list_view.currentIndex()
-        assert len(resets) == resets_before_finish
-        assert tuple(requested) == requested_before_finish
-        assert len(location_restores) == restores_before_finish
-        assert current.isValid()
-        assert current.data(window.item_model.PathRole) == selected_path
-        assert scroll.value() == scroll_before_finish
+        window._thumbnail_request_timer.stop()
+        window._request_visible_thumbnails()
+        requested_before_append = tuple(requested)
+        assert len(requested_before_append) == expected_initial
+        assert len(set(requested_before_append)) == expected_initial
+        window._flush_pending_scan_batch()
+
+        assert window.item_model.rowCount() == item_count
+        assert len(resets) == 1
+        assert tuple(requested) == requested_before_append
+        assert inserts == (
+            []
+            if item_count <= expected_initial
+            else [(expected_initial, item_count - 1)]
+        )
+        assert tuple(
+            str(item.path) for item in window.items[:expected_initial]
+        ) == initial_paths
         assert committed == [str(folder.absolute())]
         assert window._pending_scan is None
         assert "読み込み中" not in window.statusBar().currentMessage()
@@ -569,6 +602,9 @@ def test_favorite_performance_trace_covers_release_to_first_paint(
                 request.generation,
                 (BrowserScanEntry(str(item), item.name, "other", None, 1),),
             )
+        )
+        scanner.scan_completed.emit(
+            BrowserScanCompleted(request.path, request.generation, 1)
         )
         window._on_list_paint_completed()
         deadline = perf_counter() + 0.75

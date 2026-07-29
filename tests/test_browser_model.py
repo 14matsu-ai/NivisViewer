@@ -211,6 +211,50 @@ def test_incremental_model_ignores_old_generation_and_accepts_sort_change(
     assert not model.finish_directory_scan(generation=7)
 
 
+def test_final_scan_appends_pre_sorted_remainder_without_reset_or_resort(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    model = BrowserItemModel()
+    items = [
+        BrowserItem(
+            f"{index:03}.jpg",
+            tmp_path / f"{index:03}.jpg",
+            BrowserItemKind.IMAGE,
+            None,
+        )
+        for index in range(100)
+    ]
+    resets: list[bool] = []
+    inserts: list[tuple[int, int]] = []
+    model.modelReset.connect(lambda: resets.append(True))
+    model.rowsInserted.connect(
+        lambda _parent, first, last: inserts.append((first, last))
+    )
+    monkeypatch.setattr(
+        type(model._sort_policy),
+        "sorted_items",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("final append must not sort again")
+        ),
+    )
+
+    model.begin_final_directory_scan(items[:40], generation=11)
+    assert model.append_final_directory_scan(
+        items[40:],
+        generation=11,
+    ) == 60
+
+    assert resets == [True]
+    assert inserts == [(40, 99)]
+    assert model.items == tuple(items)
+    assert model.finish_directory_scan(generation=11)
+    assert model.append_final_directory_scan(
+        items[:1],
+        generation=11,
+    ) == 0
+
+
 def test_thumbnail_signature_tracks_ready_spec_and_avoids_duplicate_change(
     tmp_path: Path,
 ) -> None:
