@@ -913,6 +913,7 @@ class FileOperationService:
                 (),
                 cancelled=True,
                 request_id=request.request_id,
+                operation_id=request.operation_id,
             )
         if not validation.valid:
             item = self._failure(
@@ -958,12 +959,14 @@ class FileOperationService:
                     request.operation,
                     1,
                     1,
+                    operation_id=request.operation_id,
                 )
             )
         return FileOperationResult(
             request.operation,
             (item,),
             request_id=request.request_id,
+            operation_id=request.operation_id,
         )
 
     def _copy_atomic(self, source: str, destination: str, cancelled: Event) -> bool:

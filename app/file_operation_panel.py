@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -25,6 +25,12 @@ class FileOperationPanel(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("file_operation_panel")
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._queue = None
+        self._active_operation_id: str | None = None
+        self._active_operation = ""
+        self._cancel_requested_for_operation = False
+        self._idle_close_queued = False
         self.summary_label = QLabel("", self)
         self.detail_label = QLabel("", self)
         self.queue_label = QLabel("", self)
@@ -35,7 +41,7 @@ class FileOperationPanel(QWidget):
         self.current_file_progress = QProgressBar(self)
         self.current_file_progress.setTextVisible(True)
         self.cancel_button = QPushButton("キャンセル", self)
-        self.cancel_button.clicked.connect(self.cancel_requested)
+        self.cancel_button.clicked.connect(self._request_cancel)
         self.details_button = QPushButton("詳細", self)
         self.details_button.setVisible(False)
         self.details_view = QTextEdit(self)
@@ -65,22 +71,77 @@ class FileOperationPanel(QWidget):
         self.hide()
 
     def bind(self, queue) -> None:
+        if self._queue is queue:
+            return
+        if self._queue is not None:
+            raise RuntimeError("FileOperationPanel is already bound")
         self._queue = queue
         queue.operation_preparing.connect(self._on_operation_preparing)
         queue.operation_started.connect(self._on_operation_started)
         queue.operation_progress.connect(self.show_progress)
         queue.operation_completed.connect(self.show_result)
+        queue.state_changed.connect(self._on_state_changed)
         queue.queue_changed.connect(self._on_queue_changed)
-        self.cancel_requested.connect(queue.cancel)
 
     def _on_operation_preparing(self, request: FileOperationRequest) -> None:
+        self._begin_operation(request)
         self.show_state(request.operation.value, FileOperationState.PREPARING)
 
     def _on_operation_started(self, request: FileOperationRequest) -> None:
+        self._begin_operation(request)
         self.show_state(request.operation.value, FileOperationState.RUNNING)
+
+    def show_operation(
+        self,
+        request: FileOperationRequest,
+        state: FileOperationState,
+    ) -> None:
+        operation_id = str(request.operation_id or request.request_id)
+        if operation_id != self._active_operation_id:
+            self._begin_operation(request)
+        elif self._cancel_requested_for_operation:
+            state = FileOperationState.CANCELLING
+        self.show_state(request.operation.value, state)
 
     def _on_queue_changed(self) -> None:
         self.queue_label.setText(f"待機 {len(self._queue.queued_requests)}")
+        self.close_if_idle()
+
+    def _begin_operation(self, request: FileOperationRequest) -> None:
+        self._active_operation_id = str(
+            request.operation_id or request.request_id
+        )
+        self._active_operation = request.operation.value
+        self._cancel_requested_for_operation = False
+        self._idle_close_queued = False
+
+    def _on_state_changed(
+        self,
+        operation_id: str,
+        state: FileOperationState,
+    ) -> None:
+        if str(operation_id) != self._active_operation_id:
+            return
+        if state is FileOperationState.CANCELLING:
+            self.show_state(
+                self._active_operation,
+                FileOperationState.CANCELLING,
+            )
+
+    def _request_cancel(self) -> None:
+        if (
+            self._queue is None
+            or self._active_operation_id is None
+            or self._cancel_requested_for_operation
+        ):
+            return
+        self._cancel_requested_for_operation = True
+        self.cancel_button.setEnabled(False)
+        self.summary_label.setText(
+            f"{self._active_operation}: {FileOperationState.CANCELLING.value}"
+        )
+        self.cancel_requested.emit()
+        self._queue.cancel(self._active_operation_id)
 
     def show_state(self, operation: str, state: FileOperationState) -> None:
         self._hide_timer.stop()
@@ -92,11 +153,20 @@ class FileOperationPanel(QWidget):
                 FileOperationState.COMPLETED,
                 FileOperationState.FAILED,
                 FileOperationState.CANCELLED,
+                FileOperationState.CANCELLING,
             }
         )
         self.show()
 
     def show_progress(self, progress: FileOperationProgress) -> None:
+        if (
+            self._active_operation_id is not None
+            and progress.operation_id
+            and str(progress.operation_id) != self._active_operation_id
+        ):
+            return
+        if self._cancel_requested_for_operation:
+            return
         self.show()
         self.summary_label.setText(progress.operation.value)
         details = progress.source_path or ""
@@ -136,6 +206,12 @@ class FileOperationPanel(QWidget):
             self.current_file_progress.setRange(0, 0)
 
     def show_result(self, result: FileOperationResult) -> None:
+        if (
+            self._active_operation_id is not None
+            and result.operation_id
+            and str(result.operation_id) != self._active_operation_id
+        ):
+            return
         items = result.effective_items
         failures = sum(not item.success for item in items)
         skipped = sum(
@@ -186,6 +262,30 @@ class FileOperationPanel(QWidget):
             self._hide_timer.start(2500)
         self.byte_progress.setRange(0, 1000)
         self.byte_progress.setValue(1000 if not result.cancelled else 0)
+        self._active_operation_id = None
+        self._active_operation = ""
+        self._cancel_requested_for_operation = False
+        self.close_if_idle()
+
+    def close_if_idle(self) -> None:
+        if (
+            self._queue is None
+            or self._queue.busy
+            or self._active_operation_id is not None
+            or self._idle_close_queued
+        ):
+            return
+        self._idle_close_queued = True
+        QTimer.singleShot(0, self._close_if_still_idle)
+
+    def _close_if_still_idle(self) -> None:
+        self._idle_close_queued = False
+        if (
+            self._queue is not None
+            and not self._queue.busy
+            and self._active_operation_id is None
+        ):
+            self.close()
 
     @staticmethod
     def _format_bytes(value: float) -> str:
