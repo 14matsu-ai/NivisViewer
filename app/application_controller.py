@@ -729,7 +729,10 @@ class ApplicationController(QObject):
         if isinstance(window, BrowserWindow) and window is self._browser_window:
             self._cancel_adjacent_search(window)
             self._unregister_browser(window)
-            if self.file_operation_queue.busy:
+            if (
+                self.file_operation_queue.busy
+                and self._continue_operations_without_main_window
+            ):
                 self._show_operation_fallback()
 
     def _on_browser_destroyed(self, window_id: int) -> None:
@@ -954,15 +957,23 @@ class ApplicationController(QObject):
             panel = FileOperationPanel()
             panel.setWindowTitle("NivisViewer - ファイル操作")
             panel.bind(self.file_operation_queue)
+            panel_id = id(panel)
+            panel.destroyed.connect(
+                lambda _object=None, panel_id=panel_id: (
+                    self._clear_operation_fallback_panel(panel_id)
+                )
+            )
             self._operation_fallback_panel = panel
         active = self.file_operation_queue.active_operation
         state = self.file_operation_queue.active_state
         if active is not None and state is not None:
-            self._operation_fallback_panel.show_state(
-                active.operation.value,
-                state,
-            )
+            self._operation_fallback_panel.show_operation(active, state)
         self._operation_fallback_panel.show()
+
+    def _clear_operation_fallback_panel(self, panel_id: int) -> None:
+        panel = self._operation_fallback_panel
+        if panel is not None and id(panel) == panel_id:
+            self._operation_fallback_panel = None
 
     def _on_background_file_operation_completed(self, result: object) -> None:
         self.adjacent_book_search.invalidate()
@@ -983,7 +994,7 @@ class ApplicationController(QObject):
         if self.file_operation_queue.busy:
             return
         if self._operation_fallback_panel is not None:
-            self._operation_fallback_panel.hide()
+            self._operation_fallback_panel.close_if_idle()
         if (
             self._continue_operations_without_main_window
             and self._browser_window is None
