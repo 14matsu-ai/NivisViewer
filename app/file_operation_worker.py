@@ -5,6 +5,8 @@ from threading import Event, Lock
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
 from .file_operation_service import (
+    FileOperationErrorCode,
+    FileOperationItemResult,
     FileOperationRequest,
     FileOperationResult,
     FileOperationService,
@@ -34,11 +36,28 @@ class _FileOperationWorker(QRunnable):
 
     @Slot()
     def run(self) -> None:
-        result = self.service.execute(
-            self.request,
-            cancelled=self.cancelled,
-            progress=self.signals.progress.emit,
-        )
+        try:
+            result = self.service.execute(
+                self.request,
+                cancelled=self.cancelled,
+                progress=self.signals.progress.emit,
+            )
+        except BaseException as exc:
+            result = FileOperationResult(
+                self.request.operation,
+                tuple(
+                    FileOperationItemResult(
+                        source,
+                        self.request.destination_directory,
+                        False,
+                        FileOperationErrorCode.IO_ERROR.value,
+                        str(exc),
+                    )
+                    for source in (self.request.source_paths or (None,))
+                ),
+                request_id=self.request.request_id,
+                operation_id=self.request.operation_id,
+            )
         self.signals.completed.emit(result)
 
 

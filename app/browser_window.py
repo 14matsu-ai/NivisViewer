@@ -352,6 +352,13 @@ class BrowserWindow(QMainWindow):
         self._last_scroll_time = 0.0
         self._file_operation_request_id = 0
         self._active_file_operation_id: int | None = None
+        self._close_after_operation = False
+        self._close_after_cancel = False
+        self._cancel_requested = False
+        self._close_dialog_visible = False
+        self._close_operation_id: str | None = None
+        self._deferred_close_queued = False
+        self._close_authorized = False
         self._internal_clipboard_state = InternalClipboardState()
         self._clipboard_paths: tuple[str, ...] = ()
         self._clipboard_cut = False
@@ -1802,6 +1809,9 @@ class BrowserWindow(QMainWindow):
             self._shutdown_prepared
             or progress.request_id != self._active_file_operation_id
         ):
+            return
+        if self._close_after_cancel:
+            self.statusBar().showMessage("ファイル操作を中止しています…")
             return
         self.statusBar().showMessage(
             f"{self._operation_label(progress.operation)}中… "

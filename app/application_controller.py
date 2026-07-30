@@ -3,12 +3,18 @@ from __future__ import annotations
 import inspect
 import os
 import weakref
+from enum import StrEnum
 from pathlib import Path
 from time import monotonic
 from typing import Callable
 
 from PySide6.QtCore import QObject, QTimer, Signal
-from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
+from PySide6.QtWidgets import (
+    QAbstractButton,
+    QApplication,
+    QMessageBox,
+    QWidget,
+)
 
 from .adjacent_book_search import (
     SIBLING_FOLDERS,
@@ -51,6 +57,12 @@ from .viewer_window import ViewerWindow
 WindowFactory = Callable[..., ViewerWindow]
 BrowserWindowFactory = Callable[..., BrowserWindow]
 VALID_OPEN_BEHAVIORS = {"reuse_active", "always_new", "reuse_or_create"}
+
+
+class FileOperationCloseChoice(StrEnum):
+    CLOSE_AFTER_OPERATION = "close_after_operation"
+    CANCEL_AND_CLOSE = "cancel_and_close"
+    KEEP_OPEN = "keep_open"
 
 
 class ApplicationController(QObject):
@@ -768,6 +780,8 @@ class ApplicationController(QObject):
             self._request_application_exit()
 
     def _allow_window_close(self, window: QWidget) -> bool:
+        if isinstance(window, BrowserWindow):
+            return self._allow_browser_window_close(window)
         if not self.file_operation_queue.busy:
             return True
         is_last = (
@@ -806,6 +820,135 @@ class ApplicationController(QObject):
         self._show_operation_fallback()
         return True
 
+    def _allow_browser_window_close(self, window: BrowserWindow) -> bool:
+        if window._close_authorized:
+            window._close_authorized = False
+            return True
+        if window._close_after_operation or window._close_after_cancel:
+            return False
+        if not self.file_operation_queue.busy:
+            return True
+        if window._close_dialog_visible:
+            return False
+
+        active = self.file_operation_queue.active_operation
+        operation_id = (
+            str(active.operation_id)
+            if active is not None and active.operation_id
+            else None
+        )
+        window._close_dialog_visible = True
+        try:
+            choice = self._ask_file_operation_close_choice(window)
+        finally:
+            window._close_dialog_visible = False
+
+        if choice is FileOperationCloseChoice.KEEP_OPEN:
+            return False
+
+        active_after_dialog = self.file_operation_queue.active_operation
+        active_after_id = (
+            str(active_after_dialog.operation_id)
+            if active_after_dialog is not None
+            and active_after_dialog.operation_id
+            else None
+        )
+        window._close_operation_id = (
+            operation_id if operation_id == active_after_id else None
+        )
+        if choice is FileOperationCloseChoice.CLOSE_AFTER_OPERATION:
+            window._close_after_operation = True
+            window.statusBar().showMessage(
+                "ファイル操作の完了後にウィンドウを閉じます…"
+            )
+        else:
+            window._close_after_cancel = True
+            window.statusBar().showMessage("ファイル操作を中止しています…")
+            window.cancel_operation_button.setEnabled(False)
+            if (
+                not window._cancel_requested
+                and window._close_operation_id is not None
+            ):
+                window._cancel_requested = True
+                self.file_operation_queue.cancel(window._close_operation_id)
+
+        self._maybe_queue_browser_close(window)
+        return False
+
+    @staticmethod
+    def _build_file_operation_close_dialog(
+        window: BrowserWindow,
+    ) -> tuple[
+        QMessageBox,
+        dict[FileOperationCloseChoice, QAbstractButton],
+    ]:
+        dialog = QMessageBox(window)
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setWindowTitle("ファイル操作を実行中")
+        dialog.setText("ファイル操作が完了していません。どうしますか？")
+        buttons = {
+            FileOperationCloseChoice.CLOSE_AFTER_OPERATION: dialog.addButton(
+                "完了後に閉じる",
+                QMessageBox.ButtonRole.AcceptRole,
+            ),
+            FileOperationCloseChoice.CANCEL_AND_CLOSE: dialog.addButton(
+                "操作を中止して閉じる",
+                QMessageBox.ButtonRole.DestructiveRole,
+            ),
+            FileOperationCloseChoice.KEEP_OPEN: dialog.addButton(
+                "閉じない",
+                QMessageBox.ButtonRole.RejectRole,
+            ),
+        }
+        keep_open_button = buttons[FileOperationCloseChoice.KEEP_OPEN]
+        dialog.setDefaultButton(keep_open_button)
+        dialog.setEscapeButton(keep_open_button)
+        return dialog, buttons
+
+    def _ask_file_operation_close_choice(
+        self,
+        window: BrowserWindow,
+    ) -> FileOperationCloseChoice:
+        dialog, buttons = self._build_file_operation_close_dialog(window)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        for choice, button in buttons.items():
+            if clicked is button:
+                return choice
+        return FileOperationCloseChoice.KEEP_OPEN
+
+    def _maybe_queue_browser_close(self, window: BrowserWindow) -> None:
+        if not (window._close_after_operation or window._close_after_cancel):
+            return
+        if self.file_operation_queue.busy or window._deferred_close_queued:
+            return
+        window._deferred_close_queued = True
+        window_ref = weakref.ref(window)
+        QTimer.singleShot(
+            0,
+            lambda: self._finish_deferred_browser_close(window_ref),
+        )
+
+    def _finish_deferred_browser_close(
+        self,
+        window_ref: weakref.ReferenceType[BrowserWindow],
+    ) -> None:
+        window = window_ref()
+        if window is None:
+            return
+        window._deferred_close_queued = False
+        if self.file_operation_queue.busy:
+            return
+        if not (window._close_after_operation or window._close_after_cancel):
+            return
+        window._close_after_operation = False
+        window._close_after_cancel = False
+        window._cancel_requested = False
+        window._close_operation_id = None
+        window._close_authorized = True
+        window.cancel_operation_button.setEnabled(False)
+        window.close()
+
     def _show_operation_fallback(self) -> None:
         if self._operation_fallback_panel is None:
             panel = FileOperationPanel()
@@ -821,8 +964,22 @@ class ApplicationController(QObject):
             )
         self._operation_fallback_panel.show()
 
-    def _on_background_file_operation_completed(self, _result: object) -> None:
+    def _on_background_file_operation_completed(self, result: object) -> None:
         self.adjacent_book_search.invalidate()
+        browser = self._browser_window
+        if browser is not None and (
+            browser._close_after_operation or browser._close_after_cancel
+        ):
+            expected_operation_id = browser._close_operation_id
+            result_operation_id = str(
+                getattr(result, "operation_id", "") or ""
+            )
+            if (
+                expected_operation_id is None
+                or result_operation_id == expected_operation_id
+            ):
+                browser._close_operation_id = None
+                self._maybe_queue_browser_close(browser)
         if self.file_operation_queue.busy:
             return
         if self._operation_fallback_panel is not None:
