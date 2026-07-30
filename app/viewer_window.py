@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from .archive_backend_registry import ArchiveBackendRegistry
+from .app_icon import install_window_icon
 from .book_session import AsyncBookOpenFailed, BookOpened, BookSession
 from .config_manager import ConfigManager
 from .drag_drop import FolderDropProbe
@@ -100,6 +101,7 @@ class ViewerWindow(QMainWindow):
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle("NivisViewer")
+        install_window_icon(self)
         self.resize(1200, 820)
 
         self.config = config_manager

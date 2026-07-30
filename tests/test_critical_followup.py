@@ -5,7 +5,14 @@ from pathlib import Path
 
 import pytest
 from PIL import Image, ImageDraw
-from PySide6.QtCore import QCoreApplication, QEvent, QItemSelectionModel, Qt
+from PySide6.QtCore import (
+    QCoreApplication,
+    QEvent,
+    QItemSelectionModel,
+    QMimeData,
+    Qt,
+    QUrl,
+)
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -206,6 +213,69 @@ def test_internal_clipboard_marker_survives_delayed_changed_signal(
     assert state.preferred_drop_effect(marked) == "move"
     assert snapshot.is_cut
     assert not state.matches_mime(mime)
+
+
+@pytest.mark.parametrize(
+    ("cut", "is_directory"),
+    [
+        (True, False),
+        (True, True),
+        (False, False),
+    ],
+)
+def test_windows_rehydrated_clipboard_preserves_paste_operation(
+    tmp_path: Path,
+    qapp: QApplication,
+    cut: bool,
+    is_directory: bool,
+) -> None:
+    source_folder = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source = source_folder / ("folder" if is_directory else "book.cbz")
+    if is_directory:
+        source.mkdir(parents=True)
+        _write_file(source / "child.txt")
+    else:
+        _write_file(source)
+    destination.mkdir()
+    window, coordinator = _make_browser(tmp_path, qapp, source_folder)
+    kinds: list[FileOperationKind] = []
+    coordinator.operation_started.connect(
+        lambda request: kinds.append(request.operation)
+    )
+    _select_paths(window, [source])
+
+    if cut:
+        assert window.cut_selected_items()
+    else:
+        assert window.copy_selected_items()
+    rehydrated = QMimeData()
+    rehydrated.setUrls([QUrl.fromLocalFile(str(source.absolute()))])
+    rehydrated.setData(
+        "Preferred DropEffect",
+        (2 if cut else 1).to_bytes(4, byteorder="little"),
+    )
+    qapp.clipboard().setMimeData(rehydrated)
+    qapp.processEvents()
+    window._on_system_clipboard_changed()
+
+    assert window._clipboard_cut is cut
+    assert window._clipboard_paths == (str(source.absolute()),)
+    assert window.navigate_to(destination)
+    assert window.wait_for_scan()
+    assert window.paste_items()
+    _finish_operation(window, coordinator, qapp)
+
+    expected_kind = FileOperationKind.MOVE if cut else FileOperationKind.COPY
+    moved_or_copied = destination / source.name
+    assert kinds == [expected_kind]
+    assert moved_or_copied.exists()
+    assert source.exists() is not cut
+    if is_directory:
+        assert (moved_or_copied / "child.txt").exists()
+    _close_browser(window, coordinator, qapp)
+    qapp.clipboard().clear()
+    qapp.processEvents()
 
 
 @pytest.mark.parametrize("use_menu_actions", [False, True])

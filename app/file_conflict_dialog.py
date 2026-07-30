@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from .app_icon import install_window_icon
 from .file_operation_plan import (
     ConflictResolution,
     FileConflict,
@@ -225,6 +226,7 @@ class ConflictResolutionDialog(QDialog):
         super().__init__(parent)
         self.plan = plan
         self.setWindowTitle("ファイル名の衝突")
+        install_window_icon(self)
         self.setModal(True)
         self.resize(780, 440)
         self.model = FileConflictTableModel(plan.conflicts, self)

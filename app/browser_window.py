@@ -65,10 +65,12 @@ from .browser_model import (
     BrowserItemModel,
     browser_item_from_scan_entry,
 )
+from .app_icon import install_window_icon
 from .browser_main_drop import (
     BrowserMainDropController,
     PendingBrowserFocusRequest,
 )
+from .browser_address_bar import BrowserAddressBar
 from .browser_item_delegate import (
     BrowserItemDelegate,
 )
@@ -111,6 +113,7 @@ from .bookmark_model import BookmarkModel
 from .config_manager import ConfigManager
 from .destination_history import DestinationHistoryStore
 from .file_conflict_dialog import ConflictResolutionDialog
+from .file_properties_dialog import FilePropertiesDialog
 from .file_operation_artifact import FileOperationArtifactPolicy
 from .file_operation_coordinator import FileOperationCoordinator
 from .file_operation_panel import FileOperationPanel
@@ -223,6 +226,7 @@ class BrowserWindow(QMainWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setAcceptDrops(True)
         self.setWindowTitle("NivisViewer - ブラウザ")
+        install_window_icon(self)
         self.resize(1100, 760)
 
         self.config = config_manager
@@ -357,6 +361,10 @@ class BrowserWindow(QMainWindow):
         self._operation_refresh_generation: int | None = None
         self._operation_completion_message: str | None = None
         self._file_operation_requests: dict[int, FileOperationRequest] = {}
+        self._properties_dialogs: set[FilePropertiesDialog] = set()
+        self._property_rename_requests: dict[
+            int, tuple[FilePropertiesDialog, bool]
+        ] = {}
         self._drop_probe_workers: set[FolderDropProbe] = set()
         self.browser_main_drop = BrowserMainDropController(self)
         self.browser_main_drop.focus_request_ready.connect(
@@ -1337,7 +1345,7 @@ class BrowserWindow(QMainWindow):
             prompt = f"{len(paths)}項目をごみ箱へ移動しますか？"
         answer = QMessageBox.question(
             self,
-            "ごみ箱へ移動",
+            "削除",
             prompt,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -1348,6 +1356,71 @@ class BrowserWindow(QMainWindow):
             FileOperationKind.RECYCLE,
             sources=paths,
         )
+
+    def show_selected_properties(self) -> bool:
+        paths = self.selected_file_operation_paths()
+        if len(paths) != 1:
+            return False
+        dialog = FilePropertiesDialog(paths[0], self)
+        self._properties_dialogs.add(dialog)
+        dialog.rename_requested.connect(
+            lambda name, close_on_success, dialog=dialog: (
+                self._rename_from_properties(
+                    dialog,
+                    name,
+                    close_on_success=close_on_success,
+                )
+            )
+        )
+        dialog.finished.connect(
+            lambda _result, dialog=dialog: self._properties_dialogs.discard(dialog)
+        )
+        dialog.open()
+        return True
+
+    def _rename_from_properties(
+        self,
+        dialog: FilePropertiesDialog,
+        new_name: str,
+        *,
+        close_on_success: bool,
+    ) -> None:
+        source = dialog.path
+        if new_name == source.name:
+            dialog.clear_error()
+            if close_on_success:
+                dialog.accept()
+            return
+        validation = validate_windows_filename(new_name)
+        if not validation.valid:
+            dialog.show_error(validation.error_message or "名前が無効です")
+            return
+        if source.is_file() and source.suffix.casefold() != Path(
+            validation.normalized_name
+        ).suffix.casefold():
+            answer = QMessageBox.question(
+                dialog,
+                "拡張子の変更",
+                "拡張子を変更すると項目を開けなくなる場合があります。続行しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        if not self._start_file_operation(
+            FileOperationKind.RENAME,
+            sources=(str(source),),
+            new_name=validation.normalized_name,
+        ):
+            dialog.show_error("名前変更を開始できませんでした")
+            return
+        request_id = self._file_operation_request_id
+        self._property_rename_requests[request_id] = (
+            dialog,
+            close_on_success,
+        )
+        dialog.clear_error()
+        dialog.set_busy(True)
 
     def copy_selected_to(self, destination: str | Path | None = None) -> bool:
         paths = self.selected_file_operation_paths()
@@ -1739,6 +1812,10 @@ class BrowserWindow(QMainWindow):
         self,
         result: FileOperationResult,
     ) -> None:
+        property_rename = self._property_rename_requests.pop(
+            result.request_id,
+            None,
+        )
         request = self._file_operation_requests.pop(result.request_id, None)
         before_paths, before_row = self._file_operation_selection_before.pop(
             result.request_id,
@@ -1856,7 +1933,10 @@ class BrowserWindow(QMainWindow):
                     if not item.success
                 }
             )
-            if self.file_operation_coordinator.queue is None:
+            if (
+                property_rename is None
+                and self.file_operation_coordinator.queue is None
+            ):
                 QMessageBox.warning(
                     self,
                     "ファイル操作の一部を完了できませんでした",
@@ -1868,6 +1948,36 @@ class BrowserWindow(QMainWindow):
             completion_message = (
                 f"{self._operation_label(result.operation)}が完了しました"
             )
+
+        if property_rename is not None:
+            dialog, close_on_success = property_rename
+            dialog.set_busy(False)
+            renamed_item = next(
+                (
+                    item
+                    for item in result.effective_items
+                    if item.success and item.destination_path
+                ),
+                None,
+            )
+            if renamed_item is None:
+                failure = next(
+                    (item for item in result.effective_items if not item.success),
+                    None,
+                )
+                dialog.show_error(
+                    (
+                        failure.error_message
+                        if failure is not None
+                        else None
+                    )
+                    or "名前を変更できませんでした"
+                )
+            else:
+                dialog.mark_renamed(renamed_item.destination_path)
+                if close_on_success:
+                    dialog.accept()
+                    self.list_view.setFocus(Qt.FocusReason.OtherFocusReason)
 
         if (
             request.destination_directory
@@ -1979,7 +2089,7 @@ class BrowserWindow(QMainWindow):
             FileOperationKind.RENAME: "名前変更",
             FileOperationKind.COPY: "コピー",
             FileOperationKind.MOVE: "移動",
-            FileOperationKind.RECYCLE: "ごみ箱への移動",
+            FileOperationKind.RECYCLE: "削除",
             FileOperationKind.CREATE_DIRECTORY: "フォルダ作成",
         }[operation]
 
@@ -3241,7 +3351,7 @@ class BrowserWindow(QMainWindow):
         self.navigation_toolbar.addAction(self.refresh_action)
         self.navigation_toolbar.addSeparator()
 
-        self.address_bar = QLineEdit(self)
+        self.address_bar = BrowserAddressBar(self)
         self.address_bar.setObjectName("browser_address_bar")
         self.address_bar.setClearButtonEnabled(True)
         self.address_bar.setPlaceholderText("フォルダ、画像、ZIP/CBZのパス")
@@ -3387,7 +3497,7 @@ class BrowserWindow(QMainWindow):
         file_menu.addSeparator()
         self.rename_action = file_menu.addAction("名前の変更")
         self.rename_action.triggered.connect(self.rename_selected_item)
-        self.recycle_action = file_menu.addAction("ごみ箱へ移動")
+        self.recycle_action = file_menu.addAction("削除")
         self.recycle_action.triggered.connect(self.move_selected_to_recycle_bin)
         file_menu.addSeparator()
         self.new_folder_action = file_menu.addAction("新しいフォルダ")
@@ -4474,49 +4584,11 @@ class BrowserWindow(QMainWindow):
             and self.file_operation_coordinator.queue is None
         )
         menu = QMenu(self)
-        unsupported = bool(
-            item is not None
-            and (
-                item.kind is BrowserItemKind.OTHER
-                or not item.openable_by_nivisviewer
-            )
-        )
-        open_action = (
-            menu.addAction(
-                "既定のアプリで開く" if unsupported else "開く"
-            )
-            if item is not None
-            else None
-        )
-        external_open_action = (
-            menu.addAction("既定のアプリで開く")
-            if item is not None
-            and item.kind is not BrowserItemKind.FOLDER
-            and not unsupported
-            else None
-        )
-        new_action = (
-            menu.addAction("新しいViewerWindowで開く")
-            if item is not None
-            else None
-        )
-        if open_action is not None:
-            open_action.setEnabled(selection_count == 1)
-        if new_action is not None:
-            new_action.setEnabled(
-                selection_count == 1
-                and item.kind is not BrowserItemKind.FOLDER
-                and not unsupported
-            )
-        retry_thumbnail_action = None
-        if (
-            item is not None
-            and item.can_generate_preview
-            and index.data(BrowserItemModel.ThumbnailErrorRole)
-        ):
-            retry_thumbnail_action = menu.addAction("サムネイルを再試行")
-        if item is not None:
-            menu.addSeparator()
+        open_action = menu.addAction("開く")
+        location_action = menu.addAction("エクスプローラーで開く")
+        open_action.setEnabled(selection_count == 1)
+        location_action.setEnabled(selection_count == 1)
+        menu.addSeparator()
         cut_action = menu.addAction("切り取り")
         copy_action = menu.addAction("コピー")
         paste_action = menu.addAction("貼り付け")
@@ -4528,91 +4600,31 @@ class BrowserWindow(QMainWindow):
             and bool(self._clipboard_paths or self._clipboard_file_urls())
         )
         menu.addSeparator()
-        copy_to_action = menu.addAction("指定先へコピー...")
-        move_to_action = menu.addAction("指定先へ移動...")
-        copy_to_action.setEnabled(selection_count > 0 and not busy)
-        move_to_action.setEnabled(selection_count > 0 and not busy)
-        menu.addSeparator()
-        rename_action = menu.addAction("名前の変更")
-        recycle_action = menu.addAction("ごみ箱へ移動")
-        rename_action.setEnabled(selection_count == 1 and not busy)
+        recycle_action = menu.addAction("削除")
         recycle_action.setEnabled(selection_count > 0 and not busy)
         menu.addSeparator()
-        new_folder_action = menu.addAction("新しいフォルダ")
-        refresh_action = menu.addAction("更新")
-        new_folder_action.setEnabled(self.current_path is not None and not busy)
-        refresh_action.setEnabled(self.current_path is not None)
-        location_action = None
-        properties_action = None
-        bookmark_action = None
-        if item is not None:
-            menu.addSeparator()
-            location_action = menu.addAction("エクスプローラーで場所を開く")
-            properties_action = menu.addAction("プロパティ")
-            properties_action.setEnabled(False)
-        if item is not None and self.metadata_store is not None:
-            menu.addSeparator()
-            if self.metadata_store.is_browser_bookmarked(str(item.path)):
-                bookmark_action = menu.addAction("ブックマークから削除")
-            else:
-                bookmark_action = menu.addAction("ブックマークに追加")
+        properties_action = menu.addAction("プロパティ")
+        properties_action.setEnabled(selection_count == 1 and not busy)
         selected = menu.exec(self.list_view.viewport().mapToGlobal(position))
-        if open_action is not None and selected == open_action:
-            if unsupported:
-                assert item is not None
-                self._open_system_file(item.path)
-            else:
-                self.open_item(index)
-        elif external_open_action is not None and selected == external_open_action:
-            assert item is not None
-            self._open_system_file(item.path)
-        elif new_action is not None and selected == new_action:
-            self.open_item(index, open_in_new_window=True)
-        elif (
-            retry_thumbnail_action is not None
-            and selected == retry_thumbnail_action
-        ):
-            assert item is not None
-            self.item_model.clear_thumbnail_error(item.path)
-            self.thumbnail_provider.retry(
-                item,
-                self.thumbnail_render_spec,
-                generation=self._generation,
+        if selected == open_action and item is not None:
+            self.open_item(index)
+        elif selected == location_action and item is not None:
+            target = (
+                item.path
+                if item.kind is BrowserItemKind.FOLDER
+                else item.path.parent
             )
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
         elif selected == cut_action:
             self.cut_selected_items()
         elif selected == copy_action:
             self.copy_selected_items()
         elif selected == paste_action:
             self.paste_items()
-        elif selected == copy_to_action:
-            self.copy_selected_to()
-        elif selected == move_to_action:
-            self.move_selected_to()
-        elif selected == rename_action:
-            self.rename_selected_item()
         elif selected == recycle_action:
             self.move_selected_to_recycle_bin()
-        elif selected == new_folder_action:
-            self.create_new_folder()
-        elif selected == refresh_action:
-            self.refresh_current_folder()
-        elif location_action is not None and selected == location_action:
-            assert item is not None
-            target = item.path if item.kind == BrowserItemKind.FOLDER else item.path.parent
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
-        elif bookmark_action is not None and selected == bookmark_action:
-            assert item is not None
-            if self.metadata_store is None:
-                return
-            if self.metadata_store.is_browser_bookmarked(str(item.path)):
-                self.remove_browser_bookmark(item.path)
-            else:
-                self.add_browser_bookmark(
-                    item.path,
-                    item_type=self._bookmark_item_type(item),
-                    label=item.display_name,
-                )
+        elif selected == properties_action:
+            self.show_selected_properties()
 
     def _show_bookmark_context_menu(self, position: QPoint) -> None:
         index = self.bookmark_view.indexAt(position)
