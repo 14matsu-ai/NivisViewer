@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import ctypes
 from pathlib import Path
 
 from app.file_operation_service import FileOperationService
@@ -30,7 +31,11 @@ def test_shell_adapter_uses_unicode_double_null_and_no_confirmation(
 
     def shell_operation(pointer) -> int:
         operation = pointer._obj
-        captured["path"] = operation.pFrom
+        captured["path"] = ctypes.wstring_at(operation.pFrom)
+        captured["terminators"] = (
+            operation.pFrom[len(str(target.absolute()))],
+            operation.pFrom[len(str(target.absolute())) + 1],
+        )
         captured["flags"] = operation.fFlags
         return 0
 
@@ -41,6 +46,7 @@ def test_shell_adapter_uses_unicode_double_null_and_no_confirmation(
 
     assert result.success
     assert captured["path"].startswith(str(target.absolute()))
+    assert captured["terminators"] == ("\0", "\0")
     assert captured["flags"] & FOF_ALLOWUNDO
     assert captured["flags"] & FOF_NOCONFIRMATION
 

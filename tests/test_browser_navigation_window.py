@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QContextMenuEvent, QMouseEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
@@ -536,6 +536,63 @@ def test_address_relative_path_ctrl_l_escape_and_backspace_editing(
     QTest.keyClick(window.address_bar, Qt.Key.Key_Backspace)
     assert window.address_bar.text() == "ab"
     assert window.current_path == child.absolute()
+    window.close()
+    qapp.processEvents()
+
+
+def test_address_bar_first_click_selects_all_then_preserves_normal_editing(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "address"
+    child = folder / "child"
+    child.mkdir(parents=True)
+    window = make_window(tmp_path, folder, qapp)
+    address = window.address_bar
+    full_path = str(folder.absolute())
+    center = address.rect().center()
+
+    window.list_view.setFocus()
+    qapp.processEvents()
+    assert not address.hasFocus()
+    QTest.mouseClick(address, Qt.MouseButton.LeftButton, pos=center)
+    assert address.selectedText() == full_path
+
+    later_click = QPoint(max(2, address.width() // 4), center.y())
+    QTest.mouseClick(address, Qt.MouseButton.LeftButton, pos=later_click)
+    assert address.selectedText() != full_path
+
+    QTest.keyClick(
+        address,
+        Qt.Key.Key_A,
+        Qt.KeyboardModifier.ControlModifier,
+    )
+    assert address.selectedText() == full_path
+    QTest.keyClick(address, Qt.Key.Key_End)
+    assert address.cursorPosition() == len(address.text())
+    QTest.keyClick(address, Qt.Key.Key_Home)
+    assert address.cursorPosition() == 0
+    QTest.keyClick(address, Qt.Key.Key_Right)
+    assert address.cursorPosition() == 1
+
+    address.setText(full_path)
+    window.list_view.setFocus()
+    qapp.processEvents()
+    start = QPoint(2, center.y())
+    end = QPoint(max(8, address.width() // 2), center.y())
+    QTest.mousePress(address, Qt.MouseButton.LeftButton, pos=start)
+    QTest.mouseMove(address, end)
+    QTest.mouseRelease(address, Qt.MouseButton.LeftButton, pos=end)
+    assert address.selectedText()
+    assert address.selectedText() != full_path
+
+    address.setText("child")
+    QTest.keyClick(address, Qt.Key.Key_Return)
+    finish_scan(window, qapp)
+    assert window.current_path == child.absolute()
+    address.setText("temporary")
+    QTest.keyClick(address, Qt.Key.Key_Escape)
+    assert address.text() == str(child.absolute())
     window.close()
     qapp.processEvents()
 

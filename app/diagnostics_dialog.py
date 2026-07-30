@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .app_icon import install_window_icon
 from .logging_setup import dependency_versions
 from .pdfium_service import (
     PdfAvailabilitySnapshot,
@@ -84,6 +85,7 @@ class DiagnosticsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("NivisViewerについて／診断情報")
+        install_window_icon(self)
         self.resize(680, 480)
         self.profile_dir = Path(profile_dir)
         self.pdfium_service = pdfium_service

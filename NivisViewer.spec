@@ -15,6 +15,7 @@ pypdfium_data = collect_data_files(
     "pypdfium2",
     include_py_files=False,
 )
+app_icon = root / "assets" / "icons" / "nivisviewer.ico"
 
 a = Analysis(
     [str(root / "main.py")],
@@ -27,6 +28,7 @@ a = Analysis(
         (str(root / "README.md"), "."),
         (str(root / "portable.flag"), "."),
         (str(root / "licenses"), "licenses"),
+        (str(root / "assets" / "icons"), "assets/icons"),
     ],
     hiddenimports=[],
     hookspath=[],
@@ -53,6 +55,7 @@ exe = EXE(
     argv_emulation=False,
     target_arch="x86_64",
     version=str(version_file),
+    icon=str(app_icon),
 )
 
 coll = COLLECT(

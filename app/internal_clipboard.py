@@ -7,10 +7,14 @@ from enum import Enum
 from pathlib import Path
 
 from PySide6.QtCore import QMimeData
+from PySide6.QtGui import QGuiApplication
 
 from .file_operation_artifact import FileOperationArtifactPolicy
 
 INTERNAL_CLIPBOARD_MARKER_PROPERTY = "_nivisviewer_clipboard_marker"
+WINDOWS_PREFERRED_DROP_EFFECT_MIME = (
+    'application/x-qt-windows-mime;value="Preferred DropEffect"'
+)
 
 
 class InternalClipboardOperation(str, Enum):
@@ -106,6 +110,15 @@ class InternalClipboardState:
                 snapshot.paths,
             ),
         )
+        if QGuiApplication.platformName().casefold() == "windows":
+            mime.setData(
+                WINDOWS_PREFERRED_DROP_EFFECT_MIME,
+                (
+                    2
+                    if snapshot.operation is InternalClipboardOperation.CUT
+                    else 1
+                ).to_bytes(4, byteorder="little", signed=False),
+            )
 
     def matches_mime(self, mime: QMimeData | None) -> bool:
         snapshot = self._snapshot
@@ -123,14 +136,37 @@ class InternalClipboardState:
                 and paths == snapshot.paths
             )
         except (TypeError, ValueError):
+            pass
+        expected_effect = (
+            "move"
+            if snapshot.operation is InternalClipboardOperation.CUT
+            else "copy"
+        )
+        if self.preferred_drop_effect(mime) != expected_effect:
             return False
+        mime_paths = tuple(
+            dict.fromkeys(
+                self._absolute(url.toLocalFile())
+                for url in mime.urls()
+                if (
+                    url.isLocalFile()
+                    and url.toLocalFile()
+                    and not FileOperationArtifactPolicy.is_internal_operation_artifact(
+                        url.toLocalFile()
+                    )
+                )
+            )
+        )
+        return tuple(self.path_key(path) for path in mime_paths) == tuple(
+            self.path_key(path) for path in snapshot.paths
+        )
 
     @staticmethod
     def preferred_drop_effect(mime: QMimeData | None) -> str:
         if mime is None:
             return "unknown"
         preferred_formats = (
-            'application/x-qt-windows-mime;value="Preferred DropEffect"',
+            WINDOWS_PREFERRED_DROP_EFFECT_MIME,
             "Preferred DropEffect",
         )
         for mime_format in preferred_formats:

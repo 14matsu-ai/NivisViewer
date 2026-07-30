@@ -54,6 +54,14 @@ def verify(bundle: Path, smoke_result: Path | None = None) -> list[str]:
         for path in paths
     ):
         errors.append("PDFium native component not found")
+    required_branding = {
+        "nivisviewer.ico",
+        "nivisviewer_icon.png",
+        "nivisviewer_logo.png",
+    }
+    missing_branding = required_branding - lower_names
+    for name in sorted(missing_branding):
+        errors.append(f"branding asset not found: {name}")
     if smoke_result is not None:
         try:
             result = json.loads(smoke_result.read_text(encoding="utf-8"))

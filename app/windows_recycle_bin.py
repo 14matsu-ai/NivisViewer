@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -29,14 +30,14 @@ class RecycleBinAdapter(Protocol):
 
 class _SHFILEOPSTRUCTW(ctypes.Structure):
     _fields_ = [
-        ("hwnd", ctypes.c_void_p),
-        ("wFunc", ctypes.c_uint),
-        ("pFrom", ctypes.c_wchar_p),
-        ("pTo", ctypes.c_wchar_p),
-        ("fFlags", ctypes.c_ushort),
-        ("fAnyOperationsAborted", ctypes.c_bool),
-        ("hNameMappings", ctypes.c_void_p),
-        ("lpszProgressTitle", ctypes.c_wchar_p),
+        ("hwnd", wintypes.HWND),
+        ("wFunc", wintypes.UINT),
+        ("pFrom", ctypes.POINTER(ctypes.c_wchar)),
+        ("pTo", ctypes.POINTER(ctypes.c_wchar)),
+        ("fFlags", wintypes.WORD),
+        ("fAnyOperationsAborted", wintypes.BOOL),
+        ("hNameMappings", wintypes.LPVOID),
+        ("lpszProgressTitle", wintypes.LPCWSTR),
     ]
 
 
@@ -67,8 +68,12 @@ class WindowsRecycleBin:
                 error_message="Windowsのごみ箱APIを利用できません",
             )
         operation = _SHFILEOPSTRUCTW()
+        source_list = ctypes.create_unicode_buffer(f"{target}\0")
         operation.wFunc = FO_DELETE
-        operation.pFrom = f"{target}\0\0"
+        operation.pFrom = ctypes.cast(
+            source_list,
+            ctypes.POINTER(ctypes.c_wchar),
+        )
         operation.pTo = None
         operation.fFlags = (
             FOF_ALLOWUNDO

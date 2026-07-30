@@ -34,6 +34,7 @@ from .browser_sort import (
     BrowserSortKey,
     BrowserSortOrder,
 )
+from .app_icon import install_window_icon
 from .browser_item_delegate import GRID_PRESET_THUMBNAIL_SIZES
 from .config_manager import ConfigManager
 from .ffmpeg_thumbnail_backend import FFmpegLocator
@@ -173,6 +174,7 @@ class SettingsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("環境設定")
+        install_window_icon(self)
         self.setModal(True)
         self.resize(620, 680)
         self.config = config_manager

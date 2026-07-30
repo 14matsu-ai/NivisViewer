@@ -6,6 +6,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from app.app_icon import install_application_icon
 from app.app_paths import resolve_app_paths
 from app.application_controller import ApplicationController
 from app.command_line import parse_command_line, version_text
@@ -39,6 +40,7 @@ def main(arguments: list[str] | None = None) -> int:
     application = QApplication(qt_arguments)
     application.setApplicationName("NivisViewer")
     application.setOrganizationName("14matsu-ai")
+    install_application_icon(application, paths.resource_dir)
 
     message = InstanceMessage(
         paths=options.paths,
