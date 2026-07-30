@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -33,6 +34,8 @@ class SystemOpenAdapter(Protocol):
     def open_default(self, path: str, parent_hwnd: int | None) -> int: ...
 
     def open_picker(self, path: str, parent_hwnd: int | None) -> int: ...
+
+    def open_explorer(self, path: str, is_directory: bool) -> int: ...
 
 
 class WindowsSystemOpenAdapter:
@@ -82,6 +85,15 @@ class WindowsSystemOpenAdapter:
             self._OAIF_ALLOW_REGISTRATION | self._OAIF_EXEC,
         )
         return int(open_with(ctypes.c_void_p(parent_hwnd or 0), ctypes.byref(info)))
+
+    def open_explorer(self, path: str, is_directory: bool) -> int:
+        arguments = (
+            ["explorer.exe", path]
+            if is_directory
+            else ["explorer.exe", "/select,", path]
+        )
+        subprocess.Popen(arguments, shell=False)
+        return 0
 
 
 class SystemFileOpener:
@@ -163,6 +175,43 @@ class SystemFileOpener:
             SystemOpenStatus.FAILED,
             error_code=result,
             error_message=f"アプリ選択画面を開けませんでした (HRESULT {result})",
+        )
+
+    def open_in_explorer(
+        self,
+        path: str | Path,
+        *,
+        is_directory: bool,
+    ) -> SystemOpenResult:
+        target = self._absolute(path)
+        if (
+            not os.path.exists(target)
+            or FileOperationArtifactPolicy.is_internal_operation_artifact(target)
+        ):
+            return SystemOpenResult(
+                SystemOpenStatus.FAILED,
+                error_message="対象が見つかりません",
+            )
+        adapter = self._adapter_for_platform()
+        if adapter is None:
+            return SystemOpenResult(
+                SystemOpenStatus.FAILED,
+                error_message="Windows Explorerを利用できません",
+            )
+        try:
+            result = adapter.open_explorer(target, bool(is_directory))
+        except (AttributeError, OSError) as exc:
+            return SystemOpenResult(
+                SystemOpenStatus.FAILED,
+                error_code=getattr(exc, "winerror", None),
+                error_message=str(exc),
+            )
+        if result == 0:
+            return SystemOpenResult(SystemOpenStatus.OPENED)
+        return SystemOpenResult(
+            SystemOpenStatus.FAILED,
+            error_code=result,
+            error_message=f"Explorerを開けませんでした (error {result})",
         )
 
     def _adapter_for_platform(self) -> SystemOpenAdapter | None:

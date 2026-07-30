@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
+import math
 
-from PySide6.QtCore import QPoint, QRect, QSize, QTimer, Qt, Signal
+from PySide6.QtCore import QPoint, QRect, QRectF, QSize, QThreadPool, QTimer, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QContextMenuEvent,
@@ -24,6 +26,12 @@ from .viewer_canvas_pointer import (
     ViewerCanvasPointerController,
     ViewerCanvasPointerState,
 )
+from .viewer_render import (
+    ViewerRenderKey,
+    ViewerRenderResult,
+    ViewerRenderTask,
+    normalize_resampling_mode,
+)
 
 
 @dataclass
@@ -36,11 +44,13 @@ class ViewerImage:
     loading: bool = False
     rendered_size: tuple[int, int] | None = None
     pre_rotated: bool = False
+    qimage: QImage | None = None
 
 
 @dataclass(frozen=True)
 class SpreadLayout:
     scale: float
+    scales: tuple[float, ...]
     content_size: QSize
     rects: tuple[QRect, ...]
     effective_gap: int
@@ -58,9 +68,9 @@ def calculate_spread_layout(
     horizontal_alignment: str = "center",
     pan: tuple[int, int] = (0, 0),
 ) -> SpreadLayout:
-    """Calculate a shared-scale spread layout without requiring a QWidget."""
+    """Calculate spread geometry without requiring a QWidget."""
     if not image_sizes:
-        return SpreadLayout(1.0, QSize(0, 0), (), 0)
+        return SpreadLayout(1.0, (), QSize(0, 0), (), 0)
 
     widths = [max(1, int(width)) for width, _height in image_sizes]
     heights = [max(1, int(height)) for _width, height in image_sizes]
@@ -76,6 +86,59 @@ def calculate_spread_layout(
     max_height = max(heights)
     fit_width_scale = max(0.01, width_for_images / total_width)
     fit_height_scale = max(0.01, viewport_height / max_height)
+
+    independent_fit = len(image_sizes) == 2 and fit_mode in {
+        "fit_window",
+        "fit_no_upscale",
+        "fit_width",
+        "fit_height",
+    }
+    if independent_fit:
+        left_slot_width = width_for_images // 2
+        slot_widths = (
+            max(1, left_slot_width),
+            max(1, width_for_images - left_slot_width),
+        )
+        scales_list: list[float] = []
+        for width, height, slot_width in zip(widths, heights, slot_widths):
+            fit_slot_width = max(0.01, slot_width / width)
+            fit_slot_height = max(0.01, viewport_height / height)
+            page_scale = min(fit_slot_width, fit_slot_height)
+            if fit_mode == "fit_no_upscale":
+                page_scale = min(1.0, page_scale)
+            scales_list.append(page_scale)
+        scales = tuple(scales_list)
+        target_widths = [
+            max(1, round(width * page_scale))
+            for width, page_scale in zip(widths, scales)
+        ]
+        target_heights = [
+            max(1, round(height * page_scale))
+            for height, page_scale in zip(heights, scales)
+        ]
+        pan_x, pan_y = int(pan[0]), int(pan[1])
+        rects: list[QRect] = []
+        slot_x = pan_x
+        for index, (target_width, target_height, slot_width) in enumerate(zip(
+            target_widths,
+            target_heights,
+            slot_widths,
+        )):
+            x = (
+                slot_x + slot_width - target_width
+                if index == 0
+                else slot_x
+            )
+            y = (viewport_height - target_height) // 2 + pan_y
+            rects.append(QRect(x, y, target_width, target_height))
+            slot_x += slot_width + effective_gap
+        return SpreadLayout(
+            scale=scales[0],
+            scales=scales,
+            content_size=QSize(viewport_width, max(target_heights)),
+            rects=tuple(rects),
+            effective_gap=effective_gap,
+        )
 
     if fit_mode == "actual_size":
         scale = 1.0
@@ -111,6 +174,7 @@ def calculate_spread_layout(
         x += width + effective_gap
     return SpreadLayout(
         scale=scale,
+        scales=tuple(scale for _size in image_sizes),
         content_size=QSize(content_width, content_height),
         rects=tuple(rects),
         effective_gap=effective_gap,
@@ -130,6 +194,8 @@ class ViewerWidget(QWidget):
     extraMouseButtonPressed = Signal(str)
     viewportChanged = Signal()
     contentPainted = Signal(object)
+    magnifierPdfResolutionRequested = Signal(int, QSize)
+    magnifierCancelled = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -147,6 +213,8 @@ class ViewerWidget(QWidget):
         self.magnifier_enabled = False
         self.magnifier_zoom = 2.0
         self.magnifier_size = 220
+        self.resampling_mode = "standard"
+        self.magnifier_resampling_mode = "high_quality"
 
         self._spread = DisplaySpread(0, tuple(), True)
         self._images: list[ViewerImage] = []
@@ -160,6 +228,28 @@ class ViewerWidget(QWidget):
         self._drag_origin = QPoint(0, 0)
         self._mouse_pos: QPoint | None = None
         self._last_draw_layout: list[tuple[QRect, QPixmap]] = []
+        self._last_image_layout: list[tuple[QRect, ViewerImage, QPixmap]] = []
+        self._render_generation = 0
+        self._render_pool = QThreadPool(self)
+        self._render_pool.setMaxThreadCount(1)
+        self._render_pending: dict[ViewerRenderKey, int] = {}
+        self._render_tasks: set[ViewerRenderTask] = set()
+        self._render_cache: OrderedDict[ViewerRenderKey, QPixmap] = OrderedDict()
+        self._last_rendered_by_image: dict[str, QPixmap] = {}
+        self._render_cache_limit = 6
+        self.magnifier_selecting = False
+        self.magnifier_active = False
+        self.magnifier_source_page: int | None = None
+        self.magnifier_source_rect: QRectF | None = None
+        self.magnifier_previous_view_state: dict[str, object] | None = None
+        self.magnifier_request_generation = 0
+        self._magnifier_source_image_id: str | None = None
+        self._magnifier_source_normalized: QRectF | None = None
+        self._magnifier_selection_rect: QRect | None = None
+        self._magnifier_pixmap: QPixmap | None = None
+        self._magnifier_key: ViewerRenderKey | None = None
+        self._magnifier_waiting_for_pdf = False
+        self._magnifier_pdf_source_key = 0
         self.mouse_gestures_enabled = True
         self.mouse_gesture_show_trail = True
         self.mouse_gesture_min_distance = 36
@@ -246,33 +336,95 @@ class ViewerWidget(QWidget):
         self.update()
 
     def set_gap(self, gap: int) -> None:
-        self.gap = max(0, int(gap))
+        normalized = max(0, int(gap))
+        if normalized != self.gap:
+            self.cancel_magnifier()
+        self.gap = normalized
         self.update()
 
     def set_join_spread_pages(self, enabled: bool) -> None:
-        self.join_spread_pages = bool(enabled)
+        normalized = bool(enabled)
+        if normalized != self.join_spread_pages:
+            self.cancel_magnifier()
+        self.join_spread_pages = normalized
         self.update()
 
     def set_smooth_scaling(self, enabled: bool) -> None:
         self.smooth_scaling = enabled
         self.update()
 
+    def set_resampling_modes(
+        self,
+        *,
+        normal: str | None = None,
+        magnifier: str | None = None,
+    ) -> None:
+        changed = False
+        if normal is not None:
+            normalized = normalize_resampling_mode(normal)
+            if normalized != self.resampling_mode:
+                self.resampling_mode = normalized
+                changed = True
+        if magnifier is not None:
+            normalized = normalize_resampling_mode(magnifier)
+            if normalized != self.magnifier_resampling_mode:
+                self.magnifier_resampling_mode = normalized
+                changed = True
+                if self.magnifier_selecting or self.magnifier_active:
+                    self.cancel_magnifier()
+        if changed:
+            self._invalidate_render_requests(clear_cache=False)
+            self.update()
+
     def set_horizontal_alignment(self, alignment: str) -> None:
         if alignment not in {"left", "center", "right"}:
             alignment = "center"
+        if alignment != self.horizontal_alignment:
+            self.cancel_magnifier()
         self.horizontal_alignment = alignment
         self.update()
 
     def set_magnifier_enabled(self, enabled: bool) -> None:
         self.magnifier_enabled = enabled
+        if not enabled:
+            self.cancel_magnifier()
         self.update()
 
     def set_magnifier_options(self, *, zoom: float | None = None, size: int | None = None) -> None:
         if zoom is not None:
-            self.magnifier_zoom = min(8.0, max(1.1, zoom))
+            normalized_zoom = min(4.0, max(1.5, float(zoom)))
+            if not math.isclose(normalized_zoom, self.magnifier_zoom):
+                self.magnifier_zoom = normalized_zoom
+                if self.magnifier_selecting or self.magnifier_active:
+                    self.cancel_magnifier()
         if size is not None:
             self.magnifier_size = min(600, max(80, int(size)))
         self.update()
+
+    def cancel_magnifier(self) -> bool:
+        was_active = (
+            self.magnifier_selecting
+            or self.magnifier_active
+            or self._magnifier_key is not None
+            or self._magnifier_waiting_for_pdf
+        )
+        self.magnifier_selecting = False
+        self.magnifier_active = False
+        self.magnifier_source_page = None
+        self.magnifier_source_rect = None
+        self.magnifier_previous_view_state = None
+        self._magnifier_source_image_id = None
+        self._magnifier_source_normalized = None
+        self._magnifier_selection_rect = None
+        self._magnifier_pixmap = None
+        self._magnifier_key = None
+        self._magnifier_waiting_for_pdf = False
+        self._magnifier_pdf_source_key = 0
+        self.magnifier_request_generation += 1
+        if was_active:
+            self.magnifierCancelled.emit()
+            self.update()
+        return was_active
 
     def set_auto_hide_cursor(self, enabled: bool) -> None:
         # FullscreenChromeController owns cursor idling. Keep this method only
@@ -307,6 +459,10 @@ class ViewerWidget(QWidget):
         return self._right_button_down and bool(self._gesture_recognizer.pattern)
 
     @property
+    def displayed_page_indexes(self) -> tuple[int, ...]:
+        return tuple(slot.page_index for slot in self._spread.slots)
+
+    @property
     def gesture_trail(self) -> tuple[QPoint, ...]:
         return tuple(self._gesture_trail)
 
@@ -324,23 +480,34 @@ class ViewerWidget(QWidget):
         return was_active
 
     def set_rotation_angle(self, angle: int) -> None:
-        self.rotation_angle = angle % 360
+        normalized = angle % 360
+        if normalized != self.rotation_angle:
+            self.cancel_magnifier()
+            self._invalidate_render_requests(clear_cache=False)
+        self.rotation_angle = normalized
         self._pan = QPoint(0, 0)
         self.update()
 
     def set_fit_mode(self, fit_mode: str) -> None:
+        if fit_mode != self.fit_mode:
+            self.cancel_magnifier()
+            self._invalidate_render_requests(clear_cache=False)
         self.fit_mode = fit_mode
         if fit_mode in {"fit_window", "fit_no_upscale", "fit_width", "fit_height"}:
             self._pan = QPoint(0, 0)
         self.update()
 
     def set_manual_zoom(self, zoom: float) -> None:
+        self.cancel_magnifier()
+        self._invalidate_render_requests(clear_cache=False)
         self.manual_zoom = min(8.0, max(0.05, zoom))
         self.fit_mode = "manual_zoom"
         self.zoomChanged.emit(self.manual_zoom)
         self.update()
 
     def reset_zoom(self) -> None:
+        self.cancel_magnifier()
+        self._invalidate_render_requests(clear_cache=False)
         self.fit_mode = "fit_window"
         self.manual_zoom = 1.0
         self._pan = QPoint(0, 0)
@@ -361,7 +528,11 @@ class ViewerWidget(QWidget):
         self._spread = spread
         self._images = pages
         if not same_display_unit:
+            self.cancel_magnifier()
+            self._invalidate_render_requests(clear_cache=False)
             self._pan = QPoint(0, 0)
+        elif self._magnifier_waiting_for_pdf:
+            self._resume_magnifier_after_pdf_render()
         self.update()
 
     @staticmethod
@@ -380,6 +551,7 @@ class ViewerWidget(QWidget):
             original_size=original_size,
             rendered_size=rendered_size,
             pre_rotated=pre_rotated,
+            qimage=QImage(qimage),
         )
 
     @staticmethod
@@ -391,9 +563,12 @@ class ViewerWidget(QWidget):
         return ViewerImage(page_index=page_index, image_id=image_id, pixmap=None, original_size=None, error=error)
 
     def clear(self) -> None:
+        self.cancel_magnifier()
+        self._invalidate_render_requests(clear_cache=True)
         self._spread = DisplaySpread(0, tuple(), True)
         self._images = []
         self._last_draw_layout.clear()
+        self._last_image_layout.clear()
         self._pan = QPoint(0, 0)
         self.update()
 
@@ -424,12 +599,14 @@ class ViewerWidget(QWidget):
 
         layout = self._layout_for_current_images()
         self._last_draw_layout = []
+        self._last_image_layout = []
         painted_image_ids: list[str] = []
         for image, rect in zip(self._images, layout.rects):
-            pixmap = self._display_pixmap(image)
+            pixmap = self._pixmap_for_paint(image, rect)
             if pixmap is not None:
                 painter.drawPixmap(rect, pixmap)
                 self._last_draw_layout.append((rect, pixmap))
+                self._last_image_layout.append((rect, image, pixmap))
                 painted_image_ids.append(image.image_id)
             else:
                 self._draw_placeholder(painter, rect, image)
@@ -439,6 +616,10 @@ class ViewerWidget(QWidget):
             self.contentPainted.emit(tuple(painted_image_ids))
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
+        if event.size() != event.oldSize():
+            self._invalidate_render_requests(clear_cache=False)
+            if self.magnifier_selecting or self.magnifier_active:
+                self.cancel_magnifier()
         if self.fit_mode in {"fit_window", "fit_no_upscale", "fit_width", "fit_height"}:
             self._pan = QPoint(0, 0)
         super().resizeEvent(event)
@@ -465,6 +646,16 @@ class ViewerWidget(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         self._show_cursor_temporarily()
+        if event.button() == Qt.MouseButton.MiddleButton:
+            if self.magnifier_active:
+                self.cancel_magnifier()
+                event.accept()
+                return
+            if self.magnifier_enabled and self._begin_magnifier_selection(
+                event.position().toPoint()
+            ):
+                event.accept()
+                return
         if event.button() == Qt.MouseButton.BackButton:
             self.extraMouseButtonPressed.emit("back")
             event.accept()
@@ -513,6 +704,13 @@ class ViewerWidget(QWidget):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         self._show_cursor_temporarily()
         self._mouse_pos = event.position().toPoint()
+        if (
+            self.magnifier_selecting
+            and event.buttons() & Qt.MouseButton.MiddleButton
+        ):
+            self._update_magnifier_selection(self._mouse_pos)
+            event.accept()
+            return
         if self._right_button_down:
             point = event.position()
             if self._gesture_recognizer.active:
@@ -535,14 +733,10 @@ class ViewerWidget(QWidget):
                     self.update()
                 event.accept()
                 return
-        if self.magnifier_enabled:
-            self.update()
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event) -> None:  # type: ignore[override]
         self._mouse_pos = None
-        if self.magnifier_enabled:
-            self.update()
         super().leaveEvent(event)
 
     def _show_cursor_temporarily(self) -> None:
@@ -552,6 +746,15 @@ class ViewerWidget(QWidget):
         return
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if (
+            event.button() == Qt.MouseButton.MiddleButton
+            and self.magnifier_selecting
+        ):
+            self._update_magnifier_selection(event.position().toPoint())
+            self.magnifier_selecting = False
+            self._request_magnifier_render()
+            event.accept()
+            return
         if event.button() in {
             Qt.MouseButton.BackButton,
             Qt.MouseButton.ForwardButton,
@@ -715,6 +918,42 @@ class ViewerWidget(QWidget):
             return QSize(size.height(), size.width())
         return size
 
+    def _pixmap_for_paint(
+        self,
+        image: ViewerImage,
+        target_rect: QRect,
+    ) -> QPixmap | None:
+        if (
+            image.qimage is None
+            or self.resampling_mode == "standard"
+            or (
+                target_rect.size() == self._base_size(image)
+                and (self.rotation_angle == 0 or image.pre_rotated)
+            )
+        ):
+            return self._display_pixmap(image)
+
+        dpr = max(1.0, float(self.devicePixelRatioF()))
+        rotation = 0 if image.pre_rotated else self.rotation_angle
+        key = ViewerRenderKey(
+            image_id=image.image_id,
+            source_cache_key=int(image.qimage.cacheKey()),
+            target_width=max(1, round(target_rect.width() * dpr)),
+            target_height=max(1, round(target_rect.height() * dpr)),
+            mode=self.resampling_mode,
+            rotation=rotation,
+            device_pixel_ratio_milli=round(dpr * 1000),
+        )
+        cached = self._render_cache.get(key)
+        if cached is not None:
+            self._render_cache.move_to_end(key)
+            return cached
+        self._queue_render(image.qimage, key)
+        return self._last_rendered_by_image.get(
+            image.image_id,
+            self._display_pixmap(image),
+        )
+
     def _display_pixmap(self, image: ViewerImage) -> QPixmap | None:
         if image.pixmap is None:
             return None
@@ -722,6 +961,102 @@ class ViewerWidget(QWidget):
             return image.pixmap
         transform = QTransform().rotate(self.rotation_angle)
         return image.pixmap.transformed(transform, Qt.TransformationMode.SmoothTransformation)
+
+    def _queue_render(self, source: QImage, key: ViewerRenderKey) -> None:
+        if self._render_pending.get(key) == self._render_generation:
+            return
+        self._render_pending[key] = self._render_generation
+        task = ViewerRenderTask(source, key, self._render_generation)
+        self._render_tasks.add(task)
+        task.signals.completed.connect(
+            lambda result, owned=task: self._on_render_completed(result, owned)
+        )
+        self._render_pool.start(task)
+
+    def _on_render_completed(
+        self,
+        result: ViewerRenderResult,
+        task: ViewerRenderTask,
+    ) -> None:
+        self._render_tasks.discard(task)
+        if self._render_pending.get(result.key) == result.generation:
+            self._render_pending.pop(result.key, None)
+        if (
+            result.generation != self._render_generation
+            or result.image is None
+            or result.error is not None
+        ):
+            return
+        pixmap = QPixmap.fromImage(result.image)
+        if result.key.purpose == "magnifier":
+            if result.key != self._magnifier_key:
+                return
+            self._magnifier_pixmap = pixmap
+            self.magnifier_active = True
+            self._magnifier_waiting_for_pdf = False
+            self.update()
+            return
+
+        visible_ids = {image.image_id for image in self._images}
+        if (
+            result.key.image_id not in visible_ids
+            or result.key.mode != self.resampling_mode
+            or result.key.rotation
+            != (
+                0
+                if next(
+                    (
+                        image.pre_rotated
+                        for image in self._images
+                        if image.image_id == result.key.image_id
+                    ),
+                    False,
+                )
+                else self.rotation_angle
+            )
+        ):
+            return
+        self._render_cache[result.key] = pixmap
+        self._render_cache.move_to_end(result.key)
+        self._last_rendered_by_image[result.key.image_id] = pixmap
+        self._enforce_render_cache_limit()
+        self.update()
+
+    def _enforce_render_cache_limit(self) -> None:
+        max_bytes = 128 * 1024 * 1024
+
+        def cache_bytes() -> int:
+            return sum(
+                pixmap.width() * pixmap.height() * 4
+                for pixmap in self._render_cache.values()
+            )
+
+        while (
+            len(self._render_cache) > self._render_cache_limit
+            or cache_bytes() > max_bytes
+        ):
+            key, pixmap = self._render_cache.popitem(last=False)
+            if self._last_rendered_by_image.get(key.image_id) is pixmap:
+                self._last_rendered_by_image.pop(key.image_id, None)
+
+    def _invalidate_render_requests(self, *, clear_cache: bool) -> None:
+        self._render_generation += 1
+        self._render_pending.clear()
+        for task in tuple(self._render_tasks):
+            if self._render_pool.tryTake(task):
+                self._render_tasks.discard(task)
+        if clear_cache:
+            self._render_cache.clear()
+            self._last_rendered_by_image.clear()
+
+    def wait_for_rendering(self, msecs: int = 5000) -> bool:
+        return self._render_pool.waitForDone(max(0, int(msecs)))
+
+    def shutdown_rendering(self, msecs: int = 5000) -> bool:
+        self.cancel_magnifier()
+        self._invalidate_render_requests(clear_cache=True)
+        self._render_pool.clear()
+        return self._render_pool.waitForDone(max(0, int(msecs)))
 
     def _draw_placeholder(self, painter: QPainter, rect: QRect, image: ViewerImage) -> None:
         painter.fillRect(rect, QColor("#151515"))
@@ -735,36 +1070,228 @@ class ViewerWidget(QWidget):
         painter.drawRect(rect.adjusted(0, 0, -1, -1))
         painter.drawText(inner, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, text)
 
+    def _begin_magnifier_selection(self, position: QPoint) -> bool:
+        hit = next(
+            (
+                (rect, image)
+                for rect, image, _pixmap in reversed(self._last_image_layout)
+                if rect.contains(position) and image.qimage is not None
+            ),
+            None,
+        )
+        if hit is None:
+            return False
+        rect, image = hit
+        self.magnifier_selecting = True
+        self.magnifier_active = False
+        self.magnifier_source_page = image.page_index
+        self._magnifier_source_image_id = image.image_id
+        self.magnifier_previous_view_state = {
+            "fit_mode": self.fit_mode,
+            "manual_zoom": self.manual_zoom,
+            "pan": QPoint(self._pan),
+        }
+        self.magnifier_request_generation += 1
+        self._magnifier_pixmap = None
+        self._magnifier_key = None
+        self._magnifier_waiting_for_pdf = False
+        self._update_magnifier_selection(position, hit=(rect, image))
+        return True
+
+    def _update_magnifier_selection(
+        self,
+        position: QPoint,
+        *,
+        hit: tuple[QRect, ViewerImage] | None = None,
+    ) -> None:
+        if not self.magnifier_selecting:
+            return
+        if hit is None:
+            hit = next(
+                (
+                    (rect, image)
+                    for rect, image, _pixmap in self._last_image_layout
+                    if image.image_id == self._magnifier_source_image_id
+                ),
+                None,
+            )
+        if hit is None:
+            self.cancel_magnifier()
+            return
+        image_rect, image = hit
+        source_size = self._rotated_source_size(image)
+        if source_size.isEmpty():
+            self.cancel_magnifier()
+            return
+
+        screen_scale_x = image_rect.width() / max(1, source_size.width())
+        screen_scale_y = image_rect.height() / max(1, source_size.height())
+        crop_width = min(
+            source_size.width(),
+            max(
+                1.0,
+                self.width()
+                / max(0.0001, screen_scale_x * self.magnifier_zoom),
+            ),
+        )
+        crop_height = min(
+            source_size.height(),
+            max(
+                1.0,
+                self.height()
+                / max(0.0001, screen_scale_y * self.magnifier_zoom),
+            ),
+        )
+        target_aspect = self.width() / max(1, self.height())
+        if crop_width / max(1.0, crop_height) > target_aspect:
+            crop_width = crop_height * target_aspect
+        else:
+            crop_height = crop_width / max(0.0001, target_aspect)
+
+        relative_x = (
+            position.x() - image_rect.left()
+        ) / max(1, image_rect.width())
+        relative_y = (
+            position.y() - image_rect.top()
+        ) / max(1, image_rect.height())
+        center_x = min(1.0, max(0.0, relative_x)) * source_size.width()
+        center_y = min(1.0, max(0.0, relative_y)) * source_size.height()
+        left = min(
+            max(0.0, center_x - crop_width / 2),
+            max(0.0, source_size.width() - crop_width),
+        )
+        top = min(
+            max(0.0, center_y - crop_height / 2),
+            max(0.0, source_size.height() - crop_height),
+        )
+        source_rect = QRectF(left, top, crop_width, crop_height)
+        self.magnifier_source_rect = source_rect
+        self._magnifier_source_normalized = QRectF(
+            source_rect.left() / source_size.width(),
+            source_rect.top() / source_size.height(),
+            source_rect.width() / source_size.width(),
+            source_rect.height() / source_size.height(),
+        )
+        self._magnifier_selection_rect = QRect(
+            round(image_rect.left() + source_rect.left() * screen_scale_x),
+            round(image_rect.top() + source_rect.top() * screen_scale_y),
+            max(1, round(source_rect.width() * screen_scale_x)),
+            max(1, round(source_rect.height() * screen_scale_y)),
+        ).intersected(image_rect)
+        self.update()
+
+    def _rotated_source_size(self, image: ViewerImage) -> QSize:
+        if image.qimage is None:
+            return QSize()
+        size = image.qimage.size()
+        if not image.pre_rotated and self.rotation_angle in {90, 270}:
+            return QSize(size.height(), size.width())
+        return size
+
+    def _magnifier_image(self) -> ViewerImage | None:
+        return next(
+            (
+                image
+                for image in self._images
+                if image.page_index == self.magnifier_source_page
+                and image.image_id == self._magnifier_source_image_id
+            ),
+            None,
+        )
+
+    def _request_magnifier_render(self, *, allow_pdf_request: bool = True) -> None:
+        image = self._magnifier_image()
+        source_rect = self.magnifier_source_rect
+        if image is None or image.qimage is None or source_rect is None:
+            self.cancel_magnifier()
+            return
+
+        source_size = self._rotated_source_size(image)
+        left = max(0, min(source_size.width() - 1, math.floor(source_rect.left())))
+        top = max(0, min(source_size.height() - 1, math.floor(source_rect.top())))
+        right = max(
+            left + 1,
+            min(source_size.width(), math.ceil(source_rect.right())),
+        )
+        bottom = max(
+            top + 1,
+            min(source_size.height(), math.ceil(source_rect.bottom())),
+        )
+        dpr = max(1.0, float(self.devicePixelRatioF()))
+        target_width = max(1, round(self.width() * dpr))
+        target_height = max(1, round(self.height() * dpr))
+
+        if allow_pdf_request and image.rendered_size is not None:
+            required_width = max(
+                source_size.width(),
+                math.ceil(target_width * source_size.width() / (right - left)),
+            )
+            required_height = max(
+                source_size.height(),
+                math.ceil(target_height * source_size.height() / (bottom - top)),
+            )
+            if (
+                required_width > source_size.width()
+                or required_height > source_size.height()
+            ):
+                self._magnifier_waiting_for_pdf = True
+                self._magnifier_pdf_source_key = int(image.qimage.cacheKey())
+                self.magnifierPdfResolutionRequested.emit(
+                    image.page_index,
+                    QSize(required_width, required_height),
+                )
+                self.update()
+                return
+
+        rotation = 0 if image.pre_rotated else self.rotation_angle
+        key = ViewerRenderKey(
+            image_id=image.image_id,
+            source_cache_key=int(image.qimage.cacheKey()),
+            target_width=target_width,
+            target_height=target_height,
+            mode=self.magnifier_resampling_mode,
+            rotation=rotation,
+            device_pixel_ratio_milli=round(dpr * 1000),
+            crop=(left, top, right, bottom),
+            purpose="magnifier",
+            request_generation=self.magnifier_request_generation,
+        )
+        self._magnifier_key = key
+        self._queue_render(image.qimage, key)
+
+    def _resume_magnifier_after_pdf_render(self) -> None:
+        image = self._magnifier_image()
+        normalized = self._magnifier_source_normalized
+        if (
+            image is None
+            or image.qimage is None
+            or normalized is None
+            or int(image.qimage.cacheKey()) == self._magnifier_pdf_source_key
+        ):
+            return
+        source_size = self._rotated_source_size(image)
+        self.magnifier_source_rect = QRectF(
+            normalized.left() * source_size.width(),
+            normalized.top() * source_size.height(),
+            normalized.width() * source_size.width(),
+            normalized.height() * source_size.height(),
+        )
+        self._magnifier_waiting_for_pdf = False
+        self._request_magnifier_render(allow_pdf_request=False)
+
     def _draw_magnifier(self, painter: QPainter) -> None:
-        if not self.magnifier_enabled or self._mouse_pos is None:
+        if self.magnifier_active and self._magnifier_pixmap is not None:
+            painter.drawPixmap(self.rect(), self._magnifier_pixmap)
             return
-        for image_rect, pixmap in reversed(self._last_draw_layout):
-            if not image_rect.contains(self._mouse_pos):
-                continue
-
-            lens_size = self.magnifier_size
-            zoom = self.magnifier_zoom
-            source_w = max(1, round(lens_size / zoom))
-            source_h = max(1, round(lens_size / zoom))
-            rel_x = (self._mouse_pos.x() - image_rect.x()) / max(1, image_rect.width())
-            rel_y = (self._mouse_pos.y() - image_rect.y()) / max(1, image_rect.height())
-            src_x = round(rel_x * pixmap.width() - source_w / 2)
-            src_y = round(rel_y * pixmap.height() - source_h / 2)
-            src_x = max(0, min(src_x, max(0, pixmap.width() - source_w)))
-            src_y = max(0, min(src_y, max(0, pixmap.height() - source_h)))
-
-            target_x = self._mouse_pos.x() - lens_size // 2
-            target_y = self._mouse_pos.y() - lens_size // 2
-            target_x = max(8, min(target_x, max(8, self.width() - lens_size - 8)))
-            target_y = max(8, min(target_y, max(8, self.height() - lens_size - 8)))
-            target = QRect(target_x, target_y, lens_size, lens_size)
-            source = QRect(src_x, src_y, source_w, source_h)
-
-            painter.fillRect(target.adjusted(-3, -3, 3, 3), QColor("#111111"))
-            painter.drawPixmap(target, pixmap, source)
-            painter.setPen(QColor("#eeeeee"))
-            painter.drawRect(target.adjusted(0, 0, -1, -1))
-            return
+        if self.magnifier_selecting and self._magnifier_selection_rect is not None:
+            painter.fillRect(
+                self._magnifier_selection_rect,
+                QColor(80, 170, 255, 48),
+            )
+            pen = QPen(QColor("#f0f7ff"))
+            pen.setWidth(2)
+            painter.setPen(pen)
+            painter.drawRect(self._magnifier_selection_rect.adjusted(0, 0, -1, -1))
 
     def _draw_gesture_trail(self, painter: QPainter) -> None:
         if (

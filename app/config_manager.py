@@ -141,6 +141,8 @@ class ConfigManager(QObject):
         "magnifier_enabled": False,
         "magnifier_zoom": 2.0,
         "magnifier_size": 220,
+        "viewer_resampling_mode": "standard",
+        "magnifier_resampling_mode": "high_quality",
         "gap": 12,
         "single_first_page": True,
         "treat_wide_image_as_single": True,
@@ -554,6 +556,27 @@ class ConfigManager(QObject):
             normalized["book_open_position"] = cls.DEFAULTS[
                 "book_open_position"
             ]
+        for key in (
+            "viewer_resampling_mode",
+            "magnifier_resampling_mode",
+        ):
+            if normalized.get(key) not in {
+                "standard",
+                "moire_reduction",
+                "high_quality",
+                "smooth",
+                "pixel",
+            }:
+                normalized[key] = "standard"
+        try:
+            magnifier_zoom = float(normalized.get("magnifier_zoom", 2.0))
+        except (TypeError, ValueError):
+            magnifier_zoom = 2.0
+        normalized["magnifier_zoom"] = (
+            magnifier_zoom
+            if magnifier_zoom in {1.5, 2.0, 3.0, 4.0}
+            else 2.0
+        )
         for key in (
             "bring_viewer_to_front_on_open",
             "loop_book_navigation",

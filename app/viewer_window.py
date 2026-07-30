@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 from typing import Callable
 
@@ -71,6 +72,7 @@ from .viewer_display_unit import (
     ViewerSlotState,
 )
 from .viewer_widget import ViewerImage, ViewerWidget, calculate_spread_layout
+from .viewer_render import RESAMPLING_MODE_LABELS, normalize_resampling_mode
 
 
 _DISPLAY_LOG = logging.getLogger("nivisviewer.viewer.display_unit")
@@ -219,6 +221,12 @@ class ViewerWindow(QMainWindow):
         self.magnifier_enabled = bool(self.settings.get("magnifier_enabled", False))
         self.magnifier_zoom = float(self.settings.get("magnifier_zoom", 2.0))
         self.magnifier_size = int(self.settings.get("magnifier_size", 220))
+        self.viewer_resampling_mode = normalize_resampling_mode(
+            self.settings.get("viewer_resampling_mode", "standard")
+        )
+        self.magnifier_resampling_mode = normalize_resampling_mode(
+            self.settings.get("magnifier_resampling_mode", "high_quality")
+        )
         self.background_color = str(self.settings["background_color"])
         self.mouse_gestures_enabled = bool(
             self.settings.get("mouse_gestures_enabled", True)
@@ -268,6 +276,7 @@ class ViewerWindow(QMainWindow):
         self._pdf_prefetch_center = 0
         self._pdf_prefetch_visible_indexes: tuple[int, ...] = tuple()
         self._pdf_prefetch_direction = 0
+        self._pdf_magnifier_targets: dict[int, QSize] = {}
         self._last_preload_source: ImageSource | None = None
         self._last_preload_generation = -1
         self._last_preload_center: int | None = None
@@ -389,6 +398,10 @@ class ViewerWindow(QMainWindow):
         self.viewer.zoomChanged.connect(self._on_zoom_changed)
         self.viewer.viewportChanged.connect(self._schedule_pdf_rerender)
         self.viewer.contentPainted.connect(self._on_viewer_content_painted)
+        self.viewer.magnifierPdfResolutionRequested.connect(
+            self._request_pdf_magnifier_resolution
+        )
+        self.viewer.magnifierCancelled.connect(self._clear_pdf_magnifier_resolution)
         self.slider.focusedPageRequested.connect(self._on_slider_changed)
         self.slider.nextSinglePageRequested.connect(
             self.page_navigation.next_single_page
@@ -558,6 +571,40 @@ class ViewerWindow(QMainWindow):
         self.smooth_scaling_action.triggered.connect(self.set_smooth_scaling)
         view_menu.addAction(self.smooth_scaling_action)
 
+        self.normal_resampling_menu = view_menu.addMenu(
+            "拡大縮小方式（通常表示）"
+        )
+        self.normal_resampling_actions: dict[str, QAction] = {}
+        normal_resampling_group = QActionGroup(self)
+        normal_resampling_group.setExclusive(True)
+        for mode, label in RESAMPLING_MODE_LABELS.items():
+            action = QAction(label, self, checkable=True)
+            action.triggered.connect(
+                lambda _checked=False, selected=mode: self.set_viewer_resampling_mode(
+                    selected
+                )
+            )
+            normal_resampling_group.addAction(action)
+            self.normal_resampling_menu.addAction(action)
+            self.normal_resampling_actions[mode] = action
+
+        self.magnifier_resampling_menu = view_menu.addMenu(
+            "拡大縮小方式（拡大鏡）"
+        )
+        self.magnifier_resampling_actions: dict[str, QAction] = {}
+        magnifier_resampling_group = QActionGroup(self)
+        magnifier_resampling_group.setExclusive(True)
+        for mode, label in RESAMPLING_MODE_LABELS.items():
+            action = QAction(label, self, checkable=True)
+            action.triggered.connect(
+                lambda _checked=False, selected=mode: self.set_magnifier_resampling_mode(
+                    selected
+                )
+            )
+            magnifier_resampling_group.addAction(action)
+            self.magnifier_resampling_menu.addAction(action)
+            self.magnifier_resampling_actions[mode] = action
+
         alignment_menu = view_menu.addMenu("横位置")
         self.align_left_action = QAction("左寄せ", self, checkable=True)
         self.align_left_action.triggered.connect(lambda: self.set_horizontal_alignment("left"))
@@ -612,6 +659,20 @@ class ViewerWindow(QMainWindow):
         magnifier_settings_action.triggered.connect(self.set_magnifier_options_dialog)
         view_menu.addAction(self.magnifier_action)
         view_menu.addAction(magnifier_settings_action)
+        self.magnifier_zoom_menu = view_menu.addMenu("部分拡大倍率")
+        self.magnifier_zoom_actions: dict[float, QAction] = {}
+        magnifier_zoom_group = QActionGroup(self)
+        magnifier_zoom_group.setExclusive(True)
+        for zoom in (1.5, 2.0, 3.0, 4.0):
+            action = QAction(f"{zoom:g}倍", self, checkable=True)
+            action.triggered.connect(
+                lambda _checked=False, selected=zoom: self.set_magnifier_zoom(
+                    selected
+                )
+            )
+            magnifier_zoom_group.addAction(action)
+            self.magnifier_zoom_menu.addAction(action)
+            self.magnifier_zoom_actions[zoom] = action
 
         slideshow_menu = menu_bar.addMenu("スライドショー")
         self.slideshow_action = QAction("開始/停止", self, checkable=True)
@@ -776,6 +837,10 @@ class ViewerWindow(QMainWindow):
         self.viewer.set_horizontal_alignment(self.horizontal_alignment)
         self.viewer.set_magnifier_options(zoom=self.magnifier_zoom, size=self.magnifier_size)
         self.viewer.set_magnifier_enabled(self.magnifier_enabled)
+        self.viewer.set_resampling_modes(
+            normal=self.viewer_resampling_mode,
+            magnifier=self.magnifier_resampling_mode,
+        )
         self.viewer.set_fit_mode(self.fit_mode)
         self.viewer.set_mouse_gesture_options(
             enabled=self.mouse_gestures_enabled,
@@ -800,6 +865,21 @@ class ViewerWindow(QMainWindow):
     def apply_settings(self, changed: dict[str, object]) -> None:
         refresh = False
         fullscreen_policy_changed = False
+        if "viewer_resampling_mode" in changed:
+            self.viewer_resampling_mode = normalize_resampling_mode(
+                changed["viewer_resampling_mode"]
+            )
+            self.viewer.set_resampling_modes(normal=self.viewer_resampling_mode)
+        if "magnifier_resampling_mode" in changed:
+            self.magnifier_resampling_mode = normalize_resampling_mode(
+                changed["magnifier_resampling_mode"]
+            )
+            self.viewer.set_resampling_modes(
+                magnifier=self.magnifier_resampling_mode
+            )
+        if "magnifier_zoom" in changed:
+            self.magnifier_zoom = float(changed["magnifier_zoom"])
+            self.viewer.set_magnifier_options(zoom=self.magnifier_zoom)
         if "hide_ui_in_fullscreen" in changed:
             self.hide_ui_in_fullscreen = bool(changed["hide_ui_in_fullscreen"])
             fullscreen_policy_changed = True
@@ -1009,6 +1089,10 @@ class ViewerWindow(QMainWindow):
         self.fit_height_action.setChecked(self.fit_mode == "fit_height")
         self.actual_size_action.setChecked(self.fit_mode == "actual_size")
         self.smooth_scaling_action.setChecked(self.smooth_scaling)
+        for mode, action in self.normal_resampling_actions.items():
+            action.setChecked(mode == self.viewer_resampling_mode)
+        for mode, action in self.magnifier_resampling_actions.items():
+            action.setChecked(mode == self.magnifier_resampling_mode)
         self.align_left_action.setChecked(self.horizontal_alignment == "left")
         self.align_center_action.setChecked(self.horizontal_alignment == "center")
         self.align_right_action.setChecked(self.horizontal_alignment == "right")
@@ -1021,6 +1105,8 @@ class ViewerWindow(QMainWindow):
         self.hide_cursor_fullscreen_action.setChecked(self.hide_cursor_in_fullscreen)
         self.page_list_action.setChecked(self.show_page_list)
         self.magnifier_action.setChecked(self.magnifier_enabled)
+        for zoom, action in self.magnifier_zoom_actions.items():
+            action.setChecked(math.isclose(zoom, self.magnifier_zoom))
         if hasattr(self, "history_back_action"):
             self.history_back_action.setEnabled(bool(self._page_history_back))
         if hasattr(self, "history_forward_action"):
@@ -1050,6 +1136,7 @@ class ViewerWindow(QMainWindow):
         if not preserve_current_page:
             self._reload_page_index = None
         self.viewer.cancel_pending_canvas_click()
+        self.viewer.cancel_magnifier()
         self._active_open_trace_id = (
             self._next_open_trace_id
             or performance_trace.begin("viewer.open_path.started", str(path))
@@ -1559,6 +1646,15 @@ class ViewerWindow(QMainWindow):
         self.viewer.set_magnifier_enabled(checked)
         self._sync_actions()
 
+    def set_magnifier_zoom(self, zoom: float) -> None:
+        normalized = float(zoom)
+        if normalized not in {1.5, 2.0, 3.0, 4.0}:
+            normalized = 2.0
+        self.magnifier_zoom = normalized
+        self._update_shared_setting("magnifier_zoom", normalized)
+        self.viewer.set_magnifier_options(zoom=normalized)
+        self._sync_actions()
+
     def _on_page_list_dock_visibility_changed(self, visible: bool) -> None:
         if self.isFullScreen() and self.hide_ui_in_fullscreen:
             return
@@ -1665,33 +1761,19 @@ class ViewerWindow(QMainWindow):
             self._refresh_view()
 
     def set_magnifier_options_dialog(self) -> None:
-        zoom, accepted = QInputDialog.getDouble(
+        choices = ("1.5倍", "2倍", "3倍", "4倍")
+        current = (1.5, 2.0, 3.0, 4.0).index(self.magnifier_zoom)
+        selected, accepted = QInputDialog.getItem(
             self,
             "拡大鏡の倍率",
             "倍率:",
-            self.magnifier_zoom,
-            1.1,
-            8.0,
-            1,
+            choices,
+            current,
+            False,
         )
         if not accepted:
             return
-        size, accepted = QInputDialog.getInt(
-            self,
-            "拡大鏡のサイズ",
-            "ピクセル:",
-            self.magnifier_size,
-            80,
-            600,
-            10,
-        )
-        if not accepted:
-            return
-        self.magnifier_zoom = zoom
-        self.magnifier_size = size
-        self._update_shared_setting("magnifier_zoom", zoom)
-        self._update_shared_setting("magnifier_size", size)
-        self.viewer.set_magnifier_options(zoom=zoom, size=size)
+        self.set_magnifier_zoom(float(selected.removesuffix("倍")))
 
     def open_next_book(self) -> None:
         self._open_adjacent_book(1)
@@ -1923,6 +2005,13 @@ class ViewerWindow(QMainWindow):
                 self._first_frame_image_id = focused_image_id
         self._active_request_id += 1
         spread = self.model.spread_at()
+        if tuple(
+            slot.page_index for slot in spread.slots
+        ) != self.viewer.displayed_page_indexes or (
+            self.viewer.magnifier_source_page is not None
+            and self.viewer.magnifier_source_page != self.model.focused_index
+        ):
+            self.viewer.cancel_magnifier()
         self._visible_page_indexes = tuple(slot.page_index for slot in spread.slots)
         self.image_cache.set_render_spec(self._current_pdf_render_spec())
         self._display_unit = self._display_unit.cancel_loading()
@@ -2638,6 +2727,8 @@ class ViewerWindow(QMainWindow):
 
     def _handle_escape(self) -> None:
         self.viewer.cancel_pending_canvas_click()
+        if self.viewer.cancel_magnifier():
+            return
         if self.viewer.cancel_mouse_gesture():
             return
         self.exit_fullscreen()
@@ -2880,22 +2971,6 @@ class ViewerWindow(QMainWindow):
         spread = self.model.spread_at()
         viewport_width = max(1, self.viewer.width())
         viewport_height = max(1, self.viewer.height())
-        logical_sizes = [
-            self.model.get_image_size(slot.page_index) or (360, 520)
-            for slot in spread.slots
-        ]
-        if self.rotation_angle in {90, 270}:
-            logical_sizes = [(height, width) for width, height in logical_sizes]
-        layout = calculate_spread_layout(
-            logical_sizes,
-            (viewport_width, viewport_height),
-            fit_mode=self.fit_mode,
-            manual_zoom=self.viewer.manual_zoom,
-            gap=self.gap,
-            join_spread_pages=self.join_spread_pages,
-            spread_is_single=spread.is_single,
-            horizontal_alignment=self.horizontal_alignment,
-        )
         dpr = max(1.0, float(self.viewer.devicePixelRatioF()))
         specs: dict[int, PageRenderSpec] = {}
         span_units = max(
@@ -2918,13 +2993,53 @@ class ViewerWindow(QMainWindow):
             )
         ):
             spec_indexes.update(unit)
+        page_scales: dict[int, float] = {}
+        pending_indexes = set(spec_indexes)
+        while pending_indexes:
+            page_index = min(pending_indexes)
+            unit = self.model.spread_at(page_index)
+            unit_sizes = [
+                self.model.get_image_size(slot.page_index) or (360, 520)
+                for slot in unit.slots
+            ]
+            if self.rotation_angle in {90, 270}:
+                unit_sizes = [
+                    (height, width) for width, height in unit_sizes
+                ]
+            unit_layout = calculate_spread_layout(
+                unit_sizes,
+                (viewport_width, viewport_height),
+                fit_mode=self.fit_mode,
+                manual_zoom=self.viewer.manual_zoom,
+                gap=self.gap,
+                join_spread_pages=self.join_spread_pages,
+                spread_is_single=unit.is_single,
+                horizontal_alignment=self.horizontal_alignment,
+            )
+            for slot, page_scale in zip(unit.slots, unit_layout.scales):
+                page_scales[slot.page_index] = page_scale
+                pending_indexes.discard(slot.page_index)
+            pending_indexes.discard(page_index)
         for page_index in sorted(spec_indexes):
             width, height = self.model.get_image_size(page_index) or (360, 520)
             if self.rotation_angle in {90, 270}:
                 width, height = height, width
+            page_scale = page_scales.get(page_index, 1.0)
+            logical_width = max(1, round(width * page_scale))
+            logical_height = max(1, round(height * page_scale))
+            magnifier_target = self._pdf_magnifier_targets.get(page_index)
+            if magnifier_target is not None:
+                logical_width = max(
+                    logical_width,
+                    math.ceil(magnifier_target.width() / dpr),
+                )
+                logical_height = max(
+                    logical_height,
+                    math.ceil(magnifier_target.height() / dpr),
+                )
             specs[page_index] = PageRenderSpec(
-                max(1, round(width * layout.scale)),
-                max(1, round(height * layout.scale)),
+                logical_width,
+                logical_height,
                 device_pixel_ratio=dpr,
                 rotation_degrees=self.rotation_angle,
                 mode=self.fit_mode,
@@ -2941,7 +3056,35 @@ class ViewerWindow(QMainWindow):
         if self.image_cache.set_render_spec(self._current_pdf_render_spec()):
             self._refresh_view()
 
+    def _request_pdf_magnifier_resolution(
+        self,
+        page_index: int,
+        physical_size: QSize,
+    ) -> None:
+        if not isinstance(self.book_session.source, PdfImageSource):
+            return
+        requested = QSize(
+            max(1, physical_size.width()),
+            max(1, physical_size.height()),
+        )
+        current = self._pdf_magnifier_targets.get(page_index)
+        if (
+            current is not None
+            and current.width() >= requested.width()
+            and current.height() >= requested.height()
+        ):
+            return
+        self._pdf_magnifier_targets = {page_index: requested}
+        self._rerender_pdf()
+
+    def _clear_pdf_magnifier_resolution(self) -> None:
+        if not self._pdf_magnifier_targets:
+            return
+        self._pdf_magnifier_targets.clear()
+        self._schedule_pdf_rerender()
+
     def set_view_mode(self, mode: str) -> None:
+        self.viewer.cancel_magnifier()
         self.view_mode = mode
         self._update_shared_setting("view_mode", mode)
         self.model.update_options(view_mode=mode)
@@ -2954,6 +3097,7 @@ class ViewerWindow(QMainWindow):
         self.set_view_mode("single" if self.view_mode == "spread" else "spread")
 
     def set_reading_direction(self, direction: str) -> None:
+        self.viewer.cancel_magnifier()
         self.reading_direction = direction
         self._update_shared_setting("reading_direction", direction)
         self.model.update_options(reading_direction=direction)
@@ -2982,6 +3126,7 @@ class ViewerWindow(QMainWindow):
         self.fullscreen_chrome.reevaluate_visibility()
 
     def set_split_wide_image(self, checked: bool) -> None:
+        self.viewer.cancel_magnifier()
         self.split_wide_image = checked
         self._update_shared_setting("split_wide_image", checked)
         self._sync_actions()
@@ -2993,6 +3138,26 @@ class ViewerWindow(QMainWindow):
         self.smooth_scaling = checked
         self._update_shared_setting("smooth_scaling", checked)
         self.viewer.set_smooth_scaling(checked)
+        self._sync_actions()
+
+    def set_viewer_resampling_mode(self, mode: str) -> None:
+        self.viewer_resampling_mode = normalize_resampling_mode(mode)
+        self._update_shared_setting(
+            "viewer_resampling_mode",
+            self.viewer_resampling_mode,
+        )
+        self.viewer.set_resampling_modes(normal=self.viewer_resampling_mode)
+        self._sync_actions()
+
+    def set_magnifier_resampling_mode(self, mode: str) -> None:
+        self.magnifier_resampling_mode = normalize_resampling_mode(mode)
+        self._update_shared_setting(
+            "magnifier_resampling_mode",
+            self.magnifier_resampling_mode,
+        )
+        self.viewer.set_resampling_modes(
+            magnifier=self.magnifier_resampling_mode
+        )
         self._sync_actions()
 
     def set_horizontal_alignment(self, alignment: str) -> None:
@@ -3159,6 +3324,7 @@ class ViewerWindow(QMainWindow):
         self._cancel_interactive_open()
         self.viewer.cancel_mouse_gesture()
         self.viewer.cancel_pending_canvas_click()
+        self.viewer.shutdown_rendering(max(5000, wait_msecs))
         self.slideshow_timer.stop()
         self._pdf_render_timer.stop()
         self._cancel_deferred_pdf_prefetch()
