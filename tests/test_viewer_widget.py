@@ -208,8 +208,8 @@ def test_normal_spread_uses_configured_gap() -> None:
     assert center_gap(layout) == 24
 
 
-@pytest.mark.parametrize("fit_mode", ["fit_window", "actual_size", "manual_zoom"])
-def test_joined_spread_has_no_center_gap_and_shared_scale(fit_mode: str) -> None:
+@pytest.mark.parametrize("fit_mode", ["actual_size", "manual_zoom"])
+def test_explicit_zoom_modes_keep_shared_scale(fit_mode: str) -> None:
     layout = calculate_spread_layout(
         [(800, 1200), (600, 900)],
         (1400, 900),
@@ -224,6 +224,21 @@ def test_joined_spread_has_no_center_gap_and_shared_scale(fit_mode: str) -> None
     first_scale = layout.rects[0].width() / 800
     second_scale = layout.rects[1].width() / 600
     assert first_scale == pytest.approx(second_scale, abs=0.002)
+
+
+def test_fitted_spread_has_no_center_gap_and_independent_scales() -> None:
+    layout = calculate_spread_layout(
+        [(800, 1200), (600, 900)],
+        (1400, 900),
+        gap=42,
+        join_spread_pages=True,
+    )
+
+    assert layout.effective_gap == 0
+    assert center_gap(layout) == 0
+    assert layout.scales[0] == pytest.approx(0.75)
+    assert layout.scales[1] == pytest.approx(1.0)
+    assert layout.rects[0].height() == layout.rects[1].height() == 900
 
 
 def test_joined_spread_centers_different_heights_and_preserves_input_order() -> None:
@@ -262,6 +277,73 @@ def test_join_setting_does_not_change_single_or_split_single_page() -> None:
     assert single.effective_gap == 0
     assert split_single.effective_gap == 35
     assert center_gap(split_single) == 35
+
+
+@pytest.mark.parametrize(
+    "sizes",
+    [
+        ((3600, 6500), (840, 1200)),
+        ((840, 1200), (3600, 6500)),
+        ((1600, 2400), (1600, 2400)),
+        ((3600, 5400), (800, 1200)),
+        ((2400, 3600), (1200, 1200)),
+        ((3600, 1800), (1200, 2400)),
+    ],
+)
+def test_spread_fit_scales_each_page_into_its_own_slot(
+    sizes: tuple[tuple[int, int], tuple[int, int]],
+) -> None:
+    viewport = (1400, 900)
+    gap = 24
+    layout = calculate_spread_layout(sizes, viewport, gap=gap)
+    slot_width = (viewport[0] - gap) // 2
+
+    assert len(layout.scales) == 2
+    for index, ((width, height), scale, rect) in enumerate(
+        zip(sizes, layout.scales, layout.rects)
+    ):
+        expected_scale = min(slot_width / width, viewport[1] / height)
+        assert scale == pytest.approx(expected_scale)
+        assert rect.width() == max(1, round(width * expected_scale))
+        assert rect.height() == max(1, round(height * expected_scale))
+        assert 0 <= rect.top()
+        assert rect.bottom() < viewport[1]
+        if index == 0:
+            assert rect.left() >= 0
+            assert rect.right() < slot_width
+        else:
+            assert rect.left() >= slot_width + gap
+            assert rect.right() < viewport[0]
+    assert center_gap(layout) == gap
+
+
+def test_large_resolution_difference_does_not_shrink_small_page() -> None:
+    layout = calculate_spread_layout(
+        [(3600, 6500), (840, 1200)],
+        (1400, 900),
+        gap=24,
+    )
+
+    assert layout.scales[0] != layout.scales[1]
+    assert layout.rects[0].height() == 900
+    assert layout.rects[1].height() == 900
+    assert layout.rects[1].height() > 800
+
+
+@pytest.mark.parametrize("angle", [90, 180, 270])
+def test_rotated_spread_dimensions_fit_independently(angle: int) -> None:
+    original = ((3600, 6500), (840, 1200))
+    rotated = (
+        tuple(reversed(original[0])) if angle in {90, 270} else original[0],
+        tuple(reversed(original[1])) if angle in {90, 270} else original[1],
+    )
+
+    layout = calculate_spread_layout(rotated, (1400, 900), gap=24)
+
+    assert all(rect.left() >= 0 for rect in layout.rects)
+    assert all(rect.right() < 1400 for rect in layout.rects)
+    assert all(rect.top() >= 0 for rect in layout.rects)
+    assert all(rect.bottom() < 900 for rect in layout.rects)
 
 
 def send_mouse_event(

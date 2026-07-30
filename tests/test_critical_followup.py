@@ -43,6 +43,7 @@ class FakeSystemOpenAdapter:
         self.picker_result = picker_result
         self.default_calls: list[tuple[str, int | None]] = []
         self.picker_calls: list[tuple[str, int | None]] = []
+        self.explorer_calls: list[tuple[str, bool]] = []
 
     def open_default(self, path: str, parent_hwnd: int | None) -> int:
         self.default_calls.append((path, parent_hwnd))
@@ -51,6 +52,10 @@ class FakeSystemOpenAdapter:
     def open_picker(self, path: str, parent_hwnd: int | None) -> int:
         self.picker_calls.append((path, parent_hwnd))
         return self.picker_result
+
+    def open_explorer(self, path: str, is_directory: bool) -> int:
+        self.explorer_calls.append((path, is_directory))
+        return 0
 
 
 def _write_file(path: Path, content: str = "data") -> None:
@@ -553,6 +558,99 @@ def test_supported_file_stays_internal_and_explicit_external_open_is_available(
 
     assert window._open_system_file(target)
     assert [Path(call[0]) for call in adapter.default_calls] == [target.absolute()]
+    _close_browser(window, coordinator, qapp)
+
+
+@pytest.mark.parametrize("suffix", [".jpg", ".zip", ".pdf", ".office"])
+def test_browser_explicit_open_with_picker_uses_native_picker_for_single_file(
+    tmp_path: Path,
+    qapp: QApplication,
+    suffix: str,
+) -> None:
+    folder = tmp_path / f"files-{suffix.removeprefix('.')}"
+    target = folder / f"日本語 & draft{suffix}"
+    _write_file(target)
+    adapter = FakeSystemOpenAdapter()
+    window, coordinator = _make_browser(
+        tmp_path,
+        qapp,
+        folder,
+        system_file_opener=SystemFileOpener(adapter),
+    )
+    row = window.item_model.row_for_path(target)
+    item = window.item_model.item_at(window.item_model.index(row, 0))
+    assert item is not None
+
+    assert window._open_with_application_picker(item)
+
+    assert adapter.default_calls == []
+    assert adapter.picker_calls == [(str(target.absolute()), int(window.winId()))]
+    _close_browser(window, coordinator, qapp)
+
+
+def test_browser_picker_and_explorer_do_not_launch_for_disappeared_target(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "files"
+    target = folder / "vanished.pdf"
+    _write_file(target)
+    adapter = FakeSystemOpenAdapter()
+    window, coordinator = _make_browser(
+        tmp_path,
+        qapp,
+        folder,
+        system_file_opener=SystemFileOpener(adapter),
+    )
+    row = window.item_model.row_for_path(target)
+    item = window.item_model.item_at(window.item_model.index(row, 0))
+    assert item is not None
+    target.unlink()
+
+    assert not window._open_with_application_picker(item)
+    assert not window._open_item_in_explorer(item)
+    assert adapter.picker_calls == []
+    assert adapter.explorer_calls == []
+    _close_browser(window, coordinator, qapp)
+
+
+@pytest.mark.parametrize(
+    ("name", "is_directory"),
+    [
+        ("日本語 image.jpg", False),
+        ("archive.zip", False),
+        ("document.pdf", False),
+        ("child folder", True),
+    ],
+)
+def test_browser_explorer_passes_file_or_folder_kind_to_adapter(
+    tmp_path: Path,
+    qapp: QApplication,
+    name: str,
+    is_directory: bool,
+) -> None:
+    folder = tmp_path / f"files-{name.replace('.', '-')}"
+    target = folder / name
+    if is_directory:
+        target.mkdir(parents=True)
+    else:
+        _write_file(target)
+    adapter = FakeSystemOpenAdapter()
+    window, coordinator = _make_browser(
+        tmp_path,
+        qapp,
+        folder,
+        system_file_opener=SystemFileOpener(adapter),
+    )
+    row = window.item_model.row_for_path(target)
+    item = window.item_model.item_at(window.item_model.index(row, 0))
+    assert item is not None
+
+    assert window._open_item_in_explorer(item)
+
+    assert adapter.explorer_calls == [
+        (str(target.absolute()), is_directory)
+    ]
     _close_browser(window, coordinator, qapp)
 
 

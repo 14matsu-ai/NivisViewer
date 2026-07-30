@@ -697,6 +697,7 @@ def test_context_menu_has_exact_labels_and_separator_order(
 
     assert items == [
         "開く",
+        "関連付けで開く...",
         "エクスプローラーで開く",
         None,
         "切り取り",
@@ -715,6 +716,7 @@ def test_context_menu_has_exact_labels_and_separator_order(
     ):
         assert unwanted not in items
     assert not actions["削除"].enabled
+    assert not actions["関連付けで開く..."].enabled
     close_window(window, coordinator, qapp)
 
 
@@ -773,6 +775,169 @@ def test_context_menu_open_calls_existing_open_item_not_system_opener(
     assert len(opened) == 1
     assert opened[0][0] == index
     assert system_opened == []
+    close_window(window, coordinator, qapp)
+
+
+def test_context_menu_open_with_picker_calls_explicit_picker_for_file(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "folder"
+    source = folder / "日本語 book.cbz"
+    write_file(source)
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [source])
+    actions: dict[str, object] = {}
+
+    class FakeAction:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.enabled = True
+
+        def setEnabled(self, enabled: bool) -> None:
+            self.enabled = enabled
+
+    class FakeMenu:
+        def __init__(self, _parent=None) -> None:
+            pass
+
+        def addAction(self, text: str):
+            action = FakeAction(text)
+            actions[text] = action
+            return action
+
+        def addSeparator(self) -> None:
+            pass
+
+        def exec(self, _position):
+            return actions["関連付けで開く..."]
+
+    opened = []
+    monkeypatch.setattr("app.browser_window.QMenu", FakeMenu)
+    monkeypatch.setattr(
+        window,
+        "_open_with_application_picker",
+        lambda item: opened.append(item),
+    )
+    row = window.item_model.row_for_path(source)
+    index = window.item_model.index(row, 0)
+
+    window._show_context_menu(window.list_view.visualRect(index).center())
+
+    assert actions["関連付けで開く..."].enabled
+    assert len(opened) == 1
+    assert opened[0].path == source
+    close_window(window, coordinator, qapp)
+
+
+def test_context_menu_open_with_picker_enablement(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "folder"
+    first = folder / "first.cbz"
+    second = folder / "second.pdf"
+    child = folder / "child"
+    write_file(first)
+    write_file(second)
+    child.mkdir()
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    menus: list[dict[str, object]] = []
+
+    class FakeAction:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.enabled = True
+
+        def setEnabled(self, enabled: bool) -> None:
+            self.enabled = enabled
+
+    class FakeMenu:
+        def __init__(self, _parent=None) -> None:
+            self.actions: dict[str, FakeAction] = {}
+            menus.append(self.actions)
+
+        def addAction(self, text: str):
+            action = FakeAction(text)
+            self.actions[text] = action
+            return action
+
+        def addSeparator(self) -> None:
+            pass
+
+        def exec(self, _position):
+            return None
+
+    monkeypatch.setattr("app.browser_window.QMenu", FakeMenu)
+
+    def show_for(path: Path, selected: list[Path]) -> FakeAction:
+        select_paths(window, selected)
+        row = window.item_model.row_for_path(path)
+        index = window.item_model.index(row, 0)
+        window._show_context_menu(window.list_view.visualRect(index).center())
+        return menus[-1]["関連付けで開く..."]  # type: ignore[return-value]
+
+    assert show_for(first, [first]).enabled
+    assert not show_for(child, [child]).enabled
+    assert not show_for(first, [first, second]).enabled
+    first.unlink()
+    assert not show_for(first, [first]).enabled
+    close_window(window, coordinator, qapp)
+
+
+def test_context_menu_explorer_uses_clicked_item_with_multiple_selection(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "folder"
+    first = folder / "first.zip"
+    second = folder / "second.pdf"
+    write_file(first)
+    write_file(second)
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [first, second])
+    actions: dict[str, object] = {}
+
+    class FakeAction:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.enabled = True
+
+        def setEnabled(self, enabled: bool) -> None:
+            self.enabled = enabled
+
+    class FakeMenu:
+        def __init__(self, _parent=None) -> None:
+            pass
+
+        def addAction(self, text: str):
+            action = FakeAction(text)
+            actions[text] = action
+            return action
+
+        def addSeparator(self) -> None:
+            pass
+
+        def exec(self, _position):
+            return actions["エクスプローラーで開く"]
+
+    opened = []
+    monkeypatch.setattr("app.browser_window.QMenu", FakeMenu)
+    monkeypatch.setattr(
+        window,
+        "_open_item_in_explorer",
+        lambda item: opened.append(item),
+    )
+    row = window.item_model.row_for_path(second)
+    index = window.item_model.index(row, 0)
+
+    window._show_context_menu(window.list_view.visualRect(index).center())
+
+    assert len(opened) == 1
+    assert opened[0].path == second
     close_window(window, coordinator, qapp)
 
 

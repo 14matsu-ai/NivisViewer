@@ -1155,6 +1155,36 @@ class BrowserWindow(QMainWindow):
         )
         return False
 
+    def _open_with_application_picker(self, item: BrowserItem) -> bool:
+        target = self._absolute_browser_path(item.path)
+        if item.kind is BrowserItemKind.FOLDER or not target.is_file():
+            self._show_temporary_status("関連付けで開く対象が見つかりません")
+            return False
+        result = self.system_file_opener.open_with_application_picker(
+            target,
+            parent_hwnd=int(self.winId()),
+        )
+        if result.success:
+            self._show_temporary_status("アプリ選択画面を開きました")
+            return True
+        self._show_temporary_status(
+            result.error_message or "アプリ選択画面を開けませんでした"
+        )
+        return False
+
+    def _open_item_in_explorer(self, item: BrowserItem) -> bool:
+        target = self._absolute_browser_path(item.path)
+        result = self.system_file_opener.open_in_explorer(
+            target,
+            is_directory=item.kind is BrowserItemKind.FOLDER,
+        )
+        if result.success:
+            return True
+        self._show_temporary_status(
+            result.error_message or "Explorerを開けませんでした"
+        )
+        return False
+
     def _folder_snapshot_for_item(
         self,
         item: BrowserItem,
@@ -4588,16 +4618,28 @@ class BrowserWindow(QMainWindow):
                 QItemSelectionModel.SelectionFlag.ClearAndSelect,
             )
             self.list_view.setCurrentIndex(index)
-        selection_count = len(self.selected_file_operation_paths())
+        selected_paths = self.selected_file_operation_paths()
+        selection_count = len(selected_paths)
         busy = (
             self.file_operation_coordinator.busy
             and self.file_operation_coordinator.queue is None
         )
         menu = QMenu(self)
         open_action = menu.addAction("開く")
+        open_with_action = menu.addAction("関連付けで開く...")
         location_action = menu.addAction("エクスプローラーで開く")
-        open_action.setEnabled(selection_count == 1)
-        location_action.setEnabled(selection_count == 1)
+        target_exists = bool(
+            item is not None
+            and self._absolute_browser_path(item.path).exists()
+        )
+        open_action.setEnabled(selection_count == 1 and item is not None)
+        open_with_action.setEnabled(
+            selection_count == 1
+            and item is not None
+            and item.kind is not BrowserItemKind.FOLDER
+            and target_exists
+        )
+        location_action.setEnabled(item is not None and target_exists)
         menu.addSeparator()
         cut_action = menu.addAction("切り取り")
         copy_action = menu.addAction("コピー")
@@ -4618,13 +4660,10 @@ class BrowserWindow(QMainWindow):
         selected = menu.exec(self.list_view.viewport().mapToGlobal(position))
         if selected == open_action and item is not None:
             self.open_item(index)
+        elif selected == open_with_action and item is not None:
+            self._open_with_application_picker(item)
         elif selected == location_action and item is not None:
-            target = (
-                item.path
-                if item.kind is BrowserItemKind.FOLDER
-                else item.path.parent
-            )
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+            self._open_item_in_explorer(item)
         elif selected == cut_action:
             self.cut_selected_items()
         elif selected == copy_action:
