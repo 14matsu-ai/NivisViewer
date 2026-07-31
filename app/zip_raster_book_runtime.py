@@ -179,6 +179,7 @@ class ZipRasterRequest:
     current: ZipRasterDisplayUnit
     work_order: tuple[ZipRasterDisplayUnit, ...]
     render_spec: ZipRasterRenderSpec
+    navigation_direction: int = 0
 
     def __post_init__(self) -> None:
         order = tuple(self.work_order)
@@ -198,6 +199,12 @@ class ZipRasterRequest:
         object.__setattr__(self, "source_epoch", int(self.source_epoch))
         object.__setattr__(self, "request_id", int(self.request_id))
         object.__setattr__(self, "work_order", tuple(normalized))
+        direction = int(self.navigation_direction)
+        object.__setattr__(
+            self,
+            "navigation_direction",
+            -1 if direction < 0 else 1 if direction > 0 else 0,
+        )
 
 
 @dataclass(frozen=True)
@@ -235,6 +242,8 @@ class ZipRasterRuntimeMetrics:
     cancel_requests: int = 0
     stale_results: int = 0
     terminal_errors: int = 0
+    cache_evictions: int = 0
+    prefetch_admission_stops: int = 0
 
 
 @dataclass(frozen=True)
@@ -286,6 +295,180 @@ class _CachedFrame:
     pages: tuple[ZipRasterFramePage, ...]
     worker_completed_at: float
     gui_ready_at: float
+
+
+class _ZipRasterFrameStore:
+    """Own completed frames independently from the active worker frontier.
+
+    ZipPlaFork's ``BackgroundMultiWorker`` order also supplies the eviction
+    priority used by ``ViewerForm.ReduceUsingMemory``.  The previous runtime
+    incorrectly treated the three currently scheduled units as the complete
+    cache membership and discarded every other completed frame on each page
+    request.  This store keeps completed work until the configured unit/byte
+    budget actually requires eviction, while the current -> next -> previous
+    order ranks the protected neighborhood.
+
+    The full-book order is represented as a distance/direction rank instead of
+    allocating a Python object for every page on every wheel event.  Only the
+    small active frontier is materialized by ``ZipRasterRequest``.
+    """
+
+    def __init__(self, *, unit_limit: int, byte_budget: int) -> None:
+        self._frames: OrderedDict[_UnitKey, _CachedFrame] = OrderedDict()
+        self._unit_limit = max(1, int(unit_limit))
+        self._byte_budget = max(1, int(byte_budget))
+        self._active_order: tuple[_UnitKey, ...] = ()
+        self._current_key: _UnitKey | None = None
+        self._direction = 0
+
+    def __contains__(self, key: _UnitKey) -> bool:
+        return key in self._frames
+
+    @property
+    def unit_count(self) -> int:
+        return len(self._frames)
+
+    @property
+    def page_indexes(self) -> tuple[int, ...]:
+        return tuple(
+            page.page_index
+            for frame in self._frames.values()
+            for page in frame.unit.pages
+        )
+
+    @property
+    def byte_size(self) -> int:
+        return sum(self._frame_bytes(frame) for frame in self._frames.values())
+
+    def get(self, key: _UnitKey, *, touch: bool = False) -> _CachedFrame | None:
+        frame = self._frames.get(key)
+        if frame is not None and touch:
+            self._frames.move_to_end(key)
+        return frame
+
+    def values(self) -> tuple[_CachedFrame, ...]:
+        return tuple(self._frames.values())
+
+    def clear(self) -> None:
+        self._frames.clear()
+
+    def set_limits(
+        self,
+        *,
+        unit_limit: int | None = None,
+        byte_budget: int | None = None,
+    ) -> int:
+        if unit_limit is not None:
+            self._unit_limit = max(1, int(unit_limit))
+        if byte_budget is not None:
+            self._byte_budget = max(1, int(byte_budget))
+        return self._prune()
+
+    def set_retention_order(
+        self,
+        active_order: tuple[_UnitKey, ...],
+        current_key: _UnitKey | None,
+        direction: int,
+    ) -> int:
+        self._active_order = tuple(active_order)
+        self._current_key = current_key
+        normalized_direction = int(direction)
+        if normalized_direction < 0:
+            self._direction = -1
+        elif normalized_direction > 0:
+            self._direction = 1
+        else:
+            self._direction = 0
+        return self._prune()
+
+    def put(self, frame: _CachedFrame) -> tuple[bool, int]:
+        self._frames[frame.key] = frame
+        self._frames.move_to_end(frame.key)
+        evicted = self._prune()
+        return frame.key in self._frames, evicted
+
+    def can_admit_prefetch(self, key: _UnitKey) -> bool:
+        if key in self._frames:
+            return False
+        if (
+            len(self._frames) < self._unit_limit
+            and self.byte_size < self._byte_budget
+        ):
+            return True
+        victim = self._eviction_candidate()
+        if victim is None:
+            return False
+        # A newly relevant neighbor may replace an older/farther frame, but a
+        # background request never churns an equal-or-better retained frame.
+        return self._retention_rank(key) < self._retention_rank(victim)
+
+    def _prune(self) -> int:
+        evicted = 0
+        while (
+            len(self._frames) > self._unit_limit
+            or self.byte_size > self._byte_budget
+        ):
+            removable = self._eviction_candidate()
+            if removable is None:
+                # A single current frame may legitimately exceed the byte
+                # budget. Keeping it is required by the old-frame/atomic
+                # commit contract; no background frame is admitted beside it.
+                break
+            self._frames.pop(removable, None)
+            evicted += 1
+        return evicted
+
+    def _eviction_candidate(self) -> _UnitKey | None:
+        candidates = tuple(
+            key for key in self._frames if key != self._current_key
+        )
+        if not candidates:
+            return None
+        positions = {key: index for index, key in enumerate(self._frames)}
+        return max(
+            candidates,
+            key=lambda key: (
+                self._retention_rank(key),
+                -positions[key],
+            ),
+        )
+
+    def _retention_rank(self, key: _UnitKey) -> tuple[int, int, int]:
+        try:
+            return (0, self._active_order.index(key), 0)
+        except ValueError:
+            pass
+        current = self._current_key
+        if current is None:
+            return (1, 0, 0)
+        current_anchor = self._unit_anchor(current)
+        candidate_anchor = self._unit_anchor(key)
+        delta = candidate_anchor - current_anchor
+        direction_penalty = int(
+            self._direction != 0
+            and delta != 0
+            and (1 if delta > 0 else -1) != self._direction
+        )
+        return (1, abs(delta), direction_penalty)
+
+    @staticmethod
+    def _unit_anchor(key: _UnitKey) -> int:
+        indexes = tuple(page_index for page_index, _image_id in key.unit_identity)
+        return min(indexes) if indexes else 0
+
+    @staticmethod
+    def _frame_bytes(frame: _CachedFrame) -> int:
+        pixmap_bytes = sum(
+            page.pixmap.width() * page.pixmap.height() * 4
+            for page in frame.pages
+            if page.pixmap is not None
+        )
+        qimages: dict[int, QImage] = {}
+        for page in frame.pages:
+            if page.source_qimage is not None:
+                qimages[int(page.source_qimage.cacheKey())] = page.source_qimage
+        source_bytes = sum(image.sizeInBytes() for image in qimages.values())
+        return pixmap_bytes + source_bytes
 
 
 class _JobSignals(QObject):
@@ -704,12 +887,14 @@ class ZipRasterBookRuntime(QObject):
         self._work_keys: tuple[_UnitKey, ...] = ()
         self._unit_by_key: dict[_UnitKey, ZipRasterDisplayUnit] = {}
         self._prefetch_released_request_id: int | None = None
+        self._prefetch_admission_stopped_request_id: int | None = None
         self._active_job: _ZipRasterUnitJob | None = None
         self._jobs: set[_ZipRasterUnitJob] = set()
-        self._frames: OrderedDict[_UnitKey, _CachedFrame] = OrderedDict()
         self._failed_prefetch: set[_UnitKey] = set()
-        self._cache_unit_limit = max(1, int(cache_unit_limit))
-        self._cache_byte_budget = max(1, int(cache_byte_budget))
+        self._frame_store = _ZipRasterFrameStore(
+            unit_limit=cache_unit_limit,
+            byte_budget=cache_byte_budget,
+        )
         self._metrics = ZipRasterRuntimeMetrics()
 
     @property
@@ -725,15 +910,15 @@ class ZipRasterBookRuntime(QObject):
 
     @property
     def cached_page_indexes(self) -> tuple[int, ...]:
-        return tuple(
-            page.page_index
-            for frame in self._frames.values()
-            for page in frame.unit.pages
-        )
+        return self._frame_store.page_indexes
+
+    @property
+    def cached_unit_count(self) -> int:
+        return self._frame_store.unit_count
 
     @property
     def cache_bytes(self) -> int:
-        return sum(self._frame_bytes(frame) for frame in self._frames.values())
+        return self._frame_store.byte_size
 
     def set_cache_limits(
         self,
@@ -741,14 +926,18 @@ class ZipRasterBookRuntime(QObject):
         unit_limit: int | None = None,
         byte_budget: int | None = None,
     ) -> None:
-        if unit_limit is not None:
-            self._cache_unit_limit = max(1, int(unit_limit))
-        if byte_budget is not None:
-            self._cache_byte_budget = max(1, int(byte_budget))
-        self._prune_frames()
+        evicted = self._frame_store.set_limits(
+            unit_limit=unit_limit,
+            byte_budget=byte_budget,
+        )
+        if evicted:
+            self._bump("cache_evictions", evicted)
 
     def has_cached_current(self, request: ZipRasterRequest) -> bool:
-        return self._key_for(request.current, request.render_spec) in self._frames
+        return (
+            self._key_for(request.current, request.render_spec)
+            in self._frame_store
+        )
 
     def request(self, request: ZipRasterRequest) -> bool:
         if (
@@ -766,6 +955,14 @@ class ZipRasterBookRuntime(QObject):
         self._work_keys = work_keys
         self._unit_by_key = dict(zip(work_keys, request.work_order))
         self._prefetch_released_request_id = None
+        self._prefetch_admission_stopped_request_id = None
+        evicted = self._frame_store.set_retention_order(
+            work_keys,
+            current_key,
+            request.navigation_direction,
+        )
+        if evicted:
+            self._bump("cache_evictions", evicted)
         # Admission/failure suppression belongs to one replaceable work order.
         # A later navigation may make a previously rejected neighbor current,
         # and must get a fresh attempt.
@@ -775,21 +972,19 @@ class ZipRasterBookRuntime(QObject):
         if active is not None:
             if active.key == current_key:
                 active.adopt_request(request.request_id)
-            elif current_key in self._frames and active.key in work_keys:
+            elif current_key in self._frame_store and active.key in work_keys:
                 # A same-current refresh or a compatible work-order change can
                 # adopt an already useful neighbor instead of restarting it.
                 active.adopt_request(request.request_id)
             else:
                 self._cancel_active_job()
 
-        frame = self._frames.get(current_key)
+        frame = self._frame_store.get(current_key, touch=True)
         if frame is not None:
-            self._frames.move_to_end(current_key)
             self._bump("cache_hits")
             self.frameReady.emit(self._public_frame(request, frame, True))
         else:
             self._bump("cache_misses")
-        self._prune_frames()
         self._drive()
         return True
 
@@ -798,7 +993,7 @@ class ZipRasterBookRuntime(QObject):
         if (
             request is None
             or int(request_id) != request.request_id
-            or self._current_key not in self._frames
+            or self._current_key not in self._frame_store
         ):
             return False
         self._prefetch_released_request_id = request.request_id
@@ -811,10 +1006,12 @@ class ZipRasterBookRuntime(QObject):
         self._work_keys = ()
         self._unit_by_key.clear()
         self._prefetch_released_request_id = None
+        self._prefetch_admission_stopped_request_id = None
         self._failed_prefetch.clear()
         self._cancel_active_job()
         if clear_artifacts:
-            self._frames.clear()
+            self._frame_store.clear()
+        self._frame_store.set_retention_order((), None, 0)
 
     def invalidate_layout(self) -> None:
         self.cancel(clear_artifacts=True)
@@ -853,14 +1050,22 @@ class ZipRasterBookRuntime(QObject):
             or self._active_job is not None
         ):
             return
-        if self._current_key not in self._frames:
+        if self._current_key not in self._frame_store:
             self._submit(self._current_key, ImageWorkPriority.VIEWER_CURRENT)
             return
         if self._prefetch_released_request_id != request.request_id:
             return
         for rank, key in enumerate(self._work_keys[1:]):
-            if key in self._frames or key in self._failed_prefetch:
+            if key in self._frame_store or key in self._failed_prefetch:
                 continue
+            if not self._frame_store.can_admit_prefetch(key):
+                if (
+                    self._prefetch_admission_stopped_request_id
+                    != request.request_id
+                ):
+                    self._prefetch_admission_stopped_request_id = request.request_id
+                    self._bump("prefetch_admission_stops")
+                return
             priority = (
                 ImageWorkPriority.VIEWER_NEXT
                 if rank == 0
@@ -931,10 +1136,10 @@ class ZipRasterBookRuntime(QObject):
         )
         ready_at = monotonic()
         cached = _CachedFrame(key, unit, pages, ready_at, ready_at)
-        self._frames[key] = cached
-        self._frames.move_to_end(key)
+        _retained, evicted = self._frame_store.put(cached)
+        if evicted:
+            self._bump("cache_evictions", evicted)
         self._bump("terminal_errors", len(pages))
-        self._prune_frames()
         if (
             self._accepting_requests
             and self._current_request is request
@@ -1031,10 +1236,10 @@ class ZipRasterBookRuntime(QObject):
             result.completed_at,
             gui_ready,
         )
-        self._frames[result.key] = cached
-        self._frames.move_to_end(result.key)
-        self._prune_frames()
-        if result.key != self._current_key and result.key not in self._frames:
+        retained, evicted = self._frame_store.put(cached)
+        if evicted:
+            self._bump("cache_evictions", evicted)
+        if result.key != self._current_key and not retained:
             # The artifact could not coexist with the protected current frame
             # under the byte/unit budget.  Do not immediately decode the same
             # prefetch forever; a new request/work order may retry it.
@@ -1055,50 +1260,6 @@ class ZipRasterBookRuntime(QObject):
             and result.key.source_identity == self._source_identity
             and result.key in self._work_keys
         )
-
-    def _prune_frames(self) -> None:
-        desired = set(self._work_keys)
-        for key in tuple(self._frames):
-            if desired and key not in desired:
-                self._frames.pop(key, None)
-        while (
-            len(self._frames) > self._cache_unit_limit
-            or self.cache_bytes > self._cache_byte_budget
-        ):
-            removable = next(
-                (
-                    key
-                    for key in reversed(self._work_keys)
-                    if key in self._frames and key != self._current_key
-                ),
-                None,
-            )
-            if removable is None:
-                removable = next(
-                    (
-                        key
-                        for key in self._frames
-                        if key != self._current_key
-                    ),
-                    None,
-                )
-            if removable is None:
-                break
-            self._frames.pop(removable, None)
-
-    @staticmethod
-    def _frame_bytes(frame: _CachedFrame) -> int:
-        pixmap_bytes = sum(
-            page.pixmap.width() * page.pixmap.height() * 4
-            for page in frame.pages
-            if page.pixmap is not None
-        )
-        qimages: dict[int, QImage] = {}
-        for page in frame.pages:
-            if page.source_qimage is not None:
-                qimages[int(page.source_qimage.cacheKey())] = page.source_qimage
-        source_bytes = sum(image.sizeInBytes() for image in qimages.values())
-        return pixmap_bytes + source_bytes
 
     def _key_for(
         self,
