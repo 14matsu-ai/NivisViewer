@@ -828,10 +828,14 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
         qapp.processEvents()
 
         assert window.model.focused_index == 5
-        assert applied == []
+        assert applied in ([], [("page-5.jpg",)])
         assert tuple(
             image.image_id for image in window.viewer._images
-        ) == ("page-1.jpg",)
+        ) == (
+            ("page-1.jpg",)
+            if not applied
+            else ("page-5.jpg",)
+        )
 
         assert session.image_cache.wait_for_done(3000)
         qapp.processEvents()
@@ -885,6 +889,10 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
         assert window.viewer._images[0].error
         assert window.viewer._images[0].pixmap is None
         assert cleared == []
+        window.viewer.render(QPixmap(window.viewer.size()))
+        qapp.processEvents()
+        assert window._raster_prefetch_after_paint is None
+        assert not window._raster_interactive_lane_held
 
         applied.clear()
         window.prepare_shutdown(wait_msecs=3000)

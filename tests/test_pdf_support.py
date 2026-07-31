@@ -729,7 +729,12 @@ def test_pdf_prefetch_presets_control_display_unit_range_and_memory(
         assert [
             request.page_index for request in backend.rendered
         ] == expected_pages
-        assert window.image_cache.cache_byte_budget_mib == memory_mib
+        assert window.viewer_cache_memory_mib == memory_mib
+        assert (
+            window.image_cache.cache_bytes
+            + window.viewer.render_cache_bytes()
+            <= memory_mib * 1024 * 1024
+        )
         if preset == "disabled":
             assert not window._pdf_prefetch_timer.isActive()
     finally:

@@ -7,15 +7,33 @@ NivisViewerは現在、次のソフトウェアを直接依存として使用し
 - natsort：ファイル名の自然順ソート
 - pypdfium2 / PDFium：PDFページの読み取り専用レンダリング
 
-性能設計の比較監査では、AGPL-3.0-or-laterのZipPlaFork
+Viewer性能設計の比較と構造移植には、AGPL-3.0-or-laterのZipPlaFork
 （https://github.com/himamon/ZipPlaFork、固定revision
-`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`、
-Copyright © 2016-2017 Rio's Toolbox）を参照しました。表示サイズ成果物、
-単一優先列、要求差し替え、メモリ上限の処理構造をNivisViewer向けに
-適用しています。今回、C#のソース表現、翻訳コード、binary、source
-fileは取り込まず、runtime／build依存にもしていません。固定revision、
-元file／method、処理、ライセンス由来、NivisViewer側の対応箇所と
-コード利用境界は`docs/ZIPPLAFORK_COMPARISON.md`に記録します。
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`）を使用しています。
+固定snapshotで確認したupstreamの表示は、`license/About.txt`の
+`Copyright ©  2016 Rio's Toolbox`と、
+`source/ZipPla/Properties/AssemblyInfo.cs`の
+`Copyright © 2016-2017 Rio's Toolbox`です。
+
+NivisViewerは、Viewerの単一execution lane、current中心のqueue再構築、
+1 display unitがdecodeからdisplay-ready terminalへ到達してから次unitを
+投入するpaced dispatch、完成frameのatomic publish、source/display cacheの
+連動したmemory policyをZipPlaFork由来の構造として適用しています。
+NivisViewerではliteralな1 worker jobへ統合せず、decode taskからQt signalを
+経てrender taskへ渡す境界を残したまま、同じ1-worker Viewer laneで順序を
+制御します。ZipPlaForkは移動方向を状態として追跡せず、新currentを基準に
+数値上のnext、previousの順で再計算します。NivisViewerの方向追跡、
+request/generation検証、16 ms入力coalescing、decoder-sized JPEGは独自拡張です。
+
+今回、C#のソース表現、pixel loop、GDI操作、翻訳コード、binary、upstream
+source fileは取り込まず、ZipPlaForkをruntime／build依存にもしていません。
+一方、repository規則に従い、上記アルゴリズム／処理構造は
+AGPL-3.0-or-later由来として扱います。固定revision、元file／class／method、
+処理内容、NivisViewer側の対応箇所、移植境界、cache accountingの相違は
+`docs/ZIPPLAFORK_COMPARISON.md`に記録しています。upstreamの完全な
+AGPL本文は`licenses/ZipPlaFork/AGPL.txt`、正式通知は
+`licenses/ZipPlaFork/About.txt`として、固定revisionの内容を変更せず保持して
+います。
 
 RAR／7z／CBR／CB7閲覧では、利用者環境のWindows関連付け、標準インストール先、PATH、または設定画面で指定されたWinRAR／7-Zipの認識済みCLIを任意で呼び出します。
 

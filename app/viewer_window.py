@@ -80,6 +80,7 @@ _DISPLAY_LOG = logging.getLogger("nivisviewer.viewer.display_unit")
 _PDF_PREFETCH_IDLE_GRACE_MS = 120
 _PREPARED_DISPLAY_IDLE_GRACE_MS = 16
 _DISPLAY_DEMAND_IDLE_GRACE_MS = 16
+_RASTER_PAINT_FALLBACK_MS = 250
 
 
 class ViewerWindow(QMainWindow):
@@ -171,6 +172,23 @@ class ViewerWindow(QMainWindow):
         self._pending_decode_demand: (
             tuple[int, int, int, tuple[int, ...]] | None
         ) = None
+        self._raster_prefetch_after_paint: (
+            tuple[int, int, tuple[int, ...]] | None
+        ) = None
+        self._raster_prefetch_plan: (
+            tuple[
+                int,
+                int,
+                int,
+                tuple[int, ...],
+                tuple[tuple[int, ...], ...],
+            ]
+            | None
+        ) = None
+        self._raster_prefetch_active_unit: tuple[int, ...] = tuple()
+        self._advancing_raster_prefetch = False
+        self._raster_interactive_lane_held = False
+        self._enforcing_combined_cache_budget = False
         self._visible_page_indexes: tuple[int, ...] = tuple()
         self._display_unit = ViewerDisplayUnit.empty()
         self._page_history_back: list[int] = []
@@ -303,6 +321,14 @@ class ViewerWindow(QMainWindow):
         self._decode_demand_timer.timeout.connect(
             self._apply_pending_decode_demand
         )
+        self._raster_paint_fallback_timer = QTimer(self)
+        self._raster_paint_fallback_timer.setSingleShot(True)
+        self._raster_paint_fallback_timer.setInterval(
+            _RASTER_PAINT_FALLBACK_MS
+        )
+        self._raster_paint_fallback_timer.timeout.connect(
+            self._release_raster_prefetch_without_paint
+        )
         self._raster_viewport_timer = QTimer(self)
         self._raster_viewport_timer.setSingleShot(True)
         self._raster_viewport_timer.setInterval(120)
@@ -384,7 +410,10 @@ class ViewerWindow(QMainWindow):
         return handled
 
     def _build_ui(self) -> None:
-        self.viewer = ViewerWidget(self)
+        self.viewer = ViewerWidget(
+            self,
+            image_work_coordinator=self.image_work_coordinator,
+        )
         self.slider = ViewerPageSlider(self)
         self.slider.set_page_state(0, 0)
 
@@ -438,6 +467,12 @@ class ViewerWindow(QMainWindow):
         self.viewer.contentPainted.connect(self._on_viewer_content_painted)
         self.viewer.displayCommitted.connect(
             self._on_prepared_display_committed
+        )
+        self.viewer.renderCacheChanged.connect(
+            self._on_viewer_render_cache_changed
+        )
+        self.viewer.renderWorkFinished.connect(
+            self._on_viewer_render_work_finished
         )
         self.viewer.magnifierPdfResolutionRequested.connect(
             self._request_pdf_magnifier_resolution
@@ -881,6 +916,7 @@ class ViewerWindow(QMainWindow):
         self.viewer.set_render_cache_byte_limit_mib(
             self.viewer_cache_memory_mib
         )
+        self._enforce_combined_cache_budget()
         self.viewer.set_gap(self.gap)
         self.viewer.set_join_spread_pages(self.join_spread_pages)
         self.viewer.set_rotation_angle(self.rotation_angle)
@@ -1113,6 +1149,41 @@ class ViewerWindow(QMainWindow):
             self.viewer.set_render_cache_byte_limit_mib(
                 self.viewer_cache_memory_mib
             )
+            self._enforce_combined_cache_budget()
+
+    def _enforce_combined_cache_budget(self) -> None:
+        if (
+            self._enforcing_combined_cache_budget
+            or not hasattr(self, "viewer")
+        ):
+            return
+        self._enforcing_combined_cache_budget = True
+        try:
+            total_bytes = max(
+                64,
+                min(4096, int(self.viewer_cache_memory_mib)),
+            ) * 1024 * 1024
+            # ZipPlaFork evicts the prefiltered source and display artifact for
+            # a page together under one display-driven memory policy. Rebalance
+            # both resident Nivis caches against one configured total instead
+            # of granting that total independently to each cache.
+            for _iteration in range(3):
+                render_bytes = self.viewer.render_cache_bytes()
+                self.image_cache.set_cache_byte_budget_bytes(
+                    max(1, total_bytes - render_bytes)
+                )
+                source_bytes = self.image_cache.cache_bytes
+                self.viewer.set_render_cache_byte_limit_bytes(
+                    max(1, total_bytes - source_bytes)
+                )
+                if (
+                    self.image_cache.cache_bytes
+                    + self.viewer.render_cache_bytes()
+                    <= total_bytes
+                ):
+                    break
+        finally:
+            self._enforcing_combined_cache_budget = False
 
     def _reapply_prefetch_settings(self) -> None:
         if self._shutdown_prepared or not self.model.total_pages:
@@ -2086,6 +2157,11 @@ class ViewerWindow(QMainWindow):
                 for slot in spread.slots
             ),
         )
+        if self.viewer.has_pending_prepared_rendering():
+            # ZipPlaFork rebuilds the one pending work order around every new
+            # current page. Replan queued display preparation here rather than
+            # leaving the old direction active until the idle timer fires.
+            self._schedule_prepared_display_prefetch()
         if self.viewer.apply_prepared_display(
             spread,
             source_generation=self.image_cache.generation,
@@ -2115,6 +2191,9 @@ class ViewerWindow(QMainWindow):
         )
         if isinstance(self.image_cache.source, PdfImageSource):
             self._cancel_pending_decode_demand()
+            self._raster_paint_fallback_timer.stop()
+            self._raster_prefetch_after_paint = None
+            self._release_raster_interactive_lane()
             self._prepare_deferred_pdf_prefetch(
                 request_center,
                 gated_visible_indexes,
@@ -2341,6 +2420,14 @@ class ViewerWindow(QMainWindow):
         prefetch_indexes = tuple(
             index for unit in prefetch_units for index in unit
         )
+        if not immediate_only:
+            self._start_raster_prefetch_pipeline(
+                center_index,
+                visible_indexes,
+                prefetch_units,
+            )
+            return
+        self._clear_raster_prefetch_pipeline()
         self.image_cache.preload_around(
             center_index,
             radius=0,
@@ -2354,12 +2441,204 @@ class ViewerWindow(QMainWindow):
             prefetch_units=prefetch_units,
         )
 
+    def _start_raster_prefetch_pipeline(
+        self,
+        center_index: int,
+        visible_indexes: tuple[int, ...],
+        prefetch_units: tuple[tuple[int, ...], ...],
+    ) -> None:
+        """Run one complete display unit through decode and scale at a time.
+
+        ZipPlaFork revision 07955f5267e2fb92d6fc6e40fde2507d8fb07b3b
+        uses one page worker whose job owns entry read through display-ready
+        publication. NivisViewer retains separate typed decode/render tasks,
+        but this dispatcher gives them the same execution semantics: the next
+        unit is not admitted until the active unit has a complete prepared
+        display. See docs/ZIPPLAFORK_COMPARISON.md (AGPL-3.0-or-later).
+        """
+        normalized_units = tuple(
+            tuple(dict.fromkeys(int(index) for index in unit))
+            for unit in prefetch_units
+            if unit
+        )
+        self._raster_prefetch_plan = (
+            int(self.image_cache.generation),
+            int(self._active_request_id),
+            int(center_index),
+            tuple(int(index) for index in visible_indexes),
+            normalized_units,
+        )
+        self._raster_prefetch_active_unit = tuple()
+        if not normalized_units:
+            self.image_cache.preload_around(
+                center_index,
+                radius=0,
+                visible_indexes=visible_indexes,
+                preferred_direction=(
+                    self._last_preload_direction
+                    if self.prefetch_direction_priority_enabled
+                    else 0
+                ),
+                prefetch_indexes=tuple(),
+                prefetch_units=tuple(),
+            )
+            self._raster_prefetch_plan = None
+            return
+        self._advance_raster_prefetch_pipeline()
+
+    def _advance_raster_prefetch_pipeline(self) -> None:
+        if self._advancing_raster_prefetch:
+            return
+        self._advancing_raster_prefetch = True
+        try:
+            plan = self._raster_prefetch_plan
+            if plan is None:
+                return
+            (
+                generation,
+                request_id,
+                center_index,
+                visible_indexes,
+                remaining_units,
+            ) = plan
+            if (
+                self._shutdown_prepared
+                or isinstance(self.image_cache.source, PdfImageSource)
+                or generation != self.image_cache.generation
+                or request_id != self._active_request_id
+                or visible_indexes != self._visible_page_indexes
+            ):
+                self._clear_raster_prefetch_pipeline()
+                return
+
+            active_unit = self._raster_prefetch_active_unit
+            if active_unit:
+                active_spread = self.model.spread_at(
+                    self.model.spread_start_for_index(active_unit[0])
+                )
+                if not self.viewer.prepared_display_is_ready(
+                    active_spread,
+                    source_generation=generation,
+                    source_identity=self._prepared_source_identity(),
+                ):
+                    missing_sources = tuple(
+                        index
+                        for index in active_unit
+                        if not self.image_cache.contains(index)
+                    )
+                    if missing_sources and any(
+                        self.image_cache.has_pending_page(index)
+                        for index in missing_sources
+                    ):
+                        return
+                    if missing_sources or self.viewer.tracks_prepared_display_unit(
+                        active_spread,
+                        source_generation=generation,
+                        source_identity=self._prepared_source_identity(),
+                    ):
+                        return
+                    # The active unit was cancelled, rejected by the current
+                    # byte budget, or reached a terminal render failure.
+                    # Never wait forever and never admit farther work after an
+                    # unrenderable source unit.
+                    self._clear_raster_prefetch_pipeline()
+                    return
+                self._raster_prefetch_active_unit = tuple()
+
+            while remaining_units:
+                unit = remaining_units[0]
+                remaining_units = remaining_units[1:]
+                self._raster_prefetch_plan = (
+                    generation,
+                    request_id,
+                    center_index,
+                    visible_indexes,
+                    remaining_units,
+                )
+                spread = self.model.spread_at(
+                    self.model.spread_start_for_index(unit[0])
+                )
+                if self.viewer.prepared_display_is_ready(
+                    spread,
+                    source_generation=generation,
+                    source_identity=self._prepared_source_identity(),
+                ):
+                    continue
+                self._raster_prefetch_active_unit = unit
+                protected_source_indexes = tuple(
+                    dict.fromkeys((*visible_indexes, *unit))
+                )
+                self.image_cache.preload_around(
+                    center_index,
+                    radius=0,
+                    visible_indexes=protected_source_indexes,
+                    preferred_direction=(
+                        self._last_preload_direction
+                        if self.prefetch_direction_priority_enabled
+                        else 0
+                    ),
+                    prefetch_indexes=unit,
+                    prefetch_units=(unit,),
+                )
+                if any(
+                    not self.image_cache.contains(index)
+                    and not self.image_cache.has_pending_page(index)
+                    for index in unit
+                ):
+                    # The combined resident-cache budget could not admit the
+                    # complete display unit. Stop prefetch at this frontier.
+                    self._clear_raster_prefetch_pipeline()
+                    return
+                # A source-cache hit can make preparation synchronous. A miss
+                # will return here and pageLoaded/renderCacheChanged resumes
+                # the pipeline after the unit becomes display-ready.
+                self._schedule_prepared_display_prefetch()
+                if not self.viewer.prepared_display_is_ready(
+                    spread,
+                    source_generation=generation,
+                    source_identity=self._prepared_source_identity(),
+                ):
+                    return
+                self._raster_prefetch_active_unit = tuple()
+
+            self._clear_raster_prefetch_pipeline()
+        finally:
+            self._advancing_raster_prefetch = False
+
+    def _clear_raster_prefetch_pipeline(self) -> None:
+        self._raster_prefetch_plan = None
+        self._raster_prefetch_active_unit = tuple()
+        if self.model.total_pages:
+            visible_indexes = self._visible_page_indexes or tuple(
+                slot.page_index for slot in self.model.spread_at().slots
+            )
+            # Active-unit source protection is temporary. ZipPlaFork drops a
+            # page's source and display artifact under the same terminal
+            # lifecycle; keeping the last admitted source protected after our
+            # split pipeline finishes would strand a far full-size raster.
+            self.image_cache.retain_visible_only(
+                self.model.focused_index,
+                visible_indexes,
+            )
+
     def _queue_decode_demand(
         self,
         request_id: int,
         center_index: int,
         visible_indexes: tuple[int, ...],
     ) -> None:
+        self._clear_raster_prefetch_pipeline()
+        staged = self._raster_prefetch_after_paint
+        if (
+            staged is not None
+            and (
+                staged[0] != self.image_cache.generation
+                or staged[2] != tuple(visible_indexes)
+            )
+        ):
+            self._raster_paint_fallback_timer.stop()
+            self._raster_prefetch_after_paint = None
+            self._release_raster_interactive_lane()
         self._pending_decode_demand = (
             int(request_id),
             int(self.image_cache.generation),
@@ -2392,11 +2671,72 @@ class ViewerWindow(QMainWindow):
             or visible_indexes != self._visible_page_indexes
         ):
             return
-        self._preload_image_source(center_index, visible_indexes)
+        staged = self._raster_prefetch_after_paint
+        current_stage = (
+            staged is not None
+            and staged[0] == generation
+            and staged[2] == visible_indexes
+        )
+        target_already_displayed = (
+            self.viewer.displayed_page_indexes == visible_indexes
+        )
+        cold_current = current_stage or not target_already_displayed
+        if cold_current:
+            # ZipPlaFork's page worker completes decode -> resize -> publish
+            # before it advances to the next queued page. NivisViewer has
+            # separate decode and display-preparation stages, so hold every
+            # non-visible prefetch until this unit has actually painted.
+            self._raster_prefetch_after_paint = (
+                generation,
+                center_index,
+                visible_indexes,
+            )
+            self._hold_raster_interactive_lane()
+        else:
+            self._release_raster_interactive_lane()
+        self._preload_image_source(
+            center_index,
+            visible_indexes,
+            immediate_only=cold_current,
+        )
 
     def _cancel_pending_decode_demand(self) -> None:
         self._decode_demand_timer.stop()
         self._pending_decode_demand = None
+        self._clear_raster_prefetch_pipeline()
+
+    def _hold_raster_interactive_lane(self) -> None:
+        if (
+            self._raster_interactive_lane_held
+            or self.image_work_coordinator is None
+        ):
+            return
+        self._raster_interactive_lane_held = True
+        self.image_work_coordinator.begin_viewer_interactive()
+
+    def _release_raster_interactive_lane(self) -> None:
+        if (
+            not self._raster_interactive_lane_held
+            or self.image_work_coordinator is None
+        ):
+            return
+        self._raster_interactive_lane_held = False
+        self.image_work_coordinator.end_viewer_interactive()
+
+    def _release_raster_prefetch_without_paint(self) -> None:
+        staged = self._raster_prefetch_after_paint
+        if staged is None:
+            return
+        self._raster_prefetch_after_paint = None
+        self._release_raster_interactive_lane()
+        if (
+            self._shutdown_prepared
+            or isinstance(self.image_cache.source, PdfImageSource)
+            or staged[0] != self.image_cache.generation
+            or staged[2] != self.viewer.displayed_page_indexes
+        ):
+            return
+        self._preload_image_source(staged[1], staged[2])
 
     def _next_pdf_rolling_indexes(
         self,
@@ -2618,9 +2958,17 @@ class ViewerWindow(QMainWindow):
         )
         existing = self._pending_display_demand
         self._pending_display_demand = demand
+        staged = self._raster_prefetch_after_paint
+        current_cold_stage = (
+            staged is not None
+            and staged[0] == self.image_cache.generation
+            and staged[2]
+            == tuple(slot.page_index for slot in spread.slots)
+        )
         if (
             not self.viewer.displayed_page_indexes
             or self._awaiting_first_frame
+            or current_cold_stage
         ):
             self._display_demand_timer.stop()
             self._apply_pending_display_demand()
@@ -2808,6 +3156,7 @@ class ViewerWindow(QMainWindow):
             or cached.generation != self.image_cache.generation
         ):
             return
+        self._enforce_combined_cache_budget()
         self._display_unit = self._display_unit.transition(
             page_index=cached.page_index,
             image_id=cached.image_id,
@@ -2860,11 +3209,20 @@ class ViewerWindow(QMainWindow):
                     self._preload_image_source(
                         self.model.focused_index,
                         self._visible_page_indexes,
+                        immediate_only=True,
                     )
             return
         if cached.page_index not in self._visible_page_indexes:
             self._update_page_list_thumbnail(cached)
-            self._arm_prepared_display_prefetch()
+            if cached.page_index in self._raster_prefetch_active_unit:
+                # The paced raster dispatcher has no farther unit admitted.
+                # Continue this unit directly into display preparation rather
+                # than paying the generic background-idle delay between the
+                # decode and scale stages.
+                self._prepared_display_timer.stop()
+                self._schedule_prepared_display_prefetch()
+            else:
+                self._arm_prepared_display_prefetch()
             return
         if first_frame_result:
             # The logical current page has completed decoding, so the reserved
@@ -2880,6 +3238,7 @@ class ViewerWindow(QMainWindow):
                 self._preload_image_source(
                     self.model.focused_index,
                     self._visible_page_indexes,
+                    immediate_only=True,
                 )
         if cached.page_index in self._visible_page_indexes:
             self._arm_deferred_pdf_prefetch()
@@ -2895,6 +3254,16 @@ class ViewerWindow(QMainWindow):
         # Native QMenu reconstruction is deferred until the user opens it;
         # this slot is delivered synchronously during ready-page navigation.
         self._arm_prepared_display_prefetch()
+        staged = self._raster_prefetch_after_paint
+        if (
+            staged is not None
+            and staged[0] == self.image_cache.generation
+            and staged[2] == self.viewer.displayed_page_indexes
+        ):
+            # Visible windows normally clear this on the next paint. The
+            # bounded fallback prevents a hidden/minimized/error-only frame
+            # from leaving Browser work paused indefinitely.
+            self._raster_paint_fallback_timer.start()
 
     def _arm_prepared_display_prefetch(
         self,
@@ -3014,17 +3383,57 @@ class ViewerWindow(QMainWindow):
             seen.add(start)
             spread = self.model.spread_at(start)
             pages = self._cached_pages_for_prepared_spread(spread)
+            active_unit = set(self._raster_prefetch_active_unit)
             protected = (
                 start == current_start
                 or (forward_starts and start == forward_starts[0])
                 or (backward_starts and start == backward_starts[0])
+                or (
+                    bool(active_unit)
+                    and active_unit
+                    == {slot.page_index for slot in spread.slots}
+                )
             )
             plan.append((priority, spread, pages, protected))
         self.viewer.prepare_display_units(plan)
+        self._advance_raster_prefetch_pipeline()
+
+    def _on_viewer_render_cache_changed(self) -> None:
+        self._advance_raster_prefetch_pipeline()
+        self._enforce_combined_cache_budget()
+        self._advance_raster_prefetch_pipeline()
+
+    def _on_viewer_render_work_finished(
+        self,
+        render_key: object,
+        succeeded: bool,
+    ) -> None:
+        if succeeded or not self._raster_prefetch_active_unit:
+            return
+        image_id = str(getattr(render_key, "image_id", ""))
+        active_ids = tuple(
+            self.model.image_id_at(index)
+            for index in self._raster_prefetch_active_unit
+        )
+        if not any(
+            expected is not None
+            and (
+                image_id == expected
+                or image_id.startswith(f"{expected}#")
+            )
+            for expected in active_ids
+        ):
+            return
+        self._clear_raster_prefetch_pipeline()
+        self._enforce_combined_cache_budget()
 
     def _begin_interactive_open(self) -> None:
         if self._awaiting_first_frame:
             self.interactive_open_cancelled.emit(self)
+        self._raster_prefetch_after_paint = None
+        self._raster_paint_fallback_timer.stop()
+        self._clear_raster_prefetch_pipeline()
+        self._release_raster_interactive_lane()
         self._awaiting_first_frame = True
         self._first_frame_image_id = None
         self.interactive_open_started.emit(self)
@@ -3040,6 +3449,20 @@ class ViewerWindow(QMainWindow):
         if isinstance(image_ids, tuple):
             self._arm_prepared_display_prefetch(after_paint=True)
             self._arm_deferred_pdf_prefetch()
+            staged = self._raster_prefetch_after_paint
+            if (
+                staged is not None
+                and not isinstance(
+                    self.image_cache.source,
+                    PdfImageSource,
+                )
+                and staged[0] == self.image_cache.generation
+                and staged[2] == self.viewer.displayed_page_indexes
+            ):
+                self._raster_paint_fallback_timer.stop()
+                self._raster_prefetch_after_paint = None
+                self._release_raster_interactive_lane()
+                self._preload_image_source(staged[1], staged[2])
         if (
             not self._awaiting_first_frame
             or not self._first_frame_image_id
@@ -3861,6 +4284,10 @@ class ViewerWindow(QMainWindow):
         self._pdf_render_timer.stop()
         self._prepared_display_timer.stop()
         self._raster_viewport_timer.stop()
+        self._raster_paint_fallback_timer.stop()
+        self._raster_prefetch_after_paint = None
+        self._clear_raster_prefetch_pipeline()
+        self._release_raster_interactive_lane()
         self._cancel_pending_display_demand()
         self._cancel_pending_decode_demand()
         self._cancel_deferred_pdf_prefetch()

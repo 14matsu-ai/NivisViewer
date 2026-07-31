@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import threading
+from unittest.mock import Mock
 
 import pytest
 from PySide6.QtCore import QEvent, QRect, QSize
@@ -10,6 +11,7 @@ from PySide6.QtWidgets import QApplication
 
 from app.config_manager import ConfigManager
 from app.image_cache import CachedImage, ImageCache
+from app.image_work_coordinator import ImageWorkPriority
 from app.page_model import DisplaySpread, PageSlot
 from app.viewer_render import ViewerRenderKey, ViewerRenderResult
 from app import viewer_render as viewer_render_module
@@ -319,6 +321,7 @@ def test_spread_unit_is_not_ready_until_both_page_results_arrive(
 
 
 def test_preparation_priorities_are_current_next_previous_then_next_next(
+    qapp: QApplication,
     monkeypatch,
 ) -> None:
     widget = ViewerWidget()
@@ -343,10 +346,10 @@ def test_preparation_priorities_are_current_next_previous_then_next_next(
     )
 
     assert queued == [
-        ("page-2.png", 80),
-        ("page-3.png", 70),
-        ("page-1.png", 60),
-        ("page-4.png", 50),
+        ("page-2.png", int(ImageWorkPriority.VIEWER_SPREAD_PARTNER)),
+        ("page-3.png", int(ImageWorkPriority.VIEWER_SPREAD_PARTNER) - 1),
+        ("page-1.png", int(ImageWorkPriority.VIEWER_SPREAD_PARTNER) - 2),
+        ("page-4.png", int(ImageWorkPriority.VIEWER_SPREAD_PARTNER) - 3),
     ]
     widget.close()
 
@@ -439,10 +442,10 @@ def test_direction_reversal_reprioritizes_retained_queued_requests(
     )
 
     assert [priority for _task, priority in pool.started] == [
-        70,
-        50,
-        70,
-        50,
+        int(ImageWorkPriority.VIEWER_SPREAD_PARTNER) - 1,
+        int(ImageWorkPriority.VIEWER_SPREAD_PARTNER) - 3,
+        int(ImageWorkPriority.VIEWER_SPREAD_PARTNER) - 1,
+        int(ImageWorkPriority.VIEWER_SPREAD_PARTNER) - 3,
     ]
     assert len(pool.taken) == 2
     priorities = {
@@ -450,8 +453,8 @@ def test_direction_reversal_reprioritizes_retained_queued_requests(
         for key, priority in widget._render_priorities.items()
     }
     assert priorities == {
-        "page-1.png": 50,
-        "page-2.png": 70,
+        "page-1.png": int(ImageWorkPriority.VIEWER_SPREAD_PARTNER) - 3,
+        "page-2.png": int(ImageWorkPriority.VIEWER_SPREAD_PARTNER) - 1,
     }
     widget.close()
 
@@ -489,9 +492,15 @@ def test_prefetch_replan_does_not_downgrade_pending_display_demand(
     widget.set_pages(spread, [page])
     widget.prepare_display_units([(0, spread, None, True)])
 
-    assert [priority for _task, priority in pool.started] == [50, 100]
+    assert [priority for _task, priority in pool.started] == [
+        int(ImageWorkPriority.VIEWER_SPREAD_PARTNER) - 3,
+        int(ImageWorkPriority.VIEWER_CURRENT),
+    ]
     key = next(iter(widget._render_priorities))
-    assert widget._render_priorities[key] == 100
+    assert (
+        widget._render_priorities[key]
+        == int(ImageWorkPriority.VIEWER_CURRENT)
+    )
     assert widget._pending_display is not None
     widget.close()
 
@@ -1282,7 +1291,10 @@ def test_page_navigation_removes_queued_magnifier_and_uses_current_priority(
 
     widget.set_pages(_single(1), [_page(1)])
 
-    assert [priority for _task, priority in pool.started] == [0, 100]
+    assert [priority for _task, priority in pool.started] == [
+        0,
+        int(ImageWorkPriority.VIEWER_CURRENT),
+    ]
     assert pool.taken == [pool.started[0][0]]
     assert magnifier_key not in widget._render_pending
     widget.close()
@@ -1354,6 +1366,337 @@ def test_window_scheduler_reprioritizes_on_direction_reversal(
     ]
     window.close()
     qapp.processEvents()
+
+
+def test_raster_prefetch_pipeline_admits_one_complete_unit_at_a_time(
+    tmp_path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    window = ViewerWindow(config_manager=config)
+    try:
+        window.model.image_ids = [
+            f"page-{index}.png" for index in range(9)
+        ]
+        window.model.update_options(view_mode="single")
+        window.model.current_index = 4
+        window.model._size_cache = {
+            index: (320, 500) for index in range(9)
+        }
+        window._active_request_id = 7
+        window._visible_page_indexes = (4,)
+        cached = {4}
+        pending: set[int] = set()
+        ready: set[int] = set()
+        admitted: list[tuple[int, ...]] = []
+        protected_calls: list[tuple[int, ...]] = []
+
+        monkeypatch.setattr(
+            window.image_cache,
+            "contains",
+            lambda index: index in cached,
+        )
+        monkeypatch.setattr(
+            window.image_cache,
+            "has_pending_page",
+            lambda index: index in pending,
+        )
+
+        def preload_around(
+            _center,
+            *,
+            prefetch_indexes,
+            visible_indexes,
+            **_kwargs,
+        ) -> None:
+            unit = tuple(prefetch_indexes)
+            admitted.append(unit)
+            protected_calls.append(tuple(visible_indexes))
+            pending.update(unit)
+
+        monkeypatch.setattr(
+            window.image_cache,
+            "preload_around",
+            preload_around,
+        )
+        monkeypatch.setattr(
+            window.viewer,
+            "prepared_display_is_ready",
+            lambda spread, **_kwargs: spread.start_index in ready,
+        )
+        monkeypatch.setattr(
+            window.viewer,
+            "tracks_prepared_display_unit",
+            lambda _spread, **_kwargs: True,
+        )
+        monkeypatch.setattr(
+            window,
+            "_schedule_prepared_display_prefetch",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            window,
+            "_enforce_combined_cache_budget",
+            lambda: None,
+        )
+
+        window._start_raster_prefetch_pipeline(
+            4,
+            (4,),
+            ((5,), (3,), (6,)),
+        )
+        assert admitted == [(5,)]
+        assert protected_calls == [(4, 5)]
+        assert window._raster_prefetch_active_unit == (5,)
+
+        pending.remove(5)
+        cached.add(5)
+        ready.add(5)
+        window._on_viewer_render_cache_changed()
+        assert admitted == [(5,), (3,)]
+        assert protected_calls[-1] == (4, 3)
+
+        pending.remove(3)
+        cached.add(3)
+        ready.add(3)
+        window._on_viewer_render_cache_changed()
+        assert admitted == [(5,), (3,), (6,)]
+
+        pending.remove(6)
+        cached.add(6)
+        ready.add(6)
+        window._on_viewer_render_cache_changed()
+        assert window._raster_prefetch_plan is None
+        assert window._raster_prefetch_active_unit == tuple()
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_raster_prefetch_pipeline_resolves_rtl_spread_from_unit_start(
+    tmp_path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    window = ViewerWindow(config_manager=config)
+    try:
+        window.model.image_ids = [
+            f"page-{index}.png" for index in range(8)
+        ]
+        window.model.update_options(
+            view_mode="spread",
+            reading_direction="rtl",
+            single_first_page=False,
+        )
+        window.model._size_cache = {
+            index: (320, 500) for index in range(8)
+        }
+        window.model._rebuild_spread_boundaries()
+        window.model.current_index = 6
+        window._active_request_id = 11
+        window._visible_page_indexes = (7, 6)
+        cached = {6, 7}
+        pending: set[int] = set()
+        ready_starts: set[int] = set()
+        checked_starts: list[int] = []
+        admitted: list[tuple[int, ...]] = []
+
+        monkeypatch.setattr(
+            window.image_cache,
+            "contains",
+            lambda index: index in cached,
+        )
+        monkeypatch.setattr(
+            window.image_cache,
+            "has_pending_page",
+            lambda index: index in pending,
+        )
+
+        def preload_around(
+            _center,
+            *,
+            prefetch_indexes,
+            **_kwargs,
+        ) -> None:
+            unit = tuple(prefetch_indexes)
+            admitted.append(unit)
+            pending.update(unit)
+
+        def is_ready(spread, **_kwargs) -> bool:
+            checked_starts.append(spread.start_index)
+            return spread.start_index in ready_starts
+
+        monkeypatch.setattr(
+            window.image_cache,
+            "preload_around",
+            preload_around,
+        )
+        monkeypatch.setattr(
+            window.viewer,
+            "prepared_display_is_ready",
+            is_ready,
+        )
+        monkeypatch.setattr(
+            window.viewer,
+            "tracks_prepared_display_unit",
+            lambda _spread, **_kwargs: True,
+        )
+        monkeypatch.setattr(
+            window,
+            "_schedule_prepared_display_prefetch",
+            lambda: None,
+        )
+
+        window._start_raster_prefetch_pipeline(
+            6,
+            (7, 6),
+            ((5, 4), (3, 2)),
+        )
+        assert admitted == [(5, 4)]
+
+        pending.difference_update((5, 4))
+        cached.update((5, 4))
+        ready_starts.add(4)
+        window._advance_raster_prefetch_pipeline()
+
+        assert 4 in checked_starts
+        assert admitted == [(5, 4), (3, 2)]
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_raster_prefetch_pipeline_stops_when_unit_is_not_admitted(
+    tmp_path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    window = ViewerWindow(config_manager=config)
+    try:
+        window.model.image_ids = [
+            f"page-{index}.png" for index in range(5)
+        ]
+        window.model.update_options(view_mode="single")
+        window.model.current_index = 2
+        window.model._size_cache = {
+            index: (320, 500) for index in range(5)
+        }
+        window._active_request_id = 3
+        window._visible_page_indexes = (2,)
+        monkeypatch.setattr(
+            window.image_cache,
+            "contains",
+            lambda index: index == 2,
+        )
+        monkeypatch.setattr(
+            window.image_cache,
+            "has_pending_page",
+            lambda _index: False,
+        )
+        monkeypatch.setattr(
+            window.image_cache,
+            "preload_around",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            window.viewer,
+            "prepared_display_is_ready",
+            lambda _spread, **_kwargs: False,
+        )
+
+        window._start_raster_prefetch_pipeline(
+            2,
+            (2,),
+            ((3,), (4,)),
+        )
+
+        assert window._raster_prefetch_plan is None
+        assert window._raster_prefetch_active_unit == tuple()
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_raster_prefetch_render_failure_stops_farther_pipeline(
+    tmp_path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    window = ViewerWindow(config_manager=config)
+    try:
+        window.model.image_ids = [
+            f"page-{index}.png" for index in range(6)
+        ]
+        window.model.update_options(view_mode="single")
+        window.model.current_index = 2
+        window.model._size_cache = {
+            index: (320, 500) for index in range(6)
+        }
+        window._active_request_id = 5
+        window._visible_page_indexes = (2,)
+        window._raster_prefetch_plan = (
+            window.image_cache.generation,
+            5,
+            2,
+            (2,),
+            ((4,),),
+        )
+        window._raster_prefetch_active_unit = (3,)
+        admitted: list[tuple[int, ...]] = []
+        monkeypatch.setattr(
+            window.image_cache,
+            "preload_around",
+            lambda _center, *, prefetch_indexes, **_kwargs: admitted.append(
+                tuple(prefetch_indexes)
+            ),
+        )
+        monkeypatch.setattr(
+            window,
+            "_enforce_combined_cache_budget",
+            lambda: None,
+        )
+        key = ViewerRenderKey(
+            "page-3.png",
+            1,
+            320,
+            500,
+            "standard",
+            0,
+            1000,
+        )
+
+        window._on_viewer_render_work_finished(key, False)
+
+        assert window._raster_prefetch_plan is None
+        assert window._raster_prefetch_active_unit == tuple()
+        assert admitted == []
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_shared_coordinator_shutdown_waits_only_widget_owned_render_tasks(
+    qapp: QApplication,
+) -> None:
+    coordinator = Mock()
+    coordinator.try_take_viewer.return_value = False
+    widget = ViewerWidget(image_work_coordinator=coordinator)
+    task = Mock()
+    task.finished = threading.Event()
+    task.finished.set()
+    widget._render_tasks.add(task)
+
+    assert widget.shutdown_rendering(50)
+    coordinator.wait_for_viewer.assert_not_called()
+    widget.close()
 
 
 @pytest.mark.parametrize("mode", ("standard", "pixel"))
@@ -1496,6 +1839,64 @@ def test_prefetch_memory_setting_also_bounds_prepared_pixmaps(
             window.viewer._render_cache_byte_limit
             == 512 * 1024 * 1024
         )
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_viewer_memory_setting_is_one_combined_source_and_pixmap_budget(
+    tmp_path,
+    qapp: QApplication,
+) -> None:
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.apply(
+        {
+            "viewer_prefetch_preset": "custom",
+            "viewer_cache_max_memory_mib": 64,
+        }
+    )
+    window = ViewerWindow(config_manager=config)
+    try:
+        bytes_per_source = 32 * 1024 * 1024
+        window.image_cache._center_index = 2
+        for index in range(3):
+            qimage = Mock()
+            qimage.isNull.return_value = False
+            qimage.sizeInBytes.return_value = bytes_per_source
+            window.image_cache._store_cached(
+                CachedImage(
+                    page_index=index,
+                    image_id=f"page-{index}.jpg",
+                    qimage=qimage,
+                    original_size=(1, 1),
+                    error=None,
+                    generation=window.image_cache.generation,
+                )
+            )
+        for index in range(2):
+            key = ViewerRenderKey(
+                f"prepared-{index}",
+                index + 1,
+                2560,
+                2048,
+                "standard",
+                0,
+                1000,
+            )
+            pixmap = Mock()
+            pixmap.width.return_value = 2560
+            pixmap.height.return_value = 2048
+            window.viewer._render_cache[key] = pixmap
+
+        window._enforce_combined_cache_budget()
+
+        combined = (
+            window.image_cache.cache_bytes
+            + window.viewer.render_cache_bytes()
+        )
+        assert combined <= 64 * 1024 * 1024
+        assert 2 in window.image_cache._cache
     finally:
         window.close()
         qapp.processEvents()

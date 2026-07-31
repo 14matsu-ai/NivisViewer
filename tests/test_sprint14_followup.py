@@ -814,6 +814,25 @@ def test_image_cache_byte_limit_prefers_current_and_spread_partner(qapp):
     assert cache._cache_bytes == 2 * one_mebibyte
 
 
+def test_image_cache_releases_completed_prefetch_source_protection(qapp):
+    cache = ImageCache(cache_size=10)
+    cache.image_ids = [f"page{index}.jpg" for index in range(13)]
+    entry_bytes = 80 * 1024 * 1024
+    cache._cache_byte_budget = 128 * 1024 * 1024
+    cache._center_index = 12
+    cache._protected_indexes = {8, 12}
+    cache._wanted_indexes = {8, 12}
+    cache._store_cached(_cached_image_with_byte_cost(8, entry_bytes))
+    cache._store_cached(_cached_image_with_byte_cost(12, entry_bytes))
+
+    cache.retain_visible_only(12, (12,))
+
+    assert tuple(cache._cache) == (12,)
+    assert cache._cache_bytes == entry_bytes
+    assert cache._protected_indexes == {12}
+    assert cache._wanted_indexes == {12}
+
+
 def test_image_cache_live_memory_budget_shrinks_with_lru_and_expands_in_place(
     qapp,
 ):
@@ -1074,6 +1093,33 @@ def test_pending_viewer_prefetch_is_promoted_when_it_becomes_current(
     coordinator.shutdown()
 
 
+def test_pending_prefetch_priority_is_downgraded_after_queue_reversal(
+    tmp_path,
+    monkeypatch,
+):
+    source = OrderedSource(tmp_path)
+    cache = ImageCache()
+    cache.set_source(source, source.ids)
+    starts: list[int] = []
+    monkeypatch.setattr(
+        cache,
+        "_start_task",
+        lambda _task, priority: starts.append(int(priority)),
+    )
+    monkeypatch.setattr(cache, "_try_take_task", lambda _task: True)
+    cache._configured_prefetch_order = True
+    cache._configured_prefetch_ranks = {1: 0}
+
+    cache.ensure_loaded(1)
+    first_priority = int(cache._tasks[(cache.generation, 1)][1])
+    cache._configured_prefetch_ranks = {1: 7}
+    cache.ensure_loaded(1)
+    reversed_priority = int(cache._tasks[(cache.generation, 1)][1])
+
+    assert reversed_priority < first_priority
+    assert starts == [first_priority, reversed_priority]
+
+
 def test_folder_prefetch_uses_custom_display_units_without_pdf_idle_timer(
     qapp,
     tmp_path,
@@ -1097,46 +1143,74 @@ def test_folder_prefetch_uses_custom_display_units_without_pdf_idle_timer(
         config_manager=config,
         book_session=session,
     )
-    opened = session.open_book(tmp_path)
-    assert window._finish_opened_book(opened, modal_on_empty=False)
-    assert window.image_cache.wait_for_done(3000)
-    qapp.processEvents()
+    try:
+        def raster_prefetch_idle() -> bool:
+            return (
+                window._raster_prefetch_plan is None
+                and not window.image_cache.has_unfinished_tasks()
+                and not window.viewer.has_pending_prepared_rendering()
+            )
 
-    assert source.started == [
-        "page0.webp",
-        "page1.webp",
-        "page2.webp",
-    ]
-    assert not window._pdf_prefetch_timer.isActive()
-    assert window._configured_prefetch_indexes(
-        5,
-        (5,),
-        forward_units=2,
-        backward_units=1,
-        direction=1,
-    ) == (6, 4, 7)
+        opened = session.open_book(tmp_path)
+        assert window._finish_opened_book(opened, modal_on_empty=False)
+        assert _drain_events(
+            qapp,
+            lambda: window.viewer.displayed_page_indexes == (0,),
+        )
+        window.viewer.render(QPixmap(window.viewer.size()))
+        assert _drain_events(
+            qapp,
+            lambda: source.started
+            == ["page0.webp", "page1.webp", "page2.webp"],
+        )
+        assert _drain_events(qapp, raster_prefetch_idle)
 
-    source.started.clear()
-    window.model.go_to_index(5)
-    window._refresh_view()
-    assert window.image_cache.wait_for_done(3000)
-    qapp.processEvents()
-    assert source.started == [
-        "page5.webp",
-        "page6.webp",
-        "page4.webp",
-        "page7.webp",
-    ]
+        assert not window._pdf_prefetch_timer.isActive()
+        assert window._configured_prefetch_indexes(
+            5,
+            (5,),
+            forward_units=2,
+            backward_units=1,
+            direction=1,
+        ) == (6, 4, 7)
 
-    source.started.clear()
-    window.model.go_to_index(6)
-    window._refresh_view()
-    assert window.image_cache.wait_for_done(3000)
-    qapp.processEvents()
-    assert source.started == ["page8.webp"]
+        source.started.clear()
+        window.model.go_to_index(5)
+        window._refresh_view()
+        assert _drain_events(
+            qapp,
+            lambda: window.viewer.displayed_page_indexes == (5,),
+        )
+        window.viewer.render(QPixmap(window.viewer.size()))
+        assert _drain_events(
+            qapp,
+            lambda: source.started
+            == [
+                "page5.webp",
+                "page6.webp",
+                "page4.webp",
+                "page7.webp",
+            ],
+        )
+        assert _drain_events(qapp, raster_prefetch_idle)
 
-    window.close()
-    qapp.processEvents()
+        source.started.clear()
+        window.model.go_to_index(6)
+        window._refresh_view()
+        assert _drain_events(
+            qapp,
+            lambda: window.viewer.displayed_page_indexes == (6,),
+        )
+        window.viewer.render(QPixmap(window.viewer.size()))
+        assert _drain_events(
+            qapp,
+            lambda: source.started == ["page8.webp"],
+        ), source.started
+        assert _drain_events(qapp, raster_prefetch_idle)
+    finally:
+        window.prepare_shutdown(wait_msecs=3000)
+        window.close()
+        qapp.processEvents()
     session.shutdown(wait_msecs=3000)
 
 

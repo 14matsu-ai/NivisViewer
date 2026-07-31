@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import Event
 
 from PIL import Image
 from PySide6.QtCore import QObject, QRunnable, Qt, Signal, Slot
@@ -94,26 +95,30 @@ class ViewerRenderTask(QRunnable):
         self.key = key
         self.generation = int(generation)
         self.signals = ViewerRenderSignals()
+        self.finished = Event()
 
     @Slot()
     def run(self) -> None:
         try:
-            image, resized = render_qimage(self.source, self.key)
-            result = ViewerRenderResult(
-                self.key,
-                self.generation,
-                image,
-                resized,
-            )
-        except Exception as exc:  # pragma: no cover - defensive worker boundary
-            result = ViewerRenderResult(
-                self.key,
-                self.generation,
-                None,
-                False,
-                str(exc),
-            )
-        self.signals.completed.emit(result)
+            try:
+                image, resized = render_qimage(self.source, self.key)
+                result = ViewerRenderResult(
+                    self.key,
+                    self.generation,
+                    image,
+                    resized,
+                )
+            except Exception as exc:  # pragma: no cover - defensive worker boundary
+                result = ViewerRenderResult(
+                    self.key,
+                    self.generation,
+                    None,
+                    False,
+                    str(exc),
+                )
+            self.signals.completed.emit(result)
+        finally:
+            self.finished.set()
 
 
 def qimage_to_pillow(image: QImage) -> Image.Image:
