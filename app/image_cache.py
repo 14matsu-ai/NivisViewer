@@ -33,6 +33,8 @@ class CachedImage:
     rendered_size: tuple[int, int] | None = None
     rendered_rotation: int = 0
     render_spec_signature: tuple[object, ...] | None = None
+    source_is_preview: bool = False
+    raster_decode_revision: int = 0
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,8 @@ class _ImageLoadTask(QRunnable):
         render_spec: PageRenderSpec | None,
         render_spec_signature: tuple[object, ...] | None,
         priority: int,
+        raster_decode_bounds: tuple[int, int] | None = None,
+        raster_decode_revision: int = 0,
         trace_id: int = 0,
     ) -> None:
         super().__init__()
@@ -68,6 +72,8 @@ class _ImageLoadTask(QRunnable):
         self.render_spec = render_spec
         self.render_spec_signature = render_spec_signature
         self.priority = priority
+        self.raster_decode_bounds = raster_decode_bounds
+        self.raster_decode_revision = int(raster_decode_revision)
         self.trace_id = int(trace_id)
         self.signals = _ImageLoadSignals()
         self.finished = Event()
@@ -90,9 +96,53 @@ class _ImageLoadTask(QRunnable):
             qimage: QImage | None = None
             original_size: tuple[int, int] | None = None
             rendered_size: tuple[int, int] | None = None
+            source_is_preview = False
+            target_decoder = getattr(
+                self.source,
+                "open_qimage_at_most",
+                None,
+            )
+            if (
+                self.raster_decode_bounds is not None
+                and callable(target_decoder)
+                and self.adjustments == (1.0, 1.0, 1.0)
+                and self.render_spec is None
+            ):
+                performance_trace.mark(
+                    self.trace_id,
+                    "source.target_decode.started",
+                    (
+                        f"{self.image_id} "
+                        f"max={self.raster_decode_bounds[0]}x"
+                        f"{self.raster_decode_bounds[1]}"
+                    ),
+                )
+                decoded = target_decoder(
+                    self.image_id,
+                    self.raster_decode_bounds,
+                )
+                if decoded is not None:
+                    qimage, original_size = decoded
+                    source_is_preview = (
+                        qimage.width(),
+                        qimage.height(),
+                    ) != original_size
+                performance_trace.mark(
+                    self.trace_id,
+                    "source.target_decode.completed",
+                    (
+                        "fallback"
+                        if qimage is None or qimage.isNull()
+                        else (
+                            f"{qimage.width()}x{qimage.height()} "
+                            f"preview={source_is_preview}"
+                        )
+                    ),
+                )
             open_qimage = getattr(self.source, "open_qimage", None)
             if (
-                callable(open_qimage)
+                (qimage is None or qimage.isNull())
+                and callable(open_qimage)
                 and Path(self.image_id).suffix.casefold() == ".webp"
                 and self.adjustments == (1.0, 1.0, 1.0)
                 and self.render_spec is None
@@ -168,6 +218,8 @@ class _ImageLoadTask(QRunnable):
                     else 0
                 ),
                 render_spec_signature=self.render_spec_signature,
+                source_is_preview=source_is_preview,
+                raster_decode_revision=self.raster_decode_revision,
             )
         except ImageSourceError as exc:
             cancelled = exc.code in {
@@ -182,6 +234,7 @@ class _ImageLoadTask(QRunnable):
                 error=str(exc),
                 generation=self.generation,
                 render_spec_signature=self.render_spec_signature,
+                raster_decode_revision=self.raster_decode_revision,
             )
         except Exception as exc:
             result = CachedImage(
@@ -192,6 +245,7 @@ class _ImageLoadTask(QRunnable):
                 error=str(exc),
                 generation=self.generation,
                 render_spec_signature=self.render_spec_signature,
+                raster_decode_revision=self.raster_decode_revision,
             )
         self.signals.loaded.emit(
             _ImageLoadResult(result, self.source, cancelled=cancelled)
@@ -267,11 +321,16 @@ class ImageCache(QObject):
         self._center_index = 0
         self._preferred_direction = 0
         self._configured_prefetch_order = False
+        self._configured_prefetch_ranks: dict[int, int] = {}
+        self._configured_prefetch_units: tuple[tuple[int, ...], ...] = ()
         self._thread_pool = QThreadPool(self)
         self._thread_pool.setMaxThreadCount(1)
         self._coordinator = image_work_coordinator
         self._adjustments = (1.0, 1.0, 1.0)
         self._render_spec: PageRenderSpec | dict[int, PageRenderSpec] | None = None
+        self._raster_decode_bounds: tuple[int, int] | None = None
+        self._raster_decode_revision = 0
+        self._force_full_resolution: set[int] = set()
         self._trace_id = 0
 
     def set_cache_size(self, cache_size: int) -> None:
@@ -288,6 +347,36 @@ class ImageCache(QObject):
             min(4096, int(memory_mib)),
         ) * 1024 * 1024
         self._enforce_limit()
+
+    def set_raster_decode_bounds(
+        self,
+        maximum_size: tuple[int, int] | None,
+    ) -> bool:
+        normalized = (
+            None
+            if maximum_size is None
+            else (
+                max(1, int(maximum_size[0])),
+                max(1, int(maximum_size[1])),
+            )
+        )
+        if normalized == self._raster_decode_bounds:
+            return False
+        self._raster_decode_bounds = normalized
+        self._raster_decode_revision += 1
+        self._cancel_in_flight()
+        for index, cached in tuple(self._cache.items()):
+            if cached.source_is_preview:
+                self._evict_cached(index)
+        return True
+
+    def ensure_full_resolution(self, page_index: int) -> bool:
+        cached = self._cache.get(int(page_index))
+        if cached is None or not cached.source_is_preview:
+            return False
+        self._force_full_resolution.add(int(page_index))
+        self.ensure_loaded(int(page_index))
+        return True
 
     def set_adjustments(self, *, brightness: float, contrast: float, gamma: float) -> None:
         adjustments = (
@@ -319,6 +408,9 @@ class ImageCache(QObject):
         self._center_index = 0
         self._preferred_direction = 0
         self._configured_prefetch_order = False
+        self._configured_prefetch_ranks.clear()
+        self._configured_prefetch_units = ()
+        self._force_full_resolution.clear()
         self._trace_id = int(trace_id)
 
     def set_render_spec(
@@ -431,6 +523,9 @@ class ImageCache(QObject):
         self._center_index = 0
         self._preferred_direction = 0
         self._configured_prefetch_order = False
+        self._configured_prefetch_ranks.clear()
+        self._configured_prefetch_units = ()
+        self._force_full_resolution.clear()
 
     def has_in_flight_for_source(self, source: ImageSource) -> bool:
         return any(active_source is source for active_source in self._in_flight.values())
@@ -470,6 +565,7 @@ class ImageCache(QObject):
         preferred_direction: int = 0,
         rolling_indexes: tuple[int, ...] = tuple(),
         prefetch_indexes: tuple[int, ...] | None = None,
+        prefetch_units: tuple[tuple[int, ...], ...] = tuple(),
     ) -> None:
         if not self.image_ids:
             return
@@ -500,6 +596,21 @@ class ImageCache(QObject):
             min(1, int(preferred_direction)),
         )
         self._configured_prefetch_order = prefetch_indexes is not None
+        self._configured_prefetch_ranks.clear()
+        if prefetch_indexes is not None:
+            for rank, index in enumerate(candidates):
+                self._configured_prefetch_ranks.setdefault(index, rank)
+        self._configured_prefetch_units = tuple(
+            tuple(
+                dict.fromkeys(
+                    index
+                    for index in unit
+                    if 0 <= index < len(self.image_ids)
+                )
+            )
+            for unit in prefetch_units
+            if unit
+        )
         self._wanted_indexes = self._limit_wanted_to_capacity(wanted)
         self._cancel_unwanted_in_flight()
 
@@ -543,10 +654,17 @@ class ImageCache(QObject):
         ]
         if not known_costs:
             return set(wanted)
+        # ``cache_size`` is the legacy manual count limit.  A configured
+        # forward/backward plan can legitimately contain more entries (for
+        # example current + 6 forward + 4 backward = 11).  In that case the
+        # byte budget remains the hard bound; silently clipping the plan back
+        # to the legacy count makes the settings ineffective even for small
+        # images.
+        requested_count_limit = max(self.cache_size, len(wanted))
         entry_capacity = max(
             1,
             min(
-                self.cache_size,
+                requested_count_limit,
                 self._cache_byte_budget // max(known_costs),
             ),
         )
@@ -560,9 +678,25 @@ class ImageCache(QObject):
             wanted - required,
             key=self._pdf_prefetch_rank,
         )
-        return required | set(
-            optional[: max(0, entry_capacity - len(required))]
-        )
+        remaining = max(0, entry_capacity - len(required))
+        selected: set[int] = set()
+        grouped: set[int] = set()
+        optional_set = set(optional)
+        for unit in self._configured_prefetch_units:
+            candidates = (set(unit) & optional_set) - selected
+            grouped.update(set(unit) & optional_set)
+            if candidates and len(candidates) <= remaining:
+                selected.update(candidates)
+                remaining -= len(candidates)
+        if remaining:
+            for index in optional:
+                if index in grouped:
+                    continue
+                selected.add(index)
+                remaining -= 1
+                if remaining <= 0:
+                    break
+        return required | selected
 
     def _cancel_unwanted_in_flight(self) -> None:
         for (generation, index), source in tuple(self._in_flight.items()):
@@ -587,7 +721,13 @@ class ImageCache(QObject):
         if self.source is None or not (0 <= page_index < len(self.image_ids)):
             return
         in_flight_key = (self.generation, page_index)
-        if page_index in self._cache:
+        cached = self._cache.get(page_index)
+        force_full_resolution = (
+            page_index in self._force_full_resolution
+            and cached is not None
+            and cached.source_is_preview
+        )
+        if cached is not None and not force_full_resolution:
             return
 
         if page_index == self._center_index:
@@ -635,6 +775,12 @@ class ImageCache(QObject):
                 else self._page_render_spec_signature(render_spec)
             ),
             priority,
+            (
+                None
+                if force_full_resolution
+                else self._raster_decode_bounds
+            ),
+            self._raster_decode_revision,
             self._trace_id,
         )
         performance_trace.mark(
@@ -647,13 +793,20 @@ class ImageCache(QObject):
         self._start_task(task, work_priority)
 
     def _pdf_prefetch_priority(self, page_index: int) -> tuple[int, int]:
-        rank = self._pdf_prefetch_rank(page_index)
+        queue_rank = self._pdf_prefetch_rank(page_index)
+        render_rank = self._directional_prefetch_rank(page_index)
         return (
-            int(PdfRenderPriority.VIEWER_NEXT) + rank,
-            int(ImageWorkPriority.VIEWER_NEXT) - rank,
+            int(PdfRenderPriority.VIEWER_NEXT) + render_rank,
+            int(ImageWorkPriority.VIEWER_NEXT) - queue_rank,
         )
 
     def _pdf_prefetch_rank(self, page_index: int) -> int:
+        configured_rank = self._configured_prefetch_ranks.get(page_index)
+        if configured_rank is not None:
+            return configured_rank
+        return self._directional_prefetch_rank(page_index)
+
+    def _directional_prefetch_rank(self, page_index: int) -> int:
         distance = max(1, abs(page_index - self._center_index))
         if self._preferred_direction:
             in_preferred_direction = (
@@ -692,6 +845,8 @@ class ImageCache(QObject):
         self._cancel_requested_tasks.discard(task_key)
         self._in_flight.pop(task_key, None)
         self._tasks.pop(task_key, None)
+        if not cached.source_is_preview:
+            self._force_full_resolution.discard(cached.page_index)
         if result.cancelled:
             if (
                 retry_cancelled
@@ -708,6 +863,14 @@ class ImageCache(QObject):
         if not self.has_in_flight_for_source(result.source):
             self.sourceIdle.emit(result.source)
         if cached.generation != self.generation:
+            return
+        if (
+            cached.source_is_preview
+            and cached.raster_decode_revision
+            != self._raster_decode_revision
+        ):
+            if cached.page_index in self._wanted_indexes:
+                self.ensure_loaded(cached.page_index)
             return
         if not (0 <= cached.page_index < len(self.image_ids)):
             return
@@ -732,7 +895,11 @@ class ImageCache(QObject):
         self.pageLoaded.emit(cached)
 
     def _enforce_limit(self) -> None:
-        while len(self._cache) > self.cache_size:
+        active_count_limit = max(
+            self.cache_size,
+            len(self._wanted_indexes),
+        )
+        while len(self._cache) > active_count_limit:
             candidate = self._oldest_evictable_index()
             if candidate is None:
                 break

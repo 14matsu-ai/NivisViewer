@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import zipfile
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 from PIL import Image
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from app.application_controller import ApplicationController
@@ -241,7 +243,7 @@ def test_folder_and_zip_source_preparation_runs_off_gui_thread(
     stat_threads: list[int] = []
     listing_threads: list[int] = []
     original_stat = Path.stat
-    original_iterdir = Path.iterdir
+    original_scandir = os.scandir
     original_infolist = zipfile.ZipFile.infolist
     window = ViewerWindow(config_manager=make_config(tmp_path))
 
@@ -250,10 +252,10 @@ def test_folder_and_zip_source_preparation_runs_off_gui_thread(
             stat_threads.append(threading.get_ident())
         return original_stat(path, *args, **kwargs)
 
-    def counted_iterdir(path: Path):
-        if path == folder:
+    def counted_scandir(path):
+        if Path(path) == folder:
             listing_threads.append(threading.get_ident())
-        return original_iterdir(path)
+        return original_scandir(path)
 
     def counted_infolist(source: zipfile.ZipFile):
         if Path(source.filename) == archive:
@@ -261,7 +263,7 @@ def test_folder_and_zip_source_preparation_runs_off_gui_thread(
         return original_infolist(source)
 
     monkeypatch.setattr(Path, "stat", counted_stat)
-    monkeypatch.setattr(Path, "iterdir", counted_iterdir)
+    monkeypatch.setattr(os, "scandir", counted_scandir)
     monkeypatch.setattr(zipfile.ZipFile, "infolist", counted_infolist)
 
     assert window.open_path(target)
@@ -700,6 +702,10 @@ def test_prefetched_zip_page_is_applied_once_without_reread_or_clear(
         window.viewer.clear = record_clear  # type: ignore[method-assign]
 
         window.next_page()
+        QTest.qWait(window._display_demand_timer.interval() + 5)
+        qapp.processEvents()
+        assert window.viewer.wait_for_rendering()
+        qapp.processEvents()
 
         assert window.model.focused_index == 1
         assert tuple(
@@ -746,14 +752,17 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
         qapp.processEvents()
         window.set_page_list_visible(True)
         qapp.processEvents()
+        QTest.qWait(window.viewer._resize_render_timer.interval() + 20)
+        qapp.processEvents()
+        assert window.viewer.wait_for_rendering()
+        qapp.processEvents()
         window.viewer.render(QPixmap(window.viewer.size()))
         previous_ids = tuple(
             image.image_id for image in window.viewer._images
         )
         previous_pixmap_keys = tuple(
-            image.pixmap.cacheKey()
-            for image in window.viewer._images
-            if image.pixmap is not None
+            pixmap.cacheKey()
+            for _rect, pixmap in window.viewer._last_draw_layout
         )
         assert previous_ids == ("page-0.jpg",)
         assert previous_pixmap_keys
@@ -774,6 +783,7 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
 
         first_started, first_release = source.block("page-1.jpg")
         window.next_page()
+        QTest.qWait(window._decode_demand_timer.interval() + 50)
         assert first_started.wait(2)
         qapp.processEvents()
         window.viewer.render(QPixmap(window.viewer.size()))
@@ -784,9 +794,8 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
             image.image_id for image in window.viewer._images
         ) == previous_ids
         assert tuple(
-            image.pixmap.cacheKey()
-            for image in window.viewer._images
-            if image.pixmap is not None
+            pixmap.cacheKey()
+            for _rect, pixmap in window.viewer._last_draw_layout
         ) == previous_pixmap_keys
         assert not any(image.loading for image in window.viewer._images)
         assert window.slider.value() == 1
@@ -800,17 +809,22 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
         first_release.set()
         assert session.image_cache.wait_for_done(2000)
         qapp.processEvents()
+        QTest.qWait(window._display_demand_timer.interval() + 5)
+        qapp.processEvents()
+        assert window.viewer.wait_for_rendering()
+        qapp.processEvents()
         assert applied == [("page-1.jpg",)]
         assert tuple(
             image.image_id for image in window.viewer._images
         ) == ("page-1.jpg",)
 
         applied.clear()
-        rapid_started, rapid_release = source.block("page-2.jpg")
+        reads_before_rapid = list(source.read_calls)
         window.next_page()
-        assert rapid_started.wait(2)
         for _index in range(3):
             window.next_page()
+        assert source.read_calls == reads_before_rapid
+        QTest.qWait(window._decode_demand_timer.interval() + 50)
         qapp.processEvents()
 
         assert window.model.focused_index == 5
@@ -819,8 +833,11 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
             image.image_id for image in window.viewer._images
         ) == ("page-1.jpg",)
 
-        rapid_release.set()
         assert session.image_cache.wait_for_done(3000)
+        qapp.processEvents()
+        QTest.qWait(window._display_demand_timer.interval() + 5)
+        qapp.processEvents()
+        assert window.viewer.wait_for_rendering()
         qapp.processEvents()
         assert applied == [("page-5.jpg",)]
         assert tuple(
@@ -830,6 +847,10 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
             image_id in {"page-2.jpg", "page-3.jpg", "page-4.jpg"}
             for unit in applied
             for image_id in unit
+        )
+        assert not any(
+            image_id in {"page-2.jpg", "page-3.jpg", "page-4.jpg"}
+            for image_id in source.read_calls[len(reads_before_rapid) :]
         )
 
         applied.clear()
@@ -854,7 +875,10 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
             image.image_id for image in window.viewer._images
         ) == ("page-5.jpg",)
         assert applied == []
+        QTest.qWait(window._decode_demand_timer.interval() + 50)
         assert session.image_cache.wait_for_done(2000)
+        qapp.processEvents()
+        QTest.qWait(window._display_demand_timer.interval() + 5)
         qapp.processEvents()
         assert applied == [("page-6.jpg",)]
         assert len(window.viewer._images) == 1

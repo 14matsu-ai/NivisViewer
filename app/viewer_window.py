@@ -54,6 +54,7 @@ from .image_source import (
     create_image_source,
 )
 from .metadata_store import MetadataStore
+from .page_model import DisplaySpread
 from .pdf_backend import PageRenderSpec
 from .pdf_image_source import PdfImageSource
 from .path_availability import (
@@ -77,6 +78,8 @@ from .viewer_render import RESAMPLING_MODE_LABELS, normalize_resampling_mode
 
 _DISPLAY_LOG = logging.getLogger("nivisviewer.viewer.display_unit")
 _PDF_PREFETCH_IDLE_GRACE_MS = 120
+_PREPARED_DISPLAY_IDLE_GRACE_MS = 16
+_DISPLAY_DEMAND_IDLE_GRACE_MS = 16
 
 
 class ViewerWindow(QMainWindow):
@@ -162,6 +165,12 @@ class ViewerWindow(QMainWindow):
         self._active_request_id = 0
         self._reload_page_index: int | None = None
         self._applied_display_request_id = 0
+        self._pending_display_demand: (
+            tuple[int, int, DisplaySpread, tuple[ViewerImage, ...]] | None
+        ) = None
+        self._pending_decode_demand: (
+            tuple[int, int, int, tuple[int, ...]] | None
+        ) = None
         self._visible_page_indexes: tuple[int, ...] = tuple()
         self._display_unit = ViewerDisplayUnit.empty()
         self._page_history_back: list[int] = []
@@ -218,7 +227,6 @@ class ViewerWindow(QMainWindow):
         self.show_page_list = bool(self.settings.get("show_page_list", False))
         self.thumbnail_size = int(self.settings.get("thumbnail_size", 96))
         self.auto_open_adjacent_book = bool(self.settings.get("auto_open_adjacent_book", False))
-        self.magnifier_enabled = bool(self.settings.get("magnifier_enabled", False))
         self.magnifier_zoom = float(self.settings.get("magnifier_zoom", 2.0))
         self.magnifier_size = int(self.settings.get("magnifier_size", 220))
         self.viewer_resampling_mode = normalize_resampling_mode(
@@ -271,6 +279,36 @@ class ViewerWindow(QMainWindow):
         self._pdf_prefetch_timer.setSingleShot(True)
         self._pdf_prefetch_timer.setInterval(_PDF_PREFETCH_IDLE_GRACE_MS)
         self._pdf_prefetch_timer.timeout.connect(self._start_deferred_pdf_prefetch)
+        self._prepared_display_timer = QTimer(self)
+        self._prepared_display_timer.setSingleShot(True)
+        self._prepared_display_timer.setInterval(
+            _PREPARED_DISPLAY_IDLE_GRACE_MS
+        )
+        self._prepared_display_timer.timeout.connect(
+            self._schedule_prepared_display_prefetch
+        )
+        self._display_demand_timer = QTimer(self)
+        self._display_demand_timer.setSingleShot(True)
+        self._display_demand_timer.setInterval(
+            _DISPLAY_DEMAND_IDLE_GRACE_MS
+        )
+        self._display_demand_timer.timeout.connect(
+            self._apply_pending_display_demand
+        )
+        self._decode_demand_timer = QTimer(self)
+        self._decode_demand_timer.setSingleShot(True)
+        self._decode_demand_timer.setInterval(
+            _DISPLAY_DEMAND_IDLE_GRACE_MS
+        )
+        self._decode_demand_timer.timeout.connect(
+            self._apply_pending_decode_demand
+        )
+        self._raster_viewport_timer = QTimer(self)
+        self._raster_viewport_timer.setSingleShot(True)
+        self._raster_viewport_timer.setInterval(120)
+        self._raster_viewport_timer.timeout.connect(
+            self._refresh_raster_decode_bounds
+        )
         self._pdf_prefetch_source: PdfImageSource | None = None
         self._pdf_prefetch_generation = -1
         self._pdf_prefetch_center = 0
@@ -396,10 +434,16 @@ class ViewerWindow(QMainWindow):
         self.viewer.gestureRecognized.connect(self._on_mouse_gesture)
         self.viewer.extraMouseButtonPressed.connect(self._on_extra_mouse_button)
         self.viewer.zoomChanged.connect(self._on_zoom_changed)
-        self.viewer.viewportChanged.connect(self._schedule_pdf_rerender)
+        self.viewer.viewportChanged.connect(self._on_viewport_changed)
         self.viewer.contentPainted.connect(self._on_viewer_content_painted)
+        self.viewer.displayCommitted.connect(
+            self._on_prepared_display_committed
+        )
         self.viewer.magnifierPdfResolutionRequested.connect(
             self._request_pdf_magnifier_resolution
+        )
+        self.viewer.magnifierSourceResolutionRequested.connect(
+            self._request_raster_magnifier_resolution
         )
         self.viewer.magnifierCancelled.connect(self._clear_pdf_magnifier_resolution)
         self.slider.focusedPageRequested.connect(self._on_slider_changed)
@@ -652,9 +696,10 @@ class ViewerWindow(QMainWindow):
         view_menu.addAction(rotate_right_action)
         view_menu.addAction(reset_rotation_action)
         view_menu.addSeparator()
-        self.magnifier_action = QAction("拡大鏡", self, checkable=True)
-        self.magnifier_action.setShortcut("M")
-        self.magnifier_action.triggered.connect(self.set_magnifier_enabled)
+        self.magnifier_action = QAction("拡大鏡の切り替え", self)
+        self.magnifier_action.setShortcut("Z")
+        self.magnifier_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.magnifier_action.triggered.connect(self.toggle_magnifier)
         magnifier_settings_action = QAction("拡大鏡の設定", self)
         magnifier_settings_action.triggered.connect(self.set_magnifier_options_dialog)
         view_menu.addAction(self.magnifier_action)
@@ -685,6 +730,9 @@ class ViewerWindow(QMainWindow):
 
         self.bookmark_menu = menu_bar.addMenu("ブックマーク")
         self._rebuild_bookmark_menu()
+        self.bookmark_menu.aboutToShow.connect(
+            self._rebuild_bookmark_menu
+        )
 
         settings_menu = menu_bar.addMenu("設定")
         gap_action = QAction("画像間の余白", self)
@@ -830,13 +878,15 @@ class ViewerWindow(QMainWindow):
 
     def _apply_settings_to_widgets(self) -> None:
         self.viewer.set_background_color(self.background_color)
+        self.viewer.set_render_cache_byte_limit_mib(
+            self.viewer_cache_memory_mib
+        )
         self.viewer.set_gap(self.gap)
         self.viewer.set_join_spread_pages(self.join_spread_pages)
         self.viewer.set_rotation_angle(self.rotation_angle)
         self.viewer.set_smooth_scaling(self.smooth_scaling)
         self.viewer.set_horizontal_alignment(self.horizontal_alignment)
         self.viewer.set_magnifier_options(zoom=self.magnifier_zoom, size=self.magnifier_size)
-        self.viewer.set_magnifier_enabled(self.magnifier_enabled)
         self.viewer.set_resampling_modes(
             normal=self.viewer_resampling_mode,
             magnifier=self.magnifier_resampling_mode,
@@ -1059,6 +1109,10 @@ class ViewerWindow(QMainWindow):
         self.image_cache.set_cache_byte_budget_mib(
             self.viewer_cache_memory_mib
         )
+        if hasattr(self, "viewer"):
+            self.viewer.set_render_cache_byte_limit_mib(
+                self.viewer_cache_memory_mib
+            )
 
     def _reapply_prefetch_settings(self) -> None:
         if self._shutdown_prepared or not self.model.total_pages:
@@ -1073,6 +1127,9 @@ class ViewerWindow(QMainWindow):
             )
             self._prepare_deferred_pdf_prefetch(center, visible_indexes)
         else:
+            self.image_cache.set_raster_decode_bounds(
+                self._current_raster_decode_bounds()
+            )
             self._preload_image_source(center, visible_indexes)
 
     def _sync_actions(self) -> None:
@@ -1104,7 +1161,6 @@ class ViewerWindow(QMainWindow):
         self.hide_ui_fullscreen_action.setChecked(self.hide_ui_in_fullscreen)
         self.hide_cursor_fullscreen_action.setChecked(self.hide_cursor_in_fullscreen)
         self.page_list_action.setChecked(self.show_page_list)
-        self.magnifier_action.setChecked(self.magnifier_enabled)
         for zoom, action in self.magnifier_zoom_actions.items():
             action.setChecked(math.isclose(zoom, self.magnifier_zoom))
         if hasattr(self, "history_back_action"):
@@ -1640,11 +1696,8 @@ class ViewerWindow(QMainWindow):
         self.page_list_dock.setVisible(checked)
         self._sync_actions()
 
-    def set_magnifier_enabled(self, checked: bool) -> None:
-        self.magnifier_enabled = checked
-        self._update_shared_setting("magnifier_enabled", checked)
-        self.viewer.set_magnifier_enabled(checked)
-        self._sync_actions()
+    def toggle_magnifier(self) -> None:
+        self.viewer.toggle_magnifier()
 
     def set_magnifier_zoom(self, zoom: float) -> None:
         normalized = float(zoom)
@@ -1994,6 +2047,8 @@ class ViewerWindow(QMainWindow):
         self.bookmark_menu.addAction(clear_action)
 
     def _refresh_view(self) -> None:
+        self._cancel_pending_display_demand()
+        self.viewer.supersede_pending_display()
         if hasattr(self, "fullscreen_chrome"):
             self.fullscreen_chrome.reevaluate_visibility()
         if self._awaiting_first_frame:
@@ -2013,6 +2068,9 @@ class ViewerWindow(QMainWindow):
         ):
             self.viewer.cancel_magnifier()
         self._visible_page_indexes = tuple(slot.page_index for slot in spread.slots)
+        self.image_cache.set_raster_decode_bounds(
+            self._current_raster_decode_bounds()
+        )
         self.image_cache.set_render_spec(self._current_pdf_render_spec())
         self._display_unit = self._display_unit.cancel_loading()
         self._display_unit = ViewerDisplayUnit.create(
@@ -2028,6 +2086,21 @@ class ViewerWindow(QMainWindow):
                 for slot in spread.slots
             ),
         )
+        if self.viewer.apply_prepared_display(
+            spread,
+            source_generation=self.image_cache.generation,
+            source_identity=self._prepared_source_identity(),
+        ):
+            self._applied_display_request_id = self._active_request_id
+            source_pages = self._cached_pages_for_prepared_spread(
+                spread,
+                include_tracked=True,
+            )
+            if source_pages is not None:
+                # Keep only the current unit's decoded source attached for
+                # magnifier/resize.  The prepared pixmap remains the paint
+                # artifact, so this does not recreate it during navigation.
+                self.viewer.attach_current_sources(source_pages)
         first_frame_gate = (
             self._awaiting_first_frame
             and self._first_frame_image_id is not None
@@ -2041,17 +2114,26 @@ class ViewerWindow(QMainWindow):
             else self._visible_page_indexes
         )
         if isinstance(self.image_cache.source, PdfImageSource):
+            self._cancel_pending_decode_demand()
             self._prepare_deferred_pdf_prefetch(
                 request_center,
                 gated_visible_indexes,
             )
         else:
             self._cancel_deferred_pdf_prefetch()
-            self._preload_image_source(
-                request_center,
-                gated_visible_indexes,
-                immediate_only=first_frame_gate,
-            )
+            if first_frame_gate:
+                self._cancel_pending_decode_demand()
+                self._preload_image_source(
+                    request_center,
+                    gated_visible_indexes,
+                    immediate_only=True,
+                )
+            else:
+                self._queue_decode_demand(
+                    self._active_request_id,
+                    request_center,
+                    gated_visible_indexes,
+                )
         if _DISPLAY_LOG.isEnabledFor(logging.DEBUG):
             _DISPLAY_LOG.debug(
                 "display unit request=%s generation=%s focused=%s slots=%r gate=%s",
@@ -2161,7 +2243,7 @@ class ViewerWindow(QMainWindow):
             start = next_start
         return tuple(units)
 
-    def _configured_prefetch_indexes(
+    def _configured_prefetch_units(
         self,
         center_index: int,
         visible_indexes: tuple[int, ...],
@@ -2169,7 +2251,7 @@ class ViewerWindow(QMainWindow):
         forward_units: int,
         backward_units: int,
         direction: int,
-    ) -> tuple[int, ...]:
+    ) -> tuple[tuple[int, ...], ...]:
         if self.prefetch_direction_priority_enabled and direction < 0:
             forward_step, backward_step = -1, 1
         else:
@@ -2184,18 +2266,53 @@ class ViewerWindow(QMainWindow):
             backward_step,
             backward_units,
         )
-        units = list(forward + backward)
-        if not self.prefetch_direction_priority_enabled or direction == 0:
+        if self.prefetch_direction_priority_enabled and direction != 0:
+            # Keep both immediate neighbours ready before spending the
+            # remaining budget on farther work in the current direction.
+            # This makes an abrupt direction reversal hit the nearest
+            # completed display unit instead of waiting behind all forward
+            # prefetches.
+            units = []
+            if forward:
+                units.append(forward[0])
+            if backward:
+                units.append(backward[0])
+            units.extend(forward[1:])
+            units.extend(backward[1:])
+        else:
+            units = list(forward + backward)
             units.sort(
                 key=lambda unit: min(
                     abs(index - center_index) for index in unit
                 )
             )
         visible = set(visible_indexes)
+        return tuple(
+            tuple(index for index in unit if index not in visible)
+            for unit in units
+            if any(index not in visible for index in unit)
+        )
+
+    def _configured_prefetch_indexes(
+        self,
+        center_index: int,
+        visible_indexes: tuple[int, ...],
+        *,
+        forward_units: int,
+        backward_units: int,
+        direction: int,
+    ) -> tuple[int, ...]:
+        units = self._configured_prefetch_units(
+            center_index,
+            visible_indexes,
+            forward_units=forward_units,
+            backward_units=backward_units,
+            direction=direction,
+        )
         indexes: list[int] = []
         for unit in units:
             for index in unit:
-                if index not in visible and index not in indexes:
+                if index not in indexes:
                     indexes.append(index)
         return tuple(indexes)
 
@@ -2210,16 +2327,19 @@ class ViewerWindow(QMainWindow):
             center_index,
             visible_indexes,
         )
-        prefetch_indexes = (
+        prefetch_units = (
             tuple()
             if immediate_only
-            else self._configured_prefetch_indexes(
+            else self._configured_prefetch_units(
                 center_index,
                 visible_indexes,
                 forward_units=self.image_prefetch_forward_units,
                 backward_units=self.image_prefetch_backward_units,
                 direction=direction,
             )
+        )
+        prefetch_indexes = tuple(
+            index for unit in prefetch_units for index in unit
         )
         self.image_cache.preload_around(
             center_index,
@@ -2231,7 +2351,52 @@ class ViewerWindow(QMainWindow):
                 else 0
             ),
             prefetch_indexes=prefetch_indexes,
+            prefetch_units=prefetch_units,
         )
+
+    def _queue_decode_demand(
+        self,
+        request_id: int,
+        center_index: int,
+        visible_indexes: tuple[int, ...],
+    ) -> None:
+        self._pending_decode_demand = (
+            int(request_id),
+            int(self.image_cache.generation),
+            int(center_index),
+            tuple(int(index) for index in visible_indexes),
+        )
+        if (
+            not self.viewer.displayed_page_indexes
+            or self._awaiting_first_frame
+        ):
+            self._decode_demand_timer.stop()
+            self._apply_pending_decode_demand()
+            return
+        # Raster decode and archive reads begin only after the input stream has
+        # been idle briefly. Repeated wheel events replace this demand, so
+        # pages crossed during a rapid gesture never enter the worker queue.
+        self._decode_demand_timer.start()
+
+    def _apply_pending_decode_demand(self) -> None:
+        demand = self._pending_decode_demand
+        self._pending_decode_demand = None
+        if demand is None or self._shutdown_prepared:
+            return
+        request_id, generation, center_index, visible_indexes = demand
+        if (
+            request_id != self._active_request_id
+            or request_id != self._display_unit.request_id
+            or generation != self.image_cache.generation
+            or generation != self._display_unit.generation
+            or visible_indexes != self._visible_page_indexes
+        ):
+            return
+        self._preload_image_source(center_index, visible_indexes)
+
+    def _cancel_pending_decode_demand(self) -> None:
+        self._decode_demand_timer.stop()
+        self._pending_decode_demand = None
 
     def _next_pdf_rolling_indexes(
         self,
@@ -2309,6 +2474,13 @@ class ViewerWindow(QMainWindow):
             not in {self.model.current_index, self.model.focused_index}
         ):
             return
+        prefetch_units = self._configured_prefetch_units(
+            center_index,
+            self._pdf_prefetch_visible_indexes,
+            forward_units=self.pdf_prefetch_forward_units,
+            backward_units=self.pdf_prefetch_backward_units,
+            direction=self._pdf_prefetch_direction,
+        )
         self.image_cache.preload_around(
             center_index,
             radius=0,
@@ -2318,13 +2490,10 @@ class ViewerWindow(QMainWindow):
                 if self.prefetch_direction_priority_enabled
                 else 0
             ),
-            prefetch_indexes=self._configured_prefetch_indexes(
-                center_index,
-                self._pdf_prefetch_visible_indexes,
-                forward_units=self.pdf_prefetch_forward_units,
-                backward_units=self.pdf_prefetch_backward_units,
-                direction=self._pdf_prefetch_direction,
+            prefetch_indexes=tuple(
+                index for unit in prefetch_units for index in unit
             ),
+            prefetch_units=prefetch_units,
         )
 
     def _cancel_deferred_pdf_prefetch(self) -> None:
@@ -2417,29 +2586,114 @@ class ViewerWindow(QMainWindow):
         # A navigation target replaces the canvas only after every slot has
         # reached a terminal state. Until then the last complete frame stays
         # owned by ViewerWidget.
-        if (
+        should_apply = (
             target_is_terminal
             and request_id != self._applied_display_request_id
-        ):
-            self.viewer.set_pages(spread, pages)
-            self._applied_display_request_id = request_id
+        )
         self._update_slider()
         self._update_status()
         self._sync_page_list_selection()
-        self._rebuild_bookmark_menu()
         self._sync_actions()
+        if should_apply:
+            self._queue_display_demand(request_id, spread, pages)
+        elif request_id == self._applied_display_request_id:
+            if target_is_terminal:
+                # A prepared unit can remain displayable after its decoded
+                # source was evicted. Reattach the implicitly shared source
+                # when it becomes available again without recreating pixmaps.
+                self.viewer.attach_current_sources(pages)
+            self._arm_prepared_display_prefetch()
 
-    def _viewer_images_for_cached(self, cached: CachedImage, *, split_allowed: bool) -> list[ViewerImage]:
+    def _queue_display_demand(
+        self,
+        request_id: int,
+        spread: DisplaySpread,
+        pages: list[ViewerImage],
+    ) -> None:
+        demand = (
+            int(request_id),
+            int(self.image_cache.generation),
+            spread,
+            tuple(pages),
+        )
+        existing = self._pending_display_demand
+        self._pending_display_demand = demand
+        if (
+            not self.viewer.displayed_page_indexes
+            or self._awaiting_first_frame
+        ):
+            self._display_demand_timer.stop()
+            self._apply_pending_display_demand()
+            return
+        if (
+            existing is None
+            or existing[0] != demand[0]
+            or existing[1] != demand[1]
+        ):
+            # A cold target replaces the previous queued target. Heavy native
+            # scaling starts only after a short input-idle boundary so rapid
+            # wheel events can coalesce without contending with the GUI thread.
+            self._display_demand_timer.start()
+
+    def _apply_pending_display_demand(self) -> None:
+        demand = self._pending_display_demand
+        self._pending_display_demand = None
+        if demand is None or self._shutdown_prepared:
+            return
+        request_id, generation, spread, pages = demand
+        if (
+            request_id != self._active_request_id
+            or request_id != self._display_unit.request_id
+            or generation != self.image_cache.generation
+            or generation != self._display_unit.generation
+            or tuple(
+                (slot.page_index, slot.image_id) for slot in spread.slots
+            )
+            != tuple(
+                (slot.page_index, slot.image_id)
+                for slot in self._display_unit.slots
+            )
+        ):
+            return
+        # Starting the target-size worker is intentionally outside the input
+        # handler. The previous complete frame remains visible until this
+        # request commits atomically.
+        self.viewer.set_pages(spread, list(pages))
+        self._applied_display_request_id = request_id
+
+    def _cancel_pending_display_demand(self) -> None:
+        self._display_demand_timer.stop()
+        self._pending_display_demand = None
+
+    def _viewer_images_for_cached(
+        self,
+        cached: CachedImage,
+        *,
+        split_allowed: bool,
+        create_pixmap: bool | None = None,
+    ) -> list[ViewerImage]:
         if cached.qimage is None or cached.original_size is None:
             return [ViewerWidget.error_page(cached.page_index, cached.image_id, "画像を表示できません。")]
 
+        if create_pixmap is None:
+            # QPixmap is a GUI-thread display artifact.  All normal modes,
+            # including standard, prepare and cache it before navigation.
+            create_pixmap = False
+        source_identity = self._prepared_source_identity()
         width, height = cached.original_size
+        rendered_rotation = int(cached.rendered_rotation) % 360
+        split_axis_pixels = (
+            cached.qimage.height()
+            if rendered_rotation in {90, 270}
+            else cached.qimage.width()
+        )
         should_split = (
             self.split_wide_image
             and split_allowed
             and height > 0
             and width / height >= 1.25
             and width >= 2
+            and split_axis_pixels >= 2
         )
         if not should_split:
             return [
@@ -2450,15 +2704,100 @@ class ViewerWindow(QMainWindow):
                     cached.original_size,
                     cached.rendered_size,
                     bool(cached.rendered_rotation),
+                    create_pixmap,
+                    cached.generation,
+                    source_identity,
+                    source_is_preview=cached.source_is_preview,
                 )
             ]
 
         left_width = width // 2
         right_width = width - left_width
-        left = cached.qimage.copy(0, 0, left_width, height)
-        right = cached.qimage.copy(left_width, 0, right_width, height)
-        left_page = ViewerWidget.from_qimage(cached.page_index, f"{cached.image_id}#left", left, (left_width, height))
-        right_page = ViewerWidget.from_qimage(cached.page_index, f"{cached.image_id}#right", right, (right_width, height))
+        left_pixel_span = max(
+            1,
+            min(
+                split_axis_pixels - 1,
+                round(split_axis_pixels * left_width / width),
+            ),
+        )
+        if rendered_rotation == 90:
+            left_split = (
+                0,
+                0,
+                cached.qimage.width(),
+                left_pixel_span,
+            )
+            right_split = (
+                0,
+                left_pixel_span,
+                cached.qimage.width(),
+                cached.qimage.height() - left_pixel_span,
+            )
+        elif rendered_rotation == 180:
+            left_split = (
+                cached.qimage.width() - left_pixel_span,
+                0,
+                left_pixel_span,
+                cached.qimage.height(),
+            )
+            right_split = (
+                0,
+                0,
+                cached.qimage.width() - left_pixel_span,
+                cached.qimage.height(),
+            )
+        elif rendered_rotation == 270:
+            left_split = (
+                0,
+                cached.qimage.height() - left_pixel_span,
+                cached.qimage.width(),
+                left_pixel_span,
+            )
+            right_split = (
+                0,
+                0,
+                cached.qimage.width(),
+                cached.qimage.height() - left_pixel_span,
+            )
+        else:
+            left_split = (
+                0,
+                0,
+                left_pixel_span,
+                cached.qimage.height(),
+            )
+            right_split = (
+                left_pixel_span,
+                0,
+                cached.qimage.width() - left_pixel_span,
+                cached.qimage.height(),
+            )
+        left_page = ViewerWidget.from_qimage(
+            cached.page_index,
+            f"{cached.image_id}#left",
+            cached.qimage,
+            (left_width, height),
+            rendered_size=(left_split[2], left_split[3]),
+            pre_rotated=bool(rendered_rotation),
+            create_pixmap=create_pixmap,
+            source_generation=cached.generation,
+            source_identity=source_identity,
+            split_range=left_split,
+            source_is_preview=cached.source_is_preview,
+        )
+        right_page = ViewerWidget.from_qimage(
+            cached.page_index,
+            f"{cached.image_id}#right",
+            cached.qimage,
+            (right_width, height),
+            rendered_size=(right_split[2], right_split[3]),
+            pre_rotated=bool(rendered_rotation),
+            create_pixmap=create_pixmap,
+            source_generation=cached.generation,
+            source_identity=source_identity,
+            split_range=right_split,
+            source_is_preview=cached.source_is_preview,
+        )
         if self.reading_direction == "rtl":
             return [right_page, left_page]
         return [left_page, right_page]
@@ -2525,6 +2864,7 @@ class ViewerWindow(QMainWindow):
             return
         if cached.page_index not in self._visible_page_indexes:
             self._update_page_list_thumbnail(cached)
+            self._arm_prepared_display_prefetch()
             return
         if first_frame_result:
             # The logical current page has completed decoding, so the reserved
@@ -2545,6 +2885,142 @@ class ViewerWindow(QMainWindow):
             self._arm_deferred_pdf_prefetch()
         self._update_page_list_thumbnail(cached)
         self._render_spread(self.model.spread_at(), self._active_request_id)
+        if not cached.source_is_preview:
+            self.viewer.resume_magnifier_after_source_render()
+
+    def _on_prepared_display_committed(
+        self,
+        _image_ids: object,
+    ) -> None:
+        # Native QMenu reconstruction is deferred until the user opens it;
+        # this slot is delivered synchronously during ready-page navigation.
+        self._arm_prepared_display_prefetch()
+
+    def _arm_prepared_display_prefetch(
+        self,
+        *,
+        after_paint: bool = False,
+    ) -> None:
+        if self._shutdown_prepared:
+            self._prepared_display_timer.stop()
+            return
+        self._prepared_display_timer.start(
+            0 if after_paint else _PREPARED_DISPLAY_IDLE_GRACE_MS
+        )
+
+    def _cached_pages_for_prepared_spread(
+        self,
+        spread: DisplaySpread,
+        *,
+        include_tracked: bool = False,
+    ) -> list[ViewerImage] | None:
+        if not include_tracked and self.viewer.tracks_prepared_display_unit(
+            spread,
+            source_generation=self.image_cache.generation,
+            source_identity=self._prepared_source_identity(),
+        ):
+            return None
+        pages: list[ViewerImage] = []
+        for slot in spread.slots:
+            cached = self.image_cache.get(slot.page_index)
+            if (
+                cached is None
+                or cached.generation != self.image_cache.generation
+            ):
+                return None
+            if cached.error:
+                pages.append(
+                    ViewerWidget.error_page(
+                        slot.page_index,
+                        slot.image_id,
+                        cached.error,
+                    )
+                )
+                continue
+            if cached.qimage is None or cached.original_size is None:
+                return None
+            pages.extend(
+                self._viewer_images_for_cached(
+                    cached,
+                    split_allowed=spread.is_single,
+                    create_pixmap=False,
+                )
+            )
+        return pages
+
+    def _prepared_source_identity(self) -> str:
+        return (
+            str(self.model.source.source_path)
+            if self.model.source is not None
+            else ""
+        )
+
+    def _schedule_prepared_display_prefetch(self) -> None:
+        if (
+            self._shutdown_prepared
+            or not self.model.total_pages
+            or self._pending_display_demand is not None
+        ):
+            if self._shutdown_prepared or not self.model.total_pages:
+                self.viewer.prepare_display_units(())
+            return
+
+        current = self.model.spread_at()
+        current_start = current.start_index
+        direction = (
+            self._last_preload_direction
+            if self.prefetch_direction_priority_enabled
+            else 1
+        )
+        if direction == 0:
+            direction = 1
+        if isinstance(self.image_cache.source, PdfImageSource):
+            forward_count = self.pdf_prefetch_forward_units
+            backward_count = self.pdf_prefetch_backward_units
+        else:
+            forward_count = self.image_prefetch_forward_units
+            backward_count = self.image_prefetch_backward_units
+        forward_units = self._display_units_from(
+            current_start,
+            1 if direction > 0 else -1,
+            forward_count,
+        )
+        backward_units = self._display_units_from(
+            current_start,
+            -1 if direction > 0 else 1,
+            backward_count,
+        )
+        forward_starts = [min(unit) for unit in forward_units if unit]
+        backward_starts = [min(unit) for unit in backward_units if unit]
+        ordered_starts = [current_start]
+        if forward_starts:
+            ordered_starts.append(forward_starts[0])
+        if backward_starts:
+            ordered_starts.append(backward_starts[0])
+        ordered_starts.extend(forward_starts[1:])
+        ordered_starts.extend(backward_starts[1:])
+        seen: set[int] = set()
+        plan: list[
+            tuple[
+                int,
+                DisplaySpread,
+                list[ViewerImage] | None,
+                bool,
+            ]
+        ] = []
+        for priority, start in enumerate(ordered_starts):
+            if start in seen:
+                continue
+            seen.add(start)
+            spread = self.model.spread_at(start)
+            pages = self._cached_pages_for_prepared_spread(spread)
+            protected = (
+                start == current_start
+                or (forward_starts and start == forward_starts[0])
+                or (backward_starts and start == backward_starts[0])
+            )
+            plan.append((priority, spread, pages, protected))
+        self.viewer.prepare_display_units(plan)
 
     def _begin_interactive_open(self) -> None:
         if self._awaiting_first_frame:
@@ -2562,6 +3038,7 @@ class ViewerWindow(QMainWindow):
 
     def _on_viewer_content_painted(self, image_ids: object) -> None:
         if isinstance(image_ids, tuple):
+            self._arm_prepared_display_prefetch(after_paint=True)
             self._arm_deferred_pdf_prefetch()
         if (
             not self._awaiting_first_frame
@@ -2795,7 +3272,7 @@ class ViewerWindow(QMainWindow):
                     "R: 左綴じ / 右綴じ切替",
                     "F: 全画面切替",
                     "Esc: 全画面解除",
-                    "M: 拡大鏡",
+                    "Z: 拡大鏡の切り替え",
                     "+ / - / Ctrl+Wheel: ズーム",
                     "0: ウィンドウに合わせる",
                     "S: スライドショー",
@@ -2963,7 +3440,38 @@ class ViewerWindow(QMainWindow):
         self._update_shared_setting("fit_mode", self.fit_mode)
         self._sync_actions()
         self._update_status()
+        if self.image_cache.set_raster_decode_bounds(
+            self._current_raster_decode_bounds()
+        ):
+            self._refresh_view()
+        else:
+            self._schedule_pdf_rerender()
+
+    def _current_raster_decode_bounds(self) -> tuple[int, int] | None:
+        if (
+            isinstance(self.book_session.source, PdfImageSource)
+            or self.viewer_resampling_mode != "standard"
+            or self.fit_mode not in {"fit_window", "fit_no_upscale"}
+        ):
+            return None
+        dpr = max(1.0, float(self.viewer.devicePixelRatioF()))
+        return (
+            max(1, round(self.viewer.width() * dpr)),
+            max(1, round(self.viewer.height() * dpr)),
+        )
+
+    def _on_viewport_changed(self) -> None:
         self._schedule_pdf_rerender()
+        if not isinstance(self.book_session.source, PdfImageSource):
+            self._raster_viewport_timer.start()
+
+    def _refresh_raster_decode_bounds(self) -> None:
+        if self._shutdown_prepared or not self.model.total_pages:
+            return
+        if self.image_cache.set_raster_decode_bounds(
+            self._current_raster_decode_bounds()
+        ):
+            self._refresh_view()
 
     def _current_pdf_render_spec(self) -> dict[int, PageRenderSpec] | None:
         if not isinstance(self.book_session.source, PdfImageSource):
@@ -3077,6 +3585,16 @@ class ViewerWindow(QMainWindow):
         self._pdf_magnifier_targets = {page_index: requested}
         self._rerender_pdf()
 
+    def _request_raster_magnifier_resolution(
+        self,
+        page_index: int,
+        _physical_size: QSize,
+    ) -> None:
+        if isinstance(self.book_session.source, PdfImageSource):
+            return
+        if not self.image_cache.ensure_full_resolution(page_index):
+            self.viewer.resume_magnifier_after_source_render()
+
     def _clear_pdf_magnifier_resolution(self) -> None:
         if not self._pdf_magnifier_targets:
             return
@@ -3098,6 +3616,8 @@ class ViewerWindow(QMainWindow):
 
     def set_reading_direction(self, direction: str) -> None:
         self.viewer.cancel_magnifier()
+        if direction != self.reading_direction:
+            self.viewer.invalidate_prepared_displays()
         self.reading_direction = direction
         self._update_shared_setting("reading_direction", direction)
         self.model.update_options(reading_direction=direction)
@@ -3127,6 +3647,8 @@ class ViewerWindow(QMainWindow):
 
     def set_split_wide_image(self, checked: bool) -> None:
         self.viewer.cancel_magnifier()
+        if bool(checked) != self.split_wide_image:
+            self.viewer.invalidate_prepared_displays()
         self.split_wide_image = checked
         self._update_shared_setting("split_wide_image", checked)
         self._sync_actions()
@@ -3148,6 +3670,10 @@ class ViewerWindow(QMainWindow):
         )
         self.viewer.set_resampling_modes(normal=self.viewer_resampling_mode)
         self._sync_actions()
+        if self.image_cache.set_raster_decode_bounds(
+            self._current_raster_decode_bounds()
+        ) and self.model.total_pages:
+            self._refresh_view()
 
     def set_magnifier_resampling_mode(self, mode: str) -> None:
         self.magnifier_resampling_mode = normalize_resampling_mode(mode)
@@ -3175,7 +3701,13 @@ class ViewerWindow(QMainWindow):
         self._update_shared_setting("fit_mode", mode)
         self._sync_actions()
         self._update_status()
-        self._rerender_pdf()
+        raster_changed = self.image_cache.set_raster_decode_bounds(
+            self._current_raster_decode_bounds()
+        )
+        if raster_changed and self.model.total_pages:
+            self._refresh_view()
+        else:
+            self._rerender_pdf()
         self.fullscreen_chrome.reevaluate_visibility()
 
     def zoom_in(self) -> None:
@@ -3327,6 +3859,10 @@ class ViewerWindow(QMainWindow):
         self.viewer.shutdown_rendering(max(5000, wait_msecs))
         self.slideshow_timer.stop()
         self._pdf_render_timer.stop()
+        self._prepared_display_timer.stop()
+        self._raster_viewport_timer.stop()
+        self._cancel_pending_display_demand()
+        self._cancel_pending_decode_demand()
         self._cancel_deferred_pdf_prefetch()
         self._save_current_reading_position()
         self.book_session.shutdown(wait_msecs=wait_msecs)

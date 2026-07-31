@@ -378,6 +378,37 @@ class QueuedLoadSource(ImageSource):
         return image_id
 
 
+class TargetDecodeImageSource(ImageSource):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.target_calls: list[tuple[str, tuple[int, int]]] = []
+        self.full_calls: list[str] = []
+
+    def list_images(self) -> list[str]:
+        return ["large.jpg"]
+
+    def open_qimage_at_most(
+        self,
+        image_id: str,
+        maximum_size: tuple[int, int],
+    ) -> tuple[QImage, tuple[int, int]]:
+        self.target_calls.append((image_id, maximum_size))
+        image = QImage(
+            maximum_size[0],
+            maximum_size[1],
+            QImage.Format.Format_RGB32,
+        )
+        image.fill(QColor("#f0f0f0"))
+        return image, (4096, 6500)
+
+    def open_image(self, image_id: str) -> Image.Image:
+        self.full_calls.append(image_id)
+        return Image.new("RGB", (4096, 6500), "white")
+
+    def display_path(self, image_id: str) -> str:
+        return image_id
+
+
 def _cached_qimage(
     index: int,
     width: int,
@@ -468,6 +499,38 @@ def test_image_cache_tracks_qimage_bytes_on_hit_replacement_and_clear(qapp):
     assert cache._cache == {}
     assert cache._cache_entry_bytes == {}
     assert cache._cache_bytes == 0
+
+
+def test_image_cache_target_decode_can_upgrade_preview_to_full_source(
+    tmp_path: Path,
+    qapp,
+) -> None:
+    source = TargetDecodeImageSource(tmp_path)
+    cache = ImageCache(cache_size=3)
+    cache.set_source(source, source.list_images())
+    cache.set_raster_decode_bounds((1361, 2160))
+    cache.preload_around(0, radius=0, visible_indexes=(0,))
+    assert cache.wait_for_done()
+    qapp.processEvents()
+
+    preview = cache.get(0)
+    assert preview is not None
+    assert preview.source_is_preview
+    assert preview.original_size == (4096, 6500)
+    assert preview.qimage is not None
+    assert (preview.qimage.width(), preview.qimage.height()) == (1361, 2160)
+    assert source.target_calls == [("large.jpg", (1361, 2160))]
+    assert not source.full_calls
+
+    assert cache.ensure_full_resolution(0)
+    assert cache.wait_for_done()
+    qapp.processEvents()
+
+    full = cache.get(0)
+    assert full is not None
+    assert not full.source_is_preview
+    assert full.original_size == (4096, 6500)
+    assert source.full_calls == ["large.jpg"]
 
 
 @pytest.mark.parametrize(
@@ -1051,7 +1114,7 @@ def test_folder_prefetch_uses_custom_display_units_without_pdf_idle_timer(
         forward_units=2,
         backward_units=1,
         direction=1,
-    ) == (6, 7, 4)
+    ) == (6, 4, 7)
 
     source.started.clear()
     window.model.go_to_index(5)
@@ -1194,6 +1257,20 @@ def test_spread_keeps_complete_previous_unit_until_slow_partner_is_ready(
     window.resize(640, 480)
     window.show()
     try:
+        def current_paint_pixmap_keys() -> tuple[int, ...]:
+            layout = window.viewer._layout_for_current_images()
+            assert len(layout.rects) == len(window.viewer._images)
+            pixmaps = tuple(
+                window.viewer._pixmap_for_paint(image, rect)
+                for image, rect in zip(window.viewer._images, layout.rects)
+            )
+            assert all(pixmap is not None for pixmap in pixmaps)
+            return tuple(
+                pixmap.cacheKey()
+                for pixmap in pixmaps
+                if pixmap is not None
+            )
+
         assert window.open_path(tmp_path / "dummy.webp")
         assert _drain_events(
             qapp,
@@ -1203,16 +1280,9 @@ def test_spread_keeps_complete_previous_unit_until_slow_partner_is_ready(
             }
             == {"page0.webp", "page1.webp"},
         )
-        assert all(
-            image.pixmap is not None and not image.loading
-            for image in window.viewer._images
-        )
+        assert all(not image.loading for image in window.viewer._images)
         previous_images = tuple(window.viewer._images)
-        previous_pixmap_keys = tuple(
-            image.pixmap.cacheKey()
-            for image in previous_images
-            if image.pixmap is not None
-        )
+        previous_pixmap_keys = current_paint_pixmap_keys()
         applied: list[tuple[str, ...]] = []
         original_set_pages = window.viewer.set_pages
 
@@ -1228,11 +1298,7 @@ def test_spread_keeps_complete_previous_unit_until_slow_partner_is_ready(
 
         assert applied == []
         assert tuple(window.viewer._images) == previous_images
-        assert tuple(
-            image.pixmap.cacheKey()
-            for image in window.viewer._images
-            if image.pixmap is not None
-        ) == previous_pixmap_keys
+        assert current_paint_pixmap_keys() == previous_pixmap_keys
         assert not any(image.loading for image in window.viewer._images)
 
         release_target_partner.set()
@@ -1247,10 +1313,8 @@ def test_spread_keeps_complete_previous_unit_until_slow_partner_is_ready(
         )
         assert len(applied) == 1
         assert set(applied[0]) == {"page2.webp", "page3.webp"}
-        assert all(
-            image.pixmap is not None and not image.loading
-            for image in window.viewer._images
-        )
+        assert all(not image.loading for image in window.viewer._images)
+        assert len(current_paint_pixmap_keys()) == 2
     finally:
         release_target_partner.set()
         session.image_cache.wait_for_done(3000)

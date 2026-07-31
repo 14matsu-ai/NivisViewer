@@ -7,6 +7,16 @@ NivisViewerは現在、次のソフトウェアを直接依存として使用し
 - natsort：ファイル名の自然順ソート
 - pypdfium2 / PDFium：PDFページの読み取り専用レンダリング
 
+性能設計の比較監査では、AGPL-3.0-or-laterのZipPlaFork
+（https://github.com/himamon/ZipPlaFork、固定revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`、
+Copyright © 2016-2017 Rio's Toolbox）を参照しました。表示サイズ成果物、
+単一優先列、要求差し替え、メモリ上限の処理構造をNivisViewer向けに
+適用しています。今回、C#のソース表現、翻訳コード、binary、source
+fileは取り込まず、runtime／build依存にもしていません。固定revision、
+元file／method、処理、ライセンス由来、NivisViewer側の対応箇所と
+コード利用境界は`docs/ZIPPLAFORK_COMPARISON.md`に記録します。
+
 RAR／7z／CBR／CB7閲覧では、利用者環境のWindows関連付け、標準インストール先、PATH、または設定画面で指定されたWinRAR／7-Zipの認識済みCLIを任意で呼び出します。
 
 - WinRARはNivisViewerとは別の第三者ソフトウェアです。現在の配布物へWinRAR、UnRAR、RARのバイナリを同梱しません。

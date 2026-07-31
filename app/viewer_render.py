@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from PIL import Image
-from PySide6.QtCore import QObject, QRunnable, Signal, Slot
-from PySide6.QtGui import QImage
+from PySide6.QtCore import QObject, QRunnable, Qt, Signal, Slot
+from PySide6.QtGui import QImage, QTransform
 
 from .thumbnail_render import pil_to_qimage
 
@@ -60,6 +60,12 @@ class ViewerRenderKey:
     crop: tuple[int, int, int, int] | None = None
     purpose: str = "viewer"
     request_generation: int = 0
+    layout_generation: int = 0
+    source_generation: int = 0
+    source_identity: str = ""
+    split_range: tuple[int, int, int, int] | None = None
+    smooth_transform: bool = True
+    source_sized: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,11 +117,36 @@ class ViewerRenderTask(QRunnable):
 
 
 def qimage_to_pillow(image: QImage) -> Image.Image:
+    direct_formats = {
+        QImage.Format.Format_RGB888: ("RGB", "RGB"),
+        QImage.Format.Format_RGBA8888: ("RGBA", "RGBA"),
+        QImage.Format.Format_Grayscale8: ("L", "L"),
+        QImage.Format.Format_RGBX8888: ("RGB", "RGBX"),
+        QImage.Format.Format_RGB32: ("RGB", "BGRX"),
+        QImage.Format.Format_ARGB32: ("RGBA", "BGRA"),
+    }
+    mode_and_raw_mode = direct_formats.get(image.format())
+    if mode_and_raw_mode is not None:
+        mode, raw_mode = mode_and_raw_mode
+        return Image.frombytes(
+            mode,
+            (image.width(), image.height()),
+            bytes(image.constBits()),
+            "raw",
+            raw_mode,
+            image.bytesPerLine(),
+            1,
+        )
+
     converted = image.convertToFormat(QImage.Format.Format_RGBA8888)
     return Image.frombytes(
         "RGBA",
         (converted.width(), converted.height()),
-        bytes(converted.bits()),
+        bytes(converted.constBits()),
+        "raw",
+        "RGBA",
+        converted.bytesPerLine(),
+        1,
     )
 
 
@@ -123,8 +154,79 @@ def render_qimage(
     source: QImage,
     key: ViewerRenderKey,
 ) -> tuple[QImage, bool]:
+    target = (
+        max(1, int(key.target_width)),
+        max(1, int(key.target_height)),
+    )
+    if (
+        key.rotation % 360 == 0
+        and key.crop is None
+        and key.split_range is None
+        and (source.width(), source.height()) == target
+        and key.mode != "standard"
+    ):
+        return QImage(source), False
+
+    if key.mode == "standard":
+        prepared = QImage(source)
+        if key.split_range is not None:
+            left, top, width, height = key.split_range
+            prepared = prepared.copy(
+                left,
+                top,
+                max(1, width),
+                max(1, height),
+            )
+        rotation = key.rotation % 360
+        if rotation:
+            prepared = prepared.transformed(
+                QTransform().rotate(rotation),
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        if key.crop is not None:
+            left, top, right, bottom = key.crop
+            prepared = prepared.copy(
+                left,
+                top,
+                max(1, right - left),
+                max(1, bottom - top),
+            )
+        resized = (prepared.width(), prepared.height()) != target
+        if resized:
+            prepared = prepared.scaled(
+                target[0],
+                target[1],
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                (
+                    Qt.TransformationMode.SmoothTransformation
+                    if key.smooth_transform
+                    else Qt.TransformationMode.FastTransformation
+                ),
+            )
+        native_format = (
+            QImage.Format.Format_ARGB32_Premultiplied
+            if prepared.hasAlphaChannel()
+            else QImage.Format.Format_RGB32
+        )
+        if prepared.format() != native_format:
+            prepared = prepared.convertToFormat(native_format)
+        return prepared, resized
+
     prepared = qimage_to_pillow(source)
     try:
+        if key.split_range is not None:
+            left, top, width, height = key.split_range
+            split = prepared.crop(
+                (
+                    left,
+                    top,
+                    left + max(1, width),
+                    top + max(1, height),
+                )
+            )
+            prepared.close()
+            prepared = split
+
         rotation = key.rotation % 360
         if rotation:
             rotated = prepared.rotate(-rotation, expand=True)
@@ -137,10 +239,6 @@ def render_qimage(
             prepared.close()
             prepared = cropped
 
-        target = (
-            max(1, int(key.target_width)),
-            max(1, int(key.target_height)),
-        )
         resized = prepared.size != target
         if resized:
             resampling = pillow_resampling_for(

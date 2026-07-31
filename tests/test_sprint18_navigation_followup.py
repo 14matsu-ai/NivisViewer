@@ -157,6 +157,15 @@ def _wait_for_applied_display(
             and window._applied_display_request_id
             == window._active_request_id
             == window._display_unit.request_id
+            and window.viewer._pending_display is None
+            and tuple(
+                (image.page_index, image.image_id)
+                for image in window.viewer._images
+            )
+            == tuple(
+                (slot.page_index, slot.image_id)
+                for slot in window._display_unit.slots
+            )
         ):
             return
         QTest.qWait(5)

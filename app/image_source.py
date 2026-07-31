@@ -7,11 +7,10 @@ import zipfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
 
 from natsort import natsorted
 from PIL import Image, ImageOps
-from PySide6.QtCore import QByteArray, QBuffer, QIODevice
+from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QSize
 from PySide6.QtGui import QImage, QImageReader
 
 from .archive_backend import (
@@ -88,6 +87,57 @@ def _read_webp_qimage(data: bytes) -> QImage | None:
     return None if image.isNull() else image.copy()
 
 
+def _read_jpeg_qimage_at_most(
+    data: bytes,
+    maximum_size: tuple[int, int],
+) -> tuple[QImage, tuple[int, int]] | None:
+    """Decode a JPEG near its display size using the decoder's scale path."""
+    maximum_width = max(1, int(maximum_size[0]))
+    maximum_height = max(1, int(maximum_size[1]))
+    try:
+        with Image.open(io.BytesIO(data)) as header:
+            raw_width, raw_height = header.size
+            orientation = int(header.getexif().get(274, 1))
+    except Exception:
+        return None
+    if raw_width <= 0 or raw_height <= 0:
+        return None
+
+    swaps_axes = orientation in {5, 6, 7, 8}
+    logical_size = (
+        (raw_height, raw_width)
+        if swaps_axes
+        else (raw_width, raw_height)
+    )
+    scale = min(
+        1.0,
+        maximum_width / logical_size[0],
+        maximum_height / logical_size[1],
+    )
+    logical_target = (
+        max(1, round(logical_size[0] * scale)),
+        max(1, round(logical_size[1] * scale)),
+    )
+    raw_target = (
+        (logical_target[1], logical_target[0])
+        if swaps_axes
+        else logical_target
+    )
+
+    buffer = QBuffer()
+    buffer.setData(QByteArray(data))
+    if not buffer.open(QIODevice.OpenModeFlag.ReadOnly):
+        return None
+    reader = QImageReader(buffer, b"jpeg")
+    reader.setAutoTransform(True)
+    reader.setScaledSize(QSize(*raw_target))
+    image = reader.read()
+    buffer.close()
+    if image.isNull():
+        return None
+    return image, logical_size
+
+
 @dataclass(frozen=True)
 class FolderListingSnapshot:
     folder: Path
@@ -147,6 +197,13 @@ class ImageSource(ABC):
     def open_qimage(self, image_id: str) -> QImage | None:
         return None
 
+    def open_qimage_at_most(
+        self,
+        image_id: str,
+        maximum_size: tuple[int, int],
+    ) -> tuple[QImage, tuple[int, int]] | None:
+        return None
+
     def close(self) -> None:
         pass
 
@@ -183,12 +240,33 @@ class FolderImageSource(ImageSource):
         if self._listed_images is not None:
             return list(self._listed_images)
         try:
-            iterator = self.source_path.rglob("*") if self.recursive else self.source_path.iterdir()
-            files = [
-                path
-                for path in iterator
-                if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
-            ]
+            if self.recursive:
+                files = [
+                    path
+                    for path in self.source_path.rglob("*")
+                    if (
+                        path.is_file()
+                        and path.suffix.lower() in SUPPORTED_EXTENSIONS
+                    )
+                ]
+            else:
+                files = []
+                with os.scandir(self.source_path) as entries:
+                    for entry in entries:
+                        if (
+                            os.path.splitext(entry.name)[1].lower()
+                            not in SUPPORTED_EXTENSIONS
+                        ):
+                            continue
+                        try:
+                            is_file = entry.is_file(follow_symlinks=True)
+                        except OSError:
+                            # Match Path.is_file(): an entry removed during
+                            # enumeration, or otherwise unavailable, is simply
+                            # no longer part of the book.
+                            continue
+                        if is_file:
+                            files.append(Path(entry.path))
         except OSError as exc:
             raise ImageSourceError(f"フォルダを読み込めません: {self.source_path}") from exc
 
@@ -252,6 +330,24 @@ class FolderImageSource(ImageSource):
         self._size_cache[image_id] = (image.width(), image.height())
         return image
 
+    def open_qimage_at_most(
+        self,
+        image_id: str,
+        maximum_size: tuple[int, int],
+    ) -> tuple[QImage, tuple[int, int]] | None:
+        if Path(image_id).suffix.casefold() not in {".jpg", ".jpeg", ".jpe"}:
+            return None
+        try:
+            data = _read_image_file_bytes(image_id)
+        except OSError:
+            return None
+        self._file_size_cache[self._path_identity(image_id)] = len(data)
+        decoded = _read_jpeg_qimage_at_most(data, maximum_size)
+        if decoded is not None:
+            _image, logical_size = decoded
+            self._size_cache[image_id] = logical_size
+        return decoded
+
     def logical_size(self, image_id: str) -> tuple[int, int] | None:
         cached = self._size_cache.get(image_id)
         if cached is not None:
@@ -277,6 +373,7 @@ class FolderImageSource(ImageSource):
 
 class ZipImageSource(ImageSource):
     load_sizes_lazily = True
+    _READ_CHUNK_BYTES = 1024 * 1024
 
     def __init__(self, archive_path: str | Path, *, sort_descending: bool = False) -> None:
         super().__init__(archive_path)
@@ -291,6 +388,9 @@ class ZipImageSource(ImageSource):
         except OSError as exc:
             raise ImageSourceError(f"書庫を開けません: {self.source_path}") from exc
         self._lock = threading.RLock()
+        self._active_lock = threading.RLock()
+        self._closed = threading.Event()
+        self._active_requests: dict[str, set[threading.Event]] = {}
         self._listed_images: tuple[str, ...] | None = None
         self._display_names: dict[str, str] = {}
 
@@ -313,27 +413,145 @@ class ZipImageSource(ImageSource):
         return list(self._listed_images)
 
     def open_image(self, image_id: str) -> Image.Image:
+        cancelled = self._begin_request(image_id)
         try:
-            with self._lock:
-                with self._zip.open(image_id, "r") as file:
-                    data = file.read()
-            stream: BinaryIO = io.BytesIO(data)
+            stream = self._read_entry_stream(image_id, cancelled)
+            self._raise_if_cancelled(cancelled)
             with Image.open(stream) as image:
                 image.seek(0)
-                return ImageOps.exif_transpose(image).copy()
+                result = ImageOps.exif_transpose(image).copy()
+            if cancelled.is_set():
+                result.close()
+                self._raise_if_cancelled(cancelled)
+            return result
+        except ImageSourceError:
+            raise
         except Exception as exc:
             raise ImageSourceError(f"書庫内の画像を読み込めません: {image_id}") from exc
+        finally:
+            self._finish_request(image_id, cancelled)
 
     def open_qimage(self, image_id: str) -> QImage | None:
         if Path(image_id).suffix.casefold() != ".webp":
             return None
+        cancelled = self._begin_request(image_id)
         try:
-            with self._lock:
-                with self._zip.open(image_id, "r") as file:
-                    data = file.read()
-            return _read_webp_qimage(data)
+            stream = self._read_entry_stream(image_id, cancelled)
+            self._raise_if_cancelled(cancelled)
+            image = _read_webp_qimage(stream.getvalue())
+            self._raise_if_cancelled(cancelled)
+            return image
+        except ImageSourceError:
+            raise
         except Exception:
             return None
+        finally:
+            self._finish_request(image_id, cancelled)
+
+    def open_qimage_at_most(
+        self,
+        image_id: str,
+        maximum_size: tuple[int, int],
+    ) -> tuple[QImage, tuple[int, int]] | None:
+        if Path(image_id).suffix.casefold() not in {".jpg", ".jpeg", ".jpe"}:
+            return None
+        cancelled = self._begin_request(image_id)
+        try:
+            stream = self._read_entry_stream(image_id, cancelled)
+            self._raise_if_cancelled(cancelled)
+            decoded = _read_jpeg_qimage_at_most(
+                stream.getvalue(),
+                maximum_size,
+            )
+            self._raise_if_cancelled(cancelled)
+            return decoded
+        except ImageSourceError:
+            raise
+        except Exception:
+            return None
+        finally:
+            self._finish_request(image_id, cancelled)
+
+    def _begin_request(self, image_id: str) -> threading.Event:
+        cancelled = threading.Event()
+        with self._active_lock:
+            if self._closed.is_set():
+                cancelled.set()
+            self._active_requests.setdefault(image_id, set()).add(cancelled)
+        return cancelled
+
+    def _finish_request(
+        self,
+        image_id: str,
+        cancelled: threading.Event,
+    ) -> None:
+        with self._active_lock:
+            requests = self._active_requests.get(image_id)
+            if requests is None:
+                return
+            requests.discard(cancelled)
+            if not requests:
+                self._active_requests.pop(image_id, None)
+
+    @staticmethod
+    def _raise_if_cancelled(cancelled: threading.Event) -> None:
+        if cancelled.is_set():
+            raise ImageSourceError(
+                "ZIP画像の読み込みを中止しました。",
+                code=ArchiveErrorCode.PROCESS_CANCELLED.value,
+            )
+
+    def _read_entry_stream(
+        self,
+        image_id: str,
+        cancelled: threading.Event,
+    ) -> io.BytesIO:
+        self._raise_if_cancelled(cancelled)
+        buffer = io.BytesIO()
+        with self._lock:
+            try:
+                info = self._zip.getinfo(image_id)
+            except KeyError as exc:
+                raise ImageSourceError(
+                    f"書庫内の画像が見つかりません: {image_id}",
+                    code=ArchiveErrorCode.ENTRY_NOT_FOUND.value,
+                ) from exc
+            if info.file_size > MAX_IMAGE_ENTRY_BYTES:
+                raise ImageSourceError(
+                    "書庫内の画像が大きすぎます。",
+                    code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
+                )
+            self._raise_if_cancelled(cancelled)
+            if info.file_size:
+                buffer.seek(info.file_size - 1)
+                buffer.write(b"\0")
+                buffer.seek(0)
+            self._raise_if_cancelled(cancelled)
+            total = 0
+            with self._zip.open(info, "r") as file:
+                while True:
+                    self._raise_if_cancelled(cancelled)
+                    chunk = file.read(self._READ_CHUNK_BYTES)
+                    self._raise_if_cancelled(cancelled)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_IMAGE_ENTRY_BYTES:
+                        raise ImageSourceError(
+                            "書庫内の画像が大きすぎます。",
+                            code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
+                        )
+                    buffer.write(chunk)
+        buffer.truncate(total)
+        buffer.seek(0)
+        return buffer
+
+    def cancel_image_request(self, image_id: str) -> None:
+        with self._active_lock:
+            for cancelled in tuple(
+                self._active_requests.get(image_id, ())
+            ):
+                cancelled.set()
 
     def display_path(self, image_id: str) -> str:
         display_name = getattr(self, "_display_names", {}).get(image_id, image_id)
@@ -346,7 +564,13 @@ class ZipImageSource(ImageSource):
             return None
 
     def close(self) -> None:
-        self._zip.close()
+        self._closed.set()
+        with self._active_lock:
+            for requests in tuple(self._active_requests.values()):
+                for cancelled in tuple(requests):
+                    cancelled.set()
+        with self._lock:
+            self._zip.close()
 
     @staticmethod
     def _decode_display_name(info: zipfile.ZipInfo) -> str:

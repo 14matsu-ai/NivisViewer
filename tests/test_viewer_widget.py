@@ -137,6 +137,8 @@ def test_clear_releases_images_from_last_draw_layout_and_can_repaint(
         ViewerWidget.from_qimage(1, "second", second_image, (90, 130)),
     ]
     widget.set_rotation_angle(90)
+    widget.show()
+    qapp.processEvents()
     widget.set_pages(
         DisplaySpread(
             0,
@@ -145,7 +147,7 @@ def test_clear_releases_images_from_last_draw_layout_and_can_repaint(
         ),
         first_pages,
     )
-    widget.show()
+    assert widget.wait_for_rendering()
     qapp.processEvents()
     widget.render(QPixmap(widget.size()))
 
@@ -187,10 +189,13 @@ def test_clear_releases_images_from_last_draw_layout_and_can_repaint(
         DisplaySpread(2, (PageSlot("replacement", 2),), True),
         [replacement],
     )
+    assert widget.wait_for_rendering()
+    qapp.processEvents()
     widget.render(QPixmap(widget.size()))
 
     assert len(widget._last_draw_layout) == 1
-    assert widget._last_draw_layout[0][1].cacheKey() == replacement.pixmap.cacheKey()
+    assert widget._last_image_layout[0][1].image_id == "replacement"
+    assert widget._last_draw_layout[0][1].cacheKey() not in old_pixmap_keys
     widget.clear()
     widget.clear()
     assert widget._last_draw_layout == []

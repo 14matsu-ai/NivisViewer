@@ -438,7 +438,7 @@ class BrowserItemModel(QAbstractListModel):
             and self._thumbnail_signatures.get(key) == signature
         ):
             return False
-        self._thumbnail_images[key] = image.copy()
+        self._thumbnail_images[key] = QImage(image)
         if low_resolution:
             self._low_resolution_thumbnails.add(key)
             self._thumbnail_signatures.pop(key, None)
