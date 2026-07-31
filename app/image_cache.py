@@ -341,11 +341,31 @@ class ImageCache(QObject):
     def cache_byte_budget_mib(self) -> int:
         return self._cache_byte_budget // (1024 * 1024)
 
+    @property
+    def cache_bytes(self) -> int:
+        return self._cache_bytes
+
     def set_cache_byte_budget_mib(self, memory_mib: int) -> None:
+        self.set_cache_byte_budget_bytes(
+            max(
+                64,
+                min(4096, int(memory_mib)),
+            )
+            * 1024
+            * 1024
+        )
+
+    def set_cache_byte_budget_bytes(self, memory_bytes: int) -> None:
         self._cache_byte_budget = max(
-            64,
-            min(4096, int(memory_mib)),
-        ) * 1024 * 1024
+            1,
+            int(memory_bytes),
+        )
+        limited_wanted = self._limit_wanted_to_capacity(
+            self._wanted_indexes
+        )
+        if limited_wanted != self._wanted_indexes:
+            self._wanted_indexes = limited_wanted
+            self._cancel_unwanted_in_flight()
         self._enforce_limit()
 
     def set_raster_decode_bounds(
@@ -556,6 +576,39 @@ class ImageCache(QObject):
             self._cache.move_to_end(page_index)
         return cached
 
+    def contains(self, page_index: int) -> bool:
+        return int(page_index) in self._cache
+
+    def has_pending_page(self, page_index: int) -> bool:
+        key = (self.generation, int(page_index))
+        return key in self._tasks or key in self._in_flight
+
+    def retain_visible_only(
+        self,
+        center_index: int,
+        visible_indexes: tuple[int, ...],
+    ) -> None:
+        """Release temporary prefetch protection without starting new work."""
+        if not self.image_ids:
+            self._protected_indexes.clear()
+            self._wanted_indexes.clear()
+            return
+        center = max(0, min(int(center_index), len(self.image_ids) - 1))
+        visible = {
+            int(index)
+            for index in visible_indexes
+            if 0 <= int(index) < len(self.image_ids)
+        }
+        visible.add(center)
+        self._center_index = center
+        self._protected_indexes = visible
+        self._wanted_indexes = set(visible)
+        self._configured_prefetch_order = False
+        self._configured_prefetch_ranks.clear()
+        self._configured_prefetch_units = tuple()
+        self._cancel_unwanted_in_flight()
+        self._enforce_limit()
+
     def preload_around(
         self,
         center_index: int,
@@ -750,7 +803,10 @@ class ImageCache(QObject):
         existing = self._tasks.get(in_flight_key)
         if existing is not None:
             task, old_priority = existing
-            if work_priority > old_priority and self._try_take_task(task):
+            if (
+                work_priority != old_priority
+                and self._try_take_task(task)
+            ):
                 task.priority = priority
                 self._tasks[in_flight_key] = (task, work_priority)
                 self._start_task(task, work_priority)
@@ -906,7 +962,7 @@ class ImageCache(QObject):
             self._evict_cached(candidate)
         while (
             self._cache_bytes > self._cache_byte_budget
-            and len(self._cache) > 1
+            and self._cache
         ):
             candidate = self._oldest_evictable_index()
             if candidate is None:

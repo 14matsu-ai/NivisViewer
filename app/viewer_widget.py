@@ -4,6 +4,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 import math
+from time import monotonic
 
 from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, QSize, QThreadPool, QTimer, Qt, Signal
 from PySide6.QtGui import (
@@ -21,6 +22,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
+from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
 from .mouse_gesture import MouseGestureRecognizer
 from .page_model import DisplaySpread
 from .viewer_canvas_pointer import (
@@ -240,8 +242,15 @@ class ViewerWidget(QWidget):
     magnifierSourceResolutionRequested = Signal(int, QSize)
     magnifierCancelled = Signal()
     displayCommitted = Signal(object)
+    renderCacheChanged = Signal()
+    renderWorkFinished = Signal(object, bool)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        image_work_coordinator: ImageWorkCoordinator | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
@@ -275,6 +284,7 @@ class ViewerWidget(QWidget):
         self._render_generation = 0
         self._render_pool = QThreadPool(self)
         self._render_pool.setMaxThreadCount(1)
+        self._render_coordinator = image_work_coordinator
         self._render_pending: dict[ViewerRenderKey, int] = {}
         self._render_tasks: set[ViewerRenderTask] = set()
         self._render_task_by_key: dict[ViewerRenderKey, ViewerRenderTask] = {}
@@ -424,11 +434,27 @@ class ViewerWidget(QWidget):
             self.update()
 
     def set_render_cache_byte_limit_mib(self, memory_mib: int) -> None:
-        self._render_cache_byte_limit = max(
-            64,
-            min(4096, int(memory_mib)),
-        ) * 1024 * 1024
+        self.set_render_cache_byte_limit_bytes(
+            max(
+                64,
+                min(4096, int(memory_mib)),
+            )
+            * 1024
+            * 1024
+        )
+
+    def set_render_cache_byte_limit_bytes(
+        self,
+        memory_bytes: int,
+    ) -> None:
+        self._render_cache_byte_limit = max(1, int(memory_bytes))
         self._enforce_render_cache_limit()
+
+    def render_cache_bytes(self) -> int:
+        return sum(
+            pixmap.width() * pixmap.height() * 4
+            for pixmap in self._render_cache.values()
+        )
 
     def set_resampling_modes(
         self,
@@ -501,7 +527,7 @@ class ViewerWidget(QWidget):
         for task in tuple(self._render_tasks):
             if (
                 task.key.purpose == "magnifier"
-                and self._render_pool.tryTake(task)
+                and self._try_take_render_task(task)
             ):
                 self._discard_render_task(task)
         self.magnifier_selecting = False
@@ -723,6 +749,11 @@ class ViewerWidget(QWidget):
                 painted_image_ids.append(image.image_id)
             else:
                 self._draw_placeholder(painter, rect, image)
+                if image.error:
+                    # A terminal error placeholder is still a completed frame.
+                    # Report it so after-paint scheduling and Browser gating
+                    # cannot wait forever for a pixmap that will never exist.
+                    painted_image_ids.append(image.image_id)
         self._draw_magnifier(painter)
         self._draw_gesture_trail(painter)
         if painted_image_ids:
@@ -1277,7 +1308,14 @@ class ViewerWidget(QWidget):
             self._prepared_requests.values(),
             key=lambda value: value.priority,
         ):
-            queue_priority = 80 - request.priority * 10
+            # Decode and display preparation share the same one-worker Viewer
+            # lane. Keep both stages in the coordinator's priority domain so a
+            # newly requested display artifact cannot sit behind queued source
+            # prefetch work merely because the old render pool used 0-100.
+            queue_priority = (
+                int(ImageWorkPriority.VIEWER_SPREAD_PARTNER)
+                - request.priority
+            )
             for source, render_key in zip(
                 request.sources,
                 request.key.render_keys,
@@ -1323,7 +1361,7 @@ class ViewerWidget(QWidget):
             if (
                 task.key.purpose == "viewer"
                 and task.key not in allowed_render_keys
-                and self._render_pool.tryTake(task)
+                and self._try_take_render_task(task)
             ):
                 self._discard_render_task(task)
         self._enforce_render_cache_limit()
@@ -1379,6 +1417,43 @@ class ViewerWidget(QWidget):
         ) or any(
             matches(key, request.images)
             for key, request in self._prepared_requests.items()
+        )
+
+    def prepared_display_is_ready(
+        self,
+        spread: DisplaySpread,
+        *,
+        source_generation: int,
+        source_identity: str,
+    ) -> bool:
+        identity = tuple(
+            (slot.page_index, slot.image_id) for slot in spread.slots
+        )
+        return any(
+            (
+                key.spread_identity == identity
+                and key.layout_generation == self._render_generation
+                and all(
+                    image.source_generation == int(source_generation)
+                    and image.source_identity == str(source_identity)
+                    for image in unit.images
+                )
+                and all(
+                    render_key is None
+                    or (
+                        render_key.mode == self.resampling_mode
+                        and render_key in self._render_cache
+                    )
+                    for render_key in key.render_keys
+                )
+            )
+            for key, unit in self._prepared_units.items()
+        )
+
+    def has_pending_prepared_rendering(self) -> bool:
+        return bool(self._prepared_requests) or any(
+            task.key.purpose == "viewer"
+            for task in self._render_tasks
         )
 
     def apply_prepared_display(
@@ -1451,7 +1526,7 @@ class ViewerWidget(QWidget):
             if (
                 task.key in pending_keys
                 and task.key not in prepared_keys
-                and self._render_pool.tryTake(task)
+                and self._try_take_render_task(task)
             ):
                 self._discard_render_task(task)
 
@@ -1514,7 +1589,7 @@ class ViewerWidget(QWidget):
         for task in tuple(self._render_tasks):
             if (
                 task.key.purpose == "magnifier"
-                and self._render_pool.tryTake(task)
+                and self._try_take_render_task(task)
             ):
                 self._discard_render_task(task)
         missing = [
@@ -1528,7 +1603,11 @@ class ViewerWidget(QWidget):
             self._commit_pending_display()
             return
         for source, key in missing:
-            self._queue_render(source, key, priority=100)
+            self._queue_render(
+                source,
+                key,
+                priority=int(ImageWorkPriority.VIEWER_CURRENT),
+            )
 
     def _pending_display_is_ready(self, pending: _PendingDisplay) -> bool:
         return all(
@@ -1609,7 +1688,7 @@ class ViewerWidget(QWidget):
                     and not allow_priority_decrease
                 )
                 or task is None
-                or not self._render_pool.tryTake(task)
+                or not self._try_take_render_task(task)
             ):
                 return
             self._discard_render_task(task)
@@ -1621,7 +1700,25 @@ class ViewerWidget(QWidget):
         task.signals.completed.connect(
             lambda result, owned=task: self._on_render_completed(result, owned)
         )
-        self._render_pool.start(task, int(priority))
+        self._start_render_task(task, int(priority))
+
+    def _start_render_task(
+        self,
+        task: ViewerRenderTask,
+        priority: int,
+    ) -> None:
+        if self._render_coordinator is not None:
+            self._render_coordinator.start_viewer(task, int(priority))
+        else:
+            self._render_pool.start(task, int(priority))
+
+    def _try_take_render_task(self, task: ViewerRenderTask) -> bool:
+        if self._render_coordinator is not None:
+            return self._render_coordinator.try_take_viewer(task)
+        try:
+            return self._render_pool.tryTake(task)
+        except RuntimeError:
+            return False
 
     def _discard_render_task(self, task: ViewerRenderTask) -> None:
         self._render_tasks.discard(task)
@@ -1669,6 +1766,8 @@ class ViewerWidget(QWidget):
             for request in prepared_accepts:
                 request.failed_keys.add(result.key)
                 self._prepared_requests.pop(request.key, None)
+            if result.key.purpose == "viewer":
+                self.renderWorkFinished.emit(result.key, False)
             return
         if result.key.purpose == "magnifier":
             if result.key != self._magnifier_key:
@@ -1700,6 +1799,8 @@ class ViewerWidget(QWidget):
         if pending_accepts:
             self._commit_pending_display()
         self._enforce_render_cache_limit()
+        self.renderCacheChanged.emit()
+        self.renderWorkFinished.emit(result.key, True)
 
     def _unit_render_keys_ready(
         self,
@@ -1858,7 +1959,7 @@ class ViewerWidget(QWidget):
                     for task in tuple(self._render_tasks):
                         if (
                             task.key in cancel_only_keys
-                            and self._render_pool.tryTake(task)
+                            and self._try_take_render_task(task)
                         ):
                             self._discard_render_task(task)
                     for key in cancel_only_keys:
@@ -1903,19 +2004,31 @@ class ViewerWidget(QWidget):
         self._render_priorities.clear()
         self._render_task_by_key.clear()
         for task in tuple(self._render_tasks):
-            if self._render_pool.tryTake(task):
+            if self._try_take_render_task(task):
                 self._render_tasks.discard(task)
         if clear_cache:
             self._render_cache.clear()
             self._last_rendered_by_image.clear()
 
     def wait_for_rendering(self, msecs: int = 5000) -> bool:
+        if self._render_coordinator is not None:
+            return self._wait_for_owned_render_tasks(msecs)
         return self._render_pool.waitForDone(max(0, int(msecs)))
+
+    def _wait_for_owned_render_tasks(self, msecs: int) -> bool:
+        deadline = monotonic() + max(0, int(msecs)) / 1000
+        for task in tuple(self._render_tasks):
+            remaining = max(0.0, deadline - monotonic())
+            if not task.finished.wait(remaining):
+                return False
+        return True
 
     def shutdown_rendering(self, msecs: int = 5000) -> bool:
         self._resize_render_timer.stop()
         self.cancel_magnifier()
         self._invalidate_render_requests(clear_cache=True)
+        if self._render_coordinator is not None:
+            return self._wait_for_owned_render_tasks(msecs)
         self._render_pool.clear()
         return self._render_pool.waitForDone(max(0, int(msecs)))
 
@@ -2126,7 +2239,7 @@ class ViewerWidget(QWidget):
         for task in tuple(self._render_tasks):
             if task.key.purpose != "magnifier":
                 continue
-            if self._render_pool.tryTake(task):
+            if self._try_take_render_task(task):
                 self._discard_render_task(task)
 
         rotation = 0 if image.pre_rotated else self.rotation_angle
@@ -2144,7 +2257,11 @@ class ViewerWidget(QWidget):
             split_range=image.split_range,
         )
         self._magnifier_key = key
-        self._queue_render(image.qimage, key, priority=100)
+        self._queue_render(
+            image.qimage,
+            key,
+            priority=int(ImageWorkPriority.VIEWER_INTERACTIVE_RERENDER),
+        )
 
     def resume_magnifier_after_source_render(self) -> None:
         self._resume_magnifier_after_pdf_render()

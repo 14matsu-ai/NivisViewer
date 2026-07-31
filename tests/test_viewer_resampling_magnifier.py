@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication
 
 from app import viewer_render as viewer_render_module
 from app.config_manager import ConfigManager
+from app.image_work_coordinator import ImageWorkPriority
 from app.page_model import DisplaySpread, PageSlot
 from app.viewer_render import (
     RESAMPLING_MODE_LABELS,
@@ -679,7 +680,10 @@ def test_magnifier_render_uses_demand_priority(
 
     assert len(queued) == 1
     assert queued[0][0].purpose == "magnifier"
-    assert queued[0][1] == 100
+    assert (
+        queued[0][1]
+        == int(ImageWorkPriority.VIEWER_INTERACTIVE_RERENDER)
+    )
     widget.close()
 
 
