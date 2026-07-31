@@ -247,7 +247,7 @@ def test_page_navigation_controller_never_opens_books() -> None:
     assert model.focused_index == 2
 
 
-def test_page_list_selection_uses_focused_index_fast_path(
+def test_page_list_selection_uses_committed_presentation_fast_path(
     tmp_path: Path,
     qapp,
     monkeypatch,
@@ -277,7 +277,9 @@ def test_page_list_selection_uses_focused_index_fast_path(
         assert resolve_calls == 0
         current_item = window.page_list.currentItem()
         assert current_item is not None
-        assert current_item.data(Qt.ItemDataRole.UserRole) == last_index
+        assert window.model.focused_index == last_index
+        assert window.presentation_state.displayed_page == 0
+        assert current_item.data(Qt.ItemDataRole.UserRole) == 0
     finally:
         window.close()
         qapp.processEvents()

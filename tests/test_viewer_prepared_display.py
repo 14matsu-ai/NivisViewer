@@ -2150,9 +2150,9 @@ def test_window_cold_display_demand_coalesces_to_latest_after_input_idle(
         applied: list[tuple[str, ...]] = []
         original_set_pages = window.viewer.set_pages
 
-        def record_set_pages(spread, pages):
+        def record_set_pages(spread, pages, **kwargs):
             applied.append(tuple(page.image_id for page in pages))
-            original_set_pages(spread, pages)
+            original_set_pages(spread, pages, **kwargs)
 
         monkeypatch.setattr(window.viewer, "set_pages", record_set_pages)
         for index in (1, 2, 3):
@@ -2172,10 +2172,15 @@ def test_window_cold_display_demand_coalesces_to_latest_after_input_idle(
         window._apply_pending_display_demand()
 
         assert applied == [("page-3.png",)]
-        assert (
-            window._applied_display_request_id
-            == window._active_request_id
-        )
+        # set_pages starts the final resize but is not a presentation commit.
+        assert window._applied_display_request_id != window._active_request_id
+        assert window.presentation_state.displayed_page == 0
+        assert window.slider.value() == 0
+        assert window.viewer.wait_for_rendering()
+        qapp.processEvents()
+        assert window._applied_display_request_id == window._active_request_id
+        assert window.presentation_state.displayed_page == 3
+        assert window.slider.value() == 3
         assert window.viewer.wait_for_rendering()
         qapp.processEvents()
         assert window.viewer.displayed_page_indexes == (3,)

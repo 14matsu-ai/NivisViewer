@@ -342,6 +342,10 @@ class ImageCache(QObject):
         return self._cache_byte_budget // (1024 * 1024)
 
     @property
+    def cache_byte_budget_bytes(self) -> int:
+        return self._cache_byte_budget
+
+    @property
     def cache_bytes(self) -> int:
         return self._cache_bytes
 
@@ -432,6 +436,29 @@ class ImageCache(QObject):
         self._configured_prefetch_units = ()
         self._force_full_resolution.clear()
         self._trace_id = int(trace_id)
+
+    def suspend_for_book_runtime(self) -> None:
+        """Stop the legacy raster pipeline while a book runtime owns ZIP work.
+
+        The source remains attached for model metadata only. Advancing the
+        generation rejects already-queued legacy results; ZIP display work
+        must not return to this cache because of a feature or decoder error.
+        """
+        self._cancel_in_flight()
+        self.generation += 1
+        self._clear_cache()
+        self._wanted_indexes.clear()
+        self._protected_indexes.clear()
+        self._center_index = 0
+        self._preferred_direction = 0
+        self._configured_prefetch_order = False
+        self._configured_prefetch_ranks.clear()
+        self._configured_prefetch_units = ()
+        self._force_full_resolution.clear()
+
+    def suspend_raster_work(self) -> None:
+        """Backward-compatible alias for older tests and historical tooling."""
+        self.suspend_for_book_runtime()
 
     def set_render_spec(
         self,
@@ -881,9 +908,17 @@ class ImageCache(QObject):
         work_priority: int,
     ) -> None:
         if self._coordinator is not None:
-            self._coordinator.start_viewer(task, work_priority)
-        else:
-            self._thread_pool.start(task, int(work_priority))
+            if self._coordinator.start_viewer(task, work_priority):
+                return
+            task_key = (task.generation, task.page_index)
+            task_entry = self._tasks.get(task_key)
+            if task_entry is not None and task_entry[0] is task:
+                self._tasks.pop(task_key, None)
+                self._in_flight.pop(task_key, None)
+                self._cancel_requested_tasks.discard(task_key)
+            task.finished.set()
+            return
+        self._thread_pool.start(task, int(work_priority))
 
     def _try_take_task(self, task: _ImageLoadTask) -> bool:
         if self._coordinator is not None:
@@ -1037,3 +1072,5 @@ class ImageCache(QObject):
             if self._try_take_task(task):
                 self._tasks.pop((generation, index), None)
                 self._in_flight.pop((generation, index), None)
+            elif callable(cancel):
+                self._cancel_requested_tasks.add((generation, index))

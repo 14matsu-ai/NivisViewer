@@ -16,10 +16,12 @@ from .image_source import (
     FolderListingSnapshot,
     ImageSource,
     ImageSourceError,
+    ZipImageSource,
     create_image_source,
 )
 from .page_model import PageModel
 from .performance_trace import performance_trace
+from .zip_raster_book_runtime import ZipRasterBookRuntime
 
 
 SourceFactory = Callable[..., tuple[ImageSource, str | None]]
@@ -193,6 +195,7 @@ class BookSession(QObject):
     error_occurred = Signal(str)
     async_opened = Signal(object)
     async_open_failed = Signal(object)
+    viewer_runtime_changed = Signal(object)
 
     def __init__(
         self,
@@ -209,11 +212,19 @@ class BookSession(QObject):
             self,
             image_work_coordinator=image_work_coordinator,
         )
+        self._image_work_coordinator = image_work_coordinator
         self.current_path: Path | None = None
         self.source: ImageSource | None = None
+        self.viewer_runtime: ZipRasterBookRuntime | None = None
+        # The active book epoch must change only when the installed source
+        # changes.  Pending-open tokens are separate so a failed/cancelled
+        # replacement cannot invalidate the Viewer runtime of the book that
+        # remains on screen.
         self.generation = 0
+        self._open_generation = 0
         self._source_factory = source_factory
         self._retired_sources: dict[int, ImageSource] = {}
+        self._retired_viewer_runtimes: dict[int, ZipRasterBookRuntime] = {}
         self._open_pool = QThreadPool()
         self._open_pool.setMaxThreadCount(1)
         self._open_cancel: Event | None = None
@@ -242,7 +253,7 @@ class BookSession(QObject):
     ) -> BookOpened:
         self.cancel_pending_open()
         requested_path = Path(path)
-        self.generation += 1
+        self._open_generation += 1
         self._shutdown = False
 
         new_source: ImageSource | None = None
@@ -290,8 +301,10 @@ class BookSession(QObject):
             raise error from exc
 
         old_source = self.source
+        self.generation += 1
         self.source = new_source
         self.current_path = requested_path
+        self._replace_viewer_runtime(new_source)
         self.image_cache.set_source(
             new_source,
             self.model.image_ids,
@@ -329,9 +342,9 @@ class BookSession(QObject):
         folder_snapshot: FolderListingSnapshot | None = None,
     ) -> int:
         self.cancel_pending_open()
-        self.generation += 1
+        self._open_generation += 1
         self._shutdown = False
-        generation = self.generation
+        generation = self._open_generation
         cancelled = Event()
         worker = _BookOpenWorker(
             self._source_factory,
@@ -378,7 +391,9 @@ class BookSession(QObject):
 
     def close_book(self) -> None:
         self.cancel_pending_open()
+        self._open_generation += 1
         old_source = self.source
+        self._replace_viewer_runtime(None)
         had_book = old_source is not None
         self.generation += 1
         self.image_cache.clear()
@@ -401,10 +416,26 @@ class BookSession(QObject):
         self.close_book()
         if self._open_workers:
             _RETIRED_BOOK_OPEN_POOLS.add(self._open_pool)
+        runtime_deadline = max(0, int(wait_msecs))
+        completed_runtimes = tuple(
+            runtime
+            for runtime in tuple(self._retired_viewer_runtimes.values())
+            if runtime.shutdown(wait_msecs=runtime_deadline)
+        )
+        for runtime in completed_runtimes:
+            if self._retired_viewer_runtimes.get(id(runtime)) is runtime:
+                self._finalize_viewer_runtime(runtime)
         if self.image_cache.wait_for_owned_tasks(wait_msecs):
-            for source in list(self._retired_sources.values()):
-                self._close_source(source)
-            self._retired_sources.clear()
+            for source in tuple(self._retired_sources.values()):
+                if any(
+                    runtime.source is source
+                    and runtime.has_unfinished_tasks()
+                    for runtime in self._retired_viewer_runtimes.values()
+                ):
+                    continue
+                retired = self._retired_sources.pop(id(source), None)
+                if retired is source:
+                    self._close_source(source)
         if self._has_owned_async_work():
             self.setParent(None)
             _RETIRED_BOOK_SESSIONS.add(self)
@@ -415,7 +446,7 @@ class BookSession(QObject):
         self._open_workers.pop(result.generation, None)
         if not self._open_workers:
             _RETIRED_BOOK_OPEN_POOLS.discard(self._open_pool)
-        if self._shutdown or result.generation != self.generation:
+        if self._shutdown or result.generation != self._open_generation:
             if result.source is not None:
                 self._close_source(result.source)
             self._maybe_finalize_shutdown()
@@ -472,8 +503,10 @@ class BookSession(QObject):
             )
             return
         old_source = self.source
+        self.generation += 1
         self.source = result.source
         self.current_path = result.requested_path
+        self._replace_viewer_runtime(result.source)
         trace_id = result.trace_id
         self.image_cache.set_source(
             result.source,
@@ -487,7 +520,7 @@ class BookSession(QObject):
             source_path=result.source.source_path,
             selected_image=result.selected_image,
             total_pages=self.model.total_pages,
-            generation=result.generation,
+            generation=self.generation,
             requested_page_identity=(
                 result.source.page_identity(result.selected_image)
                 if result.selected_image is not None
@@ -502,21 +535,94 @@ class BookSession(QObject):
         self.async_opened.emit(opened)
 
     def _retire_source(self, source: ImageSource) -> None:
-        if self.image_cache.has_in_flight_for_source(source):
+        if self._source_has_owned_async_work(source):
             self._retired_sources[id(source)] = source
             return
         self._close_source(source)
 
     def _release_retired_source(self, source: ImageSource) -> None:
-        retired = self._retired_sources.pop(id(source), None)
-        if retired is source:
-            self._close_source(source)
+        self._try_release_retired_source(source)
         self._maybe_finalize_shutdown()
+
+    def _source_has_owned_async_work(self, source: ImageSource) -> bool:
+        if self.image_cache.has_in_flight_for_source(source):
+            return True
+        return any(
+            runtime.source is source and runtime.has_unfinished_tasks()
+            for runtime in self._retired_viewer_runtimes.values()
+        )
+
+    def _try_release_retired_source(self, source: ImageSource) -> bool:
+        retired = self._retired_sources.get(id(source))
+        if retired is not source or self._source_has_owned_async_work(source):
+            return False
+        self._retired_sources.pop(id(source), None)
+        self._close_source(source)
+        return True
+
+    def _replace_viewer_runtime(
+        self,
+        source: ImageSource | None,
+    ) -> None:
+        old_runtime = self.viewer_runtime
+        new_runtime = (
+            ZipRasterBookRuntime(
+                source,
+                self.generation,
+                self,
+                image_work_coordinator=self._image_work_coordinator,
+                cache_unit_limit=max(3, self.image_cache.cache_size),
+                cache_byte_budget=self.image_cache.cache_byte_budget_bytes,
+            )
+            if isinstance(source, ZipImageSource)
+            else None
+        )
+        self.viewer_runtime = new_runtime
+        if new_runtime is not None:
+            new_runtime.idle.connect(self._release_retired_viewer_runtime)
+        if old_runtime is not None and old_runtime is not new_runtime:
+            self._retire_viewer_runtime(old_runtime)
+        self.viewer_runtime_changed.emit(new_runtime)
+
+    def _retire_viewer_runtime(
+        self,
+        runtime: ZipRasterBookRuntime,
+    ) -> None:
+        completed = runtime.shutdown(wait_msecs=0)
+        if completed:
+            self._finalize_viewer_runtime(runtime)
+            return
+        self._retired_viewer_runtimes[id(runtime)] = runtime
+
+    @Slot(object)
+    def _release_retired_viewer_runtime(self, runtime: object) -> None:
+        if not isinstance(runtime, ZipRasterBookRuntime):
+            return
+        retired = self._retired_viewer_runtimes.get(id(runtime))
+        if retired is not runtime or runtime.has_unfinished_tasks():
+            return
+        source = runtime.source
+        self._finalize_viewer_runtime(runtime)
+        self._try_release_retired_source(source)
+        self._maybe_finalize_shutdown()
+
+    def _finalize_viewer_runtime(
+        self,
+        runtime: ZipRasterBookRuntime,
+    ) -> None:
+        self._retired_viewer_runtimes.pop(id(runtime), None)
+        runtime.shutdown(wait_msecs=0)
+        runtime.setParent(None)
+        runtime.deleteLater()
 
     def _has_owned_async_work(self) -> bool:
         return bool(
             self._open_workers
             or self._retired_sources
+            or any(
+                runtime.has_unfinished_tasks()
+                for runtime in self._retired_viewer_runtimes.values()
+            )
             or self.image_cache.has_unfinished_tasks()
         )
 

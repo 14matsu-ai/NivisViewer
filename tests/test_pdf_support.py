@@ -1814,7 +1814,13 @@ def test_pdf_viewer_async_open_spread_render_and_history(
     window = controller.open_path(pdf)
     try:
         deadline = time.monotonic() + 3
-        while window.model.total_pages != 3 and time.monotonic() < deadline:
+        while (
+            (
+                window.model.total_pages != 3
+                or window.presentation_state.displayed_page != 0
+            )
+            and time.monotonic() < deadline
+        ):
             qapp.processEvents()
             time.sleep(0.005)
         assert isinstance(window.book_session.source, PdfImageSource)
@@ -1833,8 +1839,12 @@ def test_pdf_viewer_async_open_spread_render_and_history(
         window.rotate_right()
         deadline = time.monotonic() + 3
         while (
-            not {1, 2}.issubset(
-                {request.page_index for request in backend.rendered}
+            (
+                not {1, 2}.issubset(
+                    {request.page_index for request in backend.rendered}
+                )
+                or window.presentation_state.displayed_page
+                != window.model.focused_index
             )
             and time.monotonic() < deadline
         ):

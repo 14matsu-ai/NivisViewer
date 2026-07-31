@@ -15,6 +15,7 @@ from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import QStyle, QStyleOptionViewItem
 
 from app.application_controller import ApplicationController
+from app.archive_backend import ArchiveErrorCode
 from app.book_session import BookSession
 from app.browser_item_delegate import BrowserItemDelegate
 from app.browser_model import BrowserItem, BrowserItemKind, BrowserItemModel
@@ -30,6 +31,7 @@ from app.image_cache import (
 from app.image_source import (
     FolderListingSnapshot,
     ImageSource,
+    ImageSourceError,
     create_image_source,
 )
 from app.image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
@@ -409,6 +411,48 @@ class TargetDecodeImageSource(ImageSource):
         return image_id
 
 
+class CancellableTargetDecodeImageSource(ImageSource):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.started = Event()
+        self.cancel_requested = Event()
+        self.target_calls: list[tuple[str, tuple[int, int]]] = []
+
+    def list_images(self) -> list[str]:
+        return ["large.jpg"]
+
+    def open_qimage_at_most(
+        self,
+        image_id: str,
+        maximum_size: tuple[int, int],
+    ) -> tuple[QImage, tuple[int, int]]:
+        self.target_calls.append((image_id, maximum_size))
+        if len(self.target_calls) == 1:
+            self.started.set()
+            assert self.cancel_requested.wait(2)
+            raise ImageSourceError(
+                "cancelled",
+                code=ArchiveErrorCode.PROCESS_CANCELLED.value,
+            )
+        image = QImage(
+            maximum_size[0],
+            maximum_size[1],
+            QImage.Format.Format_RGB32,
+        )
+        image.fill(QColor("#f0f0f0"))
+        return image, (4096, 6500)
+
+    def cancel_image_request(self, image_id: str) -> None:
+        assert image_id == "large.jpg"
+        self.cancel_requested.set()
+
+    def open_image(self, image_id: str) -> Image.Image:
+        raise AssertionError(f"Pillow fallback was not expected: {image_id}")
+
+    def display_path(self, image_id: str) -> str:
+        return image_id
+
+
 def _cached_qimage(
     index: int,
     width: int,
@@ -531,6 +575,60 @@ def test_image_cache_target_decode_can_upgrade_preview_to_full_source(
     assert not full.source_is_preview
     assert full.original_size == (4096, 6500)
     assert source.full_calls == ["large.jpg"]
+
+
+def test_image_cache_retries_wanted_page_after_decode_bounds_cancel(
+    tmp_path: Path,
+    qapp,
+) -> None:
+    source = CancellableTargetDecodeImageSource(tmp_path)
+    cache = ImageCache(cache_size=3)
+    cache.set_source(source, source.list_images())
+    cache.set_raster_decode_bounds((1361, 2160))
+    cache.preload_around(0, radius=0, visible_indexes=(0,))
+    assert source.started.wait(1)
+
+    assert cache.set_raster_decode_bounds((800, 1200))
+    cache.preload_around(0, radius=0, visible_indexes=(0,))
+    assert cache.wait_for_done(2000)
+
+    assert _drain_events(
+        qapp,
+        lambda: len(source.target_calls) == 2,
+        timeout=0.5,
+    )
+    assert cache.wait_for_done(2000)
+    assert _drain_events(qapp, lambda: cache.get(0) is not None)
+    assert source.target_calls == [
+        ("large.jpg", (1361, 2160)),
+        ("large.jpg", (800, 1200)),
+    ]
+    cached = cache.get(0)
+    assert cached is not None
+    assert cached.raster_decode_revision == 2
+    assert cached.qimage is not None
+    assert (cached.qimage.width(), cached.qimage.height()) == (800, 1200)
+
+
+def test_image_cache_drops_task_when_coordinator_rejects_start(
+    tmp_path: Path,
+    qapp,
+) -> None:
+    coordinator = ImageWorkCoordinator(max_workers=1)
+    assert coordinator.shutdown(wait_msecs=0)
+    source = TargetDecodeImageSource(tmp_path)
+    cache = ImageCache(
+        cache_size=3,
+        image_work_coordinator=coordinator,
+    )
+    cache.set_source(source, source.list_images())
+    cache.set_raster_decode_bounds((800, 1200))
+
+    cache.preload_around(0, radius=0, visible_indexes=(0,))
+
+    assert source.target_calls == []
+    assert not cache.has_pending_page(0)
+    assert cache.wait_for_owned_tasks(0)
 
 
 @pytest.mark.parametrize(
@@ -1360,9 +1458,9 @@ def test_spread_keeps_complete_previous_unit_until_slow_partner_is_ready(
         applied: list[tuple[str, ...]] = []
         original_set_pages = window.viewer.set_pages
 
-        def record_set_pages(spread, pages):
+        def record_set_pages(spread, pages, **kwargs):
             applied.append(tuple(image.image_id for image in pages))
-            original_set_pages(spread, pages)
+            original_set_pages(spread, pages, **kwargs)
 
         window.viewer.set_pages = record_set_pages  # type: ignore[method-assign]
         window.model.go_to_index(2)

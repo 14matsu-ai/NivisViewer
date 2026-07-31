@@ -302,6 +302,356 @@ def test_zip_jpeg_target_decode_uses_display_bound(
     assert (image.width(), image.height()) == (1361, 2160)
 
 
+def test_zip_streamed_jpeg_decodes_without_full_payload_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "source.jpg"
+    write_image(image_path, size=(1200, 800))
+    archive = tmp_path / "book.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+        output.write(image_path, "ページ/001.jpg")
+
+    source = ZipImageSource(archive)
+    entry_open_calls = 0
+    original_open = source._zip.open
+
+    def counted_open(*args, **kwargs):
+        nonlocal entry_open_calls
+        entry_open_calls += 1
+        return original_open(*args, **kwargs)
+
+    def unexpected_materialization(*_args, **_kwargs):
+        raise AssertionError("streamed JPEG decode must not materialize the payload")
+
+    monkeypatch.setattr(source._zip, "open", counted_open)
+    monkeypatch.setattr(source, "_read_entry_stream", unexpected_materialization)
+    monkeypatch.setattr("app.image_source.Image.open", unexpected_materialization)
+    try:
+        decoded = source.open_streamed_jpeg_at_most(
+            "ページ/001.jpg",
+            (600, 600),
+        )
+        entry_size = source._zip.NameToInfo["ページ/001.jpg"].file_size
+    finally:
+        source.close()
+
+    assert decoded is not None
+    assert decoded.original_size == (1200, 800)
+    assert (decoded.qimage.width(), decoded.qimage.height()) == (600, 400)
+    assert 0 < decoded.bytes_read <= entry_size
+    assert decoded.read_calls >= 1
+    assert entry_open_calls == 1
+
+
+def test_zip_compatible_jpeg_uses_one_qbytearray_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "source.jpg"
+    write_image(image_path, size=(1200, 800))
+    archive = tmp_path / "book.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+        output.write(image_path, "ページ/001.jpg")
+
+    source = ZipImageSource(archive)
+    entry_open_calls = 0
+    original_open = source._zip.open
+
+    def counted_open(*args, **kwargs):
+        nonlocal entry_open_calls
+        entry_open_calls += 1
+        return original_open(*args, **kwargs)
+
+    def unexpected_bytesio(*_args, **_kwargs):
+        raise AssertionError("compatible JPEG decode must not build BytesIO")
+
+    monkeypatch.setattr(source._zip, "open", counted_open)
+    monkeypatch.setattr(source, "_read_entry_stream", unexpected_bytesio)
+    try:
+        decoded = source.open_compatible_jpeg_at_most(
+            "ページ/001.jpg",
+            (600, 600),
+        )
+        entry_size = source._zip.NameToInfo["ページ/001.jpg"].file_size
+    finally:
+        source.close()
+
+    assert decoded is not None
+    assert decoded.backend == "qbytearray-qbuffer"
+    assert decoded.full_payload_materializations == 1
+    assert decoded.bytes_read == entry_size
+    assert decoded.read_calls >= 2
+    assert decoded.original_size == (1200, 800)
+    assert (decoded.qimage.width(), decoded.qimage.height()) == (600, 400)
+    assert entry_open_calls == 1
+
+
+def test_zip_compatible_jpeg_applies_exif_axis_swap(
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "rotated.jpg"
+    exif = Image.Exif()
+    exif[274] = 6
+    with Image.new("RGB", (1200, 800), "white") as image:
+        image.save(image_path, "JPEG", exif=exif)
+    archive = tmp_path / "book.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+        output.write(image_path, "rotated.jpg")
+
+    source = ZipImageSource(archive)
+    try:
+        decoded = source.open_compatible_jpeg_at_most(
+            "rotated.jpg",
+            (400, 600),
+        )
+    finally:
+        source.close()
+
+    assert decoded is not None
+    assert decoded.original_size == (800, 1200)
+    assert (decoded.qimage.width(), decoded.qimage.height()) == (400, 600)
+
+
+def test_zip_streamed_jpeg_applies_exif_axis_swap(
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "rotated.jpg"
+    exif = Image.Exif()
+    exif[274] = 6
+    with Image.new("RGB", (1200, 800), "white") as image:
+        image.save(image_path, "JPEG", exif=exif)
+    archive = tmp_path / "book.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+        output.write(image_path, "rotated.jpg")
+
+    source = ZipImageSource(archive)
+    try:
+        decoded = source.open_streamed_jpeg_at_most(
+            "rotated.jpg",
+            (400, 600),
+        )
+    finally:
+        source.close()
+
+    assert decoded is not None
+    assert decoded.original_size == (800, 1200)
+    assert (decoded.qimage.width(), decoded.qimage.height()) == (400, 600)
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    (
+        "open_streamed_jpeg_at_most",
+        "open_compatible_jpeg_at_most",
+    ),
+)
+def test_zip_jpeg_fast_paths_validate_entry_size_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+) -> None:
+    archive = tmp_path / "book.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("page.jpg", b"x" * 64)
+
+    source = ZipImageSource(archive)
+    entry_open_calls = 0
+    original_open = source._zip.open
+
+    def counted_open(*args, **kwargs):
+        nonlocal entry_open_calls
+        entry_open_calls += 1
+        return original_open(*args, **kwargs)
+
+    monkeypatch.setattr(source._zip, "open", counted_open)
+    monkeypatch.setattr("app.image_source.MAX_IMAGE_ENTRY_BYTES", 32)
+    try:
+        with pytest.raises(ImageSourceError) as exc_info:
+            getattr(source, method_name)("page.jpg", (100, 100))
+    finally:
+        source.close()
+
+    assert exc_info.value.code == ArchiveErrorCode.ENTRY_TOO_LARGE.value
+    assert entry_open_calls == 0
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    (
+        "open_streamed_jpeg_at_most",
+        "open_compatible_jpeg_at_most",
+    ),
+)
+def test_zip_jpeg_fast_paths_cancel_with_existing_error_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+) -> None:
+    image_path = tmp_path / "page.jpg"
+    write_image(image_path, size=(1200, 800))
+    archive = tmp_path / "book.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+        output.write(image_path, "page.jpg")
+
+    source = ZipImageSource(archive)
+    original_open = source._zip.open
+    read_started = Event()
+    release_read = Event()
+
+    class BlockingEntry:
+        def __init__(self, entry) -> None:
+            self._entry = entry
+            self._blocked = False
+
+        def __enter__(self):
+            self._entry.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return self._entry.__exit__(exc_type, exc, traceback)
+
+        def read(self, size: int = -1) -> bytes:
+            chunk = self._entry.read(size)
+            if chunk and not self._blocked:
+                self._blocked = True
+                read_started.set()
+                assert release_read.wait(2)
+            return chunk
+
+    monkeypatch.setattr(
+        source._zip,
+        "open",
+        lambda *args, **kwargs: BlockingEntry(original_open(*args, **kwargs)),
+    )
+    error_codes: list[str | None] = []
+
+    def load() -> None:
+        try:
+            getattr(source, method_name)("page.jpg", (600, 400))
+        except ImageSourceError as exc:
+            error_codes.append(exc.code)
+
+    worker = Thread(target=load)
+    worker.start()
+    try:
+        assert read_started.wait(1)
+        source.cancel_image_request("page.jpg")
+    finally:
+        release_read.set()
+    worker.join(2)
+    try:
+        assert not worker.is_alive()
+        assert error_codes == [ArchiveErrorCode.PROCESS_CANCELLED.value]
+        assert source._active_requests == {}
+    finally:
+        source.close()
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    (
+        "open_streamed_jpeg_at_most",
+        "open_compatible_jpeg_at_most",
+    ),
+)
+def test_zip_close_defers_while_jpeg_fast_path_owns_archive_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+) -> None:
+    image_path = tmp_path / "page.jpg"
+    write_image(image_path, size=(1200, 800))
+    archive = tmp_path / "book.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+        output.write(image_path, "page.jpg")
+
+    source = ZipImageSource(archive)
+    original_open = source._zip.open
+    read_started = Event()
+    release_read = Event()
+
+    class BlockingEntry:
+        def __init__(self, entry) -> None:
+            self._entry = entry
+            self._blocked = False
+
+        def __enter__(self):
+            self._entry.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return self._entry.__exit__(exc_type, exc, traceback)
+
+        def read(self, size: int = -1) -> bytes:
+            chunk = self._entry.read(size)
+            if chunk and not self._blocked:
+                self._blocked = True
+                read_started.set()
+                assert release_read.wait(2)
+            return chunk
+
+    monkeypatch.setattr(
+        source._zip,
+        "open",
+        lambda *args, **kwargs: BlockingEntry(original_open(*args, **kwargs)),
+    )
+    error_codes: list[str | None] = []
+
+    def load() -> None:
+        try:
+            getattr(source, method_name)("page.jpg", (600, 400))
+        except ImageSourceError as exc:
+            error_codes.append(exc.code)
+
+    worker = Thread(target=load)
+    worker.start()
+    assert read_started.wait(1)
+
+    close_worker = Thread(target=source.close)
+    close_worker.start()
+    try:
+        close_worker.join(0.5)
+        assert not close_worker.is_alive()
+        assert source._closed.is_set()
+        assert not source._zip_closed
+    finally:
+        release_read.set()
+
+    worker.join(2)
+    close_worker.join(2)
+    assert not worker.is_alive()
+    assert not close_worker.is_alive()
+    assert error_codes == [ArchiveErrorCode.PROCESS_CANCELLED.value]
+    assert source._active_requests == {}
+    assert source._zip_closed
+    assert source._zip.fp is None
+
+
+def test_zip_streamed_corrupt_jpeg_returns_none_for_legacy_fallback(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "book.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+        output.writestr("broken.jpg", b"this is not a jpeg")
+
+    source = ZipImageSource(archive)
+    try:
+        streamed = source.open_streamed_jpeg_at_most(
+            "broken.jpg",
+            (400, 400),
+        )
+        legacy = source.open_qimage_at_most(
+            "broken.jpg",
+            (400, 400),
+        )
+    finally:
+        source.close()
+
+    assert streamed is None
+    assert legacy is None
+
+
 def test_zip_running_entry_read_can_be_cancelled_between_chunks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
