@@ -302,6 +302,33 @@ def test_thumbnail_signature_tracks_ready_spec_and_avoids_duplicate_change(
     assert not model._has_compatible_thumbnail(item, 101)
 
 
+def test_thumbnail_model_keeps_cow_snapshot_isolated_from_input_mutation(
+    tmp_path: Path,
+) -> None:
+    model = BrowserItemModel()
+    item = BrowserItem(
+        "page.jpg",
+        tmp_path / "page.jpg",
+        BrowserItemKind.IMAGE,
+        1.0,
+    )
+    model.set_items([item])
+    image = QImage(16, 16, QImage.Format.Format_RGB32)
+    image.fill(0xFFFF0000)
+    original_key = image.cacheKey()
+
+    assert model.set_thumbnail_image(item.path, image, request_token=101)
+    stored = model._thumbnail_images[model._key(item.path)]
+    assert stored is not image
+    assert stored.cacheKey() == original_key
+
+    image.fill(0xFF0000FF)
+
+    assert stored.pixelColor(0, 0).red() == 255
+    assert stored.pixelColor(0, 0).blue() == 0
+    assert stored.cacheKey() != image.cacheKey()
+
+
 def test_refresh_retains_only_unchanged_ready_thumbnail_signatures(
     tmp_path: Path,
 ) -> None:

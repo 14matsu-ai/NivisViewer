@@ -310,7 +310,7 @@ class BrowserThumbnailProvider(QObject):
         if cached is not None:
             self._increment_stat("memory_hit")
             self._cache.move_to_end(cache_key)
-            image = cached.copy()
+            image = QImage(cached)
             QTimer.singleShot(
                 0,
                 lambda path=str(item.path), current=requested_generation, result=image: (
@@ -329,7 +329,7 @@ class BrowserThumbnailProvider(QObject):
             )
             if candidate is not None:
                 candidate_image, candidate_spec = candidate
-                image = candidate_image.copy()
+                image = QImage(candidate_image)
                 if candidate_spec.long_edge >= normalized_size.long_edge * 0.95:
                     QTimer.singleShot(
                         0,
@@ -1034,7 +1034,7 @@ class BrowserThumbnailProvider(QObject):
                     "サムネイルを生成できませんでした",
                 )
             return
-        self._cache[cache_key] = image.copy()
+        self._cache[cache_key] = QImage(image)
         if pending is not None and isinstance(
             pending.worker.size, ThumbnailRenderSpec
         ):

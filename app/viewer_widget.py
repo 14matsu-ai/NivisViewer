@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, replace
 import math
 
-from PySide6.QtCore import QPoint, QRect, QRectF, QSize, QThreadPool, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, QSize, QThreadPool, QTimer, Qt, Signal
 from PySide6.QtGui import (
     QColor,
+    QCloseEvent,
     QContextMenuEvent,
     QImage,
     QMouseEvent,
@@ -45,6 +46,11 @@ class ViewerImage:
     rendered_size: tuple[int, int] | None = None
     pre_rotated: bool = False
     qimage: QImage | None = None
+    source_generation: int = 0
+    source_identity: str = ""
+    split_range: tuple[int, int, int, int] | None = None
+    display_prepared: bool = False
+    source_is_preview: bool = False
 
 
 @dataclass(frozen=True)
@@ -54,6 +60,42 @@ class SpreadLayout:
     content_size: QSize
     rects: tuple[QRect, ...]
     effective_gap: int
+
+
+@dataclass
+class _PendingDisplay:
+    spread: DisplaySpread
+    images: tuple[ViewerImage, ...]
+    keys: tuple[ViewerRenderKey | None, ...]
+    generation: int
+    request_generation: int
+    failed_keys: dict[ViewerRenderKey, str]
+
+
+@dataclass(frozen=True)
+class PreparedDisplayUnitKey:
+    spread_identity: tuple[tuple[int, str], ...]
+    image_ids: tuple[str, ...]
+    render_keys: tuple[ViewerRenderKey | None, ...]
+    layout_generation: int
+
+
+@dataclass(frozen=True)
+class _PreparedDisplayUnit:
+    spread: DisplaySpread
+    images: tuple[ViewerImage, ...]
+    render_keys: tuple[ViewerRenderKey | None, ...]
+
+
+@dataclass
+class _PreparedUnitRequest:
+    key: PreparedDisplayUnitKey
+    spread: DisplaySpread
+    images: tuple[ViewerImage, ...]
+    sources: tuple[QImage | None, ...]
+    priority: int
+    protected: bool
+    failed_keys: set[ViewerRenderKey]
 
 
 def calculate_spread_layout(
@@ -195,7 +237,9 @@ class ViewerWidget(QWidget):
     viewportChanged = Signal()
     contentPainted = Signal(object)
     magnifierPdfResolutionRequested = Signal(int, QSize)
+    magnifierSourceResolutionRequested = Signal(int, QSize)
     magnifierCancelled = Signal()
+    displayCommitted = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -210,7 +254,6 @@ class ViewerWidget(QWidget):
         self.rotation_angle = 0
         self.smooth_scaling = True
         self.horizontal_alignment = "center"
-        self.magnifier_enabled = False
         self.magnifier_zoom = 2.0
         self.magnifier_size = 220
         self.resampling_mode = "standard"
@@ -234,9 +277,31 @@ class ViewerWidget(QWidget):
         self._render_pool.setMaxThreadCount(1)
         self._render_pending: dict[ViewerRenderKey, int] = {}
         self._render_tasks: set[ViewerRenderTask] = set()
+        self._render_task_by_key: dict[ViewerRenderKey, ViewerRenderTask] = {}
+        self._render_priorities: dict[ViewerRenderKey, int] = {}
         self._render_cache: OrderedDict[ViewerRenderKey, QPixmap] = OrderedDict()
         self._last_rendered_by_image: dict[str, QPixmap] = {}
-        self._render_cache_limit = 6
+        self._render_cache_limit = 12
+        self._render_cache_byte_limit = 256 * 1024 * 1024
+        self._pending_display: _PendingDisplay | None = None
+        self._display_request_generation = 0
+        self._prepared_units: OrderedDict[
+            PreparedDisplayUnitKey,
+            _PreparedDisplayUnit,
+        ] = OrderedDict()
+        self._prepared_requests: dict[
+            PreparedDisplayUnitKey,
+            _PreparedUnitRequest,
+        ] = {}
+        self._prepared_unit_priorities: dict[PreparedDisplayUnitKey, int] = {}
+        self._protected_prepared_units: set[PreparedDisplayUnitKey] = set()
+        self._resize_render_timer = QTimer(self)
+        self._resize_render_timer.setSingleShot(True)
+        self._resize_render_timer.setInterval(120)
+        self._resize_render_timer.timeout.connect(self._refresh_current_render)
+        self._deferred_render_target: (
+            tuple[DisplaySpread, tuple[ViewerImage, ...]] | None
+        ) = None
         self.magnifier_selecting = False
         self.magnifier_active = False
         self.magnifier_source_page: int | None = None
@@ -340,18 +405,30 @@ class ViewerWidget(QWidget):
         if normalized != self.gap:
             self.cancel_magnifier()
         self.gap = normalized
-        self.update()
+        self._refresh_current_render()
 
     def set_join_spread_pages(self, enabled: bool) -> None:
         normalized = bool(enabled)
         if normalized != self.join_spread_pages:
             self.cancel_magnifier()
         self.join_spread_pages = normalized
-        self.update()
+        self._refresh_current_render()
 
     def set_smooth_scaling(self, enabled: bool) -> None:
-        self.smooth_scaling = enabled
-        self.update()
+        normalized = bool(enabled)
+        changed = normalized != self.smooth_scaling
+        self.smooth_scaling = normalized
+        if changed and self.resampling_mode == "standard":
+            self._refresh_current_render()
+        else:
+            self.update()
+
+    def set_render_cache_byte_limit_mib(self, memory_mib: int) -> None:
+        self._render_cache_byte_limit = max(
+            64,
+            min(4096, int(memory_mib)),
+        ) * 1024 * 1024
+        self._enforce_render_cache_limit()
 
     def set_resampling_modes(
         self,
@@ -359,22 +436,35 @@ class ViewerWidget(QWidget):
         normal: str | None = None,
         magnifier: str | None = None,
     ) -> None:
-        changed = False
+        normal_changed = False
+        magnifier_changed = False
         if normal is not None:
             normalized = normalize_resampling_mode(normal)
             if normalized != self.resampling_mode:
                 self.resampling_mode = normalized
-                changed = True
+                normal_changed = True
         if magnifier is not None:
             normalized = normalize_resampling_mode(magnifier)
             if normalized != self.magnifier_resampling_mode:
                 self.magnifier_resampling_mode = normalized
-                changed = True
+                magnifier_changed = True
                 if self.magnifier_selecting or self.magnifier_active:
                     self.cancel_magnifier()
-        if changed:
-            self._invalidate_render_requests(clear_cache=False)
+        if normal_changed:
+            self._refresh_current_render()
+        elif magnifier_changed:
             self.update()
+
+    def event(self, event) -> bool:  # type: ignore[override]
+        handled = super().event(event)
+        if (
+            event.type() == QEvent.Type.DevicePixelRatioChange
+            and hasattr(self, "_render_pool")
+        ):
+            # A monitor transition can change physical target dimensions
+            # without a logical QWidget resize.
+            self._refresh_current_render()
+        return handled
 
     def set_horizontal_alignment(self, alignment: str) -> None:
         if alignment not in {"left", "center", "right"}:
@@ -382,13 +472,13 @@ class ViewerWidget(QWidget):
         if alignment != self.horizontal_alignment:
             self.cancel_magnifier()
         self.horizontal_alignment = alignment
-        self.update()
+        self._refresh_current_render()
 
     def set_magnifier_enabled(self, enabled: bool) -> None:
-        self.magnifier_enabled = enabled
+        # Kept as a compatibility shim for older settings callers. Magnification
+        # is now an immediate pointer action and no longer has a pre-enable mode.
         if not enabled:
             self.cancel_magnifier()
-        self.update()
 
     def set_magnifier_options(self, *, zoom: float | None = None, size: int | None = None) -> None:
         if zoom is not None:
@@ -408,6 +498,12 @@ class ViewerWidget(QWidget):
             or self._magnifier_key is not None
             or self._magnifier_waiting_for_pdf
         )
+        for task in tuple(self._render_tasks):
+            if (
+                task.key.purpose == "magnifier"
+                and self._render_pool.tryTake(task)
+            ):
+                self._discard_render_task(task)
         self.magnifier_selecting = False
         self.magnifier_active = False
         self.magnifier_source_page = None
@@ -425,6 +521,21 @@ class ViewerWidget(QWidget):
             self.magnifierCancelled.emit()
             self.update()
         return was_active
+
+    def toggle_magnifier(self, position: QPoint | None = None) -> bool:
+        if (
+            self.magnifier_selecting
+            or self.magnifier_active
+            or self._magnifier_key is not None
+            or self._magnifier_waiting_for_pdf
+        ):
+            self.cancel_magnifier()
+            return True
+        target = QPoint(position) if position is not None else self._mouse_pos
+        if target is None or not self._begin_magnifier_selection(target):
+            return False
+        self._request_magnifier_render()
+        return True
 
     def set_auto_hide_cursor(self, enabled: bool) -> None:
         # FullscreenChromeController owns cursor idling. Keep this method only
@@ -483,35 +594,31 @@ class ViewerWidget(QWidget):
         normalized = angle % 360
         if normalized != self.rotation_angle:
             self.cancel_magnifier()
-            self._invalidate_render_requests(clear_cache=False)
         self.rotation_angle = normalized
         self._pan = QPoint(0, 0)
-        self.update()
+        self._refresh_current_render()
 
     def set_fit_mode(self, fit_mode: str) -> None:
         if fit_mode != self.fit_mode:
             self.cancel_magnifier()
-            self._invalidate_render_requests(clear_cache=False)
         self.fit_mode = fit_mode
         if fit_mode in {"fit_window", "fit_no_upscale", "fit_width", "fit_height"}:
             self._pan = QPoint(0, 0)
-        self.update()
+        self._refresh_current_render()
 
     def set_manual_zoom(self, zoom: float) -> None:
         self.cancel_magnifier()
-        self._invalidate_render_requests(clear_cache=False)
         self.manual_zoom = min(8.0, max(0.05, zoom))
         self.fit_mode = "manual_zoom"
         self.zoomChanged.emit(self.manual_zoom)
-        self.update()
+        self._refresh_current_render()
 
     def reset_zoom(self) -> None:
         self.cancel_magnifier()
-        self._invalidate_render_requests(clear_cache=False)
         self.fit_mode = "fit_window"
         self.manual_zoom = 1.0
         self._pan = QPoint(0, 0)
-        self.update()
+        self._refresh_current_render()
 
     def scroll_forward(self) -> bool:
         return self._scroll_vertical(1)
@@ -525,15 +632,12 @@ class ViewerWidget(QWidget):
             and tuple(slot.page_index for slot in spread.slots)
             == tuple(slot.page_index for slot in self._spread.slots)
         )
-        self._spread = spread
-        self._images = pages
         if not same_display_unit:
             self.cancel_magnifier()
-            self._invalidate_render_requests(clear_cache=False)
             self._pan = QPoint(0, 0)
-        elif self._magnifier_waiting_for_pdf:
+        if same_display_unit and self._magnifier_waiting_for_pdf:
             self._resume_magnifier_after_pdf_render()
-        self.update()
+        self._prepare_display(spread, pages)
 
     @staticmethod
     def from_qimage(
@@ -543,15 +647,24 @@ class ViewerWidget(QWidget):
         original_size: tuple[int, int],
         rendered_size: tuple[int, int] | None = None,
         pre_rotated: bool = False,
+        create_pixmap: bool = True,
+        source_generation: int = 0,
+        source_identity: str = "",
+        split_range: tuple[int, int, int, int] | None = None,
+        source_is_preview: bool = False,
     ) -> ViewerImage:
         return ViewerImage(
             page_index=page_index,
             image_id=image_id,
-            pixmap=QPixmap.fromImage(qimage),
+            pixmap=QPixmap.fromImage(qimage) if create_pixmap else None,
             original_size=original_size,
             rendered_size=rendered_size,
             pre_rotated=pre_rotated,
             qimage=QImage(qimage),
+            source_generation=int(source_generation),
+            source_identity=str(source_identity),
+            split_range=split_range,
+            source_is_preview=bool(source_is_preview),
         )
 
     @staticmethod
@@ -617,9 +730,26 @@ class ViewerWidget(QWidget):
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
         if event.size() != event.oldSize():
-            self._invalidate_render_requests(clear_cache=False)
             if self.magnifier_selecting or self.magnifier_active:
                 self.cancel_magnifier()
+            pending = self._pending_display
+            if pending is not None:
+                deferred_render_target = (
+                    pending.spread,
+                    pending.images,
+                )
+            elif self._deferred_render_target is not None:
+                deferred_render_target = self._deferred_render_target
+            else:
+                deferred_render_target = (
+                    self._spread,
+                    tuple(self._images),
+                )
+            # Reject old-size work immediately, but retain the last complete
+            # frame until the debounced replacement is ready.
+            self._invalidate_render_requests(clear_cache=False)
+            self._deferred_render_target = deferred_render_target
+            self._resize_render_timer.start()
         if self.fit_mode in {"fit_window", "fit_no_upscale", "fit_width", "fit_height"}:
             self._pan = QPoint(0, 0)
         super().resizeEvent(event)
@@ -647,13 +777,7 @@ class ViewerWidget(QWidget):
     def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         self._show_cursor_temporarily()
         if event.button() == Qt.MouseButton.MiddleButton:
-            if self.magnifier_active:
-                self.cancel_magnifier()
-                event.accept()
-                return
-            if self.magnifier_enabled and self._begin_magnifier_selection(
-                event.position().toPoint()
-            ):
+            if self.toggle_magnifier(event.position().toPoint()):
                 event.accept()
                 return
         if event.button() == Qt.MouseButton.BackButton:
@@ -705,10 +829,17 @@ class ViewerWidget(QWidget):
         self._show_cursor_temporarily()
         self._mouse_pos = event.position().toPoint()
         if (
-            self.magnifier_selecting
-            and event.buttons() & Qt.MouseButton.MiddleButton
+            (self.magnifier_selecting or self.magnifier_active)
+            and not (
+                event.buttons()
+                & (
+                    Qt.MouseButton.LeftButton
+                    | Qt.MouseButton.RightButton
+                )
+            )
         ):
             self._update_magnifier_selection(self._mouse_pos)
+            self._request_magnifier_render()
             event.accept()
             return
         if self._right_button_down:
@@ -746,13 +877,9 @@ class ViewerWidget(QWidget):
         return
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
-        if (
-            event.button() == Qt.MouseButton.MiddleButton
-            and self.magnifier_selecting
+        if event.button() == Qt.MouseButton.MiddleButton and (
+            self.magnifier_selecting or self.magnifier_active
         ):
-            self._update_magnifier_selection(event.position().toPoint())
-            self.magnifier_selecting = False
-            self._request_magnifier_render()
             event.accept()
             return
         if event.button() in {
@@ -882,9 +1009,16 @@ class ViewerWidget(QWidget):
         return QSize(width, height)
 
     def _layout_for_current_images(self) -> SpreadLayout:
+        return self._layout_for_images(self._spread, self._images)
+
+    def _layout_for_images(
+        self,
+        spread: DisplaySpread,
+        images: list[ViewerImage] | tuple[ViewerImage, ...],
+    ) -> SpreadLayout:
         sizes = [
             (self._base_size(image).width(), self._base_size(image).height())
-            for image in self._images
+            for image in images
         ]
         return calculate_spread_layout(
             sizes,
@@ -893,7 +1027,7 @@ class ViewerWidget(QWidget):
             manual_zoom=self.manual_zoom,
             gap=self.gap,
             join_spread_pages=self.join_spread_pages,
-            spread_is_single=self._spread.is_single,
+            spread_is_single=spread.is_single,
             horizontal_alignment=self.horizontal_alignment,
             pan=(self._pan.x(), self._pan.y()),
         )
@@ -923,107 +1057,701 @@ class ViewerWidget(QWidget):
         image: ViewerImage,
         target_rect: QRect,
     ) -> QPixmap | None:
-        if (
-            image.qimage is None
-            or self.resampling_mode == "standard"
-            or (
-                target_rect.size() == self._base_size(image)
-                and (self.rotation_angle == 0 or image.pre_rotated)
-            )
-        ):
+        key = self._viewer_render_key(image, target_rect)
+        if key is None:
             return self._display_pixmap(image)
-
-        dpr = max(1.0, float(self.devicePixelRatioF()))
-        rotation = 0 if image.pre_rotated else self.rotation_angle
-        key = ViewerRenderKey(
-            image_id=image.image_id,
-            source_cache_key=int(image.qimage.cacheKey()),
-            target_width=max(1, round(target_rect.width() * dpr)),
-            target_height=max(1, round(target_rect.height() * dpr)),
-            mode=self.resampling_mode,
-            rotation=rotation,
-            device_pixel_ratio_milli=round(dpr * 1000),
-        )
         cached = self._render_cache.get(key)
         if cached is not None:
             self._render_cache.move_to_end(key)
             return cached
-        self._queue_render(image.qimage, key)
         return self._last_rendered_by_image.get(
             image.image_id,
             self._display_pixmap(image),
         )
 
+    def _viewer_render_key(
+        self,
+        image: ViewerImage,
+        target_rect: QRect,
+    ) -> ViewerRenderKey | None:
+        if (
+            image.qimage is None
+            or (
+                self.resampling_mode != "standard"
+                and target_rect.size() == self._base_size(image)
+                and (self.rotation_angle == 0 or image.pre_rotated)
+                and image.pixmap is not None
+            )
+        ):
+            return None
+        dpr = max(1.0, float(self.devicePixelRatioF()))
+        rotation = 0 if image.pre_rotated else self.rotation_angle
+        target_width = max(1, round(target_rect.width() * dpr))
+        target_height = max(1, round(target_rect.height() * dpr))
+        source_sized = False
+        if self.resampling_mode == "standard":
+            source_size = self._rotated_source_size(image)
+            if (
+                source_size.isValid()
+                and (
+                    target_width > source_size.width()
+                    or target_height > source_size.height()
+                )
+            ):
+                # Standard keeps the historical QPainter upscale path.  A
+                # source-sized artifact is enough above 100%; allocating an
+                # 8x target pixmap for manual zoom can otherwise require
+                # several GiB for one large page.
+                scale = min(
+                    1.0,
+                    target_width / source_size.width(),
+                    target_height / source_size.height(),
+                )
+                target_width = max(1, round(source_size.width() * scale))
+                target_height = max(1, round(source_size.height() * scale))
+            source_sized = (
+                source_size.isValid()
+                and target_width == source_size.width()
+                and target_height == source_size.height()
+            )
+        return ViewerRenderKey(
+            image_id=image.image_id,
+            source_cache_key=int(image.qimage.cacheKey()),
+            target_width=target_width,
+            target_height=target_height,
+            mode=self.resampling_mode,
+            rotation=rotation,
+            device_pixel_ratio_milli=round(dpr * 1000),
+            layout_generation=0 if source_sized else self._render_generation,
+            source_generation=image.source_generation,
+            source_identity=image.source_identity,
+            split_range=image.split_range,
+            smooth_transform=(
+                self.smooth_scaling
+                if (
+                    self.resampling_mode == "standard"
+                    and not source_sized
+                )
+                else True
+            ),
+            source_sized=source_sized,
+        )
+
+    def _refresh_current_render(self) -> None:
+        deferred = self._deferred_render_target
+        self._deferred_render_target = None
+        pending = self._pending_display
+        spread = (
+            deferred[0]
+            if deferred is not None
+            else pending.spread if pending is not None else self._spread
+        )
+        images = list(
+            deferred[1]
+            if deferred is not None
+            else pending.images if pending is not None else self._images
+        )
+        self._invalidate_render_requests(clear_cache=False)
+        if not images:
+            self.update()
+            return
+        self._prepare_display(spread, images)
+
+    def _prepared_unit_key(
+        self,
+        spread: DisplaySpread,
+        pages: list[ViewerImage] | tuple[ViewerImage, ...],
+    ) -> PreparedDisplayUnitKey:
+        layout = self._layout_for_images(spread, pages)
+        render_keys = tuple(
+            self._viewer_render_key(image, rect)
+            for image, rect in zip(pages, layout.rects)
+        )
+        return PreparedDisplayUnitKey(
+            spread_identity=tuple(
+                (slot.page_index, slot.image_id) for slot in spread.slots
+            ),
+            image_ids=tuple(image.image_id for image in pages),
+            render_keys=render_keys,
+            layout_generation=self._render_generation,
+        )
+
+    def prepare_display_units(
+        self,
+        units: Iterable[
+            tuple[
+                int,
+                DisplaySpread,
+                list[ViewerImage] | None,
+                bool,
+            ]
+        ],
+    ) -> None:
+        desired_by_identity: dict[
+            tuple[tuple[int, str], ...],
+            tuple[int, bool],
+        ] = {}
+        planned: dict[PreparedDisplayUnitKey, _PreparedUnitRequest] = {}
+        for priority, spread, pages, protected in units:
+            spread_identity = tuple(
+                (slot.page_index, slot.image_id) for slot in spread.slots
+            )
+            normalized_priority = max(0, int(priority))
+            previous_desired = desired_by_identity.get(spread_identity)
+            if (
+                previous_desired is None
+                or normalized_priority < previous_desired[0]
+            ):
+                desired_by_identity[spread_identity] = (
+                    normalized_priority,
+                    bool(protected),
+                )
+            if pages is None:
+                continue
+            unit_key = self._prepared_unit_key(spread, pages)
+            request = _PreparedUnitRequest(
+                key=unit_key,
+                spread=spread,
+                images=tuple(pages),
+                sources=tuple(image.qimage for image in pages),
+                priority=normalized_priority,
+                protected=bool(protected),
+                failed_keys=set(),
+            )
+            existing = planned.get(unit_key)
+            if existing is None or request.priority < existing.priority:
+                planned[unit_key] = request
+
+        planned_by_identity = {
+            key.spread_identity: key for key in planned
+        }
+        self._prepared_units = OrderedDict(
+            (key, unit)
+            for key, unit in self._prepared_units.items()
+            if (
+                key.spread_identity in desired_by_identity
+                and (
+                    key.spread_identity not in planned_by_identity
+                    or planned_by_identity[key.spread_identity] == key
+                )
+            )
+        )
+        retained_requests: dict[
+            PreparedDisplayUnitKey,
+            _PreparedUnitRequest,
+        ] = {}
+        for key, request in self._prepared_requests.items():
+            desired = desired_by_identity.get(key.spread_identity)
+            if (
+                desired is None
+                or (
+                    key.spread_identity in planned_by_identity
+                    and planned_by_identity[key.spread_identity] != key
+                )
+            ):
+                continue
+            request.priority, request.protected = desired
+            retained_requests[key] = request
+        self._prepared_requests = retained_requests
+
+        for unit_key, request in sorted(
+            planned.items(),
+            key=lambda item: item[1].priority,
+        ):
+            if self._unit_render_keys_ready(unit_key.render_keys):
+                self._store_prepared_unit(request)
+                self._prepared_requests.pop(unit_key, None)
+                continue
+            self._prepared_requests[unit_key] = request
+
+        pending_render_keys = (
+            {
+                key
+                for key in self._pending_display.keys
+                if key is not None
+            }
+            if self._pending_display is not None
+            else set()
+        )
+        for request in sorted(
+            self._prepared_requests.values(),
+            key=lambda value: value.priority,
+        ):
+            queue_priority = 80 - request.priority * 10
+            for source, render_key in zip(
+                request.sources,
+                request.key.render_keys,
+            ):
+                if (
+                    render_key is not None
+                    and render_key not in self._render_cache
+                    and source is not None
+                ):
+                    self._queue_render(
+                        source,
+                        render_key,
+                        priority=queue_priority,
+                        allow_priority_decrease=(
+                            render_key not in pending_render_keys
+                        ),
+                    )
+
+        tracked_keys = (
+            set(self._prepared_units)
+            | set(self._prepared_requests)
+        )
+        self._prepared_unit_priorities = {
+            key: desired_by_identity[key.spread_identity][0]
+            for key in tracked_keys
+            if key.spread_identity in desired_by_identity
+        }
+        self._protected_prepared_units = {
+            key
+            for key in tracked_keys
+            if desired_by_identity.get(key.spread_identity, (0, False))[1]
+        }
+        allowed_render_keys = {
+            key
+            for request in self._prepared_requests.values()
+            for key in request.key.render_keys
+            if key is not None
+        }
+        pending = self._pending_display
+        if pending is not None:
+            allowed_render_keys.update(pending_render_keys)
+        for task in tuple(self._render_tasks):
+            if (
+                task.key.purpose == "viewer"
+                and task.key not in allowed_render_keys
+                and self._render_pool.tryTake(task)
+            ):
+                self._discard_render_task(task)
+        self._enforce_render_cache_limit()
+
+    def _store_prepared_unit(
+        self,
+        request: _PreparedUnitRequest,
+    ) -> None:
+        images = tuple(
+            replace(image, pixmap=None, qimage=None)
+            for image in request.images
+        )
+        self._prepared_units[request.key] = _PreparedDisplayUnit(
+            request.spread,
+            images,
+            request.key.render_keys,
+        )
+        self._prepared_units.move_to_end(request.key)
+
+    def tracks_prepared_display_unit(
+        self,
+        spread: DisplaySpread,
+        *,
+        source_generation: int,
+        source_identity: str,
+    ) -> bool:
+        identity = tuple(
+            (slot.page_index, slot.image_id) for slot in spread.slots
+        )
+
+        def matches(
+            key: PreparedDisplayUnitKey,
+            images: tuple[ViewerImage, ...],
+        ) -> bool:
+            return (
+                key.spread_identity == identity
+                and key.layout_generation == self._render_generation
+                and all(
+                    image.source_generation == int(source_generation)
+                    and image.source_identity == str(source_identity)
+                    for image in images
+                )
+                and all(
+                    render_key is None
+                    or render_key.mode == self.resampling_mode
+                    for render_key in key.render_keys
+                )
+            )
+
+        return any(
+            matches(key, unit.images)
+            for key, unit in self._prepared_units.items()
+        ) or any(
+            matches(key, request.images)
+            for key, request in self._prepared_requests.items()
+        )
+
+    def apply_prepared_display(
+        self,
+        spread: DisplaySpread,
+        *,
+        source_generation: int,
+        source_identity: str,
+    ) -> bool:
+        identity = tuple(
+            (slot.page_index, slot.image_id) for slot in spread.slots
+        )
+        for unit_key, unit in reversed(self._prepared_units.items()):
+            if (
+                unit_key.spread_identity != identity
+                or unit_key.layout_generation != self._render_generation
+            ):
+                continue
+            render_keys = unit.render_keys
+            concrete_keys = tuple(
+                key for key in render_keys if key is not None
+            )
+            if (
+                len(concrete_keys) != len(render_keys)
+                or any(
+                    key.source_generation != int(source_generation)
+                    or key.source_identity != str(source_identity)
+                    or key.mode != self.resampling_mode
+                    for key in concrete_keys
+                )
+                or any(key not in self._render_cache for key in concrete_keys)
+            ):
+                continue
+            self.supersede_pending_display()
+            images = tuple(
+                replace(
+                    image,
+                    pixmap=self._render_cache[key],
+                    qimage=None,
+                    display_prepared=True,
+                )
+                for image, key in zip(unit.images, concrete_keys)
+            )
+            self.cancel_magnifier()
+            self._display_request_generation += 1
+            self._pending_display = None
+            self._prepared_units.move_to_end(unit_key)
+            self._commit_display(spread, images)
+            return True
+        return False
+
+    def supersede_pending_display(self) -> None:
+        self._resize_render_timer.stop()
+        self._deferred_render_target = None
+        pending = self._pending_display
+        if pending is None:
+            return
+        self._pending_display = None
+        self._display_request_generation += 1
+        pending_keys = {
+            key for key in pending.keys if key is not None
+        }
+        prepared_keys = {
+            key
+            for request in self._prepared_requests.values()
+            for key in request.key.render_keys
+            if key is not None
+        }
+        for task in tuple(self._render_tasks):
+            if (
+                task.key in pending_keys
+                and task.key not in prepared_keys
+                and self._render_pool.tryTake(task)
+            ):
+                self._discard_render_task(task)
+
+    def invalidate_prepared_displays(self) -> None:
+        self._resize_render_timer.stop()
+        self._deferred_render_target = None
+        self._invalidate_render_requests(clear_cache=False)
+
+    def attach_current_sources(
+        self,
+        pages: Iterable[ViewerImage],
+    ) -> None:
+        sources = {image.image_id: image for image in pages}
+        if not sources:
+            return
+        attached: list[ViewerImage] = []
+        for image in self._images:
+            source = sources.get(image.image_id)
+            if source is None or source.qimage is None:
+                attached.append(image)
+                continue
+            attached.append(
+                replace(
+                    image,
+                    qimage=QImage(source.qimage),
+                    original_size=source.original_size,
+                    rendered_size=source.rendered_size,
+                    pre_rotated=source.pre_rotated,
+                    source_generation=source.source_generation,
+                    source_identity=source.source_identity,
+                    split_range=source.split_range,
+                    source_is_preview=source.source_is_preview,
+                )
+            )
+        self._images = attached
+
+    def _prepare_display(
+        self,
+        spread: DisplaySpread,
+        pages: list[ViewerImage],
+    ) -> None:
+        if self._deferred_render_target is not None:
+            # A page request arriving during resize debounce supersedes the
+            # older viewport snapshot.  Otherwise the timer could revive an
+            # empty or previous display after the new request was queued.
+            self._deferred_render_target = (spread, tuple(pages))
+        self._display_request_generation += 1
+        request_generation = self._display_request_generation
+        unit_key = self._prepared_unit_key(spread, pages)
+        keys = unit_key.render_keys
+        pending = _PendingDisplay(
+            spread=spread,
+            images=tuple(pages),
+            keys=keys,
+            generation=self._render_generation,
+            request_generation=request_generation,
+            failed_keys={},
+        )
+        self._pending_display = pending
+        for task in tuple(self._render_tasks):
+            if (
+                task.key.purpose == "magnifier"
+                and self._render_pool.tryTake(task)
+            ):
+                self._discard_render_task(task)
+        missing = [
+            (image.qimage, key)
+            for image, key in zip(pages, keys)
+            if key is not None
+            and key not in self._render_cache
+            and image.qimage is not None
+        ]
+        if not missing:
+            self._commit_pending_display()
+            return
+        for source, key in missing:
+            self._queue_render(source, key, priority=100)
+
+    def _pending_display_is_ready(self, pending: _PendingDisplay) -> bool:
+        return all(
+            key is None
+            or key in self._render_cache
+            or key in pending.failed_keys
+            for key in pending.keys
+        )
+
+    def _commit_pending_display(self) -> None:
+        pending = self._pending_display
+        if (
+            pending is None
+            or pending.generation != self._render_generation
+            or pending.request_generation != self._display_request_generation
+            or not self._pending_display_is_ready(pending)
+        ):
+            return
+        self._pending_display = None
+        images = tuple(
+            (
+                replace(
+                    image,
+                    pixmap=None,
+                    qimage=None,
+                    error=pending.failed_keys[key],
+                    loading=False,
+                    display_prepared=False,
+                )
+                if key is not None and key in pending.failed_keys
+                else image
+            )
+            for image, key in zip(pending.images, pending.keys)
+        )
+        self._commit_display(pending.spread, images)
+
+    def _commit_display(
+        self,
+        spread: DisplaySpread,
+        images: tuple[ViewerImage, ...],
+    ) -> None:
+        self._spread = spread
+        self._images = list(images)
+        self._discard_stale_cached_generations()
+        self._enforce_render_cache_limit()
+        self.update()
+        self.displayCommitted.emit(
+            tuple(image.image_id for image in images)
+        )
+
     def _display_pixmap(self, image: ViewerImage) -> QPixmap | None:
         if image.pixmap is None:
             return None
-        if self.rotation_angle == 0 or image.pre_rotated:
+        if (
+            self.rotation_angle == 0
+            or image.pre_rotated
+            or image.display_prepared
+        ):
             return image.pixmap
         transform = QTransform().rotate(self.rotation_angle)
         return image.pixmap.transformed(transform, Qt.TransformationMode.SmoothTransformation)
 
-    def _queue_render(self, source: QImage, key: ViewerRenderKey) -> None:
+    def _queue_render(
+        self,
+        source: QImage,
+        key: ViewerRenderKey,
+        *,
+        priority: int = 0,
+        allow_priority_decrease: bool = False,
+    ) -> None:
         if self._render_pending.get(key) == self._render_generation:
-            return
+            previous_priority = self._render_priorities.get(key, priority)
+            task = self._render_task_by_key.get(key)
+            if (
+                priority == previous_priority
+                or (
+                    priority < previous_priority
+                    and not allow_priority_decrease
+                )
+                or task is None
+                or not self._render_pool.tryTake(task)
+            ):
+                return
+            self._discard_render_task(task)
         self._render_pending[key] = self._render_generation
+        self._render_priorities[key] = int(priority)
         task = ViewerRenderTask(source, key, self._render_generation)
         self._render_tasks.add(task)
+        self._render_task_by_key[key] = task
         task.signals.completed.connect(
             lambda result, owned=task: self._on_render_completed(result, owned)
         )
-        self._render_pool.start(task)
+        self._render_pool.start(task, int(priority))
+
+    def _discard_render_task(self, task: ViewerRenderTask) -> None:
+        self._render_tasks.discard(task)
+        key = getattr(task, "key", None)
+        if key is not None and self._render_task_by_key.get(key) is task:
+            self._render_task_by_key.pop(key, None)
+            self._render_pending.pop(key, None)
+            self._render_priorities.pop(key, None)
 
     def _on_render_completed(
         self,
         result: ViewerRenderResult,
         task: ViewerRenderTask,
     ) -> None:
-        self._render_tasks.discard(task)
+        self._discard_render_task(task)
         if self._render_pending.get(result.key) == result.generation:
             self._render_pending.pop(result.key, None)
         if (
             result.generation != self._render_generation
-            or result.image is None
-            or result.error is not None
         ):
             return
-        pixmap = QPixmap.fromImage(result.image)
+        pending = self._pending_display
+        pending_accepts = (
+            pending is not None
+            and pending.generation == result.generation
+            and result.key in pending.keys
+        )
+        prepared_accepts = tuple(
+            request
+            for request in self._prepared_requests.values()
+            if result.key in request.key.render_keys
+        )
+        if result.image is None or result.error is not None:
+            if (
+                result.key.purpose == "magnifier"
+                and result.key == self._magnifier_key
+            ):
+                self.cancel_magnifier()
+                return
+            if pending_accepts:
+                pending.failed_keys[result.key] = (
+                    result.error or "画像の表示準備に失敗しました。"
+                )
+                self._commit_pending_display()
+            for request in prepared_accepts:
+                request.failed_keys.add(result.key)
+                self._prepared_requests.pop(request.key, None)
+            return
         if result.key.purpose == "magnifier":
             if result.key != self._magnifier_key:
                 return
+            pixmap = QPixmap.fromImage(result.image)
+            pixmap.setDevicePixelRatio(
+                max(1.0, result.key.device_pixel_ratio_milli / 1000.0)
+            )
             self._magnifier_pixmap = pixmap
+            self.magnifier_selecting = False
             self.magnifier_active = True
             self._magnifier_waiting_for_pdf = False
             self.update()
             return
 
-        visible_ids = {image.image_id for image in self._images}
-        if (
-            result.key.image_id not in visible_ids
-            or result.key.mode != self.resampling_mode
-            or result.key.rotation
-            != (
-                0
-                if next(
-                    (
-                        image.pre_rotated
-                        for image in self._images
-                        if image.image_id == result.key.image_id
-                    ),
-                    False,
-                )
-                else self.rotation_angle
-            )
-        ):
+        if not pending_accepts and not prepared_accepts:
             return
+        pixmap = QPixmap.fromImage(result.image)
+        pixmap.setDevicePixelRatio(
+            max(1.0, result.key.device_pixel_ratio_milli / 1000.0)
+        )
         self._render_cache[result.key] = pixmap
         self._render_cache.move_to_end(result.key)
         self._last_rendered_by_image[result.key.image_id] = pixmap
+        for request in prepared_accepts:
+            if self._unit_render_keys_ready(request.key.render_keys):
+                self._store_prepared_unit(request)
+                self._prepared_requests.pop(request.key, None)
+        if pending_accepts:
+            self._commit_pending_display()
         self._enforce_render_cache_limit()
-        self.update()
 
-    def _enforce_render_cache_limit(self) -> None:
-        max_bytes = 128 * 1024 * 1024
+    def _unit_render_keys_ready(
+        self,
+        keys: tuple[ViewerRenderKey | None, ...],
+    ) -> bool:
+        return all(key is None or key in self._render_cache for key in keys)
+
+    def _current_render_keys(self) -> set[ViewerRenderKey]:
+        layout = self._layout_for_current_images()
+        return {
+            key
+            for image, rect in zip(self._images, layout.rects)
+            if (key := self._viewer_render_key(image, rect)) is not None
+        }
+
+    def _discard_stale_cached_generations(self) -> None:
+        stale = tuple(
+            key
+            for key in self._render_cache
+            if (
+                not key.source_sized
+                and key.layout_generation != self._render_generation
+            )
+        )
+        for key in stale:
+            pixmap = self._render_cache.pop(key)
+            if self._last_rendered_by_image.get(key.image_id) is pixmap:
+                self._last_rendered_by_image.pop(key.image_id, None)
+
+    def _enforce_render_cache_limit(
+        self,
+        protected_keys: Iterable[ViewerRenderKey] = (),
+    ) -> None:
+        protected = set(protected_keys) | self._current_render_keys()
+        pending = self._pending_display
+        if pending is not None:
+            protected.update(
+                key for key in pending.keys if key is not None
+            )
+        for unit_key, request in self._prepared_requests.items():
+            if unit_key not in self._protected_prepared_units:
+                continue
+            # A spread becomes reusable only after every page is ready. Keep
+            # completed halves of current/near in-flight units until that
+            # atomic request can either finish or be superseded.
+            protected.update(
+                key for key in request.key.render_keys if key is not None
+            )
+        for unit_key in self._protected_prepared_units:
+            protected.update(
+                key for key in unit_key.render_keys if key is not None
+            )
 
         def cache_bytes() -> int:
             return sum(
@@ -1031,17 +1759,149 @@ class ViewerWidget(QWidget):
                 for pixmap in self._render_cache.values()
             )
 
+        planned_render_keys = {
+            key
+            for unit_key in (
+                set(self._prepared_units)
+                | set(self._prepared_requests)
+            )
+            for key in unit_key.render_keys
+            if key is not None
+        }
+        active_count_limit = max(
+            self._render_cache_limit,
+            len(planned_render_keys),
+        )
         while (
-            len(self._render_cache) > self._render_cache_limit
-            or cache_bytes() > max_bytes
+            len(self._render_cache) > active_count_limit
+            or cache_bytes() > self._render_cache_byte_limit
         ):
-            key, pixmap = self._render_cache.popitem(last=False)
-            if self._last_rendered_by_image.get(key.image_id) is pixmap:
-                self._last_rendered_by_image.pop(key.image_id, None)
+            far_unit = next(
+                (
+                    key
+                    for key in sorted(
+                        self._prepared_units,
+                        key=lambda value: self._prepared_unit_priorities.get(
+                            value,
+                            99,
+                        ),
+                        reverse=True,
+                    )
+                    if key not in self._protected_prepared_units
+                ),
+                None,
+            )
+            removable_keys = (
+                [
+                    key
+                    for key in far_unit.render_keys
+                    if (
+                        key is not None
+                        and key in self._render_cache
+                        and key not in protected
+                    )
+                ]
+                if far_unit is not None
+                else []
+            )
+            if far_unit is not None:
+                # A spread is useful only while every page is ready.  Evict
+                # the whole far display unit together instead of leaving one
+                # orphaned half in the pixmap cache.
+                self._prepared_units.pop(far_unit, None)
+            if not removable_keys:
+                far_request = next(
+                    (
+                        key
+                        for key in sorted(
+                            self._prepared_requests,
+                            key=lambda value: self._prepared_unit_priorities.get(
+                                value,
+                                99,
+                            ),
+                            reverse=True,
+                        )
+                        if key not in self._protected_prepared_units
+                        and {
+                            render_key
+                            for render_key in key.render_keys
+                            if render_key is not None
+                        }.isdisjoint(protected)
+                    ),
+                    None,
+                )
+                if far_request is not None:
+                    # Do not leave an incomplete far spread waiting forever
+                    # after one cached half is evicted. Drop its queued work
+                    # and any completed halves as one unit; a later plan may
+                    # request it again when it is near the current page.
+                    self._prepared_requests.pop(far_request, None)
+                    self._prepared_unit_priorities.pop(
+                        far_request,
+                        None,
+                    )
+                    request_keys = {
+                        key
+                        for key in far_request.render_keys
+                        if key is not None
+                    }
+                    retained_keys = {
+                        key
+                        for unit_key in (
+                            set(self._prepared_units)
+                            | set(self._prepared_requests)
+                        )
+                        for key in unit_key.render_keys
+                        if key is not None
+                    }
+                    cancel_only_keys = request_keys - retained_keys
+                    for task in tuple(self._render_tasks):
+                        if (
+                            task.key in cancel_only_keys
+                            and self._render_pool.tryTake(task)
+                        ):
+                            self._discard_render_task(task)
+                    for key in cancel_only_keys:
+                        pixmap = self._render_cache.pop(key, None)
+                        if (
+                            pixmap is not None
+                            and self._last_rendered_by_image.get(
+                                key.image_id
+                            ) is pixmap
+                        ):
+                            self._last_rendered_by_image.pop(
+                                key.image_id,
+                                None,
+                            )
+                    continue
+                removable = next(
+                    (
+                        key
+                        for key in self._render_cache
+                        if key not in protected
+                    ),
+                    None,
+                )
+                removable_keys = [] if removable is None else [removable]
+            if not removable_keys:
+                break
+            for key in removable_keys:
+                pixmap = self._render_cache.pop(key)
+                if self._last_rendered_by_image.get(key.image_id) is pixmap:
+                    self._last_rendered_by_image.pop(key.image_id, None)
 
     def _invalidate_render_requests(self, *, clear_cache: bool) -> None:
         self._render_generation += 1
+        self._pending_display = None
+        self._display_request_generation += 1
+        self._prepared_requests.clear()
+        self._prepared_units.clear()
+        self._prepared_unit_priorities.clear()
+        self._protected_prepared_units.clear()
+        self._deferred_render_target = None
         self._render_pending.clear()
+        self._render_priorities.clear()
+        self._render_task_by_key.clear()
         for task in tuple(self._render_tasks):
             if self._render_pool.tryTake(task):
                 self._render_tasks.discard(task)
@@ -1053,10 +1913,15 @@ class ViewerWidget(QWidget):
         return self._render_pool.waitForDone(max(0, int(msecs)))
 
     def shutdown_rendering(self, msecs: int = 5000) -> bool:
+        self._resize_render_timer.stop()
         self.cancel_magnifier()
         self._invalidate_render_requests(clear_cache=True)
         self._render_pool.clear()
         return self._render_pool.waitForDone(max(0, int(msecs)))
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
+        self.shutdown_rendering()
+        super().closeEvent(event)
 
     def _draw_placeholder(self, painter: QPainter, rect: QRect, image: ViewerImage) -> None:
         painter.fillRect(rect, QColor("#151515"))
@@ -1104,7 +1969,7 @@ class ViewerWidget(QWidget):
         *,
         hit: tuple[QRect, ViewerImage] | None = None,
     ) -> None:
-        if not self.magnifier_selecting:
+        if not (self.magnifier_selecting or self.magnifier_active):
             return
         if hit is None:
             hit = next(
@@ -1183,7 +2048,11 @@ class ViewerWidget(QWidget):
     def _rotated_source_size(self, image: ViewerImage) -> QSize:
         if image.qimage is None:
             return QSize()
-        size = image.qimage.size()
+        size = (
+            QSize(image.split_range[2], image.split_range[3])
+            if image.split_range is not None
+            else image.qimage.size()
+        )
         if not image.pre_rotated and self.rotation_angle in {90, 270}:
             return QSize(size.height(), size.width())
         return size
@@ -1221,6 +2090,16 @@ class ViewerWidget(QWidget):
         target_width = max(1, round(self.width() * dpr))
         target_height = max(1, round(self.height() * dpr))
 
+        if allow_pdf_request and image.source_is_preview:
+            self._magnifier_waiting_for_pdf = True
+            self._magnifier_pdf_source_key = int(image.qimage.cacheKey())
+            self.magnifierSourceResolutionRequested.emit(
+                image.page_index,
+                QSize(target_width, target_height),
+            )
+            self.update()
+            return
+
         if allow_pdf_request and image.rendered_size is not None:
             required_width = max(
                 source_size.width(),
@@ -1243,6 +2122,13 @@ class ViewerWidget(QWidget):
                 self.update()
                 return
 
+        self.magnifier_request_generation += 1
+        for task in tuple(self._render_tasks):
+            if task.key.purpose != "magnifier":
+                continue
+            if self._render_pool.tryTake(task):
+                self._discard_render_task(task)
+
         rotation = 0 if image.pre_rotated else self.rotation_angle
         key = ViewerRenderKey(
             image_id=image.image_id,
@@ -1255,9 +2141,13 @@ class ViewerWidget(QWidget):
             crop=(left, top, right, bottom),
             purpose="magnifier",
             request_generation=self.magnifier_request_generation,
+            split_range=image.split_range,
         )
         self._magnifier_key = key
-        self._queue_render(image.qimage, key)
+        self._queue_render(image.qimage, key, priority=100)
+
+    def resume_magnifier_after_source_render(self) -> None:
+        self._resume_magnifier_after_pdf_render()
 
     def _resume_magnifier_after_pdf_render(self) -> None:
         image = self._magnifier_image()

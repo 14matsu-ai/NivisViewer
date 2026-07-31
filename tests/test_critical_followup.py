@@ -690,7 +690,11 @@ def test_png_spreads_page_5_7_9_finish_both_slots(
         assert window.open_path(folder / f"{page:03}.png")
         _wait_for_viewer_terminal(window, qapp)
         assert len(window.viewer._images) == 2
-        assert all(image.pixmap is not None for image in window.viewer._images)
+        layout = window.viewer._layout_for_current_images()
+        assert all(
+            window.viewer._pixmap_for_paint(image, rect) is not None
+            for image, rect in zip(window.viewer._images, layout.rects)
+        )
         assert all(
             slot.state is ViewerSlotState.READY
             for slot in window._display_unit.slots

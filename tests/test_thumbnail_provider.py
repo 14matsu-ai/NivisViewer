@@ -173,6 +173,52 @@ def test_memory_cache_is_checked_before_decoder(
     provider.close()
 
 
+def test_memory_cache_hit_uses_cow_image_handles_without_sharing_mutation(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    image_path = tmp_path / "page.jpg"
+    write_image(image_path)
+    item = make_item(image_path, BrowserItemKind.IMAGE)
+    provider = BrowserThumbnailProvider(disk_cache_enabled=False)
+    delivered: list[QImage] = []
+    provider.thumbnail_ready.connect(
+        lambda _path, _generation, image: delivered.append(image)
+    )
+    generation = provider.begin_generation()
+    source = QImage(12, 12, QImage.Format.Format_RGB32)
+    source.fill(0xFFFF0000)
+
+    provider._on_finished(
+        str(item.path),
+        generation,
+        120,
+        item.modified_at,
+        source,
+    )
+    cache_key = (provider._path_key(item.path), 120, item.modified_at)
+    cached = provider._cache[cache_key]
+    assert cached is not source
+    assert cached.cacheKey() == source.cacheKey()
+
+    source.fill(0xFF0000FF)
+    assert cached.pixelColor(0, 0).red() == 255
+    assert cached.pixelColor(0, 0).blue() == 0
+
+    delivered.clear()
+    assert not provider.request(item, 120, generation=generation)
+    qapp.processEvents()
+    assert len(delivered) == 1
+    cache_hit = delivered[0]
+    assert cache_hit is not cached
+    assert cache_hit.cacheKey() == cached.cacheKey()
+
+    cache_hit.fill(0xFF00FF00)
+    assert cached.pixelColor(0, 0).red() == 255
+    assert cached.pixelColor(0, 0).green() == 0
+    provider.close()
+
+
 def test_disk_hit_skips_decoder_and_miss_is_persisted(
     tmp_path: Path,
     qapp: QApplication,
