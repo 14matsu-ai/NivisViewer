@@ -727,7 +727,10 @@ def test_browser_to_viewer_wide_open_matches_clicked_path(
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
         qapp.processEvents()
-        if viewer.model.get_image_size(target_index) is not None:
+        if (
+            viewer.model.get_image_size(target_index) is not None
+            and viewer.presentation_state.displayed_page == target_index
+        ):
             break
         QTest.qWait(5)
     assert viewer.model.focused_index == target_index

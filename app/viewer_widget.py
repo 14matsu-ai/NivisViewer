@@ -56,6 +56,23 @@ class ViewerImage:
 
 
 @dataclass(frozen=True)
+class ViewerFrameCommit:
+    """A complete Widget frame swap and its originating request token.
+
+    The token is deliberately opaque to ``ViewerWidget``.  Presentation
+    semantics belong to ``ViewerPresentationState``; the Widget only reports
+    that every logical slot was replaced in one canvas transaction.
+    """
+
+    frame_token: object | None
+    widget_frame_serial: int
+    spread_identity: tuple[tuple[int, str], ...]
+    page_indexes: tuple[int, ...]
+    image_ids: tuple[str, ...]
+    failed_page_indexes: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class SpreadLayout:
     scale: float
     scales: tuple[float, ...]
@@ -72,6 +89,7 @@ class _PendingDisplay:
     generation: int
     request_generation: int
     failed_keys: dict[ViewerRenderKey, str]
+    frame_token: object | None = None
 
 
 @dataclass(frozen=True)
@@ -242,8 +260,10 @@ class ViewerWidget(QWidget):
     magnifierSourceResolutionRequested = Signal(int, QSize)
     magnifierCancelled = Signal()
     displayCommitted = Signal(object)
+    frameCommitted = Signal(object)
     renderCacheChanged = Signal()
     renderWorkFinished = Signal(object, bool)
+    framePainted = Signal(int, object)
 
     def __init__(
         self,
@@ -295,6 +315,11 @@ class ViewerWidget(QWidget):
         self._render_cache_byte_limit = 256 * 1024 * 1024
         self._pending_display: _PendingDisplay | None = None
         self._display_request_generation = 0
+        self._presentation_frame_serial = 0
+        self._direct_display_mode = False
+        self._direct_frame_serial = 0
+        self._direct_current_frame_serial = 0
+        self._direct_current_frame_token: object | None = None
         self._prepared_units: OrderedDict[
             PreparedDisplayUnitKey,
             _PreparedDisplayUnit,
@@ -310,7 +335,13 @@ class ViewerWidget(QWidget):
         self._resize_render_timer.setInterval(120)
         self._resize_render_timer.timeout.connect(self._refresh_current_render)
         self._deferred_render_target: (
-            tuple[DisplaySpread, tuple[ViewerImage, ...]] | None
+            tuple[
+                DisplaySpread,
+                tuple[ViewerImage, ...],
+                object | None,
+            ]
+            | tuple[DisplaySpread, tuple[ViewerImage, ...]]
+            | None
         ) = None
         self.magnifier_selecting = False
         self.magnifier_active = False
@@ -489,7 +520,13 @@ class ViewerWidget(QWidget):
         ):
             # A monitor transition can change physical target dimensions
             # without a logical QWidget resize.
-            self._refresh_current_render()
+            if self._direct_display_mode:
+                # The compatible raster path owns decoder sizing.  Ask the
+                # window to invalidate its physical-pixel artifact instead of
+                # merely repainting the old-DPR QPixmap.
+                self.viewportChanged.emit()
+            else:
+                self._refresh_current_render()
         return handled
 
     def set_horizontal_alignment(self, alignment: str) -> None:
@@ -652,7 +689,15 @@ class ViewerWidget(QWidget):
     def scroll_backward(self) -> bool:
         return self._scroll_vertical(-1)
 
-    def set_pages(self, spread: DisplaySpread, pages: list[ViewerImage]) -> None:
+    def set_pages(
+        self,
+        spread: DisplaySpread,
+        pages: list[ViewerImage],
+        *,
+        frame_token: object | None = None,
+    ) -> None:
+        if self._direct_display_mode:
+            return
         same_display_unit = (
             spread.start_index == self._spread.start_index
             and tuple(slot.page_index for slot in spread.slots)
@@ -663,7 +708,163 @@ class ViewerWidget(QWidget):
             self._pan = QPoint(0, 0)
         if same_display_unit and self._magnifier_waiting_for_pdf:
             self._resume_magnifier_after_pdf_render()
-        self._prepare_display(spread, pages)
+        self._prepare_display(spread, pages, frame_token=frame_token)
+
+    def set_direct_display_mode(self, active: bool) -> None:
+        """Enable the QPixmap-only display-ready commit boundary.
+
+        Entering the mode invalidates every production resize/render/prepared
+        request, but snapshots the last complete pixmap first so switching
+        pipelines cannot blank an already painted frame.
+        """
+
+        normalized = bool(active)
+        if normalized == self._direct_display_mode:
+            return
+        if normalized:
+            layout = self._layout_for_current_images()
+            preserved_images: list[ViewerImage] = []
+            for image, rect in zip(self._images, layout.rects):
+                pixmap = self._pixmap_for_paint(image, rect)
+                preserved_images.append(
+                    replace(
+                        image,
+                        pixmap=(
+                            QPixmap(pixmap)
+                            if pixmap is not None and not pixmap.isNull()
+                            else None
+                        ),
+                        qimage=None,
+                        pre_rotated=True,
+                        display_prepared=(
+                            pixmap is not None and not pixmap.isNull()
+                        ),
+                    )
+                )
+            self.cancel_magnifier()
+            self._resize_render_timer.stop()
+            self._deferred_render_target = None
+            self._invalidate_render_requests(clear_cache=True)
+            self._images = preserved_images
+            self._direct_current_frame_serial = 0
+            self._direct_current_frame_token = None
+        else:
+            self._direct_current_frame_serial = 0
+            self._direct_current_frame_token = None
+        self._direct_display_mode = normalized
+
+    def commit_display_ready_single(
+        self,
+        spread: DisplaySpread,
+        page_index: int,
+        image_id: str,
+        original_size: tuple[int, int],
+        pixmap: QPixmap,
+        frame_token: object,
+    ) -> int:
+        """Atomically publish one already prepared QPixmap-only frame."""
+
+        if (
+            not spread.is_single
+            or len(spread.slots) != 1
+            or spread.slots[0].page_index != int(page_index)
+            or spread.slots[0].image_id != str(image_id)
+        ):
+            raise ValueError("direct display commit requires one matching page")
+        width, height = (int(original_size[0]), int(original_size[1]))
+        if width <= 0 or height <= 0:
+            raise ValueError("original_size must contain positive dimensions")
+        if pixmap.isNull():
+            raise ValueError("direct display pixmap must not be null")
+
+        return self.commit_display_ready_frame(
+            spread,
+            (
+                ViewerImage(
+                    page_index=int(page_index),
+                    image_id=str(image_id),
+                    pixmap=QPixmap(pixmap),
+                    original_size=(width, height),
+                    pre_rotated=True,
+                    qimage=None,
+                    display_prepared=True,
+                ),
+            ),
+            frame_token,
+        )
+
+    def commit_display_ready_frame(
+        self,
+        spread: DisplaySpread,
+        images: Iterable[ViewerImage],
+        frame_token: object,
+    ) -> int:
+        """Publish one complete runtime-prepared frame in a single swap.
+
+        A book runtime may provide a single page, a normal two-page spread, or
+        two split artifacts derived from one wide logical page.  Every image
+        must already be terminal: it either owns a non-null display pixmap or
+        carries an error placeholder.  Source ``QImage`` handles may remain
+        attached for magnifier work; they are not used for the main paint.
+        """
+
+        if not self._direct_display_mode:
+            raise RuntimeError("display-ready runtime mode is not active")
+        prepared = tuple(images)
+        if not prepared:
+            raise ValueError("display-ready frame must contain an image")
+        spread_pages = {slot.page_index for slot in spread.slots}
+        prepared_pages = {image.page_index for image in prepared}
+        if prepared_pages != spread_pages:
+            raise ValueError("display-ready frame does not match its spread")
+        if not spread.is_single and len(prepared) != len(spread.slots):
+            raise ValueError("display-ready spread must contain every slot once")
+        for image in prepared:
+            has_pixmap = image.pixmap is not None and not image.pixmap.isNull()
+            if not has_pixmap and not image.error:
+                raise ValueError(
+                    "display-ready image must contain a pixmap or error"
+                )
+
+        same_display_unit = (
+            spread.start_index == self._spread.start_index
+            and tuple(slot.page_index for slot in spread.slots)
+            == tuple(slot.page_index for slot in self._spread.slots)
+        )
+        if not same_display_unit:
+            self._pan = QPoint(0, 0)
+
+        self._direct_frame_serial += 1
+        frame_serial = self._direct_frame_serial
+        committed_images = tuple(
+            replace(
+                image,
+                pixmap=(
+                    QPixmap(image.pixmap)
+                    if image.pixmap is not None and not image.pixmap.isNull()
+                    else None
+                ),
+                loading=False,
+                display_prepared=(
+                    image.pixmap is not None and not image.pixmap.isNull()
+                ),
+            )
+            for image in prepared
+        )
+        self._direct_current_frame_serial = frame_serial
+        self._direct_current_frame_token = frame_token
+        self._spread = spread
+        self._images = list(committed_images)
+        self.update()
+        self._emit_frame_committed(
+            spread,
+            committed_images,
+            frame_token=frame_token,
+        )
+        self.displayCommitted.emit(
+            tuple(image.image_id for image in committed_images)
+        )
+        return frame_serial
 
     @staticmethod
     def from_qimage(
@@ -704,6 +905,8 @@ class ViewerWidget(QWidget):
     def clear(self) -> None:
         self.cancel_magnifier()
         self._invalidate_render_requests(clear_cache=True)
+        self._direct_current_frame_serial = 0
+        self._direct_current_frame_token = None
         self._spread = DisplaySpread(0, tuple(), True)
         self._images = []
         self._last_draw_layout.clear()
@@ -757,30 +960,52 @@ class ViewerWidget(QWidget):
         self._draw_magnifier(painter)
         self._draw_gesture_trail(painter)
         if painted_image_ids:
-            self.contentPainted.emit(tuple(painted_image_ids))
+            painted_ids = tuple(painted_image_ids)
+            self.contentPainted.emit(painted_ids)
+            if (
+                self._direct_display_mode
+                and self._direct_current_frame_serial > 0
+            ):
+                self.framePainted.emit(
+                    self._direct_current_frame_serial,
+                    painted_ids,
+                )
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
         if event.size() != event.oldSize():
             if self.magnifier_selecting or self.magnifier_active:
                 self.cancel_magnifier()
-            pending = self._pending_display
-            if pending is not None:
-                deferred_render_target = (
-                    pending.spread,
-                    pending.images,
-                )
-            elif self._deferred_render_target is not None:
-                deferred_render_target = self._deferred_render_target
-            else:
-                deferred_render_target = (
-                    self._spread,
-                    tuple(self._images),
-                )
-            # Reject old-size work immediately, but retain the last complete
-            # frame until the debounced replacement is ready.
-            self._invalidate_render_requests(clear_cache=False)
-            self._deferred_render_target = deferred_render_target
-            self._resize_render_timer.start()
+            if not self._direct_display_mode:
+                pending = self._pending_display
+                if pending is not None:
+                    if pending.frame_token is not None:
+                        # A page request belongs to the old viewport/DPR
+                        # identity. Keep the last committed frame; Window will
+                        # issue a new presentation token for the resized view.
+                        deferred_render_target = (
+                            self._spread,
+                            tuple(self._images),
+                            None,
+                        )
+                    else:
+                        deferred_render_target = (
+                            pending.spread,
+                            pending.images,
+                            None,
+                        )
+                elif self._deferred_render_target is not None:
+                    deferred_render_target = self._deferred_render_target
+                else:
+                    deferred_render_target = (
+                        self._spread,
+                        tuple(self._images),
+                        None,
+                    )
+                # Reject old-size work immediately, but retain the last complete
+                # frame until the debounced replacement is ready.
+                self._invalidate_render_requests(clear_cache=False)
+                self._deferred_render_target = deferred_render_target
+                self._resize_render_timer.start()
         if self.fit_mode in {"fit_window", "fit_no_upscale", "fit_width", "fit_height"}:
             self._pan = QPoint(0, 0)
         super().resizeEvent(event)
@@ -1169,6 +1394,11 @@ class ViewerWidget(QWidget):
         )
 
     def _refresh_current_render(self) -> None:
+        if self._direct_display_mode:
+            self._resize_render_timer.stop()
+            self._deferred_render_target = None
+            self.update()
+            return
         deferred = self._deferred_render_target
         self._deferred_render_target = None
         pending = self._pending_display
@@ -1182,11 +1412,20 @@ class ViewerWidget(QWidget):
             if deferred is not None
             else pending.images if pending is not None else self._images
         )
+        frame_token = (
+            deferred[2]
+            if deferred is not None and len(deferred) >= 3
+            else pending.frame_token if pending is not None else None
+        )
         self._invalidate_render_requests(clear_cache=False)
         if not images:
             self.update()
             return
-        self._prepare_display(spread, images)
+        self._prepare_display(
+            spread,
+            images,
+            frame_token=frame_token,
+        )
 
     def _prepared_unit_key(
         self,
@@ -1218,6 +1457,8 @@ class ViewerWidget(QWidget):
             ]
         ],
     ) -> None:
+        if self._direct_display_mode and key.purpose != "magnifier":
+            return
         desired_by_identity: dict[
             tuple[tuple[int, str], ...],
             tuple[int, bool],
@@ -1388,6 +1629,8 @@ class ViewerWidget(QWidget):
         source_generation: int,
         source_identity: str,
     ) -> bool:
+        if self._direct_display_mode:
+            return False
         identity = tuple(
             (slot.page_index, slot.image_id) for slot in spread.slots
         )
@@ -1426,6 +1669,8 @@ class ViewerWidget(QWidget):
         source_generation: int,
         source_identity: str,
     ) -> bool:
+        if self._direct_display_mode:
+            return False
         identity = tuple(
             (slot.page_index, slot.image_id) for slot in spread.slots
         )
@@ -1451,6 +1696,8 @@ class ViewerWidget(QWidget):
         )
 
     def has_pending_prepared_rendering(self) -> bool:
+        if self._direct_display_mode:
+            return False
         return bool(self._prepared_requests) or any(
             task.key.purpose == "viewer"
             for task in self._render_tasks
@@ -1462,7 +1709,10 @@ class ViewerWidget(QWidget):
         *,
         source_generation: int,
         source_identity: str,
+        frame_token: object | None = None,
     ) -> bool:
+        if self._direct_display_mode:
+            return False
         identity = tuple(
             (slot.page_index, slot.image_id) for slot in spread.slots
         )
@@ -1501,7 +1751,11 @@ class ViewerWidget(QWidget):
             self._display_request_generation += 1
             self._pending_display = None
             self._prepared_units.move_to_end(unit_key)
-            self._commit_display(spread, images)
+            self._commit_display(
+                spread,
+                images,
+                frame_token=frame_token,
+            )
             return True
         return False
 
@@ -1539,6 +1793,8 @@ class ViewerWidget(QWidget):
         self,
         pages: Iterable[ViewerImage],
     ) -> None:
+        if self._direct_display_mode:
+            return
         sources = {image.image_id: image for image in pages}
         if not sources:
             return
@@ -1567,12 +1823,20 @@ class ViewerWidget(QWidget):
         self,
         spread: DisplaySpread,
         pages: list[ViewerImage],
+        *,
+        frame_token: object | None = None,
     ) -> None:
+        if self._direct_display_mode:
+            return
         if self._deferred_render_target is not None:
             # A page request arriving during resize debounce supersedes the
             # older viewport snapshot.  Otherwise the timer could revive an
             # empty or previous display after the new request was queued.
-            self._deferred_render_target = (spread, tuple(pages))
+            self._deferred_render_target = (
+                spread,
+                tuple(pages),
+                frame_token,
+            )
         self._display_request_generation += 1
         request_generation = self._display_request_generation
         unit_key = self._prepared_unit_key(spread, pages)
@@ -1584,6 +1848,7 @@ class ViewerWidget(QWidget):
             generation=self._render_generation,
             request_generation=request_generation,
             failed_keys={},
+            frame_token=frame_token,
         )
         self._pending_display = pending
         for task in tuple(self._render_tasks):
@@ -1642,20 +1907,63 @@ class ViewerWidget(QWidget):
             )
             for image, key in zip(pending.images, pending.keys)
         )
-        self._commit_display(pending.spread, images)
+        self._commit_display(
+            pending.spread,
+            images,
+            frame_token=pending.frame_token,
+        )
 
     def _commit_display(
         self,
         spread: DisplaySpread,
         images: tuple[ViewerImage, ...],
+        *,
+        frame_token: object | None = None,
     ) -> None:
         self._spread = spread
         self._images = list(images)
         self._discard_stale_cached_generations()
         self._enforce_render_cache_limit()
         self.update()
+        self._emit_frame_committed(
+            spread,
+            images,
+            frame_token=frame_token,
+        )
         self.displayCommitted.emit(
             tuple(image.image_id for image in images)
+        )
+
+    def _emit_frame_committed(
+        self,
+        spread: DisplaySpread,
+        images: tuple[ViewerImage, ...],
+        *,
+        frame_token: object | None,
+    ) -> None:
+        self._presentation_frame_serial += 1
+        self.frameCommitted.emit(
+            ViewerFrameCommit(
+                frame_token=frame_token,
+                widget_frame_serial=self._presentation_frame_serial,
+                spread_identity=tuple(
+                    (slot.page_index, slot.image_id)
+                    for slot in spread.slots
+                ),
+                page_indexes=tuple(
+                    slot.page_index for slot in spread.slots
+                ),
+                image_ids=tuple(image.image_id for image in images),
+                failed_page_indexes=tuple(
+                    sorted(
+                        {
+                            image.page_index
+                            for image in images
+                            if image.error
+                        }
+                    )
+                ),
+            )
         )
 
     def _display_pixmap(self, image: ViewerImage) -> QPixmap | None:
@@ -1678,6 +1986,8 @@ class ViewerWidget(QWidget):
         priority: int = 0,
         allow_priority_decrease: bool = False,
     ) -> None:
+        if self._direct_display_mode:
+            return
         if self._render_pending.get(key) == self._render_generation:
             previous_priority = self._render_priorities.get(key, priority)
             task = self._render_task_by_key.get(key)

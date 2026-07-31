@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QByteArray, QEvent, QPoint, QSize, QThreadPool, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QByteArray, QEvent, QPoint, QSize, QThreadPool, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -72,8 +72,31 @@ from .viewer_display_unit import (
     ViewerDisplayUnit,
     ViewerSlotState,
 )
-from .viewer_widget import ViewerImage, ViewerWidget, calculate_spread_layout
+from .viewer_presentation_state import (
+    PresentationBook,
+    PresentationCommit,
+    PresentationFrameToken,
+    PresentationNavigation,
+    PresentationPage,
+    PresentationUnit,
+    PresentationValues,
+    ViewerPresentationState,
+)
+from .viewer_widget import (
+    ViewerFrameCommit,
+    ViewerImage,
+    ViewerWidget,
+    calculate_spread_layout,
+)
 from .viewer_render import RESAMPLING_MODE_LABELS, normalize_resampling_mode
+from .zip_raster_book_runtime import (
+    ZipRasterBookRuntime,
+    ZipRasterDisplayUnit,
+    ZipRasterFrame,
+    ZipRasterPage,
+    ZipRasterRenderSpec,
+    ZipRasterRequest,
+)
 
 
 _DISPLAY_LOG = logging.getLogger("nivisviewer.viewer.display_unit")
@@ -81,6 +104,8 @@ _PDF_PREFETCH_IDLE_GRACE_MS = 120
 _PREPARED_DISPLAY_IDLE_GRACE_MS = 16
 _DISPLAY_DEMAND_IDLE_GRACE_MS = 16
 _RASTER_PAINT_FALLBACK_MS = 250
+_ZIP_RUNTIME_BROWSER_RESUME_GRACE_MS = 500
+_ZIP_RUNTIME_DEMAND_IDLE_GRACE_MS = 6
 
 
 class ViewerWindow(QMainWindow):
@@ -90,6 +115,7 @@ class ViewerWindow(QMainWindow):
     interactive_open_started = Signal(object)
     first_frame_ready = Signal(object)
     interactive_open_cancelled = Signal(object)
+    presentationCommitted = Signal(object)
 
     def __init__(
         self,
@@ -153,6 +179,14 @@ class ViewerWindow(QMainWindow):
         )
         self.model = self.book_session.model
         self.image_cache = self.book_session.image_cache
+        self.presentation_state = ViewerPresentationState()
+        # Compatibility only for older focused scheduler tests. Production
+        # requests always read the indexes owned by presentation_state.
+        self._visible_page_indexes_adapter: tuple[int, ...] | None = None
+        self._presentation_viewport_refresh_required = False
+        self._pending_progress_seed: (
+            tuple[int, PresentationValues] | None
+        ) = None
         self._load_prefetch_settings()
         self.image_cache.pageLoaded.connect(self._on_cache_page_loaded)
         self.book_session.page_changed.connect(self._queue_metadata_progress)
@@ -163,11 +197,16 @@ class ViewerWindow(QMainWindow):
         self._drop_active = False
         self._adjacent_book_handler = adjacent_book_handler
         self._shutdown_prepared = False
-        self._active_request_id = 0
         self._reload_page_index: int | None = None
-        self._applied_display_request_id = 0
         self._pending_display_demand: (
-            tuple[int, int, DisplaySpread, tuple[ViewerImage, ...]] | None
+            tuple[
+                int,
+                int,
+                DisplaySpread,
+                tuple[ViewerImage, ...],
+                PresentationFrameToken,
+            ]
+            | None
         ) = None
         self._pending_decode_demand: (
             tuple[int, int, int, tuple[int, ...]] | None
@@ -189,10 +228,6 @@ class ViewerWindow(QMainWindow):
         self._advancing_raster_prefetch = False
         self._raster_interactive_lane_held = False
         self._enforcing_combined_cache_budget = False
-        self._visible_page_indexes: tuple[int, ...] = tuple()
-        self._display_unit = ViewerDisplayUnit.empty()
-        self._page_history_back: list[int] = []
-        self._page_history_forward: list[int] = []
         self._metadata_book_path = ""
         self._metadata_book_item_type = ""
         self._status_override_message: str | None = None
@@ -321,6 +356,14 @@ class ViewerWindow(QMainWindow):
         self._decode_demand_timer.timeout.connect(
             self._apply_pending_decode_demand
         )
+        self._zip_runtime_request_timer = QTimer(self)
+        self._zip_runtime_request_timer.setSingleShot(True)
+        self._zip_runtime_request_timer.setInterval(
+            _ZIP_RUNTIME_DEMAND_IDLE_GRACE_MS
+        )
+        self._zip_runtime_request_timer.timeout.connect(
+            self._dispatch_pending_zip_runtime_request
+        )
         self._raster_paint_fallback_timer = QTimer(self)
         self._raster_paint_fallback_timer.setSingleShot(True)
         self._raster_paint_fallback_timer.setInterval(
@@ -328,6 +371,14 @@ class ViewerWindow(QMainWindow):
         )
         self._raster_paint_fallback_timer.timeout.connect(
             self._release_raster_prefetch_without_paint
+        )
+        self._zip_runtime_browser_resume_timer = QTimer(self)
+        self._zip_runtime_browser_resume_timer.setSingleShot(True)
+        self._zip_runtime_browser_resume_timer.setInterval(
+            _ZIP_RUNTIME_BROWSER_RESUME_GRACE_MS
+        )
+        self._zip_runtime_browser_resume_timer.timeout.connect(
+            self._release_raster_interactive_lane
         )
         self._raster_viewport_timer = QTimer(self)
         self._raster_viewport_timer.setSingleShot(True)
@@ -345,6 +396,11 @@ class ViewerWindow(QMainWindow):
         self._last_preload_generation = -1
         self._last_preload_center: int | None = None
         self._last_preload_direction = 0
+        self._zip_runtime_active = False
+        self._zip_runtime: ZipRasterBookRuntime | None = None
+        self._zip_runtime_current_frame_serial = 0
+        self._zip_runtime_last_painted_serial = 0
+        self._pending_zip_runtime_request: ZipRasterRequest | None = None
         self.image_cache.set_adjustments(brightness=self.brightness, contrast=self.contrast, gamma=self.gamma)
         self.page_navigation = ViewerPageNavigationController(
             self.model,
@@ -353,6 +409,13 @@ class ViewerWindow(QMainWindow):
         )
 
         self._build_ui()
+        self.book_session.viewer_runtime_changed.connect(
+            self._bind_zip_runtime
+        )
+        self._bind_zip_runtime(self.book_session.viewer_runtime)
+        self.viewer.framePainted.connect(
+            self._on_zip_runtime_frame_painted
+        )
         self._connect_shortcuts()
         self._restore_window_state()
         self._apply_settings_to_widgets()
@@ -363,6 +426,43 @@ class ViewerWindow(QMainWindow):
     @property
     def _current_book_key(self) -> str:
         return self.book_session.book_key
+
+    @property
+    def _active_request_id(self) -> int:
+        """Compatibility view of the presentation-owned request serial."""
+
+        adapter = getattr(self, "_request_id_adapter", None)
+        if self.presentation_state.requested is None and adapter is not None:
+            return int(adapter)
+        return self.presentation_state.pending_request_serial
+
+    @_active_request_id.setter
+    def _active_request_id(self, value: int) -> None:
+        # Limited to old scheduler-focused tests which do not create a real
+        # PresentationRequest. Production code never assigns this adapter.
+        self._request_id_adapter = int(value)
+
+    @property
+    def _applied_display_request_id(self) -> int:
+        displayed = self.presentation_state.displayed
+        return displayed.token.request_serial if displayed is not None else 0
+
+    @property
+    def _visible_page_indexes(self) -> tuple[int, ...]:
+        adapter = self._visible_page_indexes_adapter
+        if self.presentation_state.requested is None and adapter is not None:
+            return adapter
+        return self.presentation_state.requested_page_indexes
+
+    @_visible_page_indexes.setter
+    def _visible_page_indexes(self, value: tuple[int, ...]) -> None:
+        # Compatibility adapter for isolated prefetch-policy tests only.
+        self._visible_page_indexes_adapter = tuple(int(index) for index in value)
+
+    @property
+    def _display_unit(self) -> ViewerDisplayUnit:
+        tracker = self.presentation_state.display_tracker
+        return tracker if tracker is not None else ViewerDisplayUnit.empty()
 
     @property
     def _opened_path(self) -> str:
@@ -465,6 +565,9 @@ class ViewerWindow(QMainWindow):
         self.viewer.zoomChanged.connect(self._on_zoom_changed)
         self.viewer.viewportChanged.connect(self._on_viewport_changed)
         self.viewer.contentPainted.connect(self._on_viewer_content_painted)
+        self.viewer.frameCommitted.connect(
+            self._on_viewer_frame_committed
+        )
         self.viewer.displayCommitted.connect(
             self._on_prepared_display_committed
         )
@@ -1145,6 +1248,11 @@ class ViewerWindow(QMainWindow):
         self.image_cache.set_cache_byte_budget_mib(
             self.viewer_cache_memory_mib
         )
+        if getattr(self, "_zip_runtime", None) is not None:
+            self._zip_runtime.set_cache_limits(
+                unit_limit=max(3, self.cache_size),
+                byte_budget=self.image_cache.cache_byte_budget_bytes,
+            )
         if hasattr(self, "viewer"):
             self.viewer.set_render_cache_byte_limit_mib(
                 self.viewer_cache_memory_mib
@@ -1163,6 +1271,12 @@ class ViewerWindow(QMainWindow):
                 64,
                 min(4096, int(self.viewer_cache_memory_mib)),
             ) * 1024 * 1024
+            if self._zip_runtime_active and self._zip_runtime is not None:
+                self._zip_runtime.set_cache_limits(
+                    unit_limit=max(3, self.cache_size),
+                    byte_budget=total_bytes,
+                )
+                return
             # ZipPlaFork evicts the prefiltered source and display artifact for
             # a page together under one display-driven memory policy. Rebalance
             # both resident Nivis caches against one configured total instead
@@ -1197,6 +1311,13 @@ class ViewerWindow(QMainWindow):
                 self._current_pdf_render_spec()
             )
             self._prepare_deferred_pdf_prefetch(center, visible_indexes)
+        elif self._zip_runtime_active:
+            if self._zip_runtime is not None:
+                self._zip_runtime.set_cache_limits(
+                    unit_limit=max(3, self.cache_size),
+                    byte_budget=self.image_cache.cache_byte_budget_bytes,
+                )
+            self._refresh_view()
         else:
             self.image_cache.set_raster_decode_bounds(
                 self._current_raster_decode_bounds()
@@ -1235,9 +1356,24 @@ class ViewerWindow(QMainWindow):
         for zoom, action in self.magnifier_zoom_actions.items():
             action.setChecked(math.isclose(zoom, self.magnifier_zoom))
         if hasattr(self, "history_back_action"):
-            self.history_back_action.setEnabled(bool(self._page_history_back))
+            self.history_back_action.setEnabled(
+                bool(self.presentation_state.back_history)
+            )
         if hasattr(self, "history_forward_action"):
-            self.history_forward_action.setEnabled(bool(self._page_history_forward))
+            self.history_forward_action.setEnabled(
+                bool(self.presentation_state.forward_history)
+            )
+
+    def _sync_page_history_actions(self) -> None:
+        """Update only the two action states changed by page navigation."""
+        if hasattr(self, "history_back_action"):
+            self.history_back_action.setEnabled(
+                bool(self.presentation_state.back_history)
+            )
+        if hasattr(self, "history_forward_action"):
+            self.history_forward_action.setEnabled(
+                bool(self.presentation_state.forward_history)
+            )
 
     def open_dialog(self) -> None:
         start = self.settings.get("last_open_path") or str(Path.home())
@@ -1264,6 +1400,12 @@ class ViewerWindow(QMainWindow):
             self._reload_page_index = None
         self.viewer.cancel_pending_canvas_click()
         self.viewer.cancel_magnifier()
+        self._save_current_reading_position()
+        self._pending_progress_seed = None
+        self.presentation_state.begin_replacement_open()
+        self._request_id_adapter = None
+        self._visible_page_indexes_adapter = None
+        self._deactivate_zip_runtime(clear_artifacts=True)
         self._active_open_trace_id = (
             self._next_open_trace_id
             or performance_trace.begin("viewer.open_path.started", str(path))
@@ -1275,8 +1417,6 @@ class ViewerWindow(QMainWindow):
             str(path),
         )
         self._begin_interactive_open()
-        self._save_current_reading_position()
-        self._active_request_id += 1
         suffix = Path(path).suffix.lower()
         self.book_session.open_book_async(
             path,
@@ -1309,8 +1449,9 @@ class ViewerWindow(QMainWindow):
             self.book_session.close_book()
             self._metadata_book_path = ""
             self._metadata_book_item_type = ""
+            self._pending_progress_seed = None
+            self.presentation_state.clear_book()
             self.viewer.clear()
-            self._clear_page_history()
             self._rebuild_page_list()
             self._update_slider()
             self._update_status()
@@ -1342,6 +1483,24 @@ class ViewerWindow(QMainWindow):
         ):
             self.model.go_to_index(saved_page_index)
 
+        self._pending_progress_seed = (
+            (
+                opened.generation,
+                PresentationValues(
+                    self.model.total_pages,
+                    saved_page_index,
+                    self.model.display_path_for_index(saved_page_index),
+                    self.model.file_size_for_index(saved_page_index),
+                ),
+            )
+            if (
+                configured_open_position
+                and not self._resumes_last_book_position()
+                and saved_page_index is not None
+            )
+            else None
+        )
+
         if self.metadata_store is not None:
             self.metadata_store.record_book_opened(
                 self._metadata_book_path,
@@ -1362,12 +1521,13 @@ class ViewerWindow(QMainWindow):
         self.settings["last_open_path"] = opened_path
         self._add_recent_path(opened_path)
         self.image_cache.set_cache_size(self.cache_size)
-        self._clear_page_history()
         self._rebuild_page_list()
         self._first_frame_image_id = self.model.image_id_at(
             self.model.focused_index
         )
-        self._refresh_view()
+        self._refresh_view(
+            navigation=PresentationNavigation.BOOK_SWITCH
+        )
         performance_trace.mark(
             self._active_open_trace_id,
             "viewer.initial_requests.completed",
@@ -1383,12 +1543,19 @@ class ViewerWindow(QMainWindow):
     def _on_async_book_open_failed(self, failed: AsyncBookOpenFailed) -> None:
         self._reload_page_index = None
         self._cancel_interactive_open()
+        self.presentation_state.fail_replacement_open()
         if self._shutdown_prepared or failed.cancelled:
             return
         self._set_status_override(
             failed.message or "書庫を開けません",
             5000,
         )
+        if self.book_session.is_open:
+            # Opening a replacement temporarily deactivates the old runtime.
+            # A failed replacement leaves the old book installed, so restore
+            # that book's production Viewer instead of leaving it in an
+            # inactive legacy-mode surface.
+            self._refresh_view()
 
     def _uses_configured_book_open_position(self, opened: BookOpened) -> bool:
         return (
@@ -1420,30 +1587,49 @@ class ViewerWindow(QMainWindow):
         return min(page_index, self.model.total_pages - 1)
 
     def _save_current_reading_position(self) -> None:
-        if not self._current_book_key or self.model.total_pages <= 0:
+        displayed = self.presentation_state.displayed
+        progress = self.presentation_state.progress_values
+        if displayed is None or progress is None:
+            return
+        self._store_reading_position(
+            displayed.token.book.book_key,
+            progress.page_index,
+        )
+        if self.metadata_store is not None:
+            self.metadata_store.flush()
+
+    def _store_reading_position(
+        self,
+        book_key: str,
+        page_index: int,
+    ) -> None:
+        if not book_key:
             return
         positions = self.settings.get("reading_positions")
         if not isinstance(positions, dict):
             positions = {}
-        positions[self._current_book_key] = self.model.focused_index
+        positions[book_key] = max(0, int(page_index))
         while len(positions) > 100:
             oldest_key = next(iter(positions))
             del positions[oldest_key]
         self.settings["reading_positions"] = positions
-        if self.metadata_store is not None:
-            self.metadata_store.flush()
 
     def _queue_metadata_progress(self) -> None:
+        displayed = self.presentation_state.displayed
+        progress = self.presentation_state.progress_values
         if (
-            self.metadata_store is None
-            or not self._metadata_book_path
-            or self.model.total_pages <= 0
+            displayed is None
+            or progress is None
         ):
             return
+        book_key = displayed.token.book.book_key
+        self._store_reading_position(book_key, progress.page_index)
+        if self.metadata_store is None:
+            return
         self.metadata_store.update_reading_progress(
-            self._metadata_book_path,
-            page_index=self.model.focused_index,
-            total_pages=self.model.total_pages,
+            book_key,
+            page_index=progress.page_index,
+            total_pages=progress.total_pages,
             item_type=self._metadata_book_item_type or None,
         )
 
@@ -1467,23 +1653,8 @@ class ViewerWindow(QMainWindow):
         return "folder"
 
     def _clear_page_history(self) -> None:
-        self._page_history_back.clear()
-        self._page_history_forward.clear()
-        self._sync_actions()
-
-    def _record_page_history(self, previous_index: int) -> None:
-        if not 0 <= previous_index < self.model.total_pages:
-            return
-        if previous_index == self.model.focused_index:
-            return
-        if self._page_history_back and self._page_history_back[-1] == previous_index:
-            self._page_history_forward.clear()
-            self._sync_actions()
-            return
-        self._page_history_back.append(previous_index)
-        del self._page_history_back[:-100]
-        self._page_history_forward.clear()
-        self._sync_actions()
+        self.presentation_state.clear_history()
+        self._sync_page_history_actions()
 
     def _go_to_index_with_history(self, page_index: int, *, raw: bool = False) -> bool:
         if self.model.total_pages <= 0:
@@ -1496,9 +1667,7 @@ class ViewerWindow(QMainWindow):
             self.model.go_to_index(page_index)
         if self.model.current_index == old_start and self.model.focused_index == old:
             return False
-        self._record_page_history(old)
-        self.book_session.notify_page_changed()
-        self._refresh_view()
+        self._refresh_view(navigation=PresentationNavigation.NORMAL)
         return True
 
     def _go_to_model_move_with_history(self, move) -> bool:
@@ -1509,42 +1678,30 @@ class ViewerWindow(QMainWindow):
         move()
         if self.model.current_index == old_start and self.model.focused_index == old:
             return False
-        self._record_page_history(old)
-        self.book_session.notify_page_changed()
-        self._refresh_view()
+        self._refresh_view(navigation=PresentationNavigation.NORMAL)
         return True
 
-    def _on_page_navigation_changed(self, previous_index: int) -> None:
+    def _on_page_navigation_changed(self, _previous_index: int) -> None:
         self.viewer.cancel_pending_canvas_click()
-        self._record_page_history(previous_index)
-        self.book_session.notify_page_changed()
-        self._refresh_view()
+        self._refresh_view(navigation=PresentationNavigation.NORMAL)
 
     def go_back_in_page_history(self) -> None:
-        if self.model.total_pages <= 0 or not self._page_history_back:
+        target = self.presentation_state.history_target(
+            PresentationNavigation.BACK
+        )
+        if self.model.total_pages <= 0 or target is None:
             return
-        current = self.model.focused_index
-        target = self._page_history_back.pop()
-        if 0 <= current < self.model.total_pages:
-            self._page_history_forward.append(current)
-            del self._page_history_forward[:-100]
-        self.model.go_to_index(target)
-        self.book_session.notify_page_changed()
-        self._refresh_view()
-        self._sync_actions()
+        self.model.go_to_index(target.values.page_index)
+        self._refresh_view(navigation=PresentationNavigation.BACK)
 
     def go_forward_in_page_history(self) -> None:
-        if self.model.total_pages <= 0 or not self._page_history_forward:
+        target = self.presentation_state.history_target(
+            PresentationNavigation.FORWARD
+        )
+        if self.model.total_pages <= 0 or target is None:
             return
-        current = self.model.focused_index
-        target = self._page_history_forward.pop()
-        if 0 <= current < self.model.total_pages:
-            self._page_history_back.append(current)
-            del self._page_history_back[:-100]
-        self.model.go_to_index(target)
-        self.book_session.notify_page_changed()
-        self._refresh_view()
-        self._sync_actions()
+        self.model.go_to_index(target.values.page_index)
+        self._refresh_view(navigation=PresentationNavigation.FORWARD)
 
     def _add_recent_path(self, path: str) -> None:
         recent = self.settings.get("recent_paths", [])
@@ -1813,6 +1970,8 @@ class ViewerWindow(QMainWindow):
         self.cache_size = cache_size
         self._update_shared_setting("cache_size", cache_size)
         self.image_cache.set_cache_size(cache_size)
+        if self._zip_runtime is not None:
+            self._zip_runtime.set_cache_limits(unit_limit=max(3, cache_size))
         if self.model.total_pages > 0:
             self._refresh_view()
 
@@ -2034,22 +2193,32 @@ class ViewerWindow(QMainWindow):
     def _sync_page_list_selection(self) -> None:
         if self._page_list_dirty:
             return
-        if self.model.total_pages <= 0:
-            return
         self._updating_page_list = True
-        target_item = None
-        focused_index = self.model.focused_index
-        for row in range(self.page_list.count()):
-            item = self.page_list.item(row)
-            if item is not None and item.data(Qt.ItemDataRole.UserRole) == focused_index:
-                target_item = item
-                break
-        if target_item is None:
-            self.page_list.setCurrentRow(-1)
-        else:
-            self.page_list.setCurrentItem(target_item)
-            self.page_list.scrollToItem(target_item)
-        self._updating_page_list = False
+        try:
+            target_item = None
+            displayed = self.presentation_state.displayed
+            focused_index = self.presentation_state.displayed_page
+            if (
+                displayed is not None
+                and focused_index is not None
+                and displayed.token.book.epoch == self.book_session.generation
+            ):
+                for row in range(self.page_list.count()):
+                    item = self.page_list.item(row)
+                    if (
+                        item is not None
+                        and item.data(Qt.ItemDataRole.UserRole)
+                        == focused_index
+                    ):
+                        target_item = item
+                        break
+            if target_item is None:
+                self.page_list.setCurrentRow(-1)
+            else:
+                self.page_list.setCurrentItem(target_item)
+                self.page_list.scrollToItem(target_item)
+        finally:
+            self._updating_page_list = False
 
     def _update_page_list_thumbnail(self, cached: CachedImage) -> None:
         if self._page_list_dirty:
@@ -2076,6 +2245,10 @@ class ViewerWindow(QMainWindow):
         if not isinstance(page_index, int) or not 0 <= page_index < self.model.total_pages:
             return
         self._go_to_index_with_history(page_index)
+        # QListWidget changes its selection before this callback. The
+        # semantic selection remains the last committed frame until the
+        # requested page completes.
+        self._sync_page_list_selection()
 
     def _rebuild_bookmark_menu(self) -> None:
         self.bookmark_menu.clear()
@@ -2117,11 +2290,504 @@ class ViewerWindow(QMainWindow):
         clear_action.triggered.connect(self.clear_bookmarks_for_current_book)
         self.bookmark_menu.addAction(clear_action)
 
-    def _refresh_view(self) -> None:
+    @Slot(object)
+    def _bind_zip_runtime(self, runtime: object) -> None:
+        previous = self._zip_runtime
+        if previous is not None:
+            try:
+                previous.frameReady.disconnect(self._on_zip_runtime_frame_ready)
+            except (RuntimeError, TypeError):
+                pass
+        if previous is not runtime:
+            # Deactivate while ``previous`` is still the bound owner.  This
+            # avoids cancelling the newly installed book runtime merely as a
+            # side effect of retiring the old book.
+            self._deactivate_zip_runtime(clear_artifacts=False)
+        self._zip_runtime = (
+            runtime if isinstance(runtime, ZipRasterBookRuntime) else None
+        )
+        if self._zip_runtime is not None:
+            self._zip_runtime.frameReady.connect(
+                self._on_zip_runtime_frame_ready
+            )
+
+    def _zip_display_unit(
+        self,
+        indexes: tuple[int, ...],
+        *,
+        start_index: int,
+        is_single: bool,
+    ) -> ZipRasterDisplayUnit:
+        pages: list[ZipRasterPage] = []
+        for page_index in indexes:
+            image_id = self.model.image_id_at(page_index)
+            if image_id is None:
+                continue
+            pages.append(
+                ZipRasterPage(
+                    page_index,
+                    image_id,
+                    self.model.get_image_size(page_index),
+                )
+            )
+        return ZipRasterDisplayUnit(
+            start_index,
+            tuple(pages),
+            is_single,
+        )
+
+    def _zip_runtime_request(
+        self,
+        spread: DisplaySpread,
+    ) -> ZipRasterRequest | None:
+        """Build the one runtime request used by every ZIP display mode."""
+        source = self.book_session.source
+        runtime = self._zip_runtime
+        if (
+            not isinstance(source, ZipImageSource)
+            or runtime is None
+            or runtime is not self.book_session.viewer_runtime
+            or runtime.source is not source
+            or self.model.source is not source
+        ):
+            return None
+        current_indexes = tuple(slot.page_index for slot in spread.slots)
+        current = self._zip_display_unit(
+            current_indexes,
+            start_index=spread.start_index,
+            is_single=spread.is_single,
+        )
+        center = self.model.focused_index
+        direction = self.presentation_state.direction
+        steps = (direction, -direction) if direction else (1, -1)
+        work_order: list[ZipRasterDisplayUnit] = [current]
+        seen = {current.identity}
+        for step in steps:
+            units = self._display_units_from(center, step, 1)
+            if not units:
+                continue
+            indexes = units[0]
+            unit = self._zip_display_unit(
+                indexes,
+                start_index=self.model.spread_start_for_index(indexes[0]),
+                is_single=len(indexes) == 1,
+            )
+            if unit.identity in seen:
+                continue
+            seen.add(unit.identity)
+            work_order.append(unit)
+
+        decoder_bound = self._current_raster_decode_bounds()
+        if (
+            self.rotation_angle % 360
+            or self.split_wide_image
+            or self.viewer.magnifier_selecting
+            or self.viewer.magnifier_active
+            or (self.brightness, self.contrast, self.gamma)
+            != (1.0, 1.0, 1.0)
+        ):
+            decoder_bound = None
+        render_spec = ZipRasterRenderSpec(
+            viewport_size=(
+                max(1, self.viewer.width()),
+                max(1, self.viewer.height()),
+            ),
+            device_pixel_ratio=max(
+                1.0,
+                float(self.viewer.devicePixelRatioF()),
+            ),
+            fit_mode=self.fit_mode,
+            manual_zoom=self.viewer.manual_zoom,
+            gap=self.gap,
+            join_spread_pages=self.join_spread_pages,
+            horizontal_alignment=self.horizontal_alignment,
+            rotation=self.rotation_angle,
+            resampling_mode=self.viewer_resampling_mode,
+            smooth_scaling=self.smooth_scaling,
+            split_wide_image=self.split_wide_image,
+            reading_direction=self.reading_direction,
+            brightness=self.brightness,
+            contrast=self.contrast,
+            gamma=self.gamma,
+            decoder_maximum_size=decoder_bound,
+        )
+        runtime.set_cache_limits(
+            unit_limit=max(3, self.cache_size),
+            byte_budget=self.image_cache.cache_byte_budget_bytes,
+        )
+        return ZipRasterRequest(
+            self.book_session.generation,
+            self._active_request_id,
+            current,
+            tuple(work_order),
+            render_spec,
+        )
+
+    def _activate_zip_runtime(self) -> None:
+        if self._zip_runtime_active:
+            return
+        self._cancel_pending_decode_demand()
+        self._cancel_deferred_pdf_prefetch()
+        self._prepared_display_timer.stop()
+        self._raster_paint_fallback_timer.stop()
+        self._raster_prefetch_after_paint = None
+        self._clear_raster_prefetch_pipeline()
+        self.image_cache.suspend_for_book_runtime()
+        self.viewer.set_direct_display_mode(True)
+        self._zip_runtime_current_frame_serial = 0
+        self._zip_runtime_last_painted_serial = 0
+        self._zip_runtime_active = True
+
+    def _deactivate_zip_runtime(
+        self,
+        *,
+        clear_artifacts: bool = False,
+    ) -> None:
+        self._zip_runtime_request_timer.stop()
+        self._pending_zip_runtime_request = None
+        if not self._zip_runtime_active:
+            if clear_artifacts and self._zip_runtime is not None:
+                self._zip_runtime.cancel(clear_artifacts=True)
+            return
+        self._zip_runtime_active = False
+        if self._zip_runtime is not None:
+            self._zip_runtime.cancel(clear_artifacts=clear_artifacts)
+        self._raster_paint_fallback_timer.stop()
+        self._zip_runtime_current_frame_serial = 0
+        self._zip_runtime_last_painted_serial = 0
+        self.viewer.set_direct_display_mode(False)
+        self._release_raster_interactive_lane()
+
+    def _dispatch_pending_zip_runtime_request(self) -> None:
+        request = self._pending_zip_runtime_request
+        self._pending_zip_runtime_request = None
+        runtime = self._zip_runtime
+        current_identity = tuple(
+            (slot.page_index, slot.image_id)
+            for slot in self.model.spread_at().slots
+        )
+        if (
+            request is None
+            or runtime is None
+            or self._shutdown_prepared
+            or not self._zip_runtime_active
+            or request.request_id != self._active_request_id
+            or request.source_epoch != self.book_session.generation
+            or request.current.identity != current_identity
+        ):
+            return
+        if runtime.request(request):
+            return
+        message = "ZIP Viewer runtimeは要求を受け付けられません。"
+        self.presentation_state.fail_pending(message)
+        self._set_status_override(message)
+
+    def _on_zip_runtime_frame_ready(
+        self,
+        frame: ZipRasterFrame,
+    ) -> None:
+        presentation_token = self._presentation_token_for_request(
+            frame.request_id
+        )
+        current_spread = self.model.spread_at()
+        current_identity = tuple(
+            (slot.page_index, slot.image_id)
+            for slot in current_spread.slots
+        )
+        if (
+            self._shutdown_prepared
+            or not self._zip_runtime_active
+            or presentation_token is None
+            or frame.request_id != self._active_request_id
+            or frame.source_epoch != self.book_session.generation
+            or frame.source_identity != id(self.book_session.source)
+            or frame.unit.identity != current_identity
+        ):
+            return
+        by_logical_page: dict[int, list[object]] = {}
+        for page in frame.pages:
+            by_logical_page.setdefault(page.page_index, []).append(page)
+        for page_index, outputs in by_logical_page.items():
+            if len(outputs) == 1:
+                logical_size = outputs[0].original_size
+            else:
+                logical_size = (
+                    sum(output.original_size[0] for output in outputs),
+                    max(output.original_size[1] for output in outputs),
+                )
+            self.model.set_image_size(page_index, logical_size)
+        spread = self.model.spread_at()
+        if tuple(
+            (slot.page_index, slot.image_id) for slot in spread.slots
+        ) != frame.unit.identity:
+            self._refresh_view()
+            return
+
+        images: list[ViewerImage] = []
+        for page in frame.pages:
+            source = page.source_qimage
+            images.append(
+                ViewerImage(
+                    page_index=page.page_index,
+                    image_id=page.image_id,
+                    pixmap=page.pixmap,
+                    original_size=page.original_size,
+                    error=page.error,
+                    loading=False,
+                    rendered_size=(
+                        (source.width(), source.height())
+                        if source is not None
+                        else None
+                    ),
+                    pre_rotated=False,
+                    qimage=source,
+                    source_generation=frame.source_epoch,
+                    source_identity=str(frame.source_identity),
+                    split_range=page.split_range,
+                    display_prepared=(page.pixmap is not None),
+                    source_is_preview=page.source_is_preview,
+                )
+            )
+        for slot in self._display_unit.slots:
+            outputs = by_logical_page.get(slot.page_index, [])
+            error = next(
+                (
+                    str(output.error)
+                    for output in outputs
+                    if output.error
+                ),
+                None,
+            )
+            self.presentation_state.transition_slot(
+                presentation_token,
+                page_index=slot.page_index,
+                image_id=slot.image_id,
+                state=(
+                    ViewerSlotState.FAILED
+                    if error is not None
+                    else ViewerSlotState.READY
+                ),
+                error=error,
+            )
+        self._zip_runtime_current_frame_serial = (
+            self.viewer.commit_display_ready_frame(
+                spread,
+                images,
+                presentation_token,
+            )
+        )
+        if any(
+            page.source_qimage is not None and not page.source_is_preview
+            for page in frame.pages
+        ):
+            self.viewer.resume_magnifier_after_source_render()
+        performance_trace.mark(
+            self._active_open_trace_id,
+            "zip_runtime.commit.completed",
+            f"unit={frame.unit.identity!r} cache_hit={frame.cache_hit}",
+        )
+        self._raster_paint_fallback_timer.start()
+
+    def _on_zip_runtime_frame_painted(
+        self,
+        frame_serial: int,
+        image_ids: object,
+    ) -> None:
+        if (
+            not self._zip_runtime_active
+            or int(frame_serial) != self._zip_runtime_current_frame_serial
+            or int(frame_serial) <= self._zip_runtime_last_painted_serial
+            or not isinstance(image_ids, tuple)
+        ):
+            return
+        self._zip_runtime_last_painted_serial = int(frame_serial)
+        self._raster_paint_fallback_timer.stop()
+        if self._zip_runtime is not None:
+            self._zip_runtime.release_prefetch(
+                request_id=self._active_request_id,
+            )
+        self._defer_zip_runtime_browser_resume()
+        performance_trace.mark(
+            self._active_open_trace_id,
+            "zip_runtime.paint.completed",
+        )
+
+    def _presentation_layout_signature(self) -> tuple[object, ...]:
+        return (
+            max(1, self.viewer.width()),
+            max(1, self.viewer.height()),
+            self.fit_mode,
+            round(float(self.viewer.manual_zoom), 6),
+            self.gap,
+            self.join_spread_pages,
+            self.horizontal_alignment,
+            self.rotation_angle % 360,
+            self.viewer_resampling_mode,
+            self.smooth_scaling,
+            self.split_wide_image,
+            self.reading_direction,
+            self.view_mode,
+            self.single_first_page,
+            self.treat_wide_image_as_single,
+            round(float(self.brightness), 6),
+            round(float(self.contrast), 6),
+            round(float(self.gamma), 6),
+            self._current_raster_decode_bounds(),
+            self.image_cache.generation,
+        )
+
+    def _begin_presentation_request(
+        self,
+        spread: DisplaySpread,
+        navigation: PresentationNavigation,
+    ):
+        source = self.book_session.source
+        if not spread.slots or self.model.total_pages <= 0:
+            raise RuntimeError("presentation request requires an active book")
+        focused_index = self.model.focused_index
+        focused_identity = (
+            self.model.page_identity(focused_index)
+            or self.model.image_id_at(focused_index)
+        )
+        if focused_identity is None:
+            raise RuntimeError("focused presentation page has no identity")
+        unit = PresentationUnit(
+            spread.start_index,
+            focused_index,
+            focused_identity,
+            tuple(
+                PresentationPage(
+                    slot.page_index,
+                    self.model.page_identity(slot.page_index)
+                    or slot.image_id,
+                    slot.image_id,
+                )
+                for slot in spread.slots
+            ),
+            spread.is_single,
+        )
+        book_key = (
+            self._current_book_key
+            or str(self.book_session.current_path or "")
+            or f"fake-book:{self.book_session.generation}:{id(self.model)}"
+        )
+        request = self.presentation_state.request_frame(
+            PresentationBook(
+                self.book_session.generation,
+                id(source) if source is not None else id(self.model),
+                book_key,
+            ),
+            unit,
+            PresentationValues(
+                self.model.total_pages,
+                focused_index,
+                self.model.display_path_for_index(focused_index),
+                self.model.file_size_for_index(focused_index),
+            ),
+            self._presentation_layout_signature(),
+            max(1.0, float(self.viewer.devicePixelRatioF())),
+            navigation,
+            progress_values=(
+                self._pending_progress_seed[1]
+                if (
+                    self._pending_progress_seed is not None
+                    and self._pending_progress_seed[0]
+                    == self.book_session.generation
+                    and self.presentation_state.current_book_epoch
+                    != self.book_session.generation
+                    and navigation
+                    is not PresentationNavigation.NORMAL
+                )
+                else None
+            ),
+        )
+        if (
+            navigation is PresentationNavigation.NORMAL
+            and self._pending_progress_seed is not None
+            and self._pending_progress_seed[0]
+            == self.book_session.generation
+        ):
+            self._pending_progress_seed = None
+        self._request_id_adapter = None
+        self._visible_page_indexes_adapter = None
+        return request
+
+    def _presentation_token_for_request(
+        self,
+        request_id: int,
+    ) -> PresentationFrameToken | None:
+        requested = self.presentation_state.requested
+        if (
+            requested is None
+            or requested.token.request_serial != int(request_id)
+        ):
+            return None
+        return requested.token
+
+    def _on_viewer_frame_committed(self, event: object) -> None:
+        if self._shutdown_prepared or not isinstance(event, ViewerFrameCommit):
+            return
+        token = event.frame_token
+        if not isinstance(token, PresentationFrameToken):
+            return
+        requested = self.presentation_state.requested
+        if requested is None or requested.token != token:
+            return
+        expected_identity = tuple(
+            (page.index, page.image_id) for page in requested.unit.pages
+        )
+        if event.spread_identity != expected_identity:
+            return
+        failed_indexes = set(event.failed_page_indexes)
+        errors_by_page = {
+            slot.page_index: (
+                slot.error or "画像を表示できません。"
+            )
+            for slot in requested.display_tracker.slots
+            if slot.page_index in failed_indexes
+        }
+        commit = self.presentation_state.commit_frame(
+            token,
+            event.widget_frame_serial,
+            (
+                index
+                for index in event.page_indexes
+                if index not in failed_indexes
+            ),
+            errors_by_page,
+        )
+        if commit is None:
+            return
+        self._apply_presentation_commit(commit)
+
+    def _apply_presentation_commit(
+        self,
+        commit: PresentationCommit,
+    ) -> None:
+        # The semantic state was replaced by one immutable snapshot before
+        # these projections run. This whole slot is synchronous with the
+        # Widget's complete-frame swap.
+        self._update_slider()
+        self._update_status()
+        self._sync_page_list_selection()
+        self._sync_page_history_actions()
+        self._sync_actions()
+        self.book_session.notify_page_changed()
+        if (
+            self._pending_progress_seed is not None
+            and self._pending_progress_seed[0]
+            == commit.frame.token.book.epoch
+        ):
+            self._pending_progress_seed = None
+        self.presentationCommitted.emit(commit)
+
+    def _refresh_view(
+        self,
+        *,
+        navigation: PresentationNavigation = PresentationNavigation.REFRESH,
+    ) -> None:
         self._cancel_pending_display_demand()
         self.viewer.supersede_pending_display()
-        if hasattr(self, "fullscreen_chrome"):
-            self.fullscreen_chrome.reevaluate_visibility()
         if self._awaiting_first_frame:
             focused_image_id = self.model.image_id_at(self.model.focused_index)
             if focused_image_id is not None:
@@ -2129,8 +2795,12 @@ class ViewerWindow(QMainWindow):
                 # Move the gate to the newly requested identity so an old page
                 # cannot keep spread-partner work blocked indefinitely.
                 self._first_frame_image_id = focused_image_id
-        self._active_request_id += 1
         spread = self.model.spread_at()
+        presentation_request = self._begin_presentation_request(
+            spread,
+            navigation,
+        )
+        request_id = presentation_request.token.request_serial
         if tuple(
             slot.page_index for slot in spread.slots
         ) != self.viewer.displayed_page_indexes or (
@@ -2138,25 +2808,48 @@ class ViewerWindow(QMainWindow):
             and self.viewer.magnifier_source_page != self.model.focused_index
         ):
             self.viewer.cancel_magnifier()
-        self._visible_page_indexes = tuple(slot.page_index for slot in spread.slots)
+        zip_request = self._zip_runtime_request(spread)
+        if zip_request is not None:
+            self._activate_zip_runtime()
+            self._raster_paint_fallback_timer.stop()
+            self._zip_runtime_current_frame_serial = 0
+            runtime = self._zip_runtime
+            if runtime is None:
+                return
+            if not runtime.has_cached_current(zip_request):
+                self._hold_raster_interactive_lane()
+                self._pending_zip_runtime_request = zip_request
+                has_completed_frame = any(
+                    image.display_prepared
+                    and image.pixmap is not None
+                    and not image.pixmap.isNull()
+                    for image in self.viewer._images
+                )
+                if has_completed_frame:
+                    self._zip_runtime_request_timer.start()
+                else:
+                    self._dispatch_pending_zip_runtime_request()
+                return
+            self._zip_runtime_request_timer.stop()
+            self._pending_zip_runtime_request = None
+            if runtime.request(zip_request):
+                return
+            message = "ZIP Viewer runtimeは要求を受け付けられません。"
+            self.presentation_state.fail_pending(message)
+            self._set_status_override(message)
+            return
+        if isinstance(self.book_session.source, ZipImageSource):
+            # ZIP books never fall back per feature or per decoder failure.
+            # A missing runtime is a book-lifetime error, not eligibility.
+            message = "ZIP Viewer runtimeを初期化できません。"
+            self.presentation_state.fail_pending(message)
+            self._set_status_override(message)
+            return
+        self._deactivate_zip_runtime(clear_artifacts=False)
         self.image_cache.set_raster_decode_bounds(
             self._current_raster_decode_bounds()
         )
         self.image_cache.set_render_spec(self._current_pdf_render_spec())
-        self._display_unit = self._display_unit.cancel_loading()
-        self._display_unit = ViewerDisplayUnit.create(
-            request_id=self._active_request_id,
-            generation=self.image_cache.generation,
-            focused_page_identity=self.model.focused_page_identity,
-            pages=(
-                (
-                    slot.page_index,
-                    self.model.page_identity(slot.page_index) or slot.image_id,
-                    slot.image_id,
-                )
-                for slot in spread.slots
-            ),
-        )
         if self.viewer.has_pending_prepared_rendering():
             # ZipPlaFork rebuilds the one pending work order around every new
             # current page. Replan queued display preparation here rather than
@@ -2166,8 +2859,8 @@ class ViewerWindow(QMainWindow):
             spread,
             source_generation=self.image_cache.generation,
             source_identity=self._prepared_source_identity(),
+            frame_token=presentation_request.token,
         ):
-            self._applied_display_request_id = self._active_request_id
             source_pages = self._cached_pages_for_prepared_spread(
                 spread,
                 include_tracked=True,
@@ -2209,13 +2902,13 @@ class ViewerWindow(QMainWindow):
                 )
             else:
                 self._queue_decode_demand(
-                    self._active_request_id,
+                    request_id,
                     request_center,
                     gated_visible_indexes,
                 )
         if _DISPLAY_LOG.isEnabledFor(logging.DEBUG):
             _DISPLAY_LOG.debug(
-                "display unit request=%s generation=%s focused=%s slots=%r gate=%s",
+                "display unit request=%s book_epoch=%s focused=%s slots=%r gate=%s",
                 self._display_unit.request_id,
                 self._display_unit.generation,
                 self._display_unit.focused_page_identity,
@@ -2230,7 +2923,7 @@ class ViewerWindow(QMainWindow):
                 ),
                 first_frame_gate,
             )
-        self._render_spread(spread, self._active_request_id)
+        self._render_spread(spread, request_id)
 
     def _prepare_deferred_pdf_prefetch(
         self,
@@ -2667,7 +3360,6 @@ class ViewerWindow(QMainWindow):
             request_id != self._active_request_id
             or request_id != self._display_unit.request_id
             or generation != self.image_cache.generation
-            or generation != self._display_unit.generation
             or visible_indexes != self._visible_page_indexes
         ):
             return
@@ -2706,6 +3398,7 @@ class ViewerWindow(QMainWindow):
         self._clear_raster_prefetch_pipeline()
 
     def _hold_raster_interactive_lane(self) -> None:
+        self._zip_runtime_browser_resume_timer.stop()
         if (
             self._raster_interactive_lane_held
             or self.image_work_coordinator is None
@@ -2715,6 +3408,7 @@ class ViewerWindow(QMainWindow):
         self.image_work_coordinator.begin_viewer_interactive()
 
     def _release_raster_interactive_lane(self) -> None:
+        self._zip_runtime_browser_resume_timer.stop()
         if (
             not self._raster_interactive_lane_held
             or self.image_work_coordinator is None
@@ -2723,7 +3417,21 @@ class ViewerWindow(QMainWindow):
         self._raster_interactive_lane_held = False
         self.image_work_coordinator.end_viewer_interactive()
 
+    def _defer_zip_runtime_browser_resume(self) -> None:
+        if (
+            self._raster_interactive_lane_held
+            and self.image_work_coordinator is not None
+        ):
+            self._zip_runtime_browser_resume_timer.start()
+
     def _release_raster_prefetch_without_paint(self) -> None:
+        if self._zip_runtime_active:
+            if self._zip_runtime is not None:
+                self._zip_runtime.release_prefetch(
+                    request_id=self._active_request_id,
+                )
+            self._release_raster_interactive_lane()
+            return
         staged = self._raster_prefetch_after_paint
         if staged is None:
             return
@@ -2844,11 +3552,12 @@ class ViewerWindow(QMainWindow):
         self._pdf_prefetch_direction = 0
 
     def _render_spread(self, spread, request_id: int) -> None:
+        presentation_token = self._presentation_token_for_request(request_id)
         if (
             self._shutdown_prepared
+            or presentation_token is None
             or request_id != self._active_request_id
             or self._display_unit.request_id != request_id
-            or self._display_unit.generation != self.image_cache.generation
             or tuple(
                 (slot.page_index, slot.image_id) for slot in spread.slots
             )
@@ -2869,10 +3578,10 @@ class ViewerWindow(QMainWindow):
                     if self.image_cache.source is not None
                     else ViewerSlotState.FAILED
                 )
-                self._display_unit = self._display_unit.transition(
+                self.presentation_state.transition_slot(
+                    presentation_token,
                     page_index=slot.page_index,
                     image_id=slot.image_id,
-                    generation=self.image_cache.generation,
                     state=state,
                     error=(
                         None
@@ -2891,10 +3600,10 @@ class ViewerWindow(QMainWindow):
                         )
                     )
             elif cached.error:
-                self._display_unit = self._display_unit.transition(
+                self.presentation_state.transition_slot(
+                    presentation_token,
                     page_index=slot.page_index,
                     image_id=slot.image_id,
-                    generation=cached.generation,
                     state=ViewerSlotState.FAILED,
                     error=cached.error,
                 )
@@ -2906,18 +3615,18 @@ class ViewerWindow(QMainWindow):
                     )
                 )
             elif cached.qimage is not None and cached.original_size is not None:
-                self._display_unit = self._display_unit.transition(
+                self.presentation_state.transition_slot(
+                    presentation_token,
                     page_index=slot.page_index,
                     image_id=slot.image_id,
-                    generation=cached.generation,
                     state=ViewerSlotState.READY,
                 )
                 pages.extend(self._viewer_images_for_cached(cached, split_allowed=spread.is_single))
             else:
-                self._display_unit = self._display_unit.transition(
+                self.presentation_state.transition_slot(
+                    presentation_token,
                     page_index=slot.page_index,
                     image_id=slot.image_id,
-                    generation=cached.generation,
                     state=ViewerSlotState.FAILED,
                     error="画像を表示できません。",
                 )
@@ -2930,10 +3639,6 @@ class ViewerWindow(QMainWindow):
             target_is_terminal
             and request_id != self._applied_display_request_id
         )
-        self._update_slider()
-        self._update_status()
-        self._sync_page_list_selection()
-        self._sync_actions()
         if should_apply:
             self._queue_display_demand(request_id, spread, pages)
         elif request_id == self._applied_display_request_id:
@@ -2950,11 +3655,15 @@ class ViewerWindow(QMainWindow):
         spread: DisplaySpread,
         pages: list[ViewerImage],
     ) -> None:
+        presentation_token = self._presentation_token_for_request(request_id)
+        if presentation_token is None:
+            return
         demand = (
             int(request_id),
             int(self.image_cache.generation),
             spread,
             tuple(pages),
+            presentation_token,
         )
         existing = self._pending_display_demand
         self._pending_display_demand = demand
@@ -2988,12 +3697,13 @@ class ViewerWindow(QMainWindow):
         self._pending_display_demand = None
         if demand is None or self._shutdown_prepared:
             return
-        request_id, generation, spread, pages = demand
+        request_id, generation, spread, pages, presentation_token = demand
         if (
             request_id != self._active_request_id
             or request_id != self._display_unit.request_id
             or generation != self.image_cache.generation
-            or generation != self._display_unit.generation
+            or self._presentation_token_for_request(request_id)
+            != presentation_token
             or tuple(
                 (slot.page_index, slot.image_id) for slot in spread.slots
             )
@@ -3006,8 +3716,11 @@ class ViewerWindow(QMainWindow):
         # Starting the target-size worker is intentionally outside the input
         # handler. The previous complete frame remains visible until this
         # request commits atomically.
-        self.viewer.set_pages(spread, list(pages))
-        self._applied_display_request_id = request_id
+        self.viewer.set_pages(
+            spread,
+            list(pages),
+            frame_token=presentation_token,
+        )
 
     def _cancel_pending_display_demand(self) -> None:
         self._display_demand_timer.stop()
@@ -3151,16 +3864,19 @@ class ViewerWindow(QMainWindow):
         return [left_page, right_page]
 
     def _on_cache_page_loaded(self, cached: CachedImage) -> None:
+        requested = self.presentation_state.requested
         if (
             self._shutdown_prepared
+            or self._zip_runtime_active
+            or requested is None
             or cached.generation != self.image_cache.generation
         ):
             return
         self._enforce_combined_cache_budget()
-        self._display_unit = self._display_unit.transition(
+        self.presentation_state.transition_slot(
+            requested.token,
             page_index=cached.page_index,
             image_id=cached.image_id,
-            generation=cached.generation,
             state=(
                 ViewerSlotState.FAILED
                 if cached.error
@@ -3251,6 +3967,8 @@ class ViewerWindow(QMainWindow):
         self,
         _image_ids: object,
     ) -> None:
+        if self._zip_runtime_active:
+            return
         # Native QMenu reconstruction is deferred until the user opens it;
         # this slot is delivered synchronously during ready-page navigation.
         self._arm_prepared_display_prefetch()
@@ -3399,6 +4117,8 @@ class ViewerWindow(QMainWindow):
         self._advance_raster_prefetch_pipeline()
 
     def _on_viewer_render_cache_changed(self) -> None:
+        if self._zip_runtime_active:
+            return
         self._advance_raster_prefetch_pipeline()
         self._enforce_combined_cache_budget()
         self._advance_raster_prefetch_pipeline()
@@ -3408,6 +4128,8 @@ class ViewerWindow(QMainWindow):
         render_key: object,
         succeeded: bool,
     ) -> None:
+        if self._zip_runtime_active:
+            return
         if succeeded or not self._raster_prefetch_active_unit:
             return
         image_id = str(getattr(render_key, "image_id", ""))
@@ -3446,6 +4168,27 @@ class ViewerWindow(QMainWindow):
         self.interactive_open_cancelled.emit(self)
 
     def _on_viewer_content_painted(self, image_ids: object) -> None:
+        if self._zip_runtime_active:
+            if (
+                self._awaiting_first_frame
+                and self._first_frame_image_id
+                and isinstance(image_ids, tuple)
+                and any(
+                    image_id == self._first_frame_image_id
+                    or str(image_id).startswith(
+                        f"{self._first_frame_image_id}#"
+                    )
+                    for image_id in image_ids
+                )
+            ):
+                self._awaiting_first_frame = False
+                self._first_frame_image_id = None
+                performance_trace.mark(
+                    self._active_open_trace_id,
+                    "viewer.first_paint.completed",
+                )
+                self.first_frame_ready.emit(self)
+            return
         if isinstance(image_ids, tuple):
             self._arm_prepared_display_prefetch(after_paint=True)
             self._arm_deferred_pdf_prefetch()
@@ -3637,8 +4380,12 @@ class ViewerWindow(QMainWindow):
         menu = QMenu(self)
         back_history_action = menu.addAction("表示履歴を戻る")
         forward_history_action = menu.addAction("表示履歴を進む")
-        back_history_action.setEnabled(bool(self._page_history_back))
-        forward_history_action.setEnabled(bool(self._page_history_forward))
+        back_history_action.setEnabled(
+            bool(self.presentation_state.back_history)
+        )
+        forward_history_action.setEnabled(
+            bool(self.presentation_state.forward_history)
+        )
         menu.addSeparator()
         next_action = menu.addAction("次ページ")
         previous_action = menu.addAction("前ページ")
@@ -3788,31 +4535,42 @@ class ViewerWindow(QMainWindow):
             )
 
     def _update_slider(self) -> None:
+        values = self.presentation_state.status_values
         self.slider.set_page_state(
-            self.model.total_pages,
-            self.model.focused_index,
+            values.total_pages if values is not None else 0,
+            self.presentation_state.slider_page_index or 0,
         )
 
     def _update_status(self) -> None:
         if self._status_override_message is not None:
             self.status.showMessage(self._status_override_message)
             return
-        if self.model.total_pages == 0:
+        values = self.presentation_state.status_values
+        if values is None:
             self.status.showMessage("画像が読み込まれていません")
             return
 
-        focused_index = self.model.focused_index
-        path = self.model.display_path_for_index(focused_index)
-        page_text = f"{focused_index + 1} / {self.model.total_pages}"
+        path = values.path
+        page_text = f"{values.page_index + 1} / {values.total_pages}"
         resolution = self.viewer.current_resolution_text()
         zoom = (
             f"{round(self.viewer.manual_zoom * 100)}%"
             if self.fit_mode == "manual_zoom"
             else ("100%" if self.fit_mode == "actual_size" else self.fit_mode)
         )
-        size = self._format_file_size(self.model.file_size_for_index(focused_index))
+        size = self._format_file_size(values.file_size)
+        frame_failure = self.presentation_state.frame_failure
         details = "    ".join(
-            part for part in (path, page_text, resolution, zoom, size) if part
+            part
+            for part in (
+                path,
+                page_text,
+                resolution,
+                zoom,
+                size,
+                frame_failure.message if frame_failure is not None else "",
+            )
+            if part
         )
         self.status.showMessage(details)
 
@@ -3857,12 +4615,18 @@ class ViewerWindow(QMainWindow):
 
     def _on_slider_changed(self, value: int) -> None:
         self.page_navigation.go_to_focused_page_index(value)
+        # A dragged QSlider moves before valueChanged. Restore the committed
+        # page until the requested frame reaches the atomic commit boundary.
+        self._update_slider()
 
     def _on_zoom_changed(self, zoom: float) -> None:
         self.fit_mode = "manual_zoom"
         self._update_shared_setting("fit_mode", self.fit_mode)
         self._sync_actions()
         self._update_status()
+        if self._zip_runtime_active:
+            self._refresh_view()
+            return
         if self.image_cache.set_raster_decode_bounds(
             self._current_raster_decode_bounds()
         ):
@@ -3884,6 +4648,14 @@ class ViewerWindow(QMainWindow):
         )
 
     def _on_viewport_changed(self) -> None:
+        pending_page = self.presentation_state.frame_loading
+        if pending_page or self._zip_runtime_active:
+            self.presentation_state.supersede_pending()
+            self._request_id_adapter = None
+            self._visible_page_indexes_adapter = None
+        self._presentation_viewport_refresh_required = (
+            self._presentation_viewport_refresh_required or pending_page
+        )
         self._schedule_pdf_rerender()
         if not isinstance(self.book_session.source, PdfImageSource):
             self._raster_viewport_timer.start()
@@ -3891,8 +4663,18 @@ class ViewerWindow(QMainWindow):
     def _refresh_raster_decode_bounds(self) -> None:
         if self._shutdown_prepared or not self.model.total_pages:
             return
-        if self.image_cache.set_raster_decode_bounds(
-            self._current_raster_decode_bounds()
+        force_refresh = self._presentation_viewport_refresh_required
+        self._presentation_viewport_refresh_required = False
+        if self._zip_runtime_active:
+            if self._zip_runtime is not None:
+                self._zip_runtime.invalidate_layout()
+            self._refresh_view()
+            return
+        if (
+            self.image_cache.set_raster_decode_bounds(
+                self._current_raster_decode_bounds()
+            )
+            or force_refresh
         ):
             self._refresh_view()
 
@@ -3984,7 +4766,12 @@ class ViewerWindow(QMainWindow):
     def _rerender_pdf(self) -> None:
         if not isinstance(self.book_session.source, PdfImageSource):
             return
-        if self.image_cache.set_render_spec(self._current_pdf_render_spec()):
+        force_refresh = self._presentation_viewport_refresh_required
+        self._presentation_viewport_refresh_required = False
+        if (
+            self.image_cache.set_render_spec(self._current_pdf_render_spec())
+            or force_refresh
+        ):
             self._refresh_view()
 
     def _request_pdf_magnifier_resolution(
@@ -4014,6 +4801,11 @@ class ViewerWindow(QMainWindow):
         _physical_size: QSize,
     ) -> None:
         if isinstance(self.book_session.source, PdfImageSource):
+            return
+        if self._zip_runtime_active:
+            if self._zip_runtime is not None:
+                self._zip_runtime.invalidate_layout()
+            self._refresh_view()
             return
         if not self.image_cache.ensure_full_resolution(page_index):
             self.viewer.resume_magnifier_after_source_render()
@@ -4084,6 +4876,8 @@ class ViewerWindow(QMainWindow):
         self._update_shared_setting("smooth_scaling", checked)
         self.viewer.set_smooth_scaling(checked)
         self._sync_actions()
+        if self._zip_runtime_active and self.model.total_pages:
+            self._refresh_view()
 
     def set_viewer_resampling_mode(self, mode: str) -> None:
         self.viewer_resampling_mode = normalize_resampling_mode(mode)
@@ -4093,6 +4887,9 @@ class ViewerWindow(QMainWindow):
         )
         self.viewer.set_resampling_modes(normal=self.viewer_resampling_mode)
         self._sync_actions()
+        if self._zip_runtime_active and self.model.total_pages:
+            self._refresh_view()
+            return
         if self.image_cache.set_raster_decode_bounds(
             self._current_raster_decode_bounds()
         ) and self.model.total_pages:
@@ -4114,6 +4911,8 @@ class ViewerWindow(QMainWindow):
         self._update_shared_setting("horizontal_alignment", alignment)
         self.viewer.set_horizontal_alignment(alignment)
         self._sync_actions()
+        if self._zip_runtime_active and self.model.total_pages:
+            self._refresh_view()
 
     def set_fit_mode(self, mode: str) -> None:
         if mode == "fit_window":
@@ -4124,6 +4923,10 @@ class ViewerWindow(QMainWindow):
         self._update_shared_setting("fit_mode", mode)
         self._sync_actions()
         self._update_status()
+        if self._zip_runtime_active and self.model.total_pages:
+            self._refresh_view()
+            self.fullscreen_chrome.reevaluate_visibility()
+            return
         raster_changed = self.image_cache.set_raster_decode_bounds(
             self._current_raster_decode_bounds()
         )
@@ -4143,18 +4946,27 @@ class ViewerWindow(QMainWindow):
         self.rotation_angle = (self.rotation_angle - 90) % 360
         self.viewer.set_rotation_angle(self.rotation_angle)
         self._update_status()
-        self._rerender_pdf()
+        self._refresh_after_rotation_change()
 
     def rotate_right(self) -> None:
         self.rotation_angle = (self.rotation_angle + 90) % 360
         self.viewer.set_rotation_angle(self.rotation_angle)
         self._update_status()
-        self._rerender_pdf()
+        self._refresh_after_rotation_change()
 
     def reset_rotation(self) -> None:
         self.rotation_angle = 0
         self.viewer.set_rotation_angle(self.rotation_angle)
         self._update_status()
+        self._refresh_after_rotation_change()
+
+    def _refresh_after_rotation_change(self) -> None:
+        if self._zip_runtime_active:
+            if self._zip_runtime is not None:
+                self._zip_runtime.invalidate_layout()
+            if self.model.total_pages:
+                self._refresh_view()
+            return
         self._rerender_pdf()
 
     def toggle_slideshow(self) -> None:
@@ -4273,12 +5085,17 @@ class ViewerWindow(QMainWindow):
         if self._shutdown_prepared:
             return
         self._shutdown_prepared = True
+        self._save_current_reading_position()
+        self.presentation_state.close()
+        self._zip_runtime_request_timer.stop()
+        self._pending_zip_runtime_request = None
         self._path_probe_generation += 1
         self._pending_path_probe = None
         self.fullscreen_chrome.shutdown()
         self._cancel_interactive_open()
         self.viewer.cancel_mouse_gesture()
         self.viewer.cancel_pending_canvas_click()
+        self._deactivate_zip_runtime(clear_artifacts=True)
         self.viewer.shutdown_rendering(max(5000, wait_msecs))
         self.slideshow_timer.stop()
         self._pdf_render_timer.stop()
@@ -4291,7 +5108,6 @@ class ViewerWindow(QMainWindow):
         self._cancel_pending_display_demand()
         self._cancel_pending_decode_demand()
         self._cancel_deferred_pdf_prefetch()
-        self._save_current_reading_position()
         self.book_session.shutdown(wait_msecs=wait_msecs)
         if self._owns_archive_backend_registry:
             self.archive_backend_registry.close()

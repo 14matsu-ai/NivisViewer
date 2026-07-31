@@ -6,7 +6,7 @@ from PySide6.QtGui import QImage, QMouseEvent, QPixmap, QWheelEvent
 from PySide6.QtWidgets import QApplication
 
 from app.page_model import DisplaySpread, PageSlot
-from app.viewer_widget import ViewerWidget, calculate_spread_layout
+from app.viewer_widget import ViewerImage, ViewerWidget, calculate_spread_layout
 
 
 def center_gap(layout) -> int:
@@ -199,6 +199,216 @@ def test_clear_releases_images_from_last_draw_layout_and_can_repaint(
     widget.clear()
     widget.clear()
     assert widget._last_draw_layout == []
+    widget.close()
+
+
+def test_direct_display_commit_is_qpixmap_only_atomic_and_paint_acknowledged(
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    widget = ViewerWidget()
+    widget.resize(320, 240)
+    widget.set_direct_display_mode(True)
+    committed: list[tuple[str, ...]] = []
+    painted: list[tuple[int, tuple[str, ...]]] = []
+    updates: list[None] = []
+    original_update = widget.update
+
+    def record_update(*args) -> None:
+        updates.append(None)
+        original_update(*args)
+
+    monkeypatch.setattr(widget, "update", record_update)
+    widget.displayCommitted.connect(committed.append)
+    widget.framePainted.connect(
+        lambda serial, image_ids: painted.append((serial, image_ids))
+    )
+    pixmap = QPixmap(160, 220)
+    pixmap.fill(Qt.GlobalColor.red)
+    spread = DisplaySpread(4, (PageSlot("page-4", 4),), True)
+    token = object()
+
+    serial = widget.commit_display_ready_single(
+        spread,
+        4,
+        "page-4",
+        (1600, 2200),
+        pixmap,
+        token,
+    )
+
+    assert serial == 1
+    assert updates == [None]
+    assert committed == [("page-4",)]
+    assert widget.displayed_page_indexes == (4,)
+    assert len(widget._images) == 1
+    direct_image = widget._images[0]
+    assert direct_image.qimage is None
+    assert direct_image.pixmap is not None
+    assert direct_image.display_prepared
+    assert direct_image.pre_rotated
+    assert direct_image.original_size == (1600, 2200)
+    assert widget._direct_current_frame_token is token
+    assert widget._pending_display is None
+    assert widget._render_tasks == set()
+
+    widget.render(QPixmap(widget.size()))
+
+    assert painted == [(serial, ("page-4",))]
+    widget.close()
+
+
+def test_direct_mode_preserves_completed_frame_and_resize_starts_no_render(
+    qapp: QApplication,
+) -> None:
+    widget = ViewerWidget()
+    widget.resize(320, 240)
+    source = QImage(120, 180, QImage.Format.Format_RGB32)
+    source.fill(Qt.GlobalColor.blue)
+    spread = DisplaySpread(0, (PageSlot("existing", 0),), True)
+    widget.set_pages(
+        spread,
+        [
+            ViewerWidget.from_qimage(
+                0,
+                "existing",
+                source,
+                (120, 180),
+                create_pixmap=False,
+            )
+        ],
+    )
+    assert widget.wait_for_rendering()
+    qapp.processEvents()
+    widget.render(QPixmap(widget.size()))
+    assert widget._last_draw_layout
+    old_pixmap = widget._last_draw_layout[0][1]
+
+    widget.set_direct_display_mode(True)
+
+    assert widget.displayed_page_indexes == (0,)
+    assert widget._images[0].qimage is None
+    assert widget._images[0].pixmap is not None
+    assert not widget._images[0].pixmap.isNull()
+    assert widget._images[0].pixmap.cacheKey() == old_pixmap.cacheKey()
+    assert widget._render_cache == {}
+    assert widget._prepared_units == {}
+    assert widget._prepared_requests == {}
+    assert widget._pending_display is None
+
+    widget.resize(500, 300)
+    qapp.processEvents()
+    widget._refresh_current_render()
+
+    assert not widget._resize_render_timer.isActive()
+    assert widget._deferred_render_target is None
+    assert widget._pending_display is None
+    assert widget._render_tasks == set()
+    widget.render(QPixmap(widget.size()))
+    assert widget._last_draw_layout
+    assert widget._last_draw_layout[0][1].cacheKey() == old_pixmap.cacheKey()
+    widget.close()
+
+
+def test_direct_mode_deactivation_restores_production_rendering(
+    qapp: QApplication,
+) -> None:
+    widget = ViewerWidget()
+    widget.resize(320, 240)
+    widget.set_direct_display_mode(True)
+    direct_pixmap = QPixmap(120, 180)
+    direct_pixmap.fill(Qt.GlobalColor.red)
+    widget.commit_display_ready_single(
+        DisplaySpread(0, (PageSlot("direct", 0),), True),
+        0,
+        "direct",
+        (120, 180),
+        direct_pixmap,
+        "direct-token",
+    )
+    direct_paints: list[tuple[int, tuple[str, ...]]] = []
+    widget.framePainted.connect(
+        lambda serial, image_ids: direct_paints.append((serial, image_ids))
+    )
+    widget.render(QPixmap(widget.size()))
+    assert direct_paints == [(1, ("direct",))]
+
+    widget.set_direct_display_mode(False)
+    source = QImage(100, 160, QImage.Format.Format_RGB32)
+    source.fill(Qt.GlobalColor.green)
+    widget.set_pages(
+        DisplaySpread(1, (PageSlot("production", 1),), True),
+        [
+            ViewerWidget.from_qimage(
+                1,
+                "production",
+                source,
+                (100, 160),
+                create_pixmap=False,
+            )
+        ],
+    )
+    assert widget.wait_for_rendering()
+    qapp.processEvents()
+    widget.render(QPixmap(widget.size()))
+
+    assert widget.displayed_page_indexes == (1,)
+    assert widget._images[0].image_id == "production"
+    assert widget._images[0].qimage is not None
+    assert widget._direct_current_frame_serial == 0
+    assert direct_paints == [(1, ("direct",))]
+    assert widget._render_cache
+    widget.close()
+
+
+def test_direct_display_commit_rejects_inactive_or_mismatched_units(
+    qapp: QApplication,
+) -> None:
+    widget = ViewerWidget()
+    pixmap = QPixmap(80, 120)
+    pixmap.fill(Qt.GlobalColor.red)
+    spread = DisplaySpread(2, (PageSlot("page-2", 2),), True)
+
+    with pytest.raises(RuntimeError):
+        widget.commit_display_ready_single(
+            spread,
+            2,
+            "page-2",
+            (80, 120),
+            pixmap,
+            1,
+        )
+
+    widget.set_direct_display_mode(True)
+    with pytest.raises(ValueError):
+        widget.commit_display_ready_single(
+            spread,
+            3,
+            "page-3",
+            (80, 120),
+            pixmap,
+            2,
+        )
+    incomplete_spread = DisplaySpread(
+        2,
+        (PageSlot("page-2", 2), PageSlot("page-3", 3)),
+        False,
+    )
+    with pytest.raises(ValueError):
+        widget.commit_display_ready_frame(
+            incomplete_spread,
+            (
+                ViewerImage(
+                    page_index=2,
+                    image_id="page-2",
+                    pixmap=pixmap,
+                    original_size=(80, 120),
+                    display_prepared=True,
+                ),
+            ),
+            3,
+        )
+    assert widget.displayed_page_indexes == ()
     widget.close()
 
 

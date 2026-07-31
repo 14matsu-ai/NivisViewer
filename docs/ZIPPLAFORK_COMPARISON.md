@@ -18,6 +18,10 @@ commit自体がViewerの単一workerを導入したわけではない。commit�
 `CatalogForm`のthumbnail同時読み込み制限であり、Viewerの
 `bmwLoadEachPage.ThreadCount = 1`はsnapshot内に既に存在する。
 
+2026-07-31に`refs/heads/master`を再照合し、現在HEADも固定revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`と同一Git objectであることを
+確認した。このため、固定snapshot以後に取りこぼしたViewer性能変更はない。
+
 NivisViewerは個人利用専用で、ZipPlaForkのコード、アルゴリズム、処理構造の
 コピー、翻訳、移植を許可している。今回のPython差分にC#の式、pixel loop、
 GDI操作、`BackgroundWorker`実装の逐語的なコピーまたは翻訳はない。一方、
@@ -54,7 +58,7 @@ NivisViewerへ組み込んでいない。固定revisionの`license/AGPL.txt`は
 | 入力受付 | `ViewerForm.cs:1066-1085`, `ViewerForm` constructor; `:15852-15855`, default shortcut table | `PreviewKeyDown`、`KeyboardShortcut`、mouse gestureを接続し、既定のWheelDown/UpをNext/Previousへ割り当てる。 |
 | command dispatch | `ViewerForm.cs:13042`, `getMouseGestureSettingTemplate` | `Command.NextPage` / `PreviousPage`を`moveToNextPage` / `MoveToPreviousPage`へ結び付ける。 |
 | ページ移動要求 | `ViewerForm.cs:12403`, `moveToNextPage`; `:12424`, `MoveToPreviousPage`; `:9279`, `movePageNatural` | `NextPage` / `PreviousPage`が有効な完成済み表示単位を返した場合だけ`currentPage`を変更する。移動不能時は旧currentへ戻す。 |
-| current / 未完成判定 | `ViewerForm.cs:1903`, `NextPage`; `:1951`, `PreviousPage` | 必要な`ResizedImageArray`または`ResizedSizeArray`が未完成なら、通常のnatural navigationは現在位置を返して先へ進まない。 |
+| current / 未完成判定 | `ViewerForm.cs:1903`, `NextPage`; `:1951`, `PreviousPage` | singleでは現在unitがreadyなら次の未完成pageへ1つ進み、そこで後続入力を止める。spreadのprevious等には次unitのsize/ready不足で移動しない分岐がある。ready frontierを越えて最終入力pageへcoalesceする設計ではない。 |
 | 方向管理 | `ViewerForm.cs:5558`, `SetBackgroundMode`; `:5586`, `priorityLevel` | 直前の移動方向を状態として保持しない。常に新しい`currentPage`を中心にpriorityを再計算する。 |
 | current / next / previous priority | `ViewerForm.cs:5586`, `priorityLevel` | level 0=current display unit、level 1=数値上のnext display unit、level 2=数値上のprevious display unit、level 3=その他。逆方向移動中でも数値上のnextがpreviousより先である。 |
 | queue / scheduler | `ViewerForm.Designer.cs:1628-1636`, `bmwLoadEachPage`; `GenerarClasses.cs:247`, `SetWorksOrder`; `:266`, `privateRunWorkerCompletedEventHandler` | Viewer page workerは1 thread。priority permutationを差し替え、現在実行中の1 jobはpreemptせず、完了境界で次の未開始jobを新orderから選ぶ。 |
@@ -65,14 +69,64 @@ NivisViewerへ組み込んでいない。固定revisionの`license/AGPL.txt`は
 | resize / scale | `ViewerForm.cs:5273`, `GetResizedSize`; `:3405-3449`, scaling selection; `BitmapResizer.cs`; `QuickGraphic.cs`; `LongVectorImageResizer.cs` | viewportとbindingからtarget sizeを決め、同じjobでdisplay sizeへresizeする。page schedulerは1 threadだが、pixel resizer内部はparallel pathを使用できる。 |
 | display-ready生成 | `ViewerForm.cs:3177-3550`, `bmwLoadEachPage_DoWork` | decodeからresize/post-filter、`VirtualBitmapEx`生成までをliteralな1 background page jobで完結する。 |
 | publish | `ViewerForm.cs:5451`, `SetNewResizedImage` | 完成した`VirtualBitmapEx`だけを`ResizedImageArray[idx]`へ代入する。admission失敗時はdisposeして`ReworkOrder`する。 |
-| 表示差し替え | `ViewerForm.cs:5371`, `bmwLoadEachPage_EachRunWorkerCompleted`; `:6438`, `showCurrentPage` | current unitの完成結果が公開された後にinvalidateする。normal navigation自体も未完成先へ進まない。 |
-| paint / 暗転回避 | `ViewerForm.cs:6768`, `pbView_Paint`; `:6990`, `pbView_PaintToCanvas` | reusable GDI canvasへdisplay-size artifactを描き、最後にcanvasを表示する。通常移動では未完成先へ切り替えず、無条件のblank clearを挟まない。 |
+| 表示差し替え | `ViewerForm.cs:5371`, `bmwLoadEachPage_EachRunWorkerCompleted`; `:6438`, `showCurrentPage` | singleのcold targetではlogical currentとtrackbarを先に進め、入力直後とworker完成後にinvalidateする。完成後は`ResizedImageArray`へ公開済みのartifactへ差し替える。 |
+| paint / loading frame | `ViewerForm.cs:6748-6756`, `:6768`, `pbView_Paint`; `:6990`, `pbView_PaintToCanvas` | cold target未完成時は空clearせず、再利用canvas上の旧frameをin-placeでhalf-gray化してloading frameとして描く。通常coldはloading paint 1回＋完成paint 1回で、NivisViewerの「旧frameを無加工保持」とは異なる。 |
 | prefetch | `ViewerForm.cs:5558`, `SetBackgroundMode`; `GenerarClasses.BackgroundMultiWorker` | page配列全体をwork setとし、current近傍から遠方へ1 jobずつ進む。memory admission不能時は再work化または必要近傍完成後にpauseする。 |
 | source / display cache | `ViewerForm.cs` fields `PreFilteredImageArray`, `OriginalImageInfoArray`, `ResizedSizeArray`, `ResizedImageArray` | decoded/filter済みsourceとdisplay-ready artifactを別配列で保持するが、同じpage indexとeviction lifecycleに結び付ける。 |
-| memory accounting / eviction | `ViewerForm.cs:5417-5449`, `SetMemoryUBound`; `:5471`, `ReduceUsingMemory` | `usedMemory`がbyte計上するのはdisplay artifact (`VirtualBitmapEx`)。source bytesを加算してはいない。ただしdisplay artifactをevictすると同じpageの`PreFilteredImageArray`とmetadataも同時にdisposeする。priorityの遠い側から破棄し、最低近傍数を保護する。 |
+| memory accounting / eviction | `ViewerForm.cs:3522-3528`, `VirtualBitmapEx`生成; `ImageLoader.cs:1660-1673`, constructor; `ViewerForm.cs:5471-5524`, `ReduceUsingMemory` | `VirtualBitmapEx.DataSizeInBytes`へ原寸`PreFilteredImageArray`相当bytesとresize済みdisplay bytesの双方を加算する。evictionでは同pageのresized bitmap、原寸source、size/infoを同じlifecycleでdisposeする。 |
 | 方向反転 | `ViewerForm.cs:5377-5384`, `SetBackgroundMode` call | travel direction専用のqueue反転はない。新current基準のorder再構築により、旧方向の未開始jobを後方へ送る。実行中の最大1 jobは完了する。 |
 | stale work / source replacement | `ViewerForm.cs:2757-2771`, open path; `:2882-2915`, `Reload` / `clearResizedImageArray`; `GenerarClasses.cs`, `RunWorkerAsyncWithInterrupt` | 新loader/arrayへ切り替える前に旧resized配列をclearし、`waitCancel=true`で旧worker終了を待つ。意味のあるgeneration IDではなく、wait-cancelとobject replacementで隔離する。 |
 | spread protection | `ViewerForm.cs:1903-2002`, `NextPage` / `PreviousPage`; `:5273`, `GetResizedSize`; `priorityLevel` level 0 | current binding内の最大1/2 pageを同じ表示単位としてsize判定し、partnerもlevel 0で優先する。 |
+
+### 2.1 通常color JPEG 1ページの具体的処理列
+
+対象はsingle page、standard fit、identity EXIF、filterなし、
+`ReadOnMemoryMode.None`である。
+
+1. book open時に`File.OpenRead`とarchive readerを各1回だけ作り、
+   全entry metadataを配列化する
+   (`PackedImageLoader.cs:283-330`, `:1197-1244`, `:1341-1445`)。
+2. page jobは`EntryArray[page]`に記録済みのphysical indexから
+   `ZipArchiveEntry.Open()`または`OpenEntryStream()`を1回呼ぶ
+   (`ViewerForm.cs:3192-3203`, `PackedImageLoader.cs:1781-1917`)。
+3. non-seek streamだけ`SeekableStream`とprefix用`MemoryStream`を各1個作る。
+   EXIFを読んだprefixだけbufferし、`StopBuffering`後は元entry streamを
+   decoderが直接読む (`PackedImageLoader.cs:2731-2898`)。
+4. `new System.Drawing.Bitmap(stream)`でJPEGを原寸decodeする。managed層で
+   entry全体の`byte[]`、`MemoryStream`、`ToArray`は作らない
+   (`ImageLoader.cs:2065-2068`)。
+5. orientationが90/270度の時だけ追加Bitmapを1個作る。通常24bpp color
+   JPEGはformat変換せず、grayscale判定を1回行う
+   (`ViewerFormImageFilter.cs:177-220`, `ViewerForm.cs:4321-4485`)。
+6. 原寸sourceを`PreFilteredImageArray[page]`へ保存し、同じworker job内で
+   `GetResizedSize`、resize 1回、任意post-filter、`VirtualBitmapEx`生成まで
+   完了する (`ViewerForm.cs:3279-3528`, `BitmapResizer.cs:42-188`)。
+7. worker completionをUI synchronization contextへ1回marshalし、
+   `ResizedImageArray[page]`へ1回insert、currentなら
+   `showCurrentPage(false)`からinvalidateする
+   (`GenerarClasses.cs:266-287`, `ViewerForm.cs:5371-5468`)。
+8. paintは再利用canvasへfit済みbitmapをscanline copyし、最後に
+   `DrawImageUnscaled`でwindowへ転送する
+   (`ViewerForm.cs:6768-6858`, `:6990-7250`, `:7386-7414`)。
+
+| 処理 | ZipPlaFork full cold | display hit |
+| --- | ---: | ---: |
+| archive再open / reader再生成 / entry全走査 | 0 / 0 / 0 | 0 / 0 / 0 |
+| physical entry参照 / entry stream open / 展開 | 1 / 1 / 1 | 0 / 0 / 0 |
+| entry全体byte copy / byte[] / full MemoryStream | 0 / 0 / 0 | 0 / 0 / 0 |
+| EXIF prefix MemoryStream | 通常1 | 0 |
+| JPEG decoder / decode | 1 / 原寸1 | 0 / 0 |
+| orientation追加Bitmap | identity 0、90/270度時1 | 0 |
+| display resize / resized Bitmap / wrapper | 1 / 1 / 1 | 0 / 既存1 / 既存1 |
+| page worker job / worker→UI callback | 1 / 1 | 0 / 0 |
+| source cache lookup / insert | 1 / 1 | 0 / 0 |
+| display cache insert | UIで1 | 0 |
+| 入力直後 / 完成後invalidate | 1 / 1 | 1 / 0 |
+| 通常paint | loading 1＋完成1 | 1 |
+
+方向反転時は実行中の旧方向jobをpreemptしないため最大1件残り、その結果も
+通常どおりcacheへ入る。worker完了境界で新current中心に全orderをsortし直す。
+個別のqueued worker objectはなく、次に選ばれるjobだけが変わる。
 
 ## 3. NivisViewer Viewer path: end-to-end inventory
 
@@ -101,7 +155,163 @@ NivisViewerへ組み込んでいない。固定revisionの`license/AGPL.txt`は
 | combined memory | `app/viewer_window.py`, `_enforce_combined_cache_budget`; `ImageCache.cache_bytes`; `ViewerWidget.render_cache_bytes` | 設定値をsource cacheとpixmap cacheへ別々に満額付与せず、両者のresident byte合計へ1つの上限を適用する。巨大なcurrent spreadの保護によりbest-effortで超過し得る。 |
 | spread protection | `PageModel.spread_at`; `ViewerWidget.prepare_display_units`, `_protected_prepared_units`; `ImageCache._protected_indexes` | current spread partnerをcurrent相当でdecodeし、prepared cacheはcurrent、直近両側、active paced unitをdisplay-unit単位で保護する。partial spreadをatomic表示しない。 |
 
-## 4. Structural comparison and adoption decision
+### 3.1 `d19554a` production cold pathの実数
+
+前回のpaced scheduler移植後も、通常JPEG cold missのcritical pathには次の
+二段構造が残っていた。
+
+```text
+16 ms decode-demand timer
+  -> _ImageLoadTask
+     -> ZipExtFile read -> preallocated BytesIO
+     -> BytesIO.getvalue
+     -> Pillow header/EXIF parser
+     -> QByteArray -> QBuffer -> QImageReader target decode
+  -> queued ImageCache._on_loaded
+     -> source cache insert -> pageLoaded
+  -> ViewerWindow._on_cache_page_loaded
+     -> combined budget -> _render_spread
+  -> ViewerRenderTask（通常target一致なので実resize 0回）
+  -> queued ViewerWidget._on_render_completed
+     -> QPixmap.fromImage -> render cache insert
+     -> atomic commit -> update -> paint
+```
+
+single通常経路の`focused_index`参照はinput handler内6回、cold完了時に
+さらに3回である。ただし`PageModel.focused_index`のcurrent identity一致
+fast pathが成立するため、この条件では`index_for_identity`、
+`list_images`、entry全走査はすべて0回であり、大ZIPの線形要因ではない。
+
+| 項目 | prepared hit | source hit / prepared miss | full cold (`d19554a`) |
+| --- | ---: | ---: | ---: |
+| 固定idle待ち | 0 ms | 約16 ms | 約16 ms |
+| Viewer worker task | 0 | render 1 | decode 1＋render 1 |
+| cross-thread queued callback | 0 | 1 | 2 |
+| ZIP entry open / 展開 | 0 / 0 | 0 / 0 | 1 / 1 |
+| entry payload materialization | 0 | 0 | entry `BytesIO`＋Pillow `BytesIO`＋Qt `QByteArray` |
+| JPEG parser / pixel decoder | 0 / 0 | 0 / 0 | Pillow 1 / QImageReader 1 |
+| post-decode scale | 0 | 通常0 | 通常0 |
+| `QPixmap.fromImage` | 0 | 1 | 1 |
+| source cache lookup / insert | 2 / 0 | 2 / 0 | 3 / 1 |
+| render cache lookup / insert | 2 / 0 | 3 / 1 | 3 / 1 |
+| combined budget enforcement | 0 | 1 | 2 |
+| slider / status更新 | 1 / 1 | 1 / 1 | 2 / 2 |
+| `_sync_actions` / QAction setter | 2 / 約80 | 2 / 約80 | 3 / 約120 |
+| nominal fit layout / DPR参照 | 3 / 2 | 6 / 6 | 7 / 7 |
+| 実windowでのDWM attribute設定 | 2 | 2 | 2 |
+
+`BytesIO.getvalue()`やQt implicit sharingがcopyを省略する場合はあるが、
+source code上はchunk群からentry buffer、Pillow header buffer、Qt byte arrayの
+最大3 payload相当の境界がある。加えて、通常portraitではresizeしない
+`ViewerRenderTask`がworker切替と2つ目のqueued callbackだけを発生させていた。
+
+### 3.2 production-only bottleneck
+
+既存offscreen benchmarkはWindowをshowせず、BrowserWindow /
+BrowserThumbnailProviderも接続しない。そのため次の実機処理を測っていなかった。
+
+- `ViewerWindow._refresh_view`が毎ページ
+  `FullscreenChromeController.reevaluate_visibility`を同期呼出しし、visible
+  Windows windowでは`winId()`と`DwmSetWindowAttribute`を2回実行していた。
+  fullscreen state、native handle、paletteが変わらないページ移動には不要である。
+- cold currentで`begin_viewer_interactive`がBrowser thumbnail pending全件を
+  lock内走査・cancelし、paint内の`contentPainted`から即resumeして30 ms後に
+  Browser decodeを再開していた。次のpage decodeとCPU／memory bandwidthが
+  競合し得る。
+- benchmarkは`window.next_page()`を直接呼ぶため、wheel event、
+  `nextRequested`、`next_page_or_scroll`、旧frame fit layout 1回を含まない。
+- offscreen raster pixmapにはvisible backing store、Windows compositor、
+  real screen DPR、native QPixmap upload、vsync presentationがない。
+
+この差により、前回のscheduler変更はprefetch orderを改善しても、実機の
+DWM call、Browser pause/resume cascade、16 ms gate、payload materialization、
+二段worker、QPixmap uploadを残したままであり、体感差が小さかったと説明できる。
+
+### 3.3 `ZipPlaCompatibleRasterPath`
+
+2026-07-31の変更では、次の限定条件を満たす通常経路を新しいproduction
+dispatcherとして採用した。
+
+- `ZipImageSource`のZIP/CBZ
+- JPEG entry
+- single page
+- `fit_window`または`fit_no_upscale`
+- standard resampling、rotation 0、画像調整なし
+- wide splitなし、magnifier機能OFF、page list設定OFF
+
+呼び出し列は次のとおり。
+
+```text
+ViewerWindow._refresh_view
+  -> strict eligibility / request ID / book generation
+  -> ImageCache.suspend_raster_work（A→B切替時の1回だけ）
+  -> ZipPlaCompatibleRasterPath.request
+  -> _ZipPlaCompatibleRasterJob（同時最大1件）
+     -> ZipImageSource.open_compatible_jpeg_at_most
+        -> ZipFile.NameToInfo O(1)
+        -> ZipExtFile 1回
+        -> 1 MiB chunkをreserved QByteArrayへ格納
+        -> seekable QBuffer
+        -> QImageReader.size/transformation（C++側）
+        -> setAutoTransform + setScaledSize + read
+  -> queued GUI callback 1回
+     -> stale source/epoch/request/layout照合
+     -> QPixmap.fromImage 1回
+     -> path-local QPixmap ring insert
+     -> ViewerWidget.commit_display_ready_single
+        -> QPixmap-only atomic swap -> update 1回
+  -> paintEvent -> frame serial acknowledgement
+```
+
+この経路は`ImageCache` source cache、`CachedImage`、`ViewerRenderTask`、
+render cache、prepared-unit cache、combined-cache enforcementを通らない。
+QImageはworker resultから唯一のGUI callbackへownershipを渡し、
+QPixmap化後に保持しない。current／numeric next／numeric previousの最大3枚だけを
+QPixmap ringへ保持する。cache hitはworker 0、queued callback 0、
+QPixmap生成0で同じartifactをcommitする。
+
+direction reversalでは、新currentと同じactive jobだけrequest IDをadoptする。
+それ以外のactive jobはcancelし、未開始なら`tryTake`する。controller自身は
+先行queued jobを作らないため、旧方向queued jobは0件である。running
+ZipExtFile readは1 MiB chunk境界でcancelされ、decoder内部から戻った古い結果も
+QPixmap化前にrejectする。
+
+直接移植・対応箇所:
+
+| ZipPlaFork由来の処理 | 移植元 | NivisViewer側 |
+| --- | --- | --- |
+| persistent archive/index、entryをpage jobが一度だけ取得してdecoderへ渡す | `PackedImageLoader.cs:283-330`, `:1781-1917` | `app/image_source.py`, `_read_entry_qbytearray`, `ZipImageSource.open_compatible_jpeg_at_most` |
+| entry→decode→display-readyを1 page jobで完結 | `ViewerForm.cs:3177-3550`, `bmwLoadEachPage_DoWork` | `app/zippla_compatible_raster_path.py`, `_ZipPlaCompatibleRasterJob.run` |
+| current→next→previousを1件ずつdispatch | `ViewerForm.cs:5558-5605`, `SetBackgroundMode` / `priorityLevel` | `ZipPlaCompatibleRasterPath.request`, `_drive` |
+| completion 1回でdisplay artifact公開 | `GenerarClasses.cs:266-287`, `ViewerForm.cs:5371-5468` | `ZipPlaCompatibleRasterPath._on_job_completed`, `ViewerWidget.commit_display_ready_single` |
+| page単位の近傍artifact保持 | `PreFilteredImageArray`, `ResizedImageArray` | path-local最大3枚QPixmap ring。対応外機能は従来Aへfallback |
+
+Qt/Python差として、ZipPlaForkのC#/native streamに最も近いPython製sequential
+`QIODevice`はQt JPEG pluginから約1,985回/pageの`readData` callbackを発生
+させ、高詳細JPEGのworker decodeが旧buffered 241.86 msに対して270.44 msに
+なった。そのためproduction新Bはentryを一つのreserved `QByteArray`へ
+materializeし、seekable `QBuffer`から`QImageReader`へ渡す。`BytesIO`、
+`getvalue()`、Pillow header parserは通らず、Python decoder callbackもない。
+ZipPlaForkは原寸source＋resized artifactを保持するのに対し、この限定pathは
+display QPixmapだけを保持し、magnifier、非standard、page list等は従来
+pipelineへ戻す。
+
+付随するproduction変更:
+
+- page refreshから不変なDWM attribute再適用を撤去した。
+- compatible cache hitではBrowser laneをpauseしない。
+- cold frame paint後のBrowser resumeに500 ms graceを設け、連続入力中の
+  thumbnail全queue pause/resumeを避ける。
+- compatible commitでslider/statusを各1回だけ更新し、page navigation時は
+  history action 2件だけ更新する。full QAction同期とpage-list scanは通らない。
+- active ZIP decode中の`ZipImageSource.close()`はUI threadでlock待ちせず、
+  cancelを設定してreturnし、最後のrequest終了時にpersistent ZipFileを閉じる。
+
+## 4. Historical legacy-pipeline comparison
+
+次表は`ZipPlaCompatibleRasterPath`採用前の旧Aに対する判断であり、対象条件を
+満たすZIP/JPEG production経路の最終判断ではない。旧Aがfallbackとして残る
+理由と、前回paced dispatcherが実機体感を十分変えなかった差分を保存する。
 
 | 項目 | ZipPlaForkの実装 | NivisViewerの実装 | どちらが優れているか | 理由 | 取り込み方針 |
 | --- | --- | --- | --- | --- | --- |
@@ -122,6 +332,23 @@ NivisViewerへ組み込んでいない。固定revisionの`license/AGPL.txt`は
 | QPixmap / paint | GDI `VirtualBitmapEx`とreusable bitmap canvas | worker `QImage`、GUI-thread one-time `QPixmap.fromImage`、cached paint | NivisViewer | QtのGUI resource境界を守りつつnavigation時変換を避ける | 維持 |
 | Browser contention | Viewer比較対象内にNivis相当のapplication-wide lane制御なし | current cold中はBrowser laneをpause、paint/fallbackでrelease | NivisViewer | Viewerを他画面のdecode競合から保護する | 維持 |
 
+### 4.1 Final comparison for eligible ZIP/JPEG
+
+| 項目 | ZipPlaForkの実装 | NivisViewerの実装 | どちらが優れているか | 理由 | 取り込み方針（維持 / 部分移植 / 構造移植 / 全置換） |
+| --- | --- | --- | --- | --- | --- |
+| decode pipeline | persistent entry streamからnative decoderへ渡し、同じpage jobでorientation、resize、display bitmapまで作る | 新Bはentryを一つのreserved `QByteArray`へ読み、seekable `QBuffer` / `QImageReader`でdecoder scaleし、同じjobでdisplay-ready `QImage`まで作る | native streamはZipPlaFork、Qt/Python上の実測は新B構成 | Python sequential streamは約1,985 callback/pageで旧Aより遅かった。QByteArray版は1 materializationを許容してcallbackをC++内へ戻す | 構造移植 |
+| scheduler / queue | page worker 1、completion 1、完了境界でpriority orderを再評価 | `_ZipPlaCompatibleRasterJob`最大1、completion 1、先行queueを作らない | 同等、新Bはstale境界が強い | cold currentは旧A 2 task / 2 callback、新B 1 / 1 | 全置換 |
+| priority制御 | current → numeric next → numeric previous | current完成・matching paint後に移動方向側 → 反対側 | 新B | current paintまで近傍I/O/decodeを開始しない | 構造移植 |
+| direction reversal handling | 実行中1件の終了後、新current中心にwork orderを再構築 | 未開始jobを`tryTake`、running jobへcancel、request/source/layout serialで結果棄却 | 新B | 反転coldは旧A 3 task / 3 callback、新B 2 / 2。stale commit 0 | 構造移植 |
+| cache structure | original bitmap配列とresized bitmap配列をpage lifecycleで管理 | eligible pathは最大3 display-ready QPixmap ringだけ。source/prepared/render cacheを通らない | 新B | 常設logical cache 121.46→30.36 MiB、7→3 page | 全置換 |
+| eviction policy | current周辺を保護し、遠方pageのsource/displayをdispose | current、next、previous以外をpruneし、source/epoch/layout/DPR key違いを残さない | 新B | 古い仕様entryと多層cache間の寿命差を除去 | 全置換 |
+| prefetch policy | current完成後、浅い近傍をsingle workerで処理 | matching `framePainted`後だけ最大2近傍。rapid inputは6 ms idle graceで最終currentへcoalesce | 新B | rapid-finalのcommit前通過page decode 0。paint後page 19 / 17は別phase | 構造移植 |
+| display apply timing | 完成bitmapだけをUI completionで差し替える | GUI callbackでQPixmapを1回作り、`commit_display_ready_single`でatomic swap | 同等、新Bはserial確認が強い | 未完成QImageやplaceholderをViewerへ公開しない | 構造移植 |
+| dark-frame avoidance | reusable canvasの旧frameを残しloading maskを描く | 完成済み旧QPixmapを無加工保持し、新frame完成後だけswap | 新B（Qt上） | blocking probe中`clear()` 0、commit 0、旧frame保持 | 構造移植 |
+| cold miss behavior | entry open→decode→resize→displayを1 jobで完了 | 1 entry、1 materialization、1 QImage、1 QPixmap、1 task、1 callback、1 paint | 新B | fresh-process順送り255.481 ms、反転268.689 ms、往復中央値262.848 ms、rapid270.425 msで旧Aより2.47–8.21%短い | 全置換 |
+| memory use | originalとresizedを保持する | task-local compressed QByteArray/QImage、常設最大3 QPixmap | 新B | viewer working-set delta 195.63→65.02 MiB（-66.76%） | 全置換 |
+| large ZIP behavior | archive readerとentry indexをbook中保持、entryごとにstreamを開く | persistent `ZipFile`とO(1) indexを保持し、対象entryだけ32 x 1 MiB read | 同等のindex、pipelineは新B | 682,441,432-byte、日本語名21 entryの同一SHA-256 ZIPで完走 | 構造移植 |
+
 ## 5. Fixed-revision port map
 
 以下はすべてrevision
@@ -136,13 +363,27 @@ AGPL-3.0-or-later由来である。
 | `ViewerForm.cs:5451`, `SetNewResizedImage`; `:5471`, `ReduceUsingMemory` | 完成artifactだけをpublishし、遠方pageをmemory policyで破棄 | `app/viewer_widget.py`, `_on_render_completed`, `_commit_pending_display`, `_commit_display`; `app/image_cache.py`, `_enforce_limit`, `retain_visible_only`; `app/viewer_window.py`, `_clear_raster_prefetch_pipeline`, `_enforce_combined_cache_budget` | algorithm/structure移植。upstreamはdisplay bytesだけを計上しsourceを同時evict、Nivisはsource+pixmap双方を計上し、active unitの一時source保護をterminal時に解除する。 |
 | `ViewerForm.cs:6438`, `showCurrentPage`; `:6768`, `pbView_Paint`; `:6990`, `pbView_PaintToCanvas` | 完成frameのatomicな表示とblank frame回避 | `app/viewer_widget.py`, `_commit_display`, `paintEvent`; `app/viewer_window.py`, `_on_viewer_content_painted` | 処理構造移植。GDI canvas、`LockBits`、`CopyMemory`は未コピー。 |
 | `ViewerForm.cs:1903`, `NextPage`; `:1951`, `PreviousPage`; `:9279`, `movePageNatural` | 未完成表示単位へnormal currentを進めない | 現在は完全移植なし。`ViewerWidget`がold visual frameを維持する一方、`PageModel`はtargetへ進む | 差分として意図的に記録。stateとvisualを同時commitする場合は追加の構造移植候補。 |
-| `PackedImageLoader.cs:1781`, `OpenImageStream`; `:1856`, `OpenInnerImageStream` | entry単位の読み出しとdecodeへの受け渡し | `app/image_source.py`, `ZipImageSource._read_entry_stream`, `open_qimage_at_most` | 現在は独立実装。Nivisはfull entry bufferを作るため、direct stream構造は未移植。 |
+| `PackedImageLoader.cs:1781`, `OpenImageStream`; `:1856`, `OpenInnerImageStream` | entry単位の読み出しownershipと同じpage jobのdecoderへの受け渡し | `app/image_source.py`, `ZipImageSource._read_entry_qbytearray`, `open_compatible_jpeg_at_most`; `app/zippla_compatible_raster_path.py`, `_ZipPlaCompatibleRasterJob.run` | 構造移植。C# native streamはPython callback costのため直訳せず、一つのQByteArray/QBufferへ適応した。 |
+| `ViewerForm.cs:3177-3550`, `bmwLoadEachPage_DoWork`; `:5371-5468`, completion | eligible JPEGでentry取得からdisplay-ready artifactまでをliteralな1 jobと1 UI completionで処理 | `app/zippla_compatible_raster_path.py`, `_ZipPlaCompatibleRasterJob.run`, `_on_job_completed`; `app/viewer_widget.py`, `commit_display_ready_single` | class / processing structure移植。Qt GUI resource規則によりQPixmap化だけGUI threadで行う。 |
+| `ViewerForm.cs:5558-5605`, `SetBackgroundMode`; `GenerarClasses.cs:247-287` | current完成後に近傍を一件ずつ選び、完了境界で最新orderへ戻る | `ZipPlaCompatibleRasterPath.request`, `release_prefetch`, `_drive`; `ViewerWindow._on_compatible_raster_frame_painted` | 構造移植。新Bは方向側優先、6 ms rapid coalescing、request/source/layout serialを追加。 |
 | `ViewerForm.cs:2757-2771`, open; `:2882-2915`, reload; `GenerarClasses.cs`, `RunWorkerAsyncWithInterrupt` | 古いworkを新sourceへ混入させない | `app/image_cache.py`, `generation`, `_on_loaded`; `app/viewer_window.py`, request ID / `ViewerDisplayUnit`; `app/viewer_widget.py`, render generations | 目的を独立実装。Nivisのgeneration方式を維持。 |
 
 ## 6. Removed, replaced, and deliberately retained structures
 
-今回、production Viewer pathでは次を置換した。
+今回、eligible ZIP/JPEG production pathでは次をさらに置換した。以下の
+旧paced pipelineは非対応条件とfailure fallbackには残るが、新Bのcritical
+pathには入らない。
 
+- `_ImageLoadTask` → GUI load callback → `ViewerRenderTask` → GUI render
+  callbackを、`_ZipPlaCompatibleRasterJob` → GUI frame callbackへ置換した。
+- `BytesIO` → Pillow header parse → `QByteArray` handoffを、reserved
+  `QByteArray` → seekable `QBuffer`へ置換した。
+- source cache、prepared-unit cache、render cache、combined budget lookupを
+  eligible current pathから撤去し、最大3件artifact ringへ置換した。
+- current result callback直後にprefetchを開始する方式を、matching
+  `framePainted`後に解放する方式へ置換した。
+- 高速入力中の各cold requestを即時worker投入する方式を、古いworkをcancel後、
+  6 ms idle graceで最新requestだけをsubmitする方式へ置換した。
 - decode用poolとrender用poolを別々に同時進行させる経路を、共通の
   1-worker Viewer laneへ置換した。
 - 全prefetch unitを先にqueueへ積む経路を、1 display unitだけadmitし、
@@ -156,7 +397,7 @@ AGPL-3.0-or-later由来である。
 - 最後にadmitした遠方sourceがpipeline完了後もprotectedに残る方式を、
   terminal時にcurrent visibleだけへsource保護を戻す方式へ置換した。
 
-次は撤去していない。
+次はfallbackと非対応機能のため撤去していない。
 
 - `ImageCache`のdecoded/decoder-sized `QImage` cache
 - `ViewerWidget`のdisplay-ready `QPixmap` cacheとprepared-unit metadata
@@ -165,13 +406,16 @@ AGPL-3.0-or-later由来である。
 - coordinatorを注入しないtest/fake用のlocal one-worker fallback pools
 - Pillow/PySide6/PDFiumに適合した既存decode/render実装
 
-したがって、今回の実装を「ZipPlaForkの1 jobをそのまま移植した」とは表現しない。
-正確には、二段taskを維持したまま、1 unitがdisplay-ready terminalになるまで
-次unitをadmitしないpaced single-lane processing structureを移植した。
+eligible ZIP/JPEG新Bはliteralな1 page QRunnableと1 GUI completionへ
+置換した。ただしC#／GDI+コードの逐語コピーではなく、archive/worker ownership、
+work order、completion/publish順をPySide6へ構造移植したものである。
+旧Aの二段taskはpage list、magnifier、rotation、non-standard、非JPEG、
+decoder failureのfallbackとして残る。
 
-## 7. Current ready/cold measurement status
+## 7. Historical legacy-A ready/cold measurement status
 
-次表は最新のpaced single-lane、共通priority、combined cache実装を対象とする。
+次表はcompatible新B採用前のpaced single-lane、共通priority、combined
+cache実装を対象とする旧A baselineである。
 `QT_QPA_PLATFORM=offscreen`で、21 entry、4096 x 6500 JPEG、3840 x 2106
 Viewer、日本語名を含む15,313,338 byteの一時ZIPを使った。JPEGは生成時間を
 抑えるため最大8種類の画素内容をentry名を変えて再利用した。実アプリ、
@@ -201,6 +445,46 @@ forced-cold 4種には同じ計測方法の変更前値がないため、上表�
 とし、異なる旧cold計測と直接比較しない。
 
 offscreen結果は構造回帰の証拠であり、最終判断は同一実ZIPを用いた実機体感とする。
+
+### 7.1 Final fresh-process A/B after compatible adoption
+
+2026-07-31の最終runはA/B別fresh process、21 entry、4096 x 6500高詳細JPEG、
+3840 x 2106 Viewer、682,441,432-byte ZIPで実行した。A/BのZIP SHA-256は
+`7bf798a4eee4a895c56d6e2a3415aa1a6ab47e4228d41d0118d24a39124e35f1`
+で一致する。
+
+| Scenario | 旧A request→paint | 新B request→paint | B差 |
+| --- | ---: | ---: | ---: |
+| 完全cold初回 | 270.349 ms | 266.759 ms | -1.33% |
+| ready順送り | 6.216 ms | 7.629 ms | +1.413 ms |
+| ready逆方向 | 5.107 ms | 6.939 ms | +1.832 ms |
+| ready往復 median | 5.394 ms | 6.312 ms | +0.918 ms |
+| 順送りcold | 278.333 ms | 255.481 ms | -8.21% |
+| 反転直後cold | 275.505 ms | 268.689 ms | -2.47% |
+| 往復cold median / max | 277.500 / 279.248 ms | 262.848 / 278.292 ms | median -5.28% |
+| rapid-final cold | 287.891 ms | 270.425 ms | -6.07% |
+
+1 cold pageのcurrent-critical処理は、旧Aが1 entry / 1 `BytesIO` /
+3 whole-payload API handoff / 1 QImage / 1 QPixmap / 2 task /
+2 GUI callback / 1 paint、新Bが1 entry / 1 `QByteArray` /
+0追加whole-payload handoff / 1 QImage / 1 QPixmap / 1 task /
+1 GUI callback / 1 paintだった。順送りdecode終了→paintは8.462→5.823 ms。
+新Bはpaint後に近傍を読むため、順送りの総計には別phaseの1 entry、
+rapid-finalにはpage 19 / 17の2 entryが加わる。通過page 11–17の
+最終commit前decodeは0である。
+
+memory-pressureでは旧Aがbaseline 349.07 MiB、sampled max 544.70 MiB、
+delta 195.63 MiB、logical cache 121.46 MiB / 7 page、新Bが
+175.90 MiB、240.92 MiB、65.02 MiB、30.36 MiB / 3 pageだった。
+process peakにはZIP/JPEG生成やQt allocator high-waterも含まれるため、
+viewer baselineからのsampled deltaをA/B判断に使った。
+
+単発ready hitの新Bはworker/QImage/QPixmap生成0、atomic commit 1、paint 1で
+ある。ready往復では直前paint後prefetchのcancel完了callbackが3回だけcurrent
+intervalへ重なったが、ZIP read、materialization、QImage/QPixmap生成は0だった。
+0.918–1.832 msの差はdirect-frame request/serial検証、paint acknowledgement、
+prefetch cancel bookkeepingの固定費で、coldの支配点ではない。offscreen
+timingだけで実機体感を断定しない。
 
 同じ行列でdecoder-sized JPEGを意図的に無効化した`--full-decode`診断も
 完走した。これは標準JPEG表示経路ではなく、full rasterを必要とする形式・条件の
@@ -448,15 +732,20 @@ left outside this page-navigation change:
   ready. The old complete frame prevents darkness, but slider/status and image
   can temporarily refer to different pages. Matching ZipPlaFork exactly would
   require pending navigation state and an atomic model+visual commit.
-- Raster ZIP decode still materializes a complete uncompressed entry in
-  `BytesIO` before decoder input. Direct entry-stream decode remains a possible
-  cold-miss optimization after cancellation and Windows lifetime contracts are
-  preserved.
-- The paced dispatcher retains a Qt queued-signal boundary between decode and
-  render instead of one literal runnable. Its remaining dispatch/GUI conversion
-  cost is included in the current 53.336–60.200 ms target-decode forced-cold
-  paint results.
-  Whether it remains perceptible must still be decided on the real device.
+- Eligible ZIP/JPEG新Bはcomplete entryを一つのreserved `QByteArray`へ
+  materializeする。Python sequential `QIODevice`直結はfull payloadを
+  避けられるが、約1,985 callback/pageにより高詳細decodeが遅くなったため
+  production採用しなかった。将来native extension、Qt private archive device、
+  または別native decoderを検討する場合はライセンスと実測が必要である。
+- Eligible新Bはliteral 1 runnableになったが、Qt規則上QPixmap生成とatomic
+  commitには1 queued GUI callbackが必要である。順送りのdecode終了→paintは
+  5.823 msで、ここにはQPixmap、commit、offscreen paintが含まれる。
+- ready hitは旧Aより0.918–1.832 ms遅い。worker/QImage/QPixmap生成は0である。
+  単発hitではqueued worker callbackも0だが、ready往復では直前paint後prefetchの
+  cancel完了callbackが3回だけ重なった。差はdirect-frame request/serial
+  validation、paint acknowledgement、prefetch cancel bookkeepingの固定費で
+  ある。cold改善と引き換えに許容したが、実機入力で悪化が見える場合はhit専用の
+  synchronous commitとready往復時のprefetch抑制をさらに短縮する候補が残る。
 - If a source-sized standard render is still running when zoom changes again,
   the stale generation is rejected correctly but the latest generation may
   repeat that one preparation. Completed source-sized artifacts are reused.
@@ -464,8 +753,409 @@ left outside this page-navigation change:
   perform a large-image Smooth scale on the GUI thread. It is independent of
   the normal hidden page-list navigation path and should be moved to a worker
   in a separate change.
-- The 128 MiB resident-cache pressure run measured 121.47 MiB of counted
-  source-plus-pixmap artifacts, but the sampled process working-set delta was
-  146.04 MiB. Task-local images, Qt allocations, decoder buffers, and the
-  generated ZIP are outside the resident-cache accounting, so the setting is
-  not a hard process-memory limit.
+- 新Bのlogical artifactは30.36 MiB / 3 pageだが、fresh-process
+  working-set deltaは65.02 MiBだった。task-local compressed QByteArray、
+  QImage、Qt allocations、decoder bufferは常設artifact accounting外なので、
+  設定値はhard process-memory limitではない。
+
+## 11. Viewer-wide subsystem comparison and replacement decision
+
+This section supersedes the earlier assumption that the narrow
+`ZipPlaCompatibleRasterPath` could become the final Viewer architecture by
+being extended one option at a time.  The comparison was performed before the
+next implementation step and covers the complete path from book ownership to
+paint and shutdown.
+
+The ZipPlaFork reference remains commit
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b` under AGPL-3.0-or-later.  The main
+reference points are `PackedImageLoader.cs` (`PackedImageLoader` construction,
+entry table, `OpenImageStream`, `Dispose`), `GenerarClasses.cs`
+(`BackgroundMultiWorker.SetWorksOrder`, completion and interrupt handling), and
+`ViewerForm.cs` (`bmwLoadEachPage_DoWork`, `priorityLevel`,
+`SetNewResizedImage`, `ReduceUsingMemory`, `showCurrentPage`, and
+`pbView_Paint`).  The attribution and license notice in sections 1 and 5 and
+`THIRD_PARTY_NOTICES.md` apply to the structural port selected below.
+
+### 11.1 Ten-subsystem comparison
+
+| Subsystem | ZipPlaFork design | Current NivisViewer design | NivisViewer problem | Benefit of the ZipPlaFork structure | Port difficulty | Effect on NivisViewer-specific features | Decision |
+|---|---|---|---|---|---|---|---|
+| 1. Archive management | `PackedImageLoader` opens the book once, retains one archive/entry table, opens only the requested entry stream, and disposes the archive after the viewer worker has stopped. | `BookSession` owns an `ImageSource`; `ZipImageSource` already retains one `ZipFile`, cached entry names, request-local cancellation, deferred close, and retired-source lifetime.  It also exposes legacy `BytesIO`, compatible `QByteArray`, and experimental sequential-device decode entry points. | The persistent ZIP lifetime is sound, but ownership and cancellation knowledge are split between `BookSession`, `ImageCache`, `ZipPlaCompatibleRasterPath`, and the source.  Three decode-facing APIs permit three page lifecycles. | One book owner and one entry-open contract make close, cancellation, and reuse explicit and prevent two viewer consumers from decoding the same entry. | Medium-high | Folder, external RAR/7z, PDF, asynchronous open, Windows sharing, and Japanese names require adapters. | **Structural port.** Retain the persistent-handle/deferred-close behavior, but put it behind the new book runtime/page-source contract. |
+| 2. Page state | `currentPage` advances only through navigation rules that consult the ready/known-size frontier; the accepted current page, trackbar, and shown image are updated by one Viewer form. | Logical current is `PageModel`; requested state is `ViewerWindow._active_request_id` plus `ViewerDisplayUnit`; displayed state is `ViewerWidget._spread/_images`; the compatible path has another current request/frame serial. | Logical page and related UI can advance while the old visual frame remains.  Legacy and compatible paths commit slider/status at different times, and rapid input has no single authoritative requested/displayed state. | A single presentation transaction prevents logical/visual disagreement and gives reversal and stale-result rejection one owner. | High | Spread, lazy wide-page discovery, history, bookmarks, slideshow, slider and reading progress must keep their semantics. | **Full replacement** by an explicit requested/displayed presentation state after the page runtime cutover. |
+| 3. Image-load pipeline | One `bmwLoadEachPage_DoWork` page job performs entry open, decode, EXIF/filter work, target resize, and creation of the display artifact before one completion is published. | Legacy path is `_ImageLoadTask` to source `QImage`, then a second `ViewerRenderTask` to resize/rotate/filter, then prepared/pixmap publication.  The compatible path is a second end-to-end pipeline limited to ZIP/JPEG/single/standard/fit/no rotation/no adjustments/no page list/no magnifier. | Feature options switch the whole pipeline.  Source and display work have separate callbacks, schedulers, caches, failure rules, and generations; the narrow fast path is a bolt-on rather than the Viewer. | A page/display-slot job has one critical path and one result.  Decoder fallback stays inside the job instead of returning to another Viewer architecture. | High | All raster formats, spread slots, split/crop, rotation, resampling, image adjustments, manual zoom, DPI and magnifier must be expressible in a render specification. | **Full replacement** for ZIP books by one runtime-owned entry-to-display-ready job. |
+| 4. Asynchronous processing | `BackgroundMultiWorker` uses one Viewer worker. `SetWorksOrder` replaces the page permutation; after a completion the worker chooses the first unstarted item in the latest order.  Book replacement uses interrupt/wait cancellation. | The production coordinator normally supplies one Viewer lane, but `ViewerWindow`, `ImageCache`, `ViewerWidget`, and the compatible path each own queue or pending-job state.  Without the coordinator, decode and scale can use separate one-thread pools. | One physical lane does not make one scheduler: obsolete running render work cannot be preempted, generations are duplicated, and shutdown must drain several owners. | One active page job and a replaceable work order bound obsolete work to the currently running decoder and make current/next/previous ordering observable. | High | Browser must retain a separate lane; PDF priorities and injected test pools need adapters. | **Structural port / Viewer scheduler full replacement.** Keep Nivis generation validation and Qt thread-affinity rules. |
+| 5. Prefetch | `priorityLevel` orders the current display unit first, numeric next second, previous third, then remaining pages; a changed current recomputes the order.  Memory admission can stop/rework the frontier. | Window raster plan, `ImageCache` wanted/protected/ranks, Widget prepared-unit requests, compatible-path neighbors, and multiple idle/paint timers all plan related work. | Four planners must agree. Direction reversal can leave a running legacy decode or render, and cache admission/prefetch release are owned by different objects. | A replaceable work order provides one current -> forward neighbor -> reverse neighbor policy and stops remote work when the page-artifact budget is full. | High | Spread partner is part of level 0; configurable direction and PDF rolling behavior remain policy inputs. | **Full replacement** inside the new runtime. |
+| 6. Cache and memory | Page-indexed source information and `VirtualBitmapEx` display artifacts share a lifecycle and one memory reduction order. `ReduceUsingMemory` evicts farthest pages using the current work order. | `ImageCache` stores source `QImage`; `ViewerWidget` stores render `QPixmap`, last-rendered aliases, and prepared-unit state; the compatible path stores a separate three-pixmap ring. A Window loop tries to rebalance independent budgets. | The same page can have several unrelated lifetimes and ledgers. Entering/leaving the compatible mode discards one cache and warms the other. The compatible three-page cap is not a byte budget. | A page record with source/display components, one byte ledger, and current/spread/next/previous protection makes eviction and reversal reuse coherent. | High | Magnifier may require a full source artifact; one unusually large visible spread may intentionally exceed the budget. | **Full replacement** by a runtime-owned page artifact cache; preserve explicit visible-unit protection. |
+| 7. Display update | `SetNewResizedImage` publishes a completed result and `showCurrentPage` paints it. During a cold load ZipPlaFork grays the preceding canvas rather than clearing it. | Legacy `ViewerWidget` waits for all spread slots to become terminal and atomically swaps them; direct mode also commits one completed pixmap while the old frame remains. Paint acknowledgement releases prefetch/browser work. | Atomic old-frame retention is good, but direct-versus-legacy guards permeate the Widget, while slider/status/page-list selection are committed separately. | One `commit_frame` boundary can keep NivisViewer's superior old-frame retention while removing path-specific Widget modes and synchronizing UI state. | Medium | Pan, zoom, magnifier interaction, gestures, fullscreen chrome and error placeholders remain surface behavior. | **Structural port**, not a literal visual copy. Retain Nivis atomic old-frame behavior and replace the two publication modes with one frame contract. |
+| 8. Page list and thumbnails | The Viewer launches catalog viewing separately rather than sharing its in-window loader/cache. `CatalogForm` owns a distinct loader and a globally one-at-a-time thumbnail task; `ThumbViewer.PaintPart` requests only visible rows plus a small margin and clears images outside it. | The Viewer eagerly builds all `QListWidgetItem` rows. It consumes Viewer `ImageCache` results, linearly finds the row, then smooth-scales a large `QImage` and creates `QIcon` on the GUI thread. Merely showing the dock disables the compatible path. Browser thumbnails have a better dedicated lane/cache. | Thumbnail work competes with or changes the Viewer pipeline and can block the GUI. There is no visible-row scheduler for the Viewer page list. | A separate visible-range thumbnail session cannot invalidate or select the main Viewer runtime and can be paused while a cold current page is outstanding. | Medium | Filtering, current selection, bookmark decoration, thumbnail size/DPI, and click navigation remain. | **Full replacement** of the Viewer page-list thumbnail subsystem; retain Browser's independent visible-range/disk-cache design. |
+| 9. Display features | Single/spread, binding direction, divided pages, filters, magnifier, rotation and fullscreen are integrated around the same loader/work-order/page arrays rather than choosing a different fast pipeline. | NivisViewer has richer explicit `PageModel`, layout, fit/manual zoom, split-range, resampling, EXIF, magnifier and DPI handling, but almost every feature makes the compatible pipeline ineligible. | Feature support and performance architecture are coupled: turning on a feature destroys the direct cache and returns to the legacy two-stage path. | Treating the feature set as request/render specifications keeps one execution structure while preserving Nivis behavior. | High | This is almost the complete visible feature surface and needs contract-level regression coverage. | **Keep NivisViewer feature policy; structurally replace its execution path.** |
+| 10. Errors and shutdown | Worker exceptions become terminal error images/results; book replacement interrupts and waits for the current worker, clears page arrays, and disposes the old loader. | Legacy errors become terminal `CachedImage` records and can atomically join a spread; compatible failures maintain a Window failed-key set and retry the legacy pipeline. BookSession retired sources, direct-path wait, Widget render wait, cache wait, and coordinator shutdown are separate. | Failure can silently change architecture, and source retirement cannot ask one owner whether all consumers have stopped. Shutdown is special-cased for every pipeline. | One result type (`ready`, `error`, `cancelled`, `stale`) and one runtime shutdown make error behavior and archive lifetime deterministic. | Medium-high | Broken/unsupported entries, book switching, old-frame retention, asynchronous open and application shutdown must remain robust. | **Structural port.** Retain deferred close, terminal error frames and generation rejection; remove failure-triggered Viewer fallback. |
+
+### 11.2 Main NivisViewer design problems
+
+The dominant issue is ownership fragmentation, not a missing decoder tweak:
+
+1. A normal raster page can be represented simultaneously by an
+   `ImageCache` source record, a `ViewerWidget` render/prepared record, and a
+   compatible-path artifact.  Each has a separate eviction and generation.
+2. `ViewerWindow` is the effective scheduler but does not own a page job.  It
+   coordinates several timers and queues implemented by other objects.
+3. A UI feature is currently allowed to choose between two Viewer engines.
+   Page-list visibility, spread, rotation, magnifier, adjustment, resampling,
+   or fit mode can discard the compatible cache and restart the legacy path.
+4. Logical, requested, completed, displayed, and painted page identities do
+   not belong to one state machine.
+5. Page-list thumbnail creation uses Viewer decode results and GUI-thread
+   large-image scaling instead of a separate visible-range pipeline.
+
+The current diff confirms that the compatible path was added beside the old
+architecture: the substantial additions to `viewer_window.py`,
+`viewer_widget.py`, `image_source.py`, and `image_cache.py`, plus the new
+`zippla_compatible_raster_path.py`, did not remove the legacy raster loader,
+render scheduler, prepared cache, or their prefetch planners.  Extending its
+eligibility one condition at a time would preserve this root problem.
+
+### 11.3 Structures to retain
+
+The replacement must preserve these NivisViewer strengths rather than copying
+ZipPlaFork literally:
+
+- Qt GUI-thread-only `QPixmap` creation and request/source generation checks;
+- `PageModel` spread, LTR/RTL, cover, wide-page, and split policy, initially as
+  a pure topology/layout input;
+- the completed-old-frame retention and all-slots-terminal atomic frame swap;
+- fit/manual zoom, resampling, rotation, EXIF, image adjustments, magnifier,
+  PDF render specification, and device-pixel-ratio behavior;
+- asynchronous book open, retired-source close, Windows path/share behavior,
+  external archive adapters, and Japanese filenames;
+- Browser's dedicated thumbnail provider, memory/disk cache, and visible-row
+  scheduling, while making Viewer cold work able to suppress active Browser
+  work at a clear boundary.
+
+### 11.4 Replacement roadmap
+
+The work is grouped into four subsystem-sized changes, in performance-impact
+order.  These are replacement boundaries, not a list of new helpers to attach
+to the existing paths.
+
+1. **`ZipRasterBookRuntime` full cutover.** One runtime owns a ZIP book's page
+   request, one-active-job work order, entry-to-display-ready pipeline,
+   current/next/previous page artifact cache, eviction, cancellation and
+   shutdown. Every ZIP display request uses it; page-list visibility, spread,
+   rotation, filter, fit or magnifier must not select the legacy pipeline.
+2. **`ViewerPresentationState` full replacement.** Make requested and displayed
+   display units explicit and commit the accepted frame, slider, status,
+   page-list selection, history/progress policy and painted acknowledgement as
+   one transaction.
+3. **`ViewerPageListRuntime` full separation.** Replace eager Viewer-cache
+   thumbnails with a visible-row worker/cache that never changes the main
+   Viewer runtime and never scales large source images on the GUI thread.
+4. **`BookPageSource` unification and legacy raster removal.** Split source
+   ownership/entry access from decode/render, migrate folder and external
+   archives to the raster runtime, adapt PDF to the common presentation
+   contract, then delete the legacy `ImageCache`/prepared pipeline.
+
+### 11.5 First structural port selected
+
+The first implementation target is **`ZipRasterBookRuntime`**, not an
+archive-only or cache-only change. The existing `ZipImageSource` already gets
+the most important persistent archive/index behavior right; replacing only it
+would leave the two-stage pipeline and mode-dependent engine switch intact.
+
+The cutover contract is:
+
+```text
+one ZIP book
+  -> one runtime
+  -> latest display-unit request + replaceable work order
+  -> at most one active page job
+       entry read -> decode -> EXIF/filter -> split/rotate/resize
+       -> display-ready QImage result
+  -> GUI-thread QPixmap creation
+  -> one complete frame commit; preceding frame remains visible until then
+  -> paint acknowledgement permits shallow next/previous work
+```
+
+The following old ZIP structures become removal targets once the cutover is
+complete: standalone `ZipPlaCompatibleRasterPath`,
+`ImageCache.suspend_raster_work`, compatible eligibility/timer/failure-key
+state in `ViewerWindow`, ZIP participation in `_ImageLoadTask` and
+`ViewerRenderTask`, ZIP prepared-display/paced-prefetch state, and
+`ViewerWidget` direct-versus-legacy mode guards.  Folder, PDF, and external
+archive handling may temporarily remain behind an explicitly named legacy
+runtime boundary; there must be no per-feature fallback within a ZIP book.
+
+### 11.6 Implemented first cutover
+
+The first replacement unit is now implemented as a **book-level production
+cutover**, not another eligibility path:
+
+| ZipPlaFork source | Ported processing structure | NivisViewer destination |
+|---|---|---|
+| `PackedImageLoader.cs:283`, constructor; `:1197`, ZIP entry table; `:1781` / `:1856`, entry stream ownership; `:2601`, disposal | One runtime is created for one already-indexed persistent `ZipImageSource` and retired before its book source is closed. | `app/book_session.py`, `BookSession._replace_viewer_runtime`, `_retire_viewer_runtime`, `_release_retired_viewer_runtime`; `app/zip_raster_book_runtime.py`, `ZipRasterBookRuntime` |
+| `ViewerForm.cs:3177-3550`, `bmwLoadEachPage_DoWork` | One display-unit runnable performs all logical pages in the unit: entry read, decode, EXIF-aware source creation, adjustments, wide split, rotation, filter/resize, and display-ready `QImage`. | `app/zip_raster_book_runtime.py`, `_ZipRasterUnitJob.run`, `_render_unit`, `_decode_page`, `_split_ranges`; existing `viewer_render.render_qimage` is the Qt/Pillow render adapter used inside that same job. |
+| `GenerarClasses.cs:247`, `SetWorksOrder`; `ViewerForm.cs:5558`, `SetBackgroundMode`; `:5586`, `priorityLevel` | The current display unit is first, followed by the current-direction neighbor and reverse neighbor. At most one job is active; a new request replaces the pending order and can leave at most the one already-running obsolete decoder. Prefetch is released only after the current frame paints. | `ZipRasterBookRuntime.request`, `_drive`, `_submit`, `_cancel_active_job`, `release_prefetch`; `ViewerWindow._zip_runtime_request`, `_on_zip_runtime_frame_painted` |
+| `ViewerForm.cs:5371`, worker completion; `:5451`, `SetNewResizedImage`; `:6438`, `showCurrentPage` | The sole queued GUI completion creates `QPixmap` objects and publishes only a terminal complete single/spread/split frame. The preceding complete frame remains owned by the Widget until that transaction. | `ZipRasterBookRuntime._on_job_completed`; `ViewerWidget.commit_display_ready_frame`; `ViewerWindow._on_zip_runtime_frame_ready` |
+| `ViewerForm.cs:5471`, `ReduceUsingMemory` | Source and display components belong to one cached frame/page lifecycle. One work-order-aware byte ledger evicts the farthest non-current display unit. | `ZipRasterBookRuntime._frames`, `_frame_bytes`, `_prune_frames`, `set_cache_limits` |
+
+Production ownership is now:
+
+```text
+BookSession
+  -> one ZipRasterBookRuntime for one ZipImageSource
+ViewerWindow._refresh_view
+  -> ZipRasterRequest for every ZIP mode and feature
+ZipRasterBookRuntime
+  -> one active end-to-end display-unit job
+  -> one page-record cache/work order/shutdown owner
+ViewerWidget
+  -> one complete-frame commit and paint acknowledgement
+```
+
+The following old production structures were removed from `ViewerWindow`:
+
+- `_compatible_raster_request` and its ZIP/JPEG/single/fit/rotation/filter/
+  page-list/magnifier eligibility matrix;
+- compatible failure keys and failure-triggered fallback to the legacy path;
+- compatible path ownership, signals, page-list visibility deactivation, and
+  rotation/magnifier fallback/replay state;
+- per-feature activation/deactivation of two ZIP Viewer engines.
+
+For ZIP books, `ImageCache` is now suspended once at the book-runtime boundary;
+`_ImageLoadTask`, legacy raster prefetch, `ViewerRenderTask`, and the prepared
+display cache do not participate in page navigation. Folder, PDF, and external
+archive sources still use that legacy subsystem until roadmap item 4. The old
+standalone `app/zippla_compatible_raster_path.py` is no longer referenced by
+production and remains only as historical A/B code pending removal together
+with the old benchmark harness.
+
+Nivis-specific behavior retained in the cutover includes complete-old-frame
+retention, GUI-thread-only QPixmap creation, request/source generation checks,
+single and spread ordering, LTR/RTL, cover/wide policy, wide split, all fit
+modes, manual zoom, rotation, EXIF, resampling, image adjustments, magnifier
+source handles, DPI-specific render specifications, terminal error frames,
+Browser lane gating, and deferred source close.
+
+Known boundaries after this first unit:
+
+- logical `PageModel` navigation still advances before the frame transaction;
+  `ViewerPresentationState` is roadmap item 2;
+- Viewer page-list thumbnails are not yet sourced from the runtime and their
+  legacy GUI-thread scale must be replaced by roadmap item 3;
+- the Widget still names the runtime surface `direct display mode`; its old
+  prepared-render guards can be removed after folder/external/PDF adapters use
+  the same frame contract;
+- decoder-scaled JPEG is a strategy inside the one job. Rotation, wide split,
+  adjustments, non-standard resampling, and active magnifier deliberately use
+  a full source so the runtime does not switch architectures;
+- one running Pillow/native decode may finish after reversal, but its request
+  cannot publish and no second Viewer job runs concurrently.
+
+### 11.7 Post-cutover ownership corrections and validation
+
+Integration review found and corrected the following subsystem-boundary
+defects before validation:
+
+- pending-open tokens are separate from the active book epoch, so a failed or
+  cancelled replacement open cannot invalidate the still-displayed ZIP
+  runtime;
+- a retired `ZipImageSource` remains open until both its runtime worker and
+  queued GUI completion have drained; after `ImageCache` itself is drained,
+  non-runtime sources such as PDF still close synchronously;
+- a prefetch artifact rejected by the byte budget is marked complete/blocked
+  for that work order instead of being decoded in a loop;
+- same-key current work and still-useful neighbor work adopt the latest
+  request instead of being cancelled by every Window refresh;
+- failure to start the current worker produces one terminal frame rather than
+  leaving the interactive lane waiting forever;
+- runtime shutdown owns both worker completion and queued-result drainage;
+- the atomic Widget boundary rejects an incomplete two-slot spread.
+
+The production runtime was then measured without showing a window or sending
+native input. `scripts/benchmark_zip_runtime_navigation.py` created one
+temporary 243,839,098-byte ZIP containing 12 identical-payload, deterministic
+4096 x 6500 detailed JPEG entries. Each entry was 20,319,795 bytes. The
+viewport was 1200 x 800, the normal artifact budget was 256 MiB, and the
+pressure budget was 6 MiB. Times are offscreen evidence only and do not prove
+real-device responsiveness.
+
+| Scenario | Final request -> commit / paint | ZIP entry reads | Observable full-payload materialization | Source / display QImage | QPixmap.fromImage | GUI callbacks (frame / artifact / commit) | Paints (content / frame) | Jobs | Sampled working-set peak delta | Retained cache | Transit requested-page decodes | Result |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| cold forward | 125 / 125 ms | 3 / 60,959,385 B | 6 / 121,918,770 B | 3 / 3 | 3 | 1 / 3 / 1 | 1 / 1 | 3 | 43.281 MiB | 3 pages / 8,414,880 B | 0 | settled |
+| cold reversal | 109 / 125 ms | 3 completed / 60,959,385 B; 1 cancelled read | 6 / 121,918,770 B | 3 / 3 | 3 | 1 / 3 / 1 | 1 / 1 | 4 | 43.375 MiB | 3 pages / 8,414,880 B | 1 already-running obsolete page | settled; 1 stale result rejected |
+| forced-cold roundtrip | 109 / 109 ms | 4 completed / 81,279,180 B; 1 cancelled read | 8 / 162,558,360 B | 4 / 4 | 4 | 2 / 4 / 2 | 2 / 2 | 5 | 44.273 MiB | 3 pages / 8,414,880 B | 2 | settled; 1 stale result rejected |
+| rapid final (requests 2..7) | 125 / 125 ms | 3 / 60,959,385 B | 6 / 121,918,770 B | 3 / 3 | 3 | 1 / 3 / 1 | 1 / 1 | 3 | 43.516 MiB | 3 pages / 8,414,880 B | 1 (page 6 reused as final neighbor); pages 2..5: 0 | settled |
+| ready hit | 0 / 0 ms | 0 / 0 B | 0 / 0 B | 0 / 0 | 0 | 1 / 0 / 1 | 1 / 1 | 0 | 0.012 MiB | 3 pages / 8,414,880 B | 0 | cache hit |
+| 6 MiB memory pressure | 125 / 125 ms | 3 / 60,959,385 B | 6 / 121,918,770 B | 3 / 3 | 3 | 1 / 3 / 1 | 1 / 1 | 3 | 43.066 MiB | 2 pages / 5,609,920 B | 0 | settled; no resubmit loop |
+
+For the final displayed frames, worker-completion to GUI-ready time was 0 ms
+at the probe's millisecond resolution; GUI-ready to explicit offscreen paint
+was 0 ms except for one 16 ms event-pump interval during reversal. The
+remaining cold critical path is therefore inside entry read plus Qt JPEG
+decode, not repeated GUI commits or paints. In particular, each completed
+JPEG currently has two observable full compressed-payload materializations:
+one `BytesIO` and one `getvalue()` handoff. Decoder/backend work is deliberately
+left as a later optimization only after the Viewer-wide structural cutover.
+
+The monolithic 1,429-test process exposes a pre-existing Qt state-order hang
+at the second application-controller test when another QApplication/session
+test file precedes it (`test_app_icon.py` and `test_book_session.py` both
+reproduce the ordering). `test_application_controller.py` passes all 27 tests
+in its own process. Running the suite in file-group processes completed all
+1,429 collected tests.
+The first PDF split run also exposed a close-order regression; the fix above
+was applied and the complete 73-test PDF group then passed.
+
+### 11.8 Implemented second cutover: `ViewerPresentationState`
+
+Roadmap item 2 is now implemented as a presentation-state replacement.  It is
+not a cache or decoder adjustment.  `PageModel` remains the requested logical
+topology, while one new state owner decides when a completed frame becomes the
+displayed book/page and when its dependent UI and persistence values may
+advance.
+
+The fixed upstream revision and AGPL provenance remain those recorded in
+sections 1 and 5.  The relevant structural source is
+`source/ZipPla/ViewerForm.cs`: `bmwLoadEachPage_EachRunWorkerCompleted`
+(`:5371`), `SetNewResizedImage` (`:5451`), `showCurrentPage` (`:6438`), and
+`pbView_Paint` / `pbView_PaintToCanvas` (`:6748-6990`).  ZipPlaFork keeps the
+accepted current page, completed resized artifact, trackbar, and Viewer paint
+coordination inside one Viewer-form publication sequence.  NivisViewer now
+ports that single-owner/publication structure, while deliberately retaining
+its stronger behavior of leaving the preceding frame unmodified until an
+entire replacement frame is ready.
+
+The token, epoch, layout/DPR validation, immutable Python snapshots, history
+transaction, saved-progress policy, Qt signals, and complete-old-frame swap
+are independent NivisViewer implementations.  They are not line-for-line C#
+translations.  The structural adoption is recorded as
+AGPL-3.0-or-later-derived because the accepted-current/completed-artifact/UI
+publication organization was taken from ZipPlaFork.
+
+| Former owner or update site | Former meaning/problem | Replacement owner and boundary |
+|---|---|---|
+| `PageModel.current_index` / `focused_index` and `ViewerPageNavigationController._move` | Input immediately moves the logical/requested page.  Callers could mistake it for the visible page. | They remain request topology only. `ViewerPresentationState.request_frame` snapshots the requested single/spread display unit, direction, book, layout and DPR without changing the displayed snapshot. |
+| `ViewerWindow._active_request_id`, `_visible_page_indexes`, `_display_unit` | Window-owned request serial, requested pages and readiness tracker were independent mutable fields. | `ViewerPresentationState.pending_request_serial`, `requested`, `requested_page_indexes`, and `display_tracker`. Read-only compatibility properties remain only for isolated legacy tests/callers. |
+| `ViewerWindow._applied_display_request_id` | ZIP meant post-swap, prepared hit meant synchronous post-swap, and legacy cold meant render start before the actual swap. | `ViewerPresentationState.displayed.token.request_serial` means accepted presentation commit on every path. `ViewerWidget.frameCommitted` is the sole pixel-to-semantic commit bridge. |
+| `_go_to_index_with_history`, `_go_to_model_move_with_history`, `_on_page_navigation_changed`, `_go_back_in_page_history`, `_go_forward_in_page_history` | History and metadata progress advanced at input time, including pages never shown during rapid input. | Navigation supplies `PresentationNavigation`; back/forward stacks mutate only in `commit_frame`. `BookSession.notify_page_changed` is emitted only by `_apply_presentation_commit`. |
+| `_render_spread`, `_on_zip_runtime_frame_ready`, `_apply_pending_display_demand` | Slider, status and page-list selection had path-dependent pre/post-commit timing; legacy marked a request applied at render start. | These paths only feed terminal slots and a frame token to `ViewerWidget`. `_on_viewer_frame_committed` validates and commits; `_apply_presentation_commit` then updates slider, status, page-list, history actions and progress as one GUI-turn transaction. |
+| `_update_slider`, `_update_status`, `_sync_page_list_selection` | They read `model.focused_index`, sometimes combining a requested path/page with the old frame's resolution. | They project only `slider_page_index`, `status_values`, failure state and `displayed_page` from `ViewerPresentationState`. A user-moved slider or page-list row is restored to the last committed value while the request loads. |
+| `_save_current_reading_position`, `_queue_metadata_progress` | They saved the requested model focus, so rapid transit pages or an unrendered final page could become progress. | They save the committed book key and `progress_values`. Normal navigation uses the displayed commit page; the explicit “open first page but retain saved resume position” policy is carried in the initial request and committed deterministically. |
+| `ViewerWidget._spread` / `_images`, `_commit_display`, `commit_display_ready_frame` | The Widget correctly owned pixels but emitted no common frame identity for all paths. | `ViewerFrameCommit` contains the opaque presentation token, Widget serial, complete spread identity, page indexes, image identities and failures. Both direct and prepared paths emit it only after the atomic pixel swap. |
+| `ViewerWindow.open_path`, failed-open callback, empty-book path and shutdown | Pending replacement, active displayed book, and late callbacks used several unrelated generation fields. | `begin_replacement_open`, `fail_replacement_open`, `clear_book`, and `close` fence requests while preserving or clearing the committed snapshot according to the explicit book-state contract. |
+
+`ViewerPresentationState` now exclusively owns the following semantic state:
+
+- requested page/display unit and the last committed displayed page/unit;
+- pending request serial and state-owned committed-frame serial;
+- navigation direction and navigation/history intent;
+- requested book identity, committed book epoch, layout signature and DPR;
+- per-slot loading/readiness/failure, whole-frame loading and failure state;
+- committed slider value, status values, history page and progress page;
+- back/forward history stacks and pending replacement-open/closed fences.
+
+The production transition is:
+
+```text
+EMPTY or COMMITTED(old frame)
+  -- input/request --> REQUESTED(new token, requested moves, old display/UI stays)
+
+REQUESTED
+  -- newer input or reversal --> REQUESTED(new token; earlier tokens become stale)
+  -- non-frame failure -------> FAILED_PENDING(old display/UI stays)
+  -- exact complete frame ----> Widget atomic pixel swap
+                                -> PRESENTATION COMMIT
+                                -> displayed + slider + status + page-list
+                                   + history + progress advance together
+
+BOOK_REPLACEMENT_PENDING
+  -- open failure ------------> COMMITTED(old book remains)
+  -- source opened -----------> REQUESTED(new epoch, old frame remains)
+  -- first exact frame -------> COMMITTED(new active presentation)
+
+CLOSED
+  -- any queued callback -----> rejected; no semantic mutation
+```
+
+Only a frame whose book epoch/source identity, request serial, complete display
+unit, layout signature and DPR all match the current token can commit.  A
+newer request makes every intermediate completion stale, including results
+from the old navigation direction.  Stale frames do not update pixels,
+displayed state, slider, status, history or progress.
+
+For a spread, every logical slot must be terminal before the Widget may swap
+or the state may commit. A genuine end-of-book missing partner is represented
+by a complete one-slot display unit; an in-flight half-spread is not. A broken
+or unsupported page can be a terminal error slot: if the complete error frame
+is atomically swapped, that page becomes the displayed page exactly once and
+the failure is exposed by the committed status. A failure that does not
+produce a frame leaves the old displayed page intact.
+
+Temporary loading/error messages used for book probing remain a separate
+status-overlay layer; they do not redefine the committed page. Paint
+acknowledgement still releases prefetch and first-frame gates, but it no
+longer determines slider/history/progress. Those values are fixed at the
+atomic frame commit.
+
+The remaining compatibility surface is intentionally narrow:
+
+- `_active_request_id`, `_applied_display_request_id`,
+  `_visible_page_indexes`, and `_display_unit` are projections/adapters over
+  the new state for legacy white-box tests and remaining pipeline calls; there
+  is no duplicate production storage;
+- `ViewerDisplayUnit` remains the per-request slot-readiness tracker owned by
+  the presentation request and is not a second displayed-state owner;
+- `PageModel` still owns requested topology and layout navigation, never the
+  displayed presentation;
+- `ViewerWidget` owns pixels and paint mechanics, not page history or reading
+  progress.
+
+The next replacement boundary is `ViewerPageListRuntime`.  Page-list selection
+is already a read-only projection of the committed presentation.  The next
+unit will take ownership only of row materialization, visible-range thumbnail
+requests, thumbnail worker/cache lifetime, delayed updates and pause/resume
+against current-page work.  A page-list click may submit a navigation request,
+but that runtime must never assign displayed page, slider, history or progress
+and must never select or invalidate the main Viewer decode pipeline.
+
+Validation used only syntax checks, fake/temp data and offscreen Qt.  All
+1,434 collected regression tests passed across controlled file/test-process
+groups.  The new state contracts, Window/Widget integration, ZIP runtime/book
+lifetime, metadata progress, prepared-render boundary, navigation/page-list/
+magnifier/rotation/DPI behavior, PDF, external archive and image-source groups
+are included.
+
+A single combined Qt process remains unreliable because GUI state survives
+between unrelated tests.  `test_application_controller.py` stops in Browser
+fallback-icon painting when its first two tests share a process, while all 27
+tests pass in individual processes.  `test_sprint15_models.py`,
+`test_sprint18_navigation_followup.py`, and
+`test_viewer_resampling_magnifier.py` also require an already-created session
+`qapp` or their established companion group.  The full regression therefore
+used those explicit isolation/bootstrap boundaries.  It also found three old
+`_commit_display` test spies that did not accept the new `frame_token` keyword;
+the adapters were corrected and the complete 39-test resampling/magnifier file
+then passed.  These are test-harness boundary findings, not hidden production
+fallbacks.
+
+The production ZIP offscreen probe was rerun after the presentation cutover
+with the same 12-entry, 4096 x 6500 detailed-JPEG fixture used in section 11.7
+(20,319,795 bytes per entry; 243,839,098-byte ZIP; 1200 x 800 viewport).  It
+does not claim real-device improvement and deliberately does not alter cache
+counts or decoder strategy.
+
+| Scenario | final request -> semantic-adjacent Widget commit / paint | ZIP reads / bytes | observable whole-payload copies / bytes | source + display QImage | QPixmap.fromImage | frame/artifact/commit callbacks | content/frame paints | jobs | sampled peak WS delta | retained pages / bytes | transit request decodes | worker-complete -> paint |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| cold forward | 125 / 125 ms | 3 / 60,959,385 | 6 / 121,918,770 | 3 + 3 | 3 | 1 / 3 / 1 | 1 / 1 | 3 | 43.066 MiB | 3 / 8,414,880 | 0 | 0 ms |
+| cold reversal | 109 / 109 ms | 3 completed / 60,959,385; 1 cancelled | 6 / 121,918,770 | 3 + 3 | 3 | 1 / 3 / 1 | 1 / 1 | 4 | 43.074 MiB | 3 / 8,414,880 | 1 | 0 ms |
+| forced-cold roundtrip | 109 / 109 ms | 4 completed / 81,279,180; 1 cancelled | 8 / 162,558,360 | 4 + 4 | 4 | 2 / 4 / 2 | 2 / 2 | 5 | 44.477 MiB | 3 / 8,414,880 | 2 | 0 / 0 ms |
+| rapid final (requests 2..7) | 125 / 125 ms | 3 / 60,959,385 | 6 / 121,918,770 | 3 + 3 | 3 | 1 / 3 / 1 | 1 / 1 | 3 | 43.293 MiB | 3 / 8,414,880 | 1 (page 6; pages 2..5 zero) | 0 ms |
+| ready hit | 0 / 0 ms | 0 / 0 | 0 / 0 | 0 + 0 | 0 | 1 / 0 / 1 | 1 / 1 | 0 | 0.016 MiB | 3 / 8,414,880 | 0 | n/a |
+| 6 MiB pressure | 141 / 141 ms | 3 / 60,959,385 | 6 / 121,918,770 | 3 + 3 | 3 | 1 / 3 / 1 | 1 / 1 | 3 | 43.344 MiB | 2 / 5,609,920 | 0 | 16 ms |
+
+Every scenario settled before its timeout, produced exactly one final-frame
+commit per final displayed request (two for the intentionally two-leg
+roundtrip), and left no benchmark process behind.  The cold critical path
+remains archive read plus JPEG decode; presentation commit did not add extra
+QImage, QPixmap, GUI callback, paint or job work.  Real application launch and
+native input remain intentionally untested.

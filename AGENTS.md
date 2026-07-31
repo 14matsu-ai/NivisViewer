@@ -9,6 +9,8 @@
 - 依存ライブラリを追加する場合は、理由とライセンスを報告する。
 - NivisViewerは配布・公開を前提としない完全な個人用アプリとして扱う。
 - Viewer性能改善ではZipPlaForkのコード、アルゴリズム、処理構造のコピー・翻訳・移植を許可する。従来の「設計だけ参考にして直接移植しない」という制約は適用しない。
+- Viewer性能改善では現行Viewer実装の維持を目的にしない。ZipPlaForkの方が優れている箇所は、局所修正に限定せず、class、scheduler、cache、decode／resize／publish pipelineを構造単位で撤去・置換してよい。
+- 「NivisViewer流へ合わせる」ことより、通常の大画像ZIPにおけるcold miss、順送り、逆方向反転、往復、高速連続入力の実機体感を優先する。
 - ZipPlaForkから移植する場合は、移植元repository、固定revision、元ファイル、元処理、ライセンス、著作権表示、NivisViewer側の対応箇所を`docs/ZIPPLAFORK_COMPARISON.md`へ記録する。
 - ZipPlaFork由来コードはAGPL-3.0-or-later由来として明示し、必要なライセンス本文と通知を保持する。ZipPlaFork以外のAGPL依存追加は、理由と影響を報告してから行う。
 - Windowsと日本語ファイル名を前提にする。

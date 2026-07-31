@@ -343,9 +343,9 @@ def test_nonstandard_normal_render_is_atomic_and_keeps_previous_page(
     commits: list[tuple[str, ...]] = []
     original_commit = widget._commit_display
 
-    def record_commit(spread, images):
+    def record_commit(spread, images, **kwargs):
         commits.append(tuple(image.image_id for image in images))
-        original_commit(spread, images)
+        original_commit(spread, images, **kwargs)
 
     widget._commit_display = record_commit  # type: ignore[method-assign]
     widget.set_pages(
@@ -394,9 +394,9 @@ def test_standard_display_uses_qt_worker_once_and_never_pillow(
     )
     original_commit = widget._commit_display
 
-    def record_commit(spread, images):
+    def record_commit(spread, images, **kwargs):
         commits.append(tuple(image.image_id for image in images))
-        original_commit(spread, images)
+        original_commit(spread, images, **kwargs)
 
     monkeypatch.setattr(widget, "_commit_display", record_commit)
     _set_single_page(widget, image=_image(409, 650))
@@ -461,9 +461,9 @@ def test_nonstandard_spread_queues_each_page_once_and_commits_as_one_unit(
         queued.append(key)
         original_queue(image, key, **kwargs)
 
-    def record_commit(spread, images):
+    def record_commit(spread, images, **kwargs):
         commits.append(tuple(image.image_id for image in images))
-        original_commit(spread, images)
+        original_commit(spread, images, **kwargs)
 
     monkeypatch.setattr(widget, "_queue_render", record_queue)
     monkeypatch.setattr(widget, "_commit_display", record_commit)

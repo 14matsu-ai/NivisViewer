@@ -11,7 +11,7 @@ from pathlib import Path
 from natsort import natsorted
 from PIL import Image, ImageOps
 from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QSize
-from PySide6.QtGui import QImage, QImageReader
+from PySide6.QtGui import QImage, QImageIOHandler, QImageReader
 
 from .archive_backend import (
     ArchiveBackendError,
@@ -138,6 +138,58 @@ def _read_jpeg_qimage_at_most(
     return image, logical_size
 
 
+def _read_jpeg_qbytearray_at_most(
+    data: QByteArray,
+    maximum_size: tuple[int, int],
+) -> tuple[QImage, tuple[int, int]] | None:
+    """Decode one seekable Qt byte buffer without Python QIODevice callbacks."""
+    maximum_width = max(1, int(maximum_size[0]))
+    maximum_height = max(1, int(maximum_size[1]))
+    buffer = QBuffer(data)
+    if not buffer.open(QIODevice.OpenModeFlag.ReadOnly):
+        return None
+    try:
+        reader = QImageReader(buffer, b"jpeg")
+        raw_size = reader.size()
+        transformation = reader.transformation()
+        raw_width = raw_size.width()
+        raw_height = raw_size.height()
+        if raw_width <= 0 or raw_height <= 0:
+            return None
+
+        swaps_axes = bool(
+            transformation
+            & QImageIOHandler.Transformation.TransformationRotate90
+        )
+        logical_size = (
+            (raw_height, raw_width)
+            if swaps_axes
+            else (raw_width, raw_height)
+        )
+        scale = min(
+            1.0,
+            maximum_width / logical_size[0],
+            maximum_height / logical_size[1],
+        )
+        logical_target = (
+            max(1, round(logical_size[0] * scale)),
+            max(1, round(logical_size[1] * scale)),
+        )
+        raw_target = (
+            (logical_target[1], logical_target[0])
+            if swaps_axes
+            else logical_target
+        )
+        reader.setAutoTransform(True)
+        reader.setScaledSize(QSize(*raw_target))
+        image = reader.read()
+        if image.isNull():
+            return None
+        return image, logical_size
+    finally:
+        buffer.close()
+
+
 @dataclass(frozen=True)
 class FolderListingSnapshot:
     folder: Path
@@ -146,6 +198,86 @@ class FolderListingSnapshot:
     fingerprints: tuple[tuple[str, int | None, int | None], ...] = ()
     generation: int = 0
     sort_identity: str = "name:ascending"
+
+
+@dataclass(frozen=True)
+class StreamedJpegDecode:
+    qimage: QImage
+    original_size: tuple[int, int]
+    bytes_read: int
+    read_calls: int
+    backend: str = "python-sequential-qiodevice"
+    full_payload_materializations: int = 0
+
+
+class _ZipEntrySequentialDevice(QIODevice):
+    """Expose one ZipExtFile to Qt without materializing the full payload."""
+
+    def __init__(
+        self,
+        entry,
+        *,
+        expected_size: int,
+        cancelled: threading.Event,
+        maximum_bytes: int,
+        read_chunk_bytes: int,
+    ) -> None:
+        super().__init__()
+        self._entry = entry
+        self._expected_size = max(0, int(expected_size))
+        self._cancelled = cancelled
+        self._maximum_bytes = max(0, int(maximum_bytes))
+        self._read_chunk_bytes = max(1, int(read_chunk_bytes))
+        self.bytes_read = 0
+        self.read_calls = 0
+        self.too_large = False
+        self.read_error: Exception | None = None
+
+    def isSequential(self) -> bool:
+        return True
+
+    def bytesAvailable(self) -> int:
+        remaining = max(0, self._expected_size - self.bytes_read)
+        return remaining + super().bytesAvailable()
+
+    def readData(self, maximum_length: int) -> bytes:
+        if (
+            maximum_length <= 0
+            or self._cancelled.is_set()
+            or self.too_large
+            or self.read_error is not None
+        ):
+            return b""
+        allowed = self._maximum_bytes - self.bytes_read
+        if allowed < 0:
+            self.too_large = True
+            return b""
+        request_size = min(
+            int(maximum_length),
+            self._read_chunk_bytes,
+            allowed + 1,
+        )
+        if request_size <= 0:
+            return b""
+        try:
+            chunk = self._entry.read(request_size)
+            self.read_calls += 1
+        except Exception as exc:
+            self.read_error = exc
+            return b""
+        self.bytes_read += len(chunk)
+        if self.bytes_read > self._maximum_bytes:
+            self.too_large = True
+            return b""
+        # A request can be cancelled while ZipExtFile.read() is inflating data.
+        # Returning EOF lets QImageReader unwind; the caller then raises the
+        # repository's existing PROCESS_CANCELLED error.
+        if self._cancelled.is_set():
+            return b""
+        return chunk
+
+    def writeData(self, _data: bytes) -> int:
+        return -1
 
 
 class ImageSourceError(RuntimeError):
@@ -390,6 +522,7 @@ class ZipImageSource(ImageSource):
         self._lock = threading.RLock()
         self._active_lock = threading.RLock()
         self._closed = threading.Event()
+        self._zip_closed = False
         self._active_requests: dict[str, set[threading.Event]] = {}
         self._listed_images: tuple[str, ...] | None = None
         self._display_names: dict[str, str] = {}
@@ -472,6 +605,160 @@ class ZipImageSource(ImageSource):
         finally:
             self._finish_request(image_id, cancelled)
 
+    def open_streamed_jpeg_at_most(
+        self,
+        image_id: str,
+        maximum_size: tuple[int, int],
+    ) -> StreamedJpegDecode | None:
+        """Decode a ZIP JPEG directly from ZipExtFile through QImageReader."""
+        if Path(image_id).suffix.casefold() not in {".jpg", ".jpeg", ".jpe"}:
+            return None
+        maximum_width = max(1, int(maximum_size[0]))
+        maximum_height = max(1, int(maximum_size[1]))
+        cancelled = self._begin_request(image_id)
+        try:
+            self._raise_if_cancelled(cancelled)
+            with self._lock:
+                self._raise_if_cancelled(cancelled)
+                info = self._zip.NameToInfo.get(image_id)
+                if info is None:
+                    raise ImageSourceError(
+                        f"書庫内の画像が見つかりません: {image_id}",
+                        code=ArchiveErrorCode.ENTRY_NOT_FOUND.value,
+                    )
+                if info.file_size > MAX_IMAGE_ENTRY_BYTES:
+                    raise ImageSourceError(
+                        "書庫内の画像が大きすぎます。",
+                        code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
+                    )
+                self._raise_if_cancelled(cancelled)
+                try:
+                    entry = self._zip.open(info, "r")
+                except ImageSourceError:
+                    raise
+                except Exception:
+                    return None
+                with entry:
+                    device = _ZipEntrySequentialDevice(
+                        entry,
+                        expected_size=info.file_size,
+                        cancelled=cancelled,
+                        maximum_bytes=MAX_IMAGE_ENTRY_BYTES,
+                        read_chunk_bytes=self._READ_CHUNK_BYTES,
+                    )
+                    if not device.open(QIODevice.OpenModeFlag.ReadOnly):
+                        return None
+                    try:
+                        reader = QImageReader(device, b"jpeg")
+                        raw_size = reader.size()
+                        transformation = reader.transformation()
+                        self._raise_if_cancelled(cancelled)
+                        if device.too_large:
+                            raise ImageSourceError(
+                                "書庫内の画像が大きすぎます。",
+                                code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
+                            )
+                        if device.read_error is not None:
+                            return None
+                        raw_width = raw_size.width()
+                        raw_height = raw_size.height()
+                        if raw_width <= 0 or raw_height <= 0:
+                            return None
+
+                        swaps_axes = bool(
+                            transformation
+                            & QImageIOHandler.Transformation.TransformationRotate90
+                        )
+                        logical_size = (
+                            (raw_height, raw_width)
+                            if swaps_axes
+                            else (raw_width, raw_height)
+                        )
+                        scale = min(
+                            1.0,
+                            maximum_width / logical_size[0],
+                            maximum_height / logical_size[1],
+                        )
+                        logical_target = (
+                            max(1, round(logical_size[0] * scale)),
+                            max(1, round(logical_size[1] * scale)),
+                        )
+                        raw_target = (
+                            (logical_target[1], logical_target[0])
+                            if swaps_axes
+                            else logical_target
+                        )
+
+                        reader.setAutoTransform(True)
+                        reader.setScaledSize(QSize(*raw_target))
+                        image = reader.read()
+                        self._raise_if_cancelled(cancelled)
+                        if device.too_large:
+                            raise ImageSourceError(
+                                "書庫内の画像が大きすぎます。",
+                                code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
+                            )
+                        if device.read_error is not None or image.isNull():
+                            return None
+                        return StreamedJpegDecode(
+                            qimage=image,
+                            original_size=logical_size,
+                            bytes_read=device.bytes_read,
+                            read_calls=device.read_calls,
+                        )
+                    finally:
+                        device.close()
+        except ImageSourceError:
+            raise
+        except Exception:
+            return None
+        finally:
+            self._finish_request(image_id, cancelled)
+
+    def open_compatible_jpeg_at_most(
+        self,
+        image_id: str,
+        maximum_size: tuple[int, int],
+    ) -> StreamedJpegDecode | None:
+        """Decode through one seekable QByteArray owned by the page job.
+
+        A Python ``QIODevice.readData`` callback for every libjpeg request is
+        measurably slower on large detailed JPEGs.  Reading the entry in large
+        chunks directly into one reserved ``QByteArray`` keeps one payload
+        materialization, then lets QBuffer/QImageReader stay in C++.
+        """
+        if Path(image_id).suffix.casefold() not in {".jpg", ".jpeg", ".jpe"}:
+            return None
+        cancelled = self._begin_request(image_id)
+        try:
+            payload, read_calls = self._read_entry_qbytearray(
+                image_id,
+                cancelled,
+            )
+            self._raise_if_cancelled(cancelled)
+            decoded = _read_jpeg_qbytearray_at_most(
+                payload,
+                maximum_size,
+            )
+            self._raise_if_cancelled(cancelled)
+            if decoded is None:
+                return None
+            image, logical_size = decoded
+            return StreamedJpegDecode(
+                qimage=image,
+                original_size=logical_size,
+                bytes_read=payload.size(),
+                read_calls=read_calls,
+                backend="qbytearray-qbuffer",
+                full_payload_materializations=1,
+            )
+        except ImageSourceError:
+            raise
+        except Exception:
+            return None
+        finally:
+            self._finish_request(image_id, cancelled)
+
     def _begin_request(self, image_id: str) -> threading.Event:
         cancelled = threading.Event()
         with self._active_lock:
@@ -485,13 +772,23 @@ class ZipImageSource(ImageSource):
         image_id: str,
         cancelled: threading.Event,
     ) -> None:
+        close_zip = False
         with self._active_lock:
             requests = self._active_requests.get(image_id)
-            if requests is None:
-                return
-            requests.discard(cancelled)
-            if not requests:
-                self._active_requests.pop(image_id, None)
+            if requests is not None:
+                requests.discard(cancelled)
+                if not requests:
+                    self._active_requests.pop(image_id, None)
+            if (
+                self._closed.is_set()
+                and not self._active_requests
+                and not self._zip_closed
+            ):
+                self._zip_closed = True
+                close_zip = True
+        if close_zip:
+            with self._lock:
+                self._zip.close()
 
     @staticmethod
     def _raise_if_cancelled(cancelled: threading.Event) -> None:
@@ -546,6 +843,47 @@ class ZipImageSource(ImageSource):
         buffer.seek(0)
         return buffer
 
+    def _read_entry_qbytearray(
+        self,
+        image_id: str,
+        cancelled: threading.Event,
+    ) -> tuple[QByteArray, int]:
+        self._raise_if_cancelled(cancelled)
+        payload = QByteArray()
+        read_calls = 0
+        with self._lock:
+            try:
+                info = self._zip.getinfo(image_id)
+            except KeyError as exc:
+                raise ImageSourceError(
+                    f"書庫内の画像が見つかりません: {image_id}",
+                    code=ArchiveErrorCode.ENTRY_NOT_FOUND.value,
+                ) from exc
+            if info.file_size > MAX_IMAGE_ENTRY_BYTES:
+                raise ImageSourceError(
+                    "書庫内の画像が大きすぎます。",
+                    code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
+                )
+            payload.reserve(max(0, int(info.file_size)))
+            self._raise_if_cancelled(cancelled)
+            total = 0
+            with self._zip.open(info, "r") as file:
+                while True:
+                    self._raise_if_cancelled(cancelled)
+                    chunk = file.read(self._READ_CHUNK_BYTES)
+                    read_calls += 1
+                    self._raise_if_cancelled(cancelled)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_IMAGE_ENTRY_BYTES:
+                        raise ImageSourceError(
+                            "書庫内の画像が大きすぎます。",
+                            code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
+                        )
+                    payload.append(chunk)
+        return payload, read_calls
+
     def cancel_image_request(self, image_id: str) -> None:
         with self._active_lock:
             for cancelled in tuple(
@@ -564,13 +902,20 @@ class ZipImageSource(ImageSource):
             return None
 
     def close(self) -> None:
-        self._closed.set()
+        close_zip = False
         with self._active_lock:
+            self._closed.set()
             for requests in tuple(self._active_requests.values()):
                 for cancelled in tuple(requests):
                     cancelled.set()
-        with self._lock:
-            self._zip.close()
+            if not self._active_requests and not self._zip_closed:
+                self._zip_closed = True
+                close_zip = True
+        # Do not make the UI wait for a running decoder that owns _lock.
+        # The final _finish_request closes the persistent ZipFile instead.
+        if close_zip:
+            with self._lock:
+                self._zip.close()
 
     @staticmethod
     def _decode_display_name(info: zipfile.ZipInfo) -> str:

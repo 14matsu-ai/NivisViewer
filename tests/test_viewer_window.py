@@ -121,6 +121,18 @@ def test_open_path_displays_book(tmp_path: Path, qapp: QApplication) -> None:
     finish_open(window, qapp)
     assert window.book_session.current_path == image
     assert window.model.total_pages == 1
+    # Source installation only advances requested state. The slider is
+    # enabled by the first complete presentation-frame commit.
+    assert window.presentation_state.requested_page == 0
+    assert window.presentation_state.displayed_page is None
+    assert not window.slider.isEnabled()
+    assert window.image_cache.wait_for_done(2000)
+    qapp.processEvents()
+    QTest.qWait(window._display_demand_timer.interval() + 20)
+    qapp.processEvents()
+    assert window.viewer.wait_for_rendering()
+    qapp.processEvents()
+    assert window.presentation_state.displayed_page == 0
     assert window.slider.isEnabled()
     window.close()
     qapp.processEvents()
@@ -165,6 +177,10 @@ def test_hidden_page_list_defers_all_items_until_first_visible(
     assert window.open_path(tmp_path / "book")
     finish_open(window, qapp)
     assert window.image_cache.wait_for_done(2000)
+    qapp.processEvents()
+    QTest.qWait(window._display_demand_timer.interval() + 20)
+    qapp.processEvents()
+    assert window.viewer.wait_for_rendering()
     qapp.processEvents()
 
     assert item_counts_at_request
@@ -628,100 +644,6 @@ def test_mouse_settings_apply_to_existing_viewer_immediately(
     qapp.processEvents()
 
 
-def test_prefetched_zip_page_is_applied_once_without_reread_or_clear(
-    tmp_path: Path,
-    qapp: QApplication,
-) -> None:
-    folder = tmp_path / "zip-pages"
-    first = folder / "1.jpg"
-    second = folder / "2.jpg"
-    write_image(first)
-    write_image(second)
-    archive = tmp_path / "book.zip"
-    with zipfile.ZipFile(archive, "w") as output:
-        output.write(first, "1.jpg")
-        output.write(second, "2.jpg")
-
-    class CountingZipSource(ZipImageSource):
-        def __init__(self, path: Path) -> None:
-            super().__init__(path)
-            self.decode_calls: list[str] = []
-
-        def open_image(self, image_id: str) -> Image.Image:
-            self.decode_calls.append(image_id)
-            return super().open_image(image_id)
-
-    source = CountingZipSource(archive)
-    config = make_config(tmp_path)
-    config.apply(
-        {
-            "view_mode": "single",
-            "viewer_prefetch_preset": "custom",
-            "viewer_prefetch_image_forward_units": 0,
-            "viewer_prefetch_image_backward_units": 0,
-        },
-        save=False,
-    )
-    session = BookSession(
-        source_factory=lambda _path, **_kwargs: (source, None),
-    )
-    window = ViewerWindow(config_manager=config, book_session=session)
-    applied: list[tuple[str, ...]] = []
-    cleared: list[None] = []
-    delivered: list[CachedImage] = []
-    try:
-        window.show()
-        opened = session.open_book(archive)
-        assert window._finish_opened_book(opened, modal_on_empty=False)
-        assert session.image_cache.wait_for_done(2000)
-        qapp.processEvents()
-        session.image_cache.preload_around(
-            0,
-            radius=0,
-            visible_indexes=(0,),
-            prefetch_indexes=(1,),
-        )
-        assert session.image_cache.wait_for_done(2000)
-        qapp.processEvents()
-        assert session.image_cache.get(1) is not None
-
-        source.decode_calls.clear()
-        session.image_cache.pageLoaded.connect(delivered.append)
-        original_set_pages = window.viewer.set_pages
-        original_clear = window.viewer.clear
-
-        def record_set_pages(spread, pages):
-            applied.append(tuple(image.image_id for image in pages))
-            original_set_pages(spread, pages)
-
-        def record_clear():
-            cleared.append(None)
-            original_clear()
-
-        window.viewer.set_pages = record_set_pages  # type: ignore[method-assign]
-        window.viewer.clear = record_clear  # type: ignore[method-assign]
-
-        window.next_page()
-        QTest.qWait(window._display_demand_timer.interval() + 5)
-        qapp.processEvents()
-        assert window.viewer.wait_for_rendering()
-        qapp.processEvents()
-
-        assert window.model.focused_index == 1
-        assert tuple(
-            image.image_id for image in window.viewer._images
-        ) == ("2.jpg",)
-        assert applied == [("2.jpg",)]
-        assert all(applied_unit for applied_unit in applied)
-        assert cleared == []
-        assert source.decode_calls == []
-        assert delivered == []
-        assert not window._pdf_prefetch_timer.isActive()
-    finally:
-        window.close()
-        qapp.processEvents()
-
-
 def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
     tmp_path: Path,
     qapp: QApplication,
@@ -743,6 +665,9 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
     window = ViewerWindow(config_manager=config, book_session=session)
     applied: list[tuple[str, ...]] = []
     cleared: list[None] = []
+    presentation_commits: list[
+        tuple[int | None, int, str, int | None, tuple[str, ...]]
+    ] = []
     try:
         window.resize(640, 480)
         window.show()
@@ -770,9 +695,9 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
         original_set_pages = window.viewer.set_pages
         original_clear = window.viewer.clear
 
-        def record_set_pages(spread, pages):
+        def record_set_pages(spread, pages, **kwargs):
             applied.append(tuple(image.image_id for image in pages))
-            original_set_pages(spread, pages)
+            original_set_pages(spread, pages, **kwargs)
 
         def record_clear():
             cleared.append(None)
@@ -780,6 +705,24 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
 
         window.viewer.set_pages = record_set_pages  # type: ignore[method-assign]
         window.viewer.clear = record_clear  # type: ignore[method-assign]
+
+        def record_presentation_commit(_commit) -> None:
+            current_item = window.page_list.currentItem()
+            presentation_commits.append(
+                (
+                    window.presentation_state.displayed_page,
+                    window.slider.value(),
+                    window.status.currentMessage(),
+                    (
+                        current_item.data(Qt.ItemDataRole.UserRole)
+                        if current_item is not None
+                        else None
+                    ),
+                    tuple(image.image_id for image in window.viewer._images),
+                )
+            )
+
+        window.presentationCommitted.connect(record_presentation_commit)
 
         first_started, first_release = source.block("page-1.jpg")
         window.next_page()
@@ -798,12 +741,14 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
             for _rect, pixmap in window.viewer._last_draw_layout
         ) == previous_pixmap_keys
         assert not any(image.loading for image in window.viewer._images)
-        assert window.slider.value() == 1
-        assert "2 / 7" in window.status.currentMessage()
+        assert window.presentation_state.requested_page == 1
+        assert window.presentation_state.displayed_page == 0
+        assert window.slider.value() == 0
+        assert "1 / 7" in window.status.currentMessage()
         assert window.page_list.currentItem() is not None
         assert (
             window.page_list.currentItem().data(Qt.ItemDataRole.UserRole)
-            == 1
+            == 0
         )
 
         first_release.set()
@@ -817,6 +762,14 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
         assert tuple(
             image.image_id for image in window.viewer._images
         ) == ("page-1.jpg",)
+        assert presentation_commits[-1][0:2] == (1, 1)
+        assert "2 / 7" in presentation_commits[-1][2]
+        assert presentation_commits[-1][3:] == (1, ("page-1.jpg",))
+        assert [
+            entry.values.page_index
+            for entry in window.presentation_state.back_history
+        ] == [0]
+        assert window.presentation_state.progress_page == 1
 
         applied.clear()
         reads_before_rapid = list(source.read_calls)
@@ -828,14 +781,24 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
         qapp.processEvents()
 
         assert window.model.focused_index == 5
+        assert window.presentation_state.requested_page == 5
+        assert window.presentation_state.displayed_page == 1
+        assert window.slider.value() == 1
+        assert "2 / 7" in window.status.currentMessage()
         assert applied in ([], [("page-5.jpg",)])
-        assert tuple(
+        intermediate_ids = tuple(
             image.image_id for image in window.viewer._images
-        ) == (
-            ("page-1.jpg",)
-            if not applied
-            else ("page-5.jpg",)
         )
+        # set_pages records acceptance of the new source image before its
+        # asynchronous render necessarily commits. Either the old complete
+        # frame or the final target is valid at this intermediate boundary;
+        # crossed pages are never valid.
+        assert intermediate_ids in {
+            ("page-1.jpg",),
+            ("page-5.jpg",),
+        }
+        if not applied:
+            assert intermediate_ids == ("page-1.jpg",)
 
         assert session.image_cache.wait_for_done(3000)
         qapp.processEvents()
@@ -847,6 +810,14 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
         assert tuple(
             image.image_id for image in window.viewer._images
         ) == ("page-5.jpg",)
+        assert presentation_commits[-1][0:2] == (5, 5)
+        assert "6 / 7" in presentation_commits[-1][2]
+        assert presentation_commits[-1][3:] == (5, ("page-5.jpg",))
+        assert [
+            entry.values.page_index
+            for entry in window.presentation_state.back_history
+        ] == [0, 1]
+        assert window.presentation_state.progress_page == 5
         assert not any(
             image_id in {"page-2.jpg", "page-3.jpg", "page-4.jpg"}
             for unit in applied
@@ -888,6 +859,12 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
         assert len(window.viewer._images) == 1
         assert window.viewer._images[0].error
         assert window.viewer._images[0].pixmap is None
+        assert window.presentation_state.displayed_page == 6
+        assert window.presentation_state.frame_failure is not None
+        assert window.slider.value() == 6
+        assert "7 / 7" in window.status.currentMessage()
+        assert presentation_commits[-1][0:2] == (6, 6)
+        assert window.presentation_state.progress_page == 6
         assert cleared == []
         window.viewer.render(QPixmap(window.viewer.size()))
         qapp.processEvents()

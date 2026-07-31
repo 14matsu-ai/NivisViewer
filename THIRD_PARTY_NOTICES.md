@@ -1,5 +1,93 @@
 # Third-Party Notices
 
+## ZipPlaFork-derived Viewer scheduling and raster-loading structure
+
+This notice supersedes any earlier description that treated ZipPlaFork only as
+design inspiration or stated that its Viewer processing structure was not
+ported.
+
+- Upstream repository: <https://github.com/himamon/ZipPlaFork>
+- Fixed revision: `07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`
+- Upstream license: GNU Affero General Public License v3.0 or later
+  (`AGPL-3.0-or-later`)
+- Preserved license and upstream notice: `licenses/ZipPlaFork/AGPL.txt` and
+  `licenses/ZipPlaFork/About.txt`
+
+The following fixed-revision upstream files, methods, and processing structures
+were examined and used for the book-scoped ZIP raster Viewer runtime:
+
+- `source/ZipPla/ImageLoader.cs`:
+  `ImageLoader.GetJpegOrientation(Stream)`,
+  `ImageLoader.LoadRotateBitmap(Stream)`,
+  the private
+  `ImageLoader.GetFullBitmap(Stream, bool, out ImageInfo, string, bool)`, and
+  its public `ImageLoader.GetFullBitmap(Stream, string, bool)` wrapper. The
+  traced JPEG path uses `SeekableStream.Seekablize(...)`, `Exif.GetAll(...)`,
+  `StopBuffering()`, `new Bitmap(seekable)`, and
+  `ViewerFormImageFilter.Rotate(...)`.
+- `source/ZipPla/ImageLoader.cs`: `VirtualBitmapEx`,
+  `VirtualBitmapEx.DataSizeInBytes`, and
+  `BitmapEx.GetDataSizeInBytes()`. The accounting includes both other/display
+  data and the retained source bitmap.
+- `source/ZipPla/PackedImageLoader.cs`: `PackedImageLoader` and
+  `ReadOnMemoryMode` (normally `None`), including the retained archive
+  reader/entry index and the physical-entry stream passed to
+  `ImageLoader.GetFullBitmap(Stream, ...)`.
+- `source/ZipPla/ViewerForm.cs`: the one-page-at-a-time worker, current-first
+  and nearby work selection, UI completion callback, completed-bitmap
+  replacement, and loading-mask regions traced end to end.
+- `source/ZipPla/ViewerFormImageFilter.cs`:
+  `ViewerFormImageFilter.GetOrientation(int)` and
+  `ViewerFormImageFilter.Rotate(...)`.
+- `source/ZipPla/Exif.cs`: `Exif.GetAll(Stream)`.
+
+NivisViewer's `app/zip_raster_book_runtime.py`, especially
+`ZipRasterBookRuntime`, `_ZipRasterUnitJob`, and their page-record eviction,
+is a **direct structural translation/port** of that worker ownership and
+work-order control flow: one active display-unit job, entry read through
+display-ready image preparation in that job, current completion before ordered
+prefetch, current/next/previous artifact retention, and cancellation or
+rejection of obsolete work. It is not a verbatim or line-for-line translation
+of the upstream C# source.
+
+NivisViewer's `app/viewer_presentation_state.py` and the corresponding
+integration in `app/viewer_window.py` and `app/viewer_widget.py` also adopt the
+single-owner completed-artifact publication structure traced through
+`source/ZipPla/ViewerForm.cs` methods
+`bmwLoadEachPage_EachRunWorkerCompleted`, `SetNewResizedImage`,
+`showCurrentPage`, and `pbView_Paint` / `pbView_PaintToCanvas`. In NivisViewer,
+the accepted complete frame, displayed page, slider, status, page history, and
+reading progress are published from one presentation commit instead of being
+updated independently. This processing organization is treated as a direct
+structural port and as AGPL-3.0-or-later-derived. It is not a verbatim or
+line-for-line translation of the upstream C# source.
+
+The following are independent NivisViewer Qt/Python implementations, not
+literal ZipPlaFork translations:
+
+- `app/image_source.py`: the persistent Python `ZipFile`/entry index,
+  request-local cancellation, deferred ZIP close, Pillow decode adapter,
+  Qt JPEG decoder-sized adapter, and WebP adapter used by the book runtime.
+  The reserved-`QByteArray` and sequential-`QIODevice` JPEG adapters were
+  measured for the earlier compatible-path A/B and remain regression/profiling
+  code; neither defines the current runtime architecture.
+- GUI-thread-only `QPixmap.fromImage`, immutable
+  source/layout/request-generation checks, book-epoch and DPR tokens,
+  immutable presentation snapshots, committed history/progress policy,
+  byte-budgeted page records, and atomic single/spread/wide-split ViewerWidget
+  frame replacement.
+- NivisViewer-specific Browser-lane gating, render-spec adaptation for
+  page-list-independent single/spread/rotation/filter/magnifier behavior,
+  stale-result rejection, and BookSession-owned shutdown.
+
+Those Qt/Python mechanisms implement the same performance objective but were
+written independently for NivisViewer. The structural portions identified
+above remain documented as ZipPlaFork-derived and
+AGPL-3.0-or-later-derived. See section 11 of
+`docs/ZIPPLAFORK_COMPARISON.md` for the current method-level mapping and
+adoption decision. `docs/ZIPPLAFORK_FINAL_ADOPTION.md` is retained only as the
+superseded compatible-path A/B record.
+
 NivisViewerは現在、次のソフトウェアを直接依存として使用しています。
 
 - PySide6 / Qt：GUI
@@ -15,22 +103,23 @@ Viewer性能設計の比較と構造移植には、AGPL-3.0-or-laterのZipPlaFor
 `source/ZipPla/Properties/AssemblyInfo.cs`の
 `Copyright © 2016-2017 Rio's Toolbox`です。
 
-NivisViewerは、Viewerの単一execution lane、current中心のqueue再構築、
-1 display unitがdecodeからdisplay-ready terminalへ到達してから次unitを
-投入するpaced dispatch、完成frameのatomic publish、source/display cacheの
-連動したmemory policyをZipPlaFork由来の構造として適用しています。
-NivisViewerではliteralな1 worker jobへ統合せず、decode taskからQt signalを
-経てrender taskへ渡す境界を残したまま、同じ1-worker Viewer laneで順序を
-制御します。ZipPlaForkは移動方向を状態として追跡せず、新currentを基準に
-数値上のnext、previousの順で再計算します。NivisViewerの方向追跡、
-request/generation検証、16 ms入力coalescing、decoder-sized JPEGは独自拡張です。
+NivisViewerはZIP／CBZ book全体について、単一display-unit job、current中心の
+work order再構築、current完成後のnext／previous dispatch、完成frameのatomic
+publish、近傍page record保持をZipPlaFork由来の構造として直接移植しています。
+single／spread、rotation、filter、page-list表示、magnifierなどの機能を理由に
+従来のdecode task、render task、prepared/source cache経路へfallbackしません。
+NivisViewer独自の拡張は、移動方向を反映した近傍順、
+request/generation/source/layout検証、協調cancel、decoder-sized JPEGを同一job
+内のdecoder strategyとして使うこと、GUI-thread QPixmap化、完成前の旧frame
+保持、およびBookSessionによるruntime／archive lifetime所有です。
 
-今回、C#のソース表現、pixel loop、GDI操作、翻訳コード、binary、upstream
-source fileは取り込まず、ZipPlaForkをruntime／build依存にもしていません。
-一方、repository規則に従い、上記アルゴリズム／処理構造は
+C#ソースの逐語・行単位コピー、GDI固有処理、binary、upstream source fileの
+同梱は行わず、ZipPlaForkをruntime／build依存にもしていません。ただし、
+上記worker ownershipとwork-order control flowは直接的な構造翻訳であり、
 AGPL-3.0-or-later由来として扱います。固定revision、元file／class／method、
 処理内容、NivisViewer側の対応箇所、移植境界、cache accountingの相違は
-`docs/ZIPPLAFORK_COMPARISON.md`に記録しています。upstreamの完全な
+`docs/ZIPPLAFORK_COMPARISON.md`と
+`docs/ZIPPLAFORK_FINAL_ADOPTION.md`に記録しています。upstreamの完全な
 AGPL本文は`licenses/ZipPlaFork/AGPL.txt`、正式通知は
 `licenses/ZipPlaFork/About.txt`として、固定revisionの内容を変更せず保持して
 います。

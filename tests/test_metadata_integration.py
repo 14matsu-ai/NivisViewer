@@ -4,10 +4,12 @@ import sqlite3
 import zipfile
 from io import BytesIO
 from pathlib import Path
+from time import monotonic
 from unittest.mock import patch
 
 import pytest
 from PIL import Image
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from app.application_controller import ApplicationController
@@ -58,6 +60,23 @@ def close_controller(
 def finish_viewer_open(qapp: QApplication, window) -> None:
     assert window.book_session.wait_for_async(2000)
     qapp.processEvents()
+
+
+def finish_presentation(
+    qapp: QApplication,
+    window,
+    page_index: int,
+    *,
+    timeout_ms: int = 3000,
+) -> None:
+    deadline = monotonic() + timeout_ms / 1000
+    while (
+        window.presentation_state.displayed_page != page_index
+        and monotonic() < deadline
+    ):
+        qapp.processEvents()
+        QTest.qWait(5)
+    assert window.presentation_state.displayed_page == page_index
 
 
 def persisted_page(database_path: Path, book_path: Path) -> int:
@@ -126,6 +145,7 @@ def test_progress_is_batched_then_flushed_when_switching_books(
     finish_viewer_open(qapp, window)
 
     window.next_one_page()
+    finish_presentation(qapp, window, 1)
 
     assert window.model.current_index == 1
     assert persisted_page(controller.config.metadata_database_path, first_book) == 0
@@ -146,6 +166,7 @@ def test_viewer_close_flushes_latest_progress(
     window = controller.open_path(book)
     finish_viewer_open(qapp, window)
     window.next_one_page()
+    finish_presentation(qapp, window, 1)
 
     window.close()
     qapp.processEvents()
@@ -166,6 +187,7 @@ def test_normal_reopen_restores_progress_and_clamps_to_page_count(
     finish_viewer_open(qapp, window)
     window.next_one_page()
     window.next_one_page()
+    finish_presentation(qapp, window, 2)
     window.prepare_shutdown()
 
     reopened = controller.create_viewer_window()
@@ -324,12 +346,14 @@ def test_zip_open_position_defaults_to_first_and_can_resume(
 
     first = controller.open_path(archive, open_in_new_window=True)
     finish_viewer_open(qapp, first)
+    finish_presentation(qapp, first, 0)
     assert first.model.current_index == 0
     assert controller.metadata_store.get_reading_progress(str(archive)).page_index == 2
 
     controller.config.apply({"book_open_position": "resume_last"})
     resumed = controller.open_path(archive, open_in_new_window=True)
     finish_viewer_open(qapp, resumed)
+    finish_presentation(qapp, resumed, 2)
     assert resumed.model.current_index == 2
     close_controller(controller, qapp)
 
@@ -349,6 +373,8 @@ def test_multiple_viewers_update_shared_database_without_corruption(
     first.next_one_page()
     second.next_one_page()
     second.next_one_page()
+    finish_presentation(qapp, first, 1)
+    finish_presentation(qapp, second, 2)
     first.close()
     second.close()
     qapp.processEvents()
@@ -372,6 +398,7 @@ def test_controller_shutdown_flushes_and_closes_store_idempotently(
     window = controller.open_path(book)
     finish_viewer_open(qapp, window)
     window.next_one_page()
+    finish_presentation(qapp, window, 1)
 
     controller.shutdown()
     controller.shutdown()
@@ -409,6 +436,7 @@ def test_lifecycle_metadata_flush_does_not_probe_source(
     window = controller.open_path(first_book)
     finish_viewer_open(qapp, window)
     window.next_one_page()
+    finish_presentation(qapp, window, 1)
     source_key = MetadataStore.normalize_path(first_book)
     calls = {"is_dir": 0}
     original_infer = MetadataStore._infer_item_type
