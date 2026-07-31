@@ -2421,6 +2421,7 @@ class ViewerWindow(QMainWindow):
             current,
             tuple(work_order),
             render_spec,
+            navigation_direction=direction,
         )
 
     def _activate_zip_runtime(self) -> None:

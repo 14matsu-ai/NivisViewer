@@ -49,6 +49,7 @@ def _request(
     current: ZipRasterDisplayUnit,
     *work_order: ZipRasterDisplayUnit,
     spec: ZipRasterRenderSpec | None = None,
+    direction: int = 0,
 ) -> ZipRasterRequest:
     return ZipRasterRequest(
         1,
@@ -56,6 +57,7 @@ def _request(
         current,
         work_order or (current,),
         spec or ZipRasterRenderSpec((640, 480)),
+        navigation_direction=direction,
     )
 
 
@@ -126,6 +128,68 @@ def test_runtime_uses_one_ordered_job_lane_and_paint_gates_prefetch(
         assert frames[-1].request_id == 2
         assert frames[-1].cache_hit
         assert runtime.metrics.jobs_submitted == jobs_before_hit
+    finally:
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()
+
+
+def test_completed_frames_outlive_active_frontier_and_make_roundtrip_ready(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    source = ZipImageSource(_write_zip(tmp_path, pages=6))
+    runtime = ZipRasterBookRuntime(source, 1, cache_unit_limit=5)
+    frames: list[ZipRasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    try:
+        for request_id, page_index in enumerate(range(4), start=1):
+            order = [_unit(page_index)]
+            if page_index + 1 < 6:
+                order.append(_unit(page_index + 1))
+            if page_index > 0:
+                order.append(_unit(page_index - 1))
+            assert runtime.request(
+                _request(
+                    request_id,
+                    order[0],
+                    *order,
+                    direction=1,
+                )
+            )
+            _wait_until(
+                qapp,
+                lambda current=request_id: bool(frames)
+                and frames[-1].request_id == current,
+            )
+            assert runtime.release_prefetch(request_id=request_id)
+            _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+
+        # Page 0 and 1 are outside the final (3, 4, 2) active frontier, but
+        # remain valid completed artifacts because no cache limit is exceeded.
+        assert set(runtime.cached_page_indexes) == {0, 1, 2, 3, 4}
+
+        # At capacity, the newly adjacent page replaces the farthest retained
+        # page instead of purging every frame outside the three active keys.
+        assert runtime.request(
+            _request(5, _unit(4), _unit(4), _unit(5), _unit(3), direction=1)
+        )
+        qapp.processEvents()
+        assert frames[-1].request_id == 5
+        assert frames[-1].cache_hit
+        assert runtime.release_prefetch(request_id=5)
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+        assert set(runtime.cached_page_indexes) == {1, 2, 3, 4, 5}
+        assert runtime.metrics.cache_evictions == 1
+
+        submitted_before_roundtrip = runtime.metrics.jobs_submitted
+        assert runtime.request(
+            _request(6, _unit(1), _unit(1), _unit(0), _unit(2), direction=-1)
+        )
+        qapp.processEvents()
+
+        assert frames[-1].request_id == 6
+        assert frames[-1].cache_hit
+        assert runtime.metrics.jobs_submitted == submitted_before_roundtrip
     finally:
         assert runtime.shutdown(wait_msecs=3000)
         source.close()
@@ -218,7 +282,7 @@ def test_runtime_returns_terminal_error_frame_without_legacy_fallback(
         source.close()
 
 
-def test_memory_budget_rejects_each_prefetch_once_without_decode_loop(
+def test_memory_budget_stops_prefetch_before_decode_churn(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
@@ -231,15 +295,12 @@ def test_memory_budget_rejects_each_prefetch_once_without_decode_loop(
         assert runtime.request(request)
         _wait_until(qapp, lambda: len(frames) == 1)
         assert runtime.release_prefetch(request_id=1)
-        _wait_until(
-            qapp,
-            lambda: runtime.metrics.jobs_submitted == 3
-            and not runtime.has_unfinished_tasks(),
-        )
-
-        QTest.qWait(50)
         qapp.processEvents()
-        assert runtime.metrics.jobs_submitted == 3
+
+        # The current frame alone exceeds the byte budget, so low-priority
+        # neighbors are not decoded only to be evicted immediately.
+        assert runtime.metrics.jobs_submitted == 1
+        assert runtime.metrics.prefetch_admission_stops == 1
         assert runtime.cached_page_indexes == (1,)
     finally:
         assert runtime.shutdown(wait_msecs=3000)

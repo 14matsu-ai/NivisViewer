@@ -866,6 +866,31 @@ def _ensure_anchor_and_clear(
     gc.collect()
 
 
+def _install_legacy_frontier_purge(runtime: ZipRasterBookRuntime) -> None:
+    """Benchmark-only reproduction of the superseded three-unit purge.
+
+    This does not add a production fallback. It lets the same process fixture,
+    decoder and Viewer path measure only the cache-ownership policy changed by
+    ``_ZipRasterFrameStore``.
+    """
+
+    original_request = runtime.request
+
+    def request_with_frontier_purge(
+        current_runtime: ZipRasterBookRuntime,
+        request,
+    ) -> bool:
+        accepted = original_request(request)
+        desired = set(current_runtime._work_keys)
+        frames = current_runtime._frame_store._frames
+        for key in tuple(frames):
+            if desired and key not in desired:
+                frames.pop(key, None)
+        return accepted
+
+    runtime.request = MethodType(request_with_frontier_purge, runtime)
+
+
 def _finish_regular_scenario(
     application: QApplication,
     window: ViewerWindow,
@@ -902,6 +927,7 @@ def _viewer_case(
     viewport: tuple[int, int],
     cache_mib: int,
     timeout_seconds: float,
+    cache_policy: str,
 ) -> Iterator[tuple[ViewerWindow, _ViewerProbe]]:
     config = ConfigManager(root / "benchmark-config.json")
     config.load()
@@ -960,6 +986,8 @@ def _viewer_case(
         if not window._zip_runtime_active:
             raise AssertionError("production ZIP runtime was not selected")
         probe = _ViewerProbe(window)
+        if cache_policy == "legacy-frontier-purge":
+            _install_legacy_frontier_purge(probe.runtime)
         if not _wait_for_quiet(
             application,
             window,
@@ -1116,6 +1144,45 @@ def _run_scenarios(
         timeout_seconds=timeout_seconds,
     )
 
+    # Walk beyond the old three-unit frontier, let each current/neighbor job
+    # settle, then return to a previously completed page without clearing the
+    # book cache. This distinguishes retention from cold decode without
+    # changing decoder, ZIP payload, viewport, or input timing.
+    _ensure_anchor_and_clear(
+        application, window, probe, 1, timeout_seconds=timeout_seconds
+    )
+    for page in (2, 3, 4, 5):
+        _execute_leg(
+            application,
+            window,
+            probe,
+            lambda target=page: window._go_to_index_with_history(target),
+            page,
+            timeout_seconds=timeout_seconds,
+        )
+        if not _wait_for_quiet(
+            application, window, probe, timeout_seconds=timeout_seconds
+        ):
+            raise TimeoutError("retention-path setup did not settle")
+    snapshot = probe.begin()
+    retained_return = _execute_leg(
+        application,
+        window,
+        probe,
+        lambda: window._go_to_index_with_history(2),
+        2,
+        timeout_seconds=timeout_seconds,
+    )
+    results["retained_roundtrip"] = _finish_regular_scenario(
+        application,
+        window,
+        probe,
+        snapshot,
+        requested_pages=[2],
+        legs=[retained_return],
+        timeout_seconds=timeout_seconds,
+    )
+
     # Populate a complete current/neighbor work order, then repeat the exact
     # current request to exercise the display-ready cache-hit path.
     _ensure_anchor_and_clear(
@@ -1224,6 +1291,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--pressure-mib", type=int, default=6)
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument(
+        "--cache-policy",
+        choices=("retention", "legacy-frontier-purge"),
+        default="retention",
+        help=(
+            "retention is production B; legacy-frontier-purge is a "
+            "benchmark-only reproduction of superseded A"
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         help="optional JSON output path; stdout is always written",
@@ -1267,6 +1343,7 @@ def main() -> int:
             viewport=viewport,
             cache_mib=int(args.cache_mib),
             timeout_seconds=float(args.timeout),
+            cache_policy=str(args.cache_policy),
         ) as (window, probe):
             scenarios = _run_scenarios(
                 application,
@@ -1276,8 +1353,9 @@ def main() -> int:
                 pressure_mib=int(args.pressure_mib),
             )
         report = {
-            "schema_version": 1,
+            "schema_version": 2,
             "path": "ViewerWindow -> ZipRasterBookRuntime",
+            "cache_policy": str(args.cache_policy),
             "qt_platform": os.environ.get("QT_QPA_PLATFORM"),
             "fixture": {
                 "temporary_directory": True,
@@ -1291,9 +1369,13 @@ def main() -> int:
             },
             "measurement_scope": {
                 "legacy_ab": (
-                    "not run: the old compatible-path A/B is historical; a "
-                    "legacy ZIP run now requires a benchmark-only non-ZIP "
-                    "adapter and is not a production-path comparison"
+                    "cache-policy A/B only: both modes use the production ZIP "
+                    "runtime, decoder and render path; legacy-frontier-purge "
+                    "reproduces only the superseded cache-membership rule"
+                ),
+                "retained_roundtrip": (
+                    "walks four pages beyond the old three-unit frontier and "
+                    "returns without an artificial cache clear"
                 ),
                 "zip_bytes": (
                     "exact for completed application-visible entry reads; "

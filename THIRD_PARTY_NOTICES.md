@@ -35,20 +35,26 @@ were examined and used for the book-scoped ZIP raster Viewer runtime:
   `ImageLoader.GetFullBitmap(Stream, ...)`.
 - `source/ZipPla/ViewerForm.cs`: the one-page-at-a-time worker, current-first
   and nearby work selection, UI completion callback, completed-bitmap
-  replacement, and loading-mask regions traced end to end.
+  replacement, loading-mask regions, `priorityLevel` full-page ranking, and
+  `ReduceUsingMemory` work-order-based disposal traced end to end.
+- `source/ZipPla/GenerarClasses.cs`:
+  `BackgroundMultiWorker.SetWorksOrder` and its completion-time selection of
+  the first unfinished item from the latest order.
 - `source/ZipPla/ViewerFormImageFilter.cs`:
   `ViewerFormImageFilter.GetOrientation(int)` and
   `ViewerFormImageFilter.Rotate(...)`.
 - `source/ZipPla/Exif.cs`: `Exif.GetAll(Stream)`.
 
 NivisViewer's `app/zip_raster_book_runtime.py`, especially
-`ZipRasterBookRuntime`, `_ZipRasterUnitJob`, and their page-record eviction,
+`ZipRasterBookRuntime`, `_ZipRasterUnitJob`, and `_ZipRasterFrameStore`,
 is a **direct structural translation/port** of that worker ownership and
 work-order control flow: one active display-unit job, entry read through
 display-ready image preparation in that job, current completion before ordered
-prefetch, current/next/previous artifact retention, and cancellation or
-rejection of obsolete work. It is not a verbatim or line-for-line translation
-of the upstream C# source.
+prefetch, completed-artifact retention until real unit/byte pressure,
+current/next/previous protection, work-order/distance eviction, and
+cancellation or rejection of obsolete work. The active three-unit scheduling
+frontier is not used as cache membership. It is not a verbatim or line-for-line
+translation of the upstream C# source.
 
 NivisViewer's `app/viewer_presentation_state.py` and the corresponding
 integration in `app/viewer_window.py` and `app/viewer_widget.py` also adopt the
@@ -111,7 +117,8 @@ single／spread、rotation、filter、page-list表示、magnifierなどの機能
 NivisViewer独自の拡張は、移動方向を反映した近傍順、
 request/generation/source/layout検証、協調cancel、decoder-sized JPEGを同一job
 内のdecoder strategyとして使うこと、GUI-thread QPixmap化、完成前の旧frame
-保持、およびBookSessionによるruntime／archive lifetime所有です。
+保持、全page配列をwheelごとに生成しないdistance rank、decode前のmemory
+admission、およびBookSessionによるruntime／archive lifetime所有です。
 
 C#ソースの逐語・行単位コピー、GDI固有処理、binary、upstream source fileの
 同梱は行わず、ZipPlaForkをruntime／build依存にもしていません。ただし、
