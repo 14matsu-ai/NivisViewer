@@ -4,6 +4,7 @@ import os
 import threading
 import zipfile
 from pathlib import Path
+from time import monotonic
 
 import pytest
 from PIL import Image
@@ -41,6 +42,13 @@ def finish_open(
 ) -> None:
     assert window.book_session.wait_for_async(timeout_ms)
     qapp.processEvents()
+
+
+def current_page_list_page(window: ViewerWindow) -> int | None:
+    index = window.page_list.currentIndex()
+    if not index.isValid():
+        return None
+    return window.page_list_model.page_index_at(index.row())
 
 
 class ControlledZipSource(ImageSource):
@@ -82,6 +90,11 @@ class ControlledZipSource(ImageSource):
 
     def display_path(self, image_id: str) -> str:
         return f"{self.source_path}!/{image_id}"
+
+    def fork_for_thumbnail(self) -> ImageSource:
+        # PageList owns an independent read session; its low-priority reads
+        # must not contaminate the main Viewer navigation assertions below.
+        return ControlledZipSource(self.source_path, pages=len(self.ids))
 
 
 def test_shared_config_is_injected(tmp_path: Path, qapp: QApplication) -> None:
@@ -138,25 +151,38 @@ def test_open_path_displays_book(tmp_path: Path, qapp: QApplication) -> None:
     qapp.processEvents()
 
 
-def test_hidden_page_list_defers_all_items_until_first_visible(
+def test_page_list_virtualizes_rows_and_loads_only_the_visible_frontier(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
     class ManyPageSource(ImageSource):
         load_sizes_lazily = True
 
-        def __init__(self) -> None:
+        def __init__(self, *, thumbnail: bool = False) -> None:
             super().__init__(tmp_path / "book")
             self.ids = [f"page-{index:04d}.jpg" for index in range(1000)]
+            self.thumbnail = thumbnail
+            self.open_calls: list[str] = []
+            self.forks: list[ManyPageSource] = []
+            self.closed = False
 
         def list_images(self) -> list[str]:
             return list(self.ids)
 
-        def open_image(self, _image_id: str) -> Image.Image:
+        def open_image(self, image_id: str) -> Image.Image:
+            self.open_calls.append(image_id)
             return Image.new("RGB", (8, 12), "white")
 
         def display_path(self, image_id: str) -> str:
             return image_id
+
+        def fork_for_thumbnail(self) -> ImageSource:
+            fork = ManyPageSource(thumbnail=True)
+            self.forks.append(fork)
+            return fork
+
+        def close(self) -> None:
+            self.closed = True
 
     source = ManyPageSource()
     session = BookSession(
@@ -166,14 +192,6 @@ def test_hidden_page_list_defers_all_items_until_first_visible(
         config_manager=make_config(tmp_path),
         book_session=session,
     )
-    item_counts_at_request: list[int] = []
-    original_preload = window.image_cache.preload_around
-
-    def record_preload(*args, **kwargs):
-        item_counts_at_request.append(window.page_list.count())
-        return original_preload(*args, **kwargs)
-
-    window.image_cache.preload_around = record_preload
     assert window.open_path(tmp_path / "book")
     finish_open(window, qapp)
     assert window.image_cache.wait_for_done(2000)
@@ -183,41 +201,124 @@ def test_hidden_page_list_defers_all_items_until_first_visible(
     assert window.viewer.wait_for_rendering()
     qapp.processEvents()
 
-    assert item_counts_at_request
-    assert item_counts_at_request[0] == 0
-    assert window.page_list.count() == 0
-    assert window._page_list_dirty
+    runtime = session.page_list_runtime
+    assert runtime is not None
+    assert window.page_list_model.rowCount() == 0
+    assert not runtime.visible
+    assert not runtime.has_unfinished_tasks()
+    assert source.forks == []
 
-    rebuilds: list[None] = []
-    original_rebuild = window._rebuild_page_list
-
-    def counted_rebuild():
-        rebuilds.append(None)
-        original_rebuild()
-
-    window._rebuild_page_list = counted_rebuild
     window.show()
     qapp.processEvents()
     window.set_page_list_visible(True)
-    qapp.processEvents()
+    deadline = monotonic() + 3
+    while not runtime.cached_pages and monotonic() < deadline:
+        qapp.processEvents()
+        QTest.qWait(5)
 
-    assert window.page_list.count() == 1000
-    assert not window._page_list_dirty
-    assert window.page_list.currentItem() is not None
-    assert (
-        window.page_list.currentItem().data(Qt.ItemDataRole.UserRole)
-        == window.model.focused_index
+    assert window.page_list_model.rowCount() == 1000
+    assert current_page_list_page(window) == window.model.focused_index
+    assert 0 < len(runtime.desired_pages) < 1000
+    assert source.forks
+    assert set(source.forks[0].open_calls).issubset(
+        {
+            runtime.image_ids[index]
+            for index in runtime.desired_pages
+        }
     )
-    assert not window.page_list.item(0).icon().isNull()
-    assert len(rebuilds) == 1
+    assert runtime.cached_pages
+    first_cached = runtime.cached_pages[0]
+    row = window.page_list_model.row_for_page(first_cached)
+    icon = window.page_list_model.data(
+        window.page_list_model.index(row, 0),
+        Qt.ItemDataRole.DecorationRole,
+    )
+    assert icon is not None and not icon.isNull()
 
     window.set_page_list_visible(False)
-    window.set_page_list_visible(True)
+    deadline = monotonic() + 3
+    while runtime.has_unfinished_tasks() and monotonic() < deadline:
+        qapp.processEvents()
+        QTest.qWait(5)
     qapp.processEvents()
-    assert window.page_list.count() == 1000
-    assert len(rebuilds) == 1
+    assert window.page_list_model.rowCount() == 0
+    assert runtime.desired_pages == ()
+    assert runtime.cached_pages == ()
+    assert source.forks[0].closed
     window.close()
     qapp.processEvents()
+
+
+def test_page_list_switches_with_first_committed_replacement_frame(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    first_folder = tmp_path / "first-book"
+    second_folder = tmp_path / "second-book"
+    first_image = first_folder / "first.jpg"
+    second_image = second_folder / "second.jpg"
+    write_image(first_image)
+    write_image(second_image)
+    config = make_config(tmp_path)
+    config.apply({"show_page_list": True}, save=False)
+    session = BookSession()
+    window = ViewerWindow(config_manager=config, book_session=session)
+    window.resize(640, 480)
+    window.show()
+    try:
+        first_opened = session.open_book(first_folder)
+        assert window._finish_opened_book(first_opened, modal_on_empty=False)
+        assert session.image_cache.wait_for_done(2000)
+        qapp.processEvents()
+        QTest.qWait(window._display_demand_timer.interval() + 20)
+        qapp.processEvents()
+        assert window.viewer.wait_for_rendering()
+        qapp.processEvents()
+
+        first_runtime = session.page_list_runtime
+        assert first_runtime is not None
+        assert window._page_list_runtime is first_runtime
+        assert window.page_list.isEnabled()
+        assert window.page_list_model.image_id_for_page(0) == str(first_image)
+
+        second_opened = session.open_book(second_folder)
+        second_runtime = session.page_list_runtime
+        assert second_runtime is not None
+        assert second_runtime is not first_runtime
+
+        # Source/model installation is not a presentation commit.  Keep the
+        # preceding committed list as a disabled snapshot and do not retain a
+        # pointer to BookSession's now-retired runtime.
+        assert window._page_list_runtime is None
+        assert window._staged_page_list_runtime is second_runtime
+        assert not window.page_list.isEnabled()
+        assert window.page_list_model.image_id_for_page(0) == str(first_image)
+        qapp.processEvents()
+        window._update_page_list_visible_work()
+        assert window.page_list_model.image_id_for_page(0) == str(first_image)
+
+        assert window._finish_opened_book(second_opened, modal_on_empty=False)
+        assert session.image_cache.wait_for_done(2000)
+        qapp.processEvents()
+        QTest.qWait(window._display_demand_timer.interval() + 20)
+        qapp.processEvents()
+        assert window.viewer.wait_for_rendering()
+        deadline = monotonic() + 3
+        while (
+            window._page_list_runtime is not second_runtime
+            and monotonic() < deadline
+        ):
+            qapp.processEvents()
+            window.viewer.wait_for_rendering()
+            QTest.qWait(5)
+
+        assert window._page_list_runtime is second_runtime
+        assert window._staged_page_list_runtime is None
+        assert window.page_list.isEnabled()
+        assert window.page_list_model.image_id_for_page(0) == str(second_image)
+    finally:
+        window.close()
+        qapp.processEvents()
 
 
 def test_close_safely_shuts_down_book_session(
@@ -707,17 +808,12 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
         window.viewer.clear = record_clear  # type: ignore[method-assign]
 
         def record_presentation_commit(_commit) -> None:
-            current_item = window.page_list.currentItem()
             presentation_commits.append(
                 (
                     window.presentation_state.displayed_page,
                     window.slider.value(),
                     window.status.currentMessage(),
-                    (
-                        current_item.data(Qt.ItemDataRole.UserRole)
-                        if current_item is not None
-                        else None
-                    ),
+                    current_page_list_page(window),
                     tuple(image.image_id for image in window.viewer._images),
                 )
             )
@@ -745,11 +841,7 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
         assert window.presentation_state.displayed_page == 0
         assert window.slider.value() == 0
         assert "1 / 7" in window.status.currentMessage()
-        assert window.page_list.currentItem() is not None
-        assert (
-            window.page_list.currentItem().data(Qt.ItemDataRole.UserRole)
-            == 0
-        )
+        assert current_page_list_page(window) == 0
 
         first_release.set()
         assert session.image_cache.wait_for_done(2000)

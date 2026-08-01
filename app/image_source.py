@@ -14,8 +14,10 @@ from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QSize
 from PySide6.QtGui import QImage, QImageIOHandler, QImageReader
 
 from .archive_backend import (
+    ArchiveEntry,
     ArchiveBackendError,
     ArchiveErrorCode,
+    ArchiveListing,
     MAX_IMAGE_ENTRY_BYTES,
     select_image_entries,
 )
@@ -201,6 +203,12 @@ class FolderListingSnapshot:
 
 
 @dataclass(frozen=True)
+class SevenZipListingSnapshot:
+    listing: ArchiveListing
+    image_entries: tuple[ArchiveEntry, ...]
+
+
+@dataclass(frozen=True)
 class StreamedJpegDecode:
     qimage: QImage
     original_size: tuple[int, int]
@@ -335,6 +343,14 @@ class ImageSource(ABC):
         maximum_size: tuple[int, int],
     ) -> tuple[QImage, tuple[int, int]] | None:
         return None
+
+    def fork_for_thumbnail(self) -> ImageSource:
+        """Return a source session suitable for PageList thumbnail work.
+
+        The default keeps compatibility with lightweight/custom sources.  A
+        caller owns the returned source only when it is not ``self``.
+        """
+        return self
 
     def close(self) -> None:
         pass
@@ -501,6 +517,14 @@ class FolderImageSource(ImageSource):
 
     def file_size(self, image_id: str) -> int | None:
         return self._file_size_cache.get(self._path_identity(image_id))
+
+    def fork_for_thumbnail(self) -> ImageSource:
+        return FolderImageSource(
+            self.source_path,
+            recursive=self.recursive,
+            sort_descending=self.sort_descending,
+            image_snapshot=tuple(self.list_images()),
+        )
 
 
 class ZipImageSource(ImageSource):
@@ -901,6 +925,12 @@ class ZipImageSource(ImageSource):
         except KeyError:
             return None
 
+    def fork_for_thumbnail(self) -> ImageSource:
+        return ZipImageSource(
+            self.source_path,
+            sort_descending=self.sort_descending,
+        )
+
     def close(self) -> None:
         close_zip = False
         with self._active_lock:
@@ -937,6 +967,7 @@ class SevenZipImageSource(ImageSource):
         backend,
         sort_descending: bool = False,
         cancel_token=None,
+        listing_snapshot: SevenZipListingSnapshot | None = None,
     ) -> None:
         super().__init__(archive_path)
         self.backend = backend
@@ -945,17 +976,23 @@ class SevenZipImageSource(ImageSource):
         self._active_lock = threading.RLock()
         self._active_requests: dict[str, set[threading.Event]] = {}
         try:
-            listing = backend.list_entries(
-                str(self.source_path),
-                cancel_token=cancel_token,
-            )
+            if listing_snapshot is None:
+                listing = backend.list_entries(
+                    str(self.source_path),
+                    cancel_token=cancel_token,
+                )
+                entries = tuple(
+                    select_image_entries(
+                        listing,
+                        SUPPORTED_EXTENSIONS,
+                        descending=sort_descending,
+                    )
+                )
+            else:
+                listing = listing_snapshot.listing
+                entries = listing_snapshot.image_entries
             if listing.encrypted:
                 raise ArchiveBackendError(ArchiveErrorCode.PASSWORD_REQUIRED)
-            entries = select_image_entries(
-                listing,
-                SUPPORTED_EXTENSIONS,
-                descending=sort_descending,
-            )
         except ArchiveBackendError as exc:
             raise ImageSourceError(
                 exc.user_message,
@@ -970,6 +1007,7 @@ class SevenZipImageSource(ImageSource):
         self.solid = listing.solid
         self._entries = entries
         self._entry_by_id = {entry.path: entry for entry in entries}
+        self._listing_snapshot = SevenZipListingSnapshot(listing, entries)
 
     def list_images(self) -> list[str]:
         return [entry.path for entry in self._entries]
@@ -1036,6 +1074,14 @@ class SevenZipImageSource(ImageSource):
     def file_size(self, image_id: str) -> int | None:
         entry = self._entry_by_id.get(image_id)
         return entry.size if entry is not None else None
+
+    def fork_for_thumbnail(self) -> ImageSource:
+        return SevenZipImageSource(
+            self.source_path,
+            backend=self.backend,
+            sort_descending=self.sort_descending,
+            listing_snapshot=self._listing_snapshot,
+        )
 
     def close(self) -> None:
         self._closed.set()

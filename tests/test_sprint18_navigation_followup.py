@@ -275,11 +275,13 @@ def test_page_list_selection_uses_committed_presentation_fast_path(
         window._sync_page_list_selection()
 
         assert resolve_calls == 0
-        current_item = window.page_list.currentItem()
-        assert current_item is not None
+        current_index = window.page_list.currentIndex()
+        assert current_index.isValid()
         assert window.model.focused_index == last_index
         assert window.presentation_state.displayed_page == 0
-        assert current_item.data(Qt.ItemDataRole.UserRole) == 0
+        assert (
+            window.page_list_model.page_index_at(current_index.row()) == 0
+        )
     finally:
         window.close()
         qapp.processEvents()

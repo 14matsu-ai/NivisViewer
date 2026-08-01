@@ -110,7 +110,7 @@ ApplicationController
 - `ViewerPageNavigationController`: 通常／全画面slider、canvas click、メニューからの論理1ページ移動と固定表示単位移動を一元化し、本を開く責務を持たない
 - `ViewerPageSlider`: focused page indexを0始まりで表示し、angleDelta／pixelDeltaを累積してwheelを1ノッチ1論理ページへ変換し、処理済みeventをconsumeする
 - `FullscreenChromeController`: 全画面時の上下端検出、BottomRevealStrip、menu／slider／statusのoverlay表示、自動非表示、通常配置への復元を担当
-- `BookSession`: 現在のパス、ImageSource、PageModel、ImageCache、読み込み世代、外部書庫の非同期prepare→commit、ソース切替と終了を管理
+- `BookSession`: 現在のパス、ImageSource、PageModel、ImageCache、読み込み世代、外部書庫の非同期prepare→commitに加え、book単位のViewer runtimeとViewerPageListRuntimeの生成・退役・callback drain後のsource解放を管理
 - `ConfigManager`: 実行ファイル基準の`config.json`を読み書きし、メタデータDBやキャッシュの配置基準も提供するポータブル設定管理
 - `ImageSource`: フォルダ、単体画像の親フォルダ、ZIP/CBZ、外部backend書庫を共通化する画像供給層
 - `PageModel`: focused page identity、logical page anchor、固定DisplayUnit、sliding single-page navigationを管理する非GUIモデル
@@ -118,7 +118,8 @@ ApplicationController
 - `ViewerWidget`: 渡された画像の描画、拡大縮小、パン、クリックやホイール入力、追加ボタン検出、ジェスチャー軌跡オーバーレイを担当
 - `ViewerCanvasPointerController`: 左クリックをダブルクリック間隔まで保留し、single click、pan、double click、modifier、overlay、drop、gesture、BookSession generationを排他的に判定
 - `MouseGestureRecognizer`: QtやGUI状態に依存せず、移動量をU/D/L/Rへ量子化して連続方向を圧縮
-- `PageThumbnailProvider`: QImageからQtアイコンへの変換を担当し、ViewerWindowのページ一覧とBrowserWindowの一覧で利用
+- `ViewerPageListModel`: Viewerのページ一覧を仮想rowとして公開し、未filter時はrowとpage indexを同一視して全件Widgetや逆引き表を生成しない
+- `ViewerPageListRuntime`: 表示中rowと小さなmarginだけを最新work orderとして保持し、book専用source session、低優先度1-job、target-size QImage cache、byte budget、stale/cancel/shutdownを所有する。QPixmap/QIcon化だけはaccepted resultを受けたViewerWindowのGUI threadで行う
 
 BrowserWindowのフォルダツリーはQt標準の`QFileSystemModel`と`QTreeView`を使い、フォルダだけを表示します。モデルの空ルートからWindowsのドライブへアクセスでき、フォルダ選択は短いタイマーでまとめてから一覧を更新します。右側は`QListView`と`BrowserItemModel`によるModel/View構成です。
 

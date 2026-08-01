@@ -13,18 +13,20 @@ from PySide6.QtGui import (
     QDesktopServices,
     QDragEnterEvent,
     QDropEvent,
+    QIcon,
     QKeySequence,
+    QPixmap,
     QShortcut,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QColorDialog,
     QDockWidget,
     QFileDialog,
     QInputDialog,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
+    QListView,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -64,8 +66,13 @@ from .path_availability import (
     lexical_absolute,
 )
 from .performance_trace import performance_trace
-from .thumbnail_provider import PageThumbnailProvider
 from . import viewer_commands as commands
+from .viewer_page_list_runtime import (
+    ViewerPageListModel,
+    ViewerPageListRuntime,
+    ViewerPageThumbnail,
+    ViewerPageThumbnailSpec,
+)
 from .viewer_page_navigation import ViewerPageNavigationController
 from .viewer_page_slider import ViewerPageSlider
 from .viewer_display_unit import (
@@ -364,6 +371,18 @@ class ViewerWindow(QMainWindow):
         self._zip_runtime_request_timer.timeout.connect(
             self._dispatch_pending_zip_runtime_request
         )
+        self._page_list_filter_timer = QTimer(self)
+        self._page_list_filter_timer.setSingleShot(True)
+        self._page_list_filter_timer.setInterval(80)
+        self._page_list_filter_timer.timeout.connect(
+            self._apply_page_list_filter
+        )
+        self._page_list_viewport_timer = QTimer(self)
+        self._page_list_viewport_timer.setSingleShot(True)
+        self._page_list_viewport_timer.setInterval(0)
+        self._page_list_viewport_timer.timeout.connect(
+            self._update_page_list_visible_work
+        )
         self._raster_paint_fallback_timer = QTimer(self)
         self._raster_paint_fallback_timer.setSingleShot(True)
         self._raster_paint_fallback_timer.setInterval(
@@ -401,6 +420,9 @@ class ViewerWindow(QMainWindow):
         self._zip_runtime_current_frame_serial = 0
         self._zip_runtime_last_painted_serial = 0
         self._pending_zip_runtime_request: ZipRasterRequest | None = None
+        self._page_list_runtime: ViewerPageListRuntime | None = None
+        self._staged_page_list_runtime: ViewerPageListRuntime | None = None
+        self._page_list_waiting_for_current_paint = False
         self.image_cache.set_adjustments(brightness=self.brightness, contrast=self.contrast, gamma=self.gamma)
         self.page_navigation = ViewerPageNavigationController(
             self.model,
@@ -413,6 +435,12 @@ class ViewerWindow(QMainWindow):
             self._bind_zip_runtime
         )
         self._bind_zip_runtime(self.book_session.viewer_runtime)
+        self.book_session.page_list_runtime_changed.connect(
+            self._stage_page_list_runtime
+        )
+        self._stage_page_list_runtime(
+            self.book_session.page_list_runtime
+        )
         self.viewer.framePainted.connect(
             self._on_zip_runtime_frame_painted
         )
@@ -507,6 +535,17 @@ class ViewerWindow(QMainWindow):
             in {QEvent.Type.Resize, QEvent.Type.ScreenChangeInternal}
         ):
             QTimer.singleShot(0, self.fullscreen_chrome.reevaluate_visibility)
+        if (
+            hasattr(self, "_page_list_viewport_timer")
+            and hasattr(self, "page_list_model")
+            and event.type()
+            in {
+                QEvent.Type.Resize,
+                QEvent.Type.ScreenChangeInternal,
+                QEvent.Type.DevicePixelRatioChange,
+            }
+        ):
+            self._refresh_page_list_thumbnail_spec()
         return handled
 
     def _build_ui(self) -> None:
@@ -528,14 +567,28 @@ class ViewerWindow(QMainWindow):
         self.status = QStatusBar(self)
         self.setStatusBar(self.status)
 
-        self._updating_page_list = False
-        self._page_list_dirty = False
+        self._updating_page_list_selection = False
         self.page_list_filter = QLineEdit(self)
         self.page_list_filter.setPlaceholderText("ページ名で絞り込み")
-        self.page_list_filter.textChanged.connect(lambda _text: self._rebuild_page_list())
-        self.page_list = QListWidget(self)
+        self.page_list_filter.textChanged.connect(
+            lambda _text: self._page_list_filter_timer.start()
+        )
+        self.page_list_model = ViewerPageListModel(self)
+        self.page_list = QListView(self)
+        self.page_list.setModel(self.page_list_model)
         self.page_list.setIconSize(QSize(self.thumbnail_size, self.thumbnail_size))
-        self.page_list.currentRowChanged.connect(self._on_page_list_row_changed)
+        self.page_list.setUniformItemSizes(True)
+        self.page_list.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerItem
+        )
+        self.page_list.selectionModel().currentChanged.connect(
+            self._on_page_list_current_changed
+        )
+        self.page_list.verticalScrollBar().valueChanged.connect(
+            lambda _value: self._schedule_page_list_visible_work()
+        )
+        self._page_list_viewport = self.page_list.viewport()
+        self._page_list_viewport.installEventFilter(self)
         page_list_container = QWidget(self)
         page_list_layout = QVBoxLayout(page_list_container)
         page_list_layout.setContentsMargins(4, 4, 4, 4)
@@ -1104,10 +1157,7 @@ class ViewerWindow(QMainWindow):
             self.page_list.setIconSize(
                 QSize(self.thumbnail_size, self.thumbnail_size)
             )
-            for index in range(self.model.total_pages):
-                cached = self.image_cache.get(index)
-                if cached is not None:
-                    self._update_page_list_thumbnail(cached)
+            self._refresh_page_list_thumbnail_spec()
         fullscreen_chrome_changed = False
         if "fullscreen_auto_reveal_ui" in changed:
             self.fullscreen_auto_reveal_ui = bool(
@@ -1452,7 +1502,7 @@ class ViewerWindow(QMainWindow):
             self._pending_progress_seed = None
             self.presentation_state.clear_book()
             self.viewer.clear()
-            self._rebuild_page_list()
+            self._activate_page_list_runtime(None)
             self._update_slider()
             self._update_status()
             return False
@@ -1521,7 +1571,6 @@ class ViewerWindow(QMainWindow):
         self.settings["last_open_path"] = opened_path
         self._add_recent_path(opened_path)
         self.image_cache.set_cache_size(self.cache_size)
-        self._rebuild_page_list()
         self._first_frame_image_id = self.model.image_id_at(
             self.model.focused_index
         )
@@ -1937,12 +1986,12 @@ class ViewerWindow(QMainWindow):
         self._sync_actions()
 
     def _on_page_list_dock_visibility_changed(self, visible: bool) -> None:
-        if self.isFullScreen() and self.hide_ui_in_fullscreen:
+        if self.isFullScreen():
+            self._refresh_page_list_model()
             return
         self.show_page_list = visible
         self._update_shared_setting("show_page_list", visible)
-        if visible and self._page_list_dirty:
-            self._rebuild_page_list()
+        self._refresh_page_list_model()
         if hasattr(self, "page_list_action"):
             self._sync_actions()
 
@@ -1998,10 +2047,7 @@ class ViewerWindow(QMainWindow):
         self.thumbnail_size = size
         self._update_shared_setting("thumbnail_size", size)
         self.page_list.setIconSize(QSize(size, size))
-        for index in range(self.model.total_pages):
-            cached = self.image_cache.get(index)
-            if cached is not None:
-                self._update_page_list_thumbnail(cached)
+        self._refresh_page_list_thumbnail_spec()
 
     def set_brightness_dialog(self) -> None:
         value, accepted = QInputDialog.getDouble(self, "明るさ", "倍率:", self.brightness, 0.1, 3.0, 2)
@@ -2038,8 +2084,7 @@ class ViewerWindow(QMainWindow):
             self.gamma = max(0.1, min(5.0, float(gamma)))
             self._update_shared_setting("gamma", self.gamma)
         self.image_cache.set_adjustments(brightness=self.brightness, contrast=self.contrast, gamma=self.gamma)
-        self.page_list.clear()
-        self._rebuild_page_list()
+        self._refresh_page_list_thumbnail_spec()
         if self.model.total_pages > 0:
             self._refresh_view()
 
@@ -2160,95 +2205,268 @@ class ViewerWindow(QMainWindow):
         if 0 <= page_index < self.model.total_pages:
             self._go_to_index_with_history(page_index)
 
-    def _rebuild_page_list(self) -> None:
-        if not self.page_list_dock.isVisible():
-            self._page_list_dirty = True
-            if self.page_list.count():
-                self._updating_page_list = True
-                try:
-                    self.page_list.clear()
-                finally:
-                    self._updating_page_list = False
+    @Slot(object)
+    def _stage_page_list_runtime(self, runtime: object) -> None:
+        staged = runtime if isinstance(runtime, ViewerPageListRuntime) else None
+        if staged is None:
+            self._staged_page_list_runtime = None
+            if self.book_session.source is None:
+                self._activate_page_list_runtime(None)
             return
-        self._page_list_dirty = False
-        self._updating_page_list = True
-        try:
-            self.page_list.clear()
-            filter_text = self.page_list_filter.text().casefold().strip()
-            for index, image_id in enumerate(self.model.image_ids):
-                label = f"{index + 1}: {Path(image_id).name}"
-                if filter_text and filter_text not in label.casefold():
-                    continue
-                item = QListWidgetItem(label)
-                item.setData(Qt.ItemDataRole.UserRole, index)
-                self.page_list.addItem(item)
-        finally:
-            self._updating_page_list = False
-        for index in range(self.model.total_pages):
-            cached = self.image_cache.get(index)
-            if cached is not None:
-                self._update_page_list_thumbnail(cached)
+        displayed = self.presentation_state.displayed
+        if (
+            displayed is not None
+            and displayed.token.book.epoch == staged.source_epoch
+        ):
+            self._activate_page_list_runtime(staged)
+            return
+        # The source has opened, but the preceding book remains the active
+        # presentation until the first complete replacement frame commits.
+        # BookSession may retire/delete the preceding runtime immediately, so
+        # retain only its already-materialized model projection here.  The old
+        # rows are read-only until the new frame commits and cannot navigate
+        # the newly installed PageModel by an unrelated row index.
+        previous = self._page_list_runtime
+        if previous is not None and previous is not staged:
+            try:
+                previous.thumbnailReady.disconnect(
+                    self._on_page_list_thumbnail_ready
+                )
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                previous.set_visible(False)
+            except RuntimeError:
+                pass
+        self._page_list_runtime = None
+        self._staged_page_list_runtime = staged
+        self.page_list.setEnabled(False)
+        staged.set_visible(False)
+
+    def _activate_page_list_runtime(
+        self,
+        runtime: ViewerPageListRuntime | None,
+    ) -> None:
+        previous = self._page_list_runtime
+        if previous is not None and previous is not runtime:
+            try:
+                previous.thumbnailReady.disconnect(
+                    self._on_page_list_thumbnail_ready
+                )
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                previous.set_visible(False)
+            except RuntimeError:
+                pass
+        self._page_list_runtime = runtime
+        if self._staged_page_list_runtime is runtime:
+            self._staged_page_list_runtime = None
+        if runtime is not None and runtime is not previous:
+            runtime.thumbnailReady.connect(
+                self._on_page_list_thumbnail_ready
+            )
+        self.page_list.setEnabled(runtime is not None)
+        self._refresh_page_list_model()
+
+    def _commit_staged_page_list_runtime(self, epoch: int) -> None:
+        runtime = self._staged_page_list_runtime
+        if runtime is None or runtime.source_epoch != int(epoch):
+            return
+        self._activate_page_list_runtime(runtime)
+
+    def _refresh_page_list_model(self) -> None:
+        runtime = self._page_list_runtime
+        if not self.page_list_dock.isVisible():
+            if runtime is not None:
+                runtime.set_visible(False)
+            self.page_list_model.clear()
+            return
+        if runtime is None:
+            # During a successful replacement open, keep the preceding
+            # committed book's rows/icons as a disabled snapshot until the
+            # first complete frame atomically activates the staged runtime.
+            if self._staged_page_list_runtime is None:
+                self.page_list_model.clear()
+            return
+        runtime.set_visible(True)
+        self.page_list_model.set_book(
+            runtime.source_epoch,
+            runtime.image_ids,
+            self.page_list_filter.text(),
+        )
         self._sync_page_list_selection()
+        self._schedule_page_list_visible_work()
+
+    def _apply_page_list_filter(self) -> None:
+        if not self.page_list_dock.isVisible():
+            return
+        self.page_list_model.set_filter(self.page_list_filter.text())
+        self._sync_page_list_selection()
+        self._schedule_page_list_visible_work()
 
     def _sync_page_list_selection(self) -> None:
-        if self._page_list_dirty:
-            return
-        self._updating_page_list = True
+        self._updating_page_list_selection = True
         try:
-            target_item = None
             displayed = self.presentation_state.displayed
             focused_index = self.presentation_state.displayed_page
+            row = -1
             if (
                 displayed is not None
                 and focused_index is not None
-                and displayed.token.book.epoch == self.book_session.generation
+                and displayed.token.book.epoch
+                == self.page_list_model.book_epoch
             ):
-                for row in range(self.page_list.count()):
-                    item = self.page_list.item(row)
-                    if (
-                        item is not None
-                        and item.data(Qt.ItemDataRole.UserRole)
-                        == focused_index
-                    ):
-                        target_item = item
-                        break
-            if target_item is None:
-                self.page_list.setCurrentRow(-1)
-            else:
-                self.page_list.setCurrentItem(target_item)
-                self.page_list.scrollToItem(target_item)
+                row = self.page_list_model.row_for_page(focused_index)
+            target = (
+                self.page_list_model.index(row, 0)
+                if row >= 0
+                else self.page_list_model.index(-1, 0)
+            )
+            self.page_list.setCurrentIndex(target)
+            if target.isValid():
+                self.page_list.scrollTo(
+                    target,
+                    QAbstractItemView.ScrollHint.EnsureVisible,
+                )
         finally:
-            self._updating_page_list = False
+            self._updating_page_list_selection = False
+        self._schedule_page_list_visible_work()
 
-    def _update_page_list_thumbnail(self, cached: CachedImage) -> None:
-        if self._page_list_dirty:
+    def _on_page_list_current_changed(
+        self,
+        current: object,
+        _previous: object,
+    ) -> None:
+        if (
+            self._updating_page_list_selection
+            or self._page_list_runtime is None
+        ):
             return
-        if cached.qimage is None or cached.error:
-            return
-        item = None
-        for row in range(self.page_list.count()):
-            candidate = self.page_list.item(row)
-            if candidate is not None and candidate.data(Qt.ItemDataRole.UserRole) == cached.page_index:
-                item = candidate
-                break
-        if item is None:
-            return
-        item.setIcon(PageThumbnailProvider.create_icon(cached.qimage, self.thumbnail_size))
-
-    def _on_page_list_row_changed(self, row: int) -> None:
-        if self._updating_page_list or row < 0:
-            return
-        item = self.page_list.item(row)
-        if item is None:
-            return
-        page_index = item.data(Qt.ItemDataRole.UserRole)
-        if not isinstance(page_index, int) or not 0 <= page_index < self.model.total_pages:
+        row = current.row() if hasattr(current, "row") else -1
+        page_index = self.page_list_model.page_index_at(row)
+        if page_index is None or not 0 <= page_index < self.model.total_pages:
             return
         self._go_to_index_with_history(page_index)
-        # QListWidget changes its selection before this callback. The
-        # semantic selection remains the last committed frame until the
-        # requested page completes.
+        # Selection is a projection of the committed frame, never ownership
+        # of the requested/displayed semantic page.
         self._sync_page_list_selection()
+
+    def _page_thumbnail_spec(self) -> ViewerPageThumbnailSpec:
+        return ViewerPageThumbnailSpec.create(
+            self.thumbnail_size,
+            max(1.0, float(self.devicePixelRatioF())),
+            self.rotation_angle,
+            self.brightness,
+            self.contrast,
+            self.gamma,
+        )
+
+    def _refresh_page_list_thumbnail_spec(self) -> None:
+        if (
+            self._page_list_runtime is None
+            and self._staged_page_list_runtime is not None
+        ):
+            return
+        self.page_list_model.clear_thumbnails()
+        self._schedule_page_list_visible_work()
+
+    def _schedule_page_list_visible_work(self) -> None:
+        if self._shutdown_prepared:
+            return
+        self._page_list_viewport_timer.start()
+
+    def _update_page_list_visible_work(self) -> None:
+        runtime = self._page_list_runtime
+        count = self.page_list_model.rowCount()
+        if (
+            runtime is None
+            or not self.page_list_dock.isVisible()
+            or count <= 0
+        ):
+            if runtime is not None:
+                runtime.set_visible(False)
+            if self._staged_page_list_runtime is None:
+                self.page_list_model.clear_thumbnails()
+            return
+
+        runtime.set_visible(True)
+        viewport = self.page_list.viewport()
+        top_index = self.page_list.indexAt(QPoint(1, 1))
+        bottom_index = self.page_list.indexAt(
+            QPoint(1, max(1, viewport.height() - 2))
+        )
+        top_row = top_index.row() if top_index.isValid() else 0
+        if bottom_index.isValid():
+            bottom_row = bottom_index.row()
+        else:
+            item_extent = max(
+                self.thumbnail_size,
+                self.page_list.fontMetrics().height(),
+            ) + 4
+            bottom_row = min(
+                count - 1,
+                top_row + max(1, viewport.height() // item_extent),
+            )
+        first = max(0, min(top_row, bottom_row) - 2)
+        last = min(count - 1, max(top_row, bottom_row) + 2)
+        ordered = [
+            page_index
+            for row in range(first, last + 1)
+            if (page_index := self.page_list_model.page_index_at(row))
+            is not None
+        ]
+        displayed_page = self.presentation_state.displayed_page
+        if displayed_page in ordered:
+            ordered.remove(displayed_page)
+            ordered.insert(0, displayed_page)
+        desired = tuple(ordered)
+        self.page_list_model.retain_thumbnails(desired)
+        runtime.request_visible_pages(desired, self._page_thumbnail_spec())
+
+    @Slot(object)
+    def _on_page_list_thumbnail_ready(self, result: object) -> None:
+        runtime = self._page_list_runtime
+        if (
+            runtime is None
+            or not isinstance(result, ViewerPageThumbnail)
+            or result.runtime_id != runtime.runtime_id
+            or result.source_epoch != runtime.source_epoch
+            or result.source_epoch != self.page_list_model.book_epoch
+            or result.spec != self._page_thumbnail_spec()
+            or result.page_index not in runtime.desired_pages
+            or not self.page_list_dock.isVisible()
+            or result.qimage is None
+            or result.qimage.isNull()
+        ):
+            return
+        if (
+            self.page_list_model.image_id_for_page(result.page_index)
+            != result.image_id
+        ):
+            return
+        pixmap = QPixmap.fromImage(result.qimage)
+        if pixmap.isNull():
+            return
+        pixmap.setDevicePixelRatio(result.spec.device_pixel_ratio)
+        self.page_list_model.set_thumbnail(
+            result.page_index,
+            QIcon(pixmap),
+        )
+        runtime.record_pixmap_upload()
+
+    def _set_page_list_paused(self, paused: bool) -> None:
+        if self._shutdown_prepared and not paused:
+            paused = True
+        seen: set[int] = set()
+        for runtime in (
+            self._page_list_runtime,
+            self._staged_page_list_runtime,
+        ):
+            if runtime is None or id(runtime) in seen:
+                continue
+            seen.add(id(runtime))
+            runtime.set_paused(paused)
 
     def _rebuild_bookmark_menu(self) -> None:
         self.bookmark_menu.clear()
@@ -2768,6 +2986,9 @@ class ViewerWindow(QMainWindow):
         # The semantic state was replaced by one immutable snapshot before
         # these projections run. This whole slot is synchronous with the
         # Widget's complete-frame swap.
+        self._commit_staged_page_list_runtime(
+            commit.frame.token.book.epoch
+        )
         self._update_slider()
         self._update_status()
         self._sync_page_list_selection()
@@ -2887,7 +3108,16 @@ class ViewerWindow(QMainWindow):
             self._cancel_pending_decode_demand()
             self._raster_paint_fallback_timer.stop()
             self._raster_prefetch_after_paint = None
-            self._release_raster_interactive_lane()
+            pdf_current_is_cold = (
+                self._awaiting_first_frame
+                or self.viewer.displayed_page_indexes
+                != gated_visible_indexes
+            )
+            if pdf_current_is_cold:
+                self._page_list_waiting_for_current_paint = True
+                self._hold_raster_interactive_lane()
+            else:
+                self._release_raster_interactive_lane()
             self._prepare_deferred_pdf_prefetch(
                 request_center,
                 gated_visible_indexes,
@@ -3400,6 +3630,7 @@ class ViewerWindow(QMainWindow):
 
     def _hold_raster_interactive_lane(self) -> None:
         self._zip_runtime_browser_resume_timer.stop()
+        self._set_page_list_paused(True)
         if (
             self._raster_interactive_lane_held
             or self.image_work_coordinator is None
@@ -3408,8 +3639,14 @@ class ViewerWindow(QMainWindow):
         self._raster_interactive_lane_held = True
         self.image_work_coordinator.begin_viewer_interactive()
 
-    def _release_raster_interactive_lane(self) -> None:
+    def _release_raster_interactive_lane(
+        self,
+        *,
+        resume_page_list: bool = True,
+    ) -> None:
         self._zip_runtime_browser_resume_timer.stop()
+        self._page_list_waiting_for_current_paint = False
+        self._set_page_list_paused(not resume_page_list)
         if (
             not self._raster_interactive_lane_held
             or self.image_work_coordinator is None
@@ -3431,6 +3668,9 @@ class ViewerWindow(QMainWindow):
                 self._zip_runtime.release_prefetch(
                     request_id=self._active_request_id,
                 )
+            self._release_raster_interactive_lane()
+            return
+        if self._page_list_waiting_for_current_paint:
             self._release_raster_interactive_lane()
             return
         staged = self._raster_prefetch_after_paint
@@ -3914,7 +4154,6 @@ class ViewerWindow(QMainWindow):
             (slot.page_index, slot.image_id) for slot in self._display_unit.slots
         )
         if repositioned or slot_identity_changed:
-            self._update_page_list_thumbnail(cached)
             self._refresh_view()
             if first_frame_result:
                 if isinstance(self.image_cache.source, PdfImageSource):
@@ -3930,7 +4169,6 @@ class ViewerWindow(QMainWindow):
                     )
             return
         if cached.page_index not in self._visible_page_indexes:
-            self._update_page_list_thumbnail(cached)
             if cached.page_index in self._raster_prefetch_active_unit:
                 # The paced raster dispatcher has no farther unit admitted.
                 # Continue this unit directly into display preparation rather
@@ -3959,7 +4197,6 @@ class ViewerWindow(QMainWindow):
                 )
         if cached.page_index in self._visible_page_indexes:
             self._arm_deferred_pdf_prefetch()
-        self._update_page_list_thumbnail(cached)
         self._render_spread(self.model.spread_at(), self._active_request_id)
         if not cached.source_is_preview:
             self.viewer.resume_magnifier_after_source_render()
@@ -3973,6 +4210,12 @@ class ViewerWindow(QMainWindow):
         # Native QMenu reconstruction is deferred until the user opens it;
         # this slot is delivered synchronously during ready-page navigation.
         self._arm_prepared_display_prefetch()
+        if self._page_list_waiting_for_current_paint:
+            # Decode/render has finished.  A visible window normally releases
+            # PageList work on contentPainted; the bounded fallback covers a
+            # hidden/minimized/error-only surface without overlapping the
+            # expensive current-frame operation itself.
+            self._raster_paint_fallback_timer.start()
         staged = self._raster_prefetch_after_paint
         if (
             staged is not None
@@ -4156,7 +4399,7 @@ class ViewerWindow(QMainWindow):
         self._raster_prefetch_after_paint = None
         self._raster_paint_fallback_timer.stop()
         self._clear_raster_prefetch_pipeline()
-        self._release_raster_interactive_lane()
+        self._release_raster_interactive_lane(resume_page_list=False)
         self._awaiting_first_frame = True
         self._first_frame_image_id = None
         self.interactive_open_started.emit(self)
@@ -4166,6 +4409,7 @@ class ViewerWindow(QMainWindow):
             return
         self._awaiting_first_frame = False
         self._first_frame_image_id = None
+        self._release_raster_interactive_lane()
         self.interactive_open_cancelled.emit(self)
 
     def _on_viewer_content_painted(self, image_ids: object) -> None:
@@ -4188,9 +4432,18 @@ class ViewerWindow(QMainWindow):
                     self._active_open_trace_id,
                     "viewer.first_paint.completed",
                 )
+                self._set_page_list_paused(False)
                 self.first_frame_ready.emit(self)
             return
         if isinstance(image_ids, tuple):
+            if (
+                self._page_list_waiting_for_current_paint
+                and isinstance(self.image_cache.source, PdfImageSource)
+                and self.viewer.displayed_page_indexes
+                == self._visible_page_indexes
+            ):
+                self._raster_paint_fallback_timer.stop()
+                self._release_raster_interactive_lane()
             self._arm_prepared_display_prefetch(after_paint=True)
             self._arm_deferred_pdf_prefetch()
             staged = self._raster_prefetch_after_paint
@@ -4221,6 +4474,7 @@ class ViewerWindow(QMainWindow):
             return
         self._awaiting_first_frame = False
         self._first_frame_image_id = None
+        self._set_page_list_paused(False)
         performance_trace.mark(
             self._active_open_trace_id,
             "viewer.first_paint.completed",
@@ -4465,6 +4719,13 @@ class ViewerWindow(QMainWindow):
         super().dragEnterEvent(event)
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
+        if watched is getattr(self, "_page_list_viewport", None):
+            if event.type() in {
+                QEvent.Type.Resize,
+                QEvent.Type.Show,
+                QEvent.Type.LayoutRequest,
+            }:
+                self._schedule_page_list_visible_work()
         if watched in getattr(self, "_drop_targets", ()):
             if event.type() in {QEvent.Type.DragEnter, QEvent.Type.DragMove}:
                 if ExternalDropOpenController.local_paths(event.mimeData()):
@@ -4962,6 +5223,7 @@ class ViewerWindow(QMainWindow):
         self._refresh_after_rotation_change()
 
     def _refresh_after_rotation_change(self) -> None:
+        self._refresh_page_list_thumbnail_spec()
         if self._zip_runtime_active:
             if self._zip_runtime is not None:
                 self._zip_runtime.invalidate_layout()
@@ -5090,6 +5352,16 @@ class ViewerWindow(QMainWindow):
         self.presentation_state.close()
         self._zip_runtime_request_timer.stop()
         self._pending_zip_runtime_request = None
+        self._page_list_filter_timer.stop()
+        self._page_list_viewport_timer.stop()
+        self._set_page_list_paused(True)
+        for runtime in {
+            self._page_list_runtime,
+            self._staged_page_list_runtime,
+        }:
+            if runtime is not None:
+                runtime.set_visible(False)
+        self.page_list_model.clear()
         self._path_probe_generation += 1
         self._pending_path_probe = None
         self.fullscreen_chrome.shutdown()

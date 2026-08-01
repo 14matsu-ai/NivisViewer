@@ -153,6 +153,14 @@ class PdfImageSource(ImageSource):
     def file_size(self, image_id: str) -> int | None:
         return self._source_size
 
+    def fork_for_thumbnail(self) -> ImageSource:
+        return PdfImageSource(
+            self.source_path,
+            pdfium_service=self.pdfium_service,
+            base_dpi=self.base_dpi,
+            draw_annotations=self.draw_annotations,
+        )
+
     def cancel_image_request(self, image_id: str) -> None:
         with self._request_lock:
             for cancelled in tuple(self._active_requests.get(image_id, ())):

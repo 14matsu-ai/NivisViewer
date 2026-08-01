@@ -13,8 +13,8 @@ import zipfile
 
 from natsort import natsorted
 from PIL import Image
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QIcon, QImage, QPixmap
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal, Slot
+from PySide6.QtGui import QImage
 
 from .browser_model import (
     BROWSER_IMAGE_EXTENSIONS,
@@ -39,18 +39,6 @@ from .thumbnail_render import (
 
 _RETIRED_THUMBNAIL_PROVIDERS: set[BrowserThumbnailProvider] = set()
 _THUMBNAIL_LOG = logging.getLogger("nivisviewer.thumbnail")
-
-
-class PageThumbnailProvider:
-    @staticmethod
-    def create_icon(qimage: QImage, size: int) -> QIcon:
-        thumbnail = qimage.scaled(
-            size,
-            size,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        return QIcon(QPixmap.fromImage(thumbnail))
 
 
 @dataclass(frozen=True)

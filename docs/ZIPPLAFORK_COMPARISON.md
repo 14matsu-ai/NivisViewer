@@ -1370,3 +1370,280 @@ invalidation, memory-pressure behavior, book replacement, Viewer close, and
 Windows working-set stability. Expected evidence is fewer cold flashes/pauses
 and no additional read/decode on a page still within the configured budget;
 offscreen results alone are not a claim of improved physical-device feel.
+
+## 13. Overnight whole-Viewer audit and fourth structural replacement
+
+This audit started from NivisViewer commit
+`da24bdd47fc706327b3c70cb0fa64bbeb450eee8` (`Separate ZIP frame retention
+from the active work frontier`).  `HEAD`, `origin/main`, and `origin/HEAD` were
+identical, and the worktree had no modified or untracked files.  That commit is
+therefore the protected baseline for this unit.
+
+The ZipPlaFork reference was checked again on 2026-08-01.  Remote `HEAD` and
+`refs/heads/master` still both resolve to the fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`; there are no newer upstream
+Viewer or Catalog changes to merge into this comparison.
+
+### 13.1 Updated unresolved subsystem comparison
+
+The comparison below was completed before implementing another subsystem.  A
+"page move" frequency means the path can affect normal wheel/click/key
+navigation; "optional-visible" means it is absent with the page-list dock
+hidden but can be severe once the dock is enabled.
+
+| Candidate subsystem | ZipPlaFork fixed-revision design | NivisViewer design at the audit baseline | NivisViewer problem and real-device relevance | Frequency / GUI and duplicate work | Port difficulty, feature effect, and risk | Replacement boundary and expected effect |
+|---|---|---|---|---|---|---|
+| Page list / thumbnail | `CatalogForm.cs` separates lightweight `ThumbViewerItem` metadata from images. `ThumbViewer.PaintPart` loads only the visible region plus one small margin, clears images outside it, and `ThumbViewerItem.LoadAsync` is globally one-at-a-time. Data-index/show-index arrays provide direct mapping and changed cells are redrawn locally. | `ViewerWindow` owns a `QListWidget`, synchronously creates every `QListWidgetItem`, scans every row for selection and every accepted thumbnail, and calls `PageThumbnailProvider.create_icon` on the GUI thread. The thumbnail source is the legacy full-size `ImageCache`; ZIP runtime artifacts do not populate the list. Hidden/fullscreen state can retain all icons after the list has once been shown. | Opening a large visible list can run O(all pages) widget creation before the current request. A legacy current/prefetch callback can smooth-scale a large image and upload a pixmap before main-frame preparation. Icons are outside the Viewer byte ledger, and the legacy-cache dependency blocks removal of the old folder/RAR/PDF pipeline. | **Optional-visible, every accepted legacy decode and every presentation selection.** GUI work is O(rows) lookup plus large-image scale/upload; row/icon memory and source decode can be duplicated. | Medium-high. Filtering, click/keyboard navigation, committed selection, DPR/size/rotation/filter generations, broken pages, all source types, book switch and close must remain. A thumbnail worker must not share the ZIP entry lock with current work. | **Full replacement:** `QAbstractListModel/QListView` virtual rows plus a book-owned `ViewerPageListRuntime`, visible+margin order, one low-priority worker, dedicated thumbnail source/artifact cache, byte budget and epoch/spec rejection. Expected to remove GUI scaling/all-row searches and current-cache coupling when the dock is visible. |
+| Folder / single-image Viewer | The same page-worker/work-order/display-artifact structure is used for packed and ordinary images. | `FolderImageSource` has useful JPEG/WebP target-decode helpers, but production returns to `_ImageLoadTask -> ImageCache -> ViewerRenderTask -> prepared QPixmap`; source and display caches, timers and callbacks are separate. A single-image open is a folder book using this same path. | Every folder page miss crosses two schedulers and two caches. Running Pillow work cannot be source-cancelled, layout changes can repeat preparation, and the path keeps most legacy raster state alive. | **Common, every folder/single page move.** Normally one GUI callback per source and one per render plus cache bookkeeping; decoded and prepared artifacts overlap. | High as a full deletion, medium after PageList no longer consumes `ImageCache`. Spread, wide-page discovery, magnifier, adjustments, rotation and folder snapshot ordering must remain. | **Structural replacement after PageList:** source-independent raster book runtime/page artifact record using the existing presentation frame contract. Expected to remove the two-stage scheduler and enable display-only invalidation. |
+| RAR / 7z / CBR / CB7 | Packed-image ownership remains book scoped and entry work participates in the same page order/cache lifecycle. | `SevenZipImageSource` keeps the entry listing but starts an external 7-Zip/WinRAR process for every page, materializes all stdout bytes, then performs full Pillow decode through the legacy pipeline. `solid` is recorded but not used by extraction order. | Process startup, repeated archive traversal and full-entry/full-raster materialization can dominate, especially for solid archives. Merely attaching the current source to a new scheduler would leave the primary cost intact. | **Format-dependent, every external-archive miss.** Low GUI cost itself, but high process/I/O/CPU duplication; reversal cancels by terminating the per-entry request after work may already have started. | High and backend-specific. Must retain optional external tools, Japanese paths, output/size limits, cancellation, solid behavior and safe process shutdown. Persistent-library support is not assumed and no dependency may be added. | **Full source/runtime replacement:** book-scoped `Rar7zBookRuntime`/page source with listing reuse, cancelable extraction policy and solid-aware work order. Expected effect can be large but is not safe as the first overnight cutover. |
+| PDF | Document pages share the Viewer page order and page artifact lifecycle. | `PdfImageSource`/`PdfiumService` already keep one document, target-render by viewport/DPR, serialize/prioritize/deduplicate PDFium work and close via a control barrier. The outer `ImageCache` worker waits for the service, converts pixels through PIL, and then enters prepared rendering. | Archive/document lifetime is already sound. Remaining costs are double asynchronous ownership, PIL/pixel conversion, and source/prepared duplication rather than document reopen. | **PDF-only, every miss/rerender.** Callback and pixel conversion duplication; current priority inside the PDF service is already strong. | High. Native page rotation, annotations, zoom/DPR target size, labels, magnifier and shutdown ordering are mature and easy to regress. | **Sibling `PdfBookRuntime` later:** preserve PdfiumService and expose the common complete-frame/cache/paint contract. Expected to remove the outer wait/conversion stages without forcing PDF through a raster decoder abstraction. |
+| Viewer UI critical path | Accepted resized image, current page and trackbar are coordinated in the Viewer form; Catalog redraw is local. | `ViewerPresentationState` now commits displayed page, slider, status, history and progress with `ViewerWidget.frameCommitted`. Page-list selection still performs a linear row search. Toolbar/menu projection is separate but does not decode or resize pixels. | The previous logical/visual split is resolved. No new slider/status/history/progress critical-path owner was found. Page-list selection remains the material synchronous outlier. | **Every committed page**, but current semantic projections are small; PageList adds O(rows). | Low benefit/high regression risk for another transaction rewrite. Fullscreen chrome, pan/zoom, slideshow and metadata policy are Nivis-specific. | **Maintain presentation transaction; move only PageList selection to O(1) model mapping.** No separate UI rewrite is justified now. |
+| Cache / memory | Page-indexed source and resized arrays share one page lifecycle; `ReduceUsingMemory` evicts from the least-important end. Catalog images outside the visible range are explicitly disposed. | ZIP now has `_ZipRasterFrameStore`; other formats retain `ImageCache` plus Viewer prepared/render cache. PageList `QIcon/QPixmap` memory is unbudgeted. ZIP source/display variants are still invalidated together on layout changes. | The largest fixed ZIP retention defect is resolved. The next unbounded ownership is PageList icons. Legacy formats still duplicate source/display lifetime, and ZIP layout-only changes may repeat decode. | ZIP store: every ZIP request and now bounded. PageList: optional-visible and grows with visited rows. Legacy caches: every non-ZIP page. | PageList budget is medium risk; common artifact records are high risk because magnifier/source-resolution sufficiency must remain. | **First bound PageList independently; then introduce a common page-artifact record with source/display variants.** Do not retune ZIP counts or decoders in this unit. |
+| Input / navigation | The worker consumes the latest work order; completed work remains cacheable, and the next order is chosen after completion. | Wheel/click/key navigation coalesces requests; `ViewerPresentationState` owns requested/displayed serials and direction; ZIP runtime has a one-job current/next/previous frontier with stale rejection and retained frames. Legacy sources keep their older decode/display demand timers. | ZIP navigation semantics are no longer the primary structural gap. PageList scroll has no visible-row scheduler because thumbnails are incidental cache callbacks. Non-ZIP reversal can leave one stale decode and a separate stale render. | **Every input.** ZIP duplicate transit work is bounded; PageList and legacy sources are the remaining work-order gaps. | Low risk to preserve current navigation; high risk to unify all source engines at once. | **Maintain navigation/presentation contracts.** PageList gets an independently replaceable visible order; folder/external/PDF migrate one book runtime at a time. |
+| Book switch / close | Page workers are interrupted/waited before packed loaders and bitmaps are disposed. | `BookSession` separates pending-open from active epoch, retires ZIP runtime/source until workers and queued GUI completions drain, preserves the old frame on failed replacement, and PDF closes through a service barrier. PageList currently owns no worker/source and icons live until widget/model clearing. | Existing main-source lifetime is stronger than a literal synchronous port. A new PageList source would become an unsafe extra owner unless BookSession retires its runtime and waits for both worker completion and queued-result rejection. | **Every book switch/close.** Low steady-state GUI cost; high consequence if wrong. | Medium for a dedicated runtime, very high for broad lifetime unification. Deadlock or premature archive/document close is a stop condition. | **Extend BookSession ownership only for PageList runtime now.** The runtime owns its forked read-only source, cancels and drains before close; failed replacement leaves the active runtime/model untouched. |
+
+### 13.2 Ranked replacement units
+
+The already-completed ZIP frame-retention change is not ranked again.  Scores
+are qualitative (`5` is strongest/highest); risk is inverse (`5` is most
+risky).  "Overnight" means the boundary can be completed and reviewed without
+leaving a mixed production engine.
+
+| Rank | Large work unit | Real-device effect | Production frequency | Current/UI contention | Old code removable | ZipPla clarity | Risk | Overnight completion | Decision |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | **`ViewerPageListRuntime` + virtual row model** | 4 | 2 when hidden / 5 when visible | 5 | 4 | 5 | 3 | 4 | **Implement as this unit.** It is the next roadmap prerequisite and has a closed ownership boundary. |
+| 2 | **Source-independent `FolderRasterBookRuntime` + page artifact record** | 4 | 5 | 3 | 5 | 4 | 4 | 2 | Next after PageList. Start only when the PageList no longer reads `ImageCache`. |
+| 3 | **Book-scoped `Rar7zBookRuntime` / external archive page source** | 5 for affected books | 2 | 2 | 4 | 4 | 5 | 1 | High expected upside, but external-process/solid-archive lifetime is too broad for the first cutover. |
+| 4 | **`PdfBookRuntime` preserving PdfiumService** | 3 | 2 | 2 | 3 | 3 | 5 | 1 | Defer; current document lifetime and prioritization are already correct. |
+| 5 | **Common source/display variant and legacy prepared-pipeline removal** | 4 | 5 | 3 | 5 | 4 | 5 | 1 | End state spanning ranks 2-4, not a single safe overnight patch. |
+
+### 13.3 Selected replacement contract
+
+The selected subsystem is `ViewerPageListRuntime`; this decision follows the
+audit rather than treating the previous roadmap ordering as automatic.  The
+production boundary is:
+
+```text
+BookSession
+  -> one ViewerPageListRuntime per installed book
+       -> lazy independent thumbnail source/session
+       -> latest visible rows + small margin
+       -> at most one low-priority worker job
+       -> target-sized QImage cache with a byte budget
+       -> epoch/spec/visibility rejection and explicit shutdown
+
+ViewerWindow
+  -> QAbstractListModel / QListView lightweight rows
+  -> viewport rows -> runtime work order
+  -> accepted target-sized QImage -> one GUI QPixmap/QIcon upload
+  -> click submits navigation only
+  -> committed ViewerPresentationState projects selection through O(1) map
+```
+
+The runtime must pause/cancel while a current Viewer frame is cold, resume
+only after the accepted paint/fallback releases the interactive lane, and use
+an independent ZIP handle so a thumbnail cannot own the main
+`ZipImageSource` lock.  Folder, external-archive and PDF thumbnail sources are
+forked lazily off the GUI thread.  BookSession retirement must keep the main
+source and the runtime alive until its worker and queued completion drain.
+
+The immediate removal targets are eager `QListWidgetItem` ownership,
+`PageThumbnailProvider`, GUI-thread smooth scaling, PageList calls from
+`ImageCache.pageLoaded`, all-row selection/thumbnail scans, and hidden
+unbudgeted icons.  `ViewerPresentationState`, the main ZIP runtime/cache,
+Viewer atomic old-frame swap, Browser thumbnail subsystem, PDF service and
+external archive backend remain independent and unchanged by this unit.
+
+### 13.4 Implemented replacement: `ViewerPageListRuntime`
+
+The selected boundary is now implemented.  It is one subsystem replacement,
+not a thumbnail helper attached to the old `QListWidget`:
+
+```text
+BookSession (one owner per installed book)
+  -> ViewerPageListRuntime
+       -> lazy source-specific read-only fork
+       -> replaceable visible-row order
+       -> one active low-priority job
+       -> entry read -> target decode/render -> orientation/filter/rotation
+          -> final-size QImage
+       -> desired/spec/book-generation validation
+       -> visible-only QImage byte cache
+
+ViewerWindow (GUI projection only)
+  -> ViewerPageListModel / QListView virtual rows
+  -> viewport + two-row margin request
+  -> accepted final-size QImage -> QPixmap/QIcon once
+  -> page click -> navigation request only
+  -> frame commit -> O(1) committed-page selection
+```
+
+The production integration is split deliberately:
+
+- `app/viewer_page_list_runtime.py` owns the virtual model, work order,
+  one-job scheduler, cancellation, target-sized artifact, cache accounting,
+  stale rejection and clone shutdown.  Worker code creates no `QPixmap` or
+  `QIcon`.
+- `app/book_session.py` creates exactly one runtime for each installed book,
+  retires it on switch/close, and retains the main source until both native
+  work and its queued completion have drained.
+- `app/image_source.py` provides lazy independent folder, ZIP and 7-Zip/RAR
+  thumbnail sessions.  The external-archive fork reuses the immutable listing
+  snapshot instead of starting a second listing process.
+- `app/pdf_image_source.py` opens a separate PDF document session through the
+  existing `PdfiumService`; PageList renders directly to the thumbnail target
+  and closes that document after callback drainage.
+- `app/viewer_window.py` maps only the visible viewport plus two rows on each
+  side, performs the accepted `QPixmap.fromImage`, and projects the committed
+  presentation page through direct page/row mapping.  It pauses PageList when
+  a ZIP, folder/external-archive, or PDF current frame is cold and resumes on
+  the accepted paint (or the existing post-completion hidden-window fallback).
+
+Hidden/fullscreen PageList state now has zero rows, zero desired jobs, zero
+thumbnail artifacts and no open thumbnail-source fork.  Changing thumbnail
+size, DPR, rotation or adjustments changes the immutable spec; late results
+from the preceding spec cannot upload.  A rapid scroll replaces the order and
+cancels a no-longer-visible active entry request.  Completed icons are kept
+only for the current desired rows, while the QImage side has an explicit byte
+budget.
+
+Book replacement has a two-phase presentation boundary.  Source installation
+stages the new runtime but does not relabel the old frame.  The preceding row
+projection remains visible but disabled and no longer holds the retired
+QObject.  The first complete replacement `ViewerPresentationState` frame
+commit activates the new runtime/model atomically.  A failed replacement never
+installs or stages a new runtime, so the active book/list remains usable.
+
+### 13.5 Exact ZipPlaFork provenance and adaptation map
+
+The fixed source is ZipPlaFork revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, file
+`source/ZipPla/CatalogForm.cs`.  The structure originated in upstream commit
+`8ea492821efa95ac66483246c5b17fa71b400f0e`; thumbnail concurrency is one at
+the fixed revision.  The following control flow is directly structurally
+ported and is therefore recorded as AGPL-3.0-or-later-derived:
+
+| Upstream class / method | Adopted behavior | NivisViewer destination |
+|---|---|---|
+| `ThumbViewerItem.LoadAsync`, `ThumbViewerItem.Clear` | One thumbnail load lifecycle and explicit release outside the useful region. | `_ViewerPageThumbnailJob`; `ViewerPageListRuntime._drive`, `set_visible`, `_retain_cache` |
+| `ThumbViewer.PaintPart`, `ThumbViewer.DrawItem` | Materialize/publish only items required by the painted region; update the completed item locally. | `ViewerWindow._update_page_list_visible_work`, `_on_page_list_thumbnail_ready`; `ViewerPageListModel.set_thumbnail` |
+| `ThumbViewer.preRenderScroll`, `ThumbViewer.OnMouseWheel` | Re-evaluate the useful range after scrolling rather than filling the book. | `ViewerWindow._schedule_page_list_visible_work`; `ViewerPageListRuntime.request_visible_pages` |
+| `ThumbViewer.SilentSet` and data/show-index mappings | Separate lightweight item identity from the displayed row and provide direct mapping. | `ViewerPageListModel.page_index_at`, `row_for_page`, filtered mapping |
+| `ThumbViewer.Clear` | Dispose thumbnail ownership when the view/book no longer needs it. | `ViewerPageListRuntime.cancel` / `shutdown`; `ViewerPageListModel.clear` |
+| `CatalogForm.bmwMakePreview_RunWorkerStarting` lightweight item setup | Metadata rows do not eagerly own decoded images. | `ViewerPageListModel.rowCount` / `data` |
+
+NivisViewer's Qt model, book/spec generations, byte accounting, source forks,
+cooperative cancellation, PDF target render, GUI-only pixmap upload,
+presentation-commit staging and callback-drained source lifetime are independent
+Python/Qt adaptations.  ZipPlaFork's paint-time task creation, static global
+semaphore, 33 ms sleep, GDI drawing/bitmap code and alternate-data-stream cache
+were not copied.  License text and upstream notices remain in
+`licenses/ZipPlaFork/AGPL.txt` and `licenses/ZipPlaFork/About.txt`; the notice
+mapping is also recorded in `THIRD_PARTY_NOTICES.md`.
+
+### 13.6 Removed old PageList ownership
+
+The following production structures were removed rather than left as a feature
+fallback:
+
+| Old structure | Result |
+|---|---|
+| `QListWidget` plus one `QListWidgetItem` for every page | Replaced by `QListView` + `ViewerPageListModel`; unfiltered row lookup allocates no page-index tuple/reverse map and creates no per-page item objects. |
+| Linear current-page and thumbnail item scans | Replaced by `row_for_page` / `page_index_at` mappings. |
+| `PageThumbnailProvider.create_icon` GUI smooth-scale of the full decoded image | Class removed.  Worker publishes a final-size QImage; GUI performs only accepted pixmap/icon upload. |
+| PageList mutation from `ImageCache.pageLoaded` | Removed.  PageList has its own source, queue, artifacts and callbacks for every supported book source. |
+| `_page_list_dirty`, eager `_rebuild_page_list`, `_update_page_list_thumbnail` | Removed.  Hidden state clears model/runtime ownership; visibility reconstructs only virtual metadata and the current work order. |
+| Icons accumulated for every page visited while the list was ever visible | Replaced by visible-window retention and explicit release. |
+
+The Browser thumbnail provider/cache is a separate subsystem and was not
+changed.  `ImageCache` and the prepared-display scheduler remain only for the
+main non-ZIP Viewer until the ranked folder/external/PDF runtimes replace them;
+PageList is no longer a reason to preserve those structures.
+
+### 13.7 Offscreen PageList A/B
+
+`scripts/benchmark_viewer_page_list_runtime.py` uses offscreen Qt and one real
+temporary stored JPEG ZIP.  A is a benchmark-only reproduction of the removed
+PageList ownership (2,000 eager items, full-size decoded QImage presented to a
+GUI smooth-scale/upload callback); it is **not** the superseded Viewer frame
+engine.  B calls the production `ViewerPageListModel` and
+`ViewerPageListRuntime`.  The physical ZIP contains one deterministic entry
+mapped to 2,000 logical ids so both sides read identical 60,629-byte payloads.
+The image is 1,600 x 2,400, thumbnail edge 160, visible range six, scroll order
+six positions, artificial cancellable entry delay 8 ms, and B QImage budget
+204,800 bytes.  No window was shown and no native input or external GUI was
+used.
+
+Detailed counters and worker-completion timestamps are disabled in the
+BookSession production runtime.  The benchmark and focused runtime tests opt
+in through `collect_metrics=True`; no timestamp log or per-job metrics object
+churn is left on the normal Viewer path.
+
+| Scenario | A / B elapsed ms | A / B row build ms | A GUI scale ms / B | A work items / B jobs | A / B queued callbacks | A / B successful transit decodes | A / B ZIP reads (bytes) | A / B QImage outputs | A / B QPixmap uploads |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| hidden 2,000-page book | 8.511 / 0.295 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| first visible range | 189.678 / 85.298 | 6.826 / 0.127 | 28.858 / 0 | 6 / 6 | 6 / 6 | 0 / 0 | 6 / 6 (363,774 / 363,774) | 6 full / 6 target | 6 / 6 |
+| rapid scroll to final range | 1,140.669 / 84.913 | 6.639 / 0.114 | 157.398 / 0 | 36 / 7 | 36 / 7 | 30 / 0 | 36 / 6 (2,182,644 / 363,774) | 36 full / 6 target | 36 / 6 |
+| current-frame pause/resume | 188.255 / 115.009 | 6.767 / 0.109 | 26.259 / 0 | 6 / 7 | 6 / 7 | 0 / 0 | 6 / 6 (363,774 / 363,774) | 6 full / 6 target | 6 / 6 |
+| six-range memory pressure | 1,157.438 / 550.485 | 6.755 / 0.117 | 167.346 / 0 | 36 / 36 | 36 / 36 | 30 / 30 | 36 / 36 (2,182,644 / 2,182,644) | 36 full / 36 target | 36 / 36 |
+
+B's rapid and pause cases each submitted one cancelled job and rejected one
+stale callback; rapid scrolling produced no successful transit decode.  While
+the current-frame pause was held, its submitted-job count stayed `1 -> 1` and
+entry reads stayed `0 -> 0`; after resume it restarted the requested work.
+
+| Scenario | A / B retained pages | A icon bytes / B icon+QImage bytes | B QImage cache pages / bytes / evictions | A / B working-set delta MiB | A / B sampled peak delta MiB | B source open/fork/close |
+|---|---:|---:|---:|---:|---:|---:|
+| hidden | 0 / 0 | 0 / 0 | 0 / 0 / 0 | 0.680 / 0.062 | 0.680 / 0.062 | 1 / 0 / 1 |
+| first visible | 6 / 6 | 307,200 / 547,840 | 2 / 136,960 / 4 | 3.988 / 1.547 | 14.965 / 1.547 | 2 / 1 / 2 |
+| rapid scroll | 36 / 6 | 1,843,200 / 547,840 | 2 / 136,960 / 4 | 3.578 / 0.984 | 14.559 / 0.980 | 2 / 1 / 2 |
+| pause/resume | 6 / 6 | 307,200 / 547,840 | 2 / 136,960 / 4 | 1.797 / 1.238 | 12.781 / 1.238 | 2 / 1 / 2 |
+| memory pressure | 36 / 6 | 1,843,200 / 547,840 | 2 / 136,960 / 34 | 4.164 / 3.863 | 15.148 / 3.859 | 2 / 1 / 2 |
+
+The retained-byte columns are conservative but not symmetric: A counts the
+icons owned by the removed list but not the legacy `ImageCache` source raster;
+B counts both visible icons and its QImage cache.  Working-set samples are
+process-wide and affected by allocator retention/order.  They support bounded
+ownership but are not a real-device measurement.
+
+Every successful A ZIP read materialized one entry `BytesIO`; every successful
+B read did the same and the current `ZipImageSource.open_qimage_at_most` added
+one `BytesIO.getvalue()` full-payload copy.  Thus B performed 6 extra full
+copies in the visible/pause cases and 36 in the memory-pressure case.  This is
+reported as the remaining PageList source bottleneck rather than hidden by
+fallback.  Both sides intentionally recorded zero paint events because the
+benchmark measures artifact publication without showing a view; request to
+actual screen paint still requires real-device confirmation.
+
+### 13.8 Validation, remaining risk and next boundary
+
+The major contracts cover virtual mapping, latest visible-order replacement,
+one active job, pause/cancel/stale rejection, byte-budget/hidden cleanup,
+clone close after queued callback drainage, and presentation-atomic book-list
+switching.  Related offscreen regression includes BookSession, all built-in
+source families, PDF, Viewer presentation/rendering and ZIP runtime.  The
+final collection contains 1,440 tests and all pass under controlled process
+boundaries: 1,348 tests in 81 independent file processes, all eight
+`test_sprint15_models.py` cases with an explicitly created offscreen
+`QApplication`, and all 84 application-controller/navigation-follow-up nodes
+in independent processes.  The combined application-controller and
+navigation-follow-up files retain their existing shared-Qt-state teardown
+stall.  One application-controller node also timed out once in the automated
+node loop and passed immediately on a direct isolated retry; no assertion
+failed.  These conditions are reported rather than treating process teardown
+as production evidence.
+
+Remaining risks are: cooperative cancellation cannot interrupt every Pillow
+codec after native decode has entered; the visible QIcon set is range-bounded
+but Qt pixmap memory is not part of the QImage byte counter; first PageList use
+opens one additional source/document session; filtering is O(all page names)
+only when filter text changes; and ZIP JPEG thumbnail target decode still
+materializes/copies the whole compressed entry once.  Offscreen timings do not
+prove physical-device responsiveness.
+
+The next structural replacement remains the source-independent
+`FolderRasterBookRuntime` / page artifact record.  Its boundary starts at the
+main Viewer's folder/single-image request and ends at complete-frame publish;
+it may remove the `ImageCache -> ViewerRenderTask -> prepared display` split.
+It must not absorb PageList, Browser thumbnails, `ViewerPresentationState`, or
+the ZIP runtime, and it was deliberately not started in this unit.
