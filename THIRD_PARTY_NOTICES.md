@@ -68,6 +68,31 @@ updated independently. This processing organization is treated as a direct
 structural port and as AGPL-3.0-or-later-derived. It is not a verbatim or
 line-for-line translation of the upstream C# source.
 
+NivisViewer's `app/viewer_page_list_runtime.py` and its integration in
+`app/book_session.py` and `app/viewer_window.py` adopt the visible-only
+thumbnail ownership structure from `source/ZipPla/CatalogForm.cs`:
+`CatalogForm.bmwMakePreview_RunWorkerStarting` (lightweight item creation),
+`ThumbViewerItem`, `ThumbViewerItem.LoadAsync`, `ThumbViewerItem.Clear`,
+`ThumbViewer.SilentSet`, the data/show-index mappings,
+`ThumbViewer.OnPaint` / `PaintPart`, `DrawItem`, `preRenderScroll`,
+`OnMouseWheel`, and `ThumbViewer.Clear`.  The structure was introduced in
+upstream commit `8ea492821efa95ac66483246c5b17fa71b400f0e` and its thumbnail
+concurrency was reduced to one worker by the fixed/head commit
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`.
+
+The adopted structure is: lightweight virtual rows, direct page/row mapping,
+thumbnail requests only for the visible range plus a small margin, one
+low-priority thumbnail job, explicit disposal outside that range, and local
+publication of only the completed item.  This is treated as a direct
+structural port and as AGPL-3.0-or-later-derived.  The Qt model/view classes,
+book/spec generations, cooperative cancellation, separate read-only source
+sessions, target-sized `QImage` byte budget, GUI-thread-only accepted
+`QPixmap/QIcon` upload, current-Viewer pause/paint-resume gate, and queued
+callback/source drainage are independent NivisViewer implementations.  The
+upstream paint-time task start, static process-wide semaphore, incomplete
+cancellation, 33 ms sleep, GDI bitmap/canvas code, and NTFS alternate-data-
+stream thumbnail cache were not copied.
+
 The following are independent NivisViewer Qt/Python implementations, not
 literal ZipPlaFork translations:
 

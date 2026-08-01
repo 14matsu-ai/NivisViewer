@@ -21,6 +21,7 @@ from .image_source import (
 )
 from .page_model import PageModel
 from .performance_trace import performance_trace
+from .viewer_page_list_runtime import ViewerPageListRuntime
 from .zip_raster_book_runtime import ZipRasterBookRuntime
 
 
@@ -196,6 +197,7 @@ class BookSession(QObject):
     async_opened = Signal(object)
     async_open_failed = Signal(object)
     viewer_runtime_changed = Signal(object)
+    page_list_runtime_changed = Signal(object)
 
     def __init__(
         self,
@@ -216,6 +218,7 @@ class BookSession(QObject):
         self.current_path: Path | None = None
         self.source: ImageSource | None = None
         self.viewer_runtime: ZipRasterBookRuntime | None = None
+        self.page_list_runtime: ViewerPageListRuntime | None = None
         # The active book epoch must change only when the installed source
         # changes.  Pending-open tokens are separate so a failed/cancelled
         # replacement cannot invalidate the Viewer runtime of the book that
@@ -225,6 +228,9 @@ class BookSession(QObject):
         self._source_factory = source_factory
         self._retired_sources: dict[int, ImageSource] = {}
         self._retired_viewer_runtimes: dict[int, ZipRasterBookRuntime] = {}
+        self._retired_page_list_runtimes: dict[
+            int, ViewerPageListRuntime
+        ] = {}
         self._open_pool = QThreadPool()
         self._open_pool.setMaxThreadCount(1)
         self._open_cancel: Event | None = None
@@ -305,6 +311,10 @@ class BookSession(QObject):
         self.source = new_source
         self.current_path = requested_path
         self._replace_viewer_runtime(new_source)
+        self._replace_page_list_runtime(
+            new_source,
+            tuple(self.model.image_ids),
+        )
         self.image_cache.set_source(
             new_source,
             self.model.image_ids,
@@ -394,6 +404,7 @@ class BookSession(QObject):
         self._open_generation += 1
         old_source = self.source
         self._replace_viewer_runtime(None)
+        self._replace_page_list_runtime(None, ())
         had_book = old_source is not None
         self.generation += 1
         self.image_cache.clear()
@@ -425,12 +436,29 @@ class BookSession(QObject):
         for runtime in completed_runtimes:
             if self._retired_viewer_runtimes.get(id(runtime)) is runtime:
                 self._finalize_viewer_runtime(runtime)
+        completed_page_list_runtimes = tuple(
+            runtime
+            for runtime in tuple(
+                self._retired_page_list_runtimes.values()
+            )
+            if runtime.shutdown(wait_msecs=runtime_deadline)
+        )
+        for runtime in completed_page_list_runtimes:
+            if (
+                self._retired_page_list_runtimes.get(id(runtime))
+                is runtime
+            ):
+                self._finalize_page_list_runtime(runtime)
         if self.image_cache.wait_for_owned_tasks(wait_msecs):
             for source in tuple(self._retired_sources.values()):
                 if any(
                     runtime.source is source
                     and runtime.has_unfinished_tasks()
                     for runtime in self._retired_viewer_runtimes.values()
+                ) or any(
+                    runtime.source is source
+                    and runtime.has_unfinished_tasks()
+                    for runtime in self._retired_page_list_runtimes.values()
                 ):
                     continue
                 retired = self._retired_sources.pop(id(source), None)
@@ -507,6 +535,10 @@ class BookSession(QObject):
         self.source = result.source
         self.current_path = result.requested_path
         self._replace_viewer_runtime(result.source)
+        self._replace_page_list_runtime(
+            result.source,
+            tuple(self.model.image_ids),
+        )
         trace_id = result.trace_id
         self.image_cache.set_source(
             result.source,
@@ -547,9 +579,14 @@ class BookSession(QObject):
     def _source_has_owned_async_work(self, source: ImageSource) -> bool:
         if self.image_cache.has_in_flight_for_source(source):
             return True
-        return any(
+        if any(
             runtime.source is source and runtime.has_unfinished_tasks()
             for runtime in self._retired_viewer_runtimes.values()
+        ):
+            return True
+        return any(
+            runtime.source is source and runtime.has_unfinished_tasks()
+            for runtime in self._retired_page_list_runtimes.values()
         )
 
     def _try_release_retired_source(self, source: ImageSource) -> bool:
@@ -615,6 +652,71 @@ class BookSession(QObject):
         runtime.setParent(None)
         runtime.deleteLater()
 
+    def _replace_page_list_runtime(
+        self,
+        source: ImageSource | None,
+        image_ids: tuple[str, ...],
+    ) -> None:
+        old_runtime = self.page_list_runtime
+        cache_budget = max(
+            8 * 1024 * 1024,
+            min(
+                64 * 1024 * 1024,
+                self.image_cache.cache_byte_budget_bytes // 4,
+            ),
+        )
+        new_runtime = (
+            ViewerPageListRuntime(
+                source,
+                tuple(image_ids),
+                self.generation,
+                self,
+                image_work_coordinator=self._image_work_coordinator,
+                cache_byte_budget=cache_budget,
+            )
+            if source is not None
+            else None
+        )
+        self.page_list_runtime = new_runtime
+        if new_runtime is not None:
+            new_runtime.idle.connect(
+                self._release_retired_page_list_runtime
+            )
+        if old_runtime is not None and old_runtime is not new_runtime:
+            self._retire_page_list_runtime(old_runtime)
+        self.page_list_runtime_changed.emit(new_runtime)
+
+    def _retire_page_list_runtime(
+        self,
+        runtime: ViewerPageListRuntime,
+    ) -> None:
+        completed = runtime.shutdown(wait_msecs=0)
+        if completed:
+            self._finalize_page_list_runtime(runtime)
+            return
+        self._retired_page_list_runtimes[id(runtime)] = runtime
+
+    @Slot(object)
+    def _release_retired_page_list_runtime(self, runtime: object) -> None:
+        if not isinstance(runtime, ViewerPageListRuntime):
+            return
+        retired = self._retired_page_list_runtimes.get(id(runtime))
+        if retired is not runtime or runtime.has_unfinished_tasks():
+            return
+        source = runtime.source
+        self._finalize_page_list_runtime(runtime)
+        self._try_release_retired_source(source)
+        self._maybe_finalize_shutdown()
+
+    def _finalize_page_list_runtime(
+        self,
+        runtime: ViewerPageListRuntime,
+    ) -> None:
+        self._retired_page_list_runtimes.pop(id(runtime), None)
+        runtime.shutdown(wait_msecs=0)
+        runtime.setParent(None)
+        runtime.deleteLater()
+
     def _has_owned_async_work(self) -> bool:
         return bool(
             self._open_workers
@@ -622,6 +724,10 @@ class BookSession(QObject):
             or any(
                 runtime.has_unfinished_tasks()
                 for runtime in self._retired_viewer_runtimes.values()
+            )
+            or any(
+                runtime.has_unfinished_tasks()
+                for runtime in self._retired_page_list_runtimes.values()
             )
             or self.image_cache.has_unfinished_tasks()
         )
