@@ -120,6 +120,7 @@ ApplicationController
 - `MouseGestureRecognizer`: QtやGUI状態に依存せず、移動量をU/D/L/Rへ量子化して連続方向を圧縮
 - `ViewerPageListModel`: Viewerのページ一覧を仮想rowとして公開し、未filter時はrowとpage indexを同一視して全件Widgetや逆引き表を生成しない
 - `ViewerPageListRuntime`: 表示中rowと小さなmarginだけを最新work orderとして保持し、book専用source session、低優先度1-job、target-size QImage cache、byte budget、stale/cancel/shutdownを所有する。QPixmap/QIcon化だけはaccepted resultを受けたViewerWindowのGUI threadで行う
+- `ZipRasterBookRuntime`: ZIP本ごとにpersistent archive source、current→next→previousの1-job lane、decode／resize／display-ready生成、completed-frame cache、cancel／stale／shutdownを所有する。decoded source QImageはbook/layout非依存の`_ZipRasterSourceStore`、DPR／rotation／zoom依存QPixmapは`_ZipRasterFrameStore`へ分離し、共通byte budgetでcurrent complete source/frameを保護する。layout invalidationはdisplay frameだけを破棄し、十分なpreviewまたはfull sourceを再利用する
 
 BrowserWindowのフォルダツリーはQt標準の`QFileSystemModel`と`QTreeView`を使い、フォルダだけを表示します。モデルの空ルートからWindowsのドライブへアクセスでき、フォルダ選択は短いタイマーでまとめてから一覧を更新します。右側は`QListView`と`BrowserItemModel`によるModel/View構成です。
 

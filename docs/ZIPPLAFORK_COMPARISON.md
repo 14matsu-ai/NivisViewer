@@ -1647,3 +1647,325 @@ main Viewer's folder/single-image request and ends at complete-frame publish;
 it may remove the `ImageCache -> ViewerRenderTask -> prepared display` split.
 It must not absorb PageList, Browser thumbnails, `ViewerPresentationState`, or
 the ZIP runtime, and it was deliberately not started in this unit.
+
+## 14. Balanced modernization audit and decoded-source/display-frame split
+
+### 14.1 Corrected objective and fixed baselines
+
+The objective is not to turn NivisViewer into the same application as
+ZipPlaFork.  ZipPlaFork remains the performance reference for archive,
+work-order and page-artifact lifetime decisions; NivisViewer remains the UX
+and modern-Qt reference where its contract is stronger.  The four decisions
+used below are:
+
+- **A / ZipPlaFork**: adopt the upstream structure because it is clearly
+  simpler, faster and sufficiently safe;
+- **B / NivisViewer**: retain the NivisViewer structure because its UX,
+  feature semantics or structured lifetime is stronger;
+- **C / Hybrid**: use the fast ZipPlaFork internal principle behind a
+  NivisViewer external/Qt contract;
+- **D / New design**: neither implementation is sufficient for a modern x64,
+  high-DPI, large-image Viewer.
+
+The NivisViewer audit started from clean worktree HEAD
+`1445d106bdfc6b0445295fbdac311628836feb0c` (`Replace the viewer page list
+with a virtual, book-scoped runtime`).  On 2026-08-20, ZipPlaFork remote
+`HEAD` and `refs/heads/master` still resolved to the fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`.  Its license remains
+AGPL-3.0-or-later and the preserved text/notices remain in
+`licenses/ZipPlaFork/AGPL.txt`, `licenses/ZipPlaFork/About.txt`, and
+`THIRD_PARTY_NOTICES.md`.
+
+### 14.2 Actual ZIP call sequences used for the comparison
+
+ZipPlaFork's fixed-revision cold page path is:
+
+```text
+ViewerForm input / command
+  -> moveToNextPage / MoveToPreviousPage / movePageNatural
+  -> currentPage + showCurrentPage
+  -> SetBackgroundModeIfPausing
+       -> if paused: SetBackgroundMode
+            -> priorityLevel(current unit, index-increasing next,
+                             index-decreasing previous, remaining)
+            -> BackgroundMultiWorker.SetWorksOrder
+       -> if active: keep the running job
+  -> bmwLoadEachPage_DoWork (one page worker)
+  -> PackedImageLoader.OpenImageStream / OpenInnerImageStream
+  -> ImageLoader.GetFullBitmap + EXIF/filter/orientation
+  -> GetResizedSize + BitmapResizer / post-filter
+  -> VirtualBitmapEx
+  -> BackgroundMultiWorker completion callback
+  -> if currentPage changed while active: SetBackgroundMode for latest current
+  -> SetNewResizedImage / ResizedImageArray
+  -> showCurrentPage + pbView_Paint / pbView_PaintToCanvas
+```
+
+The production NivisViewer ZIP path at the start of this audit is:
+
+```text
+wheel / shortcut / slider / virtual PageList
+  -> ViewerPageNavigationController + PageModel
+  -> ViewerWindow._refresh_view
+  -> ViewerPresentationState.request_frame (requested only)
+  -> ViewerWindow._zip_runtime_request
+  -> ZipRasterBookRuntime.request
+  -> _ZipRasterFrameStore lookup / latest work order
+  -> _drive(current, then paint-gated next, then previous)
+  -> _ZipRasterUnitJob.run (one display-unit worker)
+  -> ZipImageSource persistent ZipFile entry read
+  -> QImageReader or Pillow decode + EXIF/filter
+  -> calculate_spread_layout + render_qimage
+  -> queued ZipRasterBookRuntime._on_job_completed
+  -> GUI-thread QPixmap.fromImage
+  -> ViewerWidget.commit_display_ready_frame
+  -> ViewerPresentationState.commit_frame
+  -> slider/status/PageList/history/progress projection
+  -> ViewerWidget.paintEvent
+  -> framePainted -> release_prefetch
+```
+
+NivisViewer already has one production ZIP engine for single/spread, LTR/RTL,
+rotation, resampling, image adjustment, wide split, magnifier source and PageList
+visibility.  `ZipPlaCompatibleRasterPath`, the legacy `ImageCache` decode,
+prepared-display scheduler and normal `ViewerRenderTask` are not reachable from
+the ZIP main-display path.  PageList uses its own virtual model, runtime,
+worker/cache and independently opened thumbnail source.
+
+### 14.3 Strength/weakness comparison and A/B/C/D decision
+
+| Subsystem | ZipPlaFork: strengths / weaknesses | NivisViewer: strengths / weaknesses | Modern third option and decision |
+|---|---|---|---|
+| Archive access | **+** One book-lifetime loader/index and one entry stream per page job; no managed whole-entry byte array on its normal ZIP path. **-** Open/index/sort is tied to a large synchronous `ViewerForm.OpenFile`. Replacement/reload waits before replacing the loader, but Viewer close has no explicit worker-drain/resource-graph shutdown. The direct GDI stream path also relies on a bitmap remaining valid after the entry stream is disposed. | **+** Persistent `ZipFile`, O(1) `NameToInfo/getinfo`, book epoch, cancellable request and callback-drained deferred close. **-** current JPEG path materializes a `BytesIO` and then a `getvalue()` handoff. | **C.** Keep `BookSession`/deferred close and owned-pixel lifetime; retain the ZipPla page-job/entry-stream principle without copying its GDI stream-lifetime assumption. A single seekable payload decoder remains a later optimization. |
+| Page loading | **+** Entry read through display bitmap is one literal worker job. **-** Page arrays and UI form own many responsibilities. | **+** ZIP uses one display-unit QRunnable and publishes only terminal units. **-** Other raster sources still use the legacy multi-stage pipeline. | ZIP **C, already adopted**. A source-independent raster runtime is the next cross-format design. |
+| Decode | **+** Direct stream-to-GDI decode and retained prefiltered source. **-** `System.Drawing`, .NET 4.5.2 and old external WebP/Susie/ffmpeg choices are not a modern decoder strategy; the stream/bitmap lifetime assumption is unsafe to translate literally. | **+** target-sized JPEG via `QImageReader`, EXIF auto transform, Pillow fallback and WebP support. **-** extension/backend branching is embedded in source methods; valid JPEG still has a compressed-payload copy. | **D.** Future capability-driven decoder registry with owned output pixels; do not translate GDI+ or Python `QIODevice` callbacks literally. |
+| Resize | **+** Reuses retained source and creates resized output in the page job. **-** CPU/GDI-oriented implementation and manual bitmap lifetime. | **+** Qt/Pillow resampling modes, physical DPR target and same ZIP unit job. **-** source and layout frame shared one invalidation key at audit start. | **C/D.** Keep Qt render semantics; separate decoded source from display variants (implemented below). |
+| Worker / scheduler | **+** One Viewer page job and replaceable `SetWorksOrder`; current/next/previous simplicity. **-** active stale work is not cancelled, reordering waits for its completion, all-page ordering/sorting remains, and `WorkSetGuid` is effectively `Guid.Empty` rather than a generation fence. Resize may use internal parallel execution, so this is not a one-compute-thread design. | **+** One ZIP lane, latest current, cooperative entry cancel, request/source epoch stale fence and paint-gated prefetch. **-** legacy formats still have load/render/prepared stages. | ZIP **C, already superior Hybrid**. Keep the ordering principle, not `BackgroundWorker`, ineffective generation or thread-priority details. |
+| Prefetch | **+** One page job at a time and priority is rebuilt around current; exact `ResizedImageArray` hits bypass new work. **-** priority is always current then index-increasing neighbor then index-decreasing neighbor, not navigation-direction aware; active stale work finishes first, work eventually covers the book, and there is no paint acknowledgement. | **+** only current/directional next/previous, current before neighbor, post-paint release, exact-frame worker bypass and combined source/frame memory admission. **-** a 250 ms no-paint fallback and coordinator bookkeeping remain. | **C.** Preserve the bounded/direction-aware Nivis implementation while retaining ZipPla's simple ordered frontier. |
+| Cache | **+** `PreFilteredImageArray` and `ResizedImageArray` separate source/display while sharing page lifecycle; an exact ready hit paints without a worker. **-** array ownership and manual dispose are form-wide and tied to GDI objects. | **+** deterministic unit/byte budget and ready frame worker bypass. **-** `_UnitKey` previously coupled decoded QImage to viewport/DPR/rotation/zoom frame identity. | **D.** Book-scoped decoded-source store plus layout-specific frame store, with paired validity and one combined budget (implemented). |
+| Memory management | **+** source plus resized bytes are counted and least-useful pages are reduced. **-** budget changes with `ActiveForm` and volatile physical memory, eviction runs from an approximately 500 ms GUI timer, several pages can remain over the nominal budget, and scaled/source artifacts for one page are discarded together. | **+** explicit byte/unit settings and protected current complete frame. **-** Qt/plugin/transient compressed allocations remain unobservable; PageList has a separate budget. | **D.** Deterministic combined ledger now covers ZIP QImage+QPixmap without double-counting implicit shares; future runtimes need reservations and soft OS-pressure input. |
+| Page state | **+** simple current page. **-** `currentPage`, trackbar and status can move before the target bitmap is ready; old CPU canvas is gray-masked as loading. | **+** `ViewerPresentationState` separates requested/displayed and commits slider/status/history/progress with a complete frame. **-** bookmark/export commands still use the requested `PageModel.current_index` in a few paths. | **B.** Preserve PresentationState; later move bookmark/export defaults to committed state. |
+| Display commit | **+** completed resized bitmap is inserted in one UI completion. **-** no explicit epoch/layout/DPR token or immutable complete-spread transaction. | **+** complete single/spread atomic swap, old-frame retention, stale rejection and GUI-only QPixmap. **-** commit projects a broad action refresh. | **B.** Keep NivisViewer. Optimize projection only after profiling. |
+| Page list / thumbnail | **+** visible-region loading and release rather than eager full-book thumbnails. **-** paint-time Catalog machinery, GDI ownership and a static semaphore shared by all ThumbViewers; cancellation is not passed into an active `GetThumbnail`. | **+** virtual Qt model, visible margin, O(1) mapping, independent source/cache/worker, pause/cancel, byte budget. **-** first use opens a second archive/document session. | Historically **D**, now **B / maintain**. NivisViewer's completed modern design is stronger than direct Catalog translation. |
+| Input handling | **+** compact direct command mapping. **-** ready-frontier navigation can prevent rapid input from reaching a final cold page. | **+** wheel/shortcut/slider/PageList converge on one navigation/presentation boundary; rapid input coalesces to latest request. **-** requested PageModel moves ahead of displayed by design, so non-presentation commands must use the right owner. | **B/C.** Keep Nivis UX and ZipPla-style internal work-order rebuild. |
+| Spread / LTR / RTL | **+** current binding pages share level-0 priority; `NextPage`/`PreviousPage` keep the current unit until required slots are ready, so a partial spread is not painted as the new page. **-** topology and Viewer loading are intertwined. | **+** pure `PageModel.spread_at` topology, complete-unit publication, wide split and RTL half order. **-** an initially unknown wide page can cause unit reconstruction. | **B**, while retaining ZipPla's complete-unit principle and combining it with source reuse. |
+| Rotation / EXIF | **+** orientation/filter is integrated in the page job. **-** old GDI/manual DPI model. | **+** QImageReader/Pillow EXIF and worker-side rotation; rotation is in presentation tokens. **-** previously forced archive re-decode because source/frame invalidated together. | UX **B**, artifact lifetime **D implemented**. |
+| Magnifier | **+** `resetMagnifier`/`MagnifierCanvas`/`bwMagnifierMaker_DoWork` normally reuse `PreFilteredImageArray` and avoid another archive decode. **-** a separate worker/cache can contend with main resize and has no book epoch/request serial/DPR contract. | **+** retained source, selectable crop, quality mode, stale render key and full-resolution request. **-** audit found direct-display mode rejected the final magnifier render task. | **C/D.** Reuse the ZipPla retained-source principle behind the Nivis crop/UX and modern stale fence; direct-mode interactive render is enabled below. |
+| Zoom / fit | **+** source/resized separation supports new resized output. **-** UI/bitmap code is tightly coupled. | **+** fit modes, manual zoom/pan and multiple resampling modes. **-** prior source/frame key caused repeated decode for variant changes. | UX **B**, source/display lifetime **D implemented**. |
+| DPI | **+** manifest/manual DPI support for its WinForms era. **-** not a Qt6/fractional-DPR design. | **+** `devicePixelRatioF`, physical render targets, DPR-stamped pixmaps and stale-DPR rejection. **-** native upload memory is not fully measurable. | **B.** Do not port old WinForms DPI compensation. |
+| Book switch | **+** serializes loader replacement after the old page job returns. **-** synchronous/open-form coupling; failed replacement clears current paths/slider instead of rolling back the old presentation. | **+** pending replacement, failed-open rollback, old displayed state, epoch and retired runtime/source drainage. **-** open start currently clears old runtime cache, so failed replacement may need re-decode after recovery. | **B.** Preserve Nivis lifetime; consider delaying old artifact retirement separately. |
+| Close / shutdown | **-** `ViewerForm_FormClosing` saves settings but has no explicit main-worker drain or loader/page/magnifier/canvas resource-graph shutdown; `PackedImageLoader.Dispose` exists but is not explicitly reached from Viewer close. | **+** runtime/PageList/PDF drain, cooperative cancel and final source close after worker+callback lifetime. **-** native decoder cancellation is not always immediate. | **B.** NivisViewer is unambiguously stronger here. |
+| Error handling | **+** a broken entry becomes a display-sized `VirtualBitmapEx` error artifact, preserving page completion. **-** broad catches have no typed error/epoch/serial ownership. | **+** typed terminal error frame, complete spread semantics, no feature engine fallback or double commit. **-** Qt failure followed by Pillow can reread the entry. | **B** for semantics; retain the upstream error-artifact principle while payload reuse is later **D** work. |
+| Folder / single image | One Viewer loader structure covers it. | Modern UX/features, but main display still uses `ImageCache -> ViewerRenderTask -> prepared display`. | **C**, rank 2: source-independent `RasterBookRuntime`, while retaining Nivis presentation and widget contracts. |
+| ZIP / CBZ | Strong archive and one-job principles, weaker presentation/cancel/modern decoder boundaries. | One production runtime, persistent archive, current-first lane, atomic frame, virtual PageList; remaining payload copy and source/frame coupling at audit start. | **C/D.** Keep the Hybrid engine; implement the artifact lifetime split now. |
+| RAR / 7z / CBR / CB7 | Packed loader owns the book, but direct SharpCompress/GDI translation would import old constraints. | Entry index is retained, but each page may start a 7-Zip/WinRAR process and materialize stdout; solid archives are costly. | **D**, rank 3: book-scoped, cancellable, solid-aware external-archive runtime. |
+| PDF | Integrated into the old loader family. | `PdfiumService` already owns document lifetime, priority, dedup, target render, cancel and close barrier; outer legacy Viewer stages remain. | Service **B**, outer pipeline **C**, rank 4 `PdfBookRuntime`. |
+| UI-thread work | UI completion and GDI canvas paint are central; open/index/sort can be synchronous. | ZIP keeps archive/decode/resize off GUI; GUI does QPixmap upload, atomic state projection and paint. PageList scaling moved off GUI. | **B.** Keep Nivis Qt affinity/ownership; only the archive/work-order internals are Hybrid. Measure upload/paint before considering GPU/QRhi. |
+| WebP / AVIF / future formats | WebP relies on old external integrations; no AVIF design. | WebP has Qt/Pillow paths; installed decoder capability and declared extensions are not yet unified. | **D**, rank 5 capability-driven decoder registry. GPU is conditional on measured upload/paint dominance. |
+
+### 14.4 Ranked structural work
+
+| Rank | Work unit | Real-device / UX impact | Complexity and compatibility |
+|---:|---|---|---|
+| 1 | ZIP decoded-source / display-frame lifetime split, including the direct-mode magnifier boundary | Removes repeated ZIP read/decode on resize, DPI, rotation, zoom, wide/spread reconstruction and magnifier resolution transitions; restores the ZIP magnifier render. | Medium-high. Preserves the existing ZIP runtime, presentation, spread and decoder contracts. **Implemented in this section.** |
+| 2 | Source-independent `RasterBookRuntime` for folder/single images | Removes the two-stage legacy loader/render/prepared pipeline from a common Viewer path. | High. Must preserve file-change semantics, magnifier and all Viewer presentation features. |
+| 3 | Book-scoped RAR/7z runtime | Potentially removes process-per-entry and repeated solid-archive traversal, the largest format-specific cold cost. | Very high resource/cancellation/backend risk. |
+| 4 | `PdfBookRuntime` around the retained `PdfiumService` | Removes outer cache/worker/conversion stages while retaining target rendering. | High rotation/DPR/annotation/shutdown compatibility risk. |
+| 5 | Capability-driven decoder registry | Modern WebP/AVIF/native backend selection and one-payload fallback. | Medium-high; lower current ZIP page-turn impact than ranks 1-4. |
+
+GPU compositing is not ranked until measurement shows that GUI-thread
+`QPixmap.fromImage`/paint, rather than archive read and decoder work, dominates
+the physical-device interval.
+
+### 14.5 Implemented rank 1: page-artifact lifetime ownership
+
+`app/zip_raster_book_runtime.py` now separates two lifetimes:
+
+1. `_ZipRasterSourceStore` owns immutable decoded `QImage` sources by book
+   epoch, source identity, image id, pixel-affecting adjustments, decoded pixel
+   size and full/preview status.  A preview is reusable only when it meets the
+   later target; a full source satisfies every later layout.
+2. `_ZipRasterFrameStore` owns layout-dependent complete `QPixmap` frames by
+   display unit and full render spec.  Cached frames reference source keys but
+   do not own/count a second QImage copy.
+
+The runtime resolves source hits before creating `_ZipRasterUnitJob`.  A source
+hit still creates one worker job because resize/rotation/display preparation is
+off the GUI thread, but it performs no archive entry read and no image decode.
+An exact frame hit continues to create no job, callback or QPixmap.
+
+The two stores share the configured book byte budget.  Decoded QImage bytes and
+display QPixmap estimates are counted once; source eviction also removes frame
+variants that would otherwise expose a pixmap without its magnifier source.
+Current complete source/frame ownership is protected and may soft-overflow the
+budget for one exceptional page rather than blanking the Viewer.
+Prefetch admission now estimates both a missing decoded source and its physical
+display frame instead of looking only at QPixmap bytes.  It does not discard a
+completed artifact in advance, so cancellation cannot exchange a ready frame
+for work that never commits.  This is a soft retained-artifact budget: transient
+decoder/Pillow/upload allocations remain outside the ledger.  Unknown lazy page
+dimensions use the largest observed source in the same book as a pragmatic
+estimate; a highly dissimilar following page can therefore still create one
+transient overshoot before normal eviction/failure suppression takes effect.
+Only the source variant matching the active current adjustments is protected;
+old brightness/contrast/gamma variants remain evictable.
+
+`invalidate_layout()` now cancels the old work order and clears only display
+frames.  Book close/switch or explicit `clear_artifacts=True` clears both
+stores.  Therefore resize, DPR, rotation, zoom, wide/spread reconstruction and
+magnifier transitions reuse a sufficient source and upgrade a preview to full
+resolution at most once.
+
+`app/viewer_widget.py` continues to reject normal legacy render jobs while a
+book runtime owns direct display, but now permits `purpose="magnifier"`.  This
+is a NivisViewer UX projection over the committed runtime QImage, not a switch
+back to the old main Viewer engine.  The stale `key.purpose` reference in the
+direct-mode prepared-display guard was also reduced to an unconditional direct
+mode return.
+`app/viewer_window.py` marks only preview ZIP sources with `rendered_size` for a
+full-raster upgrade.  A full ZIP source no longer enters the PDF-only resolution
+request branch and wait forever for a handler that intentionally ignores ZIP.
+Direct-mode magnifier crops use the widget-owned one-thread lens pool rather
+than the book runtime's single Viewer coordinator lane.  Their stale result is
+still rejected, but a non-interruptible crop can no longer queue ahead of a
+current-page archive/decode job.
+
+Removed/replaced ownership in this unit:
+
+| Previous structure | Result |
+|---|---|
+| `_CachedFrame` owned both source QImage and layout QPixmap under one `_UnitKey` | Replaced by source keys plus independent source/frame stores. |
+| `invalidate_layout()` called `cancel(clear_artifacts=True)` | Replaced by display-only invalidation; decoded source remains book-scoped. |
+| Frame byte accounting rediscovered/deduplicated source QImages inside each frame | Replaced by one source ledger plus pixmap-only frame ledger. |
+| A source could not be reused across layout keys | Replaced by preview sufficiency/full-resolution lookup before decode. |
+| Direct display rejected every `ViewerRenderTask`, including the magnifier | Normal main renders remain rejected; the explicit magnifier crop render is admitted. |
+
+### 14.6 Provenance boundary
+
+The performance principle is informed by ZipPlaFork fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`:
+
+- `source/ZipPla/ViewerForm.cs` fields `PreFilteredImageArray`,
+  `OriginalImageInfoArray`, `ResizedSizeArray`, `ResizedImageArray`;
+- `source/ZipPla/PackedImageLoader.cs` constructor (`:283-330`),
+  `PackedImageEntry` (`:375-400`), `getZipArchiveEntries` (`:1197-1243`),
+  `OpenImageStream` / `OpenInnerImageStream` (`:1781-1867`) and
+  `SeekableStream` (`:2731-2890`);
+- `source/ZipPla/ImageLoader.cs` `GetJpegOrientation` /
+  `LoadRotateBitmap` (`:382-400`) and `GetFullBitmap(Stream)` (`:559-689`);
+- `bmwLoadEachPage_DoWork` (`:3177-3550`) and its reuse of retained source;
+- `NextPage` / `PreviousPage` (`:1903-2002`) and complete-spread gating;
+- per-entry error artifact creation (`:3565-3579`);
+- page completion/publication (`:5371-5415`);
+- `SetNewResizedImage` (`:5451-5468`);
+- `ReduceUsingMemory` (`:5471-5524`);
+- `priorityLevel` (`:5586-5605`);
+- paint/loading-mask paths (`:6768-6858`, `:6990-7321`);
+- `source/ZipPla/GenerarClasses.cs`,
+  `BackgroundMultiWorker.SetWorksOrder` (`:247-264`) and completion/next-work
+  selection (`:266-303`).
+
+The existing `ZipRasterBookRuntime`, unit job and work-order/cache ranking remain
+the recorded direct AGPL-3.0-or-later structural port.  The new
+`_ZipRasterSourceStore`, resolution-sufficiency lookup, paired source/frame
+validity, combined Qt byte ledger, PresentationState integration and
+direct-mode magnifier boundary are a new Python/Qt design rather than a
+line-for-line translation.  No new dependency or license was added.
+
+### 14.7 Validation and remaining boundary
+
+The focused contract protects: preview reuse for a smaller layout, one-time
+full-resolution upgrade, reuse of that full source for later DPR/layout work,
+GUI-thread source attachment, complete spread/frame behavior, one ordered job
+lane, stale rejection, budget admission, shutdown, and magnifier task tracking
+while direct display is active.  Detailed offscreen A/B numbers are recorded
+by `scripts/benchmark_zip_runtime_layout_reuse.py`; they remain supporting
+evidence and do not establish physical-device responsiveness.
+
+Final offscreen validation used independent pytest processes.  The focused
+Viewer/runtime set passed 227 tests.  The complete suite was split into three
+fresh processes and passed 651 + 507 + 283 = 1,441 tests.  One 20 ms
+fullscreen-hide timer assertion missed its 30 ms deadline during an earlier
+concurrent run; the test passed alone and its entire 507-test partition passed
+on two clean reruns, so no product change was made to hide that scheduling
+flake.  Syntax/import checks and `git diff --check` also passed.  One duplicate
+subagent split process remained after its agent was interrupted; after its PID,
+parent and executable were verified, only that test process was stopped and the
+same 651-test partition passed sequentially.  No spawned test/benchmark process
+remains.  The unrelated pre-existing ComfyUI Python process was neither stopped
+nor modified.
+
+The controlled default run used one temporary ZIP_STORED detailed JPEG,
+2,400 x 3,600 pixels, 6,592,317 compressed bytes, a 1,200 x 800 viewport and a
+256 MiB book budget.  Each side ran in a fresh offscreen child process with its
+own `ZipImageSource` and `ZipRasterBookRuntime`.  A reproduced the old
+layout-invalidation ownership by calling `cancel(clear_artifacts=True)` before
+every variant; B used production `invalidate_layout()` and retained decoded
+sources.  Neither side created a `ViewerWindow`, native input or an external
+GUI application.
+
+| Operation | A old clear-all ms / reads / decodes | B source-reuse ms / reads / decodes |
+|---|---:|---:|
+| Initial decoder-sized fit | 60.154 / 1 / 1 | 58.621 / 1 / 1 |
+| Smaller resize | 43.725 / 1 / 1 | 2.106 / 0 / 0 |
+| Full-resolution rotation upgrade | 95.530 / 1 / 1 | 95.260 / 1 / 1 |
+| DPR/manual-zoom variant | 83.632 / 1 / 1 | 13.036 / 0 / 0 |
+| Full-source magnifier-equivalent variant | 84.692 / 1 / 1 | 12.951 / 0 / 0 |
+| **Total** | **367.824 / 5 / 5** | **182.047 / 2 / 2** |
+
+| Counter / memory | A old clear-all | B source reuse | Difference |
+|---|---:|---:|---:|
+| ZIP entry bytes read | 32,961,585 | 13,184,634 | -19,776,951 (-60.0%) |
+| Observable whole-payload API copies / bytes | 2 / 13,184,634 | 1 / 6,592,317 | -1 / -6,592,317 |
+| Source-cache hits / misses | 0 / 5 | 3 / 2 | +3 hits / -3 misses |
+| Worker jobs / queued callbacks | 5 / 5 | 5 / 5 | 0 / 0 |
+| Display QImage outputs / `QPixmap.fromImage` | 5 / 5 | 5 / 5 | 0 / 0 |
+| Final source / frame / total cache bytes | 25,920,000 / 8,640,000 / 34,560,000 | 25,920,000 / 8,640,000 / 34,560,000 | identical |
+| Retained source pages / frame units | 1 / 1 | 1 / 1 | identical |
+| Sampled peak working-set delta | 166.141 MiB | 97.703 MiB | -68.438 MiB |
+| Process-lifetime peak delta | 170.156 MiB | 112.406 MiB | -57.750 MiB |
+| End working-set delta | 97.191 MiB | 46.703 MiB | -50.488 MiB |
+
+B is 2.020x faster (185.777 ms saved) for this five-layout sequence because it removes three ZIP
+reads and decodes; it does not hide work by reducing render jobs, callbacks,
+display QImages or pixmap uploads.  Final retained logical cache ownership is
+identical.  The memory values are process-wide and allocator-sensitive, and
+the magnifier-equivalent step measures source/display preparation rather than
+an actual widget paint.  A separate offscreen integration contract confirms
+that a direct-mode ZIP frame now completes the real magnifier task.
+
+A final production-path supplement used `ViewerWindow ->
+ZipRasterBookRuntime`, eleven 1,200 x 1,800 detailed JPEG pages (1,649,004
+bytes per ZIP entry), an 800 x 600 viewport and explicit offscreen
+`QWidget.render` paint.  It is not an old/new comparison; it checks the latest
+path after the structural change.  All scenarios settled, every transit-page
+decode count was zero, and ready/retained hits created no job, callback,
+decode or QPixmap upload.
+
+| Scenario | request→commit / paint ms | ZIP reads / decodes | jobs / stale | paints | retained pages | sampled peak delta MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| cold forward | 15 / 15 | 1 / 1 | 3 / 0 | 1 | 3 | 4.582 |
+| reversal | 15 / 15 | 0 / 0 | 4 / 0 | 1 | 4 | 0.035 |
+| cold roundtrip | 0 / 0 | 0 / 1 | 5 / 1 | 2 | 3 | 2.602 |
+| rapid final | 16 / 16 | 1 / 1 | 3 / 0 | 1 | 3 | 3.918 |
+| retained roundtrip | 0 / 0 | 0 / 0 | 0 / 0 | 1 | 6 | 0.020 |
+| ready | 0 / 0 | 0 / 0 | 0 / 0 | 1 | 3 | 0.012 |
+| memory pressure | 15 / 15 | 0 / 0 | 1 / 0 | 1 | 1 | 0.043 |
+
+The 0/15/16 ms values reflect offscreen event-loop/paint quantization and must
+not be interpreted as physical-device page-turn latency.  Cancelled partial
+entry bytes are also outside the source counter, as documented by the script.
+
+Remaining known work includes the two compressed-payload materializations on
+the normal JPEG path, Pillow/native decoder regions that cannot be interrupted
+immediately, and Qt/plugin/native upload allocation outside the byte ledger.
+A running high-quality magnifier `ViewerRenderTask` has no cooperative inner
+cancel.  It is now isolated from the book Viewer lane, but can briefly contend
+for CPU/memory bandwidth and shutdown still waits for its inner crop.  A
+preview-to-full magnifier upgrade also uses `invalidate_layout()`, preserving
+decoded sources but clearing unrelated ready neighbor frames; a targeted
+`ensure_full_source` boundary should replace that broad frame invalidation.
+Requested-page bookmark/export residue, broad post-commit action projection,
+and all non-ZIP legacy main-display runtimes also remain.  The next structural
+boundary is rank 2, the source-independent folder/single-image
+`RasterBookRuntime`.

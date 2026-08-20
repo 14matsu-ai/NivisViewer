@@ -2755,7 +2755,7 @@ class ViewerWindow(QMainWindow):
                     loading=False,
                     rendered_size=(
                         (source.width(), source.height())
-                        if source is not None
+                        if source is not None and page.source_is_preview
                         else None
                     ),
                     pre_rotated=False,

@@ -56,6 +56,15 @@ cancellation or rejection of obsolete work. The active three-unit scheduling
 frontier is not used as cache membership. It is not a verbatim or line-for-line
 translation of the upstream C# source.
 
+The same fixed revision's page-indexed `PreFilteredImageArray`,
+`OriginalImageInfoArray`, `ResizedSizeArray`, and `ResizedImageArray` informed
+the decision to give decoded sources a longer lifetime than layout-specific
+display artifacts.  NivisViewer's `_ZipRasterSourceStore`, preview/full
+resolution-sufficiency keys, paired source/frame validity, combined Qt byte
+ledger, and direct-mode magnifier projection are new Python/Qt designs rather
+than line-for-line translations.  They retain the AGPL provenance notice for
+the surrounding runtime while avoiding the upstream WinForms/GDI ownership.
+
 NivisViewer's `app/viewer_presentation_state.py` and the corresponding
 integration in `app/viewer_window.py` and `app/viewer_widget.py` also adopt the
 single-owner completed-artifact publication structure traced through

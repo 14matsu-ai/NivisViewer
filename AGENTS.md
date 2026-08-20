@@ -9,8 +9,11 @@
 - 依存ライブラリを追加する場合は、理由とライセンスを報告する。
 - NivisViewerは配布・公開を前提としない完全な個人用アプリとして扱う。
 - Viewer性能改善ではZipPlaForkのコード、アルゴリズム、処理構造のコピー・翻訳・移植を許可する。従来の「設計だけ参考にして直接移植しない」という制約は適用しない。
-- Viewer性能改善では現行Viewer実装の維持を目的にしない。ZipPlaForkの方が優れている箇所は、局所修正に限定せず、class、scheduler、cache、decode／resize／publish pipelineを構造単位で撤去・置換してよい。
-- 「NivisViewer流へ合わせる」ことより、通常の大画像ZIPにおけるcold miss、順送り、逆方向反転、往復、高速連続入力の実機体感を優先する。
+- Viewer性能改善では現行Viewer実装を無条件に維持しない。ZipPlaForkの方が性能、単純さ、安定性で優れている箇所は、局所修正に限定せず、class、scheduler、cache、decode／resize／publish pipelineを構造単位で撤去・置換してよい。
+- ZipPlaForkは性能設計・アルゴリズム・処理構造の参照実装であり、NivisViewerを同じアプリへ変えることは目的にしない。NivisViewerの方が使いやすさ、機能、現代的設計で優れているUI／外部契約は維持する。
+- Viewer比較では、ZipPlaFork方式、NivisViewer方式、両者を分離接続するHybrid、どちらにも依存しないNew designを明示的に評価する。ZipPlaForkと異なるという理由だけでNivisViewer固有構造を撤去しない。
+- ZipPlaFork由来構造を採用するときも、現代Windows、x64、高DPI、大容量RAM、大画像、新形式、非同期cancel、structured resource lifetime、virtualized UIに合わせて翻訳し、古いWinForms固有制約をそのまま再現しない。
+- 通常の大画像ZIPにおけるcold miss、順送り、逆方向反転、往復、高速連続入力の実機体感を最優先としつつ、single／spread、LTR／RTL、rotation、zoom、magnifier、DPI、page list、history／progress、PDF／folder／archive、error handling、book switchのUX契約を保護する。
 - ZipPlaForkから移植する場合は、移植元repository、固定revision、元ファイル、元処理、ライセンス、著作権表示、NivisViewer側の対応箇所を`docs/ZIPPLAFORK_COMPARISON.md`へ記録する。
 - ZipPlaFork由来コードはAGPL-3.0-or-later由来として明示し、必要なライセンス本文と通知を保持する。ZipPlaFork以外のAGPL依存追加は、理由と影響を報告してから行う。
 - Windowsと日本語ファイル名を前提にする。

@@ -690,6 +690,19 @@ def test_magnifier_render_uses_demand_priority(
 def test_rapid_magnifier_requests_and_cancel_clear_all_task_tracking(
     qapp: QApplication,
 ) -> None:
+    class FakeCoordinator:
+        def __init__(self) -> None:
+            self.started: list[tuple[object, int]] = []
+            self.taken: list[object] = []
+
+        def start_viewer(self, task, priority: int) -> bool:
+            self.started.append((task, priority))
+            return True
+
+        def try_take_viewer(self, task) -> bool:
+            self.taken.append(task)
+            return False
+
     class FakePool:
         def __init__(self) -> None:
             self.started: list[tuple[object, int]] = []
@@ -708,8 +721,12 @@ def test_rapid_magnifier_requests_and_cancel_clear_all_task_tracking(
         def waitForDone(self, _msecs: int) -> bool:
             return True
 
-    widget = ViewerWidget()
+    coordinator = FakeCoordinator()
+    widget = ViewerWidget(  # type: ignore[arg-type]
+        image_work_coordinator=coordinator,
+    )
     widget.resize(480, 320)
+    widget.set_direct_display_mode(True)
     pool = FakePool()
     widget._render_pool = pool  # type: ignore[assignment]
     source = _image()
@@ -744,6 +761,9 @@ def test_rapid_magnifier_requests_and_cancel_clear_all_task_tracking(
         assert len(widget._render_priorities) == 1
 
     assert len(pool.taken) == 2
+    # Direct-mode magnifier work must not occupy the one book-runtime Viewer
+    # lane. A running high-quality crop cannot then queue ahead of a page turn.
+    assert not coordinator.started
     assert widget.cancel_magnifier()
     assert len(pool.taken) == 3
     assert not widget._render_tasks

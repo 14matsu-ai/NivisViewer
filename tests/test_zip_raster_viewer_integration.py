@@ -6,6 +6,7 @@ from time import monotonic
 import zipfile
 
 from PIL import Image
+from PySide6.QtCore import QRectF
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -144,6 +145,23 @@ def test_zip_runtime_commits_complete_spread_and_retains_source_for_magnifier(
         assert all(image.qimage is not None for image in window.viewer._images)
         assert window._applied_display_request_id == window._active_request_id
         assert window._zip_runtime_current_frame_serial > 0
+
+        # The ZIP runtime owns the main display, but the NivisViewer
+        # magnifier remains an interactive projection of the committed source.
+        source_image = window.viewer._images[0]
+        assert source_image.qimage is not None
+        window.viewer.magnifier_selecting = True
+        window.viewer.magnifier_source_page = source_image.page_index
+        window.viewer._magnifier_source_image_id = source_image.image_id
+        window.viewer.magnifier_source_rect = QRectF(
+            0,
+            0,
+            max(1, source_image.qimage.width() // 2),
+            max(1, source_image.qimage.height() // 2),
+        )
+        window.viewer._request_magnifier_render()
+        _wait_until(qapp, lambda: window.viewer.magnifier_active)
+        assert window.viewer._magnifier_pixmap is not None
     finally:
         window.close()
         qapp.processEvents()
