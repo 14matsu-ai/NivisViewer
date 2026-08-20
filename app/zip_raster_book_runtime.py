@@ -361,10 +361,6 @@ class _ZipRasterSourceStore:
     def page_indexes(self) -> tuple[int, ...]:
         return tuple(source.page_index for source in self._sources.values())
 
-    @property
-    def keys(self) -> frozenset[_SourceKey]:
-        return frozenset(self._sources)
-
     def clear(self) -> None:
         self._sources.clear()
 
@@ -563,6 +559,7 @@ class _ZipRasterFrameStore:
         self._byte_budget = max(1, int(byte_budget))
         self._active_order: tuple[_UnitKey, ...] = ()
         self._current_key: _UnitKey | None = None
+        self._displayed_key: _UnitKey | None = None
         self._direction = 0
 
     def __contains__(self, key: _UnitKey) -> bool:
@@ -603,22 +600,8 @@ class _ZipRasterFrameStore:
     def clear(self) -> None:
         self._frames.clear()
 
-    def remove_missing_sources(
-        self,
-        valid_source_keys: frozenset[_SourceKey],
-    ) -> int:
-        removable = tuple(
-            key
-            for key, frame in self._frames.items()
-            if any(
-                source_key is not None
-                and source_key not in valid_source_keys
-                for source_key in frame.source_keys
-            )
-        )
-        for key in removable:
-            self._frames.pop(key, None)
-        return len(removable)
+    def take(self, key: _UnitKey) -> _CachedFrame | None:
+        return self._frames.pop(key, None)
 
     def set_limits(
         self,
@@ -647,6 +630,12 @@ class _ZipRasterFrameStore:
             self._direction = 1
         else:
             self._direction = 0
+        return self._prune()
+
+    def set_displayed_key(self, key: _UnitKey | None) -> int:
+        """Protect the last painted frame until its replacement paints."""
+
+        self._displayed_key = key
         return self._prune()
 
     def put(self, frame: _CachedFrame) -> tuple[bool, int]:
@@ -695,7 +684,9 @@ class _ZipRasterFrameStore:
 
     def _eviction_candidate(self) -> _UnitKey | None:
         candidates = tuple(
-            key for key in self._frames if key != self._current_key
+            key
+            for key in self._frames
+            if key not in {self._current_key, self._displayed_key}
         )
         if not candidates:
             return None
@@ -1196,6 +1187,10 @@ class RasterBookRuntime(QObject):
         self._unit_by_key: dict[_UnitKey, ZipRasterDisplayUnit] = {}
         self._prefetch_released_request_id: int | None = None
         self._prefetch_admission_stopped_request_id: int | None = None
+        self._dispatch_suspended = False
+        self._painted_key: _UnitKey | None = None
+        self._source_hydration_key: _UnitKey | None = None
+        self._source_hydration_frame: _CachedFrame | None = None
         self._active_job: _ZipRasterUnitJob | None = None
         self._jobs: set[_ZipRasterUnitJob] = set()
         self._failed_prefetch: set[_UnitKey] = set()
@@ -1223,15 +1218,32 @@ class RasterBookRuntime(QObject):
 
     @property
     def cached_page_indexes(self) -> tuple[int, ...]:
-        return self._frame_store.page_indexes
+        indexes = list(self._frame_store.page_indexes)
+        if self._source_hydration_frame is not None:
+            indexes.extend(
+                page.page_index
+                for page in self._source_hydration_frame.unit.pages
+            )
+        return tuple(indexes)
 
     @property
     def cached_unit_count(self) -> int:
-        return self._frame_store.unit_count
+        return self._frame_store.unit_count + int(
+            self._source_hydration_frame is not None
+        )
 
     @property
     def cache_bytes(self) -> int:
-        return self._frame_store.byte_size + self._source_store.byte_size
+        hydration_bytes = (
+            _ZipRasterFrameStore._frame_bytes(self._source_hydration_frame)
+            if self._source_hydration_frame is not None
+            else 0
+        )
+        return (
+            self._frame_store.byte_size
+            + self._source_store.byte_size
+            + hydration_bytes
+        )
 
     @property
     def decoded_source_count(self) -> int:
@@ -1269,13 +1281,102 @@ class RasterBookRuntime(QObject):
             in self._frame_store
         )
 
+    def require_cached_current_source(
+        self,
+        request: ZipRasterRequest,
+    ) -> bool:
+        """Withhold one source-less frame while its source is hydrated.
+
+        Main display QPixmaps intentionally survive decoded-source eviction.
+        Interactive source consumers such as the magnifier can therefore ask
+        for the same full-spec unit again.  The frame remains owned as a
+        rollback artifact: navigation/cancellation restores the ready hit,
+        while the same-current request treats only this unit as cold.
+        """
+
+        if (
+            not self._accepting_requests
+            or request.source_epoch != self.source_epoch
+        ):
+            return False
+        key = self._key_for(request.current, request.render_spec)
+        if self._source_hydration_key == key:
+            return True
+        if self._source_hydration_frame is not None:
+            self._restore_source_hydration_frame()
+        cached = self._frame_store.get(key, touch=False)
+        if cached is None:
+            return False
+        for index, page in enumerate(cached.pages):
+            if page.error is not None:
+                continue
+            if self._source_for_frame_page(
+                cached,
+                index,
+                page,
+                touch=False,
+            ) is None:
+                self._source_hydration_frame = self._frame_store.take(key)
+                self._source_hydration_key = key
+                self._failed_prefetch.discard(key)
+                return self._source_hydration_frame is not None
+        return False
+
+    def stage(self, request: ZipRasterRequest) -> bool:
+        """Adopt a navigation intent without starting its cold current job.
+
+        The Viewer uses this before its replaceable cold-demand timer.  Work
+        order, retention and cancellation therefore follow every input
+        immediately, while a paced wheel/key burst can still replace the
+        eventual decode target.  A completed staged artifact is retained but
+        never published until :meth:`request` admits that exact serial.
+        """
+
+        if (
+            not self._accepting_requests
+            or request.source_epoch != self.source_epoch
+        ):
+            return False
+        self._adopt_request(request, suspend_dispatch=True)
+        return True
+
     def request(self, request: ZipRasterRequest) -> bool:
         if (
             not self._accepting_requests
             or request.source_epoch != self.source_epoch
         ):
             return False
+        if self._dispatch_suspended and self._current_request is request:
+            # Window dispatches the exact object it staged.  Retention,
+            # cancellation and work-order replacement already happened at
+            # input time, so admission only opens the current-job gate.
+            self._dispatch_suspended = False
+        else:
+            self._adopt_request(request, suspend_dispatch=False)
+        current_key = self._current_key
+        if current_key is None:
+            return False
+        frame = self._frame_store.get(current_key, touch=True)
+        if frame is not None:
+            self._bump("cache_hits")
+            self.frameReady.emit(self._public_frame(request, frame, True))
+        else:
+            self._bump("cache_misses")
+        self._drive()
+        return True
+
+    def _adopt_request(
+        self,
+        request: ZipRasterRequest,
+        *,
+        suspend_dispatch: bool,
+    ) -> None:
         current_key = self._key_for(request.current, request.render_spec)
+        if (
+            self._source_hydration_key is not None
+            and self._source_hydration_key != current_key
+        ):
+            self._restore_source_hydration_frame()
         work_keys = tuple(
             self._key_for(unit, request.render_spec)
             for unit in request.work_order
@@ -1286,6 +1387,7 @@ class RasterBookRuntime(QObject):
         self._unit_by_key = dict(zip(work_keys, request.work_order))
         self._prefetch_released_request_id = None
         self._prefetch_admission_stopped_request_id = None
+        self._dispatch_suspended = bool(suspend_dispatch)
         evicted = self._frame_store.set_retention_order(
             work_keys,
             current_key,
@@ -1308,49 +1410,59 @@ class RasterBookRuntime(QObject):
 
         active = self._active_job
         if active is not None:
-            if active.key == current_key:
+            active_cancelled = active.cancelled.is_set()
+            if active.key == current_key and not active_cancelled:
                 active.adopt_request(request.request_id)
-            elif current_key in self._frame_store and active.key in work_keys:
+            elif (
+                not suspend_dispatch
+                and not active_cancelled
+                and current_key in self._frame_store
+                and active.key in work_keys
+            ):
                 # A same-current refresh or a compatible work-order change can
                 # adopt an already useful neighbor instead of restarting it.
                 active.adopt_request(request.request_id)
             else:
                 self._cancel_active_job()
 
-        frame = self._frame_store.get(current_key, touch=True)
-        if frame is not None:
-            self._bump("cache_hits")
-            self.frameReady.emit(self._public_frame(request, frame, True))
-        else:
-            self._bump("cache_misses")
-        self._drive()
-        return True
-
     def release_prefetch(self, *, request_id: int) -> bool:
         request = self._current_request
         if (
             request is None
+            or self._dispatch_suspended
             or int(request_id) != request.request_id
             or self._current_key not in self._frame_store
         ):
             return False
+        self._painted_key = self._current_key
+        evicted = self._frame_store.set_displayed_key(self._painted_key)
+        if evicted:
+            self._bump("cache_evictions", evicted)
         self._prefetch_released_request_id = request.request_id
         self._drive()
         return True
 
     def cancel(self, *, clear_artifacts: bool = False) -> None:
+        if clear_artifacts:
+            self._source_hydration_key = None
+            self._source_hydration_frame = None
+        else:
+            self._restore_source_hydration_frame()
         self._current_request = None
         self._current_key = None
         self._work_keys = ()
         self._unit_by_key.clear()
         self._prefetch_released_request_id = None
         self._prefetch_admission_stopped_request_id = None
+        self._dispatch_suspended = False
+        self._painted_key = None
         self._failed_prefetch.clear()
         self._cancel_active_job()
         if clear_artifacts:
             self._frame_store.clear()
             self._source_store.clear()
         self._frame_store.set_retention_order((), None, 0)
+        self._frame_store.set_displayed_key(None)
         self._source_store.set_retention_order((), None, None, 0)
 
     def invalidate_layout(self) -> None:
@@ -1391,6 +1503,7 @@ class RasterBookRuntime(QObject):
             not self._accepting_requests
             or request is None
             or self._current_key is None
+            or self._dispatch_suspended
             or self._active_job is not None
         ):
             return
@@ -1610,6 +1723,24 @@ class RasterBookRuntime(QObject):
         unit: ZipRasterDisplayUnit,
         message: str,
     ) -> None:
+        hydration_frame = (
+            self._source_hydration_frame
+            if self._source_hydration_key == key
+            else None
+        )
+        if hydration_frame is not None:
+            self._restore_source_hydration_frame()
+            self._bump("terminal_errors", len(hydration_frame.pages))
+            if (
+                self._accepting_requests
+                and not self._dispatch_suspended
+                and self._current_request is request
+                and self._current_key == key
+            ):
+                self.frameReady.emit(
+                    self._public_frame(request, hydration_frame, True)
+                )
+            return
         pages = tuple(
             ZipRasterFramePage(
                 page.page_index,
@@ -1637,6 +1768,7 @@ class RasterBookRuntime(QObject):
         self._bump("terminal_errors", len(pages))
         if (
             self._accepting_requests
+            and not self._dispatch_suspended
             and self._current_request is request
             and self._current_key == key
         ):
@@ -1682,6 +1814,15 @@ class RasterBookRuntime(QObject):
             self._drive()
             self._emit_idle_if_needed()
             return
+
+        existing_before_result = self._frame_store.get(
+            result.key,
+            touch=False,
+        )
+        existing_before_result_is_ready = bool(
+            existing_before_result is not None
+            and all(page.error is None for page in existing_before_result.pages)
+        )
 
         stored_sources: set[_SourceKey] = set()
         for rendered in result.pages:
@@ -1736,11 +1877,41 @@ class RasterBookRuntime(QObject):
             )
             source_keys.append(rendered.source_key)
         if not frame_pages:
+            if self._source_hydration_key == result.key:
+                self._restore_source_hydration_frame()
             self._drive()
             self._emit_idle_if_needed()
             return
         if terminal_errors:
             self._bump("terminal_errors", terminal_errors)
+            if self._source_hydration_key == result.key:
+                hydration_frame = self._source_hydration_frame
+                self._restore_source_hydration_frame()
+                self._enforce_combined_budget()
+                request = self._current_request
+                if (
+                    hydration_frame is not None
+                    and request is not None
+                    and not self._dispatch_suspended
+                    and result.key == self._current_key
+                ):
+                    self.frameReady.emit(
+                        self._public_frame(request, hydration_frame, True)
+                    )
+                self._drive()
+                self._emit_idle_if_needed()
+                return
+            if existing_before_result_is_ready:
+                # A source-hydration job may finish and queue its callback just
+                # before navigation restores the withheld ready QPixmap.  The
+                # old key can still be a relevant neighbor of the new request,
+                # but a late terminal result must never replace that known-good
+                # frame with an error artifact.  Successful late work remains
+                # eligible to refresh the cached source below.
+                self._enforce_combined_budget()
+                self._drive()
+                self._emit_idle_if_needed()
+                return
         gui_ready = monotonic()
         cached = _CachedFrame(
             result.key,
@@ -1750,6 +1921,9 @@ class RasterBookRuntime(QObject):
             result.completed_at,
             gui_ready,
         )
+        if self._source_hydration_key == result.key:
+            self._source_hydration_key = None
+            self._source_hydration_frame = None
         retained, evicted = self._frame_store.put(cached)
         if evicted:
             self._bump("cache_evictions", evicted)
@@ -1762,7 +1936,15 @@ class RasterBookRuntime(QObject):
             self._failed_prefetch.add(result.key)
         self.artifactReady.emit(cached)
         request = self._current_request
-        if request is not None and result.key == self._current_key:
+        if (
+            request is not None
+            and not self._dispatch_suspended
+            and result.key == self._current_key
+            and not (
+                existing_before_result_is_ready
+                and result.request_id != request.request_id
+            )
+        ):
             self.frameReady.emit(self._public_frame(request, cached, False))
         self._drive()
         self._emit_idle_if_needed()
@@ -1798,17 +1980,22 @@ class RasterBookRuntime(QObject):
     ) -> ZipRasterFrame:
         pages: list[ZipRasterFramePage] = []
         for index, page in enumerate(cached.pages):
-            source_key = (
-                cached.source_keys[index]
-                if index < len(cached.source_keys)
-                else None
+            source = self._source_for_frame_page(
+                cached,
+                index,
+                page,
+                touch=True,
             )
-            source = self._source_store.get(source_key, touch=True)
             pages.append(
                 replace(
                     page,
                     source_qimage=(
                         QImage(source.qimage) if source is not None else None
+                    ),
+                    source_is_preview=(
+                        source.source_is_preview
+                        if source is not None
+                        else page.source_is_preview
                     ),
                 )
             )
@@ -1823,16 +2010,58 @@ class RasterBookRuntime(QObject):
             cached.gui_ready_at,
         )
 
+    def _source_for_frame_page(
+        self,
+        cached: _CachedFrame,
+        index: int,
+        page: ZipRasterFramePage,
+        *,
+        touch: bool,
+    ) -> _CachedSource | None:
+        source_key = (
+            cached.source_keys[index]
+            if index < len(cached.source_keys)
+            else None
+        )
+        source = self._source_store.get(source_key, touch=touch)
+        if source is not None:
+            return source
+        logical_page = next(
+            (
+                candidate
+                for candidate in cached.unit.pages
+                if candidate.page_index == page.page_index
+                and candidate.image_id == page.logical_image_id
+            ),
+            None,
+        )
+        if logical_page is None:
+            return None
+        # A later full-resolution decode may have dominance-replaced the exact
+        # preview key recorded by this frame.  Reattach that sufficient source
+        # without a worker job.
+        return self._source_store.find(
+            logical_page,
+            cached.key.render_spec,
+            touch=touch,
+        )
+
+    def _restore_source_hydration_frame(self) -> bool:
+        frame = self._source_hydration_frame
+        self._source_hydration_key = None
+        self._source_hydration_frame = None
+        if frame is None:
+            return False
+        retained, evicted = self._frame_store.put(frame)
+        if evicted:
+            self._bump("cache_evictions", evicted)
+        return retained
+
     def _record_source_evictions(self, amount: int) -> None:
         if amount <= 0:
             return
         self._bump("source_cache_evictions", amount)
         self._bump("cache_evictions", amount)
-        removed_frames = self._frame_store.remove_missing_sources(
-            self._source_store.keys
-        )
-        if removed_frames:
-            self._bump("cache_evictions", removed_frames)
 
     def _enforce_combined_budget(self) -> None:
         while self.cache_bytes > self._cache_byte_budget:

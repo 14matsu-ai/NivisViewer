@@ -9,7 +9,7 @@ from PIL import Image
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
-from app.image_source import ZipImageSource
+from app.image_source import ImageSourceError, ZipImageSource
 from app.image_work_coordinator import ImageWorkCoordinator
 from app.zip_raster_book_runtime import (
     ZipRasterBookRuntime,
@@ -263,8 +263,9 @@ def test_layout_changes_reuse_book_scoped_decoded_source(
         assert source.decode_calls == 1
         assert frames[-1].pages[0].source_is_preview
 
-        # Rotation/magnifier-style full-resolution demand upgrades once.
-        runtime.invalidate_layout()
+        # Rotation/magnifier-style full-resolution demand upgrades once. Keep
+        # the smaller frame so its old source key can later prove dominance
+        # replacement does not force another worker job.
         assert runtime.request(
             _request(
                 3,
@@ -277,11 +278,31 @@ def test_layout_changes_reuse_book_scoped_decoded_source(
         assert source.decode_calls == 2
         assert not frames[-1].pages[0].source_is_preview
 
+        jobs_before_ready_return = runtime.metrics.jobs_submitted
+        assert runtime.request(
+            _request(
+                4,
+                current,
+                current,
+                spec=ZipRasterRenderSpec(
+                    (500, 360),
+                    device_pixel_ratio=1.5,
+                    decoder_maximum_size=(60, 90),
+                ),
+            )
+        )
+        qapp.processEvents()
+        assert frames[-1].request_id == 4
+        assert frames[-1].cache_hit
+        assert frames[-1].pages[0].source_qimage is not None
+        assert not frames[-1].pages[0].source_is_preview
+        assert runtime.metrics.jobs_submitted == jobs_before_ready_return
+
         # The full source then satisfies later DPI/layout variants.
         runtime.invalidate_layout()
         assert runtime.request(
             _request(
-                4,
+                5,
                 current,
                 current,
                 spec=ZipRasterRenderSpec(
@@ -291,14 +312,14 @@ def test_layout_changes_reuse_book_scoped_decoded_source(
                 ),
             )
         )
-        _wait_until(qapp, lambda: len(frames) == 4)
+        _wait_until(qapp, lambda: len(frames) == 5)
 
         assert source.decode_calls == 2
         assert runtime.metrics.jobs_submitted == 4
         assert runtime.metrics.source_cache_hits == 2
         assert runtime.metrics.source_cache_misses == 2
         assert runtime.decoded_source_count == 1
-        assert frames[-1].request_id == 4
+        assert frames[-1].request_id == 5
         assert frames[-1].pages[0].source_qimage is not None
 
         # Active adjustments define the protected source variant. Repeated
@@ -306,7 +327,7 @@ def test_layout_changes_reuse_book_scoped_decoded_source(
         # because they belong to the currently displayed image ID.
         one_variant_budget = runtime.cache_bytes + 1
         runtime.set_cache_limits(byte_budget=one_variant_budget)
-        for request_id, brightness in enumerate((1.1, 1.2, 1.3), start=5):
+        for request_id, brightness in enumerate((1.1, 1.2, 1.3), start=6):
             assert runtime.request(
                 _request(
                     request_id,
@@ -452,6 +473,109 @@ def test_memory_budget_stops_prefetch_before_decode_churn(
         assert runtime.metrics.prefetch_admission_stops == 1
         assert runtime.cached_page_indexes == (1,)
         assert source.opens == ["1.png"]
+    finally:
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()
+
+
+def test_source_eviction_keeps_last_painted_frame_ready_for_reversal(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    class FailingHydrationSource(ZipImageSource):
+        fail_image_id: str | None = None
+
+        def open_image(self, image_id: str) -> Image.Image:
+            if image_id == self.fail_image_id:
+                raise ImageSourceError("forced hydration failure")
+            return super().open_image(image_id)
+
+    source = FailingHydrationSource(_write_zip(tmp_path, pages=2))
+    runtime = ZipRasterBookRuntime(
+        source,
+        1,
+        cache_unit_limit=3,
+        cache_byte_budget=100_000,
+    )
+    frames: list[ZipRasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    spec = ZipRasterRenderSpec((100, 100))
+    first = _request(1, _unit(0), _unit(0), spec=spec)
+    second = _request(2, _unit(1), _unit(1), spec=spec)
+    try:
+        assert runtime.request(first)
+        _wait_until(qapp, lambda: bool(frames) and frames[-1].request_id == 1)
+        assert runtime.release_prefetch(request_id=1)
+
+        assert runtime.request(second)
+        _wait_until(qapp, lambda: bool(frames) and frames[-1].request_id == 2)
+        assert 0 in runtime.cached_page_indexes
+        assert runtime.metrics.source_cache_evictions >= 1
+
+        jobs_before_reversal = runtime.metrics.jobs_submitted
+        assert runtime.request(_request(3, _unit(0), _unit(0), spec=spec))
+        qapp.processEvents()
+        assert frames[-1].request_id == 3
+        assert frames[-1].cache_hit
+        assert runtime.metrics.jobs_submitted == jobs_before_reversal
+
+        # A full-spec QPixmap hit with an evicted source remains instant for
+        # display.  A later source consumer makes only this unit cold and
+        # hydrates it without clearing neighboring ready frames.
+        assert frames[-1].pages[0].source_qimage is None
+        hydrate = _request(4, _unit(0), _unit(0), spec=spec)
+        assert runtime.require_cached_current_source(hydrate)
+        # A superseding page restores the withheld QPixmap. Reversing before
+        # hydration dispatch is still a pure ready hit with no worker job.
+        assert runtime.stage(_request(5, _unit(1), _unit(1), spec=spec))
+        assert runtime.request(_request(6, _unit(0), _unit(0), spec=spec))
+        qapp.processEvents()
+        assert frames[-1].request_id == 6
+        assert frames[-1].cache_hit
+        assert runtime.metrics.jobs_submitted == jobs_before_reversal
+
+        # Cover the narrower race where a failed hydration result is already
+        # queued for the GUI thread when navigation restores the ready frame.
+        # Page 0 remains in page 1's work order, so the late result is relevant
+        # but must not overwrite the known-good QPixmap with an error frame.
+        source.fail_image_id = "0.png"
+        failed_hydrate = _request(7, _unit(0), _unit(0), spec=spec)
+        assert runtime.require_cached_current_source(failed_hydrate)
+        assert runtime.request(failed_hydrate)
+        assert runtime.wait_for_done(3000)
+        assert runtime.stage(
+            _request(8, _unit(1), _unit(1), _unit(0), spec=spec)
+        )
+        jobs_after_failed_hydration = runtime.metrics.jobs_submitted
+        frames_before_reversal = len(frames)
+        assert runtime.request(_request(9, _unit(0), _unit(0), spec=spec))
+        qapp.processEvents()
+        assert frames[-1].request_id == 9
+        assert frames[-1].cache_hit
+        assert frames[-1].pages[0].error is None
+        assert len(frames) == frames_before_reversal + 1
+        assert runtime.metrics.jobs_submitted == jobs_after_failed_hydration
+
+        source.fail_image_id = None
+        hydrate = _request(10, _unit(0), _unit(0), spec=spec)
+        assert runtime.require_cached_current_source(hydrate)
+        assert runtime.request(hydrate)
+        assert runtime.wait_for_done(3000)
+        assert runtime.stage(
+            _request(11, _unit(1), _unit(1), _unit(0), spec=spec)
+        )
+        frames_before_successful_reversal = len(frames)
+        assert runtime.request(_request(12, _unit(0), _unit(0), spec=spec))
+        qapp.processEvents()
+        assert frames[-1].request_id == 12
+        assert frames[-1].cache_hit
+        assert len(frames) == frames_before_successful_reversal + 1
+        # The late success refreshed the runtime-owned source without a
+        # duplicate frame commit.  A future source consumer is now a hit.
+        assert not runtime.require_cached_current_source(
+            _request(13, _unit(0), _unit(0), spec=spec)
+        )
+        assert runtime.metrics.jobs_submitted == jobs_before_reversal + 2
     finally:
         assert runtime.shutdown(wait_msecs=3000)
         source.close()

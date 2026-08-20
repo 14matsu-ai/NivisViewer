@@ -2258,3 +2258,190 @@ independently.  No benchmark/test child remained after validation.
 No real application, native input, external GUI application, commit or push
 was used.  Offscreen timing and sampled working set do not establish a
 physical-device improvement.
+
+## 16. ZIP / Folder navigation critical-path replacement (2026-08-20)
+
+### 16.1 Fixed-reference call chain
+
+The comparison remains fixed to ZipPlaFork revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b` (AGPL-3.0-or-later).
+Its relevant navigation chain is:
+
+```text
+KeyboardShortcut.Control_MouseWheel / Owner_KeyDownOrUp
+  -> Command.NextPage / PreviousPage
+  -> ViewerForm.moveToNextPage / MoveToPreviousPage
+  -> movePageNatural
+  -> NextPage / PreviousPage checks ResizedImageArray's ready frontier
+  -> currentPage + showCurrentPage
+  -> BackgroundMultiWorker.SetWorksOrder
+  -> bmwLoadEachPage_DoWork (read/decode/filter/resize)
+  -> SetNewResizedImage
+  -> showCurrentPage / paint
+```
+
+Source locations are `KeyboardShortcut.cs:436-448,653-682`,
+`ViewerForm.cs:1903-2002,3177-3550,5371-5415,5451-5468,5558-5605`, and
+`GenerarClasses.cs:247-264,298-338`.  ZipPlaFork does not coalesce rapid cold
+input: once navigation reaches an unready page, later next/previous operations
+are effectively ignored until that ready frontier advances.  Its active job is
+not preempted; only unstarted work is reordered.
+
+NivisViewer keeps the user's final target instead of dropping input:
+
+```text
+ViewerWidget wheel/key signal
+  -> ViewerPageNavigationController / PageModel requested target
+  -> ViewerPresentationState.request_frame
+  -> ViewerWindow builds current -> directional next -> reverse neighbor
+  -> exact frame lookup
+       hit: synchronous complete-frame publication
+       miss: RasterBookRuntime.stage (immediate order/cancel/retention fence)
+             -> adaptive replaceable cold admission
+             -> one active display-unit job
+  -> one queued GUI completion / QPixmap upload
+  -> atomic complete-frame commit
+  -> slider/status and semantic PresentationState commit
+  -> paint acknowledgement
+  -> bounded neighbor prefetch
+```
+
+### 16.2 Comparative decisions
+
+| Boundary | ZipPlaFork | NivisViewer before this change | Decision and result |
+|---|---|---|---|
+| Rapid cold input | Stops at the ready frontier; no final-target coalescing | A 6 ms timer delayed both decode and adoption of the new work order, so old prefetch/current work continued during the wait | **Hybrid/new design:** immediately stage every intent, but admit only the leading/final cold target. Input is not dropped. |
+| Work-order reversal | Reorders unstarted work around latest `currentPage`; active work finishes | New order reached the runtime only after the timer | **ZipPla principle adopted:** order, retention and obsolete cancellation change at input time. Nivis epoch/serial cancellation remains stronger. |
+| Ready hit | Reads completed resized image directly | Already bypassed timer, worker, decode and `QPixmap.fromImage` | **Nivis maintained:** synchronous atomic commit remains; per-input cache-limit pruning was removed. |
+| Cold current / prefetch | One worker, active work not preempted | One active job and paint-gated prefetch, but delayed staging could let old-direction work continue | **Nivis Hybrid maintained/improved:** current first, cancel/stale fence, prefetch only after matching paint. |
+| Source vs display retention | Original/resized artifacts have a simple page lifecycle | Source eviction also deleted a still-valid QPixmap frame | **Modern design:** a display frame survives source eviction; last painted and requested frames are protected until replacement paint. Magnifier rehydrates a missing source on demand. |
+| Commit UI work | WinForms updates current controls in `showCurrentPage` | PageList scroll/work, all menu QAction writes and metadata staging ran synchronously before paint | **Modern design:** slider/status and semantic commit stay synchronous; invariant full-action sync is removed; PageList scroll/work and persistence are serial-guarded/coalesced side effects. |
+| Replacement open | Old form state remains until new open completes | Provisional open cleared old runtime artifacts before success | **Nivis ownership fix:** stop old work but retain completed artifacts until replacement success; failed open restores a ready hit. |
+
+`RasterBookRuntime.stage` is a two-phase navigation contract.  It installs the
+new current/work order, updates eviction ranking, stops obsolete prefetch and
+cancels a replaceable active job without starting a cold target.  A later
+`request` for the exact staged object opens the execution gate.  A completion
+arriving while staged may be retained but cannot change presentation state.
+Already-cancelled A jobs are never re-adopted in an A -> B -> A reversal.
+
+The cold gate keeps a 6 ms leading delay for a discrete miss.  Once another
+normal navigation arrives within 120 ms, its trailing delay is derived from
+the observed input cadence (`1.25 * interval + 2 ms`, clamped to 8-32 ms).
+The first 18-48 ms version removed transit work but made already-coalesced
+0-4 ms bursts needlessly slower; the measured margin now stays just beyond
+the packet cadence instead of becoming the dominant latency.
+
+Source hydration has a separate rollback boundary.  If a ready QPixmap no
+longer owns a decoded source, the runtime temporarily withholds that one frame
+while it loads the source, but keeps the frame as a ready rollback artifact.
+A superseding navigation restores it before cancelling work, so A -> magnifier
+-> B -> A cannot turn an already-ready page cold.  Magnifier requests also use
+a current-only work order; next/previous are not decoded at full resolution
+while the lens competes for interactive CPU and memory.  A late terminal
+hydration callback may refresh the runtime-owned source, but cannot replace a
+valid frame with an error or republish an already-committed ready hit.
+
+### 16.3 Port provenance
+
+No C# statement or WinForms implementation was copied literally in this
+change.  The AGPL-derived processing principles and their translated owners
+are:
+
+| Fixed-revision source | Adopted principle | NivisViewer implementation |
+|---|---|---|
+| `GenerarClasses.cs`, `BackgroundMultiWorker.SetWorksOrder` | Replace the unstarted order immediately around the latest current page | `RasterBookRuntime.stage`, `_adopt_request`, `_drive` |
+| `ViewerForm.cs`, `NextPage` / `PreviousPage` ready-frontier checks | Do not start decode for every transit page of a cold burst | `ViewerWindow._raster_cold_dispatch_delay` and staged cold admission |
+| `ViewerForm.cs`, `SetNewResizedImage` / `showCurrentPage` | Publish only completed resized artifacts and reuse ready output directly | frame-store hit, `commit_display_ready_frame`, last-painted protection |
+
+ZipPlaFork's dropped input, fixed index-side preference, uncancellable stale
+job, all-book prefetch, pre-paint background work, WinForms/GDI canvas and
+pre-completion logical-control update were deliberately not adopted.
+
+### 16.4 Production-path admission A/B
+
+`scripts/benchmark_raster_navigation_critical_path.py` uses four fresh child
+processes: ZIP/Folder times benchmark-only baseline A and production B.  A
+changes only the child process (`stage` is a no-op and every cold delay is
+6 ms); it does not add a product fallback.  B uses the production staged
+runtime.  The same temporary 24-page fixture alternates 900 x 1,350 and
+2,400 x 3,600 detailed JPEGs, with a 1,200 x 800 viewport and five-unit,
+256 MiB cache.  Input is fake/offscreen `QWheelEvent`, never native input.
+
+Work columns are `jobs / queued callbacks / file reads / decode attempts`.
+Latency is final input to explicit offscreen paint.
+
+| ZIP scenario | A work | B work | A paint ms | B paint ms |
+|---|---:|---:|---:|---:|
+| Ready hit | 1 / 1 / 0 / 0 | 1 / 1 / 0 / 0 | 1.842 | 2.029 |
+| 10-page forward | 12 / 12 / 12 / 12 | 12 / 12 / 12 / 12 | 1.375 | 1.342 |
+| Rapid wheel 12, 0 ms | 3 / 3 / 3 / 3 | 3 / 3 / 3 / 3 | 17.145 | 18.226 |
+| Rapid wheel 12, 4 ms | 3 / 3 / 3 / 3 | 3 / 3 / 3 / 3 | 15.680 | 20.034 |
+| Rapid wheel 12, 8 ms | 7 / 7 / 6 / 7 | **4 / 4 / 3 / 4** | 17.368 | 22.615 |
+| Direction reversal | 4 / 4 / 4 / 4 | 4 / 4 / 3 / 4 | 84.443 | **53.056** |
+| Two-page roundtrip | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 1.120 | 0.891 |
+| Outside-cache return | 15 / 15 / 14 / 14 | 15 / 15 / 14 / 14 | 50.517 | 49.852 |
+| Mixed direction changes | 8 / 8 / 8 / 8 | 8 / 8 / 8 / 8 | 1.486 | 1.216 |
+
+| Folder scenario | A work | B work | A paint ms | B paint ms |
+|---|---:|---:|---:|---:|
+| Ready hit | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 1.311 | 1.319 |
+| 10-page forward | 12 / 12 / 12 / 12 | 12 / 12 / 12 / 12 | 1.506 | 1.501 |
+| Rapid wheel 12, 0 ms | 3 / 3 / 3 / 3 | 3 / 3 / 3 / 3 | 30.712 | **27.957** |
+| Rapid wheel 12, 4 ms | 3 / 3 / 3 / 3 | 3 / 3 / 3 / 3 | 26.510 | 28.227 |
+| Rapid wheel 12, 8 ms | 7 / 7 / 7 / 7 | **4 / 4 / 4 / 4** | 50.659 | **33.107** |
+| Direction reversal | 4 / 4 / 4 / 4 | 4 / 4 / 4 / 4 | 85.742 | 84.163 |
+| Two-page roundtrip | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 0.949 | 0.967 |
+| Outside-cache return | 15 / 15 / 14 / 14 | 15 / 15 / 14 / 14 | 50.843 | 50.078 |
+| Mixed direction changes | 8 / 8 / 8 / 8 | 8 / 8 / 8 / 8 | 1.851 | 1.778 |
+
+The ready critical path creates zero jobs and decodes on both sides.  The one
+ZIP ready-scenario job above is post-paint neighbor prefetch, outside
+input-to-commit.  Forward-10 has nine ready hits and one miss.  The paced 8 ms
+case removes 43% of ZIP and Folder job/callback/decode work in this large
+mixed fixture.  ZIP pays 5.247 ms of final wait in this offscreen run, while
+Folder improves by 17.552 ms because avoided native decode contention exceeds
+the admission margin.  With a smaller quick fixture the work reduction was
+69% (ZIP) and 71% (Folder).  The result is deliberately reported as a
+source/backend-dependent trade, not a universal latency win.
+
+| Aggregate | ZIP A | ZIP B | Folder A | Folder B |
+|---|---:|---:|---:|---:|
+| Jobs / callbacks | 53 / 53 | **50 / 50** | 52 / 52 | **49 / 49** |
+| Reads / decode attempts (successes) | 50 / 51 (47) | **46 / 48 (46)** | 51 / 51 (51) | **48 / 48 (48)** |
+| Stale / cancel | 3 / 5 | **1 / 2** | 4 / 5 | **2 / 2** |
+| Cache hits / misses / evictions | 38 / 44 / 26 | 38 / 44 / 26 | 38 / 43 / 26 | 38 / 43 / 26 |
+| Working-set delta MiB | +17.590 | +17.672 | +20.004 | +21.020 |
+| Process-peak growth MiB | 34.914 | 35.000 | 35.297 | 36.434 |
+| Shutdown ms | 2.197 | 2.041 | 1.875 | 1.787 |
+
+All four children reported a completed coordinator, no remaining runtime job
+and no residual benchmark process.  Timings use `perf_counter_ns`; the JSON
+also records input-to-request, request-to-cache decision, request-to-decode,
+decode-to-commit and commit-to-paint min/median/p95/max values.  Windows file
+cache is hot, QPixmap/native allocations are not fully observable, explicit
+offscreen render is not DWM presentation, and no real-device improvement is
+claimed from these values alone.
+
+### 16.5 Validation and remaining limits
+
+Syntax/import checks passed for every changed Python file.  The runtime,
+magnifier and ZIP/Folder integration group passed 59/59 in one independent
+offscreen process.  Related files passed independently: ViewerWindow 23,
+ViewerWidget 38, PresentationState 5, virtual PageList runtime 4, metadata
+integration 19, BookSession 16, ImageSource 25 and PageModel 12.  The 57-test
+Sprint 18 navigation file was covered by five independent functional groups
+(core, slider, fullscreen chrome, canvas and settings), all passing.
+
+One broad combined process aborted after 113 passes, and the whole Sprint 18
+file also aborted after 40 tests, while a Pdfium service thread or a raster Qt
+worker still existed during Python/Qt garbage collection.  The same nodes pass
+when split into clean processes; therefore this is recorded as a suite-process
+lifetime risk rather than hidden or attributed to an assertion failure.  No
+test/benchmark process remained afterward.  The complete suite was not rerun
+for this navigation-only change.
+
+The benchmark uses `ZIP_STORED`, a hot OS file cache, explicit offscreen
+`QWidget.render`, and no visible PageList.  It does not include native wheel
+delivery, DWM/GPU presentation, disk-cold I/O or a real user's simultaneous
+PageList/chrome activity.  Physical-device confirmation remains required.

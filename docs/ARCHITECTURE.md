@@ -124,6 +124,8 @@ ApplicationController
 - `FolderRasterBookRuntime`: `FolderImageSource`へ共通runtime契約を適用する薄いsource境界。通常のFolder表示と画像pathから開いた親Folder bookのmain表示では、`ImageCache -> ViewerRenderTask -> prepared display`を通らない。各file handleは全量read直後に閉じ、decoded QImageだけをbook lifetimeへ保持する
 - `ZipRasterBookRuntime`: `ZipImageSource`へ共通runtime契約を適用する薄いsource境界。persistent archive sessionとentry cancelはZIP sourceが所有し、Folderと同じsource／frame artifact、atomic commit、paint acknowledgementを使う
 
+Raster bookのcold navigationは、入力時の`stage`と実行許可時の`request`を分離する。`stage`は最新current／方向／保持順位を即時反映して旧prefetchを止めるがdecodeを開始せず、短い入力burstの最終targetだけを`request`する。ready frameはtimer／worker／QPixmap再生成なしでcommitし、last-painted frameはreplacement paintまで保護する。decoded sourceがevictされてもlayout済みQPixmapは独立してready hitを維持し、拡大鏡が必要なsourceだけを同じruntimeで再取得する。slider／statusと`ViewerPresentationState`はatomic commit時に同期し、PageList scroll、thumbnail work、history／progress persistenceはmatching paint acknowledgement後へcoalesceする。
+
 BrowserWindowのフォルダツリーはQt標準の`QFileSystemModel`と`QTreeView`を使い、フォルダだけを表示します。モデルの空ルートからWindowsのドライブへアクセスでき、フォルダ選択は短いタイマーでまとめてから一覧を更新します。右側は`QListView`と`BrowserItemModel`によるModel/View構成です。
 
 ### BrowserWindowのフォルダナビゲーション

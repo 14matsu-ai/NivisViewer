@@ -20,7 +20,7 @@ from app.viewer_render import (
     pillow_resampling_for,
     render_qimage,
 )
-from app.viewer_widget import ViewerWidget
+from app.viewer_widget import ViewerImage, ViewerWidget
 from app.viewer_window import ViewerWindow
 
 
@@ -1136,6 +1136,48 @@ def test_raster_preview_magnifier_requests_full_source_before_crop(
         task.key.purpose == "magnifier"
         for task in widget._render_tasks
     )
+    widget.close()
+
+
+def test_pixmap_only_ready_frame_rehydrates_source_for_magnifier(
+    qapp: QApplication,
+) -> None:
+    widget = ViewerWidget()
+    widget.resize(480, 320)
+    widget.set_direct_display_mode(True)
+    requests: list[tuple[int, object]] = []
+    widget.magnifierSourceResolutionRequested.connect(
+        lambda page, size: requests.append((page, size))
+    )
+    widget.show()
+    qapp.processEvents()
+    source = _image(960, 640)
+    pixmap = QPixmap.fromImage(source.scaled(480, 320))
+    spread = DisplaySpread(0, (PageSlot("page", 0),), True)
+    widget.commit_display_ready_frame(
+        spread,
+        (
+            ViewerImage(
+                page_index=0,
+                image_id="page",
+                pixmap=pixmap,
+                original_size=(960, 640),
+                qimage=None,
+                display_prepared=True,
+            ),
+        ),
+        object(),
+    )
+    widget.render(QPixmap(widget.size()))
+
+    assert widget.toggle_magnifier(widget.rect().center())
+    assert requests and requests[0][0] == 0
+    assert widget._magnifier_waiting_for_pdf
+    widget._request_magnifier_render()
+    widget._request_magnifier_render()
+    assert len(requests) == 1
+    snapshot = widget.displayed_source_snapshot(0)
+    assert snapshot is not None and snapshot[0] is not None
     widget.close()
 
 

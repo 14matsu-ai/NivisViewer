@@ -248,6 +248,57 @@ def test_folder_runtime_reversal_rejects_running_obsolete_result(
         assert runtime.shutdown(wait_msecs=3000)
 
 
+def test_folder_runtime_stages_rapid_navigation_and_decodes_only_final_target(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    class BlockingFolderSource(FolderImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.started = Event()
+            self.release = Event()
+            self.opens: list[str] = []
+
+        def open_image(self, image_id: str) -> Image.Image:
+            name = Path(image_id).name
+            self.opens.append(name)
+            if name == "0.png":
+                self.started.set()
+                assert self.release.wait(3)
+            return super().open_image(image_id)
+
+    source = BlockingFolderSource(_write_folder(tmp_path / "rapid", pages=3))
+    runtime = FolderRasterBookRuntime(source, 1)
+    frames: list[RasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    final = _request(3, _unit(source, 2), _unit(source, 2), direction=1)
+    try:
+        assert runtime.request(_request(1, _unit(source, 0), _unit(source, 0)))
+        assert source.started.wait(1)
+
+        assert runtime.stage(
+            _request(2, _unit(source, 1), _unit(source, 1), direction=1)
+        )
+        assert runtime.stage(final)
+        assert runtime.metrics.jobs_submitted == 1
+        assert source.opens == ["0.png"]
+
+        source.release.set()
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+        assert frames == []
+        assert source.opens == ["0.png"]
+
+        assert runtime.request(final)
+        _wait_until(
+            qapp,
+            lambda: bool(frames) and frames[-1].request_id == 3,
+        )
+        assert source.opens == ["0.png", "2.png"]
+    finally:
+        source.release.set()
+        assert runtime.shutdown(wait_msecs=3000)
+
+
 def test_folder_production_uses_one_runtime_and_keeps_page_list_separate(
     tmp_path: Path,
     qapp: QApplication,

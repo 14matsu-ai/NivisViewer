@@ -76,11 +76,28 @@ def test_zip_book_uses_one_runtime_across_spread_rotation_filter_and_page_list(
         runtime = session.viewer_runtime
         assert runtime is not None
         captured: list[ZipRasterRequest] = []
+        accepting = [True]
+        cancelled: list[bool] = []
+        cancel_runtime = runtime.cancel
         monkeypatch.setattr(runtime, "has_cached_current", lambda _request: True)
+
+        def accept_request(request: ZipRasterRequest) -> bool:
+            captured.append(request)
+            return accepting[0]
+
+        def cancel_request(*, clear_artifacts: bool) -> None:
+            cancelled.append(clear_artifacts)
+            cancel_runtime(clear_artifacts=clear_artifacts)
+
         monkeypatch.setattr(
             runtime,
             "request",
-            lambda request: captured.append(request) or True,
+            accept_request,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "cancel",
+            cancel_request,
         )
         monkeypatch.setattr(
             window,
@@ -109,6 +126,14 @@ def test_zip_book_uses_one_runtime_across_spread_rotation_filter_and_page_list(
         assert window._zip_runtime is runtime
         assert window._zip_runtime_active
         assert window.viewer._direct_display_mode
+
+        # A ready-path admission rejection must not leave the PageList or the
+        # shared interactive lane suspended by an earlier cold request.
+        window._hold_raster_interactive_lane()
+        accepting[0] = False
+        window._refresh_view()
+        assert cancelled and cancelled[-1] is False
+        assert not window._raster_interactive_lane_held
     finally:
         window.close()
         qapp.processEvents()
@@ -117,8 +142,27 @@ def test_zip_book_uses_one_runtime_across_spread_rotation_filter_and_page_list(
 def test_zip_runtime_commits_complete_spread_and_retains_source_for_magnifier(
     tmp_path: Path,
     qapp: QApplication,
+    monkeypatch,
 ) -> None:
     window, session, _source, archive = _window(tmp_path)
+    events: list[str] = []
+    notify_page_changed = session.notify_page_changed
+
+    def track_page_changed() -> None:
+        events.append("notify")
+        notify_page_changed()
+
+    monkeypatch.setattr(
+        session,
+        "notify_page_changed",
+        track_page_changed,
+    )
+    window.viewer.frameCommitted.connect(
+        lambda *_args: events.append("commit")
+    )
+    window.viewer.framePainted.connect(
+        lambda *_args: events.append("paint")
+    )
     window.view_mode = "spread"
     window.single_first_page = False
     window.reading_direction = "ltr"
@@ -128,6 +172,8 @@ def test_zip_runtime_commits_complete_spread_and_retains_source_for_magnifier(
         reading_direction="ltr",
     )
     try:
+        window.show()
+        qapp.processEvents()
         opened = session.open_book(archive)
         assert window._finish_opened_book(opened, modal_on_empty=False)
         runtime = session.viewer_runtime
@@ -145,6 +191,15 @@ def test_zip_runtime_commits_complete_spread_and_retains_source_for_magnifier(
         assert all(image.qimage is not None for image in window.viewer._images)
         assert window._applied_display_request_id == window._active_request_id
         assert window._zip_runtime_current_frame_serial > 0
+        _wait_until(qapp, lambda: "notify" in events)
+        assert events.index("commit") < events.index("paint") < events.index("notify")
+
+        # If A's post-paint zero timer is still armed, a synchronous ready-hit
+        # B commit must disarm it until B itself paints.
+        window._presentation_side_effect_timer.start()
+        assert window._presentation_side_effect_timer.isActive()
+        window._refresh_view()
+        assert not window._presentation_side_effect_timer.isActive()
 
         # The ZIP runtime owns the main display, but the NivisViewer
         # magnifier remains an interactive projection of the committed source.
@@ -159,6 +214,11 @@ def test_zip_runtime_commits_complete_spread_and_retains_source_for_magnifier(
             max(1, source_image.qimage.width() // 2),
             max(1, source_image.qimage.height() // 2),
         )
+        magnifier_request = window._zip_runtime_request(
+            window.model.spread_at()
+        )
+        assert magnifier_request is not None
+        assert magnifier_request.work_order == (magnifier_request.current,)
         window.viewer._request_magnifier_render()
         _wait_until(qapp, lambda: window.viewer.magnifier_active)
         assert window.viewer._magnifier_pixmap is not None
@@ -248,6 +308,8 @@ def test_failed_replacement_open_keeps_active_zip_runtime_epoch(
         active_epoch = session.generation
         assert runtime is not None
         _wait_until(qapp, lambda: window._zip_runtime_current_frame_serial > 0)
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+        jobs_before_failed_open = runtime.metrics.jobs_submitted
         old_displayed_page = window.presentation_state.displayed_page
         old_slider = window.slider.value()
         old_status = window.status.currentMessage()
@@ -258,6 +320,7 @@ def test_failed_replacement_open_keeps_active_zip_runtime_epoch(
         assert window.presentation_state.replacement_open_pending
         assert window.presentation_state.displayed_page == old_displayed_page
         assert window.slider.value() == old_slider
+        assert runtime.metrics.jobs_submitted == jobs_before_failed_open
         assert session.wait_for_async(3000)
         _wait_until(
             qapp,
