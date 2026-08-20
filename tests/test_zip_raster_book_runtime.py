@@ -195,6 +195,141 @@ def test_completed_frames_outlive_active_frontier_and_make_roundtrip_ready(
         source.close()
 
 
+def test_layout_changes_reuse_book_scoped_decoded_source(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    archive = tmp_path / "layout-book.zip"
+    page_path = tmp_path / "0.jpg"
+    with Image.new("RGB", (120, 180), (60, 90, 130)) as image:
+        image.save(page_path, "JPEG", quality=90)
+    with zipfile.ZipFile(archive, "w") as output:
+        output.write(page_path, page_path.name)
+
+    class CountingSource(ZipImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.decode_calls = 0
+
+        def open_qimage_at_most(self, image_id, maximum_size):
+            self.decode_calls += 1
+            return super().open_qimage_at_most(image_id, maximum_size)
+
+        def open_image(self, image_id: str) -> Image.Image:
+            self.decode_calls += 1
+            return super().open_image(image_id)
+
+    source = CountingSource(archive)
+    runtime = ZipRasterBookRuntime(source, 1)
+    frames: list[ZipRasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    current = ZipRasterDisplayUnit(
+        0,
+        (ZipRasterPage(0, "0.jpg"),),
+        True,
+    )
+    try:
+        assert runtime.request(
+            _request(
+                1,
+                current,
+                current,
+                spec=ZipRasterRenderSpec(
+                    (640, 480),
+                    decoder_maximum_size=(80, 120),
+                ),
+            )
+        )
+        _wait_until(qapp, lambda: len(frames) == 1)
+        assert source.decode_calls == 1
+        assert runtime.decoded_source_count == 1
+
+        # A smaller layout is satisfied by the retained decoder-sized source.
+        runtime.invalidate_layout()
+        assert runtime.request(
+            _request(
+                2,
+                current,
+                current,
+                spec=ZipRasterRenderSpec(
+                    (500, 360),
+                    device_pixel_ratio=1.5,
+                    decoder_maximum_size=(60, 90),
+                ),
+            )
+        )
+        _wait_until(qapp, lambda: len(frames) == 2)
+
+        assert source.decode_calls == 1
+        assert frames[-1].pages[0].source_is_preview
+
+        # Rotation/magnifier-style full-resolution demand upgrades once.
+        runtime.invalidate_layout()
+        assert runtime.request(
+            _request(
+                3,
+                current,
+                current,
+                spec=ZipRasterRenderSpec((900, 650), rotation=90),
+            )
+        )
+        _wait_until(qapp, lambda: len(frames) == 3)
+        assert source.decode_calls == 2
+        assert not frames[-1].pages[0].source_is_preview
+
+        # The full source then satisfies later DPI/layout variants.
+        runtime.invalidate_layout()
+        assert runtime.request(
+            _request(
+                4,
+                current,
+                current,
+                spec=ZipRasterRenderSpec(
+                    (720, 520),
+                    device_pixel_ratio=2.0,
+                    decoder_maximum_size=(100, 150),
+                ),
+            )
+        )
+        _wait_until(qapp, lambda: len(frames) == 4)
+
+        assert source.decode_calls == 2
+        assert runtime.metrics.jobs_submitted == 4
+        assert runtime.metrics.source_cache_hits == 2
+        assert runtime.metrics.source_cache_misses == 2
+        assert runtime.decoded_source_count == 1
+        assert frames[-1].request_id == 4
+        assert frames[-1].pages[0].source_qimage is not None
+
+        # Active adjustments define the protected source variant. Repeated
+        # adjustment changes must not pin every old full-resolution QImage just
+        # because they belong to the currently displayed image ID.
+        one_variant_budget = runtime.cache_bytes + 1
+        runtime.set_cache_limits(byte_budget=one_variant_budget)
+        for request_id, brightness in enumerate((1.1, 1.2, 1.3), start=5):
+            assert runtime.request(
+                _request(
+                    request_id,
+                    current,
+                    current,
+                    spec=ZipRasterRenderSpec(
+                        (720, 520),
+                        device_pixel_ratio=2.0,
+                        brightness=brightness,
+                    ),
+                )
+            )
+            _wait_until(
+                qapp,
+                lambda expected=request_id: frames[-1].request_id == expected,
+            )
+            assert runtime.decoded_source_count == 1
+            assert runtime.cache_bytes <= one_variant_budget
+    finally:
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()
+
+
 def test_runtime_completes_spread_rotation_and_adjustment_in_one_frame(
     tmp_path: Path,
     qapp: QApplication,
@@ -286,22 +421,37 @@ def test_memory_budget_stops_prefetch_before_decode_churn(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
-    source = ZipImageSource(_write_zip(tmp_path))
-    runtime = ZipRasterBookRuntime(source, 1, cache_byte_budget=1)
+    class CountingSource(ZipImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.opens: list[str] = []
+
+        def open_image(self, image_id: str) -> Image.Image:
+            self.opens.append(image_id)
+            return super().open_image(image_id)
+
+    source = CountingSource(_write_zip(tmp_path))
+    runtime = ZipRasterBookRuntime(source, 1)
     frames: list[ZipRasterFrame] = []
     runtime.frameReady.connect(frames.append)
     try:
         request = _request(1, _unit(1), _unit(1), _unit(2), _unit(0))
         assert runtime.request(request)
         _wait_until(qapp, lambda: len(frames) == 1)
+        current_bytes = runtime.cache_bytes
+        assert runtime.decoded_source_bytes > 0
+        assert runtime.cached_unit_count == 1
+        runtime.set_cache_limits(byte_budget=current_bytes + 1)
         assert runtime.release_prefetch(request_id=1)
         qapp.processEvents()
 
-        # The current frame alone exceeds the byte budget, so low-priority
-        # neighbors are not decoded only to be evicted immediately.
+        # The QPixmap-only store still has ample apparent room, but the
+        # protected decoded source consumes the combined budget.  Do not read
+        # and decode a neighbor only to evict it immediately.
         assert runtime.metrics.jobs_submitted == 1
         assert runtime.metrics.prefetch_admission_stops == 1
         assert runtime.cached_page_indexes == (1,)
+        assert source.opens == ["1.png"]
     finally:
         assert runtime.shutdown(wait_msecs=3000)
         source.close()

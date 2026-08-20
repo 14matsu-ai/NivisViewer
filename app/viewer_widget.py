@@ -307,6 +307,7 @@ class ViewerWidget(QWidget):
         self._render_coordinator = image_work_coordinator
         self._render_pending: dict[ViewerRenderKey, int] = {}
         self._render_tasks: set[ViewerRenderTask] = set()
+        self._local_render_tasks: set[ViewerRenderTask] = set()
         self._render_task_by_key: dict[ViewerRenderKey, ViewerRenderTask] = {}
         self._render_priorities: dict[ViewerRenderKey, int] = {}
         self._render_cache: OrderedDict[ViewerRenderKey, QPixmap] = OrderedDict()
@@ -1457,7 +1458,7 @@ class ViewerWidget(QWidget):
             ]
         ],
     ) -> None:
-        if self._direct_display_mode and key.purpose != "magnifier":
+        if self._direct_display_mode:
             return
         desired_by_identity: dict[
             tuple[tuple[int, str], ...],
@@ -1986,7 +1987,12 @@ class ViewerWidget(QWidget):
         priority: int = 0,
         allow_priority_decrease: bool = False,
     ) -> None:
-        if self._direct_display_mode:
+        # Book runtimes own normal display artifacts in direct mode.  The
+        # magnifier is a separate NivisViewer UX projection over the committed
+        # source QImage, so it still needs one cropped render job.  Blocking it
+        # here made the ZIP magnifier wait for full resolution and then never
+        # produce a lens frame.
+        if self._direct_display_mode and key.purpose != "magnifier":
             return
         if self._render_pending.get(key) == self._render_generation:
             previous_priority = self._render_priorities.get(key, priority)
@@ -2017,13 +2023,22 @@ class ViewerWidget(QWidget):
         task: ViewerRenderTask,
         priority: int,
     ) -> None:
-        if self._render_coordinator is not None:
+        if self._direct_display_mode and task.key.purpose == "magnifier":
+            # A lens crop is an optional projection of an already committed
+            # source.  Keep it off the single book-runtime Viewer lane so a
+            # non-interruptible Pillow/Lanczos crop cannot delay the next page.
+            self._local_render_tasks.add(task)
+            self._render_pool.start(task, int(priority))
+        elif self._render_coordinator is not None:
             self._render_coordinator.start_viewer(task, int(priority))
         else:
+            self._local_render_tasks.add(task)
             self._render_pool.start(task, int(priority))
 
     def _try_take_render_task(self, task: ViewerRenderTask) -> bool:
-        if self._render_coordinator is not None:
+        if task not in self._local_render_tasks:
+            if self._render_coordinator is None:
+                return False
             return self._render_coordinator.try_take_viewer(task)
         try:
             return self._render_pool.tryTake(task)
@@ -2032,6 +2047,7 @@ class ViewerWidget(QWidget):
 
     def _discard_render_task(self, task: ViewerRenderTask) -> None:
         self._render_tasks.discard(task)
+        self._local_render_tasks.discard(task)
         key = getattr(task, "key", None)
         if key is not None and self._render_task_by_key.get(key) is task:
             self._render_task_by_key.pop(key, None)
@@ -2315,7 +2331,7 @@ class ViewerWidget(QWidget):
         self._render_task_by_key.clear()
         for task in tuple(self._render_tasks):
             if self._try_take_render_task(task):
-                self._render_tasks.discard(task)
+                self._discard_render_task(task)
         if clear_cache:
             self._render_cache.clear()
             self._last_rendered_by_image.clear()
