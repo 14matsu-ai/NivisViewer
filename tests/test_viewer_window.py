@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication
 from app.application_controller import ApplicationController
 from app.book_session import BookSession
 from app.config_manager import ConfigManager
+from app.folder_raster_book_runtime import FolderRasterBookRuntime
 from app.image_cache import CachedImage
 from app.image_source import ImageSource, ImageSourceError, ZipImageSource
 from app import viewer_commands as commands
@@ -134,17 +135,21 @@ def test_open_path_displays_book(tmp_path: Path, qapp: QApplication) -> None:
     finish_open(window, qapp)
     assert window.book_session.current_path == image
     assert window.model.total_pages == 1
-    # Source installation only advances requested state. The slider is
-    # enabled by the first complete presentation-frame commit.
+    # Folder books now use the book-scoped raster runtime.  Source install
+    # still advances requested state first, but a tiny offscreen fixture may
+    # finish before this test observes that transient state.
     assert window.presentation_state.requested_page == 0
-    assert window.presentation_state.displayed_page is None
-    assert not window.slider.isEnabled()
-    assert window.image_cache.wait_for_done(2000)
-    qapp.processEvents()
-    QTest.qWait(window._display_demand_timer.interval() + 20)
-    qapp.processEvents()
-    assert window.viewer.wait_for_rendering()
-    qapp.processEvents()
+    assert isinstance(
+        window.book_session.viewer_runtime,
+        FolderRasterBookRuntime,
+    )
+    deadline = monotonic() + 3
+    while (
+        window.presentation_state.displayed_page != 0
+        and monotonic() < deadline
+    ):
+        qapp.processEvents()
+        QTest.qWait(5)
     assert window.presentation_state.displayed_page == 0
     assert window.slider.isEnabled()
     window.close()
@@ -268,15 +273,16 @@ def test_page_list_switches_with_first_committed_replacement_frame(
     try:
         first_opened = session.open_book(first_folder)
         assert window._finish_opened_book(first_opened, modal_on_empty=False)
-        assert session.image_cache.wait_for_done(2000)
-        qapp.processEvents()
-        QTest.qWait(window._display_demand_timer.interval() + 20)
-        qapp.processEvents()
-        assert window.viewer.wait_for_rendering()
-        qapp.processEvents()
-
         first_runtime = session.page_list_runtime
         assert first_runtime is not None
+        deadline = monotonic() + 3
+        while (
+            window._page_list_runtime is not first_runtime
+            and monotonic() < deadline
+        ):
+            qapp.processEvents()
+            QTest.qWait(5)
+
         assert window._page_list_runtime is first_runtime
         assert window.page_list.isEnabled()
         assert window.page_list_model.image_id_for_page(0) == str(first_image)

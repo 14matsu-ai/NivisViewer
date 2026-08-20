@@ -637,6 +637,29 @@ class ViewerWidget(QWidget):
     def displayed_page_indexes(self) -> tuple[int, ...]:
         return tuple(slot.page_index for slot in self._spread.slots)
 
+    def displayed_source_snapshot(
+        self,
+        page_index: int,
+    ) -> tuple[QImage | None, tuple[int, int] | None, str | None] | None:
+        """Return source metadata from the atomically committed frame.
+
+        Runtime-backed books intentionally do not mirror decoded sources into
+        ``ImageCache``.  Clipboard/page-info actions therefore project from
+        the same committed frame as paint instead of consulting requested-page
+        state or a second cache owner.
+        """
+
+        for image in self._images:
+            if image.page_index != int(page_index):
+                continue
+            source = (
+                QImage(image.qimage)
+                if image.qimage is not None and not image.qimage.isNull()
+                else None
+            )
+            return source, image.original_size, image.error
+        return None
+
     @property
     def gesture_trail(self) -> tuple[QPoint, ...]:
         return tuple(self._gesture_trail)

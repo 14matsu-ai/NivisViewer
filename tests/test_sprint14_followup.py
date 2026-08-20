@@ -305,20 +305,33 @@ def test_application_gate_resumes_browser_after_first_frame(qapp, tmp_path):
     controller.start()
     viewer = controller.open_path(path)
 
-    assert controller.image_work_coordinator.browser_paused
-    assert viewer.image_cache.wait_for_done(3000)
-    assert _drain_events(
-        qapp,
-        lambda: not controller.image_work_coordinator.browser_paused,
-    )
-    assert viewer.viewer._last_draw_layout
-    for window in tuple(controller.viewer_windows):
-        window.close()
-    browser = controller.get_browser_window()
-    if browser is not None:
-        browser.close()
-    qapp.processEvents()
-    controller.shutdown()
+    try:
+        assert controller.image_work_coordinator.browser_paused
+        assert viewer.book_session.wait_for_async(3000)
+        assert _drain_events(
+            qapp,
+            lambda: viewer.presentation_state.displayed_page == 0,
+        )
+        # Runtime-backed Folder books do not populate ImageCache.  Force one
+        # offscreen paint of the committed frame, then verify the shared
+        # browser lane is released by the same paint acknowledgement contract.
+        target = QPixmap(viewer.viewer.size())
+        target.fill()
+        viewer.viewer.render(target)
+        qapp.processEvents()
+        assert _drain_events(
+            qapp,
+            lambda: not controller.image_work_coordinator.browser_paused,
+        )
+        assert viewer.viewer._last_draw_layout
+    finally:
+        for window in tuple(controller.viewer_windows):
+            window.close()
+        browser = controller.get_browser_window()
+        if browser is not None:
+            browser.close()
+        qapp.processEvents()
+        controller.shutdown()
 
 
 class OrderedSource(ImageSource):

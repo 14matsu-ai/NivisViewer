@@ -50,7 +50,7 @@ def test_sprint15_config_defaults_and_ranges(tmp_path: Path) -> None:
     assert settings["folder_tree_sync_mode"] == "focus_current"
 
 
-def test_extra_compact_profile_is_96px_and_uses_one_title_line() -> None:
+def test_extra_compact_profile_is_96px_and_uses_one_title_line(qapp) -> None:
     delegate = BrowserItemDelegate(
         thumbnail_size=96,
         density=BrowserDisplayDensity.EXTRA_COMPACT,
@@ -65,7 +65,7 @@ def test_extra_compact_profile_is_96px_and_uses_one_title_line() -> None:
     assert delegate.profile.title_lines == 1
 
 
-def test_cell_padding_is_internal_and_does_not_change_thumbnail_size() -> None:
+def test_cell_padding_is_internal_and_does_not_change_thumbnail_size(qapp) -> None:
     unpadded = BrowserItemDelegate(
         thumbnail_size=96,
         density=BrowserDisplayDensity.EXTRA_COMPACT,
@@ -93,7 +93,7 @@ def test_cell_padding_is_internal_and_does_not_change_thumbnail_size() -> None:
     assert padded_rect.top() == 12
 
 
-def test_delegate_does_not_retain_selection_or_hover_identity() -> None:
+def test_delegate_does_not_retain_selection_or_hover_identity(qapp) -> None:
     delegate = BrowserItemDelegate()
 
     retained_names = {
