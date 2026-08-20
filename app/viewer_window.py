@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from pathlib import Path
+from time import perf_counter_ns
 from typing import Callable
 
 from PySide6.QtCore import QByteArray, QEvent, QPoint, QSize, QThreadPool, QTimer, Qt, QUrl, Signal, Slot
@@ -111,6 +112,9 @@ _DISPLAY_DEMAND_IDLE_GRACE_MS = 16
 _RASTER_PAINT_FALLBACK_MS = 250
 _ZIP_RUNTIME_BROWSER_RESUME_GRACE_MS = 500
 _ZIP_RUNTIME_DEMAND_IDLE_GRACE_MS = 6
+_RASTER_NAVIGATION_BURST_WINDOW_MS = 120
+_RASTER_NAVIGATION_BURST_MIN_TRAILING_MS = 8
+_RASTER_NAVIGATION_BURST_MAX_TRAILING_MS = 32
 
 
 class ViewerWindow(QMainWindow):
@@ -381,6 +385,12 @@ class ViewerWindow(QMainWindow):
         self._page_list_viewport_timer.timeout.connect(
             self._update_page_list_visible_work
         )
+        self._presentation_side_effect_timer = QTimer(self)
+        self._presentation_side_effect_timer.setSingleShot(True)
+        self._presentation_side_effect_timer.setInterval(0)
+        self._presentation_side_effect_timer.timeout.connect(
+            self._flush_presentation_side_effects
+        )
         self._raster_paint_fallback_timer = QTimer(self)
         self._raster_paint_fallback_timer.setSingleShot(True)
         self._raster_paint_fallback_timer.setInterval(
@@ -421,6 +431,10 @@ class ViewerWindow(QMainWindow):
         self._zip_runtime_current_frame_serial = 0
         self._zip_runtime_last_painted_serial = 0
         self._pending_zip_runtime_request: RasterRequest | None = None
+        self._last_raster_navigation_input_ns = 0
+        self._pending_presentation_side_effect_token: (
+            PresentationFrameToken | None
+        ) = None
         self._page_list_runtime: ViewerPageListRuntime | None = None
         self._staged_page_list_runtime: ViewerPageListRuntime | None = None
         self._page_list_waiting_for_current_paint = False
@@ -1456,7 +1470,10 @@ class ViewerWindow(QMainWindow):
         self.presentation_state.begin_replacement_open()
         self._request_id_adapter = None
         self._visible_page_indexes_adapter = None
-        self._deactivate_zip_runtime(clear_artifacts=True)
+        # A replacement open is provisional.  Stop the old runtime's work but
+        # retain its completed book artifacts until BookSession either swaps
+        # in the new source (and retires the old runtime) or reports failure.
+        self._deactivate_zip_runtime(clear_artifacts=False)
         self._active_open_trace_id = (
             self._next_open_trace_id
             or performance_trace.begin("viewer.open_path.started", str(path))
@@ -2332,7 +2349,14 @@ class ViewerWindow(QMainWindow):
         self._sync_page_list_selection()
         self._schedule_page_list_visible_work()
 
-    def _sync_page_list_selection(self) -> None:
+    def _sync_page_list_selection(
+        self,
+        *,
+        ensure_visible: bool = True,
+        schedule_visible_work: bool = True,
+    ) -> None:
+        if not self.page_list_dock.isVisible():
+            return
         self._updating_page_list_selection = True
         try:
             displayed = self.presentation_state.displayed
@@ -2351,14 +2375,42 @@ class ViewerWindow(QMainWindow):
                 else self.page_list_model.index(-1, 0)
             )
             self.page_list.setCurrentIndex(target)
-            if target.isValid():
+            if target.isValid() and ensure_visible:
                 self.page_list.scrollTo(
                     target,
                     QAbstractItemView.ScrollHint.EnsureVisible,
                 )
         finally:
             self._updating_page_list_selection = False
-        self._schedule_page_list_visible_work()
+        if schedule_visible_work:
+            self._schedule_page_list_visible_work()
+
+    def _flush_presentation_side_effects(self) -> None:
+        token = self._pending_presentation_side_effect_token
+        self._pending_presentation_side_effect_token = None
+        if self._shutdown_prepared or token is None:
+            return
+        displayed = self.presentation_state.displayed
+        if displayed is None or displayed.token != token:
+            return
+        source = self.book_session.source
+        if (
+            source is None
+            or token.book.epoch != self.book_session.generation
+            or token.book.source_identity != id(source)
+        ):
+            return
+        if self.page_list_dock.isVisible():
+            current = self.page_list.currentIndex()
+            if current.isValid():
+                self.page_list.scrollTo(
+                    current,
+                    QAbstractItemView.ScrollHint.EnsureVisible,
+                )
+            self._schedule_page_list_visible_work()
+        # Persistence is based on the already committed immutable snapshot,
+        # but does not block the ViewerWidget's first paint of that frame.
+        self.book_session.notify_page_changed()
 
     def _on_page_list_current_changed(
         self,
@@ -2607,20 +2659,25 @@ class ViewerWindow(QMainWindow):
         steps = (direction, -direction) if direction else (1, -1)
         work_order: list[RasterDisplayUnit] = [current]
         seen = {current.identity}
-        for step in steps:
-            units = self._display_units_from(center, step, 1)
-            if not units:
-                continue
-            indexes = units[0]
-            unit = self._zip_display_unit(
-                indexes,
-                start_index=self.model.spread_start_for_index(indexes[0]),
-                is_single=len(indexes) == 1,
-            )
-            if unit.identity in seen:
-                continue
-            seen.add(unit.identity)
-            work_order.append(unit)
+        source_interactive = (
+            self.viewer.magnifier_selecting
+            or self.viewer.magnifier_active
+        )
+        if not source_interactive:
+            for step in steps:
+                units = self._display_units_from(center, step, 1)
+                if not units:
+                    continue
+                indexes = units[0]
+                unit = self._zip_display_unit(
+                    indexes,
+                    start_index=self.model.spread_start_for_index(indexes[0]),
+                    is_single=len(indexes) == 1,
+                )
+                if unit.identity in seen:
+                    continue
+                seen.add(unit.identity)
+                work_order.append(unit)
 
         decoder_bound = self._current_raster_decode_bounds()
         if (
@@ -2656,10 +2713,6 @@ class ViewerWindow(QMainWindow):
             gamma=self.gamma,
             decoder_maximum_size=decoder_bound,
         )
-        runtime.set_cache_limits(
-            unit_limit=max(3, self.cache_size),
-            byte_budget=self.image_cache.cache_byte_budget_bytes,
-        )
         return RasterRequest(
             self.book_session.generation,
             self._active_request_id,
@@ -2691,6 +2744,7 @@ class ViewerWindow(QMainWindow):
     ) -> None:
         self._zip_runtime_request_timer.stop()
         self._pending_zip_runtime_request = None
+        self._last_raster_navigation_input_ns = 0
         if not self._zip_runtime_active:
             if clear_artifacts and self._zip_runtime is not None:
                 self._zip_runtime.cancel(clear_artifacts=True)
@@ -2721,12 +2775,57 @@ class ViewerWindow(QMainWindow):
             or request.source_epoch != self.book_session.generation
             or request.current.identity != current_identity
         ):
+            if runtime is not None and request is not None:
+                runtime.cancel(clear_artifacts=False)
+            self._release_raster_interactive_lane()
             return
         if runtime.request(request):
             return
+        self._fail_raster_runtime_request(runtime)
+
+    def _fail_raster_runtime_request(
+        self,
+        runtime: RasterBookRuntime | None,
+    ) -> None:
+        self._zip_runtime_request_timer.stop()
+        self._pending_zip_runtime_request = None
+        if runtime is not None:
+            runtime.cancel(clear_artifacts=False)
+        self._release_raster_interactive_lane()
         message = "Raster Viewer runtimeは要求を受け付けられません。"
         self.presentation_state.fail_pending(message)
         self._set_status_override(message)
+
+    def _raster_cold_dispatch_delay(
+        self,
+        navigation: PresentationNavigation,
+    ) -> int:
+        if navigation is not PresentationNavigation.NORMAL:
+            self._last_raster_navigation_input_ns = 0
+            return _ZIP_RUNTIME_DEMAND_IDLE_GRACE_MS
+        now = perf_counter_ns()
+        previous = self._last_raster_navigation_input_ns
+        self._last_raster_navigation_input_ns = now
+        within_burst = bool(
+            previous
+            and now - previous
+            <= _RASTER_NAVIGATION_BURST_WINDOW_MS * 1_000_000
+        )
+        if within_burst:
+            interval_ms = (now - previous) / 1_000_000
+            # Wait only just beyond the observed cadence.  A fixed 18-48 ms
+            # floor reduced transit work but made already-coalesced 0-4 ms
+            # bursts needlessly slower; this adaptive margin preserves the
+            # final-target gate without turning admission wait into the new
+            # dominant latency.
+            return max(
+                _RASTER_NAVIGATION_BURST_MIN_TRAILING_MS,
+                min(
+                    _RASTER_NAVIGATION_BURST_MAX_TRAILING_MS,
+                    round(interval_ms * 1.25) + 2,
+                ),
+            )
+        return _ZIP_RUNTIME_DEMAND_IDLE_GRACE_MS
 
     def _on_zip_runtime_frame_ready(
         self,
@@ -2864,6 +2963,11 @@ class ViewerWindow(QMainWindow):
             return
         self._zip_runtime_last_painted_serial = int(frame_serial)
         self._raster_paint_fallback_timer.stop()
+        # Runtime-backed page projections are deliberately queued only after
+        # the complete frame has painted.  A zero timer started from commit
+        # can otherwise run before Qt services the posted paint event.
+        if self._pending_presentation_side_effect_token is not None:
+            self._presentation_side_effect_timer.start()
         if self._zip_runtime is not None:
             self._zip_runtime.release_prefetch(
                 request_id=self._active_request_id,
@@ -3034,10 +3138,19 @@ class ViewerWindow(QMainWindow):
         )
         self._update_slider()
         self._update_status()
-        self._sync_page_list_selection()
+        self._sync_page_list_selection(
+            ensure_visible=False,
+            schedule_visible_work=False,
+        )
         self._sync_page_history_actions()
-        self._sync_actions()
-        self.book_session.notify_page_changed()
+        self._pending_presentation_side_effect_token = commit.frame.token
+        if self._zip_runtime_active:
+            # A previous frame may already have armed its post-paint zero
+            # timer.  A newer ready hit must disarm it until *its own* paint
+            # acknowledgement, otherwise the new token could flush early.
+            self._presentation_side_effect_timer.stop()
+        else:
+            self._presentation_side_effect_timer.start()
         if (
             self._pending_progress_seed is not None
             and self._pending_progress_seed[0]
@@ -3084,21 +3197,26 @@ class ViewerWindow(QMainWindow):
             if not runtime.has_cached_current(zip_request):
                 self._hold_raster_interactive_lane()
                 self._pending_zip_runtime_request = zip_request
-                # Always enter the short replaceable-demand timer, including
-                # the first cold frame.  Besides coalescing rapid input, this
-                # lets an already queued Browser paint finish before a Folder
-                # worker enters QImageReader.  Starting both in the same Qt
-                # event dispatch can deadlock lazy QIcon/image-plugin work on
-                # Windows/offscreen.  Pixel decode remains entirely off-GUI.
+                if not runtime.stage(zip_request):
+                    self._fail_raster_runtime_request(runtime)
+                    return
+                # The runtime adopts/fences the new work order immediately.
+                # Only cold dispatch is replaceable: the leading request keeps
+                # single-turn latency, while a detected wheel/key burst waits
+                # for its final target instead of decoding every transit page.
+                self._zip_runtime_request_timer.setInterval(
+                    self._raster_cold_dispatch_delay(navigation)
+                )
                 self._zip_runtime_request_timer.start()
                 return
             self._zip_runtime_request_timer.stop()
             self._pending_zip_runtime_request = None
+            # A ready frame terminates any preceding cold-input burst.  A
+            # later unrelated miss should receive discrete-request latency.
+            self._last_raster_navigation_input_ns = 0
             if runtime.request(zip_request):
                 return
-            message = "Raster Viewer runtimeは要求を受け付けられません。"
-            self.presentation_state.fail_pending(message)
-            self._set_status_override(message)
+            self._fail_raster_runtime_request(runtime)
             return
         if isinstance(
             self.book_session.source,
@@ -3708,6 +3826,11 @@ class ViewerWindow(QMainWindow):
 
     def _release_raster_prefetch_without_paint(self) -> None:
         if self._zip_runtime_active:
+            # Hidden/minimized widgets may never acknowledge a paint.  The
+            # existing bounded fallback still commits persistence/UI
+            # projections, but never before the normal paint opportunity.
+            if self._pending_presentation_side_effect_token is not None:
+                self._presentation_side_effect_timer.start()
             if self._zip_runtime is not None:
                 self._zip_runtime.release_prefetch(
                     request_id=self._active_request_id,
@@ -5109,8 +5232,13 @@ class ViewerWindow(QMainWindow):
         if isinstance(self.book_session.source, PdfImageSource):
             return
         if self._zip_runtime_active:
-            if self._zip_runtime is not None:
-                self._zip_runtime.invalidate_layout()
+            # The full-source render spec has its own key.  Adopting that
+            # request is enough to hydrate the current page; clearing every
+            # ready QPixmap would unnecessarily destroy navigation hits.
+            runtime = self._zip_runtime
+            request = self._zip_runtime_request(self.model.spread_at())
+            if runtime is not None and request is not None:
+                runtime.require_cached_current_source(request)
             self._refresh_view()
             return
         if not self.image_cache.ensure_full_resolution(page_index):
@@ -5396,6 +5524,8 @@ class ViewerWindow(QMainWindow):
         self.presentation_state.close()
         self._zip_runtime_request_timer.stop()
         self._pending_zip_runtime_request = None
+        self._presentation_side_effect_timer.stop()
+        self._pending_presentation_side_effect_token = None
         self._page_list_filter_timer.stop()
         self._page_list_viewport_timer.stop()
         self._set_page_list_paused(True)

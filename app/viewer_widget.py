@@ -655,7 +655,11 @@ class ViewerWidget(QWidget):
             source = (
                 QImage(image.qimage)
                 if image.qimage is not None and not image.qimage.isNull()
-                else None
+                else (
+                    image.pixmap.toImage()
+                    if image.pixmap is not None and not image.pixmap.isNull()
+                    else None
+                )
             )
             return source, image.original_size, image.error
         return None
@@ -2402,7 +2406,14 @@ class ViewerWidget(QWidget):
             (
                 (rect, image)
                 for rect, image, _pixmap in reversed(self._last_image_layout)
-                if rect.contains(position) and image.qimage is not None
+                if rect.contains(position)
+                and (
+                    image.qimage is not None
+                    or (
+                        image.pixmap is not None
+                        and not image.pixmap.isNull()
+                    )
+                )
             ),
             None,
         )
@@ -2508,12 +2519,18 @@ class ViewerWidget(QWidget):
         self.update()
 
     def _rotated_source_size(self, image: ViewerImage) -> QSize:
-        if image.qimage is None:
-            return QSize()
         size = (
             QSize(image.split_range[2], image.split_range[3])
             if image.split_range is not None
-            else image.qimage.size()
+            else (
+                image.qimage.size()
+                if image.qimage is not None
+                else (
+                    QSize(*image.original_size)
+                    if image.original_size is not None
+                    else QSize()
+                )
+            )
         )
         if not image.pre_rotated and self.rotation_angle in {90, 270}:
             return QSize(size.height(), size.width())
@@ -2533,7 +2550,7 @@ class ViewerWidget(QWidget):
     def _request_magnifier_render(self, *, allow_pdf_request: bool = True) -> None:
         image = self._magnifier_image()
         source_rect = self.magnifier_source_rect
-        if image is None or image.qimage is None or source_rect is None:
+        if image is None or source_rect is None:
             self.cancel_magnifier()
             return
 
@@ -2551,6 +2568,21 @@ class ViewerWidget(QWidget):
         dpr = max(1.0, float(self.devicePixelRatioF()))
         target_width = max(1, round(self.width() * dpr))
         target_height = max(1, round(self.height() * dpr))
+
+        if image.qimage is None:
+            if (
+                self._magnifier_waiting_for_pdf
+                and self._magnifier_pdf_source_key == 0
+            ):
+                return
+            self._magnifier_waiting_for_pdf = True
+            self._magnifier_pdf_source_key = 0
+            self.magnifierSourceResolutionRequested.emit(
+                image.page_index,
+                QSize(target_width, target_height),
+            )
+            self.update()
+            return
 
         if allow_pdf_request and image.source_is_preview:
             self._magnifier_waiting_for_pdf = True
