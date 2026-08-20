@@ -13,14 +13,17 @@ from .archive_backend import ArchiveErrorCode
 from .image_cache import ImageCache
 from .image_work_coordinator import ImageWorkCoordinator
 from .image_source import (
+    FolderImageSource,
     FolderListingSnapshot,
     ImageSource,
     ImageSourceError,
     ZipImageSource,
     create_image_source,
 )
+from .folder_raster_book_runtime import FolderRasterBookRuntime
 from .page_model import PageModel
 from .performance_trace import performance_trace
+from .raster_book_runtime import RasterBookRuntime
 from .viewer_page_list_runtime import ViewerPageListRuntime
 from .zip_raster_book_runtime import ZipRasterBookRuntime
 
@@ -217,7 +220,7 @@ class BookSession(QObject):
         self._image_work_coordinator = image_work_coordinator
         self.current_path: Path | None = None
         self.source: ImageSource | None = None
-        self.viewer_runtime: ZipRasterBookRuntime | None = None
+        self.viewer_runtime: RasterBookRuntime | None = None
         self.page_list_runtime: ViewerPageListRuntime | None = None
         # The active book epoch must change only when the installed source
         # changes.  Pending-open tokens are separate so a failed/cancelled
@@ -227,7 +230,7 @@ class BookSession(QObject):
         self._open_generation = 0
         self._source_factory = source_factory
         self._retired_sources: dict[int, ImageSource] = {}
-        self._retired_viewer_runtimes: dict[int, ZipRasterBookRuntime] = {}
+        self._retired_viewer_runtimes: dict[int, RasterBookRuntime] = {}
         self._retired_page_list_runtimes: dict[
             int, ViewerPageListRuntime
         ] = {}
@@ -602,8 +605,15 @@ class BookSession(QObject):
         source: ImageSource | None,
     ) -> None:
         old_runtime = self.viewer_runtime
+        runtime_type: type[RasterBookRuntime] | None
+        if isinstance(source, ZipImageSource):
+            runtime_type = ZipRasterBookRuntime
+        elif isinstance(source, FolderImageSource):
+            runtime_type = FolderRasterBookRuntime
+        else:
+            runtime_type = None
         new_runtime = (
-            ZipRasterBookRuntime(
+            runtime_type(
                 source,
                 self.generation,
                 self,
@@ -611,7 +621,7 @@ class BookSession(QObject):
                 cache_unit_limit=max(3, self.image_cache.cache_size),
                 cache_byte_budget=self.image_cache.cache_byte_budget_bytes,
             )
-            if isinstance(source, ZipImageSource)
+            if runtime_type is not None and source is not None
             else None
         )
         self.viewer_runtime = new_runtime
@@ -623,7 +633,7 @@ class BookSession(QObject):
 
     def _retire_viewer_runtime(
         self,
-        runtime: ZipRasterBookRuntime,
+        runtime: RasterBookRuntime,
     ) -> None:
         completed = runtime.shutdown(wait_msecs=0)
         if completed:
@@ -633,7 +643,7 @@ class BookSession(QObject):
 
     @Slot(object)
     def _release_retired_viewer_runtime(self, runtime: object) -> None:
-        if not isinstance(runtime, ZipRasterBookRuntime):
+        if not isinstance(runtime, RasterBookRuntime):
             return
         retired = self._retired_viewer_runtimes.get(id(runtime))
         if retired is not runtime or runtime.has_unfinished_tasks():
@@ -645,7 +655,7 @@ class BookSession(QObject):
 
     def _finalize_viewer_runtime(
         self,
-        runtime: ZipRasterBookRuntime,
+        runtime: RasterBookRuntime,
     ) -> None:
         self._retired_viewer_runtimes.pop(id(runtime), None)
         runtime.shutdown(wait_msecs=0)

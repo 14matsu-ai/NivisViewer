@@ -140,6 +140,70 @@ def _read_jpeg_qimage_at_most(
     return image, logical_size
 
 
+def _read_folder_jpeg_qimage_at_most(
+    data: bytes,
+    maximum_size: tuple[int, int],
+) -> tuple[QImage, tuple[int, int]] | None:
+    """Decode a folder JPEG without entering Qt's GUI-shared plugin loader.
+
+    Folder Viewer work can overlap Browser QIcon painting.  On Windows and the
+    offscreen platform, a worker-side ``QImageReader.read()`` can deadlock with
+    that GUI-side lazy icon/plugin work.  Pillow uses its libjpeg decoder
+    entirely inside the worker; ``draft`` requests native JPEG reduction and
+    ``thumbnail`` finishes the exact bound before the detached QImage copy is
+    created.
+    """
+
+    maximum_width = max(1, int(maximum_size[0]))
+    maximum_height = max(1, int(maximum_size[1]))
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            raw_width, raw_height = image.size
+            orientation = int(image.getexif().get(274, 1))
+            if raw_width <= 0 or raw_height <= 0:
+                return None
+            swaps_axes = orientation in {5, 6, 7, 8}
+            logical_size = (
+                (raw_height, raw_width)
+                if swaps_axes
+                else (raw_width, raw_height)
+            )
+            scale = min(
+                1.0,
+                maximum_width / logical_size[0],
+                maximum_height / logical_size[1],
+            )
+            logical_target = (
+                max(1, round(logical_size[0] * scale)),
+                max(1, round(logical_size[1] * scale)),
+            )
+            raw_target = (
+                (logical_target[1], logical_target[0])
+                if swaps_axes
+                else logical_target
+            )
+            image.draft("RGB", raw_target)
+            image.load()
+            prepared = ImageOps.exif_transpose(image)
+            try:
+                prepared.thumbnail(
+                    logical_target,
+                    Image.Resampling.LANCZOS,
+                    reducing_gap=2.0,
+                )
+                from .thumbnail_render import pil_to_qimage
+
+                qimage = pil_to_qimage(prepared)
+            finally:
+                if prepared is not image:
+                    prepared.close()
+    except Exception:
+        return None
+    if qimage.isNull():
+        return None
+    return qimage, logical_size
+
+
 def _read_jpeg_qbytearray_at_most(
     data: QByteArray,
     maximum_size: tuple[int, int],
@@ -490,7 +554,7 @@ class FolderImageSource(ImageSource):
         except OSError:
             return None
         self._file_size_cache[self._path_identity(image_id)] = len(data)
-        decoded = _read_jpeg_qimage_at_most(data, maximum_size)
+        decoded = _read_folder_jpeg_qimage_at_most(data, maximum_size)
         if decoded is not None:
             _image, logical_size = decoded
             self._size_cache[image_id] = logical_size

@@ -66,6 +66,14 @@ from .path_availability import (
     lexical_absolute,
 )
 from .performance_trace import performance_trace
+from .raster_book_runtime import (
+    RasterBookRuntime,
+    RasterDisplayUnit,
+    RasterFrame,
+    RasterPage,
+    RasterRenderSpec,
+    RasterRequest,
+)
 from . import viewer_commands as commands
 from .viewer_page_list_runtime import (
     ViewerPageListModel,
@@ -96,16 +104,6 @@ from .viewer_widget import (
     calculate_spread_layout,
 )
 from .viewer_render import RESAMPLING_MODE_LABELS, normalize_resampling_mode
-from .zip_raster_book_runtime import (
-    ZipRasterBookRuntime,
-    ZipRasterDisplayUnit,
-    ZipRasterFrame,
-    ZipRasterPage,
-    ZipRasterRenderSpec,
-    ZipRasterRequest,
-)
-
-
 _DISPLAY_LOG = logging.getLogger("nivisviewer.viewer.display_unit")
 _PDF_PREFETCH_IDLE_GRACE_MS = 120
 _PREPARED_DISPLAY_IDLE_GRACE_MS = 16
@@ -416,10 +414,13 @@ class ViewerWindow(QMainWindow):
         self._last_preload_center: int | None = None
         self._last_preload_direction = 0
         self._zip_runtime_active = False
-        self._zip_runtime: ZipRasterBookRuntime | None = None
+        # Historical private name retained for compatibility with focused ZIP
+        # tests.  The owner is now the shared RasterBookRuntime used by ZIP and
+        # folder-backed books alike.
+        self._zip_runtime: RasterBookRuntime | None = None
         self._zip_runtime_current_frame_serial = 0
         self._zip_runtime_last_painted_serial = 0
-        self._pending_zip_runtime_request: ZipRasterRequest | None = None
+        self._pending_zip_runtime_request: RasterRequest | None = None
         self._page_list_runtime: ViewerPageListRuntime | None = None
         self._staged_page_list_runtime: ViewerPageListRuntime | None = None
         self._page_list_waiting_for_current_paint = False
@@ -1645,6 +1646,17 @@ class ViewerWindow(QMainWindow):
             progress.page_index,
         )
         if self.metadata_store is not None:
+            # Multiple Viewer windows share one debounced metadata queue.  A
+            # later commit from another window may have replaced this book's
+            # pending value, so close must re-stage its own atomically
+            # committed presentation before flushing.  This keeps close order
+            # deterministic without ever saving a requested-only page.
+            self.metadata_store.update_reading_progress(
+                displayed.token.book.book_key,
+                page_index=progress.page_index,
+                total_pages=progress.total_pages,
+                item_type=self._metadata_book_item_type or None,
+            )
             self.metadata_store.flush()
 
     def _store_reading_position(
@@ -1805,6 +1817,12 @@ class ViewerWindow(QMainWindow):
     def copy_current_image(self) -> None:
         if self.model.total_pages <= 0:
             return
+        page_index = self.presentation_state.displayed_page
+        if page_index is not None:
+            snapshot = self.viewer.displayed_source_snapshot(page_index)
+            if snapshot is not None and snapshot[0] is not None:
+                QApplication.clipboard().setImage(snapshot[0])
+                return
         cached = self.image_cache.get(self.model.focused_index)
         if cached is not None and cached.qimage is not None:
             QApplication.clipboard().setImage(cached.qimage)
@@ -1817,10 +1835,19 @@ class ViewerWindow(QMainWindow):
     def show_page_info(self) -> None:
         if self.model.total_pages <= 0:
             return
-        page_index = self.model.focused_index
+        page_index = (
+            self.presentation_state.displayed_page
+            if self.presentation_state.displayed_page is not None
+            else self.model.focused_index
+        )
+        snapshot = self.viewer.displayed_source_snapshot(page_index)
         cached = self.image_cache.get(page_index)
         resolution = ""
-        if cached is not None and cached.original_size is not None:
+        if snapshot is not None and snapshot[1] is not None:
+            resolution = f"{snapshot[1][0]} x {snapshot[1][1]}"
+        elif snapshot is not None and snapshot[2]:
+            resolution = f"読み込みエラー: {snapshot[2]}"
+        elif cached is not None and cached.original_size is not None:
             resolution = f"{cached.original_size[0]} x {cached.original_size[1]}"
         elif cached is not None and cached.error:
             resolution = f"読み込みエラー: {cached.error}"
@@ -2522,7 +2549,7 @@ class ViewerWindow(QMainWindow):
             # side effect of retiring the old book.
             self._deactivate_zip_runtime(clear_artifacts=False)
         self._zip_runtime = (
-            runtime if isinstance(runtime, ZipRasterBookRuntime) else None
+            runtime if isinstance(runtime, RasterBookRuntime) else None
         )
         if self._zip_runtime is not None:
             self._zip_runtime.frameReady.connect(
@@ -2535,20 +2562,20 @@ class ViewerWindow(QMainWindow):
         *,
         start_index: int,
         is_single: bool,
-    ) -> ZipRasterDisplayUnit:
-        pages: list[ZipRasterPage] = []
+    ) -> RasterDisplayUnit:
+        pages: list[RasterPage] = []
         for page_index in indexes:
             image_id = self.model.image_id_at(page_index)
             if image_id is None:
                 continue
             pages.append(
-                ZipRasterPage(
+                RasterPage(
                     page_index,
                     image_id,
                     self.model.get_image_size(page_index),
                 )
             )
-        return ZipRasterDisplayUnit(
+        return RasterDisplayUnit(
             start_index,
             tuple(pages),
             is_single,
@@ -2557,12 +2584,12 @@ class ViewerWindow(QMainWindow):
     def _zip_runtime_request(
         self,
         spread: DisplaySpread,
-    ) -> ZipRasterRequest | None:
-        """Build the one runtime request used by every ZIP display mode."""
+    ) -> RasterRequest | None:
+        """Build the one runtime request used by every raster-book mode."""
         source = self.book_session.source
         runtime = self._zip_runtime
         if (
-            not isinstance(source, ZipImageSource)
+            not isinstance(source, (ZipImageSource, FolderImageSource))
             or runtime is None
             or runtime is not self.book_session.viewer_runtime
             or runtime.source is not source
@@ -2578,7 +2605,7 @@ class ViewerWindow(QMainWindow):
         center = self.model.focused_index
         direction = self.presentation_state.direction
         steps = (direction, -direction) if direction else (1, -1)
-        work_order: list[ZipRasterDisplayUnit] = [current]
+        work_order: list[RasterDisplayUnit] = [current]
         seen = {current.identity}
         for step in steps:
             units = self._display_units_from(center, step, 1)
@@ -2605,7 +2632,7 @@ class ViewerWindow(QMainWindow):
             != (1.0, 1.0, 1.0)
         ):
             decoder_bound = None
-        render_spec = ZipRasterRenderSpec(
+        render_spec = RasterRenderSpec(
             viewport_size=(
                 max(1, self.viewer.width()),
                 max(1, self.viewer.height()),
@@ -2633,7 +2660,7 @@ class ViewerWindow(QMainWindow):
             unit_limit=max(3, self.cache_size),
             byte_budget=self.image_cache.cache_byte_budget_bytes,
         )
-        return ZipRasterRequest(
+        return RasterRequest(
             self.book_session.generation,
             self._active_request_id,
             current,
@@ -2697,13 +2724,13 @@ class ViewerWindow(QMainWindow):
             return
         if runtime.request(request):
             return
-        message = "ZIP Viewer runtimeは要求を受け付けられません。"
+        message = "Raster Viewer runtimeは要求を受け付けられません。"
         self.presentation_state.fail_pending(message)
         self._set_status_override(message)
 
     def _on_zip_runtime_frame_ready(
         self,
-        frame: ZipRasterFrame,
+        frame: RasterFrame,
     ) -> None:
         presentation_token = self._presentation_token_for_request(
             frame.request_id
@@ -2795,6 +2822,22 @@ class ViewerWindow(QMainWindow):
                 presentation_token,
             )
         )
+        first_frame_failed = bool(
+            self._awaiting_first_frame
+            and self._first_frame_image_id
+            and any(
+                page.logical_image_id == self._first_frame_image_id
+                and page.error
+                for page in frame.pages
+            )
+        )
+        if first_frame_failed:
+            # An error frame is a complete, atomically committed result.  Do
+            # not leave the interactive-open/browser gate waiting for a paint
+            # acknowledgement that represents a successful source image.
+            # This mirrors the retained-path terminal-error contract while
+            # keeping a successful spread partner visible.
+            self._cancel_interactive_open()
         if any(
             page.source_qimage is not None and not page.source_is_preview
             for page in frame.pages
@@ -2802,7 +2845,7 @@ class ViewerWindow(QMainWindow):
             self.viewer.resume_magnifier_after_source_render()
         performance_trace.mark(
             self._active_open_trace_id,
-            "zip_runtime.commit.completed",
+            "raster_runtime.commit.completed",
             f"unit={frame.unit.identity!r} cache_hit={frame.cache_hit}",
         )
         self._raster_paint_fallback_timer.start()
@@ -2828,7 +2871,7 @@ class ViewerWindow(QMainWindow):
         self._defer_zip_runtime_browser_resume()
         performance_trace.mark(
             self._active_open_trace_id,
-            "zip_runtime.paint.completed",
+            "raster_runtime.paint.completed",
         )
 
     def _presentation_layout_signature(self) -> tuple[object, ...]:
@@ -3041,29 +3084,30 @@ class ViewerWindow(QMainWindow):
             if not runtime.has_cached_current(zip_request):
                 self._hold_raster_interactive_lane()
                 self._pending_zip_runtime_request = zip_request
-                has_completed_frame = any(
-                    image.display_prepared
-                    and image.pixmap is not None
-                    and not image.pixmap.isNull()
-                    for image in self.viewer._images
-                )
-                if has_completed_frame:
-                    self._zip_runtime_request_timer.start()
-                else:
-                    self._dispatch_pending_zip_runtime_request()
+                # Always enter the short replaceable-demand timer, including
+                # the first cold frame.  Besides coalescing rapid input, this
+                # lets an already queued Browser paint finish before a Folder
+                # worker enters QImageReader.  Starting both in the same Qt
+                # event dispatch can deadlock lazy QIcon/image-plugin work on
+                # Windows/offscreen.  Pixel decode remains entirely off-GUI.
+                self._zip_runtime_request_timer.start()
                 return
             self._zip_runtime_request_timer.stop()
             self._pending_zip_runtime_request = None
             if runtime.request(zip_request):
                 return
-            message = "ZIP Viewer runtimeは要求を受け付けられません。"
+            message = "Raster Viewer runtimeは要求を受け付けられません。"
             self.presentation_state.fail_pending(message)
             self._set_status_override(message)
             return
-        if isinstance(self.book_session.source, ZipImageSource):
-            # ZIP books never fall back per feature or per decoder failure.
-            # A missing runtime is a book-lifetime error, not eligibility.
-            message = "ZIP Viewer runtimeを初期化できません。"
+        if isinstance(
+            self.book_session.source,
+            (ZipImageSource, FolderImageSource),
+        ):
+            # Raster-runtime books never fall back per feature or decoder
+            # failure. A missing runtime is a book-lifetime error, not an
+            # eligibility decision.
+            message = "Raster Viewer runtimeを初期化できません。"
             self.presentation_state.fail_pending(message)
             self._set_status_override(message)
             return

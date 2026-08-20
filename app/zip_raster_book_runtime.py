@@ -28,7 +28,7 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
 
 from .archive_backend import ArchiveErrorCode
-from .image_source import ImageSourceError, ZipImageSource
+from .image_source import ImageSource, ImageSourceError, ZipImageSource
 from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
 from .thumbnail_render import pil_to_qimage
 from .viewer_render import ViewerRenderKey, normalize_resampling_mode, render_qimage
@@ -751,7 +751,7 @@ class _ZipRasterUnitJob(QRunnable):
         serial: int,
         key: _UnitKey,
         request_id: int,
-        source: ZipImageSource,
+        source: ImageSource,
         unit: ZipRasterDisplayUnit,
         cached_sources: dict[str, _CachedSource] | None = None,
     ) -> None:
@@ -777,11 +777,13 @@ class _ZipRasterUnitJob(QRunnable):
         if self.cancelled.is_set():
             return False
         self.cancelled.set()
-        for page in self.unit.pages:
-            try:
-                self.source.cancel_image_request(page.image_id)
-            except Exception:
-                pass
+        cancel_image_request = getattr(self.source, "cancel_image_request", None)
+        if callable(cancel_image_request):
+            for page in self.unit.pages:
+                try:
+                    cancel_image_request(page.image_id)
+                except Exception:
+                    pass
         return True
 
     def mark_removed_before_start(self) -> None:
@@ -1149,8 +1151,16 @@ class _ZipRasterUnitJob(QRunnable):
         return adjusted
 
 
-class ZipRasterBookRuntime(QObject):
-    """Own the complete ZIP raster Viewer execution path for one book."""
+class RasterBookRuntime(QObject):
+    """Own one complete raster Viewer execution path for one book.
+
+    ZIP and folder books share this scheduler, source/frame artifact split,
+    cache policy, and callback-drain lifetime.  Concrete subclasses constrain
+    the accepted source type without forking the execution pipeline.
+    """
+
+    _source_type: type[ImageSource] = ImageSource
+    _runtime_display_name = "Raster"
 
     frameReady = Signal(object)
     artifactReady = Signal(object)
@@ -1158,7 +1168,7 @@ class ZipRasterBookRuntime(QObject):
 
     def __init__(
         self,
-        source: ZipImageSource,
+        source: ImageSource,
         source_epoch: int,
         parent: QObject | None = None,
         *,
@@ -1166,8 +1176,10 @@ class ZipRasterBookRuntime(QObject):
         cache_unit_limit: int = 3,
         cache_byte_budget: int = _DEFAULT_CACHE_BYTES,
     ) -> None:
-        if not isinstance(source, ZipImageSource):
-            raise TypeError("ZipRasterBookRuntime requires ZipImageSource")
+        if not isinstance(source, self._source_type):
+            raise TypeError(
+                f"{type(self).__name__} requires {self._source_type.__name__}"
+            )
         super().__init__(parent)
         self.source = source
         self.source_epoch = int(source_epoch)
@@ -1585,7 +1597,7 @@ class ZipRasterBookRuntime(QObject):
                 request,
                 key,
                 unit,
-                "ZIP Viewer workerを開始できませんでした。",
+                f"{self._runtime_display_name} Viewer workerを開始できませんでした。",
             )
         else:
             self._failed_prefetch.add(key)
@@ -1846,3 +1858,10 @@ class ZipRasterBookRuntime(QObject):
                 field: int(getattr(self._metrics, field)) + int(amount),
             },
         )
+
+
+class ZipRasterBookRuntime(RasterBookRuntime):
+    """Book-scoped raster runtime constrained to a ZIP source."""
+
+    _source_type = ZipImageSource
+    _runtime_display_name = "ZIP"
