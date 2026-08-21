@@ -18,34 +18,38 @@ from .viewer_memory_policy import (
 class ConfigManager(QObject):
     settings_changed = Signal(object)
 
+    _LEGACY_VIEWER_CACHE_MEMORY_KEY = "viewer_cache_max_memory_mib"
+    _LEGACY_VIEWER_MEMORY_MIB_BY_PREFETCH_PRESET: dict[str, int] = {
+        "disabled": 128,
+        "memory_saver": 128,
+        "standard": 256,
+        "more": 512,
+    }
+
     VIEWER_PREFETCH_PRESETS: dict[str, dict[str, int]] = {
         "disabled": {
             "image_forward_units": 0,
             "image_backward_units": 0,
             "pdf_forward_units": 0,
             "pdf_backward_units": 0,
-            "cache_memory_mib": 128,
         },
         "memory_saver": {
             "image_forward_units": 2,
             "image_backward_units": 1,
             "pdf_forward_units": 1,
             "pdf_backward_units": 0,
-            "cache_memory_mib": 128,
         },
         "standard": {
             "image_forward_units": 3,
             "image_backward_units": 3,
             "pdf_forward_units": 3,
             "pdf_backward_units": 3,
-            "cache_memory_mib": 256,
         },
         "more": {
             "image_forward_units": 6,
             "image_backward_units": 2,
             "pdf_forward_units": 4,
             "pdf_backward_units": 1,
-            "cache_memory_mib": 512,
         },
     }
 
@@ -163,7 +167,6 @@ class ConfigManager(QObject):
         "viewer_prefetch_image_backward_units": 3,
         "viewer_prefetch_pdf_forward_units": 3,
         "viewer_prefetch_pdf_backward_units": 3,
-        "viewer_cache_max_memory_mib": 256,
         "viewer_memory_mode": "auto",
         "rotation_angle": 0,
         "slideshow_interval_ms": 3000,
@@ -211,20 +214,24 @@ class ConfigManager(QObject):
             return self.data
 
         if isinstance(loaded, dict):
-            merged = defaults
-            merged.update(loaded)
+            loaded = dict(loaded)
             if "viewer_memory_mode" not in loaded:
                 preset = str(loaded.get("viewer_prefetch_preset", "standard"))
-                if preset == "custom":
-                    legacy_mib = loaded.get("viewer_cache_max_memory_mib", 256)
+                if self._LEGACY_VIEWER_CACHE_MEMORY_KEY in loaded:
+                    legacy_mib = loaded[self._LEGACY_VIEWER_CACHE_MEMORY_KEY]
                 else:
-                    legacy_mib = self.VIEWER_PREFETCH_PRESETS.get(
+                    legacy_mib = self._LEGACY_VIEWER_MEMORY_MIB_BY_PREFETCH_PRESET.get(
                         preset,
-                        self.VIEWER_PREFETCH_PRESETS["standard"],
-                    )["cache_memory_mib"]
-                merged["viewer_memory_mode"] = viewer_memory_mode_from_legacy_mib(
+                        self._LEGACY_VIEWER_MEMORY_MIB_BY_PREFETCH_PRESET[
+                            "standard"
+                        ],
+                    )
+                loaded["viewer_memory_mode"] = viewer_memory_mode_from_legacy_mib(
                     legacy_mib
                 )
+            loaded.pop(self._LEGACY_VIEWER_CACHE_MEMORY_KEY, None)
+            merged = defaults
+            merged.update(loaded)
             legacy_edge = loaded.get("fullscreen_edge_trigger_px")
             if (
                 "fullscreen_top_edge_trigger_px" not in loaded
@@ -244,6 +251,8 @@ class ConfigManager(QObject):
     def save(self, updates: dict[str, Any] | None = None) -> None:
         if updates:
             self.apply(updates)
+
+        self.data.pop(self._LEGACY_VIEWER_CACHE_MEMORY_KEY, None)
 
         if not self.writable:
             self.last_error = "プロファイルは読み取り専用です。"
@@ -271,6 +280,7 @@ class ConfigManager(QObject):
     def apply(self, updates: dict[str, Any], *, save: bool = False) -> dict[str, Any]:
         merged = deepcopy(self.data)
         merged.update(updates)
+        merged.pop(self._LEGACY_VIEWER_CACHE_MEMORY_KEY, None)
         normalized = self._normalize(merged)
         changed = {
             key: value
@@ -650,12 +660,6 @@ class ConfigManager(QObject):
                 minimum=0,
                 maximum=20,
             )
-        normalized["viewer_cache_max_memory_mib"] = cls._clamped_int(
-            normalized.get("viewer_cache_max_memory_mib"),
-            default=int(cls.DEFAULTS["viewer_cache_max_memory_mib"]),
-            minimum=64,
-            maximum=32768,
-        )
         normalized["viewer_memory_mode"] = normalize_viewer_memory_mode(
             normalized.get("viewer_memory_mode")
         )
@@ -697,9 +701,6 @@ class ConfigManager(QObject):
                 ),
                 "pdf_backward_units": int(
                     self.get("viewer_prefetch_pdf_backward_units", 3)
-                ),
-                "cache_memory_mib": int(
-                    self.get("viewer_cache_max_memory_mib", 256)
                 ),
             }
         else:

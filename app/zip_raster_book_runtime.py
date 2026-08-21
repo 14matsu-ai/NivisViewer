@@ -525,6 +525,7 @@ class ZipRasterRuntimeMetrics:
     source_cache_hits: int = 0
     source_cache_misses: int = 0
     source_cache_evictions: int = 0
+    commit_warmup_releases: int = 0
     prefetch_admission_stops: int = 0
     oversized_prefetch_skips: int = 0
 
@@ -2180,6 +2181,7 @@ class RasterBookRuntime(QObject):
             ZipRasterDisplayUnit,
             tuple[tuple[int, str], ...],
         ] | None = None
+        self._commit_warmup_released_request_id: int | None = None
         self._prefetch_released_request_id: int | None = None
         self._prefetch_admission_stopped_request_id: int | None = None
         self._dispatch_suspended = False
@@ -2318,6 +2320,9 @@ class RasterBookRuntime(QObject):
             "cache_hits": self._metrics.cache_hits,
             "cache_misses": self._metrics.cache_misses,
             "jobs_submitted": self._metrics.jobs_submitted,
+            "commit_warmup_releases": (
+                self._metrics.commit_warmup_releases
+            ),
             "cancel_requests": self._metrics.cancel_requests,
             "stale_results": self._metrics.stale_results,
             "cache_evictions": self._metrics.cache_evictions,
@@ -2535,6 +2540,7 @@ class RasterBookRuntime(QObject):
         self._current_request = request
         self._current_key = current_key
         self._warmup_planner = RasterWarmupPlanner(request.warmup_plan)
+        self._commit_warmup_released_request_id = None
         self._prefetch_released_request_id = None
         self._prefetch_admission_stopped_request_id = None
         self._dispatch_suspended = bool(suspend_dispatch)
@@ -2580,6 +2586,33 @@ class RasterBookRuntime(QObject):
             else:
                 self._cancel_active_job()
 
+    def release_initial_warmup(self, *, request_id: int) -> bool:
+        """Start one nearest display-ready unit after accepted first commit.
+
+        This is the narrow book-open fast path.  It keeps the existing paint
+        acknowledgement as the ownership boundary for the displayed frame and
+        as the gate for PageList/noncritical work, while avoiding an otherwise
+        idle Viewer worker between atomic commit and physical paint.
+        """
+
+        request = self._current_request
+        if (
+            request is None
+            or self._dispatch_suspended
+            or int(request_id) != request.request_id
+            or self._current_key not in self._frame_store
+        ):
+            return False
+        if self._commit_warmup_released_request_id == request.request_id:
+            return True
+        self._commit_warmup_released_request_id = request.request_id
+        self._bump("commit_warmup_releases")
+        planner = self._warmup_planner
+        if planner is not None:
+            planner.release_after_commit(unit_limit=1)
+        self._drive()
+        return True
+
     def release_prefetch(self, *, request_id: int) -> bool:
         request = self._current_request
         if (
@@ -2620,6 +2653,7 @@ class RasterBookRuntime(QObject):
         self._current_request = None
         self._current_key = None
         self._warmup_planner = None
+        self._commit_warmup_released_request_id = None
         self._prefetch_released_request_id = None
         self._prefetch_admission_stopped_request_id = None
         self._dispatch_suspended = False
@@ -2668,6 +2702,20 @@ class RasterBookRuntime(QObject):
             self._shutdown_complete = True
         return completed
 
+    def retire(self) -> bool:
+        """Stop work without synchronously destroying a large ready cache.
+
+        A replacement book can submit its current page first; the owner calls
+        :meth:`shutdown` after that frame paints to reclaim retained QImages
+        and QPixmaps outside the new book's open critical path.
+        """
+
+        self._accepting_requests = False
+        self.cancel(clear_artifacts=False)
+        if self._coordinator is None:
+            self._thread_pool.clear()
+        return not self._jobs
+
     def _drive(self) -> None:
         request = self._current_request
         planner = self._warmup_planner
@@ -2683,7 +2731,10 @@ class RasterBookRuntime(QObject):
         if self._current_key not in self._frame_store:
             self._submit(self._current_key, ImageWorkPriority.VIEWER_CURRENT)
             return
-        if self._prefetch_released_request_id != request.request_id:
+        if (
+            self._commit_warmup_released_request_id != request.request_id
+            and self._prefetch_released_request_id != request.request_id
+        ):
             return
         while True:
             unit = planner.next_candidate(

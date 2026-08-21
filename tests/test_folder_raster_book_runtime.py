@@ -629,7 +629,27 @@ def test_folder_production_uses_one_runtime_and_keeps_page_list_separate(
         assert window._zip_runtime_active
         assert window.viewer._direct_display_mode
         assert window.image_cache.cache_bytes == 0
-        assert window.book_session.page_list_runtime is not None
+        # PageList ownership is intentionally outside the first-frame
+        # critical path.  It is materialized only after that frame paints.
+        assert window.book_session.page_list_runtime is None
+        paint_boundaries: list[tuple[object, object]] = []
+        window.viewer.framePainted.connect(
+            lambda *_args: paint_boundaries.append(
+                (
+                    window.book_session.page_list_runtime,
+                    window._pending_book_open_projection,
+                )
+            )
+        )
+        window.show()
+        _wait_until(
+            qapp,
+            lambda: window.book_session.page_list_runtime is not None,
+        )
+        assert paint_boundaries
+        assert paint_boundaries[0][0] is None
+        assert paint_boundaries[0][1] is not None
+        assert window._pending_book_open_projection is None
         assert window.book_session.page_list_runtime is not runtime
 
         committed_before = window.presentation_state.committed_frame_serial

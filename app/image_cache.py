@@ -438,14 +438,28 @@ class ImageCache(QObject):
         self._trace_id = int(trace_id)
 
     def suspend_for_book_runtime(self) -> None:
-        """Stop the legacy raster pipeline while a book runtime owns ZIP work.
+        """Detach the legacy pipeline while a book runtime owns raster work.
 
-        The source remains attached for model metadata only. Advancing the
-        generation rejects already-queued legacy results; ZIP display work
-        must not return to this cache because of a feature or decoder error.
+        ``PageModel`` and the book runtime own raster-book metadata/source
+        lifetime.  Keeping a duplicate source plus a full page-id list here
+        served no production consumer and made every ZIP/folder open initialize
+        the old cache only to suspend it moments later.
         """
+        already_detached = (
+            self.source is None
+            and not self.image_ids
+            and not self._cache
+            and not self._in_flight
+            and not self._tasks
+            and not self._wanted_indexes
+            and not self._protected_indexes
+        )
+        if already_detached:
+            return
         self._cancel_in_flight()
         self.generation += 1
+        self.source = None
+        self.image_ids = []
         self._clear_cache()
         self._wanted_indexes.clear()
         self._protected_indexes.clear()

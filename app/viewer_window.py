@@ -244,6 +244,9 @@ class ViewerWindow(QMainWindow):
         self._enforcing_combined_cache_budget = False
         self._metadata_book_path = ""
         self._metadata_book_item_type = ""
+        self._pending_book_open_projection: (
+            tuple[int, int, str, str, int, int, str] | None
+        ) = None
         self._status_override_message: str | None = None
         self._status_override_token = 0
         self._path_probe_generation = 0
@@ -1412,6 +1415,10 @@ class ViewerWindow(QMainWindow):
         self.image_cache.set_cache_byte_budget_bytes(
             self.viewer_cache_budget_bytes
         )
+        self.book_session.set_viewer_runtime_memory_limits(
+            hard_limit_bytes=self.viewer_cache_budget_bytes,
+            soft_target_bytes=self.viewer_cache_soft_target_bytes,
+        )
         if getattr(self, "_zip_runtime", None) is not None:
             self._apply_raster_memory_policy()
         if hasattr(self, "viewer"):
@@ -1432,7 +1439,7 @@ class ViewerWindow(QMainWindow):
         self.viewer_cache_soft_target_bytes = policy.target_bytes
         self.viewer_memory_resolution = policy.resolution
         self.viewer_cache_memory_mib = policy.hard_limit_bytes // (1024 * 1024)
-        runtime.set_memory_limits(
+        self.book_session.set_viewer_runtime_memory_limits(
             hard_limit_bytes=policy.hard_limit_bytes,
             soft_target_bytes=policy.target_bytes,
         )
@@ -1613,7 +1620,8 @@ class ViewerWindow(QMainWindow):
             self._reload_page_index = None
         self.viewer.cancel_pending_canvas_click()
         self.viewer.cancel_magnifier()
-        self._save_current_reading_position()
+        self._save_current_reading_position(flush_metadata=False)
+        self._pending_book_open_projection = None
         self._pending_progress_seed = None
         self.presentation_state.begin_replacement_open()
         self._request_id_adapter = None
@@ -1656,6 +1664,7 @@ class ViewerWindow(QMainWindow):
         modal_on_empty: bool,
     ) -> bool:
         self._clear_status_override()
+        self._pending_book_open_projection = None
         if self.model.total_pages == 0:
             self._cancel_interactive_open()
             if modal_on_empty:
@@ -1717,26 +1726,44 @@ class ViewerWindow(QMainWindow):
             else None
         )
 
-        if self.metadata_store is not None:
-            self.metadata_store.record_book_opened(
-                self._metadata_book_path,
-                item_type=self._metadata_book_item_type,
-                start_page_index=(
-                    saved_page_index
-                    if (
-                        configured_open_position
-                        and not self._resumes_last_book_position()
-                        and saved_page_index is not None
-                    )
-                    else self.model.focused_index
-                ),
-                total_pages=self.model.total_pages,
-            )
-
         opened_path = str(opened.requested_path)
         self.settings["last_open_path"] = opened_path
-        self._add_recent_path(opened_path)
-        self.image_cache.set_cache_size(self.cache_size)
+        opened_start_page = (
+            saved_page_index
+            if (
+                configured_open_position
+                and not self._resumes_last_book_position()
+                and saved_page_index is not None
+            )
+            else self.model.focused_index
+        )
+        raster_fast_path = isinstance(
+            self.book_session.source,
+            (ZipImageSource, FolderImageSource),
+        ) and self.book_session.viewer_runtime is not None
+        if raster_fast_path:
+            self._pending_book_open_projection = (
+                int(opened.generation),
+                id(self.book_session.source),
+                self._metadata_book_path,
+                self._metadata_book_item_type,
+                int(opened_start_page),
+                int(self.model.total_pages),
+                opened_path,
+            )
+        else:
+            self._apply_book_open_projection(
+                (
+                    int(opened.generation),
+                    id(self.book_session.source),
+                    self._metadata_book_path,
+                    self._metadata_book_item_type,
+                    int(opened_start_page),
+                    int(self.model.total_pages),
+                    opened_path,
+                )
+            )
+            self.image_cache.set_cache_size(self.cache_size)
         self._first_frame_image_id = self.model.image_id_at(
             self.model.focused_index
         )
@@ -1747,7 +1774,6 @@ class ViewerWindow(QMainWindow):
             self._active_open_trace_id,
             "viewer.initial_requests.completed",
         )
-        self.book_changed.emit(self, opened_path)
         return True
 
     def _on_async_book_opened(self, opened: BookOpened) -> None:
@@ -1801,7 +1827,11 @@ class ViewerWindow(QMainWindow):
             return None
         return min(page_index, self.model.total_pages - 1)
 
-    def _save_current_reading_position(self) -> None:
+    def _save_current_reading_position(
+        self,
+        *,
+        flush_metadata: bool = True,
+    ) -> None:
         displayed = self.presentation_state.displayed
         progress = self.presentation_state.progress_values
         if displayed is None or progress is None:
@@ -1822,7 +1852,44 @@ class ViewerWindow(QMainWindow):
                 total_pages=progress.total_pages,
                 item_type=self._metadata_book_item_type or None,
             )
-            self.metadata_store.flush()
+            if flush_metadata:
+                self.metadata_store.flush()
+
+    def _apply_book_open_projection(
+        self,
+        projection: tuple[int, int, str, str, int, int, str],
+    ) -> None:
+        (
+            epoch,
+            source_identity,
+            metadata_path,
+            item_type,
+            start_page_index,
+            total_pages,
+            opened_path,
+        ) = projection
+        source = self.book_session.source
+        if (
+            source is None
+            or epoch != self.book_session.generation
+            or source_identity != id(source)
+        ):
+            return
+        if self.metadata_store is not None:
+            self.metadata_store.record_book_opened(
+                metadata_path,
+                item_type=item_type,
+                start_page_index=start_page_index,
+                total_pages=total_pages,
+            )
+        self._add_recent_path(opened_path)
+        self.book_changed.emit(self, opened_path)
+
+    def _flush_book_open_projection(self) -> None:
+        projection = self._pending_book_open_projection
+        self._pending_book_open_projection = None
+        if projection is not None:
+            self._apply_book_open_projection(projection)
 
     def _store_reading_position(
         self,
@@ -2412,8 +2479,23 @@ class ViewerWindow(QMainWindow):
         staged = runtime if isinstance(runtime, ViewerPageListRuntime) else None
         if staged is None:
             self._staged_page_list_runtime = None
-            if self.book_session.source is None:
+            if not self.book_session.page_list_runtime_deferred:
                 self._activate_page_list_runtime(None)
+                return
+            # A raster open deliberately defers constructing the replacement
+            # PageList runtime until the first frame has painted.  Disconnect
+            # the retired runtime without clearing its already-materialized
+            # model projection, which remains a disabled rollback snapshot.
+            previous = self._page_list_runtime
+            if previous is not None:
+                try:
+                    previous.thumbnailReady.disconnect(
+                        self._on_page_list_thumbnail_ready
+                    )
+                except (RuntimeError, TypeError):
+                    pass
+            self._page_list_runtime = None
+            self.page_list.setEnabled(False)
             return
         displayed = self.presentation_state.displayed
         if (
@@ -2558,6 +2640,15 @@ class ViewerWindow(QMainWindow):
             or token.book.source_identity != id(source)
         ):
             return
+        if self._zip_runtime_active:
+            # ``framePainted`` is emitted from ViewerWidget.paintEvent.  Keep
+            # model resets, large retired-cache destruction, SQLite/history,
+            # recent actions, and Browser projection out of that signal's
+            # direct call stack; this zero-timer runs after paintEvent returns.
+            self.book_session.ensure_page_list_runtime()
+            self._commit_staged_page_list_runtime(token.book.epoch)
+            self.book_session.release_retired_book_resources()
+            self._flush_book_open_projection()
         self._sync_page_history_actions()
         if self.page_list_dock.isVisible():
             self._sync_page_list_selection(
@@ -3117,6 +3208,9 @@ class ViewerWindow(QMainWindow):
         self,
         frame: RasterFrame,
     ) -> None:
+        opening_first_frame = bool(
+            self._awaiting_first_frame and self._first_frame_image_id
+        )
         presentation_token = self._presentation_token_for_request(
             frame.request_id
         )
@@ -3223,6 +3317,20 @@ class ViewerWindow(QMainWindow):
             # This mirrors the retained-path terminal-error contract while
             # keeping a successful spread partner visible.
             self._cancel_interactive_open()
+        elif (
+            opening_first_frame
+            and self._zip_runtime_current_frame_serial > 0
+            and self._zip_runtime is not None
+            and self.presentation_state.displayed is not None
+            and self.presentation_state.displayed.token == presentation_token
+        ):
+            # ZipPlaFork's one Viewer worker proceeds to its next ordered page
+            # as soon as current publication completes.  Retain NivisViewer's
+            # atomic Qt commit/paint ownership, but release one nearest unit at
+            # accepted commit so the worker does not sit idle awaiting paint.
+            self._zip_runtime.release_initial_warmup(
+                request_id=frame.request_id,
+            )
         if any(
             page.source_qimage is not None and not page.source_is_preview
             for page in frame.pages
@@ -3419,9 +3527,10 @@ class ViewerWindow(QMainWindow):
         # The semantic state was replaced by one immutable snapshot before
         # these projections run. This whole slot is synchronous with the
         # Widget's complete-frame swap.
-        self._commit_staged_page_list_runtime(
-            commit.frame.token.book.epoch
-        )
+        if not self._zip_runtime_active:
+            self._commit_staged_page_list_runtime(
+                commit.frame.token.book.epoch
+            )
         self._update_slider()
         self._update_status()
         if not self._zip_runtime_active:
@@ -6020,6 +6129,7 @@ class ViewerWindow(QMainWindow):
             return
         self._shutdown_prepared = True
         self._save_current_reading_position()
+        self._pending_book_open_projection = None
         self.presentation_state.close()
         self._zip_runtime_request_timer.stop()
         self._pending_zip_runtime_request = None

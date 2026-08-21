@@ -164,7 +164,6 @@ def test_viewer_prefetch_presets_and_custom_controls(
             "viewer_prefetch_image_backward_units": 8,
             "viewer_prefetch_pdf_forward_units": 7,
             "viewer_prefetch_pdf_backward_units": 6,
-            "viewer_cache_max_memory_mib": 768,
         }
     )
     dialog = SettingsDialog(config)

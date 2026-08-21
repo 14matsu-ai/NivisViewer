@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -51,7 +52,6 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
         "image_backward_units": 3,
         "pdf_forward_units": 3,
         "pdf_backward_units": 3,
-        "cache_memory_mib": 256,
     }
 
 
@@ -117,7 +117,6 @@ def test_custom_viewer_prefetch_round_trip_and_clamping(tmp_path: Path) -> None:
             "viewer_prefetch_image_backward_units": 21,
             "viewer_prefetch_pdf_forward_units": 7,
             "viewer_prefetch_pdf_backward_units": 8,
-            "viewer_cache_max_memory_mib": 99999,
         },
         save=True,
     )
@@ -132,26 +131,46 @@ def test_custom_viewer_prefetch_round_trip_and_clamping(tmp_path: Path) -> None:
         "image_backward_units": 20,
         "pdf_forward_units": 7,
         "pdf_backward_units": 8,
-        "cache_memory_mib": 32768,
     }
 
 
-def test_viewer_memory_mode_round_trip_and_legacy_migration(tmp_path: Path) -> None:
-    path = tmp_path / "config.json"
-    manager = ConfigManager(path)
-    manager.load()
-    manager.apply({"viewer_memory_mode": "8192"}, save=True)
+def test_viewer_memory_mode_migration_is_one_way_on_save(tmp_path: Path) -> None:
+    legacy_key = "viewer_cache_max_memory_mib"
 
-    assert ConfigManager(path).load()["viewer_memory_mode"] == "8192"
+    fresh_path = tmp_path / "fresh.json"
+    fresh = ConfigManager(fresh_path)
+    fresh.load()
+    fresh.save()
+    assert legacy_key not in json.loads(fresh_path.read_text(encoding="utf-8"))
 
-    path.write_text(
-        '{"viewer_prefetch_preset": "more", '
-        '"viewer_cache_max_memory_mib": 768}',
+    legacy_path = tmp_path / "legacy.json"
+    legacy_path.write_text(
+        '{"viewer_cache_max_memory_mib": 768}',
         encoding="utf-8",
     )
-    assert ConfigManager(path).load()["viewer_memory_mode"] == "512"
+    legacy = ConfigManager(legacy_path)
+    assert legacy.load()["viewer_memory_mode"] == "512"
+    assert legacy_key not in legacy.data
+    legacy.save()
+    assert legacy_key not in json.loads(legacy_path.read_text(encoding="utf-8"))
 
+    mixed_path = tmp_path / "mixed.json"
+    mixed_path.write_text(
+        '{"viewer_memory_mode": "8192", '
+        '"viewer_cache_max_memory_mib": 128}',
+        encoding="utf-8",
+    )
+    mixed = ConfigManager(mixed_path)
+    assert mixed.load()["viewer_memory_mode"] == "8192"
+    assert legacy_key not in mixed.data
+    mixed.save()
+    assert legacy_key not in json.loads(mixed_path.read_text(encoding="utf-8"))
+
+
+def test_unknown_viewer_memory_mode_falls_back_to_auto(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
     path.write_text('{"viewer_memory_mode": "unknown"}', encoding="utf-8")
+
     assert ConfigManager(path).load()["viewer_memory_mode"] == "auto"
 
 

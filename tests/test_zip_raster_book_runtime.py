@@ -389,7 +389,7 @@ def test_combined_byte_eviction_prefers_old_layout_and_protects_near_plan(
         source.close()
 
 
-def test_runtime_uses_one_ordered_job_lane_and_paint_gates_prefetch(
+def test_runtime_starts_one_commit_neighbor_then_paint_releases_book_warmup(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
@@ -426,6 +426,18 @@ def test_runtime_uses_one_ordered_job_lane_and_paint_gates_prefetch(
 
         assert source.order == ["1.png"]
         assert runtime.metrics.jobs_submitted == 1
+        assert runtime.release_initial_warmup(request_id=1)
+        # A duplicate GUI callback for the same accepted commit must not
+        # replenish the pre-paint allowance and admit another unit.
+        assert runtime.release_initial_warmup(request_id=1)
+        _wait_until(
+            qapp,
+            lambda: runtime.metrics.jobs_submitted == 2
+            and not runtime.has_unfinished_tasks(),
+        )
+        assert source.order == ["1.png", "2.png"]
+        assert runtime.warmup_stop_reason == "waiting_for_paint"
+
         assert runtime.release_prefetch(request_id=1)
         _wait_until(
             qapp,
@@ -434,6 +446,7 @@ def test_runtime_uses_one_ordered_job_lane_and_paint_gates_prefetch(
         )
 
         assert source.order == ["1.png", "2.png", "0.png"]
+        assert runtime.metrics.commit_warmup_releases == 1
         assert source.max_active == 1
         assert set(runtime.cached_page_indexes) == {0, 1, 2}
 

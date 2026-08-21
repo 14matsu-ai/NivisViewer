@@ -88,7 +88,7 @@ def test_sliding_current_skips_overlapping_topology_units() -> None:
     assert sliding.rank_for_page(2) == 0
 
 
-def test_planner_waits_for_paint_skips_capacity_and_finishes_later_work() -> None:
+def test_planner_releases_one_commit_neighbor_then_waits_for_paint() -> None:
     warmup = RasterWarmupPlanner(plan(5, 0, 1))
     assert warmup.next_candidate(
         identity_of=lambda unit: unit.identity,
@@ -97,7 +97,7 @@ def test_planner_waits_for_paint_skips_capacity_and_finishes_later_work() -> Non
     ) is None
     assert warmup.stop_reason is WarmupStopReason.WAITING_FOR_PAINT
 
-    warmup.release_after_paint()
+    warmup.release_after_commit(unit_limit=1)
     first = warmup.next_candidate(
         identity_of=lambda unit: unit.identity,
         is_ready=lambda _unit: False,
@@ -105,6 +105,14 @@ def test_planner_waits_for_paint_skips_capacity_and_finishes_later_work() -> Non
     )
     assert first is not None and first.pages == (1,)
     warmup.mark_capacity_skip(first.identity)
+    assert warmup.next_candidate(
+        identity_of=lambda unit: unit.identity,
+        is_ready=lambda _unit: False,
+        is_terminal_failure=lambda _unit: False,
+    ) is None
+    assert warmup.stop_reason is WarmupStopReason.WAITING_FOR_PAINT
+
+    warmup.release_after_paint()
     remaining: list[tuple[int, ...]] = []
     while True:
         candidate = warmup.next_candidate(
