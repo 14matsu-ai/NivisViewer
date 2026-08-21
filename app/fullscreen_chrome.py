@@ -372,10 +372,18 @@ class FullscreenChromeController(QObject):
                 self._is_bottom_wheel_target(watched, event)
                 and isinstance(self.slider, ViewerPageSlider)
             ):
-                handled = self.slider.process_wheel_delta(
-                    event.angleDelta(),
-                    event.pixelDelta(),
-                )
+                self.slider.wheelInputObserved.emit(int(event.timestamp()))
+                if event.isEndEvent():
+                    handled = self.slider.process_wheel_delta(
+                        event.angleDelta(),
+                        event.pixelDelta(),
+                        sequence_finished=True,
+                    )
+                else:
+                    handled = self.slider.process_wheel_delta(
+                        event.angleDelta(),
+                        event.pixelDelta(),
+                    )
                 if handled:
                     event.accept()
                 return handled

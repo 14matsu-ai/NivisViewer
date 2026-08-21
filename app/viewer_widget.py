@@ -246,6 +246,10 @@ def calculate_spread_layout(
 class ViewerWidget(QWidget):
     nextRequested = Signal()
     previousRequested = Signal()
+    # QInputEvent.timestamp() is quint64 milliseconds.  A Qt ``int`` signal
+    # overflows after roughly 24.9 days of system uptime on Windows.
+    wheelInputObserved = Signal(object)
+    wheelSequenceFinished = Signal()
     zoomChanged = Signal(float)
     fullscreenToggleRequested = Signal()
     leftSideClicked = Signal()
@@ -469,7 +473,7 @@ class ViewerWidget(QWidget):
         self.set_render_cache_byte_limit_bytes(
             max(
                 64,
-                min(4096, int(memory_mib)),
+                min(32768, int(memory_mib)),
             )
             * 1024
             * 1024
@@ -1041,7 +1045,12 @@ class ViewerWidget(QWidget):
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
         delta = event.angleDelta().y()
+        sequence_finished = event.isEndEvent()
         if delta == 0:
+            if sequence_finished:
+                self.wheelSequenceFinished.emit()
+                event.accept()
+                return
             event.ignore()
             return
 
@@ -1049,13 +1058,19 @@ class ViewerWidget(QWidget):
             factor = 1.15 if delta > 0 else 1 / 1.15
             base = self._scale_for_current_mode() if self.fit_mode != "manual_zoom" else self.manual_zoom
             self.set_manual_zoom(base * factor)
+            if sequence_finished:
+                self.wheelSequenceFinished.emit()
             event.accept()
             return
 
         if delta < 0:
+            self.wheelInputObserved.emit(int(event.timestamp()))
             self.nextRequested.emit()
         else:
+            self.wheelInputObserved.emit(int(event.timestamp()))
             self.previousRequested.emit()
+        if sequence_finished:
+            self.wheelSequenceFinished.emit()
         event.accept()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]

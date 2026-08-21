@@ -43,6 +43,7 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
     assert manager.data["browser_folder_gestures_enabled"] is True
     assert manager.data["mouse_back_button_action"] == "previous_book"
     assert manager.data["mouse_forward_button_action"] == "next_book"
+    assert manager.viewer_memory_mode() == "auto"
     assert manager.viewer_prefetch_settings() == {
         "preset": "standard",
         "direction_priority_enabled": True,
@@ -131,8 +132,27 @@ def test_custom_viewer_prefetch_round_trip_and_clamping(tmp_path: Path) -> None:
         "image_backward_units": 20,
         "pdf_forward_units": 7,
         "pdf_backward_units": 8,
-        "cache_memory_mib": 4096,
+        "cache_memory_mib": 32768,
     }
+
+
+def test_viewer_memory_mode_round_trip_and_legacy_migration(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    manager = ConfigManager(path)
+    manager.load()
+    manager.apply({"viewer_memory_mode": "8192"}, save=True)
+
+    assert ConfigManager(path).load()["viewer_memory_mode"] == "8192"
+
+    path.write_text(
+        '{"viewer_prefetch_preset": "more", '
+        '"viewer_cache_max_memory_mib": 768}',
+        encoding="utf-8",
+    )
+    assert ConfigManager(path).load()["viewer_memory_mode"] == "512"
+
+    path.write_text('{"viewer_memory_mode": "unknown"}', encoding="utf-8")
+    assert ConfigManager(path).load()["viewer_memory_mode"] == "auto"
 
 
 def test_corrupt_json_falls_back_to_defaults(tmp_path: Path) -> None:

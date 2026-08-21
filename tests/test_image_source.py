@@ -371,7 +371,7 @@ def test_zip_compatible_jpeg_uses_one_qbytearray_payload(
     try:
         decoded = source.open_compatible_jpeg_at_most(
             "ページ/001.jpg",
-            (600, 600),
+            (600, None),
         )
         entry_size = source._zip.NameToInfo["ページ/001.jpg"].file_size
     finally:
@@ -401,16 +401,36 @@ def test_zip_compatible_jpeg_applies_exif_axis_swap(
 
     source = ZipImageSource(archive)
     try:
+        probed_size = source.probe_jpeg_size("rotated.jpg")
         decoded = source.open_compatible_jpeg_at_most(
             "rotated.jpg",
-            (400, 600),
+            (None, 600),
         )
     finally:
         source.close()
 
     assert decoded is not None
+    assert probed_size == (800, 1200)
     assert decoded.original_size == (800, 1200)
     assert (decoded.qimage.width(), decoded.qimage.height()) == (400, 600)
+
+
+def test_zip_generic_header_probe_reads_non_jpeg_dimensions(
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "page.png"
+    with Image.new("RGB", (321, 654), "navy") as image:
+        image.save(image_path, "PNG")
+    archive = tmp_path / "book.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+        output.write(image_path, "page.png")
+
+    source = ZipImageSource(archive)
+    try:
+        assert source.probe_image_size("page.png") == (321, 654)
+        assert not source._active_requests
+    finally:
+        source.close()
 
 
 def test_zip_streamed_jpeg_applies_exif_axis_swap(

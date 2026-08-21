@@ -114,6 +114,13 @@ See `THIRD_PARTY_NOTICES.md` for the retained notices and port boundaries.
 | Fixed-revision source | Adopted principle | NivisViewer implementation |
 |---|---|---|
 | `GenerarClasses.cs`, `BackgroundMultiWorker.SetWorksOrder` | Replace the unstarted order immediately around the latest current page | `RasterBookRuntime.stage`, `_adopt_request`, `_drive` |
-| `ViewerForm.cs`, `NextPage` / `PreviousPage` ready-frontier checks | Do not start decode for every transit page of a cold burst | `ViewerWindow._raster_cold_dispatch_delay` and staged cold admission |
+| `ViewerForm.cs`, `NextPage` / `PreviousPage` ready-frontier checks | Do not start decode for every transit page of a cold burst | `NavigationAdmissionPolicy`, input-kind routing and `RasterBookRuntime.stage` |
 | `ViewerForm.cs`, `SetNewResizedImage` / `showCurrentPage` | Publish only completed resized artifacts and reuse ready output directly | frame-store hit, `commit_display_ready_frame`, last-painted protection |
+
+
+| Fixed-revision source / method | Adopted principle | NivisViewer implementation |
+|---|---|---|
+| `SettingForm.cs`, memory selector; `ViewerForm.GetUserMemoryUBound` / `SetMemoryUBound` | A user memory mode must resolve to the same real budget that controls background population | `app/viewer_memory_policy.py`; `ConfigManager.viewer_memory_mode`; `ViewerWindow._load_prefetch_settings` |
+| `ViewerForm.SetBackgroundMode`, `priorityLevel`; `GenerarClasses.BackgroundMultiWorker.SetWorksOrder` | Keep a book-wide current-centered replaceable order instead of a three-unit submitted frontier | `ViewerWindow._zip_runtime_request`; `RasterBookRuntime._adopt_request`, `_drive` |
+| `ViewerForm.ReduceUsingMemory` | Let memory pressure, current priority and completed-artifact usefulness decide the stopping/eviction point | combined source/frame ledger, `set_cache_limits`, prefetch admission and work-order-aware stores |
 

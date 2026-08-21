@@ -45,6 +45,7 @@ from .thumbnail_render import (
 )
 from .seven_zip_locator import SevenZipInfo, SevenZipLocator
 from .viewer_commands import COMMAND_CHOICES
+from .viewer_memory_policy import VIEWER_MEMORY_MODE_LABELS
 from .winrar_locator import WinRARInfo, WinRARLocator
 from .windows_file_registration import WindowsFileRegistrationService
 
@@ -212,9 +213,6 @@ class SettingsDialog(QDialog):
             ),
             "pdf_backward_units": int(
                 self.config.get("viewer_prefetch_pdf_backward_units", 3)
-            ),
-            "cache_memory_mib": int(
-                self.config.get("viewer_cache_max_memory_mib", 256)
             ),
         }
         self._displayed_prefetch_preset: str | None = None
@@ -408,6 +406,13 @@ class SettingsDialog(QDialog):
         prefetch_group = QGroupBox("Viewer先読みとメモリ", tab)
         prefetch_layout = QVBoxLayout(prefetch_group)
         prefetch_form = QFormLayout()
+        self.viewer_memory_mode_combo = QComboBox(prefetch_group)
+        for label, value in VIEWER_MEMORY_MODE_LABELS:
+            self.viewer_memory_mode_combo.addItem(label, value)
+        prefetch_form.addRow(
+            "ビューワーのメモリ使用量:",
+            self.viewer_memory_mode_combo,
+        )
         self.prefetch_preset_combo = QComboBox(prefetch_group)
         for label, value in (
             ("無効", "disabled"),
@@ -439,25 +444,20 @@ class SettingsDialog(QDialog):
         ):
             spin.setRange(0, 20)
             spin.setSuffix(" 表示単位")
-        self.viewer_cache_memory_spin = QSpinBox(self.prefetch_custom_group)
-        self.viewer_cache_memory_spin.setRange(64, 4096)
-        self.viewer_cache_memory_spin.setSuffix(" MiB")
         custom_form.addRow(
-            "画像・書庫 進行方向:",
+            "ZIP・Folder以外 進行方向:",
             self.prefetch_image_forward_spin,
         )
         custom_form.addRow(
-            "画像・書庫 逆方向:",
+            "ZIP・Folder以外 逆方向:",
             self.prefetch_image_backward_spin,
         )
         custom_form.addRow("PDF 進行方向:", self.prefetch_pdf_forward_spin)
         custom_form.addRow("PDF 逆方向:", self.prefetch_pdf_backward_spin)
-        custom_form.addRow(
-            "Viewer cache最大メモリ:",
-            self.viewer_cache_memory_spin,
-        )
         prefetch_layout.addWidget(self.prefetch_custom_group)
         display_unit_note = QLabel(
+            "ZIP・Folderは、無効以外ではメモリ上限まで近い順に"
+            "先読みします。上の画像件数はその他の形式用です。\n"
             "単ページ表示では1表示単位＝1ページ、"
             "見開き表示では1表示単位＝1見開きです。",
             prefetch_group,
@@ -1067,14 +1067,15 @@ class SettingsDialog(QDialog):
             "pdf_backward_units": int(
                 self.config.get("viewer_prefetch_pdf_backward_units", 3)
             ),
-            "cache_memory_mib": int(
-                self.config.get("viewer_cache_max_memory_mib", 256)
-            ),
         }
         self._displayed_prefetch_preset = None
         self._select_data(
             self.prefetch_preset_combo,
             self.config.get("viewer_prefetch_preset", "standard"),
+        )
+        self._select_data(
+            self.viewer_memory_mode_combo,
+            self.config.get("viewer_memory_mode", "auto"),
         )
         self.prefetch_direction_priority_checkbox.setChecked(
             bool(
@@ -1457,9 +1458,6 @@ class SettingsDialog(QDialog):
         self.prefetch_pdf_backward_spin.setValue(
             int(values["pdf_backward_units"])
         )
-        self.viewer_cache_memory_spin.setValue(
-            int(values["cache_memory_mib"])
-        )
         self.prefetch_custom_group.setEnabled(preset == "custom")
         self._displayed_prefetch_preset = preset
 
@@ -1469,7 +1467,6 @@ class SettingsDialog(QDialog):
             "image_backward_units": self.prefetch_image_backward_spin.value(),
             "pdf_forward_units": self.prefetch_pdf_forward_spin.value(),
             "pdf_backward_units": self.prefetch_pdf_backward_spin.value(),
-            "cache_memory_mib": self.viewer_cache_memory_spin.value(),
         }
 
     def values(self) -> dict[str, object]:
@@ -1511,6 +1508,9 @@ class SettingsDialog(QDialog):
             "viewer_prefetch_direction_priority_enabled": (
                 self.prefetch_direction_priority_checkbox.isChecked()
             ),
+            "viewer_memory_mode": str(
+                self.viewer_memory_mode_combo.currentData() or "auto"
+            ),
             "viewer_prefetch_image_forward_units": custom_prefetch[
                 "image_forward_units"
             ],
@@ -1522,9 +1522,6 @@ class SettingsDialog(QDialog):
             ],
             "viewer_prefetch_pdf_backward_units": custom_prefetch[
                 "pdf_backward_units"
-            ],
-            "viewer_cache_max_memory_mib": custom_prefetch[
-                "cache_memory_mib"
             ],
             "hide_ui_in_fullscreen": self.fullscreen_hide_ui_checkbox.isChecked(),
             "hide_cursor_in_fullscreen": (

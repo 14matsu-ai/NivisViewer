@@ -6,13 +6,15 @@ from time import monotonic
 import zipfile
 
 from PIL import Image
-from PySide6.QtCore import QRectF
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt
+from PySide6.QtGui import QKeyEvent, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from app.book_session import BookSession
 from app.config_manager import ConfigManager
 from app.image_source import ImageSourceError, ZipImageSource
+from app.viewer_navigation_policy import NavigationInputKind
 from app.viewer_window import ViewerWindow
 from app.zip_raster_book_runtime import (
     ZipRasterDisplayUnit,
@@ -39,17 +41,130 @@ def _write_zip(tmp_path: Path, *, pages: int = 3) -> Path:
 
 def _window(
     tmp_path: Path,
+    *,
+    pages: int = 3,
+    memory_mode: str | None = None,
 ) -> tuple[ViewerWindow, BookSession, ZipImageSource, Path]:
-    archive = _write_zip(tmp_path)
+    archive = _write_zip(tmp_path, pages=pages)
     source = ZipImageSource(archive)
     config = ConfigManager(tmp_path / "config.json")
     config.load()
+    if memory_mode is not None:
+        config.apply({"viewer_memory_mode": memory_mode})
     session = BookSession(
         source_factory=lambda _path, **_kwargs: (source, None),
     )
     window = ViewerWindow(config_manager=config, book_session=session)
     window.resize(640, 480)
     return window, session, source, archive
+
+
+def test_zip_first_paint_populates_book_wide_display_ready_cache(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    window, session, _source, archive = _window(
+        tmp_path,
+        pages=12,
+        memory_mode="4096",
+    )
+    try:
+        window.set_view_mode("single")
+        window.show()
+        qapp.processEvents()
+        opened = session.open_book(archive)
+        assert window._finish_opened_book(opened, modal_on_empty=False)
+        runtime = session.viewer_runtime
+        assert runtime is not None
+
+        request = window._zip_runtime_request(window.model.spread_at())
+        assert request is not None
+        assert [
+            unit.pages[0].page_index for unit in request.work_order
+        ] == list(range(12))
+        assert window.viewer_cache_budget_bytes == 4096 * 1024 * 1024
+        assert runtime.cache_byte_budget == window.viewer_cache_budget_bytes
+        assert runtime.cache_unit_limit >= 12
+
+        _wait_until(
+            qapp,
+            lambda: runtime.cached_unit_count == 12
+            and not runtime.has_unfinished_tasks(),
+            timeout_ms=5000,
+        )
+        assert set(runtime.cached_page_indexes) == set(range(12))
+        assert runtime.decoded_source_count == 12
+
+        # The independent memory mode is also authoritative for an already
+        # open raster book; it is not only copied into the next BookSession.
+        window.config.apply({"viewer_memory_mode": "256"})
+        qapp.processEvents()
+        assert window.viewer_cache_budget_bytes == 256 * 1024 * 1024
+        assert runtime.cache_byte_budget == window.viewer_cache_budget_bytes
+        window.config.apply({"viewer_memory_mode": "4096"})
+        qapp.processEvents()
+        assert runtime.cache_byte_budget == 4096 * 1024 * 1024
+
+        window.model.go_to_index(6)
+        window.presentation_state._direction = -1
+        reversed_request = window._zip_runtime_request(
+            window.model.spread_at()
+        )
+        assert reversed_request is not None
+        assert [
+            unit.pages[0].page_index
+            for unit in reversed_request.work_order[:5]
+        ] == [6, 5, 7, 4, 8]
+
+        window.prefetch_preset = "disabled"
+        disabled_request = window._zip_runtime_request(
+            window.model.spread_at()
+        )
+        assert disabled_request is not None
+        assert disabled_request.work_order == (disabled_request.current,)
+
+        window.prefetch_preset = "standard"
+        window.fit_mode = "actual_size"
+        full_source_request = window._zip_runtime_request(
+            window.model.spread_at()
+        )
+        assert full_source_request is not None
+        assert full_source_request.render_spec.decoder_maximum_size is None
+        assert full_source_request.work_order == (
+            full_source_request.current,
+        )
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def _key_event(
+    event_type: QEvent.Type,
+    key: Qt.Key,
+    *,
+    auto_repeat: bool = False,
+) -> QKeyEvent:
+    return QKeyEvent(
+        event_type,
+        key,
+        Qt.KeyboardModifier.NoModifier,
+        "",
+        auto_repeat,
+        1,
+    )
+
+
+def _wheel_end_event() -> QWheelEvent:
+    return QWheelEvent(
+        QPointF(10, 10),
+        QPointF(10, 10),
+        QPoint(),
+        QPoint(),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollEnd,
+        False,
+    )
 
 
 def _wait_until(
@@ -63,6 +178,121 @@ def _wait_until(
         qapp.processEvents()
         QTest.qWait(5)
     assert predicate()
+
+
+def test_input_kind_admission_is_immediate_except_rapid_bursts(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    window, session, _source, archive = _window(tmp_path, pages=10)
+    try:
+        window.set_view_mode("single")
+        opened = session.open_book(archive)
+        runtime = session.viewer_runtime
+        assert runtime is not None
+        busy = [False]
+        cached = [False]
+        requested: list[ZipRasterRequest] = []
+        staged: list[ZipRasterRequest] = []
+        monkeypatch.setattr(runtime, "has_unfinished_tasks", lambda: busy[0])
+        monkeypatch.setattr(
+            runtime,
+            "has_cached_current",
+            lambda _request: cached[0],
+        )
+        monkeypatch.setattr(
+            runtime,
+            "request",
+            lambda request: requested.append(request) or True,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "stage",
+            lambda request: staged.append(request) or True,
+        )
+
+        assert window._finish_opened_book(opened, modal_on_empty=False)
+        requested.clear()
+
+        # Qt input timestamps are quint64.  They must survive the signal path
+        # beyond the signed-32-bit uptime boundary.
+        window.viewer.wheelInputObserved.emit(3_000_000_000)
+        assert window._navigation_wheel_timestamp_ns == 3_000_000_000_000_000
+        window._navigation_wheel_timestamp_ns = None
+
+        # A discrete cold turn never enters the pending timer/state machine.
+        window._raster_viewport_timer.start()
+        window.next_page()
+        assert [request.current.pages[0].page_index for request in requested] == [1]
+        assert not staged
+        assert window._pending_zip_runtime_request is None
+        assert not window._zip_runtime_request_timer.isActive()
+        assert not window._raster_viewport_timer.isActive()
+
+        # The first wheel packet remains immediate. Once the second packet
+        # proves a rapid burst, following targets replace the staged target
+        # even if a small-image worker happens to become idle between packets.
+        busy[0] = True
+        window.next_page(input_kind=NavigationInputKind.WHEEL)
+        window.next_page(input_kind=NavigationInputKind.WHEEL)
+        window.next_page(input_kind=NavigationInputKind.WHEEL)
+        assert requested[-1].current.pages[0].page_index == 2
+        assert [request.current.pages[0].page_index for request in staged] == [3, 4]
+        assert window._pending_zip_runtime_request is staged[-1]
+
+        busy[0] = False
+        wheel_end = _wheel_end_event()
+        window.viewer.wheelEvent(wheel_end)
+        assert wheel_end.isAccepted()
+        assert requested[-1] is staged[-1]
+        assert window._pending_zip_runtime_request is None
+
+        # Even inside the same wheel cadence a ready frame bypasses stage,
+        # worker creation, and the timer completely.
+        busy[0] = True
+        cached[0] = True
+        staged_count = len(staged)
+        window.next_page(input_kind=NavigationInputKind.WHEEL)
+        assert requested[-1].current.pages[0].page_index == 5
+        assert len(staged) == staged_count
+
+        # Raw key identity keeps the leading press immediate, coalesces only
+        # auto-repeat, and flushes the exact final target on release.
+        cached[0] = False
+        busy[0] = False
+        request_count = len(requested)
+        shortcut_override = _key_event(
+            QEvent.Type.ShortcutOverride,
+            Qt.Key.Key_Right,
+        )
+        QApplication.sendEvent(window.viewer, shortcut_override)
+        assert shortcut_override.isAccepted()
+        assert len(requested) == request_count
+        QApplication.sendEvent(
+            window.viewer,
+            _key_event(QEvent.Type.KeyPress, Qt.Key.Key_Right),
+        )
+        assert len(requested) == request_count + 1
+        assert requested[-1].current.pages[0].page_index == 6
+        busy[0] = False
+        QApplication.sendEvent(
+            window.viewer,
+            _key_event(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_Right,
+                auto_repeat=True,
+            ),
+        )
+        assert staged[-1].current.pages[0].page_index == 7
+        QApplication.sendEvent(
+            window.viewer,
+            _key_event(QEvent.Type.KeyRelease, Qt.Key.Key_Right),
+        )
+        assert requested[-1] is staged[-1]
+    finally:
+        window.close()
+        qapp.processEvents()
 
 
 def test_zip_book_uses_one_runtime_across_spread_rotation_filter_and_page_list(
@@ -123,6 +353,14 @@ def test_zip_book_uses_one_runtime_across_spread_rotation_filter_and_page_list(
         assert captured[-1].render_spec.rotation == 90
         assert captured[-1].render_spec.resampling_mode == "high_quality"
         assert captured[-1].render_spec.brightness == 1.2
+        assert captured[-1].render_spec.decoder_maximum_size is not None
+        assert captured[-1].render_spec.decoder_headroom == 2.0
+        assert captured[-1].render_spec.decoder_layout_sized
+        window.fit_mode = "fit_width"
+        assert window._current_book_runtime_decode_bounds()[1] is None
+        window.fit_mode = "fit_height"
+        assert window._current_book_runtime_decode_bounds()[0] is None
+        window.fit_mode = "fit_window"
         assert window._zip_runtime is runtime
         assert window._zip_runtime_active
         assert window.viewer._direct_display_mode
@@ -219,9 +457,78 @@ def test_zip_runtime_commits_complete_spread_and_retains_source_for_magnifier(
         )
         assert magnifier_request is not None
         assert magnifier_request.work_order == (magnifier_request.current,)
+        assert magnifier_request.render_spec.decoder_maximum_size is None
         window.viewer._request_magnifier_render()
         _wait_until(qapp, lambda: window.viewer.magnifier_active)
         assert window.viewer._magnifier_pixmap is not None
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_raster_magnifier_cancel_adopts_retained_preview_once(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    window, session, _source, archive = _window(tmp_path)
+    staged: list[ZipRasterRequest] = []
+    requested: list[ZipRasterRequest] = []
+    cancelled: list[bool] = []
+    try:
+        opened = session.open_book(archive)
+        runtime = session.viewer_runtime
+        assert runtime is not None
+        real_stage = runtime.stage
+        real_cancel = runtime.cancel
+
+        def stage(request: ZipRasterRequest) -> bool:
+            staged.append(request)
+            return real_stage(request)
+
+        def cancel(*, clear_artifacts: bool) -> None:
+            cancelled.append(clear_artifacts)
+            real_cancel(clear_artifacts=clear_artifacts)
+
+        monkeypatch.setattr(runtime, "stage", stage)
+        monkeypatch.setattr(runtime, "has_cached_current", lambda _request: True)
+        monkeypatch.setattr(
+            runtime,
+            "request",
+            lambda request: requested.append(request) or True,
+        )
+        monkeypatch.setattr(runtime, "cancel", cancel)
+
+        assert window._finish_opened_book(opened, modal_on_empty=False)
+        requested.clear()
+
+        # Cancellation adopts the normal preview key synchronously.  Runtime
+        # stage is the cancellation/stale boundary for an incompatible
+        # full-source promotion; it does not clear either retained frame tier.
+        window.viewer.magnifier_active = True
+        assert window.viewer.cancel_magnifier()
+        assert len(staged) == 1
+        assert staged[-1].render_spec.decoder_maximum_size is not None
+        assert window._raster_magnifier_cancel_timer.isActive()
+        assert not cancelled
+
+        _wait_until(qapp, lambda: len(requested) == 1)
+        assert requested[-1].render_spec.decoder_maximum_size is not None
+        assert not window._raster_magnifier_cancel_timer.isActive()
+        assert not cancelled
+
+        # A layout command already owns its refresh.  The cancel fallback is
+        # coalesced instead of publishing/requesting the same unit twice.
+        staged.clear()
+        requested.clear()
+        window.viewer.magnifier_active = True
+        window.set_view_mode("spread")
+        assert len(staged) == 1
+        assert len(requested) == 1
+        qapp.processEvents()
+        assert len(requested) == 1
+        assert not window._raster_magnifier_cancel_timer.isActive()
+        assert not cancelled
     finally:
         window.close()
         qapp.processEvents()

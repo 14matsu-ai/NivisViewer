@@ -157,18 +157,26 @@ def test_folder_runtime_reuses_decoded_source_across_layout_variants(
         def __init__(self, path: Path) -> None:
             super().__init__(path)
             self.decode_calls = 0
+            self.full_decodes = 0
 
         def open_qimage_at_most(self, image_id, maximum_size):
             self.decode_calls += 1
             return super().open_qimage_at_most(image_id, maximum_size)
 
+        def open_compatible_jpeg_at_most(self, image_id, maximum_size):
+            self.decode_calls += 1
+            return super().open_compatible_jpeg_at_most(image_id, maximum_size)
+
         def open_image(self, image_id: str) -> Image.Image:
             self.decode_calls += 1
+            self.full_decodes += 1
             return super().open_image(image_id)
 
-    source = CountingFolderSource(
-        _write_folder(tmp_path / "layout", pages=1, suffix=".jpg")
-    )
+    folder = tmp_path / "layout"
+    folder.mkdir()
+    with Image.new("RGB", (1200, 1800), (60, 90, 130)) as image:
+        image.save(folder / "0.jpg", "JPEG", quality=88)
+    source = CountingFolderSource(folder)
     runtime = FolderRasterBookRuntime(source, 1)
     frames: list[RasterFrame] = []
     runtime.frameReady.connect(frames.append)
@@ -181,7 +189,12 @@ def test_folder_runtime_reuses_decoded_source_across_layout_variants(
                 device_pixel_ratio=1.5,
                 decoder_maximum_size=(60, 90),
             ),
-            RasterRenderSpec((900, 650), rotation=90),
+            RasterRenderSpec(
+                (900, 650),
+                rotation=90,
+                decoder_maximum_size=(900, 650),
+                decoder_layout_sized=True,
+            ),
             RasterRenderSpec(
                 (720, 520),
                 device_pixel_ratio=2.0,
@@ -206,8 +219,269 @@ def test_folder_runtime_reuses_decoded_source_across_layout_variants(
             assert source.decode_calls == expected
         assert runtime.decoded_source_count == 1
         assert runtime.metrics.source_cache_hits == 2
+        assert source.full_decodes == 0
     finally:
         assert runtime.shutdown(wait_msecs=3000)
+
+
+def test_folder_prefetch_budgets_native_preview_and_allows_lazy_one_axis_fit(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    class CountingFolderSource(FolderImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.preview_opens: list[str] = []
+            self.header_probes: list[str] = []
+
+        def open_compatible_jpeg_at_most(self, image_id, maximum_size):
+            self.preview_opens.append(Path(image_id).name)
+            return super().open_compatible_jpeg_at_most(image_id, maximum_size)
+
+        def probe_jpeg_size(self, image_id):
+            self.header_probes.append(Path(image_id).name)
+            return super().probe_jpeg_size(image_id)
+
+    folder = tmp_path / "prefetch-budget"
+    folder.mkdir()
+    for index in range(2):
+        with Image.new("RGB", (1200, 1800), (50 + index * 20, 80, 120)) as image:
+            image.save(folder / f"{index}.jpg", "JPEG", quality=88)
+    with Image.new("RGB", (200, 6000), (90, 70, 120)) as image:
+        image.save(folder / "2.jpg", "JPEG", quality=88)
+
+    source = CountingFolderSource(folder)
+    runtime = FolderRasterBookRuntime(source, 1, cache_byte_budget=4_000_000)
+    frames: list[RasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    image_ids = source.list_images()
+    current = RasterDisplayUnit(
+        0,
+        (RasterPage(0, image_ids[0], (1200, 1800)),),
+        True,
+    )
+    known_neighbor = RasterDisplayUnit(
+        1,
+        (RasterPage(1, image_ids[1], (1200, 1800)),),
+        True,
+    )
+    bounded = RasterRenderSpec(
+        (100, 100),
+        decoder_maximum_size=(100, 100),
+        decoder_layout_sized=True,
+    )
+    try:
+        first = _request(1, current, current, known_neighbor, spec=bounded)
+        assert runtime.request(first)
+        _wait_until(qapp, lambda: len(frames) == 1)
+        current_bytes = runtime.cache_bytes
+        runtime.set_cache_limits(byte_budget=current_bytes + 100_000)
+        assert runtime.release_prefetch(request_id=1)
+        qapp.processEvents()
+
+        # Pillow retains a 150x225 native JPEG tier here.  Budget that tier,
+        # not the smaller 67x100 final target, and avoid decode-then-evict.
+        assert source.preview_opens == ["0.jpg"]
+        assert runtime.metrics.prefetch_admission_stops == 1
+
+        runtime.set_cache_limits(byte_budget=256 * 1024 * 1024)
+        runtime.invalidate_layout()
+        lazy_neighbor = RasterDisplayUnit(
+            1,
+            (RasterPage(1, image_ids[1], None),),
+            True,
+        )
+        one_axis = RasterRenderSpec(
+            (1200, 800),
+            fit_mode="fit_width",
+            decoder_maximum_size=(1200, None),
+            decoder_layout_sized=True,
+        )
+        second = _request(2, current, current, lazy_neighbor, spec=one_axis)
+        assert runtime.request(second)
+        _wait_until(qapp, lambda: frames[-1].request_id == 2)
+        assert runtime.release_prefetch(request_id=2)
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+
+        # A bounded provisional estimate keeps lazy one-axis neighbors useful;
+        # it no longer disables fit-width/fit-height prefetch unconditionally.
+        assert source.preview_opens[-1] == "1.jpg"
+        assert source.preview_opens.count("1.jpg") == 1
+
+        # An extreme unindexed one-axis neighbor does not inherit a misleading
+        # book-local observed size.  The worker probes its real JPEG dimensions
+        # and may use strictly lower-rank retained artifacts as a non-mutating
+        # allowance.  Only after successful, relevant completion does page 2
+        # replace the farther page 1 within the same combined budget.
+        runtime.invalidate_layout()
+        narrow = RasterRenderSpec(
+            (100, 100),
+            fit_mode="fit_width",
+            decoder_maximum_size=(100, None),
+            decoder_layout_sized=True,
+        )
+        extreme_neighbor = RasterDisplayUnit(
+            2,
+            (RasterPage(2, image_ids[2], None),),
+            True,
+        )
+        third = _request(3, current, current, extreme_neighbor, spec=narrow)
+        assert runtime.request(third)
+        _wait_until(qapp, lambda: frames[-1].request_id == 3)
+        runtime.set_cache_limits(byte_budget=runtime.cache_bytes + 1_500_000)
+        jobs_before_probe = runtime.metrics.jobs_submitted
+        assert runtime.release_prefetch(request_id=3)
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+
+        assert source.header_probes[-1] == "2.jpg"
+        assert source.preview_opens.count("2.jpg") == 1
+        assert runtime.metrics.jobs_submitted == jobs_before_probe + 1
+        assert runtime.metrics.prefetch_admission_stops == 1
+        assert 2 in runtime.cached_page_indexes
+        assert 1 not in runtime.cached_page_indexes
+
+        # Capacity was satisfied by sliding, so enlarging the budget does not
+        # decode the same page again or manufacture a retry loop.
+        jobs_after_slide = runtime.metrics.jobs_submitted
+        runtime.set_cache_limits(byte_budget=256 * 1024 * 1024)
+        qapp.processEvents()
+        assert source.preview_opens.count("2.jpg") == 1
+        assert runtime.metrics.jobs_submitted == jobs_after_slide
+
+        # Making the same page current is now a pure ready hit.
+        jobs_before_ready_hit = runtime.metrics.jobs_submitted
+        assert runtime.request(
+            _request(4, extreme_neighbor, extreme_neighbor, spec=narrow)
+        )
+        _wait_until(qapp, lambda: frames[-1].request_id == 4)
+        assert source.preview_opens.count("2.jpg") == 1
+        assert runtime.metrics.jobs_submitted == jobs_before_ready_hit
+    finally:
+        assert runtime.shutdown(wait_msecs=3000)
+
+
+def test_folder_one_axis_prefetch_budgets_complete_display_unit(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    class CountingFolderSource(FolderImageSource):
+        # Keep the GUI-side estimate deliberately provisional.  The worker
+        # must replace it with exact header dimensions before pixel decode.
+        compatible_jpeg_unknown_area_multiplier = 1
+
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.preview_opens: list[str] = []
+            self.header_probes: list[str] = []
+
+        def open_compatible_jpeg_at_most(self, image_id, maximum_size):
+            self.preview_opens.append(Path(image_id).name)
+            return super().open_compatible_jpeg_at_most(image_id, maximum_size)
+
+        def probe_jpeg_size(self, image_id):
+            self.header_probes.append(Path(image_id).name)
+            return super().probe_jpeg_size(image_id)
+
+    def exercise(
+        folder: Path,
+        *,
+        sizes: tuple[tuple[int, int], ...],
+        viewport: tuple[int, int],
+        decoder_maximum: tuple[int | None, int | None],
+        free_bytes: int,
+        resampling_mode: str = "standard",
+        expect_admitted: bool,
+    ) -> CountingFolderSource:
+        folder.mkdir()
+        for index, size in enumerate(sizes):
+            with Image.new("RGB", size, (60 + index * 20, 80, 120)) as image:
+                image.save(folder / f"{index}.jpg", "JPEG", quality=88)
+        source = CountingFolderSource(folder)
+        runtime = FolderRasterBookRuntime(source, 1)
+        frames: list[RasterFrame] = []
+        runtime.frameReady.connect(frames.append)
+        image_ids = source.list_images()
+        current = RasterDisplayUnit(
+            0,
+            (RasterPage(0, image_ids[0], sizes[0]),),
+            True,
+        )
+        neighbor = RasterDisplayUnit(
+            1,
+            tuple(
+                RasterPage(index, image_ids[index], None)
+                for index in range(1, len(image_ids))
+            ),
+            len(image_ids) == 2,
+        )
+        spec = RasterRenderSpec(
+            viewport,
+            fit_mode="fit_width",
+            decoder_maximum_size=decoder_maximum,
+            resampling_mode=resampling_mode,
+        )
+        try:
+            assert runtime.request(
+                _request(1, current, current, neighbor, spec=spec)
+            )
+            _wait_until(qapp, lambda: len(frames) == 1)
+            runtime.set_cache_limits(
+                byte_budget=runtime.cache_bytes + free_bytes,
+            )
+            jobs_before = runtime.metrics.jobs_submitted
+            assert runtime.release_prefetch(request_id=1)
+            _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+            assert runtime.metrics.jobs_submitted == jobs_before + 1
+            assert runtime.metrics.prefetch_admission_stops == int(
+                not expect_admitted
+            )
+            expected_opens = ["0.jpg"]
+            if expect_admitted:
+                expected_opens.extend(
+                    f"{index}.jpg" for index in range(1, len(image_ids))
+                )
+            assert source.preview_opens == expected_opens
+            assert source.header_probes == [
+                f"{index}.jpg" for index in range(1, len(image_ids))
+            ]
+            return source
+        finally:
+            assert runtime.shutdown(wait_msecs=3000)
+
+    # Standard rendering clamps the apparent 200x2000 fit-width target to its
+    # retained 10x100 source.  The worker must admit that real 10x100 frame.
+    exercise(
+        tmp_path / "standard-no-upscale",
+        sizes=((10, 100), (10, 100)),
+        viewport=(200, 200),
+        decoder_maximum=(10, None),
+        free_bytes=200_000,
+        expect_admitted=True,
+    )
+
+    # High-quality rendering does create the 200x2000 target, so the same
+    # source and budget remain correctly rejected before pixel decode.
+    exercise(
+        tmp_path / "high-quality-upscale",
+        sizes=((200, 200), (10, 100)),
+        viewport=(200, 200),
+        decoder_maximum=(10, None),
+        free_bytes=200_000,
+        resampling_mode="high_quality",
+        expect_admitted=False,
+    )
+
+    # Each tall page alone fit the same 2.401 MB snapshot used by the former
+    # page-local check.  Both missing native JPEG tiers plus their complete
+    # spread do not, so neither page may begin pixel decode.
+    exercise(
+        tmp_path / "spread-total",
+        sizes=((200, 6000), (200, 6000), (200, 6000)),
+        viewport=(100, 100),
+        decoder_maximum=(100, None),
+        free_bytes=2_401_000,
+        expect_admitted=False,
+    )
 
 
 def test_folder_runtime_reversal_rejects_running_obsolete_result(

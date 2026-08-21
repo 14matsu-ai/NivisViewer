@@ -14,6 +14,9 @@ class ViewerPageSlider(QSlider):
     previousDisplayUnitRequested = Signal()
     focusedPageRequested = Signal(int)
     wheelInteraction = Signal()
+    # Preserve QInputEvent's quint64 timestamp across long Windows uptimes.
+    wheelInputObserved = Signal(object)
+    wheelSequenceFinished = Signal()
 
     _ANGLE_STEP = 120
     _PIXEL_STEP = 40
@@ -31,11 +34,15 @@ class ViewerPageSlider(QSlider):
 
     def set_page_state(self, page_count: int, focused_index: int) -> None:
         count = max(0, int(page_count))
+        maximum = max(0, count - 1)
+        value = max(0, min(int(focused_index), maximum))
         with QSignalBlocker(self):
-            self.setEnabled(count > 0)
-            self.setMinimum(0)
-            self.setMaximum(max(0, count - 1))
-            self.setValue(max(0, min(int(focused_index), max(0, count - 1))))
+            if self.isEnabled() != (count > 0):
+                self.setEnabled(count > 0)
+            if self.minimum() != 0 or self.maximum() != maximum:
+                self.setRange(0, maximum)
+            if self.value() != value:
+                self.setValue(value)
 
     def reset_wheel_accumulator(self) -> None:
         self._angle_remainder = 0
@@ -45,6 +52,8 @@ class ViewerPageSlider(QSlider):
         self,
         angle_delta: QPoint,
         pixel_delta: QPoint,
+        *,
+        sequence_finished: bool = False,
     ) -> bool:
         vertical_angle = angle_delta.y()
         vertical_pixel = pixel_delta.y()
@@ -56,11 +65,21 @@ class ViewerPageSlider(QSlider):
                 or pixel_delta.x() != 0
             )
         )
-        if not horizontal_only and vertical_angle == 0 and vertical_pixel == 0:
+        if (
+            not horizontal_only
+            and vertical_angle == 0
+            and vertical_pixel == 0
+            and not sequence_finished
+        ):
             return False
 
         self.wheelInteraction.emit()
+        if sequence_finished and vertical_angle == 0 and vertical_pixel == 0:
+            self.wheelSequenceFinished.emit()
+            return True
         if horizontal_only:
+            if sequence_finished:
+                self.wheelSequenceFinished.emit()
             return True
 
         direction = 0
@@ -103,11 +122,15 @@ class ViewerPageSlider(QSlider):
                     self.nextSinglePageRequested.emit()
                 else:
                     self.nextDisplayUnitRequested.emit()
+        if sequence_finished:
+            self.wheelSequenceFinished.emit()
         return True
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
+        self.wheelInputObserved.emit(int(event.timestamp()))
         handled = self.process_wheel_delta(
             event.angleDelta(),
             event.pixelDelta(),
+            sequence_finished=event.isEndEvent(),
         )
         event.setAccepted(handled)

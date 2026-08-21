@@ -192,6 +192,8 @@ class PageModel:
     def set_image_size(self, index: int, size: tuple[int, int] | None) -> bool:
         previous = self.current_index
         if 0 <= index < self.total_pages:
+            if index in self._size_cache and self._size_cache[index] == size:
+                return False
             was_wide = self._cached_size_is_wide(index)
             self._size_cache[index] = size
             if was_wide != self._cached_size_is_wide(index):

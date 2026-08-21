@@ -1824,13 +1824,18 @@ def test_byte_limited_spread_prefetch_keeps_units_atomic(
     }
 
 
-def test_prefetch_memory_setting_also_bounds_prepared_pixmaps(
+def test_viewer_memory_mode_also_bounds_prepared_pixmaps(
     tmp_path,
     qapp: QApplication,
 ) -> None:
     config = ConfigManager(tmp_path / "config.json")
     config.load()
-    config.apply({"viewer_prefetch_preset": "more"})
+    config.apply(
+        {
+            "viewer_prefetch_preset": "more",
+            "viewer_memory_mode": "512",
+        }
+    )
     window = ViewerWindow(config_manager=config)
     try:
         assert window.viewer_cache_memory_mib == 512
@@ -1853,7 +1858,7 @@ def test_viewer_memory_setting_is_one_combined_source_and_pixmap_budget(
     config.apply(
         {
             "viewer_prefetch_preset": "custom",
-            "viewer_cache_max_memory_mib": 64,
+            "viewer_memory_mode": "minimal",
         }
     )
     window = ViewerWindow(config_manager=config)
@@ -1895,7 +1900,7 @@ def test_viewer_memory_setting_is_one_combined_source_and_pixmap_budget(
             window.image_cache.cache_bytes
             + window.viewer.render_cache_bytes()
         )
-        assert combined <= 64 * 1024 * 1024
+        assert combined <= 128 * 1024 * 1024
         assert 2 in window.image_cache._cache
     finally:
         window.close()

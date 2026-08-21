@@ -9,6 +9,10 @@ from typing import Any
 from PySide6.QtCore import QObject, Signal
 
 from .viewer_commands import normalize_viewer_command
+from .viewer_memory_policy import (
+    normalize_viewer_memory_mode,
+    viewer_memory_mode_from_legacy_mib,
+)
 
 
 class ConfigManager(QObject):
@@ -160,6 +164,7 @@ class ConfigManager(QObject):
         "viewer_prefetch_pdf_forward_units": 3,
         "viewer_prefetch_pdf_backward_units": 3,
         "viewer_cache_max_memory_mib": 256,
+        "viewer_memory_mode": "auto",
         "rotation_angle": 0,
         "slideshow_interval_ms": 3000,
         "background_color": "#000000",
@@ -208,6 +213,18 @@ class ConfigManager(QObject):
         if isinstance(loaded, dict):
             merged = defaults
             merged.update(loaded)
+            if "viewer_memory_mode" not in loaded:
+                preset = str(loaded.get("viewer_prefetch_preset", "standard"))
+                if preset == "custom":
+                    legacy_mib = loaded.get("viewer_cache_max_memory_mib", 256)
+                else:
+                    legacy_mib = self.VIEWER_PREFETCH_PRESETS.get(
+                        preset,
+                        self.VIEWER_PREFETCH_PRESETS["standard"],
+                    )["cache_memory_mib"]
+                merged["viewer_memory_mode"] = viewer_memory_mode_from_legacy_mib(
+                    legacy_mib
+                )
             legacy_edge = loaded.get("fullscreen_edge_trigger_px")
             if (
                 "fullscreen_top_edge_trigger_px" not in loaded
@@ -637,7 +654,10 @@ class ConfigManager(QObject):
             normalized.get("viewer_cache_max_memory_mib"),
             default=int(cls.DEFAULTS["viewer_cache_max_memory_mib"]),
             minimum=64,
-            maximum=4096,
+            maximum=32768,
+        )
+        normalized["viewer_memory_mode"] = normalize_viewer_memory_mode(
+            normalized.get("viewer_memory_mode")
         )
         normalized["thumbnail_cache_limit_mb"] = cls._clamped_int(
             normalized.get("thumbnail_cache_limit_mb"),
@@ -696,6 +716,11 @@ class ConfigManager(QObject):
             ),
             **values,
         }
+
+    def viewer_memory_mode(self) -> str:
+        return normalize_viewer_memory_mode(
+            self.get("viewer_memory_mode", "auto")
+        )
 
     def _replace_data(self, values: dict[str, Any]) -> None:
         self.data.clear()
