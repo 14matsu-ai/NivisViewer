@@ -190,6 +190,7 @@ class _BookOpenWorker(QRunnable):
 
 _RETIRED_BOOK_OPEN_POOLS: set[QThreadPool] = set()
 _RETIRED_BOOK_SESSIONS: set[BookSession] = set()
+_DEFAULT_PAGE_LIST_CACHE_BYTES = 64 * 1024 * 1024
 
 
 class BookSession(QObject):
@@ -222,6 +223,15 @@ class BookSession(QObject):
         self.source: ImageSource | None = None
         self.viewer_runtime: RasterBookRuntime | None = None
         self.page_list_runtime: ViewerPageListRuntime | None = None
+        self._pending_page_list_source: ImageSource | None = None
+        self._pending_page_list_image_ids: tuple[str, ...] = ()
+        self._page_list_cache_byte_budget = _DEFAULT_PAGE_LIST_CACHE_BYTES
+        self._viewer_runtime_hard_limit_bytes = (
+            self.image_cache.cache_byte_budget_bytes
+        )
+        self._viewer_runtime_soft_target_bytes = (
+            self._viewer_runtime_hard_limit_bytes * 7 // 8
+        )
         # The active book epoch must change only when the installed source
         # changes.  Pending-open tokens are separate so a failed/cancelled
         # replacement cannot invalidate the Viewer runtime of the book that
@@ -234,6 +244,7 @@ class BookSession(QObject):
         self._retired_page_list_runtimes: dict[
             int, ViewerPageListRuntime
         ] = {}
+        self._retired_cleanup_deferred = False
         self._open_pool = QThreadPool()
         self._open_pool.setMaxThreadCount(1)
         self._open_cancel: Event | None = None
@@ -244,6 +255,16 @@ class BookSession(QObject):
     @property
     def is_open(self) -> bool:
         return self.source is not None
+
+    @property
+    def page_list_runtime_deferred(self) -> bool:
+        """Whether the active raster book is awaiting post-paint PageList."""
+
+        return (
+            self.source is not None
+            and self._pending_page_list_source is self.source
+            and self.page_list_runtime is None
+        )
 
     @property
     def book_key(self) -> str:
@@ -318,11 +339,14 @@ class BookSession(QObject):
             new_source,
             tuple(self.model.image_ids),
         )
-        self.image_cache.set_source(
-            new_source,
-            self.model.image_ids,
-            trace_id=trace_id,
-        )
+        if self.viewer_runtime is not None:
+            self.image_cache.suspend_for_book_runtime()
+        else:
+            self.image_cache.set_source(
+                new_source,
+                self.model.image_ids,
+                trace_id=trace_id,
+            )
         if old_source is not None and old_source is not new_source:
             self._retire_source(old_source)
 
@@ -416,6 +440,7 @@ class BookSession(QObject):
         self.current_path = None
         if old_source is not None:
             self._retire_source(old_source)
+        self.release_retired_book_resources()
         if had_book:
             self.book_closed.emit()
 
@@ -537,17 +562,38 @@ class BookSession(QObject):
         self.generation += 1
         self.source = result.source
         self.current_path = result.requested_path
-        self._replace_viewer_runtime(result.source)
+        raster_fast_path = isinstance(
+            result.source,
+            (ZipImageSource, FolderImageSource),
+        )
+        if not raster_fast_path:
+            # A rapid A(raster) -> B(raster, not painted) -> C(legacy) chain
+            # has no later raster paint boundary for A.  Release any older
+            # deferred owners before installing C; running callbacks retain
+            # their sources through the normal idle-drain maps.
+            self.release_retired_book_resources()
+        self._replace_viewer_runtime(
+            result.source,
+            defer_retired_cleanup=raster_fast_path,
+        )
         self._replace_page_list_runtime(
             result.source,
             tuple(self.model.image_ids),
+            defer=raster_fast_path,
+            defer_retired_cleanup=raster_fast_path,
         )
         trace_id = result.trace_id
-        self.image_cache.set_source(
-            result.source,
-            self.model.image_ids,
-            trace_id=trace_id,
-        )
+        if self.viewer_runtime is not None:
+            # Raster books have one source owner.  Do not copy the full page
+            # list into ImageCache only to suspend that legacy cache when the
+            # Window issues its first runtime request.
+            self.image_cache.suspend_for_book_runtime()
+        else:
+            self.image_cache.set_source(
+                result.source,
+                self.model.image_ids,
+                trace_id=trace_id,
+            )
         if old_source is not None and old_source is not result.source:
             self._retire_source(old_source)
         opened = BookOpened(
@@ -603,6 +649,8 @@ class BookSession(QObject):
     def _replace_viewer_runtime(
         self,
         source: ImageSource | None,
+        *,
+        defer_retired_cleanup: bool = False,
     ) -> None:
         old_runtime = self.viewer_runtime
         runtime_type: type[RasterBookRuntime] | None
@@ -618,7 +666,10 @@ class BookSession(QObject):
                 self.generation,
                 self,
                 image_work_coordinator=self._image_work_coordinator,
-                cache_byte_budget=self.image_cache.cache_byte_budget_bytes,
+                cache_byte_budget=self._viewer_runtime_hard_limit_bytes,
+                cache_soft_target_bytes=(
+                    self._viewer_runtime_soft_target_bytes
+                ),
             )
             if runtime_type is not None and source is not None
             else None
@@ -627,13 +678,23 @@ class BookSession(QObject):
         if new_runtime is not None:
             new_runtime.idle.connect(self._release_retired_viewer_runtime)
         if old_runtime is not None and old_runtime is not new_runtime:
-            self._retire_viewer_runtime(old_runtime)
+            self._retire_viewer_runtime(
+                old_runtime,
+                defer_cleanup=defer_retired_cleanup,
+            )
         self.viewer_runtime_changed.emit(new_runtime)
 
     def _retire_viewer_runtime(
         self,
         runtime: RasterBookRuntime,
+        *,
+        defer_cleanup: bool = False,
     ) -> None:
+        if defer_cleanup:
+            self._retired_cleanup_deferred = True
+            self._retired_viewer_runtimes[id(runtime)] = runtime
+            runtime.retire()
+            return
         completed = runtime.shutdown(wait_msecs=0)
         if completed:
             self._finalize_viewer_runtime(runtime)
@@ -645,7 +706,11 @@ class BookSession(QObject):
         if not isinstance(runtime, RasterBookRuntime):
             return
         retired = self._retired_viewer_runtimes.get(id(runtime))
-        if retired is not runtime or runtime.has_unfinished_tasks():
+        if (
+            retired is not runtime
+            or self._retired_cleanup_deferred
+            or runtime.has_unfinished_tasks()
+        ):
             return
         source = runtime.source
         self._finalize_viewer_runtime(runtime)
@@ -665,15 +730,13 @@ class BookSession(QObject):
         self,
         source: ImageSource | None,
         image_ids: tuple[str, ...],
+        *,
+        defer: bool = False,
+        defer_retired_cleanup: bool = False,
     ) -> None:
         old_runtime = self.page_list_runtime
-        cache_budget = max(
-            8 * 1024 * 1024,
-            min(
-                64 * 1024 * 1024,
-                self.image_cache.cache_byte_budget_bytes // 4,
-            ),
-        )
+        self._pending_page_list_source = source if defer else None
+        self._pending_page_list_image_ids = tuple(image_ids) if defer else ()
         new_runtime = (
             ViewerPageListRuntime(
                 source,
@@ -681,9 +744,9 @@ class BookSession(QObject):
                 self.generation,
                 self,
                 image_work_coordinator=self._image_work_coordinator,
-                cache_byte_budget=cache_budget,
+                cache_byte_budget=self._page_list_cache_byte_budget,
             )
-            if source is not None
+            if source is not None and not defer
             else None
         )
         self.page_list_runtime = new_runtime
@@ -692,13 +755,55 @@ class BookSession(QObject):
                 self._release_retired_page_list_runtime
             )
         if old_runtime is not None and old_runtime is not new_runtime:
-            self._retire_page_list_runtime(old_runtime)
+            self._retire_page_list_runtime(
+                old_runtime,
+                defer_cleanup=defer_retired_cleanup,
+            )
         self.page_list_runtime_changed.emit(new_runtime)
+
+    def ensure_page_list_runtime(self) -> ViewerPageListRuntime | None:
+        """Materialize the optional PageList owner after first-frame paint."""
+
+        runtime = self.page_list_runtime
+        if runtime is not None:
+            return runtime
+        source = self._pending_page_list_source
+        if source is None or source is not self.source:
+            return None
+        image_ids = self._pending_page_list_image_ids
+        self._replace_page_list_runtime(source, image_ids, defer=False)
+        return self.page_list_runtime
+
+    def set_viewer_runtime_memory_limits(
+        self,
+        *,
+        hard_limit_bytes: int,
+        soft_target_bytes: int,
+    ) -> None:
+        """Keep raster runtime construction independent from ImageCache."""
+
+        hard = max(1, int(hard_limit_bytes))
+        soft = max(1, min(hard, int(soft_target_bytes)))
+        self._viewer_runtime_hard_limit_bytes = hard
+        self._viewer_runtime_soft_target_bytes = soft
+        runtime = self.viewer_runtime
+        if runtime is not None:
+            runtime.set_memory_limits(
+                hard_limit_bytes=hard,
+                soft_target_bytes=soft,
+            )
 
     def _retire_page_list_runtime(
         self,
         runtime: ViewerPageListRuntime,
+        *,
+        defer_cleanup: bool = False,
     ) -> None:
+        if defer_cleanup:
+            self._retired_cleanup_deferred = True
+            self._retired_page_list_runtimes[id(runtime)] = runtime
+            runtime.retire()
+            return
         completed = runtime.shutdown(wait_msecs=0)
         if completed:
             self._finalize_page_list_runtime(runtime)
@@ -710,7 +815,11 @@ class BookSession(QObject):
         if not isinstance(runtime, ViewerPageListRuntime):
             return
         retired = self._retired_page_list_runtimes.get(id(runtime))
-        if retired is not runtime or runtime.has_unfinished_tasks():
+        if (
+            retired is not runtime
+            or self._retired_cleanup_deferred
+            or runtime.has_unfinished_tasks()
+        ):
             return
         source = runtime.source
         self._finalize_page_list_runtime(runtime)
@@ -725,6 +834,19 @@ class BookSession(QObject):
         runtime.shutdown(wait_msecs=0)
         runtime.setParent(None)
         runtime.deleteLater()
+
+    def release_retired_book_resources(self) -> None:
+        """Reclaim the preceding book after the replacement frame paints."""
+
+        self._retired_cleanup_deferred = False
+        for runtime in tuple(self._retired_viewer_runtimes.values()):
+            if not runtime.has_unfinished_tasks():
+                self._finalize_viewer_runtime(runtime)
+        for runtime in tuple(self._retired_page_list_runtimes.values()):
+            if not runtime.has_unfinished_tasks():
+                self._finalize_page_list_runtime(runtime)
+        for source in tuple(self._retired_sources.values()):
+            self._try_release_retired_source(source)
 
     def _has_owned_async_work(self) -> bool:
         return bool(

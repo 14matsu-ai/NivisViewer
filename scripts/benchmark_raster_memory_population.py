@@ -1,9 +1,12 @@
 """Measure memory-driven ZIP/folder raster cache population offscreen.
 
 The benchmark drives the production ``RasterBookRuntime`` contract directly:
-one current page is requested, its completed QPixmap is painted into an
-offscreen QImage, and that paint is acknowledged so the lazy book-wide warm-up
-planner may continue.  No application window or native input is created.
+one current page is requested, its completed QPixmap is accepted on the GUI
+thread, and then painted into an offscreen QImage.  ``--warmup-gate ab``
+compares the legacy paint-gated warm-up with the production commit-neighbor
+fast path.  ``--commit-to-paint-delay-ms`` may add a deterministic interval
+between those two boundaries without creating an application window or native
+input.
 
 Each case runs in a fresh child process and creates only temporary JPEG
 fixtures.  The default matrix intentionally avoids a full 2 x 3 x 3 cross
@@ -143,6 +146,9 @@ class _SourceCounters:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._archive_open_operations = 0
+        self._list_images_calls = 0
+        self._entry_listing_operations = 0
         self._backend_calls: Counter[str] = Counter()
         self._decode_attempts_by_page: Counter[str] = Counter()
         self._successful_decodes_by_page: Counter[str] = Counter()
@@ -151,9 +157,23 @@ class _SourceCounters:
         self._low_level_read_calls = 0
         self._header_reads_by_page: Counter[str] = Counter()
         self._failures = 0
+        self._first_decode_started_at: float | None = None
+        self._first_decode_finished_at: float | None = None
+
+    def record_archive_open(self) -> None:
+        with self._lock:
+            self._archive_open_operations += 1
+
+    def record_listing(self, *, enumerated_entries: bool) -> None:
+        with self._lock:
+            self._list_images_calls += 1
+            if enumerated_entries:
+                self._entry_listing_operations += 1
 
     def begin_decode(self, image_id: str, backend: str) -> None:
         with self._lock:
+            if self._first_decode_started_at is None:
+                self._first_decode_started_at = time.perf_counter()
             self._backend_calls[backend] += 1
             self._decode_attempts_by_page[image_id] += 1
 
@@ -173,6 +193,8 @@ class _SourceCounters:
                 self._successful_decodes_by_page[image_id] += 1
             else:
                 self._failures += 1
+            if self._first_decode_finished_at is None:
+                self._first_decode_finished_at = time.perf_counter()
 
     def record_header_read(self, image_id: str) -> None:
         with self._lock:
@@ -185,6 +207,9 @@ class _SourceCounters:
             header_reads = self._header_reads_by_page.copy()
             all_reads = payload_reads + header_reads
             return {
+                "archive_open_operations": self._archive_open_operations,
+                "list_images_calls": self._list_images_calls,
+                "entry_listing_operations": self._entry_listing_operations,
                 "backend_calls": dict(sorted(self._backend_calls.items())),
                 "decode_attempts": sum(self._decode_attempts_by_page.values()),
                 "successful_decodes": sum(successful.values()),
@@ -203,11 +228,24 @@ class _SourceCounters:
                 "failed_decoder_calls": self._failures,
             }
 
+    def timing_points(self) -> tuple[float | None, float | None]:
+        with self._lock:
+            return (
+                self._first_decode_started_at,
+                self._first_decode_finished_at,
+            )
+
 
 class _CountingFolderSource(FolderImageSource):
     def __init__(self, path: Path) -> None:
         super().__init__(path)
         self.benchmark_counters = _SourceCounters()
+
+    def list_images(self) -> list[str]:
+        self.benchmark_counters.record_listing(
+            enumerated_entries=self._listed_images is None,
+        )
+        return super().list_images()
 
     def _payload_size(self, image_id: str) -> int:
         try:
@@ -277,6 +315,13 @@ class _CountingZipSource(ZipImageSource):
     def __init__(self, path: Path) -> None:
         super().__init__(path)
         self.benchmark_counters = _SourceCounters()
+        self.benchmark_counters.record_archive_open()
+
+    def list_images(self) -> list[str]:
+        self.benchmark_counters.record_listing(
+            enumerated_entries=self._listed_images is None,
+        )
+        return super().list_images()
 
     def _payload_size(self, image_id: str) -> int:
         return int(self.file_size(image_id) or 0)
@@ -477,11 +522,21 @@ def _pump_until(
     return bool(predicate())
 
 
-def _pump_until_time(application: QApplication, deadline: float) -> None:
+def _pump_until_time(
+    application: QApplication,
+    deadline: float,
+    *,
+    observer: Callable[[float], None] | None = None,
+) -> None:
     while time.perf_counter() < deadline:
         application.processEvents()
-        time.sleep(min(0.005, max(0.0, deadline - time.perf_counter())))
+        now = time.perf_counter()
+        if observer is not None:
+            observer(now)
+        time.sleep(min(0.002, max(0.0, deadline - now)))
     application.processEvents()
+    if observer is not None:
+        observer(time.perf_counter())
 
 
 def _snapshot(
@@ -540,6 +595,9 @@ def _probe_unlocked(path: Path) -> bool:
 
 def _run_worker_case(args: argparse.Namespace) -> dict[str, object]:
     source_kind, profile, mode = _parse_case(str(args.worker_case))
+    warmup_gate = str(args.warmup_gate)
+    if warmup_gate not in {"paint", "commit"}:
+        raise ValueError("worker warm-up gate must be paint or commit")
     pages = int(args.pages)
     viewport = (int(args.viewport_width), int(args.viewport_height))
     application = QApplication.instance() or QApplication([])
@@ -554,14 +612,20 @@ def _run_worker_case(args: argparse.Namespace) -> dict[str, object]:
             profile=profile,
             pages=pages,
         )
+        open_started_at = time.perf_counter()
         source = _make_source(source_kind, source_path)
+        source_constructed_at = time.perf_counter()
         memory_after_fixture = _process_memory_bytes()
         baseline_working_set = (
             memory_after_fixture[0] if memory_after_fixture is not None else None
         )
         source_closed = False
         runtime: RasterBookRuntime | None = None
-        frames: list[RasterFrame] = []
+        frame_events: list[tuple[RasterFrame, float]] = []
+
+        def capture_frame(frame: RasterFrame) -> None:
+            frame_events.append((frame, time.perf_counter()))
+
         shutdown_started = 0.0
         shutdown_complete = False
         drained_callbacks = False
@@ -581,9 +645,12 @@ def _run_worker_case(args: argparse.Namespace) -> dict[str, object]:
                 hard_limit_bytes=hard_limit,
                 soft_target_bytes=soft_target,
             )
-            runtime.frameReady.connect(frames.append)
+            runtime.frameReady.connect(capture_frame)
+            runtime_created_at = time.perf_counter()
 
+            listing_started_at = time.perf_counter()
             image_ids = source.list_images()
+            listing_completed_at = time.perf_counter()
             if len(image_ids) != pages:
                 raise RuntimeError(
                     f"fixture listed {len(image_ids)} pages, expected {pages}"
@@ -625,24 +692,63 @@ def _run_worker_case(args: argparse.Namespace) -> dict[str, object]:
                 render_spec,
                 navigation_direction=1,
             )
+            topology_ready_at = time.perf_counter()
+            metrics_before_request = asdict(runtime.metrics)
             requested_at = time.perf_counter()
             if not runtime.request(request):
                 raise RuntimeError("runtime rejected initial request")
+            request_returned_at = time.perf_counter()
+            metrics_after_request = asdict(runtime.metrics)
             if not _pump_until(
                 application,
-                lambda: bool(frames),
+                lambda: bool(frame_events),
                 timeout_seconds=float(args.first_frame_timeout),
             ):
                 raise TimeoutError("first frame did not complete")
-            frame = frames[-1]
+            frame, first_commit_at = frame_events[-1]
             errors = [page.error for page in frame.pages if page.error]
             if errors:
                 raise RuntimeError(f"first frame failed: {errors!r}")
+
+            ready_threshold_at: dict[int, float] = {}
+
+            def observe_ready(now: float) -> None:
+                ready_pages = int(runtime.cache_debug_values()["ready_page_count"])
+                for threshold in (2, 3):
+                    if ready_pages >= threshold and threshold not in ready_threshold_at:
+                        ready_threshold_at[threshold] = now
+
+            ready_pages_at_commit = int(
+                runtime.cache_debug_values()["ready_page_count"]
+            )
+            observe_ready(first_commit_at)
+            commit_warmup_release_accepted: bool | None = None
+            if warmup_gate == "commit":
+                commit_warmup_release_accepted = runtime.release_initial_warmup(
+                    request_id=1
+                )
+                if not commit_warmup_release_accepted:
+                    raise RuntimeError(
+                        "runtime rejected accepted-commit warm-up release"
+                    )
+            paint_target_at = first_commit_at + (
+                max(0.0, float(args.commit_to_paint_delay_ms)) / 1000.0
+            )
+            _pump_until_time(
+                application,
+                paint_target_at,
+                observer=observe_ready,
+            )
+            metrics_before_paint = asdict(runtime.metrics)
+            ready_pages_before_paint = int(
+                runtime.cache_debug_values()["ready_page_count"]
+            )
             _paint_frame(frame, viewport)
             first_paint_at = time.perf_counter()
             if not runtime.release_prefetch(request_id=1):
                 raise RuntimeError("runtime rejected paint acknowledgement")
-            frames.clear()
+            frame_events.clear()
+            observe_ready(first_paint_at)
 
             snapshots = [
                 _snapshot(
@@ -656,7 +762,11 @@ def _run_worker_case(args: argparse.Namespace) -> dict[str, object]:
                 )
             ]
             for seconds in args.snapshot_seconds:
-                _pump_until_time(application, first_paint_at + float(seconds))
+                _pump_until_time(
+                    application,
+                    first_paint_at + float(seconds),
+                    observer=observe_ready,
+                )
                 now = time.perf_counter()
                 snapshots.append(
                     _snapshot(
@@ -670,12 +780,26 @@ def _run_worker_case(args: argparse.Namespace) -> dict[str, object]:
                     )
                 )
 
+            first_decode_started_at, first_decode_finished_at = (
+                source.benchmark_counters.timing_points()
+            )
+            final_source_activity = source.benchmark_counters.snapshot()
+            final_runtime_metrics = asdict(runtime.metrics)
+
+            def elapsed_ms(
+                start: float | None,
+                end: float | None,
+            ) -> float | None:
+                if start is None or end is None:
+                    return None
+                return round((end - start) * 1000, 3)
+
             fixture["maximum_retained_preview_pixel_bytes"] = (
                 pages * viewport[0] * viewport[1] * 4 * 2
             )
             fixture["safety_note"] = (
                 "4 GiB/Auto are hard ceilings, not allocation requests; "
-                "300 layout-sized source+frame rasters are bounded to the "
+                f"{pages} layout-sized source+frame rasters are bounded to the "
                 "reported preview pixel ceiling, with one active worker."
             )
             result = {
@@ -683,9 +807,18 @@ def _run_worker_case(args: argparse.Namespace) -> dict[str, object]:
                     "source": source_kind,
                     "profile": profile,
                     "memory_mode": mode,
+                    "warmup_gate": warmup_gate,
                 },
                 "fixture": fixture,
                 "resolved_memory_policy": resolution.debug_values(active=True),
+                "memory_authority": {
+                    "owner": "RasterBookRuntime combined source/frame ledger",
+                    "resolver": "resolve_viewer_memory_budget",
+                    "requested_mode": mode,
+                    "current_cache_bytes_input": 0,
+                    "hard_limit_bytes": runtime.cache_byte_budget,
+                    "soft_target_bytes": runtime.cache_soft_target_bytes,
+                },
                 "memory_baseline_after_fixture": {
                     "working_set_bytes": baseline_working_set,
                     "process_lifetime_peak_bytes": (
@@ -694,16 +827,112 @@ def _run_worker_case(args: argparse.Namespace) -> dict[str, object]:
                         else None
                     ),
                 },
+                "open_operation_counts": {
+                    "archive_open_operations": int(
+                        final_source_activity["archive_open_operations"]
+                    ),
+                    "list_images_calls": int(
+                        final_source_activity["list_images_calls"]
+                    ),
+                    "entry_listing_operations": int(
+                        final_source_activity["entry_listing_operations"]
+                    ),
+                },
+                "work_totals": {
+                    "jobs_submitted": int(
+                        final_runtime_metrics["jobs_submitted"]
+                    ),
+                    "queued_callbacks": int(
+                        final_runtime_metrics["queued_callbacks"]
+                    ),
+                    "decode_attempts": int(
+                        final_source_activity["decode_attempts"]
+                    ),
+                    "successful_decodes": int(
+                        final_source_activity["successful_decodes"]
+                    ),
+                    "duplicate_successful_decodes": int(
+                        final_source_activity["duplicate_successful_decodes"]
+                    ),
+                },
                 "first_paint_latency_ms": round(
                     (first_paint_at - requested_at) * 1000, 3
                 ),
+                "open_timeline": {
+                    "source_construct_ms": elapsed_ms(
+                        open_started_at, source_constructed_at
+                    ),
+                    "source_to_runtime_ready_ms": elapsed_ms(
+                        source_constructed_at, runtime_created_at
+                    ),
+                    "entry_listing_ms": elapsed_ms(
+                        listing_started_at, listing_completed_at
+                    ),
+                    "topology_build_ms": elapsed_ms(
+                        listing_completed_at, topology_ready_at
+                    ),
+                    "open_to_request_ms": elapsed_ms(
+                        open_started_at, requested_at
+                    ),
+                    "request_call_ms": elapsed_ms(
+                        requested_at, request_returned_at
+                    ),
+                    "request_to_first_decode_start_ms": elapsed_ms(
+                        requested_at, first_decode_started_at
+                    ),
+                    "open_to_first_decode_start_ms": elapsed_ms(
+                        open_started_at, first_decode_started_at
+                    ),
+                    "first_decoder_call_ms": elapsed_ms(
+                        first_decode_started_at, first_decode_finished_at
+                    ),
+                    "request_to_first_commit_ms": elapsed_ms(
+                        requested_at, first_commit_at
+                    ),
+                    "open_to_first_commit_ms": elapsed_ms(
+                        open_started_at, first_commit_at
+                    ),
+                    "commit_to_paint_ms": elapsed_ms(
+                        first_commit_at, first_paint_at
+                    ),
+                    "commit_to_next_ready_ms": elapsed_ms(
+                        first_commit_at, ready_threshold_at.get(2)
+                    ),
+                    "paint_to_three_ready_ms": elapsed_ms(
+                        first_paint_at, ready_threshold_at.get(3)
+                    ),
+                    "jobs_before_initial_request": int(
+                        metrics_before_request["jobs_submitted"]
+                    ),
+                    "jobs_after_request_return": int(
+                        metrics_after_request["jobs_submitted"]
+                    ),
+                },
+                "warmup_boundaries": {
+                    "gate": warmup_gate,
+                    "configured_commit_to_paint_delay_ms": float(
+                        args.commit_to_paint_delay_ms
+                    ),
+                    "commit_neighbor_release_accepted": (
+                        commit_warmup_release_accepted
+                    ),
+                    "paint_release_accepted": True,
+                    "ready_pages_at_commit": ready_pages_at_commit,
+                    "ready_pages_before_paint": ready_pages_before_paint,
+                    "jobs_before_paint": int(
+                        metrics_before_paint["jobs_submitted"]
+                    ),
+                    "next_ready_before_paint": bool(
+                        ready_threshold_at.get(2, first_paint_at) < first_paint_at
+                    ),
+                },
                 "snapshots": snapshots,
             }
         finally:
             shutdown_started = time.perf_counter()
             if runtime is not None:
                 try:
-                    runtime.frameReady.disconnect(frames.append)
+                    runtime.frameReady.disconnect(capture_frame)
                 except (RuntimeError, TypeError):
                     pass
                 runtime.cancel(clear_artifacts=True)
@@ -764,6 +993,7 @@ def _case_text(case: tuple[str, str, str]) -> str:
 def _worker_command(
     args: argparse.Namespace,
     case: tuple[str, str, str],
+    warmup_gate: str,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -780,6 +1010,10 @@ def _worker_command(
         str(args.first_frame_timeout),
         "--shutdown-timeout",
         str(args.shutdown_timeout),
+        "--warmup-gate",
+        warmup_gate,
+        "--commit-to-paint-delay-ms",
+        str(args.commit_to_paint_delay_ms),
         "--snapshot-seconds",
     ]
     command.extend(str(value) for value in args.snapshot_seconds)
@@ -789,6 +1023,7 @@ def _worker_command(
 def _run_isolated_case(
     args: argparse.Namespace,
     case: tuple[str, str, str],
+    warmup_gate: str,
 ) -> dict[str, object]:
     environment = os.environ.copy()
     environment["QT_QPA_PLATFORM"] = "offscreen"
@@ -798,12 +1033,13 @@ def _run_isolated_case(
     timeout = max(
         60.0,
         float(args.first_frame_timeout)
+        + max(0.0, float(args.commit_to_paint_delay_ms)) / 1000.0
         + last_snapshot
         + float(args.shutdown_timeout)
         + 45.0,
     )
     completed = subprocess.run(
-        _worker_command(args, case),
+        _worker_command(args, case, warmup_gate),
         cwd=_REPOSITORY_ROOT,
         env=environment,
         capture_output=True,
@@ -814,7 +1050,8 @@ def _run_isolated_case(
     )
     if completed.returncode != 0:
         raise RuntimeError(
-            f"{_case_text(case)} worker failed ({completed.returncode})\n"
+            f"{_case_text(case)}:{warmup_gate} worker failed "
+            f"({completed.returncode})\n"
             f"stdout:\n{completed.stdout[-4000:]}\n"
             f"stderr:\n{completed.stderr[-4000:]}"
         )
@@ -822,7 +1059,7 @@ def _run_isolated_case(
         result = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
-            f"{_case_text(case)} returned invalid JSON\n"
+            f"{_case_text(case)}:{warmup_gate} returned invalid JSON\n"
             f"stdout:\n{completed.stdout[-4000:]}\n"
             f"stderr:\n{completed.stderr[-4000:]}"
         ) from exc
@@ -847,6 +1084,24 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--first-frame-timeout", type=float, default=30.0)
     parser.add_argument("--shutdown-timeout", type=float, default=15.0)
     parser.add_argument(
+        "--warmup-gate",
+        choices=("paint", "commit", "ab"),
+        default="paint",
+        help=(
+            "paint keeps the legacy gate, commit releases one neighbor after "
+            "accepted frame completion, and ab runs both as isolated workers"
+        ),
+    )
+    parser.add_argument(
+        "--commit-to-paint-delay-ms",
+        type=float,
+        default=0.0,
+        help=(
+            "deterministic offscreen delay after accepted frame completion "
+            "and before paint acknowledgement"
+        ),
+    )
+    parser.add_argument(
         "--case",
         action="append",
         default=[],
@@ -867,6 +1122,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error("viewport dimensions must be positive")
     if args.first_frame_timeout <= 0 or args.shutdown_timeout <= 0:
         parser.error("timeouts must be positive")
+    if args.commit_to_paint_delay_ms < 0:
+        parser.error("--commit-to-paint-delay-ms must not be negative")
     normalized_snapshots = tuple(sorted(set(args.snapshot_seconds)))
     if not normalized_snapshots or normalized_snapshots[0] <= 0:
         parser.error("--snapshot-seconds must contain positive values")
@@ -874,6 +1131,8 @@ def _parse_args() -> argparse.Namespace:
     try:
         if args.worker_case:
             _parse_case(args.worker_case)
+            if args.warmup_gate == "ab":
+                parser.error("--worker-case requires a concrete warm-up gate")
         for value in args.case:
             _parse_case(value)
     except ValueError as exc:
@@ -908,14 +1167,24 @@ def main() -> int:
         cases = _DEFAULT_CASES
         matrix_name = "default-safe"
 
+    warmup_gates = (
+        ("paint", "commit")
+        if args.warmup_gate == "ab"
+        else (str(args.warmup_gate),)
+    )
+    work = tuple(
+        (case, warmup_gate)
+        for case in cases
+        for warmup_gate in warmup_gates
+    )
     results: list[dict[str, object]] = []
-    for index, case in enumerate(cases, start=1):
+    for index, (case, warmup_gate) in enumerate(work, start=1):
         print(
-            f"[{index}/{len(cases)}] {_case_text(case)}",
+            f"[{index}/{len(work)}] {_case_text(case)}:{warmup_gate}",
             file=sys.stderr,
             flush=True,
         )
-        results.append(_run_isolated_case(args, case))
+        results.append(_run_isolated_case(args, case, warmup_gate))
 
     report = {
         "schema_version": 1,
@@ -927,15 +1196,31 @@ def main() -> int:
         "qt_platform": os.environ.get("QT_QPA_PLATFORM"),
         "matrix": matrix_name,
         "pages": int(args.pages),
+        "warmup_gate": str(args.warmup_gate),
+        "commit_to_paint_delay_ms": float(args.commit_to_paint_delay_ms),
         "snapshot_seconds_after_first_paint": list(args.snapshot_seconds),
         "measurement_scope": {
             "first_paint": (
                 "the first production frame QPixmap is drawn into an offscreen "
                 "QImage, then release_prefetch acknowledges that paint"
             ),
+            "accepted_commit": (
+                "the first complete non-error frameReady callback received on "
+                "the GUI thread; this direct-runtime benchmark has no "
+                "ViewerPresentationState"
+            ),
+            "warmup_ab": (
+                "paint leaves warm-up blocked until paint; commit calls "
+                "release_initial_warmup at accepted completion so exactly one "
+                "nearest unit may run before the same paint boundary"
+            ),
             "read_operations": (
                 "application-visible file/archive payload opens plus uncached "
                 "header probes; Qt/plugin-internal reads are not visible"
+            ),
+            "archive_and_listing": (
+                "counts cover the production source constructed after fixture "
+                "generation; temporary ZIP creation is excluded"
             ),
             "duplicate_decode": (
                 "successful decoder outputs beyond the first output for the "

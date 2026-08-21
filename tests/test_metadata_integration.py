@@ -60,6 +60,15 @@ def close_controller(
 def finish_viewer_open(qapp: QApplication, window) -> None:
     assert window.book_session.wait_for_async(2000)
     qapp.processEvents()
+    deadline = monotonic() + 3
+    while (
+        window._pending_book_open_projection is not None
+        and monotonic() < deadline
+    ):
+        qapp.processEvents()
+        QTest.qWait(5)
+    qapp.processEvents()
+    assert window._pending_book_open_projection is None
 
 
 def finish_presentation(
@@ -151,6 +160,7 @@ def test_progress_is_batched_then_flushed_when_switching_books(
     assert persisted_page(controller.config.metadata_database_path, first_book) == 0
 
     assert window.open_path(second_book)
+    finish_viewer_open(qapp, window)
     assert persisted_page(controller.config.metadata_database_path, first_book) == 1
     close_controller(controller, qapp)
 
@@ -455,6 +465,7 @@ def test_lifecycle_metadata_flush_does_not_probe_source(
 
     if operation == "book_switch":
         assert window.open_path(second_book)
+        finish_viewer_open(qapp, window)
     elif operation == "viewer_close":
         window.close()
         qapp.processEvents()

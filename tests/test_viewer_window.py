@@ -322,6 +322,12 @@ def test_page_list_switches_with_first_committed_replacement_frame(
         assert window._staged_page_list_runtime is None
         assert window.page_list.isEnabled()
         assert window.page_list_model.image_id_for_page(0) == str(second_image)
+
+        session.close_book()
+        qapp.processEvents()
+        assert window._page_list_runtime is None
+        assert window._staged_page_list_runtime is None
+        assert window.page_list_model.rowCount() == 0
     finally:
         window.close()
         qapp.processEvents()

@@ -2950,7 +2950,7 @@ The remaining boundaries are explicit:
 |---|---|
 | Lazy-size wide/spread topology | A decoded preview/full source survives size discovery and can be reused. If the newly known aspect changes single, spread-partner or wide-split topology, however, the old layout key is not a complete frame for the new unit. A display-ready frame must be generated again, without another source decode when the retained tier is sufficient. |
 | Very large books | Resolved in section 19: topology is built once per layout revision and navigation replaces only a lazy current-centered cursor. Physical-device responsiveness around 10,000 pages remains unverified, but the former per-input full-order materialization is gone. |
-| PageList live memory update | `ViewerPageListRuntime` remains deliberately separate, with a creation-time QImage budget of one quarter of the main budget clamped to 8–64 MiB. It has no live resize API, so changing `viewer_memory_mode` immediately resizes the main Viewer cache/Raster boundary but not an already open PageList runtime; a subsequently created book/runtime receives the new derived value. |
+| PageList memory ownership | `ViewerPageListRuntime` remains deliberately separate with an explicit fixed 64 MiB QImage budget. It is neither derived from nor live-resized by `viewer_memory_mode`, so the main source+frame authority cannot silently change thumbnail retention. |
 
 These residuals do not change the 24-page results in section 18.4. They limit
 the claim to the measured ordinary book and establish the next optimization
@@ -3036,10 +3036,13 @@ display-unit boundary once per book generation, source identity and topology
 revision.  A page turn then creates a small `RasterWarmupPlan`; it does not
 materialize or sort a new all-page list.
 
-After the current complete frame's paint acknowledgement, the plan lazily
-enumerates the preferred-direction neighbor, the opposite neighbor and then
-both sides at increasing distance.  It represents every single/spread display
-unit in the book, but creates candidates only as the one worker asks for them.
+After the first complete frame is accepted by the presentation commit, the
+plan may release exactly one nearest missing display unit.  The matching paint
+acknowledgement then releases the full lazy walk: preferred-direction neighbor,
+opposite neighbor and both sides at increasing distance.  It represents every
+single/spread display unit in the book, but creates candidates only as the one
+worker asks for them.  Section 20 records this bounded two-stage gate and the
+book-open critical-path reason for it.
 Direction reversal replaces the plan and therefore the unstarted cursor.
 Capacity skips, the unprocessed hint and explicit waiting/running/soft-target/
 hard-limit/complete/suspended stop reasons belong to `RasterWarmupPlanner`, not
@@ -3179,3 +3182,310 @@ preservation of an unrelated in-flight decode during recovery. Real-device
 checks must still cover long idle warm-up, a page turn during that warm-up,
 direction reversal, magnifier/full-source promotion, window deactivation and
 returning to an already warmed page.
+
+## 20. ZIP book-open critical path and commit-bounded warm-up (2026-08-21 worktree)
+
+This section narrows the next performance change to the interval from an open
+request through the first current-page commit and the first useful neighbor.
+It supersedes only the initial warm-up gate described in sections 18.3 and
+19.3.  The byte-driven stores, lazy whole-book order, PresentationState,
+complete-frame atomic swap and full post-paint population remain in force.
+Physical-device behavior is not inferred from this structural change.
+
+### 20.1 Fixed-revision ZipPlaFork book-open call sequence
+
+The reference is still
+[`himamon/ZipPlaFork`](https://github.com/himamon/ZipPlaFork) revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`.  The ordinary ZIP path at that
+revision is the following concrete sequence:
+
+```text
+ViewerForm.OpenFile(path, ...)
+  -> cancel the preceding BackgroundMultiWorker work set
+  -> save preceding history / update access time / catalog selection request
+  -> getPackedImageLoader
+     -> Program.GetPackedImageLoader
+     -> PackedImageLoader(..., onMemory=None)
+        -> File.OpenRead once and retain the stream in the loader
+  -> PackedImageLoader.GetPackedImageEntries or GetPackedImageFullEntries
+     -> getZipArchiveEntries
+        -> new ZipArchive(retained stream, Read) once
+        -> ZipArchive.Entries.ToArray -> image filtering
+     -> getNameSortedEntries / logical-name sort
+  -> choose currentPage and update the page control
+  -> clearResizedImageArray
+  -> BackgroundMultiWorker.RunWorkerAsyncWithInterrupt(all-page arguments, true)
+     -> bmwLoadEachPage_RunWorkerStarting
+        -> promote nextData/loader, allocate page arrays, SetBackgroundMode
+        -> priorityLevel + BackgroundMultiWorker.SetWorksOrder
+     -> bmwLoadEachPage_DoWork(current page)
+        -> PackedImageLoader.OpenImageStream / OpenInnerImageStream
+        -> entry stream, decode, orientation/filter, resize, VirtualBitmapEx
+     -> bmwLoadEachPage_EachRunWorkerCompleted
+        -> SetNewResizedImage -> completed artifact publication
+     -> BackgroundMultiWorker.privateRunWorkerCompletedEventHandler
+        -> select the first unfinished item in the newest order immediately
+```
+
+The source locations are `source/ZipPla/ViewerForm.cs:2308-2771`
+(`OpenFile`), `:2919-3003` (`bmwLoadEachPage_RunWorkerStarting`),
+`:3177-3602` (`bmwLoadEachPage_DoWork`), `:5371-5415` (completion),
+`:5451-5468` (`SetNewResizedImage`) and `:5558-5605`
+(`SetBackgroundMode` / `priorityLevel`); `source/ZipPla/PackedImageLoader.cs`
+`:283-330` (retained file stream), `:1197-1243` (`getZipArchiveEntries`) and
+`:1781-1867` (entry-stream access); and
+`source/ZipPla/GenerarClasses.cs:247-264,266-339`
+(`SetWorksOrder` and latest-order completion selection).  The configured
+Viewer worker count is one in `ViewerForm.Designer.cs:1628-1636`.
+
+ZipPlaFork therefore does perform synchronous work before the first page job:
+history/catalog calls, archive entry enumeration and sorting, slider/control
+projection, old resized-array disposal and the worker-starting array setup are
+not free.  Its important work-order property is narrower: once the current
+display artifact is published, the same one-worker scheduler can select the
+next ordered page at that completion boundary.  It has no Qt physical-paint
+acknowledgement gate.  The ordinary loader retains one archive stream/reader;
+copying the whole archive to memory is an optional mode, not the default path.
+
+This replacement does **not** copy ZipPlaFork's pre-open old-frame clearing,
+synchronous archive enumeration, WinForms control updates, GDI bitmap arrays,
+weak request identity or wait-cancel ownership.  Those would regress
+NivisViewer's asynchronous open, rollback frame, high-DPI and stale-result
+contracts.
+
+### 20.2 NivisViewer path before this worktree change
+
+Archive open and entry enumeration were already off the GUI thread, but the
+GUI handoff performed several non-current operations before it could request
+the first frame:
+
+```text
+ViewerWindow.open_path
+  -> _save_current_reading_position
+     -> MetadataStore.update_progress -> MetadataStore.flush (synchronous)
+  -> BookSession.open_book_async
+     -> _BookOpenWorker.run
+        -> source factory -> ZipImageSource.__init__
+           -> zipfile.ZipFile retained for the book lifetime
+        -> ZipImageSource.list_images
+           -> infolist, extension/display-name filtering, natural sort
+  -> BookSession._on_async_prepared                         [GUI]
+     -> PageModel.set_prepared_source
+     -> _replace_viewer_runtime -> old runtime shutdown/cache clearing
+     -> _replace_page_list_runtime -> thumbnail runtime construction
+     -> ImageCache.set_source -> duplicate source and full image-id ownership
+  -> ViewerWindow._finish_opened_book                      [GUI]
+     -> MetadataStore.record_book_opened
+        -> history_changed -> HistoryModel.refresh
+     -> _add_recent_path -> recent QAction projection
+     -> _refresh_view -> topology/current runtime request
+     -> book_changed -> Browser/book projection
+  -> RasterBookRuntime current read/decode/frame job
+  -> ViewerWindow._on_zip_runtime_frame_ready
+     -> QPixmap-backed complete-frame atomic commit
+  -> ViewerWidget.paintEvent / framePainted
+     -> release the whole background warm-up order
+```
+
+`_BookOpenWorker.run`, `ZipImageSource.__init__` and
+`ZipImageSource.list_images` were not the GUI-thread regression: they kept one
+ZIP handle and produced the page index in the open worker.  The avoidable
+critical-path costs began at `BookSession._on_async_prepared` and
+`ViewerWindow._finish_opened_book`.  They included destruction of a potentially
+large preceding source/frame cache, eager PageList ownership, an unused legacy
+`ImageCache` page-list copy, synchronous SQLite/history and recent-action
+projection, and Browser work made eligible before the current frame.  The
+runtime then left its one Viewer lane idle between accepted current commit and
+physical paint even when the next display unit was known and admissible.
+
+The first topology/index construction remains required once per book/layout
+revision, and the current page still cannot decode until asynchronous ZIP
+listing and natural sorting complete.  This change does not hide those costs;
+it removes unrelated ownership/projection work around them.
+
+### 20.3 Adopted Hybrid production sequence
+
+The ZIP/Folder production handoff is now:
+
+```text
+ViewerWindow.open_path
+  -> save preceding progress without a synchronous metadata flush
+  -> asynchronous source open, ZIP listing and PageModel construction
+  -> BookSession installs the new RasterBookRuntime with explicit hard/soft bytes
+     -> retire old Viewer/PageList work without clearing retained artifacts
+     -> defer replacement PageList construction
+     -> ImageCache.suspend_for_book_runtime (fully detached legacy owner)
+  -> ViewerWindow stages book-open metadata/recent/book_changed projection
+  -> submit only the current complete display unit
+  -> worker read/decode/render -> validated complete RasterFrame
+  -> atomic PresentationState/ViewerWidget commit
+     -> slider/status/displayed state update together
+     -> release_initial_warmup(request_id): at most one nearest missing unit
+  -> matching ViewerWidget paint acknowledgement
+     -> release_prefetch(request_id): release the remaining lazy book-wide order
+     -> start the zero-delay presentation-side-effect timer
+  -> after paintEvent returns
+     -> construct/activate the virtual PageList runtime
+     -> reclaim retired Viewer/PageList/source ownership
+     -> record book-open metadata, recent actions and book_changed/Browser projection
+     -> project page history/actions/PageList selection and persist committed progress
+```
+
+`ViewerWindow._on_zip_runtime_frame_ready` releases the bounded early work only
+after the request/book epoch, source identity, complete display-unit identity,
+layout/DPR contract, accepted presentation token and positive committed frame
+serial have all survived validation.  `RasterBookRuntime.release_initial_warmup`
+is idempotent per request and also requires the current complete frame to exist
+in the frame store.  `RasterWarmupPlanner.release_after_commit(unit_limit=1)`
+consumes at most one useful missing display unit, then returns to
+`waiting_for_paint`; a spread counts as one complete display unit, never one
+slot.  A matching `release_after_paint` opens the remaining memory-driven
+walk.  Ready/terminal neighbors are skipped without spending the one useful
+unit allowance.
+
+This is intentionally Hybrid.  It adopts ZipPlaFork's useful completion-boundary
+continuation but keeps NivisViewer's Qt publication boundary: QPixmap creation,
+atomic old-frame replacement and physical-paint acknowledgement are unchanged.
+PageList, SQLite/history/progress, recent-action rebuild, Browser projection
+and large retired-cache destruction remain paint-gated and are run by
+`ViewerWindow._flush_presentation_side_effects` on its zero-delay timer, outside
+the `paintEvent` call stack.  Slider and status remain part of the accepted
+atomic presentation commit; moving them after paint would reintroduce a split
+displayed-page owner.
+
+### 20.4 Ownership, memory-setting and lifecycle cleanup
+
+| Boundary | Before | Current worktree contract |
+|---|---|---|
+| Main raster source owner | `RasterBookRuntime` plus an attached, suspended `ImageCache` with another full image-id list | `PageModel` owns page metadata and `RasterBookRuntime` owns ZIP/Folder decode/frame state; `ImageCache.suspend_for_book_runtime` cancels legacy work and clears its source and IDs. |
+| Runtime memory authority | New runtimes were initially seeded through the legacy `ImageCache` budget, then corrected by Window policy | `BookSession.set_viewer_runtime_memory_limits` owns explicit hard/soft byte values used both for construction and live updates. |
+| Persisted Raster memory setting | `viewer_memory_mode` coexisted with normalized/saved `viewer_cache_max_memory_mib` and prefetch presets still exposed a hidden memory field | `viewer_memory_mode` is the sole Raster memory authority. `viewer_cache_max_memory_mib` is accepted only for one-time migration when no explicit mode exists, is removed from normalized state and is never re-saved. A newer explicit mode wins. |
+| Legacy format settings | Raster and legacy meanings were entangled | `cache_size`, image/PDF forward/backward units and preset/direction controls remain for PDF, RAR/7z, custom/non-raster paths; their continued existence is not a Raster cache cap. |
+| PageList memory | Derived as one quarter of the main budget, clamped to 8--64 MiB | An explicit 64 MiB `ViewerPageListRuntime` QImage budget defines an independent virtual-thumbnail boundary; the runtime itself is not constructed until first paint. |
+| Replacement cache destruction | Old Viewer/PageList runtime shutdown could clear a large ready cache during new-book GUI installation | `RasterBookRuntime.retire` and `ViewerPageListRuntime.retire` stop acceptance/cancel work but retain artifacts. `BookSession.release_retired_book_resources` performs final shutdown after the replacement paint. |
+| Failed/no-paint/rapid switch | Cleanup relied primarily on normal runtime idle/paint flow | Failed replacement keeps the active presentation. The bounded no-paint fallback schedules the same post-paint projections. `close_book` releases deferred owners, and a raster A -> raster B -> non-raster C chain releases them before C because no later raster paint exists. Running callbacks retain their source through the existing retired-source drain maps. |
+
+The concrete NivisViewer owners are `app/viewer_window.py`
+(`open_path`, `_finish_opened_book`, `_save_current_reading_position`,
+`_apply_book_open_projection`, `_flush_book_open_projection`,
+`_on_zip_runtime_frame_ready`, `_on_zip_runtime_frame_painted` and
+`_flush_presentation_side_effects`); `app/book_session.py`
+(`_on_async_prepared`, `_replace_viewer_runtime`, `_replace_page_list_runtime`,
+`ensure_page_list_runtime`, `set_viewer_runtime_memory_limits` and
+`release_retired_book_resources`); `app/image_cache.py`
+(`suspend_for_book_runtime`); `app/zip_raster_book_runtime.py`
+(`RasterBookRuntime.release_initial_warmup`, `retire` and `_drive`);
+`app/raster_warmup_planner.py` (`release_after_commit` /
+`release_after_paint`); `app/viewer_page_list_runtime.py` (`retire`); and
+`app/config_manager.py` (legacy memory-key migration and removal).
+
+Deferring retirement intentionally permits the preceding completed frame/cache
+to coexist with the new current decode for one replacement-paint interval.  It
+prevents a large GUI-thread deallocation burst before current dispatch and
+preserves rollback, but may cause a short transient working-set peak.  Close,
+non-raster transition and queued-callback drain remain explicit terminal
+boundaries rather than relying on object finalizers.
+
+### 20.5 Adoption decision and AGPL provenance
+
+| Fixed-revision source / method | Principle evaluated | NivisViewer result |
+|---|---|---|
+| `ViewerForm.cs`, `bmwLoadEachPage_RunWorkerStarting`, `SetBackgroundMode`, `priorityLevel`; `GenerarClasses.cs`, `SetWorksOrder` / completion selection | One Viewer lane receives current-centered work and chooses the next useful item at a completion boundary without a paint-idle gap. | **Hybrid structural port:** `RasterBookRuntime.release_initial_warmup`, `RasterWarmupPlanner.release_after_commit` and `_drive` release exactly one nearest complete unit at accepted first commit; full book population remains paint-gated. |
+| `PackedImageLoader.cs`, constructor, `getZipArchiveEntries`, `OpenImageStream` / `OpenInnerImageStream` | One book-scoped archive handle/index and entry-local page work. | **Already adopted/maintained:** `ZipImageSource.__init__`, `list_images`, entry-read methods and `ZipRasterBookRuntime` keep structured lifetime, cancellation and stale fences. No new archive copy is added. |
+| `ViewerForm.cs`, `OpenFile`, `clearResizedImageArray` | Replacement preparation and old ownership disposal before new work. | **Not adopted:** old complete output is retained; `BookSession` retires work immediately but moves bulk cache destruction after successful replacement paint. |
+| No ZipPlaFork counterpart | Async archive listing, PresentationState, PageList virtualization, post-paint side effects, migration-only settings and callback-drained rapid switching. | **NivisViewer/New design maintained:** these are modern Qt/UX/lifetime structures, not translations of WinForms code. |
+
+The one-worker completion-order principle in the first row is derived from the
+fixed AGPL-3.0-or-later ZipPlaFork source and is recorded as a direct structural
+port.  No C# statement, GDI type or WinForms control code was copied literally
+for this change.  The retained license and copyright material at
+`licenses/ZipPlaFork/AGPL.txt` and `licenses/ZipPlaFork/About.txt`, section 1
+and `THIRD_PARTY_NOTICES.md` apply.
+
+### 20.6 Controlled offscreen A/B boundary
+
+The current validation compares only the new scheduling boundary, not a
+checkout of the removed GUI ownership path.  Both sides use the same generated
+large ZIP, fixed memory policy, decoded/frame stores and one-worker runtime in
+fresh offscreen child processes:
+
+- **A / paint gate:** accept the current frame, withhold
+  `release_initial_warmup`, acknowledge paint, then call normal
+  `release_prefetch`.
+- **B / commit-bounded gate:** accept the same current frame, call production
+  `release_initial_warmup`, permit exactly one nearest missing unit, then
+  acknowledge paint and release the remaining order normally.
+
+The intended matrix is a 100--300-page large-image ZIP under fixed 256 MiB,
+fixed 4 GiB and resolved Auto.  It records archive opens/listings, page count,
+work submitted before current, current entry read/decode/job/callback counts,
+open-to-current commit, commit-to-first-neighbor-ready, first-paint time,
+ready/source/frame residency, retained bytes, working-set delta and shutdown
+drain.  A controlled commit-to-paint delay may expose worker idle time, but
+must be labelled synthetic; it is not physical presentation latency.  A direct
+runtime runner also cannot measure deferred MetadataStore, QAction, PageList or
+Browser work, so Window-level contract tests remain the evidence for those
+boundaries.
+
+The completed run used 200 2400 x 3600 JPEG pages in a 109,721,422-byte ZIP,
+a 400 x 600 target and an explicit synthetic 20-ms accepted-commit-to-paint
+boundary.  Values below are milliseconds; each A and B ran in a fresh process.
+
+| Mode | A request->commit / commit->next / paint->3 ready | B request->commit / commit->next / paint->3 ready | Ready before paint / jobs before paint, A->B | Ready at 250/500/1000 ms, A->B |
+|---|---:|---:|---:|---:|
+| fixed 256 MiB | 14.376 / 31.266 / 18.599 | 14.482 / 8.183 / 10.795 | 1/1 -> 2/2 | 29/56/106 -> 31/55/97 |
+| fixed 4 GiB | 15.948 / 31.561 / 21.161 | 16.780 / 10.840 / 10.606 | 1/1 -> 2/2 | 29/55/106 -> 28/52/101 |
+| Auto | 14.703 / 32.153 / 21.610 | 15.518 / 10.280 / 10.469 | 1/1 -> 2/2 | 29/54/104 -> 28/53/107 |
+
+First-paint latency was 35.013 -> 35.285 ms (256 MiB), 36.410 -> 37.413 ms
+(4 GiB) and 35.673 -> 36.220 ms (Auto).  Those 0.272--1.003-ms differences
+are within isolated-run noise; the controlled result does not show a material
+first-frame regression.  B retains one additional 1,920,000-byte complete
+source+frame artifact before paint.  At one second B retained 186,240,000 /
+193,920,000 / 205,440,000 bytes and its working-set deltas were 98,160,640 /
+102,424,576 / 107,077,632 bytes for 256 MiB / 4 GiB / Auto respectively.  A's
+corresponding values were 203,520,000 / 203,520,000 / 199,680,000 bytes and
+106,905,600 / 107,311,104 / 105,340,928 bytes.  The ready-count variation after
+250 ms is normal decoder-throughput noise rather than a policy regression.
+
+Every case opened the archive and built the listing once, submitted zero jobs
+before the initial request, produced zero duplicate successful decodes and
+drained callbacks, closed the source and removed the temporary fixture at
+shutdown.  The first-neighbor gap fell from 31--32 ms to 8--11 ms and the
+post-paint three-ready gap from 18.6--21.6 ms to 10.5--10.8 ms.  The synthetic
+20-ms boundary deliberately amplifies otherwise platform-dependent paint idle;
+it is not claimed as physical presentation latency.
+
+A separate three-second commit-gate reach run verifies that memory mode, not a
+hidden page/unit count, remains authoritative:
+
+| Mode | Resolved hard / soft bytes | Ready pages / retained bytes | Jobs / reads / decodes / duplicates | Stop reason / WS delta |
+|---|---:|---:|---:|---:|
+| fixed 256 MiB | 268,435,456 / 234,881,024 | 122 / 234,240,000 | 122 / 122 / 122 / 0 | `complete_with_skips` / 122,003,456 B |
+| fixed 4 GiB | 4,294,967,296 / 3,758,096,384 | 200 / 384,000,000 | 200 / 200 / 200 / 0 | `complete` / 197,177,344 B |
+| Auto | 34,359,738,368 / 30,064,771,072 | 200 / 384,000,000 | 200 / 200 / 200 / 0 | `complete` / 197,832,704 B |
+
+All three reach cases had one archive open, one listing, zero evictions and a
+clean callback/source/temporary-file shutdown.  Offscreen evidence establishes
+the eliminated idle gap and absence of a hidden count cap only; native ZIP I/O,
+decoder, QPixmap upload, DWM/GPU presentation and physical wheel feel still
+require the user's real-device check.
+
+### 20.7 Remaining risk and physical-device boundary
+
+- ZIP central-directory enumeration, display-name decoding and natural sort
+  still precede the first current request, although they run in the book-open
+  worker.  If open latency remains proportional to entry count, that index path
+  is the next measured boundary.
+- One nearest neighbor can now consume CPU/memory bandwidth before the current
+  paint.  The one-unit bound is deliberate; a real-device regression in first
+  paint should remove or narrow this release rather than expand it.
+- PageList construction and retired-cache disposal move after paint, not out of
+  the process.  They may affect the immediately following interaction and need
+  a physical rapid-open/page-turn check.
+- Replacement retirement may transiently retain two book caches.  Rapid raster
+  replacement, transition to PDF/RAR/7z, hidden/no-paint fallback and close
+  must be checked for bounded memory and zero late-state mutation.
+- The persistent ZIP handle and one active decode still depend on Python/Qt
+  backend behavior.  Matching ZipPlaFork's work order does not by itself prove
+  matching native decoder or renderer latency.

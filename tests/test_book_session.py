@@ -80,11 +80,15 @@ def test_switching_books_updates_generation(tmp_path: Path) -> None:
 
     session.open_book(first)
     first_generation = session.generation
-    first_cache_generation = session.image_cache.generation
+    first_runtime = session.viewer_runtime
+    assert first_runtime is not None
     session.open_book(second)
 
     assert session.generation > first_generation
-    assert session.image_cache.generation > first_cache_generation
+    assert session.viewer_runtime is not first_runtime
+    assert session.viewer_runtime is not None
+    assert session.viewer_runtime.source_epoch == session.generation
+    assert session.image_cache.source is None
     assert session.current_path == second
     session.shutdown()
 
@@ -383,6 +387,62 @@ def test_async_open_failure_preserves_current_book_and_clears_tracking(
     assert len(failures) == 1
     assert failures[0].message == "broken source"
     assert session._open_workers == {}
+    session.shutdown()
+
+
+def test_async_non_raster_replacement_does_not_defer_raster_cleanup(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    write_image(tmp_path / "raster-a" / "page.jpg")
+    write_image(tmp_path / "raster-b" / "page.jpg")
+
+    class TrackingFolderSource(FolderImageSource):
+        def __init__(self, source_path: Path) -> None:
+            super().__init__(source_path)
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+            super().close()
+
+    rasters = {
+        name: TrackingFolderSource(tmp_path / name)
+        for name in ("raster-a", "raster-b")
+    }
+    legacy = BlockingImageSource(
+        Path("legacy"),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def source_factory(
+        path: Path,
+        **_kwargs: object,
+    ) -> tuple[ImageSource, str | None]:
+        return rasters.get(path.name, legacy), None
+
+    session = BookSession(source_factory=source_factory)
+    session.open_book(tmp_path / "raster-a")
+    assert session.viewer_runtime is not None
+
+    # B is installed but deliberately never painted, so A is in the deferred
+    # retirement maps when the non-raster C replacement arrives.
+    session.open_book_async(tmp_path / "raster-b")
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+    assert session._retired_viewer_runtimes
+    assert session._retired_page_list_runtimes
+
+    session.open_book_async("legacy")
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+
+    assert session.source is legacy
+    assert session.viewer_runtime is None
+    assert session._retired_viewer_runtimes == {}
+    assert session._retired_page_list_runtimes == {}
+    assert all(source.closed for source in rasters.values())
     session.shutdown()
 
 

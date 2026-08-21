@@ -772,6 +772,23 @@ class ViewerPageListRuntime(QObject):
             self._shutdown_complete = True
         return completed
 
+    def retire(self) -> bool:
+        """Stop thumbnail work but defer cache destruction until post-paint."""
+
+        self._accepting_requests = False
+        self._visible = False
+        self._manual_paused = True
+        self._generation += 1
+        self._desired_pages = ()
+        self._desired_keys = ()
+        self._spec = None
+        self._failed_keys.clear()
+        self._completed_keys.clear()
+        self._cancel_active_job()
+        if self._coordinator is None:
+            self._thread_pool.clear()
+        return not self._jobs
+
     @property
     def _is_paused(self) -> bool:
         return self._manual_paused or self._coordinator_paused

@@ -219,7 +219,9 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
 
     __slots__ = (
         "_capacity_skips",
+        "_commit_release_remaining",
         "_deferred_by_target",
+        "_fully_released",
         "_iterator",
         "_plan",
         "_released",
@@ -230,7 +232,9 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
     def __init__(self, plan: RasterWarmupPlan[UnitT, IdentityT]) -> None:
         self._plan = plan
         self._capacity_skips: set[IdentityT] = set()
+        self._commit_release_remaining = 0
         self._deferred_by_target = 0
+        self._fully_released = False
         self._released = False
         self._stop_reason = WarmupStopReason.WAITING_FOR_PAINT
         self._visited_background_units = 0
@@ -272,8 +276,31 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
     def replace(self, plan: RasterWarmupPlan[UnitT, IdentityT]) -> None:
         self.__init__(plan)
 
+    def release_after_commit(self, *, unit_limit: int = 1) -> None:
+        """Release only the nearest missing units before physical paint.
+
+        The first accepted frame no longer leaves the Viewer worker idle while
+        Qt services the posted paint.  This bounded phase deliberately cannot
+        walk the book: after ``unit_limit`` useful candidates it returns to the
+        paint gate, where normal memory-driven population is released.
+        """
+
+        if self._fully_released:
+            return
+        self._released = True
+        self._commit_release_remaining = max(
+            self._commit_release_remaining,
+            max(0, int(unit_limit)),
+        )
+        self._stop_reason = (
+            WarmupStopReason.RUNNING
+            if self._commit_release_remaining
+            else WarmupStopReason.WAITING_FOR_PAINT
+        )
+
     def release_after_paint(self) -> None:
         self._released = True
+        self._fully_released = True
         self._stop_reason = WarmupStopReason.RUNNING
 
     def suspend(self) -> None:
@@ -300,7 +327,7 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
         self._iterator = self._plan.iter_background_units()
         self._stop_reason = (
             WarmupStopReason.RUNNING
-            if self._released
+            if self._fully_released or self._commit_release_remaining
             else WarmupStopReason.WAITING_FOR_PAINT
         )
 
@@ -312,6 +339,9 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
         is_terminal_failure: Callable[[UnitT], bool],
     ) -> UnitT | None:
         if not self._released:
+            self._stop_reason = WarmupStopReason.WAITING_FOR_PAINT
+            return None
+        if not self._fully_released and self._commit_release_remaining <= 0:
             self._stop_reason = WarmupStopReason.WAITING_FOR_PAINT
             return None
         if self._stop_reason in {
@@ -327,6 +357,8 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
                 continue
             if is_ready(unit) or is_terminal_failure(unit):
                 continue
+            if not self._fully_released:
+                self._commit_release_remaining -= 1
             self._stop_reason = WarmupStopReason.RUNNING
             return unit
         self._stop_reason = (

@@ -64,6 +64,7 @@ from app.folder_raster_book_runtime import FolderRasterBookRuntime
 from app.image_source import FolderImageSource, ImageSource
 from app.image_work_coordinator import ImageWorkCoordinator
 from app.raster_book_runtime import RasterBookRuntime, RasterFrame
+from app.viewer_memory_policy import viewer_memory_mode_from_legacy_mib
 from app.viewer_window import ViewerWindow
 
 
@@ -1546,7 +1547,9 @@ def _run_worker(args: argparse.Namespace) -> dict[str, Any]:
             "viewer_prefetch_direction_priority_enabled": True,
             "viewer_prefetch_image_forward_units": 1,
             "viewer_prefetch_image_backward_units": 1,
-            "viewer_cache_max_memory_mib": int(args.cache_mib),
+            "viewer_memory_mode": viewer_memory_mode_from_legacy_mib(
+                args.cache_mib
+            ),
             "show_page_list": False,
         },
         save=True,

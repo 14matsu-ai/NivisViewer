@@ -47,6 +47,15 @@ def wait_until(qapp: QApplication, predicate, timeout: float = 2.0) -> bool:
 def finish_viewer_open(qapp: QApplication, viewer) -> None:
     assert viewer.book_session.wait_for_async(2000)
     qapp.processEvents()
+    deadline = monotonic() + 3
+    while (
+        viewer._pending_book_open_projection is not None
+        and monotonic() < deadline
+    ):
+        qapp.processEvents()
+        QTest.qWait(5)
+    qapp.processEvents()
+    assert viewer._pending_book_open_projection is None
 
 
 def test_start_creates_browser_and_shares_config(

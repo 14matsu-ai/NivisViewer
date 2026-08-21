@@ -24,6 +24,7 @@ from PySide6.QtWidgets import QApplication
 
 from app.config_manager import ConfigManager
 from app.image_work_coordinator import ImageWorkCoordinator
+from app.viewer_memory_policy import viewer_memory_mode_from_legacy_mib
 from app.viewer_render import ViewerRenderTask
 from app.viewer_window import ViewerWindow
 from app.zippla_compatible_raster_path import ZipPlaCompatibleRasterPage
@@ -390,7 +391,7 @@ def _viewer_case(
             "viewer_prefetch_direction_priority_enabled": True,
             "viewer_prefetch_image_forward_units": int(forward_units),
             "viewer_prefetch_image_backward_units": int(backward_units),
-            "viewer_cache_max_memory_mib": int(cache_mib),
+            "viewer_memory_mode": viewer_memory_mode_from_legacy_mib(cache_mib),
             "show_page_list": False,
         },
         save=True,
@@ -2613,7 +2614,7 @@ def _run_initial_cold(
             "viewer_prefetch_direction_priority_enabled": True,
             "viewer_prefetch_image_forward_units": 0,
             "viewer_prefetch_image_backward_units": 0,
-            "viewer_cache_max_memory_mib": 512,
+            "viewer_memory_mode": viewer_memory_mode_from_legacy_mib(512),
             "show_page_list": False,
         },
         save=True,
