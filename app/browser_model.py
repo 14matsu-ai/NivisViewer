@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 
@@ -18,6 +18,7 @@ from .browser_sort import (
 from .file_operation_artifact import FileOperationArtifactPolicy
 from .browser_scanner import BrowserScanEntry, scan_entry_from_dir_entry
 from .image_source import ARCHIVE_EXTENSIONS, PDF_EXTENSIONS, SUPPORTED_EXTENSIONS
+from .zippla_filename_metadata import zippla_display_name
 
 
 BROWSER_IMAGE_EXTENSIONS = set(SUPPORTED_EXTENSIONS)
@@ -48,6 +49,7 @@ class BrowserItem:
     can_generate_preview: bool = True
     preview_kind: str = ""
     preview_status: str = "pending"
+    rating: int | None = None
 
     @property
     def can_open(self) -> bool:
@@ -123,6 +125,7 @@ def browser_item_from_scan_entry(entry: BrowserScanEntry) -> BrowserItem:
         openable_by_nivisviewer=entry.openable_by_nivisviewer,
         can_generate_preview=entry.can_generate_preview,
         preview_kind=entry.preview_kind,
+        rating=entry.rating,
     )
 
 
@@ -142,6 +145,9 @@ class BrowserItemModel(QAbstractListModel):
     CanGeneratePreviewRole = PathRole + 12
     PreviewStatusRole = PathRole + 13
     CutRole = PathRole + 14
+    RatingRole = PathRole + 15
+    RatingPreviewRole = PathRole + 16
+    ImageDimensionsRole = PathRole + 17
 
     _KIND_LABELS = {
         BrowserItemKind.FOLDER: "フォルダ",
@@ -165,6 +171,8 @@ class BrowserItemModel(QAbstractListModel):
         self._thumbnail_errors: dict[str, str] = {}
         self._preview_statuses: dict[str, str] = {}
         self._cut_keys: frozenset[str] = frozenset()
+        self._rating_previews: dict[str, int] = {}
+        self._image_dimensions: dict[str, tuple[int, int]] = {}
         self._fallback_icons: dict[BrowserItemKind, QIcon] = {}
         self._row_by_key: dict[str, int] = {}
 
@@ -207,6 +215,12 @@ class BrowserItemModel(QAbstractListModel):
             )
         if role == self.CutRole:
             return self._key(item.path) in self._cut_keys
+        if role == self.RatingRole:
+            return item.rating
+        if role == self.RatingPreviewRole:
+            return self._rating_previews.get(self._key(item.path))
+        if role == self.ImageDimensionsRole:
+            return self._image_dimensions.get(self._key(item.path))
         if role == self.PathRole:
             return str(item.path)
         if role == self.KindRole:
@@ -265,6 +279,9 @@ class BrowserItemModel(QAbstractListModel):
             self._low_resolution_thumbnails.clear()
         self._thumbnail_errors.clear()
         self._preview_statuses.clear()
+        self._rating_previews.clear()
+        if not preserve_thumbnails:
+            self._image_dimensions.clear()
         self._scan_generation = None
         self._rebuild_row_index()
         self.endResetModel()
@@ -285,6 +302,8 @@ class BrowserItemModel(QAbstractListModel):
         self._low_resolution_thumbnails.clear()
         self._thumbnail_errors.clear()
         self._preview_statuses.clear()
+        self._rating_previews.clear()
+        self._image_dimensions.clear()
         self._scan_generation = int(generation)
         self._rebuild_row_index()
         self.endResetModel()
@@ -329,6 +348,8 @@ class BrowserItemModel(QAbstractListModel):
         self._low_resolution_thumbnails.clear()
         self._thumbnail_errors.clear()
         self._preview_statuses.clear()
+        self._rating_previews.clear()
+        self._image_dimensions.clear()
         self._row_by_key.clear()
         self._scan_generation = int(generation)
         self.endResetModel()
@@ -501,6 +522,146 @@ class BrowserItemModel(QAbstractListModel):
         index = self.index(row, 0)
         self.dataChanged.emit(index, index, [self.PreviewStatusRole])
         return True
+
+    def set_rating_preview(
+        self,
+        path: str | Path | None,
+        rating: int | None,
+    ) -> bool:
+        changed_rows: set[int] = set()
+        if path is None:
+            keys = tuple(self._rating_previews)
+            self._rating_previews.clear()
+            changed_rows.update(
+                row
+                for key in keys
+                if (row := self._row_by_key.get(key, -1)) >= 0
+            )
+        else:
+            key = self._key(Path(path))
+            row = self._row_by_key.get(key, -1)
+            if row < 0:
+                return False
+            normalized = (
+                int(rating)
+                if rating is not None and 1 <= int(rating) <= 5
+                else None
+            )
+            previous = self._rating_previews.get(key)
+            if normalized is None:
+                if key not in self._rating_previews:
+                    return False
+                self._rating_previews.pop(key, None)
+            elif previous == normalized:
+                return False
+            else:
+                self._rating_previews[key] = normalized
+            changed_rows.add(row)
+        for row in changed_rows:
+            index = self.index(row, 0)
+            self.dataChanged.emit(index, index, [self.RatingPreviewRole])
+        return bool(changed_rows)
+
+    def set_image_dimensions(
+        self,
+        path: str | Path,
+        dimensions: tuple[int, int],
+    ) -> bool:
+        row = self.row_for_path(path)
+        width, height = (max(1, int(value)) for value in dimensions)
+        if row < 0:
+            return False
+        key = self._key(Path(path))
+        normalized = (width, height)
+        if self._image_dimensions.get(key) == normalized:
+            return False
+        self._image_dimensions[key] = normalized
+        index = self.index(row, 0)
+        self.dataChanged.emit(index, index, [self.ImageDimensionsRole])
+        return True
+
+    def image_dimensions(self, path: str | Path) -> tuple[int, int] | None:
+        return self._image_dimensions.get(self._key(Path(path)))
+
+    def apply_rating_renames(
+        self,
+        replacements: tuple[tuple[str | Path, str | Path, int | None], ...],
+    ) -> bool:
+        """Relocate model identities while retaining decoded thumbnails."""
+
+        if not replacements:
+            return False
+        replacement_by_key = {
+            self._key(Path(old)): (Path(new), rating)
+            for old, new, rating in replacements
+        }
+        changed = False
+        new_source: list[BrowserItem] = []
+        for item in self._source_items:
+            replacement_value = replacement_by_key.get(self._key(item.path))
+            if replacement_value is None:
+                new_source.append(item)
+                continue
+            new_path, rating = replacement_value
+            new_source.append(
+                replace(
+                    item,
+                    path=new_path,
+                    display_name=zippla_display_name(new_path),
+                    rating=rating,
+                )
+            )
+            changed = True
+        if not changed:
+            return False
+
+        for old, new, _rating in replacements:
+            old_key = self._key(Path(old))
+            new_key = self._key(Path(new))
+            self._move_cache_key(self._icons, old_key, new_key)
+            self._move_cache_key(self._thumbnail_images, old_key, new_key)
+            self._move_cache_key(self._thumbnail_signatures, old_key, new_key)
+            self._move_cache_key(self._thumbnail_errors, old_key, new_key)
+            self._move_cache_key(self._preview_statuses, old_key, new_key)
+            self._move_cache_key(self._image_dimensions, old_key, new_key)
+            self._rating_previews.pop(old_key, None)
+            if old_key in self._low_resolution_thumbnails:
+                self._low_resolution_thumbnails.discard(old_key)
+                self._low_resolution_thumbnails.add(new_key)
+            if old_key in self._cut_keys:
+                self._cut_keys = frozenset(
+                    new_key if key == old_key else key
+                    for key in self._cut_keys
+                )
+
+        self.layoutAboutToBeChanged.emit()
+        self._source_items = new_source
+        self._source_keys = {self._key(item.path) for item in new_source}
+        self._items = self._sort_policy.sorted_items(new_source)
+        self._rebuild_row_index()
+        self.layoutChanged.emit()
+        for _old, new, _rating in replacements:
+            row = self.row_for_path(new)
+            if row >= 0:
+                index = self.index(row, 0)
+                self.dataChanged.emit(
+                    index,
+                    index,
+                    [
+                        int(Qt.ItemDataRole.DisplayRole),
+                        int(Qt.ItemDataRole.ToolTipRole),
+                        self.PathRole,
+                        self.ItemRole,
+                        self.RatingRole,
+                        self.RatingPreviewRole,
+                    ],
+                )
+        return True
+
+    @staticmethod
+    def _move_cache_key(cache: dict, old_key: str, new_key: str) -> None:
+        if old_key in cache:
+            cache[new_key] = cache.pop(old_key)
 
     def clear_thumbnails(self) -> None:
         if (

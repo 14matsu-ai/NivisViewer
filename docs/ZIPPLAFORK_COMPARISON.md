@@ -4595,3 +4595,82 @@ AGPL-3.0-or-later. License and copyright notices remain in
 separation structurally, not the WinForms/GDI control or bitmap statements;
 the bounded Qt artifact cache, DPR-aware identity, preview/full promotion,
 stale fences and `ViewTransform` are NivisViewer-specific implementations.
+
+## 24. Browser filename rating and file detail (2026-08-22)
+
+### 24.1 Fixed-revision ZipPlaFork contract
+
+The rating source was re-audited at fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`. `source/ZipPla/ZipPlaInfo.cs`
+class `ZipPlaInfo` constructs `fileNameRegex`, parses the first valid block in
+its constructor, exposes `Rating`, serializes known values with
+`GetInfoString`, and places the canonical block before the final extension in
+`GetPathOfCurrentInfo`. The grammar is a case-insensitive, optional
+single-leading-space block `{zpi$...}`. Known semicolon-separated parameters
+are serialized in `c`, `b`, `r`, `t`, `d` order. Rating is `r=1` through
+`r=5`; no token means unrated, and zero is not a separately persisted state.
+Changing only `Rating` preserves parsed cover, binding, tags and legacy
+direction. Invalid blocks such as `r=0`, `r=6` or unknown parameters do not
+match the whole metadata grammar and remain ordinary filename text.
+
+`source/ZipPla/CatalogForm.cs` draws five stars at the thumbnail's upper-left
+after the thumbnail layer: completed stars are Gold and remaining stars are
+LightSlateGray over a black background. It also draws before thumbnail loading
+has completed. Horizontal position maps linearly and clamps to 1..5. Hover is
+preview-only; left click changes the pointed item even when other rows are
+selected, middle click clears it, and context-menu commands apply none/1..5 to
+all selected items. Rating sorting leaves unrated entries behind rated entries
+in both directions. The fixed revision contains rating filtering, but
+NivisViewer has no existing Browser query/filter authority into which it can
+be added without inventing a new language, so filter support remains a future
+UX unit.
+
+### 24.2 NivisViewer Hybrid implementation
+
+`app/zippla_filename_metadata.py` is a direct Python structural translation of
+the parser/serializer contract above. `app/rating_rename_service.py` performs a
+same-directory rename only: it checks collision, never rewrites payload bytes,
+verifies nanosecond mtime after rename, and restores only if the backend
+changed it. Browser scanning parses the filename without opening the file and
+separates physical path from the metadata-free display name.
+
+`BrowserItemModel` owns the parsed value, preview value and rating sort. Its
+rating-rename relocation changes the path identity in place, migrates the
+existing thumbnail `QImage`, preview/error/signature, cut state and cached
+dimensions, and then re-sorts without a directory rescan. Therefore a direct
+rating change performs no image read/decode and no QPixmap construction.
+Selection/current/scroll identities are remapped after a rating sort move.
+Browser navigation snapshots already derive from the model's visible order,
+so rating-sorted Folder Viewer next/previous retains that same topology.
+
+`BrowserItemDelegate` provides a DPR-aware upper-left overlay, five-way hit
+test and hover preview while preserving IconMode virtualization. A direct
+left/middle click is consumed before Qt changes the multiselection, so it
+changes that one file only. The context menu is the explicit batch authority.
+Files owned by a live Viewer use the existing affected-Viewer confirmation and
+close contract; the current immutable Folder book topology has no safe live
+path-relocation API. NivisViewer has no filesystem watcher in this Browser, so
+there is no duplicate self-event to suppress; the model is updated
+synchronously and a later explicit refresh reads the filename authority.
+
+The status bar's permanent right-hand `browser_file_detail_label` contains
+only file size and logical image dimensions. Dimensions reuse the Browser
+model cache or a one-thread Pillow header probe (no pixel `load`); EXIF
+orientations 5..8 swap logical axes. A selection generation plus normalized
+path identity rejects late results. Archive/PDF/folder selections do not probe
+cover dimensions, and multi-selection retains the existing left-hand status
+while clearing this single-image detail.
+
+### 24.3 Provenance
+
+The translated grammar, star interaction and sort semantics derive from
+[`himamon/ZipPlaFork`](https://github.com/himamon/ZipPlaFork), revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, principally
+`source/ZipPla/ZipPlaInfo.cs` (`ZipPlaInfo` constructor, `Rating`,
+`GetInfoString`, `GetPathOfCurrentInfo`) and `source/ZipPla/CatalogForm.cs`
+(catalog rating paint/hit/rename/context/sort handlers). That source is
+AGPL-3.0-or-later. Original notices and license text remain in
+`licenses/ZipPlaFork/About.txt`, `licenses/ZipPlaFork/AGPL.txt`, and
+`THIRD_PARTY_NOTICES.md`. Qt delegate painting, asynchronous header probing,
+model cache relocation, stale fences and status-bar placement are
+NivisViewer-specific modernizations.

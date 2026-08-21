@@ -373,6 +373,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
             self._paint_type_icon(painter, thumbnail_rect, item)
             if index.data(BrowserItemModel.ThumbnailErrorRole):
                 self._paint_error_badge(painter, thumbnail_rect)
+            self._paint_rating(painter, option, index)
             self._paint_title(painter, option, thumbnail_rect, item.display_name)
             painter.setOpacity(1.0)
             self._paint_interaction_frame(
@@ -511,6 +512,75 @@ class BrowserItemDelegate(QStyledItemDelegate):
                 line,
             )
             y += metrics.lineSpacing()
+
+    def rating_overlay_rect(
+        self,
+        cell_rect: QRect,
+        font: QFont | None = None,
+    ) -> QRect:
+        thumbnail_rect = self.grid_metrics.thumbnail_frame_rect(cell_rect)
+        rating_font = QFont(font or QFont())
+        rating_font.setPointSize(max(8, min(11, self.profile.font_size)))
+        metrics = QFontMetrics(rating_font)
+        return QRect(
+            thumbnail_rect.left() + 2,
+            thumbnail_rect.top() + 2,
+            metrics.horizontalAdvance("★★★★★") + 8,
+            metrics.height() + 4,
+        ).intersected(thumbnail_rect)
+
+    def rating_at_position(
+        self,
+        cell_rect: QRect,
+        position,
+        font: QFont | None = None,
+    ) -> int | None:
+        overlay = self.rating_overlay_rect(cell_rect, font)
+        stars = overlay.adjusted(4, 0, -4, 0)
+        if stars.isEmpty() or not overlay.contains(position):
+            return None
+        relative = position.x() - stars.left()
+        return max(1, min(5, (5 * relative // max(1, stars.width())) + 1))
+
+    def _paint_rating(
+        self,
+        painter: QPainter,
+        option: QStyleOptionViewItem,
+        index: QModelIndex,
+    ) -> None:
+        item = index.data(BrowserItemModel.ItemRole)
+        if item is None or item.kind is BrowserItemKind.FOLDER:
+            return
+        current = index.data(BrowserItemModel.RatingRole)
+        preview = index.data(BrowserItemModel.RatingPreviewRole)
+        rating = preview if isinstance(preview, int) else current
+        rating = int(rating) if isinstance(rating, int) else 0
+        rating = max(0, min(5, rating))
+        rating_font = QFont(option.font)
+        rating_font.setPointSize(max(8, min(11, self.profile.font_size)))
+        overlay = self.rating_overlay_rect(option.rect, rating_font)
+        if overlay.isEmpty():
+            return
+        painter.save()
+        painter.setFont(rating_font)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 218))
+        painter.drawRoundedRect(QRectF(overlay), 3, 3)
+        text_rect = overlay.adjusted(4, 2, -4, -2)
+        painter.setPen(QColor("#778899"))
+        painter.drawText(
+            text_rect,
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            "★★★★★",
+        )
+        if rating:
+            painter.setPen(QColor("#ffd700"))
+            painter.drawText(
+                text_rect,
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                "★★★★★"[:rating],
+            )
+        painter.restore()
 
     def _paint_type_icon(
         self,

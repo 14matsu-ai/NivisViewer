@@ -19,6 +19,7 @@ from .browser_visibility import (
 from .image_source import ARCHIVE_EXTENSIONS, PDF_EXTENSIONS, SUPPORTED_EXTENSIONS
 from .file_operation_artifact import FileOperationArtifactPolicy
 from .performance_trace import performance_trace
+from .zippla_filename_metadata import ZipPlaFilenameMetadata
 
 if TYPE_CHECKING:
     from .browser_model import BrowserItem
@@ -79,6 +80,7 @@ class BrowserScanEntry:
     openable_by_nivisviewer: bool = True
     can_generate_preview: bool = True
     preview_kind: str = ""
+    rating: int | None = None
 
 
 @dataclass(frozen=True)
@@ -211,9 +213,10 @@ def scan_entry_from_dir_entry(
             entry_stat = entry.stat(follow_symlinks=False)
         except OSError:
             entry_stat = None
+    filename_metadata = ZipPlaFilenameMetadata.parse(entry.path)
     return BrowserScanEntry(
         path=str(Path(entry.path).absolute()),
-        display_name=name,
+        display_name=filename_metadata.display_name,
         item_kind=item_kind,
         modified_time_ns=(
             entry_stat.st_mtime_ns if entry_stat is not None else None
@@ -229,6 +232,7 @@ def scan_entry_from_dir_entry(
         openable_by_nivisviewer=supported,
         can_generate_preview=True,
         preview_kind=preview_kind,
+        rating=filename_metadata.rating,
     )
 
 
