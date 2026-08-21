@@ -244,17 +244,23 @@ def test_folder_runtime_reuses_decoded_source_across_layout_variants(
                 (500, 360),
                 device_pixel_ratio=1.5,
                 decoder_maximum_size=(60, 90),
+                downscale_algorithm="nearest",
+                upscale_algorithm="nearest",
             ),
             RasterRenderSpec(
                 (900, 650),
                 rotation=90,
                 decoder_maximum_size=(900, 650),
                 decoder_layout_sized=True,
+                downscale_algorithm="sharp",
+                upscale_algorithm="lanczos",
             ),
             RasterRenderSpec(
                 (720, 520),
                 device_pixel_ratio=2.0,
                 decoder_maximum_size=(100, 150),
+                downscale_algorithm="area",
+                upscale_algorithm="bilinear",
             ),
         )
         expected_decodes = (1, 1, 2, 2)

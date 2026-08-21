@@ -26,9 +26,9 @@ DOWNSCALE_ALGORITHM_LABELS = {
     "auto": "自動",
     "fast": "高速",
     "smooth": "滑らか",
-    "sharp": "鮮明",
+    "sharp": "シャープ",
     "area": "面積平均",
-    "nearest": "ニアレストネイバー",
+    "nearest": "最近傍",
 }
 
 UPSCALE_ALGORITHM_LABELS = {
@@ -36,7 +36,7 @@ UPSCALE_ALGORITHM_LABELS = {
     "bilinear": "バイリニア",
     "bicubic": "バイキュービック",
     "lanczos": "Lanczos",
-    "nearest": "ニアレストネイバー",
+    "nearest": "最近傍",
 }
 
 

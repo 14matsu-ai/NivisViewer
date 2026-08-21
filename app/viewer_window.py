@@ -478,6 +478,7 @@ class ViewerWindow(QMainWindow):
         self._pending_raster_input_kind: NavigationInputKind | None = None
         self._pending_raster_repeat_key: int | None = None
         self._navigation_repeat_key: int | None = None
+        self._active_viewer_pan_keys: set[int] = set()
         self._navigation_wheel_timestamp_ns: int | None = None
         self._navigation_admission = NavigationAdmissionPolicy()
         self._pending_presentation_side_effect_token: (
@@ -5458,16 +5459,39 @@ class ViewerWindow(QMainWindow):
         return None
 
     def _handle_navigation_key_event(self, event: QKeyEvent) -> bool:
+        key = int(event.key())
+        modifiers = event.modifiers()
+        event_type = event.type()
+        if (
+            event_type == QEvent.Type.ShortcutOverride
+            and self.viewer.can_pan_with_key(key, modifiers)
+        ):
+            event.accept()
+            return True
+        if event_type == QEvent.Type.KeyPress and self.viewer.pan_with_key(
+            key,
+            modifiers,
+        ):
+            self._active_viewer_pan_keys.add(key)
+            event.accept()
+            return True
+        if (
+            event_type == QEvent.Type.KeyRelease
+            and key in self._active_viewer_pan_keys
+        ):
+            if not event.isAutoRepeat():
+                self._active_viewer_pan_keys.discard(key)
+            event.accept()
+            return True
+
         action = self._navigation_key_action(event)
         if action is None:
             return False
-        event_type = event.type()
         if event_type == QEvent.Type.ShortcutOverride:
             # Suppress the legacy zero-argument QShortcut/QAction route so the
             # following QKeyEvent retains initial/repeat/release identity.
             event.accept()
             return True
-        key = int(event.key())
         if event_type == QEvent.Type.KeyRelease:
             if not event.isAutoRepeat():
                 self._finish_key_repeat_navigation(key)
