@@ -586,6 +586,14 @@ class ZipRasterRuntimeMetrics:
     source_cache_misses: int = 0
     source_cache_evictions: int = 0
     startup_runway_releases: int = 0
+    continuous_warmup_releases: int = 0
+    warmup_planner_creations: int = 0
+    warmup_planner_recenters: int = 0
+    work_order_changes: int = 0
+    running_job_adoptions: int = 0
+    queued_job_replacements: int = 0
+    finished_job_slot_releases: int = 0
+    compatible_old_results: int = 0
     prefetch_admission_stops: int = 0
     oversized_prefetch_skips: int = 0
 
@@ -2241,8 +2249,7 @@ class RasterBookRuntime(QObject):
             ZipRasterDisplayUnit,
             tuple[tuple[int, str], ...],
         ] | None = None
-        self._startup_runway_released_request_id: int | None = None
-        self._prefetch_released_request_id: int | None = None
+        self._planner_render_spec: ZipRasterRenderSpec | None = None
         self._prefetch_admission_stopped_request_id: int | None = None
         self._dispatch_suspended = False
         self._painted_key: _UnitKey | None = None
@@ -2250,6 +2257,7 @@ class RasterBookRuntime(QObject):
         self._source_hydration_frame: _CachedFrame | None = None
         self._active_job: _ZipRasterUnitJob | None = None
         self._jobs: set[_ZipRasterUnitJob] = set()
+        self._pending_completion_keys: set[_UnitKey] = set()
         self._failed_prefetch: set[_UnitKey] = set()
         # Admission rejection is capacity state, not a broken page.  Keep it
         # separate so a later budget increase can retry the same paint-
@@ -2354,6 +2362,24 @@ class RasterBookRuntime(QObject):
         ready_pages = set(self._frame_store.page_indexes)
         source_pages = set(self._source_store.page_indexes)
         planner = self._warmup_planner
+        request = self._current_request
+        priority_identities = (
+            request.warmup_plan.priority_band_identities(
+                preferred_units=4,
+                opposite_units=1,
+            )
+            if request is not None
+            else ()
+        )
+        ready_priority_units = 0
+        if request is not None:
+            for identity in priority_identities:
+                unit = request.warmup_plan.unit_for_identity(identity)
+                if unit is not None and (
+                    self._key_for(unit, request.render_spec)
+                    in self._frame_store
+                ):
+                    ready_priority_units += 1
         return {
             "hard_limit_bytes": self._cache_byte_budget,
             "soft_target_bytes": self._cache_soft_target_bytes,
@@ -2368,6 +2394,7 @@ class RasterBookRuntime(QObject):
             ),
             "ready_page_count": len(ready_pages),
             "ready_unit_count": self.cached_unit_count,
+            "ready_ahead_unit_count": ready_priority_units,
             "source_page_count": len(source_pages),
             "source_only_page_count": len(source_pages - ready_pages),
             "unprocessed_unit_count": self.unprocessed_unit_count,
@@ -2380,11 +2407,36 @@ class RasterBookRuntime(QObject):
             "startup_runway_target_units": (
                 planner.startup_target_count if planner is not None else 0
             ),
+            "priority_band_target_units": (
+                planner.startup_target_count if planner is not None else 0
+            ),
             "cache_hits": self._metrics.cache_hits,
             "cache_misses": self._metrics.cache_misses,
             "jobs_submitted": self._metrics.jobs_submitted,
             "startup_runway_releases": (
                 self._metrics.startup_runway_releases
+            ),
+            "continuous_warmup_releases": (
+                self._metrics.continuous_warmup_releases
+            ),
+            "warmup_planner_creations": (
+                self._metrics.warmup_planner_creations
+            ),
+            "warmup_planner_recenters": (
+                self._metrics.warmup_planner_recenters
+            ),
+            "work_order_changes": self._metrics.work_order_changes,
+            "running_job_adoptions": (
+                self._metrics.running_job_adoptions
+            ),
+            "queued_job_replacements": (
+                self._metrics.queued_job_replacements
+            ),
+            "finished_job_slot_releases": (
+                self._metrics.finished_job_slot_releases
+            ),
+            "compatible_old_results": (
+                self._metrics.compatible_old_results
             ),
             "cancel_requests": self._metrics.cancel_requests,
             "stale_results": self._metrics.stale_results,
@@ -2490,8 +2542,11 @@ class RasterBookRuntime(QObject):
                 earliest_retry_rank is not None
                 and earliest_retry_rank < active_rank
             )
-            if should_reprioritize:
-                self._cancel_active_job()
+            replaced_queued = bool(
+                should_reprioritize and self._take_unstarted_job(active)
+            )
+            if replaced_queued:
+                self._bump("queued_job_replacements")
             elif active.expand_prefetch_budget(
                 self._prefetch_worker_budget(active.key)
             ):
@@ -2569,6 +2624,7 @@ class RasterBookRuntime(QObject):
             or request.source_epoch != self.source_epoch
         ):
             return False
+        self._release_finished_active_slot()
         if self._dispatch_suspended and self._current_request is request:
             # Window dispatches the exact object it staged.  Retention,
             # cancellation and work-order replacement already happened at
@@ -2602,9 +2658,21 @@ class RasterBookRuntime(QObject):
             self._restore_source_hydration_frame()
         self._current_request = request
         self._current_key = current_key
-        self._warmup_planner = RasterWarmupPlanner(request.warmup_plan)
-        self._startup_runway_released_request_id = None
-        self._prefetch_released_request_id = None
+        planner = self._warmup_planner
+        if planner is None:
+            planner = RasterWarmupPlanner(request.warmup_plan)
+            self._warmup_planner = planner
+            self._bump("warmup_planner_creations")
+        else:
+            planner.recenter(request.warmup_plan)
+            self._bump("warmup_planner_recenters")
+            self._bump("work_order_changes")
+            if self._planner_render_spec != request.render_spec:
+                # Capacity observations belong to a physical render
+                # signature.  Layout/DPR changes keep the book-scoped owner,
+                # but reconsider every unit under the new byte cost.
+                planner.reset_capacity()
+        self._planner_render_spec = request.render_spec
         self._prefetch_admission_stopped_request_id = None
         self._dispatch_suspended = bool(suspend_dispatch)
         evicted = self._frame_store.set_retention_plan(
@@ -2622,58 +2690,111 @@ class RasterBookRuntime(QObject):
         )
         self._record_source_evictions(source_evicted)
         self._enforce_combined_budget()
-        # Admission/failure suppression belongs to one replaceable work order.
-        # A later navigation may make a previously rejected neighbor current,
-        # and must get a fresh attempt.
-        self._failed_prefetch.clear()
-        self._admission_declined_prefetch.clear()
-        self._capacity_retry_after_completion.clear()
+        # Broken/capacity state is book work state, not navigation state.  Only
+        # the newly interactive current gets a targeted retry; other scanned
+        # units retain their suppression across page turns.
+        self._failed_prefetch.discard(current_key)
+        self._admission_declined_prefetch.discard(current_key)
+        self._capacity_retry_after_completion.discard(current_key)
+        planner.discard_capacity_skip(request.current.identity)
+        urgent_identities = set(
+            request.warmup_plan.priority_band_identities(
+                preferred_units=4,
+                opposite_units=1,
+            )
+        )
+        for declined_key in tuple(self._admission_declined_prefetch):
+            if (
+                declined_key.render_spec == request.render_spec
+                and declined_key.unit_identity in urgent_identities
+            ):
+                # A prior soft-target/far decline is not terminal. Promotion
+                # into the new current's ready-ahead band gives it hard-budget
+                # urgency without resetting unrelated book scan state.
+                self._admission_declined_prefetch.discard(declined_key)
+                self._failed_prefetch.discard(declined_key)
+                self._capacity_retry_after_completion.discard(declined_key)
+                planner.discard_capacity_skip(declined_key.unit_identity)
 
+        self._release_finished_active_slot()
         active = self._active_job
         if active is not None:
             active_cancelled = active.cancelled.is_set()
             if active.key == current_key and not active_cancelled:
                 active.adopt_request(request.request_id, as_current=True)
             elif (
-                not suspend_dispatch
-                and not active_cancelled
-                and current_key in self._frame_store
-                and active.key == self._first_missing_startup_key(request)
+                not active_cancelled
+                and self._active_job_is_artifact_compatible(active, request)
             ):
-                # Preserve a background decode only when it is the exact first
-                # missing complete unit in the replacement runway.  Merely
-                # remaining rank 1/2 is insufficient after direction reversal:
-                # an obsolete reverse-side job must not delay the new frontier.
-                active.adopt_request(request.request_id)
+                # ZipPlaFork never cancels the sole started page merely because
+                # navigation changed current; only the unstarted order moves.
+                # Keep that book-work ownership while retaining NivisViewer's
+                # requested/displayed split: the final target is accepted now,
+                # but this compatible result becomes cache data unless it is
+                # also the latest presentation key.  Cancelling here cannot
+                # start the replacement until the occupied worker exits, and
+                # would discard the one artifact produced during that wait.
+                if self._take_unstarted_job(active):
+                    self._bump("queued_job_replacements")
+                else:
+                    # tryTake-before-cancel closes the dequeue race: if Qt has
+                    # just started the compatible job, preserve/adopt it
+                    # instead of setting a cancellation flag that would throw
+                    # away the same work after it consumes the worker slot.
+                    active.adopt_request(request.request_id)
+                    self._bump("running_job_adoptions")
             else:
                 self._cancel_active_job()
 
-    def _first_missing_startup_key(
+    def _active_job_is_artifact_compatible(
         self,
+        active: _ZipRasterUnitJob,
         request: ZipRasterRequest,
-    ) -> _UnitKey | None:
-        for unit in request.warmup_plan.startup_runway_units(
-            preferred_units=4,
-            opposite_units=1,
+    ) -> bool:
+        if (
+            active.key.source_epoch != self.source_epoch
+            or active.key.source_identity != self._source_identity
+            or active.key.render_spec != request.render_spec
         ):
-            key = self._key_for(unit, request.render_spec)
-            if key in self._frame_store or key in self._failed_prefetch:
-                continue
-            return key
-        return None
+            return False
+        return request.warmup_plan.contains_identity(
+            active.key.unit_identity
+        )
 
-    def release_startup_runway(self, *, request_id: int) -> bool:
-        """Build a memory-admitted ready runway after an accepted commit.
+    def _release_finished_active_slot(self) -> bool:
+        active = self._active_job
+        if active is None or not active.finished.is_set():
+            return False
+        # QRunnable ownership ended before its queued GUI result was drained.
+        # Free the one-worker scheduling slot now, while a key ledger prevents
+        # a duplicate decode of that pending artifact. This lets a different
+        # final cold target start before the old page's QPixmap upload and
+        # presentation callback.
+        self._active_job = None
+        self._pending_completion_keys.add(active.key)
+        self._bump("finished_job_slot_releases")
+        return True
 
-        The desired four reading-direction units plus one reverse unit are
-        complete display units, not a retention cap.  ``_drive`` still admits
-        every unit against the combined source+frame byte policy, and the
-        single active Viewer worker continues from one completion to the next
-        without waiting for a physical paint acknowledgement between units.
-        Once that runway is exhausted the same planner continues into
-        book-wide population without another scheduler gate.  Paint remains
-        only the ownership boundary for non-critical UI projection and
-        retirement cleanup.
+    def _take_unstarted_job(self, job: _ZipRasterUnitJob) -> bool:
+        """Replace queued work without first poisoning a possible runner."""
+
+        if job.started.is_set() or job.finished.is_set():
+            return False
+        if not self._try_take(job):
+            return False
+        job.mark_removed_before_start()
+        self._jobs.discard(job)
+        if self._active_job is job:
+            self._active_job = None
+        self._emit_idle_if_needed()
+        return True
+
+    def release_continuous_warmup(self, *, request_id: int) -> bool:
+        """Activate book-scoped population after the first complete commit.
+
+        Four reading-direction units plus one reverse unit form only the
+        urgent prefix of one continuous all-book order. Navigation recenters
+        the same owner; physical paint never re-releases scheduling.
         """
 
         request = self._current_request
@@ -2684,18 +2805,24 @@ class RasterBookRuntime(QObject):
             or self._current_key not in self._frame_store
         ):
             return False
-        if self._startup_runway_released_request_id == request.request_id:
-            return True
-        self._startup_runway_released_request_id = request.request_id
-        self._bump("startup_runway_releases")
         planner = self._warmup_planner
         if planner is not None:
-            planner.release_startup_runway(
+            released = planner.release_after_first_commit(
                 preferred_units=4,
                 opposite_units=1,
             )
+            if released:
+                # Keep the legacy metric name for existing diagnostics while
+                # making the new book-scoped meaning explicit.
+                self._bump("startup_runway_releases")
+                self._bump("continuous_warmup_releases")
         self._drive()
         return True
+
+    def release_startup_runway(self, *, request_id: int) -> bool:
+        """Compatibility adapter for the former request-scoped phase."""
+
+        return self.release_continuous_warmup(request_id=request_id)
 
     def release_prefetch(self, *, request_id: int) -> bool:
         request = self._current_request
@@ -2721,10 +2848,21 @@ class RasterBookRuntime(QObject):
         # successful prefetch (which may never exist at an end page or with
         # prefetch disabled).
         self._enforce_combined_budget()
-        self._prefetch_released_request_id = request.request_id
+        # Paint transfers displayed ownership and may free the preceding
+        # frame.  It is deliberately not a raster scheduling release; the
+        # continuous one-worker planner was activated by the first accepted
+        # complete commit.
         planner = self._warmup_planner
-        if planner is not None:
-            planner.release_after_paint()
+        if (
+            planner is not None
+            and planner.background_released
+            and planner.stop_reason
+            in {WarmupStopReason.SOFT_TARGET, WarmupStopReason.HARD_LIMIT}
+            and self.cache_bytes < self._cache_soft_target_bytes
+        ):
+            # Ownership transfer can make bytes available again. Reconsider
+            # the existing order without changing its released/book lifetime.
+            planner.recenter(planner.plan)
         self._drive()
         return True
 
@@ -2737,8 +2875,7 @@ class RasterBookRuntime(QObject):
         self._current_request = None
         self._current_key = None
         self._warmup_planner = None
-        self._startup_runway_released_request_id = None
-        self._prefetch_released_request_id = None
+        self._planner_render_spec = None
         self._prefetch_admission_stopped_request_id = None
         self._dispatch_suspended = False
         self._painted_key = None
@@ -2754,11 +2891,47 @@ class RasterBookRuntime(QObject):
         self._source_store.set_retention_plan(None, None, None, 0)
         self._source_store.set_displayed_unit(None, None)
 
+    def suspend(self) -> None:
+        """Pause a provisional replacement without ending this book owner.
+
+        A failed replacement resumes the same runtime.  Preserve its planner,
+        completed artifacts, scan/admission ledger and displayed retention;
+        only stop publication and the sole active worker.  A successful
+        replacement subsequently retires this runtime through the normal
+        book-lifetime shutdown boundary.
+        """
+
+        if not self._accepting_requests:
+            return
+        self._restore_source_hydration_frame()
+        self._dispatch_suspended = True
+        planner = self._warmup_planner
+        if planner is not None:
+            planner.suspend()
+        self._cancel_active_job()
+
     def invalidate_layout(self) -> None:
         # Layout-dependent QPixmaps are invalid, but decoded archive content
         # remains valid.  Keeping this boundary is what prevents resize, DPI,
         # rotation, and magnifier transitions from reopening the same entry.
-        self.cancel(clear_artifacts=False)
+        self._restore_source_hydration_frame()
+        self._current_request = None
+        self._current_key = None
+        self._planner_render_spec = None
+        self._prefetch_admission_stopped_request_id = None
+        self._dispatch_suspended = False
+        self._painted_key = None
+        self._failed_prefetch.clear()
+        self._admission_declined_prefetch.clear()
+        self._capacity_retry_after_completion.clear()
+        planner = self._warmup_planner
+        if planner is not None:
+            planner.suspend()
+        self._cancel_active_job()
+        self._frame_store.set_retention_plan(None, None, 0)
+        self._frame_store.set_displayed_key(None)
+        self._source_store.set_retention_plan(None, None, None, 0)
+        self._source_store.set_displayed_unit(None, None)
         self._frame_store.clear()
 
     def has_unfinished_tasks(self) -> bool:
@@ -2813,19 +2986,19 @@ class RasterBookRuntime(QObject):
         ):
             return
         if self._current_key not in self._frame_store:
+            if self._has_pending_completion(self._current_key):
+                return
             self._submit(self._current_key, ImageWorkPriority.VIEWER_CURRENT)
-            return
-        if (
-            self._startup_runway_released_request_id != request.request_id
-            and self._prefetch_released_request_id != request.request_id
-        ):
             return
         while True:
             unit = planner.next_candidate(
                 identity_of=lambda candidate: candidate.identity,
                 is_ready=lambda candidate: (
-                    self._key_for(candidate, request.render_spec)
+                    (
+                        key := self._key_for(candidate, request.render_spec)
+                    )
                     in self._frame_store
+                    or self._has_pending_completion(key)
                 ),
                 is_terminal_failure=lambda candidate: (
                     self._key_for(candidate, request.render_spec)
@@ -2860,20 +3033,52 @@ class RasterBookRuntime(QObject):
                     self._prefetch_admission_stopped_request_id = request.request_id
                     self._bump("prefetch_admission_stops")
                 continue
-            rank = request.warmup_plan.rank_for_identity(unit.identity) or 1
             priority = (
                 ImageWorkPriority.VIEWER_NEXT
-                if rank == 1
+                if unit.identity
+                in request.warmup_plan.priority_band_identities(
+                    preferred_units=4,
+                    opposite_units=1,
+                )
                 else ImageWorkPriority.VIEWER_PREVIOUS
             )
             self._submit(key, priority)
             return
+
+    def _has_pending_completion(self, key: _UnitKey) -> bool:
+        if key in self._pending_completion_keys:
+            return True
+        # A worker can set ``finished`` between GUI-side observations. Scanning
+        # the small lifetime set keeps duplicate prevention correct even before
+        # navigation has explicitly detached that finished active slot.
+        return any(
+            job.key == key and job.finished.is_set()
+            for job in self._jobs
+        )
 
     def _background_rank(self, key: _UnitKey) -> int | None:
         request = self._current_request
         if request is None or key.render_spec != request.render_spec:
             return None
         return request.warmup_plan.rank_for_identity(key.unit_identity)
+
+    def _admission_rank(self, key: _UnitKey) -> int | None:
+        """Map the continuously maintained ready-ahead band to hard budget.
+
+        This is scheduling urgency only.  Retention and eviction continue to
+        use the full distance/direction rank and the combined byte budget.
+        """
+
+        rank = self._background_rank(key)
+        request = self._current_request
+        if rank is None or request is None:
+            return rank
+        if key.unit_identity in request.warmup_plan.priority_band_identities(
+            preferred_units=4,
+            opposite_units=1,
+        ):
+            return min(rank, self._admission_policy.minimum_protected_rank)
+        return rank
 
     def _unit_for_key(self, key: _UnitKey) -> ZipRasterDisplayUnit | None:
         request = self._current_request
@@ -2902,7 +3107,12 @@ class RasterBookRuntime(QObject):
         result immediately before it enters the stores.
         """
         rank = self._background_rank(key)
-        if not self._frame_store.can_admit_prefetch(key) or rank is None:
+        admission_rank = self._admission_rank(key)
+        if (
+            not self._frame_store.can_admit_prefetch(key)
+            or rank is None
+            or admission_rank is None
+        ):
             return self._admission_policy.decide_background(
                 retained_bytes=self.cache_bytes,
                 estimated_bytes=self._cache_byte_budget + 1,
@@ -2915,7 +3125,7 @@ class RasterBookRuntime(QObject):
                 retained_bytes=self.cache_bytes,
                 estimated_bytes=self._cache_byte_budget + 1,
                 reclaimable_lower_rank_bytes=0,
-                rank=rank,
+                rank=admission_rank,
             )
         source_candidates = self._source_store.lower_rank_reclaim_candidates(
             unit,
@@ -2950,7 +3160,7 @@ class RasterBookRuntime(QObject):
                 retained_bytes=self.cache_bytes,
                 estimated_bytes=None,
                 reclaimable_lower_rank_bytes=reclaimable_bytes,
-                rank=rank,
+                rank=admission_rank,
             )
         source_bytes = self._estimated_missing_source_bytes(
             unit,
@@ -2966,7 +3176,7 @@ class RasterBookRuntime(QObject):
             retained_bytes=self.cache_bytes,
             estimated_bytes=required_bytes,
             reclaimable_lower_rank_bytes=reclaimable_bytes,
-            rank=rank,
+            rank=admission_rank,
         )
 
     def _lower_rank_reclaim_plan(
@@ -3022,7 +3232,7 @@ class RasterBookRuntime(QObject):
         """Return free bytes plus every strictly lower-rank reservation."""
 
         unit = self._unit_for_key(key)
-        rank = self._background_rank(key)
+        rank = self._admission_rank(key)
         if unit is None or rank is None:
             return 0
         target = self._admission_policy.target_for_rank(rank)
@@ -3376,6 +3586,7 @@ class RasterBookRuntime(QObject):
     @Slot(object)
     def _on_job_completed(self, result: _JobResult) -> None:
         self._bump("queued_callbacks")
+        self._pending_completion_keys.discard(result.key)
         active = self._active_job
         if active is not None and active.serial == result.serial:
             self._active_job = None
@@ -3383,7 +3594,7 @@ class RasterBookRuntime(QObject):
             if job.serial == result.serial:
                 self._jobs.discard(job)
                 break
-        if not self._result_is_relevant(result):
+        if not self._result_is_artifact_compatible(result):
             self._capacity_retry_after_completion.discard(result.key)
             self._bump("stale_results")
             self._drive()
@@ -3421,6 +3632,15 @@ class RasterBookRuntime(QObject):
             self._drive()
             self._emit_idle_if_needed()
             return
+
+        request_at_completion = self._current_request
+        if (
+            request_at_completion is not None
+            and result.request_id != request_at_completion.request_id
+        ):
+            # The immutable unit/render key is still useful book cache data.
+            # Only frame publication is tied to the latest request serial.
+            self._bump("compatible_old_results")
 
         self._capacity_retry_after_completion.discard(result.key)
         existing_before_result = self._frame_store.get(
@@ -3483,7 +3703,7 @@ class RasterBookRuntime(QObject):
                 + display_bytes
                 - existing_frame_bytes
             )
-            result_rank = self._background_rank(result.key)
+            result_rank = self._admission_rank(result.key)
             result_target = self._admission_policy.target_for_rank(
                 result_rank
                 if result_rank is not None
@@ -3623,14 +3843,11 @@ class RasterBookRuntime(QObject):
         self._drive()
         self._emit_idle_if_needed()
 
-    def _result_is_relevant(self, result: _JobResult) -> bool:
+    def _result_is_artifact_compatible(self, result: _JobResult) -> bool:
         request = self._current_request
         return bool(
             self._accepting_requests
             and request is not None
-            # The request token distinguishes an adopted job from a callback
-            # already queued before navigation replaced the lazy warm-up plan.
-            and result.request_id == request.request_id
             and result.key.source_epoch == self.source_epoch
             and result.key.source_identity == self._source_identity
             and result.key.render_spec == request.render_spec

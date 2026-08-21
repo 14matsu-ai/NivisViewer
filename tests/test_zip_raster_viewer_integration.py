@@ -6,6 +6,7 @@ from time import monotonic
 import zipfile
 
 from PIL import Image
+import pytest
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt
 from PySide6.QtGui import QKeyEvent, QWheelEvent
 from PySide6.QtTest import QTest
@@ -16,6 +17,7 @@ from app.config_manager import ConfigManager
 from app.image_source import ImageSourceError, ZipImageSource
 from app.raster_warmup_planner import RasterBookTopology, RasterWarmupPlan
 from app.viewer_navigation_policy import NavigationInputKind
+from app.viewer_presentation_state import PresentationSurfaceMode
 from app.viewer_window import ViewerWindow
 from app.zip_raster_book_runtime import (
     ZipRasterDisplayUnit,
@@ -165,6 +167,84 @@ def test_zip_first_paint_populates_book_wide_display_ready_cache(
             is layout_request.warmup_plan.topology
         )
     finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_cold_first_frame_resize_fences_old_layout_without_idle_prompt(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    archive = _write_zip(tmp_path, pages=1)
+
+    class BlockingZipSource(ZipImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.entered = Event()
+            self.release = Event()
+
+        def open_image(self, image_id: str) -> Image.Image:
+            self.entered.set()
+            self.release.wait(3.0)
+            return super().open_image(image_id)
+
+    source = BlockingZipSource(archive)
+    session = BookSession(
+        source_factory=lambda _path, **_kwargs: (source, None),
+    )
+    config = ConfigManager(tmp_path / "resize-first-frame-config.json")
+    config.load()
+    window = ViewerWindow(config_manager=config, book_session=session)
+    window.resize(640, 480)
+    try:
+        window.show()
+        qapp.processEvents()
+        opened = session.open_book(archive)
+        assert window._finish_opened_book(opened, modal_on_empty=False)
+        assert source.entered.wait(2.0)
+        old_request = window.presentation_state.requested
+        assert old_request is not None
+
+        window.resize(800, 600)
+        qapp.processEvents()
+        assert (
+            window.presentation_state.requested is None
+            or window.presentation_state.requested.token != old_request.token
+        )
+        assert (
+            window.presentation_state.surface.mode
+            is PresentationSurfaceMode.LOADING
+        )
+        assert not window.viewer._images
+
+        _wait_until(
+            qapp,
+            lambda: window.presentation_state.requested is not None
+            and window.presentation_state.requested.token
+            != old_request.token,
+        )
+        replacement = window.presentation_state.requested
+        assert replacement is not None
+        assert replacement.token.layout_signature != old_request.token.layout_signature
+
+        source.release.set()
+        _wait_until(
+            qapp,
+            lambda: window.presentation_state.displayed is not None
+            and window.presentation_state.displayed.token == replacement.token,
+        )
+        assert (
+            window.presentation_state.surface.mode
+            is PresentationSurfaceMode.DISPLAYED
+        )
+        assert window.viewer.displayed_page_indexes == (0,)
+
+        window._on_viewport_changed()
+        assert window._raster_viewport_timer.isActive()
+        assert window._raster_viewport_timer.interval() == 120
+        window._raster_viewport_timer.stop()
+    finally:
+        source.release.set()
         window.close()
         qapp.processEvents()
 
@@ -322,6 +402,83 @@ def test_input_kind_admission_is_immediate_except_rapid_bursts(
         )
         assert requested[-1] is staged[-1]
     finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_rapid_wheel_keeps_started_zip_work_and_commits_only_final_target(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    archive = _write_zip(tmp_path, pages=12)
+
+    class BlockingZipSource(ZipImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.page_one_started = Event()
+            self.release_page_one = Event()
+
+        def open_image(self, image_id: str) -> Image.Image:
+            if image_id == "001.png":
+                self.page_one_started.set()
+                self.release_page_one.wait(3.0)
+            return super().open_image(image_id)
+
+    source = BlockingZipSource(archive)
+    config = ConfigManager(tmp_path / "rapid-wheel-config.json")
+    config.load()
+    config.apply({"viewer_memory_mode": "4096"})
+    session = BookSession(
+        source_factory=lambda _path, **_kwargs: (source, None),
+    )
+    window = ViewerWindow(config_manager=config, book_session=session)
+    window.resize(640, 480)
+    try:
+        window.set_view_mode("single")
+        window.show()
+        qapp.processEvents()
+        opened = session.open_book(archive)
+        assert window._finish_opened_book(opened, modal_on_empty=False)
+        runtime = session.viewer_runtime
+        assert runtime is not None
+        _wait_until(
+            qapp,
+            lambda: window.presentation_state.displayed is not None
+            and window.presentation_state.displayed.unit.focused_index == 0,
+        )
+        assert source.page_one_started.wait(1.0)
+        started_job = runtime._active_job
+        assert started_job is not None and started_job.started.is_set()
+
+        for _index in range(10):
+            window.next_page(input_kind=NavigationInputKind.WHEEL)
+        assert window.model.focused_index == 10
+        requested = window.presentation_state.requested
+        displayed = window.presentation_state.displayed
+        assert requested is not None and requested.unit.focused_index == 10
+        assert displayed is not None and displayed.unit.focused_index == 0
+        assert runtime._active_job is started_job
+        assert not started_job.cancelled.is_set()
+        assert runtime.metrics.cancel_requests == 0
+        assert runtime.metrics.running_job_adoptions == 9
+
+        # Production's wheel boundary admits the exact final request. The
+        # completed old frame remains cache-only; only page 10 can atomically
+        # replace the displayed page 0 presentation.
+        window._finish_wheel_navigation()
+        source.release_page_one.set()
+        _wait_until(
+            qapp,
+            lambda: window.presentation_state.displayed is not None
+            and window.presentation_state.displayed.unit.focused_index == 10,
+            timeout_ms=5000,
+        )
+        assert 1 in runtime.cached_page_indexes
+        assert runtime.metrics.cancel_requests == 0
+        assert runtime.metrics.stale_results == 0
+        assert runtime.metrics.warmup_planner_creations == 1
+    finally:
+        source.release_page_one.set()
         window.close()
         qapp.processEvents()
 
@@ -643,15 +800,21 @@ def test_book_switch_keeps_archive_alive_until_runtime_job_stops(
         qapp.processEvents()
 
 
-def test_failed_replacement_open_keeps_active_zip_runtime_epoch(
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_failed_or_cancelled_replacement_keeps_active_zip_runtime_epoch(
     tmp_path: Path,
     qapp: QApplication,
+    cancelled: bool,
 ) -> None:
     archive = _write_zip(tmp_path)
     source = ZipImageSource(archive)
+    replacement_entered = Event()
+    release_replacement = Event()
 
     def source_factory(path: Path, **_kwargs):
         if path.name == "broken.zip":
+            replacement_entered.set()
+            release_replacement.wait(3.0)
             raise ImageSourceError("broken replacement")
         return source, None
 
@@ -666,6 +829,8 @@ def test_failed_replacement_open_keeps_active_zip_runtime_epoch(
         runtime = session.viewer_runtime
         active_epoch = session.generation
         assert runtime is not None
+        planner = runtime._warmup_planner
+        assert planner is not None
         _wait_until(qapp, lambda: window._zip_runtime_current_frame_serial > 0)
         _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
         jobs_before_failed_open = runtime.metrics.jobs_submitted
@@ -674,12 +839,29 @@ def test_failed_replacement_open_keeps_active_zip_runtime_epoch(
         old_status = window.status.currentMessage()
         old_progress = window.presentation_state.progress_page
         old_back_history = window.presentation_state.back_history
+        old_pixmap_key = window.viewer._images[0].pixmap.cacheKey()
 
         window.open_path(tmp_path / "broken.zip")
+        assert replacement_entered.wait(2.0)
         assert window.presentation_state.replacement_open_pending
         assert window.presentation_state.displayed_page == old_displayed_page
         assert window.slider.value() == old_slider
         assert runtime.metrics.jobs_submitted == jobs_before_failed_open
+        assert not window._zip_runtime_active
+        assert runtime._warmup_planner is planner
+
+        window._on_viewport_changed()
+        QTest.qWait(150)
+        qapp.processEvents()
+        assert window.presentation_state.replacement_open_pending
+        assert not window._zip_runtime_active
+        assert runtime.metrics.jobs_submitted == jobs_before_failed_open
+        assert runtime._warmup_planner is planner
+        assert window.viewer._images[0].pixmap.cacheKey() == old_pixmap_key
+
+        if cancelled:
+            session.cancel_pending_open()
+        release_replacement.set()
         assert session.wait_for_async(3000)
         _wait_until(
             qapp,
@@ -690,17 +872,25 @@ def test_failed_replacement_open_keeps_active_zip_runtime_epoch(
         assert session.generation == active_epoch
         assert session.viewer_runtime is runtime
         assert window._zip_runtime is runtime
+        assert runtime._warmup_planner is planner
+        assert runtime.metrics.warmup_planner_creations == 1
         assert window.viewer.displayed_page_indexes == (0,)
         assert window.presentation_state.current_book_epoch == active_epoch
         assert window.presentation_state.displayed_page == old_displayed_page
         assert window.presentation_state.progress_page == old_progress
         assert window.presentation_state.back_history == old_back_history
         assert window.slider.value() == old_slider
+        assert (
+            window.presentation_state.surface.mode
+            is PresentationSurfaceMode.DISPLAYED
+        )
+        assert window.viewer._images[0].pixmap.cacheKey() == old_pixmap_key
         # The temporary open-error override may still be visible. Once it is
         # released, the committed presentation status remains the old book.
         window._clear_status_override()
         window._update_status()
         assert window.status.currentMessage() == old_status
     finally:
+        release_replacement.set()
         window.close()
         qapp.processEvents()

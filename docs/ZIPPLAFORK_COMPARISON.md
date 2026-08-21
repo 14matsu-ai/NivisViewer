@@ -58,10 +58,10 @@ NivisViewerへ組み込んでいない。固定revisionの`license/AGPL.txt`は
 | --- | --- | --- |
 | 入力受付 | `ViewerForm.cs:1066-1085`, `ViewerForm` constructor; `:15852-15855`, default shortcut table | `PreviewKeyDown`、`KeyboardShortcut`、mouse gestureを接続し、既定のWheelDown/UpをNext/Previousへ割り当てる。 |
 | command dispatch | `ViewerForm.cs:13042`, `getMouseGestureSettingTemplate` | `Command.NextPage` / `PreviousPage`を`moveToNextPage` / `MoveToPreviousPage`へ結び付ける。 |
-| ページ移動要求 | `ViewerForm.cs:12403`, `moveToNextPage`; `:12424`, `MoveToPreviousPage`; `:9279`, `movePageNatural` | `NextPage` / `PreviousPage`が有効な完成済み表示単位を返した場合だけ`currentPage`を変更する。移動不能時は旧currentへ戻す。 |
-| current / 未完成判定 | `ViewerForm.cs:1903`, `NextPage`; `:1951`, `PreviousPage` | singleでは現在unitがreadyなら次の未完成pageへ1つ進み、そこで後続入力を止める。spreadのprevious等には次unitのsize/ready不足で移動しない分岐がある。ready frontierを越えて最終入力pageへcoalesceする設計ではない。 |
+| ページ移動要求 | `ViewerForm.cs:12403`, `moveToNextPage`; `:12424`, `MoveToPreviousPage`; `:9279`, `movePageNatural` | natural `NextPage` / `PreviousPage`は**現在の数値band**がreadyなら1回だけ次のbandへ進める。移動先は未完成でもよく、そこで次のnatural入力を拒否する。`MoveForwardOnePage` / `movePageToMinimulForward`は別経路で、ready frontierを越えてlogical currentを更新できる。 |
+| current / 未完成判定 | `ViewerForm.cs:1903`, `NextPage`; `:1951`, `PreviousPage` | singleでは現在pageがreadyならcold destinationへ最大1 step進み、そのpageが完成するまで後続WheelDownを捨てる。spreadでは原則として現在の数値2-page bandが揃ってから次bandへ最大1 step進む（wide/cover分岐は1-page動作を取り得る）。natural入力にpending final targetやburst coalescerはない。 |
 | 方向管理 | `ViewerForm.cs:5558`, `SetBackgroundMode`; `:5586`, `priorityLevel` | 直前の移動方向を状態として保持しない。常に新しい`currentPage`を中心にpriorityを再計算する。 |
-| current / next / previous priority | `ViewerForm.cs:5586`, `priorityLevel` | level 0=current display unit、level 1=数値上のnext display unit、level 2=数値上のprevious display unit、level 3=その他。逆方向移動中でも数値上のnextがpreviousより先である。 |
+| current / next / previous priority | `ViewerForm.cs:5586`, `priorityLevel` | `M = MaxPageCountInWindow`の固定数値bandを使う。`M=1`はcurrent / `c+1` / `c-1`、`M=2`は`c,c+1` / `c+2,c+3` / `c-2,c-1`をlevel 0/1/2とし、残りをlevel 3へ置く。これはwide/coverを含む実際のdisplay-unit topologyではなく、逆方向移動中も数値上のnextが先である。 |
 | queue / scheduler | `ViewerForm.Designer.cs:1628-1636`, `bmwLoadEachPage`; `GenerarClasses.cs:247`, `SetWorksOrder`; `:266`, `privateRunWorkerCompletedEventHandler` | Viewer page workerは1 thread。priority permutationを差し替え、現在実行中の1 jobはpreemptせず、完了境界で次の未開始jobを新orderから選ぶ。 |
 | queue再構築 | `ViewerForm.cs:5371`, `bmwLoadEachPage_EachRunWorkerCompleted`; `:5558`, `SetBackgroundMode` | current変更を検出するとworker完了時に全page orderを再構築する。pause中は`SetBackgroundModeIfPausing`から反映する。 |
 | ZIP entry一覧 | `PackedImageLoader.cs:283`, constructor; `:1197`, `getZipArchiveEntries` | `ZipArchive`を開きentry tableを作る。archive全体をmemoryへ置くoptional pathも持つ。 |
@@ -77,7 +77,7 @@ NivisViewerへ組み込んでいない。固定revisionの`license/AGPL.txt`は
 | memory accounting / eviction | `ViewerForm.cs:3522-3528`, `VirtualBitmapEx`生成; `ImageLoader.cs:1660-1673`, constructor; `ViewerForm.cs:5471-5524`, `ReduceUsingMemory` | `VirtualBitmapEx.DataSizeInBytes`へ原寸`PreFilteredImageArray`相当bytesとresize済みdisplay bytesの双方を加算する。evictionでは同pageのresized bitmap、原寸source、size/infoを同じlifecycleでdisposeする。 |
 | 方向反転 | `ViewerForm.cs:5377-5384`, `SetBackgroundMode` call | travel direction専用のqueue反転はない。新current基準のorder再構築により、旧方向の未開始jobを後方へ送る。実行中の最大1 jobは完了する。 |
 | stale work / source replacement | `ViewerForm.cs:2757-2771`, open path; `:2882-2915`, `Reload` / `clearResizedImageArray`; `GenerarClasses.cs`, `RunWorkerAsyncWithInterrupt` | 新loader/arrayへ切り替える前に旧resized配列をclearし、`waitCancel=true`で旧worker終了を待つ。意味のあるgeneration IDではなく、wait-cancelとobject replacementで隔離する。 |
-| spread protection | `ViewerForm.cs:1903-2002`, `NextPage` / `PreviousPage`; `:5273`, `GetResizedSize`; `priorityLevel` level 0 | current binding内の最大1/2 pageを同じ表示単位としてsize判定し、partnerもlevel 0で優先する。 |
+| spread protection | `ViewerForm.cs:1903-2002`, `NextPage` / `PreviousPage`; `:5273`, `GetResizedSize`; `priorityLevel` level 0 | navigationのsize/ready判定はbinding/wide/cover分岐を持つ一方、worker priorityは`M=2`の固定数値2-page bandをlevel 0として扱う。通常partnerは同時優先されるが、実display unitとの完全な同一性は保証されない。 |
 
 ### 2.1 通常color JPEG 1ページの具体的処理列
 
@@ -318,18 +318,18 @@ pipelineへ戻す。
 | --- | --- | --- | --- | --- | --- |
 | decode pipeline | entry readからdecode、filter、resize、display-ready生成までliteralな1 page job | decode taskとrender taskは別だが、同じ1-worker laneをpaced dispatcherで直列化 | miss時の単純さはZipPlaFork、standard JPEGのpixel量はNivisViewer | ZipPlaForkはstage間queueがない。Nivisはdecoder-scaled JPEGでfull rasterを避け、generation境界が強い | 構造移植 |
 | scheduler / queue | `BackgroundMultiWorker` 1 thread、全page permutation、完了境界で再order | shared Viewer lane、1 display unitずつadmit、terminal後に次unit | NivisViewer（移植後） | literal jobは2つ残るが、遠方workをqueueへ先行登録しないため、current missを阻害しにくい | 構造移植 |
-| priority制御 | current unit → 数値上next → 数値上previous → rest | current 800、spread/prepared 700以下、interactive 600、next 500、previous 400。decode/render共通domain | NivisViewer | currentとspreadを保護しつつ、renderがdecode priorityに負けない | 構造移植 |
+| priority制御 | currentの固定数値`M`-page band → 数値上のnext band → previous band → rest | current 800、spread/prepared 700以下、interactive 600、next 500、previous 400。decode/render共通domain | NivisViewer | currentとactual spread topologyを保護しつつ、renderがdecode priorityに負けない | 構造移植 |
 | direction reversal handling | directionを追跡せず、新current基準で全order再計算 | directionを追跡し、queued decode/renderを昇格・降格し、paced planを作り直す | NivisViewer | 反転直後の直近両側を保護し、旧方向の未開始workを残しにくい | 部分移植（独自拡張を維持） |
 | cache structure | source/displayを別配列で持つがpage indexとeviction lifecycleを共有 | source `QImage` cache、render `QPixmap` cache、prepared unit metadataの二層 | ZipPlaForkは単純、NivisViewerはQt機能要件に適合 | Nivisはmagnifier、resize、resampling再生成のためsource/display分離が必要だが複雑 | 維持 |
 | eviction policy | display artifact bytesを基準に遠方からevictし、同page sourceも同時破棄 | sourceとpixmapを双方byte計上し、それぞれpriority-aware eviction | NivisViewerの計上精度、ZipPlaForkのlifecycle単純性 | Nivisは実resident artifactをより正確に上限へ反映する | 部分移植 |
 | prefetch policy | 全page work setをcurrent近傍から1 jobずつ消化 | current paint後、1 display unitずつdecodeからprepared terminalまでpaced実行 | NivisViewer | 通過pageや複数unitの同時未完成を抑止し、設定した近傍だけに限定できる | 構造移植 |
-| display apply timing | normal moveはtarget readyまで`currentPage`を進めない | logical targetは先へ進むがvisualはold frameを維持し、完成unitだけatomic commit | visual品質は同等、state整合はZipPlaFork | 暗転は双方回避するが、Nivisはslider/statusが画像より先行し得る | 部分移植候補 |
-| dark-frame avoidance | ready確認後に移動し、reusable canvasを無条件clearしない | old complete `QPixmap`を新unit完成まで保持 | NivisViewer | Qtで安全なatomic swapを行い、error terminalもpaint完了として扱う | 維持 |
+| display apply timing | natural moveは現在bandがreadyならcold destinationへ最大1 step logical currentを進め、forced one-page/trackbarはさらに先へ進める。pixel完成とはtransaction化されない | requested targetは先へ進むがdisplayed/slider/statusはold complete frameを維持し、完成unitだけatomic commit | NivisViewer | ZipPlaForkはhalf-gray loading canvasとpaint時statusを使う。Nivisはrequested/displayedを分離し、stale completionを表示へ混入させない | Hybrid（atomic commit維持） |
+| dark-frame avoidance | cold destinationへ1 step進んだ場合もreusable canvasをclearせずhalf-gray化する | old complete `QPixmap`を新unit完成まで無加工で保持 | NivisViewer | Qtで安全なatomic swapを行い、error terminalもpaint完了として扱う | 維持 |
 | cold miss behavior | current pageのliteral 1 jobが完了してから次job | current visibleのみをpaced single laneでdecode→signal→render→commit→paintし、その後prefetch | 構造要件は同等、cancel/stale拒否はNivisViewer | 4096 x 6500 JPEGのforced coldでcurrent以外を先行decodeせず、53.336–60.200 msでpaintした | 構造移植 |
 | memory use | full decoded sourceとresized artifact。`usedMemory`はdisplayのみ計上 | standard JPEGはdecoder-size source、source+pixmapをcombined byte計上 | NivisViewer | 大JPEGでfull source rasterを常駐させず、二重満額budgetも廃止 | 部分移植 |
 | large ZIP behavior | entry streamを同じpage jobのdecoderへ渡す。optional archive-memory modeあり | entryをpreallocated `BytesIO`へ展開し、decoder-scale後に別render task | 既知の実機体感はZipPlaFork、offscreen構造検証はNivisViewerも合格 | Nivisはbuffer copyが残る一方、decoder-scaled JPEG、current-only cold start、通過job抑止が有効。実機の同一ZIP再確認は未実施 | 構造移植、entry stream直結は検討継続 |
 | stale result rejection | wait-cancelとloader/array replacement | request ID、source/render generation、source identity | NivisViewer | 高速入力、resize、book replacementの古い結果を明示的に拒否できる | 維持 |
-| spread protection | current binding partnerをlevel 0、size/ready判定を一体化 | decode protection、prepared-unit protection、atomic multi-slot commit | NivisViewer | active paced spreadを含め、source/render両層で保護する | 維持 |
+| spread protection | 通常は固定数値`M=2` bandをlevel 0に置くが、navigationのwide/cover分岐とworker bandは完全には同じtopologyでない | decode protection、prepared-unit protection、atomic multi-slot commit | NivisViewer | actual complete display-unit topologyをsource/render両層で共有し、partial spreadをcommitしない | 維持 |
 | QPixmap / paint | GDI `VirtualBitmapEx`とreusable bitmap canvas | worker `QImage`、GUI-thread one-time `QPixmap.fromImage`、cached paint | NivisViewer | QtのGUI resource境界を守りつつnavigation時変換を避ける | 維持 |
 | Browser contention | Viewer比較対象内にNivis相当のapplication-wide lane制御なし | current cold中はBrowser laneをpause、paint/fallbackでrelease | NivisViewer | Viewerを他画面のdecode競合から保護する | 維持 |
 
@@ -339,7 +339,7 @@ pipelineへ戻す。
 | --- | --- | --- | --- | --- | --- |
 | decode pipeline | persistent entry streamからnative decoderへ渡し、同じpage jobでorientation、resize、display bitmapまで作る | 新Bはentryを一つのreserved `QByteArray`へ読み、seekable `QBuffer` / `QImageReader`でdecoder scaleし、同じjobでdisplay-ready `QImage`まで作る | native streamはZipPlaFork、Qt/Python上の実測は新B構成 | Python sequential streamは約1,985 callback/pageで旧Aより遅かった。QByteArray版は1 materializationを許容してcallbackをC++内へ戻す | 構造移植 |
 | scheduler / queue | page worker 1、completion 1、完了境界でpriority orderを再評価 | `_ZipPlaCompatibleRasterJob`最大1、completion 1、先行queueを作らない | 同等、新Bはstale境界が強い | cold currentは旧A 2 task / 2 callback、新B 1 / 1 | 全置換 |
-| priority制御 | current → numeric next → numeric previous | current完成・matching paint後に移動方向側 → 反対側 | 新B | current paintまで近傍I/O/decodeを開始しない | 構造移植 |
+| priority制御 | currentの固定数値band → numeric next band → previous band | current完成・matching paint後に移動方向側 → 反対側 | 新B | upstreamの固定数値bandよりactual display-unit topologyを正確に保護する | 構造移植 |
 | direction reversal handling | 実行中1件の終了後、新current中心にwork orderを再構築 | 未開始jobを`tryTake`、running jobへcancel、request/source/layout serialで結果棄却 | 新B | 反転coldは旧A 3 task / 3 callback、新B 2 / 2。stale commit 0 | 構造移植 |
 | cache structure | original bitmap配列とresized bitmap配列をpage lifecycleで管理 | eligible pathは最大3 display-ready QPixmap ringだけ。source/prepared/render cacheを通らない | 新B | 常設logical cache 121.46→30.36 MiB、7→3 page | 全置換 |
 | eviction policy | current周辺を保護し、遠方pageのsource/displayをdispose | current、next、previous以外をpruneし、source/epoch/layout/DPR key違いを残さない | 新B | 古い仕様entryと多層cache間の寿命差を除去 | 全置換 |
@@ -359,7 +359,7 @@ AGPL-3.0-or-later由来である。
 | Upstream file / class / method | 移植した処理 | NivisViewer destination | 移植境界 |
 | --- | --- | --- | --- |
 | `ViewerForm.Designer.cs:1628-1636`, `bmwLoadEachPage.ThreadCount = 1`; `ViewerForm.cs:3177`, `bmwLoadEachPage_DoWork` | memory-bandwidth-heavyなViewer page処理を1 execution laneに限定 | `app/image_work_coordinator.py`, `ImageWorkCoordinator`; `app/image_cache.py`, `_start_task`; `app/viewer_widget.py`, `_start_render_task`; `app/viewer_window.py`, `_build_ui` | 構造移植。C# worker実装は未コピー。 |
-| `ViewerForm.cs:3177-3550`, `bmwLoadEachPage_DoWork`; `:5371`, completion; `:5451`, `SetNewResizedImage` | current unitをdecodeからdisplay-ready publishまで完了してから遠方unitへ進む | `app/viewer_window.py`, `_apply_pending_decode_demand`, `_start_raster_prefetch_pipeline`, `_advance_raster_prefetch_pipeline`, `_on_viewer_content_painted`; `app/viewer_widget.py`, `prepared_display_is_ready`, `renderWorkFinished` | 構造移植。Nivisはliteral 1 QRunnableではなく、decode task → GUI signal → render taskのpaced single lane。 |
+| `ViewerForm.cs:3177-3550`, `bmwLoadEachPage_DoWork`; `:5371`, completion; `:5451`, `SetNewResizedImage` | 数値priority bandから選んだ1 pageをdecodeからdisplay-ready publishまで完了し、最新orderの次pageへ進む | `app/viewer_window.py`, `_apply_pending_decode_demand`, `_start_raster_prefetch_pipeline`, `_advance_raster_prefetch_pipeline`, `_on_viewer_content_painted`; `app/viewer_widget.py`, `prepared_display_is_ready`, `renderWorkFinished` | 構造移植。Nivisはliteral 1 QRunnableではなく、decode task → GUI signal → render taskのpaced single lane。 |
 | `ViewerForm.cs:5558`, `SetBackgroundMode`; `GenerarClasses.cs:247`, `SetWorksOrder`; `:266`, completion reorder | 新currentを中心に未開始workを再優先付け | `app/viewer_window.py`, `_refresh_view`, `_configured_prefetch_units`, `_schedule_prepared_display_prefetch`; `app/image_cache.py`, `preload_around`, `ensure_loaded`; `app/viewer_widget.py`, `prepare_display_units`, `_queue_render` | 構造移植。Nivisのtravel-direction追跡、両側直近保護、16 ms coalescingは独自拡張。 |
 | `ViewerForm.cs:5451`, `SetNewResizedImage`; `:5471`, `ReduceUsingMemory` | 完成artifactだけをpublishし、遠方pageをmemory policyで破棄 | `app/viewer_widget.py`, `_on_render_completed`, `_commit_pending_display`, `_commit_display`; `app/image_cache.py`, `_enforce_limit`, `retain_visible_only`; `app/viewer_window.py`, `_clear_raster_prefetch_pipeline`, `_enforce_combined_cache_budget` | algorithm/structure移植。upstreamはdisplay bytesだけを計上しsourceを同時evict、Nivisはsource+pixmap双方を計上し、active unitの一時source保護をterminal時に解除する。 |
 | `ViewerForm.cs:6438`, `showCurrentPage`; `:6768`, `pbView_Paint`; `:6990`, `pbView_PaintToCanvas` | 完成frameのatomicな表示とblank frame回避 | `app/viewer_widget.py`, `_commit_display`, `paintEvent`; `app/viewer_window.py`, `_on_viewer_content_painted` | 処理構造移植。GDI canvas、`LockBits`、`CopyMemory`は未コピー。 |
@@ -785,7 +785,7 @@ entry table, `OpenImageStream`, `Dispose`), `GenerarClasses.cs`
 | 2. Page state | `currentPage` advances only through navigation rules that consult the ready/known-size frontier; the accepted current page, trackbar, and shown image are updated by one Viewer form. | Logical current is `PageModel`; requested state is `ViewerWindow._active_request_id` plus `ViewerDisplayUnit`; displayed state is `ViewerWidget._spread/_images`; the compatible path has another current request/frame serial. | Logical page and related UI can advance while the old visual frame remains.  Legacy and compatible paths commit slider/status at different times, and rapid input has no single authoritative requested/displayed state. | A single presentation transaction prevents logical/visual disagreement and gives reversal and stale-result rejection one owner. | High | Spread, lazy wide-page discovery, history, bookmarks, slideshow, slider and reading progress must keep their semantics. | **Full replacement** by an explicit requested/displayed presentation state after the page runtime cutover. |
 | 3. Image-load pipeline | One `bmwLoadEachPage_DoWork` page job performs entry open, decode, EXIF/filter work, target resize, and creation of the display artifact before one completion is published. | Legacy path is `_ImageLoadTask` to source `QImage`, then a second `ViewerRenderTask` to resize/rotate/filter, then prepared/pixmap publication.  The compatible path is a second end-to-end pipeline limited to ZIP/JPEG/single/standard/fit/no rotation/no adjustments/no page list/no magnifier. | Feature options switch the whole pipeline.  Source and display work have separate callbacks, schedulers, caches, failure rules, and generations; the narrow fast path is a bolt-on rather than the Viewer. | A page/display-slot job has one critical path and one result.  Decoder fallback stays inside the job instead of returning to another Viewer architecture. | High | All raster formats, spread slots, split/crop, rotation, resampling, image adjustments, manual zoom, DPI and magnifier must be expressible in a render specification. | **Full replacement** for ZIP books by one runtime-owned entry-to-display-ready job. |
 | 4. Asynchronous processing | `BackgroundMultiWorker` uses one Viewer worker. `SetWorksOrder` replaces the page permutation; after a completion the worker chooses the first unstarted item in the latest order.  Book replacement uses interrupt/wait cancellation. | The production coordinator normally supplies one Viewer lane, but `ViewerWindow`, `ImageCache`, `ViewerWidget`, and the compatible path each own queue or pending-job state.  Without the coordinator, decode and scale can use separate one-thread pools. | One physical lane does not make one scheduler: obsolete running render work cannot be preempted, generations are duplicated, and shutdown must drain several owners. | One active page job and a replaceable work order bound obsolete work to the currently running decoder and make current/next/previous ordering observable. | High | Browser must retain a separate lane; PDF priorities and injected test pools need adapters. | **Structural port / Viewer scheduler full replacement.** Keep Nivis generation validation and Qt thread-affinity rules. |
-| 5. Prefetch | `priorityLevel` orders the current display unit first, numeric next second, previous third, then remaining pages; a changed current recomputes the order.  Memory admission can stop/rework the frontier. | Window raster plan, `ImageCache` wanted/protected/ranks, Widget prepared-unit requests, compatible-path neighbors, and multiple idle/paint timers all plan related work. | Four planners must agree. Direction reversal can leave a running legacy decode or render, and cache admission/prefetch release are owned by different objects. | A replaceable work order provides one current -> forward neighbor -> reverse neighbor policy and stops remote work when the page-artifact budget is full. | High | Spread partner is part of level 0; configurable direction and PDF rolling behavior remain policy inputs. | **Full replacement** inside the new runtime. |
+| 5. Prefetch | `priorityLevel` orders the current fixed numerical `M`-page band first, numeric next band second, previous band third, then remaining pages; a changed current recomputes the unstarted order. Memory admission can stop/rework the frontier. | Window raster plan, `ImageCache` wanted/protected/ranks, Widget prepared-unit requests, compatible-path neighbors, and multiple idle/paint timers all plan related work. | Four planners must agree. Direction reversal can leave a running legacy decode or render, and cache admission/prefetch release are owned by different objects. | A replaceable work order provides one actual current unit -> forward neighbor -> reverse neighbor policy and stops remote work when the page-artifact budget is full. | High | Spread partner comes from actual topology; configurable direction and PDF rolling behavior remain policy inputs. | **Full replacement** inside the new runtime. |
 | 6. Cache and memory | Page-indexed source information and `VirtualBitmapEx` display artifacts share a lifecycle and one memory reduction order. `ReduceUsingMemory` evicts farthest pages using the current work order. | `ImageCache` stores source `QImage`; `ViewerWidget` stores render `QPixmap`, last-rendered aliases, and prepared-unit state; the compatible path stores a separate three-pixmap ring. A Window loop tries to rebalance independent budgets. | The same page can have several unrelated lifetimes and ledgers. Entering/leaving the compatible mode discards one cache and warms the other. The compatible three-page cap is not a byte budget. | A page record with source/display components, one byte ledger, and current/spread/next/previous protection makes eviction and reversal reuse coherent. | High | Magnifier may require a full source artifact; one unusually large visible spread may intentionally exceed the budget. | **Full replacement** by a runtime-owned page artifact cache; preserve explicit visible-unit protection. |
 | 7. Display update | `SetNewResizedImage` publishes a completed result and `showCurrentPage` paints it. During a cold load ZipPlaFork grays the preceding canvas rather than clearing it. | Legacy `ViewerWidget` waits for all spread slots to become terminal and atomically swaps them; direct mode also commits one completed pixmap while the old frame remains. Paint acknowledgement releases prefetch/browser work. | Atomic old-frame retention is good, but direct-versus-legacy guards permeate the Widget, while slider/status/page-list selection are committed separately. | One `commit_frame` boundary can keep NivisViewer's superior old-frame retention while removing path-specific Widget modes and synchronizing UI state. | Medium | Pan, zoom, magnifier interaction, gestures, fullscreen chrome and error placeholders remain surface behavior. | **Structural port**, not a literal visual copy. Retain Nivis atomic old-frame behavior and replace the two publication modes with one frame contract. |
 | 8. Page list and thumbnails | The Viewer launches catalog viewing separately rather than sharing its in-window loader/cache. `CatalogForm` owns a distinct loader and a globally one-at-a-time thumbnail task; `ThumbViewer.PaintPart` requests only visible rows plus a small margin and clears images outside it. | The Viewer eagerly builds all `QListWidgetItem` rows. It consumes Viewer `ImageCache` results, linearly finds the row, then smooth-scales a large `QImage` and creates `QIcon` on the GUI thread. Merely showing the dock disables the compatible path. Browser thumbnails have a better dedicated lane/cache. | Thumbnail work competes with or changes the Viewer pipeline and can block the GUI. There is no visible-row scheduler for the Viewer page list. | A separate visible-range thumbnail session cannot invalidate or select the main Viewer runtime and can be paused while a cold current page is outstanding. | Medium | Filtering, current selection, bookmark decoration, thumbnail size/DPI, and click navigation remain. | **Full replacement** of the Viewer page-list thumbnail subsystem; retain Browser's independent visible-range/disk-cache design. |
@@ -895,7 +895,7 @@ cutover**, not another eligibility path:
 |---|---|---|
 | `PackedImageLoader.cs:283`, constructor; `:1197`, ZIP entry table; `:1781` / `:1856`, entry stream ownership; `:2601`, disposal | One runtime is created for one already-indexed persistent `ZipImageSource` and retired before its book source is closed. | `app/book_session.py`, `BookSession._replace_viewer_runtime`, `_retire_viewer_runtime`, `_release_retired_viewer_runtime`; `app/zip_raster_book_runtime.py`, `ZipRasterBookRuntime` |
 | `ViewerForm.cs:3177-3550`, `bmwLoadEachPage_DoWork` | One display-unit runnable performs all logical pages in the unit: entry read, decode, EXIF-aware source creation, adjustments, wide split, rotation, filter/resize, and display-ready `QImage`. | `app/zip_raster_book_runtime.py`, `_ZipRasterUnitJob.run`, `_render_unit`, `_decode_page`, `_split_ranges`; existing `viewer_render.render_qimage` is the Qt/Pillow render adapter used inside that same job. |
-| `GenerarClasses.cs:247`, `SetWorksOrder`; `ViewerForm.cs:5558`, `SetBackgroundMode`; `:5586`, `priorityLevel` | The current display unit is first, followed by the current-direction neighbor and reverse neighbor. At most one job is active; a new request replaces the pending order and can leave at most the one already-running obsolete decoder. Prefetch is released only after the current frame paints. | `ZipRasterBookRuntime.request`, `_drive`, `_submit`, `_cancel_active_job`, `release_prefetch`; `ViewerWindow._zip_runtime_request`, `_on_zip_runtime_frame_painted` |
+| `GenerarClasses.cs:247-339`, `SetWorksOrder` / completion selection; `ViewerForm.cs:5371-5415`, completion; `:5558`, `SetBackgroundMode`; `:5586`, `priorityLevel` | Fixed numerical current/next/previous bands define the unstarted order. At most one job is active; navigation does not cancel it, its completed bitmap remains cacheable, and the first unfinished page from the newest order starts at the completion boundary without waiting for paint. | `ZipRasterBookRuntime.request`, `_adopt_request`, `_active_job_is_artifact_compatible`, `_drive`, `_submit`, `_on_job_completed`; `ViewerWindow._zip_runtime_request` |
 | `ViewerForm.cs:5371`, worker completion; `:5451`, `SetNewResizedImage`; `:6438`, `showCurrentPage` | The sole queued GUI completion creates `QPixmap` objects and publishes only a terminal complete single/spread/split frame. The preceding complete frame remains owned by the Widget until that transaction. | `ZipRasterBookRuntime._on_job_completed`; `ViewerWidget.commit_display_ready_frame`; `ViewerWindow._on_zip_runtime_frame_ready` |
 | `ViewerForm.cs:5471`, `ReduceUsingMemory` | Source and display components belong to one cached frame/page lifecycle. One work-order-aware byte ledger evicts the farthest non-current display unit. | `app/zip_raster_book_runtime.py`, `_ZipRasterFrameStore`, `set_retention_order`, `can_admit_prefetch`, `put`, `_prune`, `_retention_rank`; `ZipRasterBookRuntime.set_cache_limits`, `request`, `_drive` |
 
@@ -1751,7 +1751,7 @@ worker/cache and independently opened thumbnail source.
 | Display commit | **+** completed resized bitmap is inserted in one UI completion. **-** no explicit epoch/layout/DPR token or immutable complete-spread transaction. | **+** complete single/spread atomic swap, old-frame retention, stale rejection and GUI-only QPixmap. **-** commit projects a broad action refresh. | **B.** Keep NivisViewer. Optimize projection only after profiling. |
 | Page list / thumbnail | **+** visible-region loading and release rather than eager full-book thumbnails. **-** paint-time Catalog machinery, GDI ownership and a static semaphore shared by all ThumbViewers; cancellation is not passed into an active `GetThumbnail`. | **+** virtual Qt model, visible margin, O(1) mapping, independent source/cache/worker, pause/cancel, byte budget. **-** first use opens a second archive/document session. | Historically **D**, now **B / maintain**. NivisViewer's completed modern design is stronger than direct Catalog translation. |
 | Input handling | **+** compact direct command mapping. **-** ready-frontier navigation can prevent rapid input from reaching a final cold page. | **+** wheel/shortcut/slider/PageList converge on one navigation/presentation boundary; rapid input coalesces to latest request. **-** requested PageModel moves ahead of displayed by design, so non-presentation commands must use the right owner. | **B/C.** Keep Nivis UX and ZipPla-style internal work-order rebuild. |
-| Spread / LTR / RTL | **+** current binding pages share level-0 priority; `NextPage`/`PreviousPage` keep the current unit until required slots are ready, so a partial spread is not painted as the new page. **-** topology and Viewer loading are intertwined. | **+** pure `PageModel.spread_at` topology, complete-unit publication, wide split and RTL half order. **-** an initially unknown wide page can cause unit reconstruction. | **B**, while retaining ZipPla's complete-unit principle and combining it with source reuse. |
+| Spread / LTR / RTL | **+** ordinary numerical `M=2` pages share level-0 priority; natural `NextPage`/`PreviousPage` generally waits for the current band before entering one cold band. **-** fixed numerical worker bands can disagree with wide/cover navigation topology, and logical current/loading paint are intertwined. | **+** pure `PageModel.spread_at` topology, complete-unit publication, wide split and RTL half order. **-** an initially unknown wide page can cause unit reconstruction. | **B**, while retaining only the useful complete-neighborhood priority principle and combining it with source reuse. |
 | Rotation / EXIF | **+** orientation/filter is integrated in the page job. **-** old GDI/manual DPI model. | **+** QImageReader/Pillow EXIF and worker-side rotation; rotation is in presentation tokens. **-** previously forced archive re-decode because source/frame invalidated together. | UX **B**, artifact lifetime **D implemented**. |
 | Magnifier | **+** `resetMagnifier`/`MagnifierCanvas`/`bwMagnifierMaker_DoWork` normally reuse `PreFilteredImageArray` and avoid another archive decode. **-** a separate worker/cache can contend with main resize and has no book epoch/request serial/DPR contract. | **+** retained source, selectable crop, quality mode, stale render key and full-resolution request. **-** audit found direct-display mode rejected the final magnifier render task. | **C/D.** Reuse the ZipPla retained-source principle behind the Nivis crop/UX and modern stale fence; direct-mode interactive render is enabled below. |
 | Zoom / fit | **+** source/resized separation supports new resized output. **-** UI/bitmap code is tightly coupled. | **+** fit modes, manual zoom/pan and multiple resampling modes. **-** prior source/frame key caused repeated decode for variant changes. | UX **B**, source/display lifetime **D implemented**. |
@@ -2876,8 +2876,8 @@ caps user memory by process/address-space and physical-memory constraints.
 `ViewerForm.SetMemoryUBound` combines process working set and available physical
 memory with an active coefficient of 0.7 and an inactive coefficient of 0.3.
 `SetBackgroundMode` and `BackgroundMultiWorker.SetWorksOrder` give the one
-Viewer worker an all-page order: current, immediate numeric next, immediate
-previous, then the remaining pages. `ReduceUsingMemory` evicts original and
+Viewer worker an all-page order: current fixed numerical band, next numerical
+band, previous numerical band, then the remaining pages. `ReduceUsingMemory` evicts original and
 resized ownership together from the low-priority end only when memory pressure
 requires it, while keeping the minimum visible neighborhood.
 
@@ -3293,15 +3293,17 @@ checks must still cover long idle warm-up, a page turn during that warm-up,
 direction reversal, magnifier/full-source promotion, window deactivation and
 returning to an already warmed page.
 
-## 20. Raster book-open critical path and Startup Ready Runway (2026-08-21 worktree)
+## 20. Historical raster book-open critical path and request-scoped Startup Ready Runway (superseded)
 
-This section covers the shared ZIP/Folder `RasterBookRuntime` interval from an
-open or navigation request through the first current-page commit, a useful
-ready runway and continuing book-wide population.  It supersedes the
-one-neighbor/paint gate described by the earlier wording in sections 18.3 and
-19.3.  The byte-driven stores, lazy whole-book order, PresentationState and
-complete-frame atomic swap remain in force.  Physical-device behavior is not
-inferred from this structural change.
+This section records the request-scoped four-forward/one-reverse predecessor.
+It superseded the one-neighbor/paint gate described by the earlier wording in
+sections 18.3 and 19.3, but is itself superseded by the persistent book-scoped
+planner and presentation-surface ownership in section 21.  Its controlled A/B
+tables remain useful historical evidence for the removed paint-idle gate; its
+planner creation/release lifecycle is no longer the production contract.  The
+byte-driven stores, PresentationState and complete-frame atomic swap remain in
+force.  Physical-device behavior is not inferred from either structural
+change.
 
 ### 20.1 Fixed-revision ZipPlaFork book-open call sequence
 
@@ -3329,7 +3331,9 @@ ViewerForm.OpenFile(path, ...)
      -> bmwLoadEachPage_RunWorkerStarting
         -> promote nextData/loader, allocate page arrays, SetBackgroundMode
         -> priorityLevel + BackgroundMultiWorker.SetWorksOrder
-     -> bmwLoadEachPage_DoWork(current page)
+     -> BackgroundMultiWorker starts WorksOrder[0]
+     -> bmwLoadEachPage_DoWork(the first page in that numerical priority band;
+                               normally current, not a topology guarantee)
         -> PackedImageLoader.OpenImageStream / OpenInnerImageStream
         -> entry stream, decode, orientation/filter, resize, VirtualBitmapEx
      -> bmwLoadEachPage_EachRunWorkerCompleted
@@ -3347,7 +3351,12 @@ The source locations are `source/ZipPla/ViewerForm.cs:2308-2771`
 `:1781-1867` (entry-stream access); and
 `source/ZipPla/GenerarClasses.cs:247-264,266-339`
 (`SetWorksOrder` and latest-order completion selection).  The configured
-Viewer worker count is one in `ViewerForm.Designer.cs:1628-1636`.
+Viewer worker count is one in `ViewerForm.Designer.cs:1628-1636`.  Revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b` is the fixed source snapshot, not
+the commit that introduced that Viewer setting: the revision itself changes
+only `CatalogForm.ThumbViewerItem` thumbnail concurrency.  The audited Viewer
+worker and methods were already present in base import/core commit
+`5e942ef0006decf01c21d9dbe037dba50e763420`.
 
 ZipPlaFork therefore does perform synchronous work before the first page job:
 history/catalog calls, archive entry enumeration and sorting, slider/control
@@ -3414,9 +3423,9 @@ revision, and the current page still cannot decode until asynchronous ZIP
 listing and natural sorting complete.  This change does not hide those costs;
 it removes unrelated ownership/projection work around them.
 
-### 20.3 Adopted Hybrid production sequence
+### 20.3 Historical request-scoped Hybrid sequence (superseded)
 
-The ZIP/Folder production handoff is now:
+At this predecessor stage, the ZIP/Folder production handoff was:
 
 ```text
 ViewerWindow.open_path
@@ -3476,15 +3485,18 @@ The runway is topology-based rather than screen-coordinate-based.  In single
 or spread mode it follows complete `RasterDisplayUnit` entries; LTR/RTL and the
 current navigation direction determine the preferred side; wide/split units
 remain atomic; and a start/end boundary neither wraps nor duplicates units.
-Every accepted navigation or direction reversal constructs a fresh
-current-centered plan.  Unstarted old-direction work disappears, an active job
-is adopted only when it is the exact first missing unit of the new runway, and
-otherwise it is cancelled/stale-rejected.  Completed old-direction artifacts
-remain reusable under the byte budget.  After the runway, the same worker
-continues the lazy book-wide order without a scheduler gap.  Physical paint
-still acknowledges ownership, releases the preceding displayed-frame
-protection and gates PageList/metadata/history/Browser projection and retired
-resource cleanup; it no longer decides whether raster warm-up may continue.
+Every accepted navigation or direction reversal constructed a fresh
+current-centered planner and request-scoped release.  Unstarted old-direction
+work disappeared, an active job was adopted only when it was the exact first
+missing unit of the replacement runway, and otherwise it was
+cancelled/stale-rejected.  Completed old-direction artifacts remained reusable
+under the byte budget.  Within one request, the runway continued into the lazy
+book-wide iterator without a paint gap; navigation nevertheless discarded that
+planner owner and its scan/admission state.  Section 21 replaces this remaining
+reset boundary.  Physical paint still acknowledges ownership, releases the
+preceding displayed-frame protection and gates PageList/metadata/history/
+Browser projection and retired-resource cleanup; it does not decide whether
+raster warm-up may continue.
 
 This is intentionally Hybrid.  It adopts ZipPlaFork's useful completion-boundary
 continuation but keeps NivisViewer's Qt publication boundary: QPixmap creation,
@@ -3531,11 +3543,11 @@ preserves rollback, but may cause a short transient working-set peak.  Close,
 non-raster transition and queued-callback drain remain explicit terminal
 boundaries rather than relying on object finalizers.
 
-### 20.5 Adoption decision and AGPL provenance
+### 20.5 Historical adoption decision and AGPL provenance
 
 | Fixed-revision source / method | Principle evaluated | NivisViewer result |
 |---|---|---|
-| `ViewerForm.cs`, `bmwLoadEachPage_RunWorkerStarting`, `SetBackgroundMode`, `priorityLevel`; `GenerarClasses.cs`, `SetWorksOrder` / completion selection | One Viewer lane receives current-centered work and chooses the next useful item at a completion boundary without a paint-idle gap. | **Hybrid structural port:** `RasterBookRuntime.release_startup_runway`, `RasterWarmupPlan.startup_runway_units`, `RasterWarmupPlanner.next_candidate` and `_drive` give the accepted current a four-forward/one-reverse complete-unit priority runway, then continue seamlessly into lazy book-wide population. |
+| `ViewerForm.cs`, `bmwLoadEachPage_RunWorkerStarting`, `SetBackgroundMode`, `priorityLevel`; `GenerarClasses.cs`, `SetWorksOrder` / completion selection | One Viewer lane receives current-centered work and chooses the next useful item at a completion boundary without a paint-idle gap. | **Superseded Hybrid predecessor:** `RasterBookRuntime.release_startup_runway` and a request-created `RasterWarmupPlanner` supplied a four-forward/one-reverse prefix. Section 21 retains the priority principle but replaces request-scoped planner ownership with one persistent book-scoped owner. |
 | `PackedImageLoader.cs`, constructor, `getZipArchiveEntries`, `OpenImageStream` / `OpenInnerImageStream` | One book-scoped archive handle/index and entry-local page work. | **Already adopted/maintained:** `ZipImageSource.__init__`, `list_images`, entry-read methods and `ZipRasterBookRuntime` keep structured lifetime, cancellation and stale fences. No new archive copy is added. |
 | `ViewerForm.cs`, `OpenFile`, `clearResizedImageArray` | Replacement preparation and old ownership disposal before new work. | **Not adopted:** old complete output is retained; `BookSession` retires work immediately but moves bulk cache destruction after successful replacement paint. |
 | No ZipPlaFork counterpart | Async archive listing, PresentationState, PageList virtualization, post-paint side effects, migration-only settings and callback-drained rapid switching. | **NivisViewer/New design maintained:** these are modern Qt/UX/lifetime structures, not translations of WinForms code. |
@@ -3629,7 +3641,7 @@ and B; no new physical latency number is inferred from this historical table.
 Native ZIP I/O, decoder, QPixmap upload, DWM/GPU presentation and physical
 wheel feel still require the user's real-device check.
 
-#### 20.6.1 Final runway validation
+#### 20.6.1 Final request-scoped runway validation (historical)
 
 The final implementation was rerun with a temporary 200-page ZIP containing
 identical 2,400 x 3,600 detailed JPEG entries, a 400 x 600 viewport, 256 MiB
@@ -3726,3 +3738,643 @@ command line and parent PID, terminated where an aborted process had remained,
 and rechecked.  No pytest, benchmark or compile process from this work remains;
 unrelated pre-existing Python processes were not touched.  Named benchmark and
 stranded pytest temporary directories created by this validation were removed.
+
+## 21. Presentation-surface ownership and persistent book-scoped continuous warm-up (2026-08-21 worktree)
+
+This section supersedes the request-scoped Startup Ready Runway lifecycle in
+section 20 while retaining its useful evidence and byte-driven cache contract.
+The production change has two independent but user-visible goals:
+
+1. the idle prompt must never regain the canvas after a valid complete frame
+   has committed; and
+2. one raster-book planner must continue across page requests instead of
+   recreating a four-forward/one-reverse startup phase on every navigation.
+
+The fixed ZipPlaFork reference remains
+[`himamon/ZipPlaFork`](https://github.com/himamon/ZipPlaFork) revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, licensed
+AGPL-3.0-or-later.  As recorded in section 1, this hash is a fixed source
+snapshot.  The commit itself changes only the `CatalogForm.ThumbViewerItem`
+thumbnail semaphore from processor-count concurrency to one.  It did not
+introduce `ViewerForm`'s `bmwLoadEachPage.ThreadCount = 1`; the audited Viewer
+implementation is inherited from `5e942ef0006decf01c21d9dbe037dba50e763420`.
+
+### 21.1 Superseded production defects
+
+The former empty-state behavior had no single presentation owner.
+`ViewerWidget.paintEvent` inferred the idle prompt solely from an empty local
+`_images` list.  During an initial asynchronous open, that list is legitimately
+empty before the first complete frame; during replacement it may also be
+temporarily detached while the old presentation is still the rollback owner.
+The Widget could therefore draw `画像を開いてください` without knowing whether
+the application was idle, loading, retaining a replacement frame or reporting
+an open error.  A viewport notification also called
+`ViewerPresentationState.supersede_pending` before the 120-ms resize debounce
+had a replacement request ready.  On a cold initial open this could reject the
+only in-flight first frame and leave the locally inferred idle surface visible
+until the delayed layout request completed.  A zero-image async source result
+could likewise reach the successful installation path without any frame that
+could end that interval.
+
+The former warm-up path removed the paint gate inside one request, but still
+created a new `RasterWarmupPlanner` in `RasterBookRuntime._adopt_request` for
+every navigation.  It reset request release flags, failed/admission suppression
+and the lazy iterator, then adopted an active background job only when it was
+the exact first missing unit of the replacement 4 + 1 runway.  Consequently a
+ready hit or a short direction change could cancel useful work, restart the
+same priority prefix and lose the previous book scan/admission ledger even
+though completed source/frame artifacts remained cached.  Section 20's 4 + 1
+prefix was not a cache limit, but its *owner lifetime* was still too short.
+
+### 21.2 Exact fixed-revision ZipPlaFork work and paint sequence
+
+The reference sequence was re-audited from the fixed Git object rather than
+inferred from method names:
+
+```text
+ViewerForm.OpenFile
+  -> choose currentPage and update the trackbar
+  -> clearResizedImageArray
+  -> BackgroundMultiWorker.RunWorkerAsyncWithInterrupt(arguments, waitCancel=true)
+     -> cancel/drain the preceding work set before installing the replacement
+     -> bmwLoadEachPage_RunWorkerStarting
+        -> promote nextData and its PackedImageLoader
+        -> dispose the preceding loader only after old work has drained
+        -> allocate PreFilteredImageArray / OriginalImageInfoArray
+        -> allocate ResizedImageArray / ResizedSizeArray for the whole book
+        -> SetBackgroundMode
+           -> priorityLevel over every page
+           -> BackgroundMultiWorker.SetWorksOrder(all-page permutation)
+           -> ThreadCount = 1
+     -> bmwLoadEachPage_DoWork(work number)
+        -> OpenImageStream / decode / pre-filter source retention
+        -> target resize / post-filter / complete VirtualBitmapEx
+        -> exception becomes a terminal error VirtualBitmapEx
+     -> bmwLoadEachPage_EachRunWorkerCompleted                 [UI completion]
+        -> if currentPage changed: SetBackgroundMode for latest current
+        -> SetNewResizedImage: memory admission and completed artifact publish
+        -> if page is in the current visible band: showCurrentPage(false)
+           -> Invalidate only; no synchronous paint and no scheduler release
+     -> BackgroundMultiWorker.privateRunWorkerCompletedEventHandler
+        -> if order changed, restart its cursor at the newest permutation
+        -> skip every WorksStarted item
+        -> start the first unfinished item immediately
+     -> later WM_PAINT / pbView_Paint / pbView_PaintToCanvas
+```
+
+The decisive ordering is that `EachRunWorkerCompleted` runs before
+`privateRunWorkerCompletedEventHandler` chooses the next page.  A current change
+therefore replaces the unstarted order at the completion boundary; the sole
+already-running page is not preempted.  Its result remains useful book cache
+data, then the next job comes from the latest current-centered permutation.
+`showCurrentPage` only calls `Invalidate`, so physical paint is not a worker
+gate.
+
+For single-page binding (`MaxPageCountInWindow = 1`), `priorityLevel` produces
+current, numerical next, numerical previous, then the remaining book.  For a
+two-page binding it produces the current numerical two-page band, the next
+numerical two-page band, the previous numerical two-page band, then the rest.
+Within a band the normal tie-break is distance from current; while the pointer
+is over the trackbar it is distance from the pointer-mapped value.  This is a
+fixed page-number band, not the actual wide/cover-aware display-unit topology.
+`SetBackgroundMode` also runs before the replacement `BindingMode` is assigned
+later in `bmwLoadEachPage_RunWorkerStarting`, so initial ordering can observe
+the preceding binding value.  These upstream quirks are not ported.
+
+`SetNewResizedImage` is completed-bitmap cache publication, not a displayed
+frame transaction.  It admits a `VirtualBitmapEx` into `ResizedImageArray`, or
+disposes and `ReworkOrder`s it.  `ReduceUsingMemory` evicts from the far end of
+the latest priority order and disposes the same page's resized artifact and
+pre-filtered source.  Completed pages survive navigation until that memory
+eviction, reload or book replacement.  Natural next-page input refuses to move
+beyond an unfinished display frontier, while direct/trackbar movement can
+advance logical current before pixels.  Incomplete spread slots are not drawn,
+but their completion can still request a loading paint; `pbView_Paint` applies
+a half-gray mask to the retained canvas.  Status is also projected during
+paint.  These logical/display and loading semantics are deliberately **not**
+ported.
+
+### 21.3 Single owner for EMPTY, LOADING, DISPLAYED and ERROR
+
+`ViewerPresentationState` now owns a monotonic `PresentationSurface` containing
+`mode`, `revision` and an optional message.  The possible modes are `EMPTY`,
+`LOADING`, `DISPLAYED` and `ERROR`.  `ViewerWindow._project_presentation_surface`
+is the sole bridge to `ViewerWidget.apply_presentation_surface`; the Widget
+rejects an older revision and no longer derives the mode from image-list
+emptiness.  `ViewerWidget.paintEvent` uses the idle prompt only for explicit
+`EMPTY`, uses a loading message for `LOADING`, preserves committed pixels for
+`DISPLAYED`, and uses the presentation-owned failure text for `ERROR`.
+
+The state transitions are:
+
+| Sequence | Presentation surface and canvas contract |
+|---|---|
+| Initial idle -> open | `EMPTY -> LOADING`; no `画像を開いてください` inference while the book/source/current frame is pending. |
+| First complete frame | `LOADING -> DISPLAYED` in the same accepted presentation commit that updates displayed page, slider and status. Paint and post-paint callbacks do not demote it. |
+| Delayed open/resize callback after commit | The Window projects the current state, and the Widget refuses a lower surface revision. A callback from the old interval cannot apply `EMPTY` or clear the frame. |
+| Replacement open with an old committed frame | `DISPLAYED` remains `DISPLAYED` while replacement source/current is pending. The old complete frame stays the rollback owner. |
+| Replacement failure | With an old committed frame, remain `DISPLAYED`; do not clear or show an empty/error placeholder over it. |
+| Initial open failure | With no committed frame, transition to explicit `ERROR`; a cancelled initial open may return to `EMPTY`. |
+| Zero readable images | `BookSession` closes the provisional source and emits `ImageSourceError(code="no_images")`; it is not installed as a successful empty book. |
+| Explicit close/clear | Only `clear_book`/`close` transitions to `EMPTY`, after which Widget clearing and the idle prompt are valid. |
+
+The viewport path now fences the old physical layout/DPR immediately.  When no
+frame has committed, the surface remains explicit `LOADING` and the replacement
+layout request is dispatched on the next event turn, rather than after the
+normal 120-ms resize debounce.  With a committed frame, that old frame remains
+`DISPLAYED` while the replacement layout is debounced.  A viewport event during
+a provisional replacement open is recorded but cannot reactivate or request
+the still-installed old book; success or failure consumes the live viewport
+when it next requests the authoritative frame.  Loading and replacement state
+therefore remain presentation concepts, not side effects of
+`ViewerWidget.clear()` or an empty `_images` collection.
+
+The concrete ownership is in `app/viewer_presentation_state.py`
+(`PresentationSurfaceMode`, `PresentationSurface`,
+`ViewerPresentationState.request_frame`, `commit_frame`,
+`begin_replacement_open`, `supersede_pending`, `fail_replacement_open`,
+`fail_pending`, `clear_book` and `close`); `app/viewer_widget.py`
+(`apply_presentation_surface` and `paintEvent`); `app/viewer_window.py`
+(`open_path`, `_on_async_book_open_failed`, `_on_zip_runtime_frame_ready`,
+`_project_presentation_surface`, `_on_viewport_changed` and close handling);
+and `app/book_session.py` (synchronous/asynchronous zero-image rejection).
+
+### 21.4 Persistent book-scoped work-order owner
+
+The request-scoped startup phase is replaced by one planner with the runtime's
+book lifetime:
+
+```text
+first display request
+  -> RasterBookRuntime._adopt_request
+     -> create RasterWarmupPlanner once
+     -> submit current complete display unit only
+first accepted complete commit
+  -> release_continuous_warmup(request_id)
+     -> RasterWarmupPlanner.release_after_first_commit once
+     -> urgent prefix F1, R1, F2, F3, F4
+     -> same iterator continues through the remaining book
+navigation / ready hit / direction reversal
+  -> _adopt_request
+     -> recenter the existing planner; do not replace its owner
+     -> preserve release state, visited identities and capacity skips
+     -> retain ready source/frame artifacts under the byte budget
+     -> if current is ready: immediate cache-hit publication, no decode job
+     -> if current is cold: current is first in the replacement unstarted order
+     -> if the sole job has already started and its book/source/render identity
+        is artifact-compatible with the new topology, let it finish and retain
+        its artifact even outside the new urgent band
+     -> replace/cancel only an unstarted queued job for the latest current
+provisional replacement open
+  -> suspend the old runtime without destroying planner/store/scan ownership
+  -> failed replacement recenters and resumes that same book planner
+  -> successful replacement retires it at the book-lifetime boundary
+old-request completion already queued on the GUI thread
+  -> accept it as cache data when source epoch/identity/render spec/topology match
+  -> never use its old request serial to mutate presentation state
+paint acknowledgement
+  -> transfer displayed ownership / reclaim safe bytes / release UI side effects
+  -> never release, pause or recreate raster scheduling
+```
+
+`RasterWarmupPlan.priority_band_identities` and
+`iter_continuous_units` express 4 + 1 as a scheduling band, not a phase or
+retention count.  The same topology handles single, spread, LTR/RTL, wide split
+and explicit terminal one-page spread units.  After the priority band, the
+iterator immediately emits the remaining book order.  On recenter the Python
+iterator is reconstructed around the latest current, but the planner object,
+released state, visited-identity ledger, capacity skips, ready frame store and
+decoded source store survive.  This is an order replacement over unstarted
+work, not a return to startup.
+
+Ready-ahead is continuously maintained as urgency.  A unit entering the new
+priority band can discard a previous soft-target capacity skip and is evaluated
+with protected admission rank; distant work remains soft-target work.  Cache
+retention and eviction still use the full direction/distance rank and combined
+source+layout-frame byte budget.  No new page-count cache limit is introduced.
+Layout/DPR/render-signature change keeps the book-scoped planner and decoded
+sources but resets physical-frame capacity observations before rebuilding
+layout-dependent frames.
+
+`RasterBookRuntime._result_is_artifact_compatible` deliberately separates
+artifact usefulness from presentation serial.  A completed result from the
+preceding navigation may enter the source/frame stores only if the runtime is
+accepting, source epoch and source identity match, render spec matches and the
+unit still exists in the current topology.  `frameReady` remains tied to the
+latest current key/request, so an artifact-compatible old result cannot commit
+an obsolete page.  Book switch, source epoch change, incompatible layout,
+cancel, retire and shutdown remain hard rejection/drain boundaries.
+
+The concrete NivisViewer implementation is `app/raster_warmup_planner.py`
+(`RasterWarmupPlan.priority_band_identities`, `iter_continuous_units`,
+`RasterWarmupPlanner.recenter`, `release_after_first_commit`,
+`discard_capacity_skip` and `next_candidate`) and
+`app/zip_raster_book_runtime.py` (`RasterBookRuntime._adopt_request`,
+`_active_job_is_artifact_compatible`, `suspend`, `release_continuous_warmup`, `release_prefetch`,
+`_drive`, `_admission_rank`, `_on_job_completed` and
+`_result_is_artifact_compatible`).  `release_startup_runway` remains only a
+compatibility adapter; it is no longer a separate production phase.
+
+### 21.5 Adopted, retained and rejected structures
+
+| Decision | Structure | Result |
+|---|---|---|
+| **Adopt from ZipPlaFork** | One Viewer lane continues at each completion boundary without waiting for paint. | The released book-scoped planner calls `_drive` from every terminal job result and continues to the next useful candidate. |
+| **Adopt from ZipPlaFork** | Replace the unstarted all-book order around latest current while allowing the sole started compatible job to finish. | `recenter` preserves planner/store state; `_active_job_is_artifact_compatible` adopts any started same-book/source/render-spec job that still belongs to the current topology, not only an urgent-band job. |
+| **Adopt from ZipPlaFork** | Completed page artifacts survive navigation and are evicted by current-centered memory policy. | Compatible old-request results may populate the byte-budgeted source/frame stores without presentation publication. |
+| **Hybrid modernization** | Current/next/previous bands. | NivisViewer uses direction-aware complete display units and a 4-forward/1-reverse urgent band before the remaining book, rather than ZipPlaFork's numerical next-before-previous page bands. |
+| **Keep NivisViewer** | Atomic frame commit and old-frame rollback. | Surface mode, displayed page, slider and status change only at accepted complete-frame commit; spread/split never publishes a partial unit. |
+| **Keep NivisViewer** | Epoch/request/layout/DPR fences, input coalescing and structured shutdown. | Artifact compatibility is separate from latest-request presentation authority; book/source replacement still drains callbacks safely. |
+| **Reject upstream literal behavior** | Clear old resized arrays before open, advance current/status before pixels, refuse natural input beyond the ready frontier, half-gray the old canvas, and rely on wait-cancel/`Guid.Empty`. | Replacement frame is retained; requests remain coalesced; loading/error/empty are explicit; generation/serial fences remain mandatory. |
+| **Reject upstream literal memory rule** | `MaxPageCountInWindow * 4` minimum bitmap admission and coupled source/display eviction. | Combined source/frame bytes remain the only capacity authority, with independent source/frame reuse. |
+| **Reject unrelated fixed-commit change** | Catalog thumbnail semaphore set to one by `07955f5`. | Virtual PageList keeps its independent worker/runtime and budget; the Catalog commit is provenance context, not a Viewer algorithm port. |
+
+### 21.6 Direct structural-port and license map
+
+| Fixed-revision source / class / method | Derived processing principle | NivisViewer counterpart |
+|---|---|---|
+| `source/ZipPla/ViewerForm.Designer.cs:1628-1636`, `bmwLoadEachPage` | One active Viewer page worker. | `app/zip_raster_book_runtime.py`, `RasterBookRuntime._submit`, `_drive` and active-job ownership. |
+| `source/ZipPla/ViewerForm.cs:2919-3007`, `bmwLoadEachPage_RunWorkerStarting`; `:5558-5605`, `SetBackgroundMode` / `priorityLevel` | Book-wide page arrays and a current-centered replaceable work order. | `app/raster_warmup_planner.py`, persistent `RasterWarmupPlanner`, priority band and continuous all-book iterator; runtime `_adopt_request`. |
+| `source/ZipPla/ViewerForm.cs:3177-3602`, `bmwLoadEachPage_DoWork` | One page job yields a terminal display-ready artifact or error. | Existing `_ZipRasterUnitJob.run` / runtime decode-render path; Nivis extends the job boundary to an atomic complete display unit. |
+| `source/ZipPla/ViewerForm.cs:5371-5415`, `bmwLoadEachPage_EachRunWorkerCompleted`; `source/ZipPla/GenerarClasses.cs:247-264,266-339`, `SetWorksOrder` / completion selection | Current change is observed before the completion handler chooses the next unfinished job; one old active result remains reusable. | `RasterWarmupPlanner.recenter`, `RasterBookRuntime._active_job_is_artifact_compatible`, `_on_job_completed`, `_result_is_artifact_compatible` and `_drive`. |
+| `source/ZipPla/ViewerForm.cs:5451-5524`, `SetNewResizedImage` / `ReduceUsingMemory` | Publish completed artifact only and remove lower-priority retained work under memory pressure. | `_ZipRasterFrameStore`, `_ZipRasterSourceStore`, `_admission_rank`, combined-budget enforcement and atomic cache insertion after successful QPixmap creation. |
+| `source/ZipPla/ViewerForm.cs:6438-6487,6768-6879,6990-7280`, `showCurrentPage` / paint path | Paint is separate from worker continuation; upstream loading/display semantics were also evaluated. | Only the non-gating separation is adopted. `ViewerPresentationState` and `PresentationSurface` replace the upstream logical/display and half-gray behavior. |
+| `source/ZipPla/PackedImageLoader.cs:283-330,1197-1243,1781-1867`, loader/index/entry stream | Book-scoped archive/index lifetime and entry-local read. | Existing `ZipImageSource` and `ZipRasterBookRuntime`; unchanged by this planner/surface replacement. |
+
+These principles remain a direct structural port from the fixed
+AGPL-3.0-or-later snapshot.  No C# statement, WinForms control, GDI bitmap loop
+or `BackgroundWorker` implementation is copied literally in this section's
+Python changes.  Original copyright and license material remains at
+`licenses/ZipPlaFork/About.txt` and `licenses/ZipPlaFork/AGPL.txt`; section 1
+and `THIRD_PARTY_NOTICES.md` remain applicable.
+
+### 21.7 Historical persistent-planner baseline (superseded by section 22)
+
+The implementation adds contract coverage for presentation-surface ownership,
+zero-image open failure, old-layout first-frame rejection with an immediate
+cold replacement request, normal resize-debounce restoration,
+persistent planner identity/recenter state, continuous first-commit release,
+complete spread units, active-job adoption, artifact-compatible old results and
+book switch/close/cancel fences.
+
+This table is the pre-adoption baseline retained to show why persistent planner
+ownership alone was insufficient.  Its `cancel 8` result is not the current
+production contract; section 22 records the focused started-job adoption A/B.
+
+| Scenario / metric | Request-scoped section-20 predecessor | Persistent book-scoped planner | Result |
+|---|---:|---:|---|
+| Empty prompt during initial loading | Widget inferred `EMPTY` from no local images | Explicit `LOADING`; stale surface projection rejected | Window/Widget tests observe no demotion after complete commit. |
+| Initial failure / failed or cancelled replacement | No explicit surface owner | `ERROR` / retained `DISPLAYED` | Old pixmap, page state and the same planner survive replacement rollback. |
+| First-frame commit / offscreen draw | 16 ms / <1 ms | 16 ms / <1 ms | Same fixture; draw resolution is below the timer resolution. The controlled 20-ms paint-ack delay is synthetic. |
+| First 10 turns, 8-ms cadence, single | 10 hit / 0 miss | 10 hit / 0 miss | Both are ready-hit fast paths; current reduces scheduling churn rather than improving this already-warm hit rate. |
+| First 10 turns, zero-delay stress, single | 3 hit / 7 miss | 3 hit / 7 miss | No hit-rate improvement when the worker is given no population time. Total elapsed is 94 -> 94 ms; the final per-turn sample is 0 -> 16 ms at the coarse timer quantum, so this is not claimed as an improvement. |
+| Spread / LTR / RTL / reversal | historical contracts | complete-unit order and latest-frame contract retained | 11 selected offscreen contract tests pass; this is structural validation, not a numeric A/B. |
+| Ready-ahead at commit / paint / 50 / 100 / 250 ms | 0 / 2 / 5 / 11 / 30 | 0 / 3 / 7 / 13 / 30 | Current begins the continuous next work one completion earlier; both reach 30 by 250 ms. |
+| Planner objects across initial + ten turns | 11 | 1 | Release remains one book-scoped event; navigation recenters the same owner. |
+| 8-ms navigation churn, four-run median | jobs 25, cancel 9, stale 8 | jobs 24, cancel 8, stale 0 | Ranges: jobs 23--27 -> 23--24; cancel 8--10 -> 8--9; stale 7--9 -> always 0. |
+| Duplicate successful decode | 0 | 0 | Compatible immutable artifacts are retained without duplicate decode or stale presentation publication. |
+| 250-ms combined cache, representative run | 59,520,000 B | 59,520,000 B | No page-count retention limit or memory increase in the matched sample. |
+| Shutdown / callback drain | clean | clean | Both child processes drained, closed the ZIP source and left no benchmark/pytest process. |
+
+Production metrics already expose `ready_ahead_unit_count`,
+`priority_band_target_units`, `continuous_warmup_releases`,
+`warmup_planner_creations`, `warmup_planner_recenters` and
+`compatible_old_results` alongside cache hit/miss, jobs, cancel, stale and
+eviction counts.  They are diagnostic evidence only; byte budget, visual
+correctness and real-device first-ten-turn behavior remain the acceptance
+criteria.  Real application launch, native input and external GUI automation
+remain outside this offscreen validation boundary.
+
+The reproducible runner is `scripts/benchmark_persistent_raster_warmup.py`.
+The matched fixture is one 69,606,482-byte `ZIP_STORED` archive containing 100
+1,600 x 2,400 JPEG pages (SHA-256
+`5875cf121405248842df98cc11e28c0c1cdc27d9206cd8af4191b26a7efd1b76`), a
+400 x 600 target, 512 MiB hard / 448 MiB soft limits and a synthetic 20-ms
+commit-to-paint acknowledgement.  `HEAD` was read-only `git archive` output at
+`199ab05b8460160a64c2d20655f36984440cbb60`; no checkout or worktree mutation
+was used.  Four independent 8-ms cadence runs had elapsed medians 195.5 -> 187
+ms, but offscreen decode scheduling is not physical wheel latency.  The
+zero-delay result is retained explicitly because it bounds the claim: this
+change removes planner/stale churn and forms ready-ahead sooner, but it does not
+make an already-cold final target decode faster than the decoder itself.
+
+Final syntax/import checks and `git diff --check` passed.  The focused
+presentation, BookSession, Widget/Window, planner, ZIP runtime, Folder runtime
+and raster-Viewer integration group passed **130 tests** in one offscreen
+process.  A separate 11-test selection covering the complete planner module,
+LTR/RTL slot order, direction reversal/compatible-result adoption, complete
+spread rotation and magnifier-source retention also passed.  The full
+repository suite was not rerun for this change; the selected scope follows the
+task's requirement to validate major ownership/work-order contracts rather
+than grow or repeatedly execute unrelated boundary tests.
+
+## 22. Fixed-revision input frontier and artifact-compatible started-job adoption (2026-08-21 worktree)
+
+Section 21 established one persistent book-scoped planner, but its first
+implementation could still cancel the sole already-started background job when
+navigation moved that job outside the new urgent band.  This section records
+the narrower final work-order correction: navigation replaces only work that
+has not started; a started job for the same book/source/render specification is
+allowed to finish and its compatible artifact is retained.  The requested page
+still changes immediately while the displayed complete frame remains atomic.
+The startup runway, input timers and cache/admission policy are unchanged.
+
+### 22.1 Exact open, work-state and next-work sequence at the fixed snapshot
+
+The following sequence was re-audited directly at ZipPlaFork revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`:
+
+```text
+ViewerForm.OpenFile
+  -> create/retain PackedImageLoader and enumerate/sort its image entries
+  -> select currentPage and project the trackbar
+  -> clearResizedImageArray
+  -> BackgroundMultiWorker.RunWorkerAsyncWithInterrupt(arguments,
+                                                         waitCancel=true)
+     -> if the preceding work set is busy:
+          CancelAsync marks that set cancelled and queues the new arguments
+          the already-running DoWork is not preempted
+          its eventual completion is forced to Cancelled and is not published
+     -> bmwLoadEachPage_RunWorkerStarting
+        -> promote nextData and the new book-scoped PackedImageLoader
+        -> dispose the preceding loader only after the preceding work drains
+        -> allocate whole-book source/info/resized/size arrays
+        -> SetBackgroundMode
+           -> priorityLevel for every numerical page
+           -> SetWorksOrder(the resulting all-page permutation)
+     -> BackgroundMultiWorker.RunWorkerAsync
+        -> allocate Works, WorksStarted=false and ResultArgs=null per work
+        -> choose WorksOrder[0] and mark that item WorksStarted=true
+        -> run at most one Viewer item because ThreadCount=1
+     -> bmwLoadEachPage_DoWork(WorkNumber)
+        -> open only that entry when its retained source is absent
+        -> decode, orientation/pre-filter and source retention
+        -> resize/post-filter and return one complete VirtualBitmapEx
+        -> return a terminal error bitmap for a per-entry failure
+     -> bmwLoadEachPage_EachRunWorkerCompleted                 [UI callback]
+        -> if currentPage changed, SetBackgroundMode(latest current)
+        -> SetNewResizedImage: admit/publish the completed bitmap as cache data
+        -> if it intersects the latest visible numerical band:
+             showCurrentPage(false) -> Invalidate only
+     -> BackgroundMultiWorker.privateRunWorkerCompletedEventHandler
+        -> store ResultArgs[completed WorkNumber]
+        -> if SetWorksOrder changed the order, reset the next-order cursor
+        -> skip every WorksStarted item in the newest WorksOrder
+        -> mark/start the first unfinished item immediately
+     -> later WM_PAINT / pbView_Paint / pbView_PaintToCanvas
+```
+
+The relevant upstream methods are `source/ZipPla/ViewerForm.cs:2308-2771`
+(`OpenFile`), `:2919-3007` (`bmwLoadEachPage_RunWorkerStarting`),
+`:3177-3602` (`bmwLoadEachPage_DoWork`), `:5371-5415`
+(`bmwLoadEachPage_EachRunWorkerCompleted`), `:5451-5524`
+(`SetNewResizedImage` / `ReduceUsingMemory`) and `:5558-5605`
+(`SetBackgroundMode` / `priorityLevel`), plus
+`source/ZipPla/GenerarClasses.cs:247-339` (`SetWorksOrder`, `ReworkOrder` and
+completion/next-work selection).  `ViewerForm.Designer.cs:1628-1636` fixes the
+Viewer worker count at one.
+
+`WorksStarted`, `ResultArgs` and resident bitmap state are distinct.  Waiting
+means `WorksStarted=false`; running means `WorksStarted=true` and
+`ResultArgs=null`; scheduler-completed means both started and a non-null result.
+`ReworkOrder` makes an item waiting again by clearing `WorksStarted` even when
+an older `ResultArgs` object still exists.  Conversely, a scheduler-completed
+item need not still own a resident bitmap after memory eviction.  Navigation
+does not cancel the one running work item.  It only replaces the unstarted
+permutation; book/reload replacement uses the separate drain/cancel boundary.
+
+`EachRunWorkerCompleted` executes before the internal completion handler chooses
+the next work item.  It can therefore rebuild the order around the latest
+`currentPage`, publish the just-finished bitmap, and then let the scheduler pick
+the first unfinished item from that newest order.  `showCurrentPage` merely
+invalidates the control.  The next decode normally starts before the queued
+Windows paint, so paint is not a scheduling gate.
+
+### 22.2 Natural WheelDown and forced one-page input are different models
+
+The default natural wheel call sequence is:
+
+```text
+ExtendedKeys.WheelDown -> Command.NextPage
+  -> getMouseGestureSettingTemplate -> moveToNextPage
+  -> NextPage -> movePageNatural(1)
+```
+
+This path is in `ViewerForm.cs:15852`, `:13049-13050`, `:12403-12417`,
+`:1903-1948` and `:9279-9360`.  It has no pending final target.  In single mode,
+an unfinished current page rejects WheelDown without changing current, work
+order or cancellation state.  A ready current page may advance once into a cold
+destination; further WheelDown is rejected until that new current completes.
+In ordinary two-page spread mode both pages of the current numerical band must
+be ready before the move, after which it may likewise enter one cold next band.
+Wide/cover branches can reduce that move to one-page behavior.  Thus ten rapid
+natural WheelDown inputs immediately after a cold open accept zero moves while
+page 0 is unfinished, or at most one cold step if page 0 becomes ready during
+the burst.  More steps require intervening completion frontiers.  Inputs beyond
+the frontier are dropped, not coalesced.
+
+The default `MoveForwardOnePage` command is different:
+
+```text
+Down -> Command.MoveForwardOnePage
+  -> movePageToMinimulForward
+  -> moveDividedPage -> isMovablePage -> movePage
+```
+
+The path is `ViewerForm.cs:15858`, `:13053-13054`, `:9536-9589`,
+`:9630-9694` and `:9759-9772`.  With `MaxDivision=1`, ten rapid commands can
+advance logical `currentPage` from `c` to `c+10` while the sole job for `c`
+continues.  They do not enqueue ten decodes.  At the next worker completion,
+`bmwLoadEachPage_EachRunWorkerCompleted` observes the latest `currentPage`,
+calls `SetBackgroundMode`, admits the completed old bitmap if memory permits,
+and the internal completion handler starts the first unfinished item around
+`c+10`.  Intermediate pages are decoded only if a worker completion happens
+between input events.  This is **completion-boundary coalescing to the latest
+logical current**, not a pending-request/final-target state machine.
+
+For an ordinary middle-of-book current, the numerical order is:
+
+| Binding | Fixed `priorityLevel` page band |
+|---|---|
+| single, `M=1` | `c`, `c+1`, `c-1`, then the remaining pages by distance |
+| spread, `M=2` | `c,c+1`, then `c+2,c+3`, then `c-2,c-1`, then the rest |
+
+At book start this becomes `0,1,2,...` in single mode.  In ordinary spread it
+also begins `0,1,2,3,...`, and natural navigation normally waits for the page-0
+band partner before accepting the next spread.  These are fixed number bands,
+not wide/cover-aware complete display units.  `SetBackgroundMode` is called in
+`bmwLoadEachPage_RunWorkerStarting` before the replacement `BindingMode` is
+assigned later in that method, so the initial `M` can even reflect the prior
+mode.  NivisViewer does not adopt either mismatch.
+
+The one-input state model is therefore:
+
+| Input/state | ZipPlaFork decode / retain / drop behavior |
+|---|---|
+| Natural input while current band is unfinished | Reject input; do not move current, create work or cancel; the running job continues. |
+| Natural input from ready current to ready destination | Move current and paint retained bitmap immediately; background job continues and the newest order is selected at its completion. |
+| Natural input from ready current to cold destination | Accept one move, keep the running job, draw the loading treatment; reject subsequent natural inputs until completion. |
+| Forced one-page or trackbar move beyond the frontier | Advance logical current; do not create one job per input; retain the running result and choose latest current at the completion boundary. |
+| Reversal to a resident page | Change current and repaint the resident bitmap; the sole old-direction job still finishes and may enter cache before the order recenters. |
+
+### 22.3 Bitmap completion and memory admission
+
+`SetNewResizedImage` is cache publication, not a displayed-frame commit.  Its
+dynamic upper bound comes from `SetMemoryUBound`; active and inactive modes use
+different fractions of current process/available memory.  Before admitting a
+new `VirtualBitmapEx`, `ReduceUsingMemory` evicts from the tail of the latest
+work order and disposes both that page's resized bitmap and pre-filtered source.
+The new bitmap is admitted when it fits, or while the resident count is below
+`MaxPageCountInWindow * 4` (four single pages or eight spread pages).  Otherwise
+it is disposed and `ReworkOrder` makes that page schedulable again.  When the
+required numerical neighborhood is resident but no further bitmap can be
+admitted, the worker can pause at `ThreadCount=0`; later navigation calls
+`SetBackgroundModeIfPausing` to resume it.
+
+These rules explain why an old running job is not inherently stale in
+ZipPlaFork: if its bitmap passes admission it remains useful book cache even
+when `currentPage` changed during decode.  They also explain what is not being
+ported: the fixed `M * 4` minimum, coupled source/display eviction and logical
+current/loading canvas semantics are WinForms-era policies, not requirements of
+the completion-boundary work-order principle.
+
+### 22.4 NivisViewer Hybrid implementation
+
+NivisViewer now adopts the useful upstream boundary without adopting its input
+loss or split presentation state:
+
+```text
+latest navigation input
+  -> accept final requested unit and serial immediately
+  -> keep displayed page, slider, status and old complete frame unchanged
+  -> RasterWarmupPlanner.recenter(latest complete-unit topology)
+  -> active job handling
+     -> exact current key: adopt latest request as current
+     -> already started + same source epoch/identity/render spec + unit still
+        in current topology: let it finish and adopt it as cache-producing work
+     -> not started: remove/replace it before setting a cancellation flag
+     -> worker already finished but GUI callback is still queued:
+        release the physical one-worker slot immediately
+        record its key as pending completion so it cannot be decoded twice
+  -> compatible completion
+     -> store source/frame artifact under the combined byte budget
+     -> publish only when it is the latest current key/request
+  -> final current completion
+     -> atomic ViewerPresentationState/frame commit
+```
+
+The implementation is in `app/zip_raster_book_runtime.py`:
+`RasterBookRuntime._adopt_request`,
+`_active_job_is_artifact_compatible`, `_take_unstarted_job`,
+`_release_finished_active_slot`, `_has_pending_completion`,
+`_result_is_artifact_compatible`, `_on_job_completed` and `_drive`, with
+diagnostic `work_order_changes`, `running_job_adoptions`,
+`queued_job_replacements` and `finished_job_slot_releases`.  A same-book
+compatible started job is no longer restricted to the 4-forward/1-reverse
+urgent band.  `tryTake` is attempted before cancellation, closing the Qt
+queued-to-running race without poisoning a job that just started.  A finished
+QRunnable is detached from `_active_job` even if its queued QImage/QPixmap
+publication callback has not run; `_pending_completion_keys` is the duplicate
+decode fence until that callback is consumed.
+Incompatible source epoch, source identity, render specification, topology,
+book switch, retire, shutdown and close remain hard rejection boundaries.
+
+This preserves the NivisViewer advantages: every input can update the final
+requested target, the old complete frame remains displayed during the miss,
+stale serials cannot mutate presentation, single/spread/wide/RTL use one actual
+display-unit topology, and paint acknowledgement owns only displayed-resource
+reclamation and deferred UI effects.  It does not release, pause or advance the
+raster worker.  Across the initial request plus ten navigation requests, the
+same planner reports **one creation and ten recenters**.
+
+Only the artifact-compatible started-job policy and its metrics changed in
+this focused implementation, together with the worker-finished/GUI-pending
+state split needed to make that policy continue immediately.  The continuous
+runway (`F1, R1, F2, F3, F4`),
+input admission/coalescing timers, combined byte budget, retention rank,
+eviction and source/frame cache formats are unchanged, making the A/B attribution
+narrow.
+
+### 22.5 Focused offscreen A/B
+
+The before/after comparison uses the same fake/offscreen raster fixture and
+changes only the focused work-ownership boundary above: started-job retention,
+safe queued replacement and worker-finished/GUI-pending separation.  The
+figures are supporting evidence, not a claim about native wheel feel or
+physical paint latency.
+
+The final rerun used one unchanged 100-page, 1600 x 2400 JPEG, ZIP_STORED
+fixture (`69,606,482` bytes, SHA-256
+`5875cf121405248842df98cc11e28c0c1cdc27d9206cd8af4191b26a7efd1b76`), a
+400 x 600 physical target, 20-ms fake paint acknowledgement and the same
+512/448-MiB hard/soft budgets.  Each cell is `before -> after`.  No runway,
+timer, radius or budget value differs between the two sides.
+
+| Scenario | first frame ms | ready hits / 10 | jobs | successful artifacts | cancel | running adoption | ready ahead | final ms | elapsed ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| single LTR, 8 ms | 16 -> 16 | 10 -> 10 | 24 -> 24 | 15 -> 23 | 9 -> 0 | 1 -> 9 | 4 -> 12 | 0 -> 0 | 204 -> 203 |
+| single RTL, 8 ms | 15 -> 16 | 10 -> 10 | 24 -> 24 | 15 -> 23 | 9 -> 0 | 1 -> 10 | 4 -> 12 | 0 -> 0 | 203 -> 203 |
+| spread LTR, 8 ms | 15 -> 16 | 10 -> 10 | 16 -> 15 | 29 -> 29 | 1 -> 0 | 9 -> 10 | 3 -> 3 | 0 -> 0 | 203 -> 203 |
+| spread RTL, 8 ms | 15 -> 15 | 10 -> 10 | 16 -> 16 | 30 -> 30 | 1 -> 0 | 9 -> 10 | 4 -> 4 | 0 -> 0 | 203 -> 203 |
+| single LTR, no added delay | 16 -> 0* | 3 -> 2 | 12 -> 12 | 11 -> 11 | 0 -> 0 | 10 -> 10 | 0 -> 0 | 0 -> 15 | 94 -> 94 |
+| single RTL, no added delay | 0* -> 16 | 2 -> 3 | 12 -> 12 | 11 -> 11 | 0 -> 0 | 10 -> 10 | 0 -> 0 | 0 -> 0 | 93 -> 94 |
+| spread LTR, no added delay | 16 -> 16 | 2 -> 2 | 12 -> 12 | 22 -> 22 | 0 -> 0 | 10 -> 10 | 0 -> 0 | 16 -> 16 | 141 -> 141 |
+| spread RTL, no added delay | 15 -> 15 | 2 -> 1 | 12 -> 12 | 22 -> 22 | 0 -> 0 | 10 -> 10 | 0 -> 0 | 15 -> 15 | 140 -> 140 |
+
+All eight runs kept one planner, ten recenters, zero duplicate successful
+decode, zero stale presentation result and clean shutdown.  `0*` is the
+millisecond timer's resolution floor, not a zero-cost first frame.  The
+no-added-delay rows wait for each frame before issuing the next request; they
+are a cache-readiness stress bound, not a simultaneous input burst.  Their
+one-hit scheduling jitter is therefore not used as an improvement claim.
+
+The actual production burst contract is covered separately with page 1 held
+inside its decode while ten wheel targets advance from page 0 to page 10:
+
+| State after first-frame commit | Previous Nivis policy | Hybrid policy |
+|---|---|---|
+| input 1 | requested 1, displayed 0; running page 1 is exact current | same |
+| input 2 | requested 2; set cancellation on running page 1 | requested 2; adopt page 1 as useful book work |
+| inputs 3-10 | requested ends at 10; cancelled page 1 still occupies the sole worker | requested ends at 10; displayed remains 0; page 1 remains useful and is adopted nine times total |
+| worker exits before GUI callback | page 1 result is discarded; final job waits for the queued callback to clear `_active_job` | page 1 key enters the pending-completion ledger and page 10 starts immediately without waiting for QPixmap publication |
+| terminal artifacts / presentation | pages 0 and 10; one cancel; displayed sequence 0 -> 10 | pages 0, 1 and 10; zero cancel/stale/duplicate; displayed sequence 0 -> 10 only |
+
+The decoded page order is `0, 1, 10` on the Hybrid path; page 1 is retained
+instead of being thrown away, and no intermediate frame is committed.  This is
+the direct answer to the open-runway problem: useful work and the latest order
+are independently owned.  Adoption does not manufacture decoded pixels at an
+actual 0-ms cadence, but it prevents navigation from converting an occupied
+worker into discarded work.  Physical ZIP entry I/O, decoder throughput,
+QPixmap upload, DWM/GPU presentation and native-input behavior remain for the
+real-device check.
+
+### 22.6 Adoption decision and AGPL provenance
+
+| Decision | Fixed-revision source principle | NivisViewer result |
+|---|---|---|
+| **Adopt structurally** | `bmwLoadEachPage_EachRunWorkerCompleted` observes latest `currentPage`; `SetBackgroundMode` replaces the unstarted order; `BackgroundMultiWorker` lets the sole started work finish and selects next work at completion. | `RasterBookRuntime._adopt_request` keeps a started artifact-compatible same-book job and replaces an unstarted job; `_on_job_completed` stores the artifact, while only latest-current authority can publish. |
+| **Adopt structurally** | `SetNewResizedImage` makes a completed old-current bitmap reusable cache data; worker continuation does not wait for paint. | Compatible old-request results can enter the frame/source stores; `_drive` continues independently of paint acknowledgement. |
+| **Modernize the boundary** | The WinForms completion callback publishes the bitmap and then its internal handler immediately chooses the next work before paint. | A finished QRunnable releases the scheduler slot before its queued GUI callback; a pending-key ledger prevents duplicate decode, so QPixmap upload and callback order do not gate a different final target. |
+| **Keep NivisViewer** | No upstream equivalent for requested/displayed serial separation or atomic complete-unit commit. | Final requested input is accepted, displayed/slider/status remain on the prior complete frame, and spread/wide commit only as one complete unit. |
+| **Do not adopt** | Natural WheelDown drops input at the unfinished frontier; forced movement advances logical current/status before pixels; loading uses a half-gray canvas. | Input coalescing retains the final target and PresentationState prevents partial/stale display publication. |
+| **Do not adopt** | Fixed numerical `M=1/2` bands, coupled source/display eviction and the `M * 4` minimum bitmap rule. | Actual display-unit topology and the existing combined byte-driven source/frame stores remain authoritative. |
+
+The structural source is
+[`himamon/ZipPlaFork`](https://github.com/himamon/ZipPlaFork) at fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, principally
+`source/ZipPla/ViewerForm.cs` methods `bmwLoadEachPage_RunWorkerStarting`,
+`bmwLoadEachPage_DoWork`, `bmwLoadEachPage_EachRunWorkerCompleted`,
+`SetNewResizedImage`, `SetBackgroundMode`, `NextPage`, `movePageNatural` and
+`movePageToMinimulForward`, plus `source/ZipPla/GenerarClasses.cs`
+`SetWorksOrder`, `ReworkOrder` and the internal completion handler.  The source
+is AGPL-3.0-or-later.  Original copyright and license materials remain in
+`licenses/ZipPlaFork/About.txt` and `licenses/ZipPlaFork/AGPL.txt`, with the
+notice in `THIRD_PARTY_NOTICES.md` and section 1 still applying.
+
+As in section 21, the fixed hash is a source snapshot, **not** the commit that
+introduced the one-worker Viewer setting.  Commit `07955f5` only changes the
+Catalog thumbnail semaphore; the audited Viewer worker was already present in
+`5e942ef0006decf01c21d9dbe037dba50e763420`.  The NivisViewer implementation is
+a Python/Qt structural translation of the completion-boundary ownership rule;
+it does not copy WinForms controls, GDI bitmap arrays or `BackgroundWorker`
+statements literally.

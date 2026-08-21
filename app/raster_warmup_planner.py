@@ -204,6 +204,69 @@ class RasterWarmupPlan(Generic[UnitT, IdentityT]):
         by it.
         """
 
+        return tuple(
+            self.topology.unit_at(ordinal)
+            for ordinal in self._priority_band_ordinals(
+                preferred_units=preferred_units,
+                opposite_units=opposite_units,
+            )
+        )
+
+    def priority_band_identities(
+        self,
+        *,
+        preferred_units: int = 4,
+        opposite_units: int = 1,
+    ) -> tuple[IdentityT, ...]:
+        """Return the complete display units in the urgent work-order band.
+
+        The band affects scheduling only. Cache residency remains governed by
+        the combined source/frame byte budget owned by the runtime.
+        """
+
+        return tuple(
+            self.topology.identity_at(ordinal)
+            for ordinal in self._priority_band_ordinals(
+                preferred_units=preferred_units,
+                opposite_units=opposite_units,
+            )
+        )
+
+    def iter_continuous_units(
+        self,
+        *,
+        preferred_units: int = 4,
+        opposite_units: int = 1,
+    ) -> Iterator[UnitT]:
+        """Yield the priority band and remaining book as one work order."""
+
+        if not self.background_enabled or not len(self.topology):
+            return
+        priority_ordinals = self._priority_band_ordinals(
+            preferred_units=preferred_units,
+            opposite_units=opposite_units,
+        )
+        emitted = {
+            self.topology.identity_at(ordinal) for ordinal in priority_ordinals
+        }
+        current_pages = frozenset(self.current_page_indexes)
+        for ordinal in priority_ordinals:
+            yield self.topology.unit_at(ordinal)
+        for ordinal in self._iter_background_ordinals():
+            identity = self.topology.identity_at(ordinal)
+            if identity in emitted or identity == self.current_identity:
+                continue
+            if current_pages.intersection(self.topology.page_indexes_at(ordinal)):
+                continue
+            emitted.add(identity)
+            yield self.topology.unit_at(ordinal)
+
+    def _priority_band_ordinals(
+        self,
+        *,
+        preferred_units: int,
+        opposite_units: int,
+    ) -> tuple[int, ...]:
         preferred_remaining = max(0, int(preferred_units))
         opposite_remaining = max(0, int(opposite_units))
         if (
@@ -219,7 +282,7 @@ class RasterWarmupPlan(Generic[UnitT, IdentityT]):
         )
         preferred_step = self.direction or 1
         opposite_step = -preferred_step
-        selected: list[UnitT] = []
+        selected: list[int] = []
 
         def append_ordinal(ordinal: int) -> bool:
             if not 0 <= ordinal < len(self.topology):
@@ -229,26 +292,25 @@ class RasterWarmupPlan(Generic[UnitT, IdentityT]):
                 return False
             if current_pages.intersection(self.topology.page_indexes_at(ordinal)):
                 return False
-            selected.append(self.topology.unit_at(ordinal))
+            selected.append(ordinal)
             return True
 
         distance = 1
-        # Preserve the useful next -> previous -> further-next shape, while
-        # limiting the reverse runway to one unit and extending the reading
-        # direction far enough for several immediate page turns.
         while preferred_remaining > 0 or opposite_remaining > 0:
             added = False
             if preferred_remaining > 0:
-                if append_ordinal(anchor + preferred_step * distance):
+                preferred_ordinal = anchor + preferred_step * distance
+                if append_ordinal(preferred_ordinal):
                     preferred_remaining -= 1
                     added = True
-                elif not 0 <= anchor + preferred_step * distance < len(self.topology):
+                elif not 0 <= preferred_ordinal < len(self.topology):
                     preferred_remaining = 0
             if opposite_remaining > 0:
-                if append_ordinal(anchor + opposite_step * distance):
+                opposite_ordinal = anchor + opposite_step * distance
+                if append_ordinal(opposite_ordinal):
                     opposite_remaining -= 1
                     added = True
-                elif not 0 <= anchor + opposite_step * distance < len(self.topology):
+                elif not 0 <= opposite_ordinal < len(self.topology):
                     opposite_remaining = 0
             distance += 1
             if not added and (
@@ -285,34 +347,33 @@ class RasterWarmupPlan(Generic[UnitT, IdentityT]):
 
 
 class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
-    """Own the lazy cursor, capacity skips, and warm-up stop state."""
+    """Own one persistent, recenterable work order for a raster book."""
 
     __slots__ = (
         "_capacity_skips",
         "_deferred_by_target",
-        "_fully_released",
         "_iterator",
+        "_last_candidate_identity",
+        "_opposite_units",
         "_plan",
+        "_preferred_units",
         "_released",
-        "_startup_iterator",
-        "_startup_target_count",
-        "_startup_units",
         "_stop_reason",
-        "_visited_background_units",
+        "_visited_identities",
     )
 
     def __init__(self, plan: RasterWarmupPlan[UnitT, IdentityT]) -> None:
         self._plan = plan
         self._capacity_skips: set[IdentityT] = set()
         self._deferred_by_target = 0
-        self._fully_released = False
+        self._preferred_units = 4
+        self._opposite_units = 1
         self._released = False
-        self._startup_units: tuple[UnitT, ...] = ()
-        self._startup_iterator: Iterator[UnitT] = iter(())
-        self._startup_target_count = 0
         self._stop_reason = WarmupStopReason.WAITING_FOR_COMMIT
-        self._visited_background_units = 0
-        self._iterator = plan.iter_background_units()
+        self._visited_identities: set[IdentityT] = set()
+        self._last_candidate_identity: IdentityT | None = None
+        self._mark_current_visited()
+        self._iterator = self._new_iterator()
 
     @property
     def plan(self) -> RasterWarmupPlan[UnitT, IdentityT]:
@@ -327,12 +388,23 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
         return frozenset(self._capacity_skips)
 
     @property
+    def visited_identities(self) -> frozenset[IdentityT]:
+        return frozenset(self._visited_identities)
+
+    @property
     def background_released(self) -> bool:
         return self._released
 
     @property
     def startup_target_count(self) -> int:
-        return self._startup_target_count
+        """Compatibility diagnostic for the active priority-band size."""
+
+        return len(
+            self._plan.priority_band_identities(
+                preferred_units=self._preferred_units,
+                opposite_units=self._opposite_units,
+            )
+        )
 
     @property
     def book_complete(self) -> bool:
@@ -343,65 +415,80 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
 
     @property
     def unprocessed_hint(self) -> int:
+        visited = sum(
+            self._plan.topology.ordinal_for_identity(identity) is not None
+            for identity in self._visited_identities
+        )
         return max(
             0,
-            self._plan.unit_count
-            - 1
-            - self._visited_background_units
-            + self._deferred_by_target,
+            self._plan.unit_count - visited + self._deferred_by_target,
         )
 
     def replace(self, plan: RasterWarmupPlan[UnitT, IdentityT]) -> None:
-        self.__init__(plan)
+        """Compatibility adapter for callers that used to replace the owner."""
+
+        self.recenter(plan)
+
+    def recenter(self, plan: RasterWarmupPlan[UnitT, IdentityT]) -> None:
+        """Reprioritize unstarted work while preserving book-scoped state."""
+
+        self._plan = plan
+        self._capacity_skips = {
+            identity
+            for identity in self._capacity_skips
+            if plan.contains_identity(identity)
+        }
+        self._deferred_by_target = 0
+        self._last_candidate_identity = None
+        self._mark_current_visited()
+        self._iterator = self._new_iterator()
+        self._stop_reason = (
+            WarmupStopReason.RUNNING
+            if self._released
+            else WarmupStopReason.WAITING_FOR_COMMIT
+        )
+
+    def release_after_first_commit(
+        self,
+        *,
+        preferred_units: int = 4,
+        opposite_units: int = 1,
+    ) -> bool:
+        """Release background population once for this planner's lifetime."""
+
+        if self._released:
+            return False
+        self._preferred_units = max(0, int(preferred_units))
+        self._opposite_units = max(0, int(opposite_units))
+        self._released = True
+        self._iterator = self._new_iterator()
+        self._stop_reason = WarmupStopReason.RUNNING
+        return True
 
     def release_startup_runway(
         self,
         *,
         preferred_units: int = 4,
         opposite_units: int = 1,
-    ) -> None:
-        """Release a complete-unit runway before physical paint.
+    ) -> bool:
+        """Compatibility adapter for the former request-scoped API."""
 
-        The caller still applies the combined source+frame byte policy to
-        every candidate.  These counts express only the desired startup
-        runway; they never bound retained cache population.
-        """
-
-        if self._fully_released:
-            return
-        self._released = True
-        self._startup_units = self._plan.startup_runway_units(
+        return self.release_after_first_commit(
             preferred_units=preferred_units,
             opposite_units=opposite_units,
         )
-        self._startup_iterator = iter(self._startup_units)
-        self._startup_target_count = len(self._startup_units)
-        self._stop_reason = (
-            WarmupStopReason.RUNNING
-            if self._startup_target_count
-            else WarmupStopReason.WAITING_FOR_COMMIT
-        )
 
     def release_after_paint(self) -> None:
-        # Paint acknowledges displayed-frame ownership and cache reclamation at
-        # the runtime boundary.  Scheduling no longer waits here: the startup
-        # runway promotes itself to the book-wide iterator when exhausted.
-        self._released = True
-        if not self._startup_units:
-            # Compatibility/failure paths may reach paint without an accepted
-            # commit release.  They can enter the normal book-wide iterator.
-            # When a runway is already active, however, paint must not skip its
-            # remaining higher-priority complete units.
-            self._fully_released = True
-        self._stop_reason = WarmupStopReason.RUNNING
+        # Paint transfers displayed-frame ownership at the runtime boundary.
+        # It is deliberately not a scheduler release or resume signal.
+        return None
 
     def suspend(self) -> None:
         self._stop_reason = WarmupStopReason.SUSPENDED
 
     def stop_for_soft_target(self) -> None:
-        # Admission has to inspect a concrete unit, so ``next_candidate`` has
-        # already advanced the lazy iterator by one.  Keep that unit counted as
-        # unprocessed until a target change resets the cursor.
+        # Admission has inspected a concrete unit after the iterator advanced.
+        # Keep it represented as deferred until recenter/reset rebuilds order.
         self._deferred_by_target = 1
         self._stop_reason = WarmupStopReason.SOFT_TARGET
 
@@ -411,16 +498,30 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
 
     def mark_capacity_skip(self, identity: IdentityT) -> None:
         self._capacity_skips.add(identity)
+        self._visited_identities.add(identity)
+
+    def discard_capacity_skip(self, identity: IdentityT) -> None:
+        """Make one newly important unit eligible without rewinding the book."""
+
+        if identity not in self._capacity_skips:
+            return
+        self._capacity_skips.discard(identity)
+        self._deferred_by_target = 0
+        self._iterator = self._new_iterator()
+        self._stop_reason = (
+            WarmupStopReason.RUNNING
+            if self._released
+            else WarmupStopReason.WAITING_FOR_COMMIT
+        )
 
     def reset_capacity(self) -> None:
         self._capacity_skips.clear()
         self._deferred_by_target = 0
-        self._visited_background_units = 0
-        self._iterator = self._plan.iter_background_units()
-        self._startup_iterator = iter(self._startup_units)
+        self._last_candidate_identity = None
+        self._iterator = self._new_iterator()
         self._stop_reason = (
             WarmupStopReason.RUNNING
-            if self._fully_released or self._startup_target_count
+            if self._released
             else WarmupStopReason.WAITING_FOR_COMMIT
         )
 
@@ -440,36 +541,38 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
             WarmupStopReason.HARD_LIMIT,
         }:
             return None
-        if not self._fully_released:
-            for unit in self._startup_iterator:
-                identity = identity_of(unit)
-                if identity in self._capacity_skips:
-                    continue
-                if is_ready(unit) or is_terminal_failure(unit):
-                    continue
-                self._stop_reason = WarmupStopReason.RUNNING
-                return unit
-            # The runway is a priority prefix, not another gate.  Once its
-            # complete units are ready (or safely declined by byte admission),
-            # continue the same one-worker population into the lazy book-wide
-            # order without waiting for paint.
-            self._fully_released = True
-
         for unit in self._iterator:
-            self._visited_background_units += 1
             identity = identity_of(unit)
+            self._visited_identities.add(identity)
             if identity in self._capacity_skips:
                 continue
             if is_ready(unit) or is_terminal_failure(unit):
                 continue
+            self._last_candidate_identity = identity
             self._stop_reason = WarmupStopReason.RUNNING
             return unit
+        self._last_candidate_identity = None
         self._stop_reason = (
             WarmupStopReason.COMPLETE_WITH_SKIPS
             if self._capacity_skips
             else WarmupStopReason.COMPLETE
         )
         return None
+
+    def _new_iterator(self) -> Iterator[UnitT]:
+        return self._plan.iter_continuous_units(
+            preferred_units=self._preferred_units,
+            opposite_units=self._opposite_units,
+        )
+
+    def _mark_current_visited(self) -> None:
+        if (
+            self._plan.topology.ordinal_for_identity(
+                self._plan.current_identity
+            )
+            is not None
+        ):
+            self._visited_identities.add(self._plan.current_identity)
 
 
 __all__ = [

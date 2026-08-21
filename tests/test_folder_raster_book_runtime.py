@@ -385,13 +385,11 @@ def test_folder_prefetch_budgets_native_preview_and_allows_lazy_one_axis_fit(
         assert runtime.request(third)
         _wait_until(qapp, lambda: frames[-1].request_id == 3)
         runtime.set_cache_limits(byte_budget=runtime.cache_bytes + 1_500_000)
-        jobs_before_probe = runtime.metrics.jobs_submitted
         assert runtime.release_startup_runway(request_id=3)
         _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
 
         assert source.header_probes[-1] == "2.jpg"
         assert source.preview_opens.count("2.jpg") == 1
-        assert runtime.metrics.jobs_submitted == jobs_before_probe + 1
         assert runtime.metrics.prefetch_admission_stops == 1
         assert 2 in runtime.cached_page_indexes
         assert 1 not in runtime.cached_page_indexes

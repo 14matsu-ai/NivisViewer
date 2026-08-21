@@ -424,6 +424,8 @@ def test_runtime_builds_startup_runway_then_continues_book_warmup(
     try:
         assert runtime.request(request)
         _wait_until(qapp, lambda: len(frames) == 1)
+        planner = runtime._warmup_planner
+        assert planner is not None
 
         assert source.order == ["2.png"]
         assert runtime.metrics.jobs_submitted == 1
@@ -448,6 +450,8 @@ def test_runtime_builds_startup_runway_then_continues_book_warmup(
         ]
         assert runtime.warmup_stop_reason == "complete"
         assert runtime.metrics.startup_runway_releases == 1
+        assert runtime.metrics.continuous_warmup_releases == 1
+        assert runtime.metrics.warmup_planner_creations == 1
         assert source.max_active == 1
         assert set(runtime.cached_page_indexes) == set(range(8))
 
@@ -464,6 +468,9 @@ def test_runtime_builds_startup_runway_then_continues_book_warmup(
         assert frames[-1].request_id == 2
         assert frames[-1].cache_hit
         assert runtime.metrics.jobs_submitted == jobs_before_hit
+        assert runtime._warmup_planner is planner
+        assert runtime.metrics.warmup_planner_creations == 1
+        assert runtime.metrics.warmup_planner_recenters == 1
     finally:
         assert runtime.shutdown(wait_msecs=3000)
         source.close()
@@ -543,6 +550,7 @@ def test_painted_book_warmup_resumes_on_budget_increase_and_fills_broad_order(
         _wait_until(qapp, lambda: len(frames) == 1)
 
         runtime.set_cache_limits(byte_budget=runtime.cache_bytes + 1)
+        assert runtime.release_startup_runway(request_id=1)
         assert runtime.release_prefetch(request_id=1)
         qapp.processEvents()
         assert runtime.cached_page_indexes == (0,)
@@ -586,18 +594,20 @@ def test_soft_target_keeps_near_minimum_then_expansion_resumes_book(
     try:
         assert runtime.request(request)
         _wait_until(qapp, lambda: len(frames) == 1)
+        assert runtime.release_startup_runway(request_id=1)
         assert runtime.release_prefetch(request_id=1)
         _wait_until(
             qapp,
             lambda: not runtime.has_unfinished_tasks()
-            and runtime.warmup_stop_reason == "soft_target",
+            and runtime.warmup_stop_reason == "complete_with_skips",
         )
 
-        # The soft target is intentionally below one image. Current and the
-        # immediate forward/reverse display units are a minimum guarantee,
-        # never a maximum count.
-        assert set(runtime.cached_page_indexes) == {2, 3, 4}
+        # The soft target is intentionally below one image. Current plus the
+        # four-forward/one-reverse priority band may populate up to the hard
+        # byte budget; it is scheduling urgency, never a page retention cap.
+        assert set(runtime.cached_page_indexes) == {2, 3, 4, 5, 6, 7}
         assert runtime.cache_bytes > runtime.cache_soft_target_bytes
+        assert runtime.cache_debug_values()["capacity_skip_count"] == 2
 
         runtime.set_memory_limits(
             hard_limit_bytes=64 * 1024 * 1024,
@@ -656,6 +666,7 @@ def test_budget_shrink_cancels_running_background_snapshot(
         assert runtime.request(request)
         _wait_until(qapp, lambda: len(frames) == 1)
         reduced_budget = runtime.cache_bytes
+        assert runtime.release_startup_runway(request_id=1)
         assert runtime.release_prefetch(request_id=1)
         _wait_until(qapp, source.background_started.is_set)
 
@@ -714,6 +725,7 @@ def test_soft_target_recovery_keeps_unrelated_background_decode(
     try:
         assert runtime.request(request)
         _wait_until(qapp, lambda: len(frames) == 1)
+        assert runtime.release_startup_runway(request_id=1)
         assert runtime.release_prefetch(request_id=1)
         _wait_until(qapp, source.far_started.is_set)
 
@@ -783,6 +795,7 @@ def test_full_cache_navigation_reclaims_only_lower_rank_for_new_neighbor(
         # but not a fourth page. The deprecated unit limit of one must not
         # truncate this byte-driven warm-up.
         runtime.set_cache_limits(byte_budget=runtime.cache_bytes * 4)
+        assert runtime.release_startup_runway(request_id=1)
         assert runtime.release_prefetch(request_id=1)
         _wait_until(
             qapp,
@@ -865,7 +878,7 @@ def test_full_cache_navigation_reclaims_only_lower_rank_for_new_neighbor(
         source.close()
 
 
-def test_direction_reversal_rejects_queued_old_serial_and_reorders_cursor(
+def test_direction_reversal_retains_queued_compatible_artifact_and_reorders(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
@@ -906,7 +919,7 @@ def test_direction_reversal_rejects_queued_old_serial_and_reorders_cursor(
         )
         assert runtime.request(first)
         _wait_until(qapp, lambda: len(frames) == 1)
-        assert runtime.release_prefetch(request_id=1)
+        assert runtime.release_startup_runway(request_id=1)
         assert source.background_started.wait(1.0)
         source.release_background.set()
         # Finish the old decode without draining its queued GUI result.  This
@@ -914,9 +927,11 @@ def test_direction_reversal_rejects_queued_old_serial_and_reorders_cursor(
         # order, but its immutable result still carries request 1.
         assert runtime.wait_for_done(3000)
 
-        # Reverse around the same ready current.  Page 0 is the exact first
-        # missing unit in the new runway, so the old-direction page-2 job is
-        # cancelled/staled instead of delaying the replacement frontier.
+        # Reverse around the same ready current. The finished page-2 result is
+        # still a useful complete artifact in the new priority band, even
+        # though its immutable callback carries request 1. Retain it without
+        # publishing stale presentation state, then continue with page 0 from
+        # the recentered unstarted order.
         second = _request(
             2,
             _unit(1),
@@ -927,15 +942,107 @@ def test_direction_reversal_rejects_queued_old_serial_and_reorders_cursor(
             direction=-1,
         )
         assert runtime.request(second)
-        assert runtime.release_prefetch(request_id=2)
-        assert runtime.metrics.cancel_requests == 1
+        assert runtime.release_startup_runway(request_id=2)
+        assert runtime.metrics.cancel_requests == 0
         _wait_until(qapp, lambda: 0 in artifacts)
 
-        assert artifacts[:2] == [1, 0]
-        assert runtime.metrics.stale_results >= 1
+        assert artifacts[:3] == [1, 2, 0]
+        assert runtime.metrics.compatible_old_results == 1
+        assert runtime.metrics.stale_results == 0
         _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
     finally:
         source.release_background.set()
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()
+
+
+def test_rapid_navigation_adopts_started_book_work_and_dispatches_final_target(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    archive = _write_zip(tmp_path, pages=12)
+
+    class BlockingSource(ZipImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.page_one_started = Event()
+            self.release_page_one = Event()
+            self.decode_order: list[str] = []
+
+        def open_image(self, image_id: str) -> Image.Image:
+            self.decode_order.append(image_id)
+            if image_id == "1.png":
+                self.page_one_started.set()
+                self.release_page_one.wait(2.0)
+            return super().open_image(image_id)
+
+    source = BlockingSource(archive)
+    runtime = ZipRasterBookRuntime(source, 1)
+    units = tuple(_unit(index) for index in range(12))
+    frames: list[ZipRasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    final_request: ZipRasterRequest | None = None
+    try:
+        initial = _request(1, units[0], *units, direction=1)
+        assert runtime.request(initial)
+        _wait_until(qapp, lambda: bool(frames))
+        assert runtime.release_continuous_warmup(request_id=1)
+        assert source.page_one_started.wait(1.0)
+        started_job = runtime._active_job
+        assert started_job is not None
+        assert started_job.started.is_set()
+
+        # Model the replaceable portion of a rapid wheel sequence. Every input
+        # updates the requested target and pending work order, but the sole
+        # already-started, compatible page remains book-owned. It is neither a
+        # presentation commit nor disposable work merely because its request
+        # serial changed.
+        for request_id, page_index in enumerate(range(2, 11), start=2):
+            final_request = _request(
+                request_id,
+                units[page_index],
+                *units,
+                direction=1,
+            )
+            assert runtime.stage(final_request)
+            assert runtime._active_job is started_job
+            assert not started_job.cancelled.is_set()
+
+        assert final_request is not None
+        assert runtime.metrics.cancel_requests == 0
+        assert runtime.metrics.running_job_adoptions == 9
+        assert runtime.metrics.warmup_planner_creations == 1
+        assert runtime.metrics.work_order_changes == 9
+
+        source.release_page_one.set()
+        # Finish the native worker without draining its queued GUI result. The
+        # final request must release that finished scheduling slot immediately
+        # while the pending key ledger prevents a duplicate page-1 decode.
+        assert runtime.wait_for_done(3000)
+        assert started_job.finished.is_set()
+        assert 1 not in runtime.cached_page_indexes
+        assert [frame.request_id for frame in frames] == [1]
+
+        jobs_before_final = runtime.metrics.jobs_submitted
+        assert runtime.request(final_request)
+        final_job = runtime._active_job
+        assert final_job is not None and final_job.key.unit_identity == (
+            final_request.current.identity
+        )
+        assert runtime.metrics.jobs_submitted == jobs_before_final + 1
+        assert runtime.metrics.finished_job_slot_releases == 1
+        _wait_until(
+            qapp,
+            lambda: frames[-1].request_id == final_request.request_id,
+        )
+        assert frames[-1].unit.identity == final_request.current.identity
+        assert 1 in runtime.cached_page_indexes
+        assert source.decode_order[:3] == ["0.png", "1.png", "10.png"]
+        assert runtime.metrics.cancel_requests == 0
+        assert runtime.metrics.stale_results == 0
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+    finally:
+        source.release_page_one.set()
         assert runtime.shutdown(wait_msecs=3000)
         source.close()
 
@@ -968,6 +1075,7 @@ def test_completed_frames_outlive_active_frontier_and_make_roundtrip_ready(
                 lambda current=request_id: bool(frames)
                 and frames[-1].request_id == current,
             )
+            assert runtime.release_startup_runway(request_id=request_id)
             assert runtime.release_prefetch(request_id=request_id)
             _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
 
@@ -1003,7 +1111,12 @@ def test_completed_frames_outlive_active_frontier_and_make_roundtrip_ready(
 
         assert frames[-1].request_id == 6
         assert frames[-1].cache_hit
-        assert runtime.metrics.jobs_submitted == submitted_before_roundtrip
+        # The current cache-hit commit is synchronous and creates no current
+        # job. The already-released planner may immediately replenish missing
+        # page 0 as background ready-ahead after that commit returns.
+        assert runtime.metrics.jobs_submitted == submitted_before_roundtrip + 1
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+        assert 0 in runtime.cached_page_indexes
     finally:
         assert runtime.shutdown(wait_msecs=3000)
         source.close()
@@ -1413,6 +1526,7 @@ def test_memory_budget_stops_prefetch_before_decode_churn(
         assert runtime.decoded_source_bytes > 0
         assert runtime.cached_unit_count == 1
         runtime.set_cache_limits(byte_budget=current_bytes + 1)
+        assert runtime.release_startup_runway(request_id=1)
         assert runtime.release_prefetch(request_id=1)
         qapp.processEvents()
 
@@ -1467,6 +1581,7 @@ def test_unknown_non_jpeg_prefetch_is_header_budgeted_before_pixel_decode(
         current_bytes = runtime.cache_bytes
         assert runtime.decoded_source_bytes > 4 << 20
         runtime.set_cache_limits(byte_budget=current_bytes + (4 << 20))
+        assert runtime.release_startup_runway(request_id=1)
         assert runtime.release_prefetch(request_id=1)
         _wait_until(qapp, lambda: 2 in runtime.cached_page_indexes)
 
@@ -1583,8 +1698,15 @@ def test_source_eviction_keeps_last_painted_frame_ready_for_reversal(
         assert frames[-1].pages[0].error is None
         assert len(frames) == frames_before_reversal + 1
         assert runtime.metrics.jobs_submitted == jobs_after_failed_hydration
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
 
         source.fail_image_id = None
+        # Give the compatible successful result room to remain resident; the
+        # earlier deliberately source-excluding budget already covered the
+        # eviction/ready-frame contract above.
+        runtime.set_cache_limits(
+            byte_budget=target_budget + old_source.qimage.sizeInBytes()
+        )
         hydrate = _request(10, _unit(0), _unit(0), spec=spec)
         assert runtime.require_cached_current_source(hydrate)
         assert runtime.request(hydrate)
@@ -1598,33 +1720,26 @@ def test_source_eviction_keeps_last_painted_frame_ready_for_reversal(
         assert frames[-1].request_id == 12
         assert frames[-1].cache_hit
         assert len(frames) == frames_before_successful_reversal + 1
-        # A result emitted under request 10 must not mutate source/frame cache
-        # after request 12, even though full-book work orders can keep the same
-        # key relevant by identity.  The next source consumer therefore asks
-        # for a fresh hydration rather than accepting stale work.
-        assert runtime._source_store.find(
+        # Presentation serials remain fenced, but the completed immutable
+        # source artifact from request 10 is compatible with request 12's
+        # exact book/render key. Retain it and avoid a duplicate hydration.
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+        retained_source = runtime._source_store.find(
             _unit(0).pages[0],
             spec,
             unit=_unit(0),
-        ) is None
+        )
+        assert retained_source is not None, (
+            runtime.cache_debug_values(),
+            runtime.metrics,
+        )
+        assert runtime.metrics.compatible_old_results >= 1
         fresh_hydration = _request(13, _unit(0), _unit(0), spec=spec)
-        assert runtime.require_cached_current_source(fresh_hydration)
+        assert not runtime.require_cached_current_source(fresh_hydration)
         jobs_before_fresh_hydration = runtime.metrics.jobs_submitted
         assert runtime.request(fresh_hydration)
-        _wait_until(
-            qapp,
-            lambda: runtime._source_store.find(
-                fresh_hydration.current.pages[0],
-                spec,
-                unit=fresh_hydration.current,
-            )
-            is not None
-            and not runtime.has_unfinished_tasks(),
-        )
-        assert (
-            runtime.metrics.jobs_submitted
-            == jobs_before_fresh_hydration + 1
-        )
+        qapp.processEvents()
+        assert runtime.metrics.jobs_submitted == jobs_before_fresh_hydration
     finally:
         assert runtime.shutdown(wait_msecs=3000)
         source.close()
