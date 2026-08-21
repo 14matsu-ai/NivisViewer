@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFileSystemModel,
     QInputDialog,
+    QLabel,
     QLineEdit,
     QListView,
     QMainWindow,
@@ -97,6 +98,10 @@ from .browser_sort import (
     normalize_browser_sort_key,
     normalize_browser_sort_order,
 )
+from .browser_image_detail import (
+    BrowserImageDetailProbe,
+    BrowserImageDetailResult,
+)
 from .browser_thumbnail_scheduler import (
     ThumbnailPriority,
     build_thumbnail_request_plan,
@@ -146,6 +151,7 @@ from .internal_clipboard import (
 )
 from .metadata_store import MetadataStore
 from .path_availability import PathAvailabilityService
+from .rating_rename_service import RatingRenameService
 from .performance_trace import performance_trace
 from .settings_dialog import SettingsDialog
 from .sidebar_layout import SidebarLayoutController
@@ -523,6 +529,16 @@ class BrowserWindow(QMainWindow):
         self._favorite_click_timer.setSingleShot(True)
         self._pending_favorite_path: str | None = None
         self._hovered_list_path: str | None = None
+        self._rating_hover_path: str | None = None
+        self._rating_press: tuple[str, int | None, Qt.MouseButton] | None = None
+        self._detail_generation = 0
+        self._detail_request_identity: tuple[int, str] | None = None
+
+        self.rating_rename_service = RatingRenameService()
+        self.image_detail_probe = BrowserImageDetailProbe(self)
+        self.image_detail_probe.completed.connect(
+            self._on_image_detail_completed
+        )
 
         self._folder_change_timer = QTimer(self)
         self._folder_change_timer.setSingleShot(True)
@@ -2492,6 +2508,7 @@ class BrowserWindow(QMainWindow):
         if self._owns_file_operation_coordinator:
             self.file_operation_coordinator.close()
         self.browser_main_drop.close()
+        self.image_detail_probe.close()
         self._pending_browser_focus = None
         self._cancel_pending_scan(rollback_history=False)
         self.scanner.close()
@@ -2979,12 +2996,208 @@ class BrowserWindow(QMainWindow):
         self._update_index_rect(previous)
         self._update_index_rect(current)
         self._update_status()
+        self._update_selected_detail()
 
     def _on_list_selection_changed(self, selected, deselected) -> None:
         for index in tuple(selected.indexes()) + tuple(deselected.indexes()):
             self._update_index_rect(index)
         self._update_status()
+        self._update_selected_detail()
         self._update_file_action_states()
+
+    def _rating_hit(self, position: QPoint) -> tuple[BrowserItem, int] | None:
+        index = self.list_view.indexAt(position)
+        item = self.item_model.item_at(index)
+        if item is None or item.kind is BrowserItemKind.FOLDER:
+            return None
+        cell_rect = self.list_view.visualRect(index)
+        rating = self.item_delegate.rating_at_position(
+            cell_rect,
+            position,
+            self.list_view.font(),
+        )
+        if rating is None:
+            return None
+        return item, rating
+
+    def _update_rating_hover(self, position: QPoint) -> None:
+        hit = self._rating_hit(position)
+        new_path = str(hit[0].path) if hit is not None else None
+        new_rating = hit[1] if hit is not None else None
+        if self._rating_hover_path and (
+            new_path is None
+            or not self._same_path(self._rating_hover_path, new_path)
+        ):
+            self.item_model.set_rating_preview(self._rating_hover_path, None)
+            self._rating_hover_path = None
+        if new_path is not None:
+            self.item_model.set_rating_preview(new_path, new_rating)
+            self._rating_hover_path = new_path
+
+    def _clear_rating_hover(self) -> None:
+        if self._rating_hover_path is not None:
+            self.item_model.set_rating_preview(self._rating_hover_path, None)
+            self._rating_hover_path = None
+        self._rating_press = None
+
+    def set_rating_for_paths(
+        self,
+        paths: tuple[str, ...],
+        rating: int | None,
+    ) -> bool:
+        """Apply filename ratings without rescanning or decoding thumbnails."""
+
+        if not paths or self.file_operation_coordinator.busy:
+            return False
+        existing_list: list[str] = []
+        for path in paths:
+            row = self.item_model.row_for_path(path)
+            item = self.item_model.item_at(row) if row >= 0 else None
+            if item is None or item.kind is BrowserItemKind.FOLDER:
+                continue
+            existing_list.append(str(self._absolute_browser_path(path)))
+        existing = tuple(existing_list)
+        if not existing:
+            return False
+        # A selection-triggered Pillow header probe briefly owns a Windows
+        # file handle. Retire its stale pending work and drain only the active
+        # header read before the same-file rename, otherwise WinError 32 can
+        # turn a direct star click into a spurious failure.
+        self._detail_generation += 1
+        self._detail_request_identity = None
+        self.image_detail_probe.close()
+        # Folder books retain immutable page identities for their lifetime.
+        # Reuse the established safety contract instead of leaving an open
+        # Viewer with a stale page path after the metadata rename.
+        if not self._confirm_and_close_affected_viewers(existing):
+            return False
+
+        state = self._capture_list_view_state()
+        replacements: list[tuple[str, str, int | None]] = []
+        failures: list[str] = []
+        for path in existing:
+            result = self.rating_rename_service.set_rating(path, rating)
+            if not result.success:
+                failures.append(
+                    f"{Path(path).name}: {result.error_message or '変更できません'}"
+                )
+                continue
+            if not result.changed:
+                continue
+            old_path = str(result.source_path)
+            new_path = str(result.destination_path)
+            replacements.append((old_path, new_path, result.rating))
+            if self.metadata_store is not None:
+                self.metadata_store.relocate_tree(old_path, new_path)
+            self.navigation_history.relocate_tree(old_path, new_path)
+
+        if replacements:
+            self._clear_rating_hover()
+            self.item_model.apply_rating_renames(tuple(replacements))
+            remap = {
+                self._path_key(old): new for old, new, _value in replacements
+            }
+
+            def relocated(path: str | None) -> str | None:
+                if path is None:
+                    return None
+                return remap.get(self._path_key(path), path)
+
+            relocated_state = _ListViewState(
+                selected_paths=tuple(
+                    relocated(path) or path for path in state.selected_paths
+                ),
+                current_path=relocated(state.current_path),
+                anchor_path=relocated(state.anchor_path),
+                vertical_scroll=state.vertical_scroll,
+                horizontal_scroll=state.horizontal_scroll,
+            )
+            self._schedule_list_view_state_restore(relocated_state)
+            self._update_selected_detail()
+
+        changed_count = len(replacements)
+        if failures:
+            summary = f"レート変更: {changed_count}件成功、{len(failures)}件失敗"
+            self._show_temporary_status(summary, 5000)
+            logging.getLogger("nivisviewer.rating").warning(
+                "%s: %s", summary, "; ".join(failures)
+            )
+        elif changed_count:
+            self._show_temporary_status(f"{changed_count}件のレートを変更しました")
+        return changed_count > 0 and not failures
+
+    @staticmethod
+    def _format_file_size(size: int | None) -> str:
+        if size is None:
+            return "—"
+        value = float(max(0, int(size)))
+        units = ("B", "KB", "MB", "GB", "TB")
+        unit = units[0]
+        for unit in units:
+            if value < 1024.0 or unit == units[-1]:
+                break
+            value /= 1024.0
+        if unit == "B":
+            return f"{int(value)} B"
+        return f"{value:.1f} {unit}"
+
+    def _update_selected_detail(self) -> None:
+        if not hasattr(self, "file_detail_label"):
+            return
+        self._detail_generation += 1
+        generation = self._detail_generation
+        indexes = self.list_view.selectionModel().selectedIndexes()
+        if len(indexes) != 1:
+            self._detail_request_identity = None
+            self.file_detail_label.clear()
+            return
+        item = self.item_model.item_at(indexes[0])
+        if item is None or item.kind is BrowserItemKind.FOLDER:
+            self._detail_request_identity = None
+            self.file_detail_label.clear()
+            return
+        size_text = self._format_file_size(item.file_size)
+        if item.kind is not BrowserItemKind.IMAGE:
+            self._detail_request_identity = None
+            self.file_detail_label.setText(size_text)
+            return
+        path = str(item.path)
+        dimensions = self.item_model.image_dimensions(path)
+        if dimensions is not None:
+            self._detail_request_identity = None
+            self.file_detail_label.setText(
+                f"{size_text}    {dimensions[0]} × {dimensions[1]}"
+            )
+            return
+        self.file_detail_label.setText(f"{size_text}    —")
+        identity = (generation, self._path_key(path))
+        self._detail_request_identity = identity
+        self.image_detail_probe.request(path, generation)
+
+    def _on_image_detail_completed(
+        self,
+        result: BrowserImageDetailResult,
+    ) -> None:
+        if self._shutdown_prepared:
+            return
+        identity = (int(result.generation), self._path_key(result.path))
+        if identity != self._detail_request_identity:
+            return
+        indexes = self.list_view.selectionModel().selectedIndexes()
+        if len(indexes) != 1:
+            return
+        item = self.item_model.item_at(indexes[0])
+        if item is None or self._path_key(item.path) != identity[1]:
+            return
+        self._detail_request_identity = None
+        size_text = self._format_file_size(item.file_size)
+        if result.dimensions is None:
+            self.file_detail_label.setText(f"{size_text}    —")
+            return
+        self.item_model.set_image_dimensions(item.path, result.dimensions)
+        self.file_detail_label.setText(
+            f"{size_text}    {result.dimensions[0]} × {result.dimensions[1]}"
+        )
 
     def _on_list_hovered(self, index: QModelIndex) -> None:
         old_path = self._hovered_list_path
@@ -3057,6 +3270,35 @@ class BrowserWindow(QMainWindow):
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
         if watched is self.list_view.viewport():
             event_type = event.type()
+            if event_type == QEvent.Type.MouseMove and isinstance(event, QMouseEvent):
+                self._update_rating_hover(event.position().toPoint())
+            elif event_type == QEvent.Type.Leave:
+                self._clear_rating_hover()
+            elif (
+                event_type == QEvent.Type.MouseButtonPress
+                and isinstance(event, QMouseEvent)
+                and event.button()
+                in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton)
+            ):
+                hit = self._rating_hit(event.position().toPoint())
+                if hit is not None:
+                    item, rating = hit
+                    self._rating_press = (str(item.path), rating, event.button())
+                    return True
+            elif (
+                event_type == QEvent.Type.MouseButtonRelease
+                and isinstance(event, QMouseEvent)
+                and event.button()
+                in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton)
+                and self._rating_press is not None
+            ):
+                pressed_path, pressed_rating, pressed_button = self._rating_press
+                self._rating_press = None
+                hit = self._rating_hit(event.position().toPoint())
+                if hit is not None and self._same_path(hit[0].path, pressed_path):
+                    rating = None if pressed_button == Qt.MouseButton.MiddleButton else pressed_rating
+                    self.set_rating_for_paths((pressed_path,), rating)
+                return True
             if event_type == QEvent.Type.DragEnter:
                 self.list_view.dragEnterEvent(event)
                 return True
@@ -3671,6 +3913,16 @@ class BrowserWindow(QMainWindow):
         self.menuBar().addAction(self.settings_action)
 
         self.statusBar().showMessage("フォルダを選択してください。")
+        self.file_detail_label = QLabel(self)
+        self.file_detail_label.setObjectName("browser_file_detail_label")
+        self.file_detail_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.file_detail_label.setMinimumWidth(150)
+        self.file_detail_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.statusBar().addPermanentWidget(self.file_detail_label)
         self.cancel_operation_button = QPushButton("キャンセル", self)
         self.cancel_operation_button.setObjectName(
             "cancel_file_operation_button"
@@ -4655,6 +4907,15 @@ class BrowserWindow(QMainWindow):
             self.list_view.setCurrentIndex(index)
         selected_paths = self.selected_file_operation_paths()
         selection_count = len(selected_paths)
+        rating_paths = tuple(
+            path
+            for path in selected_paths
+            if (
+                (row := self.item_model.row_for_path(path)) >= 0
+                and (rating_item := self.item_model.item_at(row)) is not None
+                and rating_item.kind is not BrowserItemKind.FOLDER
+            )
+        )
         busy = (
             self.file_operation_coordinator.busy
             and self.file_operation_coordinator.queue is None
@@ -4689,6 +4950,19 @@ class BrowserWindow(QMainWindow):
         menu.addSeparator()
         recycle_action = menu.addAction("削除")
         recycle_action.setEnabled(selection_count > 0 and not busy)
+        rating_menu = menu.addMenu("レート")
+        rating_actions: dict[QAction, int | None] = {}
+        for label, value in (
+            ("なし", None),
+            ("★", 1),
+            ("★★", 2),
+            ("★★★", 3),
+            ("★★★★", 4),
+            ("★★★★★", 5),
+        ):
+            action = rating_menu.addAction(label)
+            action.setEnabled(bool(rating_paths) and not busy)
+            rating_actions[action] = value
         menu.addSeparator()
         properties_action = menu.addAction("プロパティ")
         properties_action.setEnabled(selection_count == 1 and not busy)
@@ -4707,6 +4981,8 @@ class BrowserWindow(QMainWindow):
             self.paste_items()
         elif selected == recycle_action:
             self.move_selected_to_recycle_bin()
+        elif selected in rating_actions:
+            self.set_rating_for_paths(rating_paths, rating_actions[selected])
         elif selected == properties_action:
             self.show_selected_properties()
 

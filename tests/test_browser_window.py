@@ -9,6 +9,7 @@ from unittest.mock import Mock, PropertyMock, patch
 import pytest
 from PIL import Image
 from PySide6.QtCore import QItemSelectionModel, QSize
+from PySide6.QtGui import QImage
 from PySide6.QtWidgets import (
     QApplication,
     QListView,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
 
 from app.browser_model import BrowserItemKind, BrowserItemModel
 from app.browser_window import BrowserWindow
+from app.browser_image_detail import BrowserImageDetailResult
 from app.config_manager import ConfigManager
 from app.metadata_store import MetadataStore
 
@@ -39,6 +41,102 @@ def make_config(tmp_path: Path, folder: Path, *, thumbnail_size: int = 180) -> C
 def finish_scan(window: BrowserWindow, qapp: QApplication) -> None:
     assert window.wait_for_scan()
     qapp.processEvents()
+
+
+def test_file_detail_bar_shows_size_and_header_dimensions_and_rejects_stale(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "detail"
+    first = folder / "first.jpg"
+    second = folder / "second.jpg"
+    write_image(first)
+    with Image.new("RGB", (40, 30), "white") as image:
+        image.save(second)
+    window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    finish_scan(window, qapp)
+
+    first_index = window.item_model.index(window.item_model.row_for_path(first), 0)
+    window.list_view.selectionModel().select(
+        first_index,
+        QItemSelectionModel.SelectionFlag.ClearAndSelect,
+    )
+    window.list_view.setCurrentIndex(first_index)
+    stale_generation = window._detail_generation
+
+    second_index = window.item_model.index(window.item_model.row_for_path(second), 0)
+    window.list_view.selectionModel().select(
+        second_index,
+        QItemSelectionModel.SelectionFlag.ClearAndSelect,
+    )
+    window.list_view.setCurrentIndex(second_index)
+    window._on_image_detail_completed(
+        BrowserImageDetailResult(str(first), stale_generation, (999, 999))
+    )
+    window.image_detail_probe._pool.waitForDone()
+    qapp.processEvents()
+
+    detail = window.file_detail_label.text()
+    assert "40 × 30" in detail
+    assert "999" not in detail
+    assert "★" not in detail
+    window.close()
+    qapp.processEvents()
+
+
+def test_direct_rating_target_preserves_multiselection_and_thumbnail_cache(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "rating-direct"
+    first = folder / "first.jpg"
+    second = folder / "second.jpg"
+    write_image(first)
+    write_image(second)
+    window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    finish_scan(window, qapp)
+    assert window.thumbnail_provider.wait_for_done()
+    qapp.processEvents()
+    selection = window.list_view.selectionModel()
+    first_index = window.item_model.index(window.item_model.row_for_path(first), 0)
+    second_index = window.item_model.index(window.item_model.row_for_path(second), 0)
+    selection.select(first_index, QItemSelectionModel.SelectionFlag.Select)
+    selection.select(second_index, QItemSelectionModel.SelectionFlag.Select)
+    selection.setCurrentIndex(first_index, QItemSelectionModel.SelectionFlag.NoUpdate)
+    seeded_thumbnail = QImage(12, 8, QImage.Format.Format_ARGB32)
+    seeded_thumbnail.fill(0xFF224466)
+    window.item_model.set_thumbnail_image(first, seeded_thumbnail)
+    thumbnail = window.item_model.data(
+        first_index,
+        BrowserItemModel.ThumbnailImageRole,
+    )
+    thumbnail_key = thumbnail.cacheKey()
+
+    try:
+        with patch.object(
+            window.thumbnail_provider,
+            "request",
+            wraps=window.thumbnail_provider.request,
+        ) as thumbnail_request:
+            assert window.set_rating_for_paths((str(first),), 4) is True
+            qapp.processEvents()
+            assert thumbnail_request.call_count == 0
+
+        renamed = folder / "first {zpi$r=4}.jpg"
+        assert renamed.exists()
+        assert second.exists()
+        assert len(selection.selectedIndexes()) == 2
+        renamed_index = window.item_model.index(
+            window.item_model.row_for_path(renamed),
+            0,
+        )
+        assert window.item_model.data(
+            renamed_index,
+            BrowserItemModel.ThumbnailImageRole,
+        ).cacheKey() == thumbnail_key
+    finally:
+        window.close()
+        qapp.processEvents()
 
 
 @pytest.mark.parametrize("item_count", [0, 1, 25])

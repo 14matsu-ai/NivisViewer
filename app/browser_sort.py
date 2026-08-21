@@ -15,6 +15,7 @@ class BrowserSortKey(str, Enum):
     MODIFIED_TIME = "modified_time"
     ITEM_TYPE = "item_type"
     FILE_SIZE = "file_size"
+    RATING = "rating"
 
 
 class BrowserSortOrder(str, Enum):
@@ -35,6 +36,7 @@ BROWSER_SORT_KEY_LABELS = {
     BrowserSortKey.MODIFIED_TIME: "更新日時",
     BrowserSortKey.ITEM_TYPE: "種類",
     BrowserSortKey.FILE_SIZE: "サイズ",
+    BrowserSortKey.RATING: "レート",
 }
 
 BROWSER_SORT_ORDER_LABELS = {
@@ -127,6 +129,16 @@ class BrowserSortPolicy:
             return _ITEM_TYPE_ORDER.get(item.kind.value, len(_ITEM_TYPE_ORDER))
         if self.sort_key is BrowserSortKey.FILE_SIZE:
             return item.file_size if item.file_size is not None else -1
+        if self.sort_key is BrowserSortKey.RATING:
+            if item.rating is not None:
+                return item.rating
+            # ZipPlaFork keeps unrated items behind rated items for both sort
+            # directions. ``reverse`` is applied by ``sorted`` below.
+            return (
+                -1
+                if self.sort_order is BrowserSortOrder.DESCENDING
+                else 6
+            )
         return _natural_key(item.display_name)
 
     @staticmethod
