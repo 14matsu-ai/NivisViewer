@@ -6,6 +6,10 @@ from PySide6.QtGui import QImage, QMouseEvent, QPixmap, QWheelEvent
 from PySide6.QtWidgets import QApplication
 
 from app.page_model import DisplaySpread, PageSlot
+from app.viewer_presentation_state import (
+    PresentationSurface,
+    PresentationSurfaceMode,
+)
 from app.viewer_widget import ViewerImage, ViewerWidget, calculate_spread_layout
 
 
@@ -35,6 +39,35 @@ def send_wheel_event(
     event.ignore()
     widget.wheelEvent(event)
     return event
+
+
+def test_delayed_surface_projection_cannot_clear_a_committed_frame(
+    qapp: QApplication,
+) -> None:
+    widget = ViewerWidget()
+    widget.resize(160, 120)
+    widget.set_direct_display_mode(True)
+    loading = PresentationSurface(PresentationSurfaceMode.LOADING, 1)
+    assert widget.apply_presentation_surface(loading)
+
+    pixmap = QPixmap(32, 48)
+    pixmap.fill(Qt.GlobalColor.blue)
+    spread = DisplaySpread(0, (PageSlot("0.jpg", 0),), True)
+    widget.commit_display_ready_single(
+        spread,
+        0,
+        "0.jpg",
+        (32, 48),
+        pixmap,
+        object(),
+    )
+    displayed = PresentationSurface(PresentationSurfaceMode.DISPLAYED, 2)
+    assert widget.apply_presentation_surface(displayed)
+
+    assert not widget.apply_presentation_surface(loading)
+    assert widget.presentation_surface == displayed
+    assert [image.image_id for image in widget._images] == ["0.jpg"]
+    widget.close()
 
 
 @pytest.mark.parametrize(

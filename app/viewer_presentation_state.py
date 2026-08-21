@@ -19,6 +19,28 @@ class PresentationNavigation(str, Enum):
     BOOK_SWITCH = "book_switch"
 
 
+class PresentationSurfaceMode(str, Enum):
+    """Canvas state projected from the presentation owner.
+
+    ``DISPLAYED`` remains authoritative while a replacement book is opening
+    or another page is loading.  The Widget must never infer ``EMPTY`` merely
+    because its image list happens to be empty between an open request and the
+    first complete frame.
+    """
+
+    EMPTY = "empty"
+    LOADING = "loading"
+    DISPLAYED = "displayed"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class PresentationSurface:
+    mode: PresentationSurfaceMode
+    revision: int
+    message: str | None = None
+
+
 @dataclass(frozen=True)
 class PresentationPage:
     index: int
@@ -278,6 +300,10 @@ class ViewerPresentationState:
         self._direction = 0
         self._replacement_open_pending = False
         self._last_failure: PresentationFailure | None = None
+        self._surface = PresentationSurface(
+            PresentationSurfaceMode.EMPTY,
+            0,
+        )
         self._closed = False
 
     @property
@@ -338,7 +364,8 @@ class ViewerPresentationState:
     @property
     def frame_loading(self) -> bool:
         return bool(
-            self._replacement_open_pending
+            self._surface.mode is PresentationSurfaceMode.LOADING
+            or self._replacement_open_pending
             or (
                 self._requested is not None
                 and (
@@ -347,6 +374,12 @@ class ViewerPresentationState:
                 )
             )
         )
+
+    @property
+    def surface(self) -> PresentationSurface:
+        """Latest canvas disposition, including its stale-update fence."""
+
+        return self._surface
 
     @property
     def frame_failure(self) -> PresentationFailure | None:
@@ -491,6 +524,12 @@ class ViewerPresentationState:
         self._direction = direction
         self._replacement_open_pending = False
         self._last_failure = None
+        self._set_surface(
+            PresentationSurfaceMode.DISPLAYED
+            if self._committed.displayed is not None
+            else PresentationSurfaceMode.LOADING,
+            force_revision=True,
+        )
         return request
 
     def transition_slot(
@@ -627,6 +666,10 @@ class ViewerPresentationState:
         self._requested = committed_request
         self._committed = committed
         self._last_failure = None
+        self._set_surface(
+            PresentationSurfaceMode.DISPLAYED,
+            force_revision=True,
+        )
         return PresentationCommit(
             frame,
             previous,
@@ -647,6 +690,12 @@ class ViewerPresentationState:
         # a frame even before commit_frame() examines ``requested``.
         self.supersede_pending()
         self._replacement_open_pending = True
+        self._set_surface(
+            PresentationSurfaceMode.DISPLAYED
+            if self._committed.displayed is not None
+            else PresentationSurfaceMode.LOADING,
+            force_revision=True,
+        )
 
     def supersede_pending(self) -> None:
         """Fence a request while retaining the last committed presentation."""
@@ -656,11 +705,36 @@ class ViewerPresentationState:
         self._request_serial += 1
         self._requested = None
         self._last_failure = None
+        # A viewport/layout fence must not turn an initial in-flight open back
+        # into the idle prompt.  With a committed frame, that frame remains
+        # the canvas owner until an exact replacement commits.
+        self._set_surface(
+            PresentationSurfaceMode.DISPLAYED
+            if self._committed.displayed is not None
+            else PresentationSurfaceMode.LOADING,
+            force_revision=True,
+        )
 
-    def fail_replacement_open(self) -> bool:
+    def fail_replacement_open(self, message: str | None = None) -> bool:
         if self._closed or not self._replacement_open_pending:
             return False
         self._replacement_open_pending = False
+        if self._committed.displayed is not None:
+            self._set_surface(
+                PresentationSurfaceMode.DISPLAYED,
+                force_revision=True,
+            )
+        elif message:
+            self._set_surface(
+                PresentationSurfaceMode.ERROR,
+                str(message),
+                force_revision=True,
+            )
+        else:
+            self._set_surface(
+                PresentationSurfaceMode.EMPTY,
+                force_revision=True,
+            )
         return True
 
     def fail_pending(self, message: str) -> PresentationFailure | None:
@@ -673,6 +747,13 @@ class ViewerPresentationState:
         )
         self._requested = None
         self._last_failure = failure
+        self._set_surface(
+            PresentationSurfaceMode.DISPLAYED
+            if self._committed.displayed is not None
+            else PresentationSurfaceMode.ERROR,
+            None if self._committed.displayed is not None else failure.message,
+            force_revision=True,
+        )
         return failure
 
     def history_target(
@@ -709,12 +790,36 @@ class ViewerPresentationState:
         self._direction = 0
         self._replacement_open_pending = False
         self._last_failure = None
+        self._set_surface(
+            PresentationSurfaceMode.EMPTY,
+            force_revision=True,
+        )
 
     def close(self) -> None:
         if self._closed:
             return
         self.clear_book()
         self._closed = True
+
+    def _set_surface(
+        self,
+        mode: PresentationSurfaceMode,
+        message: str | None = None,
+        *,
+        force_revision: bool = False,
+    ) -> None:
+        normalized_mode = PresentationSurfaceMode(mode)
+        normalized_message = str(message) if message else None
+        if not force_revision and (
+            self._surface.mode is normalized_mode
+            and self._surface.message == normalized_message
+        ):
+            return
+        self._surface = PresentationSurface(
+            normalized_mode,
+            self._surface.revision + 1,
+            normalized_message,
+        )
 
     def _direction_for(
         self,

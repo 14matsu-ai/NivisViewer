@@ -128,6 +128,7 @@ _PDF_PREFETCH_IDLE_GRACE_MS = 120
 _PREPARED_DISPLAY_IDLE_GRACE_MS = 16
 _DISPLAY_DEMAND_IDLE_GRACE_MS = 16
 _RASTER_PAINT_FALLBACK_MS = 250
+_RASTER_VIEWPORT_DEBOUNCE_MS = 120
 _ZIP_RUNTIME_BROWSER_RESUME_GRACE_MS = 500
 class ViewerWindow(QMainWindow):
     activated = Signal(object)
@@ -433,7 +434,9 @@ class ViewerWindow(QMainWindow):
         )
         self._raster_viewport_timer = QTimer(self)
         self._raster_viewport_timer.setSingleShot(True)
-        self._raster_viewport_timer.setInterval(120)
+        self._raster_viewport_timer.setInterval(
+            _RASTER_VIEWPORT_DEBOUNCE_MS
+        )
         self._raster_viewport_timer.timeout.connect(
             self._refresh_raster_decode_bounds
         )
@@ -618,6 +621,9 @@ class ViewerWindow(QMainWindow):
         self.viewer = ViewerWidget(
             self,
             image_work_coordinator=self.image_work_coordinator,
+        )
+        self.viewer.apply_presentation_surface(
+            self.presentation_state.surface
         )
         self.slider = ViewerPageSlider(self)
         self.slider.set_page_state(0, 0)
@@ -1691,12 +1697,18 @@ class ViewerWindow(QMainWindow):
         self._pending_book_open_projection = None
         self._pending_progress_seed = None
         self.presentation_state.begin_replacement_open()
+        self._project_presentation_surface()
+        self._raster_viewport_timer.stop()
+        self._presentation_viewport_refresh_required = False
         self._request_id_adapter = None
         self._visible_page_indexes_adapter = None
         # A replacement open is provisional.  Stop the old runtime's work but
         # retain its completed book artifacts until BookSession either swaps
         # in the new source (and retires the old runtime) or reports failure.
-        self._deactivate_zip_runtime(clear_artifacts=False)
+        self._deactivate_zip_runtime(
+            clear_artifacts=False,
+            preserve_book_state=True,
+        )
         self._active_open_trace_id = (
             self._next_open_trace_id
             or performance_trace.begin("viewer.open_path.started", str(path))
@@ -1743,7 +1755,7 @@ class ViewerWindow(QMainWindow):
             self._metadata_book_item_type = ""
             self._pending_progress_seed = None
             self.presentation_state.clear_book()
-            self.viewer.clear()
+            self._project_presentation_surface()
             self._activate_page_list_runtime(None)
             self._update_slider()
             self._update_status()
@@ -1834,6 +1846,10 @@ class ViewerWindow(QMainWindow):
         self._first_frame_image_id = self.model.image_id_at(
             self.model.focused_index
         )
+        # A resize received while the replacement was provisional was not
+        # allowed to touch the old book.  The new request below reads the live
+        # viewport/DPR directly, so that deferred marker is now consumed.
+        self._presentation_viewport_refresh_required = False
         self._refresh_view(
             navigation=PresentationNavigation.BOOK_SWITCH
         )
@@ -1851,19 +1867,29 @@ class ViewerWindow(QMainWindow):
     def _on_async_book_open_failed(self, failed: AsyncBookOpenFailed) -> None:
         self._reload_page_index = None
         self._cancel_interactive_open()
-        self.presentation_state.fail_replacement_open()
-        if self._shutdown_prepared or failed.cancelled:
-            return
-        self._set_status_override(
-            failed.message or "書庫を開けません",
-            5000,
+        self.presentation_state.fail_replacement_open(
+            None if failed.cancelled else failed.message
         )
+        self._project_presentation_surface()
+        if self._shutdown_prepared:
+            self._presentation_viewport_refresh_required = False
+            return
+        if failed.cancelled:
+            self._clear_status_override()
+        else:
+            self._set_status_override(
+                failed.message or "書庫を開けません",
+                5000,
+            )
         if self.book_session.is_open:
             # Opening a replacement temporarily deactivates the old runtime.
             # A failed replacement leaves the old book installed, so restore
             # that book's production Viewer instead of leaving it in an
             # inactive legacy-mode surface.
+            self._presentation_viewport_refresh_required = False
             self._refresh_view()
+        else:
+            self._presentation_viewport_refresh_required = False
 
     def _uses_configured_book_open_position(self, opened: BookOpened) -> bool:
         return (
@@ -3109,6 +3135,7 @@ class ViewerWindow(QMainWindow):
         self,
         *,
         clear_artifacts: bool = False,
+        preserve_book_state: bool = False,
     ) -> None:
         self._raster_magnifier_cancel_timer.stop()
         self._clear_pending_raster_navigation(reset_policy=True)
@@ -3118,7 +3145,10 @@ class ViewerWindow(QMainWindow):
             return
         self._zip_runtime_active = False
         if self._zip_runtime is not None:
-            self._zip_runtime.cancel(clear_artifacts=clear_artifacts)
+            if preserve_book_state and not clear_artifacts:
+                self._zip_runtime.suspend()
+            else:
+                self._zip_runtime.cancel(clear_artifacts=clear_artifacts)
         self._raster_paint_fallback_timer.stop()
         self._zip_runtime_current_frame_serial = 0
         self._zip_runtime_last_painted_serial = 0
@@ -3269,6 +3299,7 @@ class ViewerWindow(QMainWindow):
         self._release_raster_interactive_lane()
         message = "Raster Viewer runtimeは要求を受け付けられません。"
         self.presentation_state.fail_pending(message)
+        self._project_presentation_surface()
         self._set_status_override(message)
 
     def _on_zip_runtime_frame_ready(
@@ -3381,18 +3412,17 @@ class ViewerWindow(QMainWindow):
             # This mirrors the retained-path terminal-error contract while
             # keeping a successful spread partner visible.
             self._cancel_interactive_open()
-        elif (
+        if (
             self._zip_runtime_current_frame_serial > 0
             and self._zip_runtime is not None
             and self.presentation_state.displayed is not None
             and self.presentation_state.displayed.token == presentation_token
         ):
-            # Keep NivisViewer's atomic Qt commit/paint ownership, but let the
-            # single Viewer worker form a short, memory-admitted ready runway
-            # from every newly accepted current.  This is also what recenters
-            # the startup frontier after navigation or direction reversal;
-            # already-ready artifacts remain in the byte-budgeted stores.
-            self._zip_runtime.release_startup_runway(
+            # The first accepted complete commit activates one continuous,
+            # book-scoped worker. Later commits only recenter its unstarted
+            # order; paint is not a scheduler gate. Terminal error frames are
+            # complete units too, so they must not strand the rest of a book.
+            self._zip_runtime.release_continuous_warmup(
                 request_id=frame.request_id,
             )
         if any(
@@ -3525,6 +3555,7 @@ class ViewerWindow(QMainWindow):
                 else None
             ),
         )
+        self._project_presentation_surface()
         if (
             navigation is PresentationNavigation.NORMAL
             and self._pending_progress_seed is not None
@@ -3582,7 +3613,15 @@ class ViewerWindow(QMainWindow):
         )
         if commit is None:
             return
+        self._project_presentation_surface()
         self._apply_presentation_commit(commit)
+
+    def _project_presentation_surface(self) -> bool:
+        """Apply the single presentation-owned canvas state to the Widget."""
+
+        return self.viewer.apply_presentation_surface(
+            self.presentation_state.surface
+        )
 
     def _apply_presentation_commit(
         self,
@@ -3717,6 +3756,7 @@ class ViewerWindow(QMainWindow):
             # eligibility decision.
             message = "Raster Viewer runtimeを初期化できません。"
             self.presentation_state.fail_pending(message)
+            self._project_presentation_surface()
             self._set_status_override(message)
             return
         self._deactivate_zip_runtime(clear_artifacts=False)
@@ -5681,9 +5721,19 @@ class ViewerWindow(QMainWindow):
         return 1.0
 
     def _on_viewport_changed(self) -> None:
+        if self.presentation_state.replacement_open_pending:
+            # A provisional replacement must not reactivate or re-request the
+            # still-installed old book.  Both success and failure consume the
+            # live viewport when they next request their authoritative frame.
+            self._presentation_viewport_refresh_required = True
+            return
         pending_page = self.presentation_state.frame_loading
         if pending_page or self._zip_runtime_active:
+            # Fence the old physical layout immediately.  With a committed
+            # frame PresentationState keeps DISPLAYED ownership; without one
+            # it projects LOADING rather than the idle prompt.
             self.presentation_state.supersede_pending()
+            self._project_presentation_surface()
             self._request_id_adapter = None
             self._visible_page_indexes_adapter = None
         self._presentation_viewport_refresh_required = (
@@ -5691,10 +5741,24 @@ class ViewerWindow(QMainWindow):
         )
         self._schedule_pdf_rerender()
         if not isinstance(self.book_session.source, PdfImageSource):
-            self._raster_viewport_timer.start()
+            # A cold initial ZIP/folder frame has nothing valid to retain, so
+            # issue the replacement layout request on the next event turn
+            # instead of imposing the normal 120 ms resize debounce.
+            if (
+                self._zip_runtime_active
+                and self.presentation_state.displayed is None
+            ):
+                self._raster_viewport_timer.start(0)
+            else:
+                self._raster_viewport_timer.start(
+                    _RASTER_VIEWPORT_DEBOUNCE_MS
+                )
 
     def _refresh_raster_decode_bounds(self) -> None:
         if self._shutdown_prepared or not self.model.total_pages:
+            return
+        if self.presentation_state.replacement_open_pending:
+            self._presentation_viewport_refresh_required = True
             return
         force_refresh = self._presentation_viewport_refresh_required
         self._presentation_viewport_refresh_required = False
@@ -6219,6 +6283,7 @@ class ViewerWindow(QMainWindow):
         self._save_current_reading_position()
         self._pending_book_open_projection = None
         self.presentation_state.close()
+        self._project_presentation_surface()
         self._zip_runtime_request_timer.stop()
         self._pending_zip_runtime_request = None
         self._presentation_side_effect_timer.stop()

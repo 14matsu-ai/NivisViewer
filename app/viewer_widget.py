@@ -38,6 +38,10 @@ from .viewer_render import (
     normalize_upscale_algorithm,
     resampling_policy_for_legacy_mode,
 )
+from .viewer_presentation_state import (
+    PresentationSurface,
+    PresentationSurfaceMode,
+)
 
 
 _MAX_EXACT_RENDER_PIXELS = 64 * 1024 * 1024
@@ -305,6 +309,10 @@ class ViewerWidget(QWidget):
 
         self._spread = DisplaySpread(0, tuple(), True)
         self._images: list[ViewerImage] = []
+        self._presentation_surface = PresentationSurface(
+            PresentationSurfaceMode.EMPTY,
+            0,
+        )
         self._pan = QPoint(0, 0)
         self._drag_start: QPoint | None = None
         self._press_position: QPoint | None = None
@@ -1014,6 +1022,40 @@ class ViewerWidget(QWidget):
         self._pan = QPoint(0, 0)
         self.update()
 
+    @property
+    def presentation_surface(self) -> PresentationSurface:
+        return self._presentation_surface
+
+    def apply_presentation_surface(
+        self,
+        surface: PresentationSurface,
+    ) -> bool:
+        """Project the presentation owner's fenced canvas disposition.
+
+        Image readiness is deliberately not used to infer this state.  An
+        older open/resize callback therefore cannot turn a committed frame
+        back into the idle prompt, even when it arrives after the first paint.
+        """
+
+        if not isinstance(surface, PresentationSurface):
+            raise TypeError("surface must be PresentationSurface")
+        current = self._presentation_surface
+        if surface.revision < current.revision:
+            return False
+        if surface.revision == current.revision and surface != current:
+            return False
+        if surface == current:
+            return True
+        self._presentation_surface = surface
+        if surface.mode in {
+            PresentationSurfaceMode.EMPTY,
+            PresentationSurfaceMode.ERROR,
+        }:
+            self.clear()
+        else:
+            self.update()
+        return True
+
     def current_resolution_text(self) -> str:
         if not self._images:
             return ""
@@ -1038,7 +1080,18 @@ class ViewerWidget(QWidget):
 
         if not self._images:
             painter.setPen(QColor("#777777"))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "画像を開いてください")
+            surface = self._presentation_surface
+            if surface.mode is PresentationSurfaceMode.EMPTY:
+                message = "画像を開いてください"
+            elif surface.mode is PresentationSurfaceMode.ERROR:
+                message = surface.message or "画像を開けませんでした"
+            else:
+                message = surface.message or "読み込み中…"
+            painter.drawText(
+                self.rect(),
+                Qt.AlignmentFlag.AlignCenter,
+                message,
+            )
             self._draw_gesture_trail(painter)
             return
 

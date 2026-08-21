@@ -308,6 +308,11 @@ class BookSession(QObject):
                 "page_list.completed",
                 f"pages={len(image_ids)}",
             )
+            if not image_ids:
+                raise ImageSourceError(
+                    "表示可能な画像がありません。",
+                    code="no_images",
+                )
             self.model.set_prepared_source(
                 new_source,
                 image_ids,
@@ -531,6 +536,22 @@ class BookSession(QObject):
             )
             self.error_occurred.emit(str(error))
             self.async_open_failed.emit(failed)
+            return
+        if not result.image_ids:
+            self._close_source(result.source)
+            error = ImageSourceError(
+                "表示可能な画像がありません。",
+                code="no_images",
+            )
+            self.error_occurred.emit(str(error))
+            self.async_open_failed.emit(
+                AsyncBookOpenFailed(
+                    result.requested_path,
+                    result.generation,
+                    str(error),
+                    error.code,
+                )
+            )
             return
 
         try:

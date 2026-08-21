@@ -6,6 +6,7 @@ from app.viewer_presentation_state import (
     PresentationBook,
     PresentationNavigation,
     PresentationPage,
+    PresentationSurfaceMode,
     PresentationUnit,
     PresentationValues,
     ViewerPresentationState,
@@ -98,6 +99,40 @@ def test_rapid_requests_reject_stale_frame_and_history_uses_last_displayed() -> 
     assert not state.frame_loading
     assert [entry.values.page_index for entry in state.back_history] == [0]
     assert all(entry.values.page_index != 1 for entry in state.back_history)
+
+
+def test_surface_owner_keeps_loading_and_retained_replacement_explicit() -> None:
+    state = ViewerPresentationState()
+    assert state.surface.mode is PresentationSurfaceMode.EMPTY
+
+    state.begin_replacement_open()
+    loading_revision = state.surface.revision
+    assert state.surface.mode is PresentationSurfaceMode.LOADING
+    first = _request(state, 0)
+    assert state.surface.mode is PresentationSurfaceMode.LOADING
+    state.supersede_pending()
+    assert state.surface.mode is PresentationSurfaceMode.LOADING
+    assert state.surface.revision >= loading_revision
+
+    replacement = _request(state, 0)
+    assert _commit(state, replacement, 1) is not None
+    assert state.surface.mode is PresentationSurfaceMode.DISPLAYED
+    displayed_revision = state.surface.revision
+
+    state.begin_replacement_open()
+    assert state.surface.mode is PresentationSurfaceMode.DISPLAYED
+    assert state.surface.revision > displayed_revision
+    replacement_revision = state.surface.revision
+    assert state.fail_replacement_open("broken replacement")
+    assert state.surface.mode is PresentationSurfaceMode.DISPLAYED
+    assert state.surface.revision > replacement_revision
+    assert state.commit_frame(first.token, 2, (0,)) is None
+
+    initial_failure = ViewerPresentationState()
+    initial_failure.begin_replacement_open()
+    assert initial_failure.fail_replacement_open("broken initial book")
+    assert initial_failure.surface.mode is PresentationSurfaceMode.ERROR
+    assert initial_failure.surface.message == "broken initial book"
 
 
 def test_spread_requires_every_logical_slot_to_be_terminal() -> None:

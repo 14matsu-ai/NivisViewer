@@ -390,6 +390,50 @@ def test_async_open_failure_preserves_current_book_and_clears_tracking(
     session.shutdown()
 
 
+def test_async_empty_replacement_preserves_current_book(
+    qapp: QApplication,
+) -> None:
+    current_source = BlockingImageSource(
+        Path("current"),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    class EmptyImageSource(BlockingImageSource):
+        def list_images(self) -> list[str]:
+            return []
+
+    empty_source = EmptyImageSource(
+        Path("empty"),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def source_factory(
+        path: Path,
+        **_kwargs: object,
+    ) -> tuple[ImageSource, str | None]:
+        return (empty_source if path.name == "empty" else current_source), None
+
+    session = BookSession(source_factory=source_factory)
+    session.open_book("current")
+    original_images = list(session.model.image_ids)
+    failures = []
+    session.async_open_failed.connect(failures.append)
+
+    session.open_book_async("empty")
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+
+    assert session.source is current_source
+    assert session.current_path == Path("current")
+    assert session.model.image_ids == original_images
+    assert empty_source.closed
+    assert len(failures) == 1
+    assert failures[0].code == "no_images"
+    session.shutdown()
+
+
 def test_async_non_raster_replacement_does_not_defer_raster_cleanup(
     tmp_path: Path,
     qapp: QApplication,
