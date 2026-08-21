@@ -374,7 +374,8 @@ def test_zip_book_uses_one_runtime_across_spread_rotation_filter_and_page_list(
 
         window.set_view_mode("spread")
         window.rotate_right()
-        window.set_viewer_resampling_mode("high_quality")
+        window.set_viewer_downscale_algorithm("sharp")
+        window.set_viewer_upscale_algorithm("lanczos")
         window._set_image_adjustments(brightness=1.2)
         window.page_list_dock.show()
         window._refresh_view()
@@ -382,10 +383,11 @@ def test_zip_book_uses_one_runtime_across_spread_rotation_filter_and_page_list(
         assert captured
         assert all(request.source_epoch == session.generation for request in captured)
         assert captured[-1].render_spec.rotation == 90
-        assert captured[-1].render_spec.resampling_mode == "high_quality"
+        assert captured[-1].render_spec.downscale_algorithm == "sharp"
+        assert captured[-1].render_spec.upscale_algorithm == "lanczos"
         assert captured[-1].render_spec.brightness == 1.2
         assert captured[-1].render_spec.decoder_maximum_size is not None
-        assert captured[-1].render_spec.decoder_headroom == 2.0
+        assert captured[-1].render_spec.decoder_headroom == 1.0
         assert captured[-1].render_spec.decoder_layout_sized
         window.fit_mode = "fit_width"
         assert window._current_book_runtime_decode_bounds()[1] is None

@@ -10,7 +10,7 @@ from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
-from app.image_source import ImageSourceError, ZipImageSource
+from app.image_source import ImageSourceError, StreamedJpegDecode, ZipImageSource
 from app.image_work_coordinator import ImageWorkCoordinator
 from app.raster_warmup_planner import RasterBookTopology, RasterWarmupPlan
 from app.zip_raster_book_runtime import (
@@ -389,11 +389,11 @@ def test_combined_byte_eviction_prefers_old_layout_and_protects_near_plan(
         source.close()
 
 
-def test_runtime_starts_one_commit_neighbor_then_paint_releases_book_warmup(
+def test_runtime_builds_startup_runway_then_continues_book_warmup(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
-    archive = _write_zip(tmp_path)
+    archive = _write_zip(tmp_path, pages=8)
 
     class CountingSource(ZipImageSource):
         def __init__(self, path: Path) -> None:
@@ -419,39 +419,47 @@ def test_runtime_starts_one_commit_neighbor_then_paint_releases_book_warmup(
     runtime = ZipRasterBookRuntime(source, 1)
     frames: list[ZipRasterFrame] = []
     runtime.frameReady.connect(frames.append)
-    request = _request(1, _unit(1), _unit(1), _unit(2), _unit(0))
+    units = tuple(_unit(index) for index in range(8))
+    request = _request(1, units[2], *units, direction=1)
     try:
         assert runtime.request(request)
         _wait_until(qapp, lambda: len(frames) == 1)
 
-        assert source.order == ["1.png"]
+        assert source.order == ["2.png"]
         assert runtime.metrics.jobs_submitted == 1
-        assert runtime.release_initial_warmup(request_id=1)
-        # A duplicate GUI callback for the same accepted commit must not
-        # replenish the pre-paint allowance and admit another unit.
-        assert runtime.release_initial_warmup(request_id=1)
+        assert runtime.release_startup_runway(request_id=1)
+        # A duplicate GUI callback for the same accepted commit is idempotent;
+        # it must not restart the runway or duplicate any decode.
+        assert runtime.release_startup_runway(request_id=1)
         _wait_until(
             qapp,
-            lambda: runtime.metrics.jobs_submitted == 2
+            lambda: runtime.metrics.jobs_submitted == 8
             and not runtime.has_unfinished_tasks(),
         )
-        assert source.order == ["1.png", "2.png"]
-        assert runtime.warmup_stop_reason == "waiting_for_paint"
-
-        assert runtime.release_prefetch(request_id=1)
-        _wait_until(
-            qapp,
-            lambda: runtime.metrics.jobs_submitted == 3
-            and not runtime.has_unfinished_tasks(),
-        )
-
-        assert source.order == ["1.png", "2.png", "0.png"]
-        assert runtime.metrics.commit_warmup_releases == 1
+        assert source.order == [
+            "2.png",
+            "3.png",
+            "1.png",
+            "4.png",
+            "5.png",
+            "6.png",
+            "0.png",
+            "7.png",
+        ]
+        assert runtime.warmup_stop_reason == "complete"
+        assert runtime.metrics.startup_runway_releases == 1
         assert source.max_active == 1
-        assert set(runtime.cached_page_indexes) == {0, 1, 2}
+        assert set(runtime.cached_page_indexes) == set(range(8))
+
+        # Paint is still a valid ownership/reclamation acknowledgement, but it
+        # is no longer a scheduler gate for the runway or book-wide iterator.
+        jobs_before_paint = runtime.metrics.jobs_submitted
+        assert runtime.release_prefetch(request_id=1)
+        qapp.processEvents()
+        assert runtime.metrics.jobs_submitted == jobs_before_paint
 
         jobs_before_hit = runtime.metrics.jobs_submitted
-        assert runtime.request(_request(2, _unit(2), _unit(2), _unit(1)))
+        assert runtime.request(_request(2, units[3], *units, direction=1))
         qapp.processEvents()
         assert frames[-1].request_id == 2
         assert frames[-1].cache_hit
@@ -906,10 +914,9 @@ def test_direction_reversal_rejects_queued_old_serial_and_reorders_cursor(
         # order, but its immutable result still carries request 1.
         assert runtime.wait_for_done(3000)
 
-        # Reverse around the same ready current. The finished page-2 job is
-        # still an immediate neighbor, so retaining the worker object is
-        # useful; however, its already-built request-1 result must remain
-        # stale. The replacement lazy cursor starts with page 0.
+        # Reverse around the same ready current.  Page 0 is the exact first
+        # missing unit in the new runway, so the old-direction page-2 job is
+        # cancelled/staled instead of delaying the replacement frontier.
         second = _request(
             2,
             _unit(1),
@@ -921,7 +928,7 @@ def test_direction_reversal_rejects_queued_old_serial_and_reorders_cursor(
         )
         assert runtime.request(second)
         assert runtime.release_prefetch(request_id=2)
-        assert runtime.metrics.cancel_requests == 0
+        assert runtime.metrics.cancel_requests == 1
         _wait_until(qapp, lambda: 0 in artifacts)
 
         assert artifacts[:2] == [1, 0]
@@ -1054,6 +1061,8 @@ def test_layout_changes_reuse_book_scoped_decoded_source(
         _wait_until(qapp, lambda: len(frames) == 1)
         assert source.decode_calls == 1
         assert runtime.decoded_source_count == 1
+        assert frames[-1].pages[0].pixmap is not None
+        assert frames[-1].pages[0].pixmap.size().toTuple() == (320, 480)
 
         # A smaller layout is satisfied by the retained decoder-sized source.
         runtime.invalidate_layout()
@@ -1072,10 +1081,16 @@ def test_layout_changes_reuse_book_scoped_decoded_source(
         _wait_until(qapp, lambda: len(frames) == 2)
 
         assert source.decode_calls == 1
-        assert frames[-1].pages[0].source_is_preview
+        assert frames[-1].pages[0].pixmap is not None
+        assert frames[-1].pages[0].pixmap.size().toTuple() == (360, 540)
+        assert frames[-1].pages[0].pixmap.devicePixelRatio() == 1.5
+        # 80x120 from a 120x180 JPEG requires the native 1/1 tier; retaining
+        # the full source avoids an arbitrary decoder resize and still lets the
+        # smaller layout reuse the same source without another decode.
+        assert not frames[-1].pages[0].source_is_preview
 
-        # An explicit full-resolution demand upgrades once while preserving the
-        # navigation preview as a separate tier.
+        # An explicit full-resolution demand reuses that already-sufficient
+        # native 1/1 source instead of decoding the same JPEG again.
         assert runtime.request(
             _request(
                 3,
@@ -1085,9 +1100,9 @@ def test_layout_changes_reuse_book_scoped_decoded_source(
             )
         )
         _wait_until(qapp, lambda: len(frames) == 3)
-        assert source.decode_calls == 2
+        assert source.decode_calls == 1
         assert not frames[-1].pages[0].source_is_preview
-        assert runtime.decoded_source_count == 2
+        assert runtime.decoded_source_count == 1
 
         jobs_before_ready_return = runtime.metrics.jobs_submitted
         assert runtime.request(
@@ -1106,11 +1121,10 @@ def test_layout_changes_reuse_book_scoped_decoded_source(
         assert frames[-1].request_id == 4
         assert frames[-1].cache_hit
         assert frames[-1].pages[0].source_qimage is not None
-        assert frames[-1].pages[0].source_is_preview
+        assert not frames[-1].pages[0].source_is_preview
         assert runtime.metrics.jobs_submitted == jobs_before_ready_return
 
-        # The full source can satisfy a later preview larger than the retained
-        # navigation tier without evicting that smaller tier.
+        # The same full source also satisfies a later larger layout.
         runtime.invalidate_layout()
         assert runtime.request(
             _request(
@@ -1126,11 +1140,11 @@ def test_layout_changes_reuse_book_scoped_decoded_source(
         )
         _wait_until(qapp, lambda: len(frames) == 5)
 
-        assert source.decode_calls == 2
+        assert source.decode_calls == 1
         assert runtime.metrics.jobs_submitted == 4
-        assert runtime.metrics.source_cache_hits == 2
-        assert runtime.metrics.source_cache_misses == 2
-        assert runtime.decoded_source_count == 2
+        assert runtime.metrics.source_cache_hits == 3
+        assert runtime.metrics.source_cache_misses == 1
+        assert runtime.decoded_source_count == 1
         assert frames[-1].request_id == 5
         assert frames[-1].pages[0].source_qimage is not None
 
@@ -1240,6 +1254,71 @@ def test_runtime_completes_spread_rotation_and_adjustment_in_one_frame(
         assert len(source.preview_sizes) == 2
         assert all(width < 1600 and height < 2400 for width, height in source.preview_sizes)
         assert all(page.source_is_preview for page in frame.pages)
+    finally:
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()
+
+
+def test_runtime_rejects_fresh_jpeg_preview_below_required_size(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    archive = tmp_path / "undersized-preview.zip"
+    page_path = tmp_path / "0.jpg"
+    with Image.new("RGB", (160, 240), (50, 80, 120)) as image:
+        image.save(page_path, "JPEG", quality=90)
+    with zipfile.ZipFile(archive, "w") as output:
+        output.write(page_path, page_path.name)
+
+    class UndersizedPreviewSource(ZipImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.full_decodes = 0
+
+        def open_compatible_jpeg_at_most(self, image_id, maximum_size):
+            del image_id, maximum_size
+            preview = QImage(79, 120, QImage.Format.Format_RGB32)
+            preview.fill(0)
+            return StreamedJpegDecode(
+                qimage=preview,
+                original_size=(160, 240),
+                bytes_read=1,
+                read_calls=1,
+                backend="fake-undersized",
+            )
+
+        def open_image(self, image_id: str) -> Image.Image:
+            self.full_decodes += 1
+            return super().open_image(image_id)
+
+    source = UndersizedPreviewSource(archive)
+    runtime = ZipRasterBookRuntime(source, 1)
+    frames: list[ZipRasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    current = ZipRasterDisplayUnit(
+        0,
+        (ZipRasterPage(0, "0.jpg"),),
+        True,
+    )
+    try:
+        assert runtime.request(
+            _request(
+                1,
+                current,
+                current,
+                spec=ZipRasterRenderSpec(
+                    (80, 120),
+                    decoder_maximum_size=(80, 120),
+                ),
+            )
+        )
+        _wait_until(qapp, lambda: len(frames) == 1)
+
+        assert source.full_decodes == 1
+        assert frames[0].pages[0].error is None
+        assert not frames[0].pages[0].source_is_preview
+        assert frames[0].pages[0].source_qimage is not None
+        assert frames[0].pages[0].source_qimage.size().toTuple() == (160, 240)
     finally:
         assert runtime.shutdown(wait_msecs=3000)
         source.close()

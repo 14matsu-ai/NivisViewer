@@ -34,6 +34,13 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
     assert manager.data["thumbnail_disk_cache_enabled"] is True
     assert manager.data["thumbnail_cache_limit_mb"] == 512
     assert manager.data["gap"] == 12
+    assert manager.data["viewer_downscale_algorithm"] == "auto"
+    assert manager.data["viewer_upscale_algorithm"] == "auto"
+    assert manager.data["magnifier_downscale_algorithm"] == "sharp"
+    assert manager.data["magnifier_upscale_algorithm"] == "lanczos"
+    assert "viewer_resampling_mode" not in manager.data
+    assert "magnifier_resampling_mode" not in manager.data
+    assert "smooth_scaling" not in manager.data
     assert manager.data["mouse_gestures_enabled"] is True
     assert manager.data["mouse_gesture_show_trail"] is True
     assert manager.data["mouse_gesture_min_distance"] == 36
@@ -165,6 +172,102 @@ def test_viewer_memory_mode_migration_is_one_way_on_save(tmp_path: Path) -> None
     assert legacy_key not in mixed.data
     mixed.save()
     assert legacy_key not in json.loads(mixed_path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    ("legacy_mode", "smooth_scaling", "expected"),
+    (
+        ("standard", True, ("auto", "auto")),
+        ("standard", False, ("fast", "nearest")),
+        ("moire_reduction", True, ("area", "bicubic")),
+        ("high_quality", True, ("sharp", "lanczos")),
+        ("smooth", True, ("smooth", "bilinear")),
+        ("pixel", True, ("nearest", "nearest")),
+    ),
+)
+def test_legacy_resampling_mode_is_migrated_to_explicit_algorithms(
+    tmp_path: Path,
+    legacy_mode: str,
+    smooth_scaling: bool,
+    expected: tuple[str, str],
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "viewer_resampling_mode": legacy_mode,
+                "smooth_scaling": smooth_scaling,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    restored = ConfigManager(path).load()
+
+    assert (
+        restored["viewer_downscale_algorithm"],
+        restored["viewer_upscale_algorithm"],
+    ) == expected
+    assert restored["magnifier_downscale_algorithm"] == "sharp"
+    assert restored["magnifier_upscale_algorithm"] == "lanczos"
+    assert all(
+        key not in restored
+        for key in ConfigManager._LEGACY_RESAMPLING_KEYS
+    )
+
+
+def test_explicit_resampling_algorithms_win_and_legacy_keys_are_not_resaved(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "viewer_resampling_mode": "high_quality",
+                "magnifier_resampling_mode": "pixel",
+                "smooth_scaling": False,
+                "viewer_downscale_algorithm": "area",
+                "magnifier_downscale_algorithm": "smooth",
+                "magnifier_upscale_algorithm": "bicubic",
+            }
+        ),
+        encoding="utf-8",
+    )
+    manager = ConfigManager(path)
+
+    restored = manager.load()
+
+    assert restored["viewer_downscale_algorithm"] == "area"
+    assert restored["viewer_upscale_algorithm"] == "lanczos"
+    assert restored["magnifier_downscale_algorithm"] == "smooth"
+    assert restored["magnifier_upscale_algorithm"] == "bicubic"
+    manager.save()
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert all(
+        key not in persisted
+        for key in ConfigManager._LEGACY_RESAMPLING_KEYS
+    )
+
+
+def test_resampling_algorithms_are_normalized_by_scale_direction(
+    tmp_path: Path,
+) -> None:
+    manager = ConfigManager(tmp_path / "config.json")
+    manager.load()
+
+    manager.apply(
+        {
+            "viewer_downscale_algorithm": "bicubic",
+            "viewer_upscale_algorithm": "area",
+            "magnifier_downscale_algorithm": "nearest",
+            "magnifier_upscale_algorithm": "nearest",
+        }
+    )
+
+    assert manager.get("viewer_downscale_algorithm") == "auto"
+    assert manager.get("viewer_upscale_algorithm") == "auto"
+    assert manager.get("magnifier_downscale_algorithm") == "nearest"
+    assert manager.get("magnifier_upscale_algorithm") == "nearest"
 
 
 def test_unknown_viewer_memory_mode_falls_back_to_auto(tmp_path: Path) -> None:

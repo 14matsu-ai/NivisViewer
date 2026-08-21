@@ -276,7 +276,9 @@ class FileOperationPanel(QWidget):
         ):
             return
         self._idle_close_queued = True
-        QTimer.singleShot(0, self._close_if_still_idle)
+        # Bind the callback to this QWidget so Qt drops it when
+        # WA_DeleteOnClose destroys the panel before the next event-loop turn.
+        QTimer.singleShot(0, self, self._close_if_still_idle)
 
     def _close_if_still_idle(self) -> None:
         self._idle_close_queued = False

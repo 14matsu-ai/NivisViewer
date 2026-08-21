@@ -33,8 +33,14 @@ from .viewer_render import (
     ViewerRenderKey,
     ViewerRenderResult,
     ViewerRenderTask,
+    normalize_downscale_algorithm,
     normalize_resampling_mode,
+    normalize_upscale_algorithm,
+    resampling_policy_for_legacy_mode,
 )
+
+
+_MAX_EXACT_RENDER_PIXELS = 64 * 1024 * 1024
 
 
 @dataclass
@@ -291,6 +297,11 @@ class ViewerWidget(QWidget):
         self.magnifier_size = 220
         self.resampling_mode = "standard"
         self.magnifier_resampling_mode = "high_quality"
+        self.viewer_downscale_algorithm = "auto"
+        self.viewer_upscale_algorithm = "auto"
+        self.magnifier_downscale_algorithm = "sharp"
+        self.magnifier_upscale_algorithm = "lanczos"
+        self._use_explicit_resampling_policy = False
 
         self._spread = DisplaySpread(0, tuple(), True)
         self._images: list[ViewerImage] = []
@@ -461,13 +472,18 @@ class ViewerWidget(QWidget):
         self._refresh_current_render()
 
     def set_smooth_scaling(self, enabled: bool) -> None:
+        """Compatibility adapter for profiles predating split algorithms."""
+
         normalized = bool(enabled)
         changed = normalized != self.smooth_scaling
         self.smooth_scaling = normalized
         if changed and self.resampling_mode == "standard":
-            self._refresh_current_render()
-        else:
-            self.update()
+            self.set_resampling_algorithms(
+                normal_downscale=("auto" if normalized else "fast"),
+                normal_upscale=("auto" if normalized else "nearest"),
+            )
+            return
+        self.update()
 
     def set_render_cache_byte_limit_mib(self, memory_mib: int) -> None:
         self.set_render_cache_byte_limit_bytes(
@@ -498,6 +514,8 @@ class ViewerWidget(QWidget):
         normal: str | None = None,
         magnifier: str | None = None,
     ) -> None:
+        """Compatibility adapter from the retired combined-mode API."""
+
         normal_changed = False
         magnifier_changed = False
         if normal is not None:
@@ -505,6 +523,9 @@ class ViewerWidget(QWidget):
             if normalized != self.resampling_mode:
                 self.resampling_mode = normalized
                 normal_changed = True
+            policy = resampling_policy_for_legacy_mode(normalized)
+            self.viewer_downscale_algorithm = policy.downscale_algorithm
+            self.viewer_upscale_algorithm = policy.upscale_algorithm
         if magnifier is not None:
             normalized = normalize_resampling_mode(magnifier)
             if normalized != self.magnifier_resampling_mode:
@@ -512,8 +533,55 @@ class ViewerWidget(QWidget):
                 magnifier_changed = True
                 if self.magnifier_selecting or self.magnifier_active:
                     self.cancel_magnifier()
+            policy = resampling_policy_for_legacy_mode(normalized)
+            self.magnifier_downscale_algorithm = policy.downscale_algorithm
+            self.magnifier_upscale_algorithm = policy.upscale_algorithm
+        self._use_explicit_resampling_policy = False
         if normal_changed:
             self._refresh_current_render()
+        elif magnifier_changed:
+            self.update()
+
+    def set_resampling_algorithms(
+        self,
+        *,
+        normal_downscale: str | None = None,
+        normal_upscale: str | None = None,
+        magnifier_downscale: str | None = None,
+        magnifier_upscale: str | None = None,
+    ) -> None:
+        """Set the sole production resampling authority by scale direction."""
+
+        normal_changed = False
+        magnifier_changed = False
+        if normal_downscale is not None:
+            normalized = normalize_downscale_algorithm(normal_downscale)
+            normal_changed |= normalized != self.viewer_downscale_algorithm
+            self.viewer_downscale_algorithm = normalized
+        if normal_upscale is not None:
+            normalized = normalize_upscale_algorithm(normal_upscale)
+            normal_changed |= normalized != self.viewer_upscale_algorithm
+            self.viewer_upscale_algorithm = normalized
+        if magnifier_downscale is not None:
+            normalized = normalize_downscale_algorithm(magnifier_downscale)
+            magnifier_changed |= normalized != self.magnifier_downscale_algorithm
+            self.magnifier_downscale_algorithm = normalized
+        if magnifier_upscale is not None:
+            normalized = normalize_upscale_algorithm(magnifier_upscale)
+            magnifier_changed |= normalized != self.magnifier_upscale_algorithm
+            self.magnifier_upscale_algorithm = normalized
+        self._use_explicit_resampling_policy = True
+        rerender_magnifier = bool(
+            magnifier_changed
+            and (self.magnifier_selecting or self.magnifier_active)
+        )
+        if normal_changed:
+            self._refresh_current_render()
+        if rerender_magnifier:
+            # Preserve the selected source rectangle and the last complete
+            # lens frame while a new algorithm-specific result is built.  The
+            # request generation rejects the old callback atomically.
+            self._request_magnifier_render()
         elif magnifier_changed:
             self.update()
 
@@ -963,7 +1031,10 @@ class ViewerWidget(QWidget):
     def paintEvent(self, event) -> None:  # type: ignore[override]
         painter = QPainter(self)
         painter.fillRect(self.rect(), self.background_color)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self.smooth_scaling)
+        # Runtime-prepared frames already own their exact resampling algorithm.
+        # This hint is only a safety net for subpixel DPR rounding and legacy
+        # artifacts; it is no longer a user-visible second quality authority.
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
         if not self._images:
             painter.setPen(QColor("#777777"))
@@ -978,7 +1049,21 @@ class ViewerWidget(QWidget):
         for image, rect in zip(self._images, layout.rects):
             pixmap = self._pixmap_for_paint(image, rect)
             if pixmap is not None:
-                painter.drawPixmap(rect, pixmap)
+                natural_size = pixmap.deviceIndependentSize()
+                exact_runtime_artifact = (
+                    self._direct_display_mode
+                    and image.display_prepared
+                    and abs(natural_size.width() - rect.width()) <= 0.51
+                    and abs(natural_size.height() - rect.height()) <= 0.51
+                )
+                if exact_runtime_artifact:
+                    # The book runtime already produced exact physical pixels
+                    # and attached the matching DPR.  Point-form drawing keeps
+                    # that artifact at its natural device-independent size,
+                    # avoiding a hidden second resize in QPainter.
+                    painter.drawPixmap(rect.topLeft(), pixmap)
+                else:
+                    painter.drawPixmap(rect, pixmap)
                 self._last_draw_layout.append((rect, pixmap))
                 self._last_image_layout.append((rect, image, pixmap))
                 painted_image_ids.append(image.image_id)
@@ -1387,32 +1472,18 @@ class ViewerWidget(QWidget):
         rotation = 0 if image.pre_rotated else self.rotation_angle
         target_width = max(1, round(target_rect.width() * dpr))
         target_height = max(1, round(target_rect.height() * dpr))
+        target_pixels = target_width * target_height
+        if (
+            self.fit_mode == "manual_zoom"
+            and target_pixels > _MAX_EXACT_RENDER_PIXELS
+        ):
+            # Match the book runtime's temporary safety valve until manual
+            # zoom becomes tiled.  Ordinary fit/actual-size rendering stays
+            # exact; only a pathological monolithic artifact is bounded.
+            scale = (_MAX_EXACT_RENDER_PIXELS / target_pixels) ** 0.5
+            target_width = max(1, round(target_width * scale))
+            target_height = max(1, round(target_height * scale))
         source_sized = False
-        if self.resampling_mode == "standard":
-            source_size = self._rotated_source_size(image)
-            if (
-                source_size.isValid()
-                and (
-                    target_width > source_size.width()
-                    or target_height > source_size.height()
-                )
-            ):
-                # Standard keeps the historical QPainter upscale path.  A
-                # source-sized artifact is enough above 100%; allocating an
-                # 8x target pixmap for manual zoom can otherwise require
-                # several GiB for one large page.
-                scale = min(
-                    1.0,
-                    target_width / source_size.width(),
-                    target_height / source_size.height(),
-                )
-                target_width = max(1, round(source_size.width() * scale))
-                target_height = max(1, round(source_size.height() * scale))
-            source_sized = (
-                source_size.isValid()
-                and target_width == source_size.width()
-                and target_height == source_size.height()
-            )
         return ViewerRenderKey(
             image_id=image.image_id,
             source_cache_key=int(image.qimage.cacheKey()),
@@ -1434,6 +1505,16 @@ class ViewerWidget(QWidget):
                 else True
             ),
             source_sized=source_sized,
+            downscale_algorithm=(
+                self.viewer_downscale_algorithm
+                if self._use_explicit_resampling_policy
+                else None
+            ),
+            upscale_algorithm=(
+                self.viewer_upscale_algorithm
+                if self._use_explicit_resampling_policy
+                else None
+            ),
         )
 
     def _refresh_current_render(self) -> None:
@@ -2651,6 +2732,16 @@ class ViewerWidget(QWidget):
             purpose="magnifier",
             request_generation=self.magnifier_request_generation,
             split_range=image.split_range,
+            downscale_algorithm=(
+                self.magnifier_downscale_algorithm
+                if self._use_explicit_resampling_policy
+                else None
+            ),
+            upscale_algorithm=(
+                self.magnifier_upscale_algorithm
+                if self._use_explicit_resampling_policy
+                else None
+            ),
         )
         self._magnifier_key = key
         self._queue_render(
@@ -2684,7 +2775,16 @@ class ViewerWidget(QWidget):
 
     def _draw_magnifier(self, painter: QPainter) -> None:
         if self.magnifier_active and self._magnifier_pixmap is not None:
-            painter.drawPixmap(self.rect(), self._magnifier_pixmap)
+            natural_size = self._magnifier_pixmap.deviceIndependentSize()
+            if (
+                abs(natural_size.width() - self.width()) <= 0.51
+                and abs(natural_size.height() - self.height()) <= 0.51
+            ):
+                # The lens render already has exact physical pixels and DPR.
+                # Point-form drawing avoids a fractional-DPR second resample.
+                painter.drawPixmap(self.rect().topLeft(), self._magnifier_pixmap)
+            else:
+                painter.drawPixmap(self.rect(), self._magnifier_pixmap)
             return
         if self.magnifier_selecting and self._magnifier_selection_rect is not None:
             painter.fillRect(

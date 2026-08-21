@@ -14,10 +14,14 @@ from app.config_manager import ConfigManager
 from app.image_work_coordinator import ImageWorkPriority
 from app.page_model import DisplaySpread, PageSlot
 from app.viewer_render import (
+    DOWNSCALE_ALGORITHM_LABELS,
     RESAMPLING_MODE_LABELS,
+    ResamplingPolicy,
+    UPSCALE_ALGORITHM_LABELS,
     ViewerRenderKey,
     ViewerRenderResult,
     pillow_resampling_for,
+    pillow_resampling_for_policy,
     render_qimage,
 )
 from app.viewer_widget import ViewerImage, ViewerWidget
@@ -99,6 +103,23 @@ def test_resampling_mode_maps_to_expected_pillow_filter(
 ) -> None:
     target = (100, 100) if shrinking else (400, 400)
     assert pillow_resampling_for(mode, (200, 200), target) == expected
+
+
+@pytest.mark.parametrize(
+    ("policy", "target", "expected"),
+    (
+        (ResamplingPolicy("auto", "auto"), (80, 80), Image.Resampling.BOX),
+        (ResamplingPolicy("sharp", "auto"), (160, 160), Image.Resampling.LANCZOS),
+        (ResamplingPolicy("auto", "auto"), (300, 300), Image.Resampling.BICUBIC),
+        (ResamplingPolicy("auto", "nearest"), (300, 300), Image.Resampling.NEAREST),
+    ),
+)
+def test_explicit_policy_selects_one_final_native_filter(
+    policy: ResamplingPolicy,
+    target: tuple[int, int],
+    expected: Image.Resampling,
+) -> None:
+    assert pillow_resampling_for_policy(policy, (200, 200), target) == expected
 
 
 def test_render_key_carries_target_algorithm_rotation_dpr_and_crop() -> None:
@@ -288,7 +309,7 @@ def test_exact_target_skips_qimage_to_pillow_copy(
     assert rendered.size() == source.size()
 
 
-def test_config_saves_restores_modes_and_unknown_values_fall_back(
+def test_config_saves_restores_algorithms_and_unknown_values_fall_back(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "config.json"
@@ -296,24 +317,32 @@ def test_config_saves_restores_modes_and_unknown_values_fall_back(
     config.load()
     config.apply(
         {
-            "viewer_resampling_mode": "pixel",
-            "magnifier_resampling_mode": "smooth",
+            "viewer_downscale_algorithm": "nearest",
+            "viewer_upscale_algorithm": "nearest",
+            "magnifier_downscale_algorithm": "smooth",
+            "magnifier_upscale_algorithm": "bilinear",
         },
         save=True,
     )
 
     restored = ConfigManager(path).load()
-    assert restored["viewer_resampling_mode"] == "pixel"
-    assert restored["magnifier_resampling_mode"] == "smooth"
+    assert restored["viewer_downscale_algorithm"] == "nearest"
+    assert restored["viewer_upscale_algorithm"] == "nearest"
+    assert restored["magnifier_downscale_algorithm"] == "smooth"
+    assert restored["magnifier_upscale_algorithm"] == "bilinear"
 
     config.apply(
         {
-            "viewer_resampling_mode": "future",
-            "magnifier_resampling_mode": "future",
+            "viewer_downscale_algorithm": "future",
+            "viewer_upscale_algorithm": "future",
+            "magnifier_downscale_algorithm": "future",
+            "magnifier_upscale_algorithm": "future",
         }
     )
-    assert config.get("viewer_resampling_mode") == "standard"
-    assert config.get("magnifier_resampling_mode") == "standard"
+    assert config.get("viewer_downscale_algorithm") == "auto"
+    assert config.get("viewer_upscale_algorithm") == "auto"
+    assert config.get("magnifier_downscale_algorithm") == "sharp"
+    assert config.get("magnifier_upscale_algorithm") == "lanczos"
 
 
 def test_nonstandard_normal_render_is_atomic_and_keeps_previous_page(
@@ -684,6 +713,30 @@ def test_magnifier_render_uses_demand_priority(
         queued[0][1]
         == int(ImageWorkPriority.VIEWER_INTERACTIVE_RERENDER)
     )
+    widget.close()
+
+
+def test_active_magnifier_rebuilds_without_discarding_last_complete_lens(
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    widget = ViewerWidget()
+    widget.magnifier_active = True
+    widget.magnifier_source_page = 0
+    widget._magnifier_source_image_id = "page"
+    widget.magnifier_source_rect = QRectF(10, 10, 40, 30)
+    rebuilt: list[bool] = []
+    monkeypatch.setattr(
+        widget,
+        "_request_magnifier_render",
+        lambda **_kwargs: rebuilt.append(True),
+    )
+
+    widget.set_resampling_algorithms(magnifier_downscale="area")
+
+    assert widget.magnifier_active
+    assert widget.magnifier_downscale_algorithm == "area"
+    assert rebuilt == [True]
     widget.close()
 
 
@@ -1319,7 +1372,7 @@ def test_stale_magnifier_result_is_rejected() -> None:
     widget.close()
 
 
-def test_viewer_menu_modes_are_radio_actions_and_persist(
+def test_viewer_algorithm_menus_are_radio_actions_and_persist(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
@@ -1328,16 +1381,27 @@ def test_viewer_menu_modes_are_radio_actions_and_persist(
     window = ViewerWindow(config_manager=config)
 
     assert {
-        action.text() for action in window.normal_resampling_actions.values()
-    } == set(RESAMPLING_MODE_LABELS.values())
-    assert window.normal_resampling_actions["standard"].isChecked()
-    assert window.magnifier_resampling_actions["high_quality"].isChecked()
+        action.text() for action in window.viewer_downscale_actions.values()
+    } == set(DOWNSCALE_ALGORITHM_LABELS.values())
+    assert {
+        action.text() for action in window.viewer_upscale_actions.values()
+    } == set(UPSCALE_ALGORITHM_LABELS.values())
+    assert window.viewer_downscale_actions["auto"].isChecked()
+    assert window.viewer_upscale_actions["auto"].isChecked()
+    assert window.magnifier_downscale_actions["sharp"].isChecked()
+    assert window.magnifier_upscale_actions["lanczos"].isChecked()
 
-    window.set_viewer_resampling_mode("pixel")
-    window.set_magnifier_resampling_mode("smooth")
-    assert config.get("viewer_resampling_mode") == "pixel"
-    assert config.get("magnifier_resampling_mode") == "smooth"
-    assert window.normal_resampling_actions["pixel"].isChecked()
-    assert window.magnifier_resampling_actions["smooth"].isChecked()
+    window.set_viewer_downscale_algorithm("nearest")
+    window.set_viewer_upscale_algorithm("nearest")
+    window.set_magnifier_downscale_algorithm("smooth")
+    window.set_magnifier_upscale_algorithm("bilinear")
+    assert config.get("viewer_downscale_algorithm") == "nearest"
+    assert config.get("viewer_upscale_algorithm") == "nearest"
+    assert config.get("magnifier_downscale_algorithm") == "smooth"
+    assert config.get("magnifier_upscale_algorithm") == "bilinear"
+    assert window.viewer_downscale_actions["nearest"].isChecked()
+    assert window.viewer_upscale_actions["nearest"].isChecked()
+    assert window.magnifier_downscale_actions["smooth"].isChecked()
+    assert window.magnifier_upscale_actions["bilinear"].isChecked()
     window.close()
     qapp.processEvents()

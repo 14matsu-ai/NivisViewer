@@ -725,11 +725,15 @@ def test_browser_to_viewer_wide_open_matches_clicked_path(
     browser.open_item(browser.item_model.index(browser.item_model.row_for_path(target), 0))
     target_index = names.index(wide_name)
     deadline = time.monotonic() + 3
+    progress = None
     while time.monotonic() < deadline:
         qapp.processEvents()
+        progress = store.get_reading_progress(str(folder))
         if (
             viewer.model.get_image_size(target_index) is not None
             and viewer.presentation_state.displayed_page == target_index
+            and progress is not None
+            and progress.page_index == target_index
         ):
             break
         QTest.qWait(5)
@@ -737,7 +741,6 @@ def test_browser_to_viewer_wide_open_matches_clicked_path(
     assert Path(viewer.model.display_path_for_index(viewer.model.focused_index)) == target
     assert [slot.page_index for slot in viewer.model.spread_at().slots] == [target_index]
     assert target.name in viewer.status.currentMessage()
-    progress = store.get_reading_progress(str(folder))
     assert progress is not None
     assert progress.page_index == target_index
     viewer.close()

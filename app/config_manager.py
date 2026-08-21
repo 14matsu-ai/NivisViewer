@@ -19,6 +19,23 @@ class ConfigManager(QObject):
     settings_changed = Signal(object)
 
     _LEGACY_VIEWER_CACHE_MEMORY_KEY = "viewer_cache_max_memory_mib"
+    _LEGACY_RESAMPLING_KEYS = (
+        "viewer_resampling_mode",
+        "magnifier_resampling_mode",
+        "smooth_scaling",
+    )
+    _LEGACY_RESAMPLING_ALGORITHMS: dict[str, tuple[str, str]] = {
+        "moire_reduction": ("area", "bicubic"),
+        "high_quality": ("sharp", "lanczos"),
+        "smooth": ("smooth", "bilinear"),
+        "pixel": ("nearest", "nearest"),
+    }
+    VIEWER_DOWNSCALE_ALGORITHMS = frozenset(
+        {"auto", "fast", "smooth", "sharp", "area", "nearest"}
+    )
+    VIEWER_UPSCALE_ALGORITHMS = frozenset(
+        {"auto", "bilinear", "bicubic", "lanczos", "nearest"}
+    )
     _LEGACY_VIEWER_MEMORY_MIB_BY_PREFETCH_PRESET: dict[str, int] = {
         "disabled": 128,
         "memory_saver": 128,
@@ -149,13 +166,14 @@ class ConfigManager(QObject):
         "magnifier_enabled": False,
         "magnifier_zoom": 2.0,
         "magnifier_size": 220,
-        "viewer_resampling_mode": "standard",
-        "magnifier_resampling_mode": "high_quality",
+        "viewer_downscale_algorithm": "auto",
+        "viewer_upscale_algorithm": "auto",
+        "magnifier_downscale_algorithm": "sharp",
+        "magnifier_upscale_algorithm": "lanczos",
         "gap": 12,
         "single_first_page": True,
         "treat_wide_image_as_single": True,
         "split_wide_image": False,
-        "smooth_scaling": True,
         "horizontal_alignment": "center",
         "brightness": 1.0,
         "contrast": 1.0,
@@ -214,7 +232,7 @@ class ConfigManager(QObject):
             return self.data
 
         if isinstance(loaded, dict):
-            loaded = dict(loaded)
+            loaded = self._migrate_legacy_resampling_settings(loaded)
             if "viewer_memory_mode" not in loaded:
                 preset = str(loaded.get("viewer_prefetch_preset", "standard"))
                 if self._LEGACY_VIEWER_CACHE_MEMORY_KEY in loaded:
@@ -253,6 +271,8 @@ class ConfigManager(QObject):
             self.apply(updates)
 
         self.data.pop(self._LEGACY_VIEWER_CACHE_MEMORY_KEY, None)
+        for key in self._LEGACY_RESAMPLING_KEYS:
+            self.data.pop(key, None)
 
         if not self.writable:
             self.last_error = "プロファイルは読み取り専用です。"
@@ -281,6 +301,8 @@ class ConfigManager(QObject):
         merged = deepcopy(self.data)
         merged.update(updates)
         merged.pop(self._LEGACY_VIEWER_CACHE_MEMORY_KEY, None)
+        for key in self._LEGACY_RESAMPLING_KEYS:
+            merged.pop(key, None)
         normalized = self._normalize(merged)
         changed = {
             key: value
@@ -584,17 +606,17 @@ class ConfigManager(QObject):
                 "book_open_position"
             ]
         for key in (
-            "viewer_resampling_mode",
-            "magnifier_resampling_mode",
+            "viewer_downscale_algorithm",
+            "magnifier_downscale_algorithm",
         ):
-            if normalized.get(key) not in {
-                "standard",
-                "moire_reduction",
-                "high_quality",
-                "smooth",
-                "pixel",
-            }:
-                normalized[key] = "standard"
+            if normalized.get(key) not in cls.VIEWER_DOWNSCALE_ALGORITHMS:
+                normalized[key] = cls.DEFAULTS[key]
+        for key in (
+            "viewer_upscale_algorithm",
+            "magnifier_upscale_algorithm",
+        ):
+            if normalized.get(key) not in cls.VIEWER_UPSCALE_ALGORITHMS:
+                normalized[key] = cls.DEFAULTS[key]
         try:
             magnifier_zoom = float(normalized.get("magnifier_zoom", 2.0))
         except (TypeError, ValueError):
@@ -685,6 +707,42 @@ class ConfigManager(QObject):
             maximum=300,
         )
         return normalized
+
+    @classmethod
+    def _migrate_legacy_resampling_settings(
+        cls,
+        loaded: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Translate the old combined modes once, without retaining two authorities."""
+
+        migrated = dict(loaded)
+        legacy_smooth = migrated.get("smooth_scaling", True)
+        smooth_enabled = legacy_smooth if isinstance(legacy_smooth, bool) else True
+        for prefix, legacy_key, legacy_default in (
+            ("viewer", "viewer_resampling_mode", "standard"),
+            ("magnifier", "magnifier_resampling_mode", "high_quality"),
+        ):
+            down_key = f"{prefix}_downscale_algorithm"
+            up_key = f"{prefix}_upscale_algorithm"
+            if down_key in migrated and up_key in migrated:
+                continue
+            legacy_mode = migrated.get(legacy_key, legacy_default)
+            if legacy_mode == "standard":
+                algorithms = (
+                    ("auto", "auto")
+                    if smooth_enabled
+                    else ("fast", "nearest")
+                )
+            else:
+                algorithms = cls._LEGACY_RESAMPLING_ALGORITHMS.get(
+                    str(legacy_mode),
+                    ("auto", "auto") if smooth_enabled else ("fast", "nearest"),
+                )
+            migrated.setdefault(down_key, algorithms[0])
+            migrated.setdefault(up_key, algorithms[1])
+        for key in cls._LEGACY_RESAMPLING_KEYS:
+            migrated.pop(key, None)
+        return migrated
 
     def viewer_prefetch_settings(self) -> dict[str, int | bool | str]:
         preset = str(self.get("viewer_prefetch_preset", "standard"))

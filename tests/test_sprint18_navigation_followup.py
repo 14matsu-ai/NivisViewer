@@ -258,7 +258,25 @@ def test_page_list_selection_uses_committed_presentation_fast_path(
     window, _pages = _viewer_with_pages(tmp_path, qapp, page_count=5)
     try:
         window.page_list_dock.show()
-        qapp.processEvents()
+        deadline = monotonic() + 3.0
+        while monotonic() < deadline:
+            qapp.processEvents()
+            displayed = window.presentation_state.displayed
+            if (
+                displayed is not None
+                and window.page_list_model.rowCount()
+                == window.model.total_pages
+                and window.page_list_model.book_epoch
+                == displayed.token.book.epoch
+            ):
+                break
+            QTest.qWait(5)
+        assert window.page_list_model.rowCount() == window.model.total_pages
+        assert window.presentation_state.displayed is not None
+        assert (
+            window.page_list_model.book_epoch
+            == window.presentation_state.displayed.token.book.epoch
+        )
         last_index = window.model.total_pages - 1
         window.model.go_to_raw_index(last_index)
         resolve_calls = 0

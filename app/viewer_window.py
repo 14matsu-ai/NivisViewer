@@ -115,7 +115,14 @@ from .viewer_widget import (
     ViewerWidget,
     calculate_spread_layout,
 )
-from .viewer_render import RESAMPLING_MODE_LABELS, normalize_resampling_mode
+from .viewer_render import (
+    DOWNSCALE_ALGORITHM_LABELS,
+    UPSCALE_ALGORITHM_LABELS,
+    normalize_downscale_algorithm,
+    normalize_resampling_mode,
+    normalize_upscale_algorithm,
+    resampling_policy_for_legacy_mode,
+)
 _DISPLAY_LOG = logging.getLogger("nivisviewer.viewer.display_unit")
 _PDF_PREFETCH_IDLE_GRACE_MS = 120
 _PREPARED_DISPLAY_IDLE_GRACE_MS = 16
@@ -265,7 +272,6 @@ class ViewerWindow(QMainWindow):
         self.single_first_page = bool(self.settings["single_first_page"])
         self.treat_wide_image_as_single = bool(self.settings["treat_wide_image_as_single"])
         self.split_wide_image = bool(self.settings.get("split_wide_image", False))
-        self.smooth_scaling = bool(self.settings.get("smooth_scaling", True))
         self.horizontal_alignment = str(self.settings.get("horizontal_alignment", "center"))
         self.brightness = max(0.1, min(3.0, float(self.settings.get("brightness", 1.0))))
         self.contrast = max(0.1, min(3.0, float(self.settings.get("contrast", 1.0))))
@@ -299,11 +305,17 @@ class ViewerWindow(QMainWindow):
         self.auto_open_adjacent_book = bool(self.settings.get("auto_open_adjacent_book", False))
         self.magnifier_zoom = float(self.settings.get("magnifier_zoom", 2.0))
         self.magnifier_size = int(self.settings.get("magnifier_size", 220))
-        self.viewer_resampling_mode = normalize_resampling_mode(
-            self.settings.get("viewer_resampling_mode", "standard")
+        self.viewer_downscale_algorithm = normalize_downscale_algorithm(
+            self.settings.get("viewer_downscale_algorithm", "auto")
         )
-        self.magnifier_resampling_mode = normalize_resampling_mode(
-            self.settings.get("magnifier_resampling_mode", "high_quality")
+        self.viewer_upscale_algorithm = normalize_upscale_algorithm(
+            self.settings.get("viewer_upscale_algorithm", "auto")
+        )
+        self.magnifier_downscale_algorithm = normalize_downscale_algorithm(
+            self.settings.get("magnifier_downscale_algorithm", "sharp")
+        )
+        self.magnifier_upscale_algorithm = normalize_upscale_algorithm(
+            self.settings.get("magnifier_upscale_algorithm", "lanczos")
         )
         self.background_color = str(self.settings["background_color"])
         self.mouse_gestures_enabled = bool(
@@ -561,6 +573,9 @@ class ViewerWindow(QMainWindow):
 
     def _update_shared_setting(self, key: str, value: object) -> None:
         self.config.set(key, value)
+
+    def _update_shared_settings(self, values: dict[str, object]) -> None:
+        self.config.apply(values)
 
     def window_state_snapshot(self) -> dict[str, object]:
         return {
@@ -884,43 +899,67 @@ class ViewerWindow(QMainWindow):
         view_menu.addAction(self.actual_size_action)
         view_menu.addSeparator()
 
-        self.smooth_scaling_action = QAction("高品質拡大縮小", self, checkable=True)
-        self.smooth_scaling_action.triggered.connect(self.set_smooth_scaling)
-        view_menu.addAction(self.smooth_scaling_action)
-
-        self.normal_resampling_menu = view_menu.addMenu(
-            "拡大縮小方式（通常表示）"
-        )
-        self.normal_resampling_actions: dict[str, QAction] = {}
-        normal_resampling_group = QActionGroup(self)
-        normal_resampling_group.setExclusive(True)
-        for mode, label in RESAMPLING_MODE_LABELS.items():
+        self.normal_resampling_menu = view_menu.addMenu("リサンプリング（通常表示）")
+        normal_downscale_menu = self.normal_resampling_menu.addMenu("縮小")
+        normal_upscale_menu = self.normal_resampling_menu.addMenu("拡大")
+        self.viewer_downscale_actions: dict[str, QAction] = {}
+        self.viewer_upscale_actions: dict[str, QAction] = {}
+        normal_downscale_group = QActionGroup(self)
+        normal_upscale_group = QActionGroup(self)
+        normal_downscale_group.setExclusive(True)
+        normal_upscale_group.setExclusive(True)
+        for algorithm, label in DOWNSCALE_ALGORITHM_LABELS.items():
             action = QAction(label, self, checkable=True)
             action.triggered.connect(
-                lambda _checked=False, selected=mode: self.set_viewer_resampling_mode(
-                    selected
+                lambda _checked=False, selected=algorithm: (
+                    self.set_viewer_downscale_algorithm(selected)
                 )
             )
-            normal_resampling_group.addAction(action)
-            self.normal_resampling_menu.addAction(action)
-            self.normal_resampling_actions[mode] = action
+            normal_downscale_group.addAction(action)
+            normal_downscale_menu.addAction(action)
+            self.viewer_downscale_actions[algorithm] = action
+        for algorithm, label in UPSCALE_ALGORITHM_LABELS.items():
+            action = QAction(label, self, checkable=True)
+            action.triggered.connect(
+                lambda _checked=False, selected=algorithm: (
+                    self.set_viewer_upscale_algorithm(selected)
+                )
+            )
+            normal_upscale_group.addAction(action)
+            normal_upscale_menu.addAction(action)
+            self.viewer_upscale_actions[algorithm] = action
 
         self.magnifier_resampling_menu = view_menu.addMenu(
-            "拡大縮小方式（拡大鏡）"
+            "リサンプリング（拡大鏡）"
         )
-        self.magnifier_resampling_actions: dict[str, QAction] = {}
-        magnifier_resampling_group = QActionGroup(self)
-        magnifier_resampling_group.setExclusive(True)
-        for mode, label in RESAMPLING_MODE_LABELS.items():
+        magnifier_downscale_menu = self.magnifier_resampling_menu.addMenu("縮小")
+        magnifier_upscale_menu = self.magnifier_resampling_menu.addMenu("拡大")
+        self.magnifier_downscale_actions: dict[str, QAction] = {}
+        self.magnifier_upscale_actions: dict[str, QAction] = {}
+        magnifier_downscale_group = QActionGroup(self)
+        magnifier_upscale_group = QActionGroup(self)
+        magnifier_downscale_group.setExclusive(True)
+        magnifier_upscale_group.setExclusive(True)
+        for algorithm, label in DOWNSCALE_ALGORITHM_LABELS.items():
             action = QAction(label, self, checkable=True)
             action.triggered.connect(
-                lambda _checked=False, selected=mode: self.set_magnifier_resampling_mode(
-                    selected
+                lambda _checked=False, selected=algorithm: (
+                    self.set_magnifier_downscale_algorithm(selected)
                 )
             )
-            magnifier_resampling_group.addAction(action)
-            self.magnifier_resampling_menu.addAction(action)
-            self.magnifier_resampling_actions[mode] = action
+            magnifier_downscale_group.addAction(action)
+            magnifier_downscale_menu.addAction(action)
+            self.magnifier_downscale_actions[algorithm] = action
+        for algorithm, label in UPSCALE_ALGORITHM_LABELS.items():
+            action = QAction(label, self, checkable=True)
+            action.triggered.connect(
+                lambda _checked=False, selected=algorithm: (
+                    self.set_magnifier_upscale_algorithm(selected)
+                )
+            )
+            magnifier_upscale_group.addAction(action)
+            magnifier_upscale_menu.addAction(action)
+            self.magnifier_upscale_actions[algorithm] = action
 
         alignment_menu = view_menu.addMenu("横位置")
         self.align_left_action = QAction("左寄せ", self, checkable=True)
@@ -1155,12 +1194,13 @@ class ViewerWindow(QMainWindow):
         self.viewer.set_gap(self.gap)
         self.viewer.set_join_spread_pages(self.join_spread_pages)
         self.viewer.set_rotation_angle(self.rotation_angle)
-        self.viewer.set_smooth_scaling(self.smooth_scaling)
         self.viewer.set_horizontal_alignment(self.horizontal_alignment)
         self.viewer.set_magnifier_options(zoom=self.magnifier_zoom, size=self.magnifier_size)
-        self.viewer.set_resampling_modes(
-            normal=self.viewer_resampling_mode,
-            magnifier=self.magnifier_resampling_mode,
+        self.viewer.set_resampling_algorithms(
+            normal_downscale=self.viewer_downscale_algorithm,
+            normal_upscale=self.viewer_upscale_algorithm,
+            magnifier_downscale=self.magnifier_downscale_algorithm,
+            magnifier_upscale=self.magnifier_upscale_algorithm,
         )
         self.viewer.set_fit_mode(self.fit_mode)
         self.viewer.set_mouse_gesture_options(
@@ -1186,18 +1226,42 @@ class ViewerWindow(QMainWindow):
     def apply_settings(self, changed: dict[str, object]) -> None:
         refresh = False
         fullscreen_policy_changed = False
-        if "viewer_resampling_mode" in changed:
-            self.viewer_resampling_mode = normalize_resampling_mode(
-                changed["viewer_resampling_mode"]
+        normal_resampling_changed = False
+        magnifier_resampling_changed = False
+        if "viewer_downscale_algorithm" in changed:
+            self.viewer_downscale_algorithm = normalize_downscale_algorithm(
+                changed["viewer_downscale_algorithm"]
             )
-            self.viewer.set_resampling_modes(normal=self.viewer_resampling_mode)
-        if "magnifier_resampling_mode" in changed:
-            self.magnifier_resampling_mode = normalize_resampling_mode(
-                changed["magnifier_resampling_mode"]
+            normal_resampling_changed = True
+        if "viewer_upscale_algorithm" in changed:
+            self.viewer_upscale_algorithm = normalize_upscale_algorithm(
+                changed["viewer_upscale_algorithm"]
             )
-            self.viewer.set_resampling_modes(
-                magnifier=self.magnifier_resampling_mode
+            normal_resampling_changed = True
+        if "magnifier_downscale_algorithm" in changed:
+            self.magnifier_downscale_algorithm = normalize_downscale_algorithm(
+                changed["magnifier_downscale_algorithm"]
             )
+            magnifier_resampling_changed = True
+        if "magnifier_upscale_algorithm" in changed:
+            self.magnifier_upscale_algorithm = normalize_upscale_algorithm(
+                changed["magnifier_upscale_algorithm"]
+            )
+            magnifier_resampling_changed = True
+        if normal_resampling_changed or magnifier_resampling_changed:
+            self.viewer.set_resampling_algorithms(
+                normal_downscale=self.viewer_downscale_algorithm,
+                normal_upscale=self.viewer_upscale_algorithm,
+                magnifier_downscale=self.magnifier_downscale_algorithm,
+                magnifier_upscale=self.magnifier_upscale_algorithm,
+            )
+            if normal_resampling_changed:
+                self.viewer.invalidate_prepared_displays()
+                if self._zip_runtime_active and self._zip_runtime is not None:
+                    # Frame artifacts are algorithm/layout specific; decoded
+                    # native-tier sources remain reusable across this switch.
+                    self._zip_runtime.invalidate_layout()
+            refresh = refresh or normal_resampling_changed
         if "magnifier_zoom" in changed:
             self.magnifier_zoom = float(changed["magnifier_zoom"])
             self.viewer.set_magnifier_options(zoom=self.magnifier_zoom)
@@ -1557,11 +1621,14 @@ class ViewerWindow(QMainWindow):
         self.fit_width_action.setChecked(self.fit_mode == "fit_width")
         self.fit_height_action.setChecked(self.fit_mode == "fit_height")
         self.actual_size_action.setChecked(self.fit_mode == "actual_size")
-        self.smooth_scaling_action.setChecked(self.smooth_scaling)
-        for mode, action in self.normal_resampling_actions.items():
-            action.setChecked(mode == self.viewer_resampling_mode)
-        for mode, action in self.magnifier_resampling_actions.items():
-            action.setChecked(mode == self.magnifier_resampling_mode)
+        for algorithm, action in self.viewer_downscale_actions.items():
+            action.setChecked(algorithm == self.viewer_downscale_algorithm)
+        for algorithm, action in self.viewer_upscale_actions.items():
+            action.setChecked(algorithm == self.viewer_upscale_algorithm)
+        for algorithm, action in self.magnifier_downscale_actions.items():
+            action.setChecked(algorithm == self.magnifier_downscale_algorithm)
+        for algorithm, action in self.magnifier_upscale_actions.items():
+            action.setChecked(algorithm == self.magnifier_upscale_algorithm)
         self.align_left_action.setChecked(self.horizontal_alignment == "left")
         self.align_center_action.setChecked(self.horizontal_alignment == "center")
         self.align_right_action.setChecked(self.horizontal_alignment == "right")
@@ -3003,8 +3070,8 @@ class ViewerWindow(QMainWindow):
             join_spread_pages=self.join_spread_pages,
             horizontal_alignment=self.horizontal_alignment,
             rotation=self.rotation_angle,
-            resampling_mode=self.viewer_resampling_mode,
-            smooth_scaling=self.smooth_scaling,
+            downscale_algorithm=self.viewer_downscale_algorithm,
+            upscale_algorithm=self.viewer_upscale_algorithm,
             split_wide_image=self.split_wide_image,
             reading_direction=self.reading_direction,
             brightness=self.brightness,
@@ -3208,9 +3275,6 @@ class ViewerWindow(QMainWindow):
         self,
         frame: RasterFrame,
     ) -> None:
-        opening_first_frame = bool(
-            self._awaiting_first_frame and self._first_frame_image_id
-        )
         presentation_token = self._presentation_token_for_request(
             frame.request_id
         )
@@ -3318,17 +3382,17 @@ class ViewerWindow(QMainWindow):
             # keeping a successful spread partner visible.
             self._cancel_interactive_open()
         elif (
-            opening_first_frame
-            and self._zip_runtime_current_frame_serial > 0
+            self._zip_runtime_current_frame_serial > 0
             and self._zip_runtime is not None
             and self.presentation_state.displayed is not None
             and self.presentation_state.displayed.token == presentation_token
         ):
-            # ZipPlaFork's one Viewer worker proceeds to its next ordered page
-            # as soon as current publication completes.  Retain NivisViewer's
-            # atomic Qt commit/paint ownership, but release one nearest unit at
-            # accepted commit so the worker does not sit idle awaiting paint.
-            self._zip_runtime.release_initial_warmup(
+            # Keep NivisViewer's atomic Qt commit/paint ownership, but let the
+            # single Viewer worker form a short, memory-admitted ready runway
+            # from every newly accepted current.  This is also what recenters
+            # the startup frontier after navigation or direction reversal;
+            # already-ready artifacts remain in the byte-budgeted stores.
+            self._zip_runtime.release_startup_runway(
                 request_id=frame.request_id,
             )
         if any(
@@ -3382,8 +3446,8 @@ class ViewerWindow(QMainWindow):
             self.join_spread_pages,
             self.horizontal_alignment,
             self.rotation_angle % 360,
-            self.viewer_resampling_mode,
-            self.smooth_scaling,
+            self.viewer_downscale_algorithm,
+            self.viewer_upscale_algorithm,
             self.split_wide_image,
             self.reading_direction,
             self.view_mode,
@@ -5573,8 +5637,8 @@ class ViewerWindow(QMainWindow):
     def _current_raster_decode_bounds(self) -> tuple[int, int] | None:
         if (
             isinstance(self.book_session.source, PdfImageSource)
-            or self.viewer_resampling_mode != "standard"
             or self.fit_mode not in {"fit_window", "fit_no_upscale"}
+            or self.viewer_downscale_algorithm == "nearest"
         ):
             return None
         dpr = max(1.0, float(self.viewer.devicePixelRatioF()))
@@ -5598,7 +5662,7 @@ class ViewerWindow(QMainWindow):
             "fit_no_upscale",
             "fit_width",
             "fit_height",
-        } or self.viewer_resampling_mode == "pixel":
+        } or self.viewer_downscale_algorithm == "nearest":
             return None
         dpr = max(1.0, float(self.viewer.devicePixelRatioF()))
         width = max(1, round(self.viewer.width() * dpr))
@@ -5610,12 +5674,11 @@ class ViewerWindow(QMainWindow):
         return width, height
 
     def _current_book_runtime_decode_headroom(self) -> float:
-        return {
-            "standard": 1.0,
-            "smooth": 1.25,
-            "moire_reduction": 2.0,
-            "high_quality": 2.0,
-        }.get(self.viewer_resampling_mode, 1.0)
+        # JPEG sources now retain the smallest native decoder tier that is at
+        # least the final physical slot.  Arbitrary algorithm-specific
+        # headroom caused a hidden decoder resize followed by a second final
+        # resize, so every final filter shares the same sufficient-source rule.
+        return 1.0
 
     def _on_viewport_changed(self) -> None:
         pending_page = self.presentation_state.frame_loading
@@ -5880,39 +5943,64 @@ class ViewerWindow(QMainWindow):
         self.fullscreen_chrome.reevaluate_visibility()
 
     def set_smooth_scaling(self, checked: bool) -> None:
-        self.smooth_scaling = checked
-        self._update_shared_setting("smooth_scaling", checked)
-        self.viewer.set_smooth_scaling(checked)
-        self._sync_actions()
-        if self._zip_runtime_active and self.model.total_pages:
-            self._refresh_view()
+        # Compatibility-only entry point.  The persisted authority is the
+        # explicit normal up/down pair; the obsolete boolean is never saved.
+        self._update_shared_settings(
+            {
+                "viewer_downscale_algorithm": (
+                    "auto" if checked else "fast"
+                ),
+                "viewer_upscale_algorithm": (
+                    "auto" if checked else "nearest"
+                ),
+            }
+        )
+
+    def set_viewer_downscale_algorithm(self, algorithm: str) -> None:
+        self._update_shared_setting(
+            "viewer_downscale_algorithm",
+            normalize_downscale_algorithm(algorithm),
+        )
+
+    def set_viewer_upscale_algorithm(self, algorithm: str) -> None:
+        self._update_shared_setting(
+            "viewer_upscale_algorithm",
+            normalize_upscale_algorithm(algorithm),
+        )
+
+    def set_magnifier_downscale_algorithm(self, algorithm: str) -> None:
+        self._update_shared_setting(
+            "magnifier_downscale_algorithm",
+            normalize_downscale_algorithm(algorithm),
+        )
+
+    def set_magnifier_upscale_algorithm(self, algorithm: str) -> None:
+        self._update_shared_setting(
+            "magnifier_upscale_algorithm",
+            normalize_upscale_algorithm(algorithm),
+        )
 
     def set_viewer_resampling_mode(self, mode: str) -> None:
-        self.viewer_resampling_mode = normalize_resampling_mode(mode)
-        self._update_shared_setting(
-            "viewer_resampling_mode",
-            self.viewer_resampling_mode,
+        policy = resampling_policy_for_legacy_mode(
+            normalize_resampling_mode(mode)
         )
-        self.viewer.set_resampling_modes(normal=self.viewer_resampling_mode)
-        self._sync_actions()
-        if self._zip_runtime_active and self.model.total_pages:
-            self._refresh_view()
-            return
-        if self.image_cache.set_raster_decode_bounds(
-            self._current_raster_decode_bounds()
-        ) and self.model.total_pages:
-            self._refresh_view()
+        self._update_shared_settings(
+            {
+                "viewer_downscale_algorithm": policy.downscale_algorithm,
+                "viewer_upscale_algorithm": policy.upscale_algorithm,
+            }
+        )
 
     def set_magnifier_resampling_mode(self, mode: str) -> None:
-        self.magnifier_resampling_mode = normalize_resampling_mode(mode)
-        self._update_shared_setting(
-            "magnifier_resampling_mode",
-            self.magnifier_resampling_mode,
+        policy = resampling_policy_for_legacy_mode(
+            normalize_resampling_mode(mode)
         )
-        self.viewer.set_resampling_modes(
-            magnifier=self.magnifier_resampling_mode
+        self._update_shared_settings(
+            {
+                "magnifier_downscale_algorithm": policy.downscale_algorithm,
+                "magnifier_upscale_algorithm": policy.upscale_algorithm,
+            }
         )
-        self._sync_actions()
 
     def set_horizontal_alignment(self, alignment: str) -> None:
         self.horizontal_alignment = alignment
