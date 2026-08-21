@@ -3,7 +3,7 @@
 The benchmark drives the production ``RasterBookRuntime`` contract directly:
 one current page is requested, its completed QPixmap is accepted on the GUI
 thread, and then painted into an offscreen QImage.  ``--warmup-gate ab``
-compares the legacy paint-gated warm-up with the production commit-neighbor
+compares the legacy paint-gated warm-up with the production startup-runway
 fast path.  ``--commit-to-paint-delay-ms`` may add a deterministic interval
 between those two boundaries without creating an application window or native
 input.
@@ -722,14 +722,14 @@ def _run_worker_case(args: argparse.Namespace) -> dict[str, object]:
                 runtime.cache_debug_values()["ready_page_count"]
             )
             observe_ready(first_commit_at)
-            commit_warmup_release_accepted: bool | None = None
+            startup_runway_release_accepted: bool | None = None
             if warmup_gate == "commit":
-                commit_warmup_release_accepted = runtime.release_initial_warmup(
+                startup_runway_release_accepted = runtime.release_startup_runway(
                     request_id=1
                 )
-                if not commit_warmup_release_accepted:
+                if not startup_runway_release_accepted:
                     raise RuntimeError(
-                        "runtime rejected accepted-commit warm-up release"
+                        "runtime rejected accepted-commit startup runway"
                     )
             paint_target_at = first_commit_at + (
                 max(0.0, float(args.commit_to_paint_delay_ms)) / 1000.0
@@ -913,8 +913,8 @@ def _run_worker_case(args: argparse.Namespace) -> dict[str, object]:
                     "configured_commit_to_paint_delay_ms": float(
                         args.commit_to_paint_delay_ms
                     ),
-                    "commit_neighbor_release_accepted": (
-                        commit_warmup_release_accepted
+                    "startup_runway_release_accepted": (
+                        startup_runway_release_accepted
                     ),
                     "paint_release_accepted": True,
                     "ready_pages_at_commit": ready_pages_at_commit,
@@ -1088,8 +1088,9 @@ def _parse_args() -> argparse.Namespace:
         choices=("paint", "commit", "ab"),
         default="paint",
         help=(
-            "paint keeps the legacy gate, commit releases one neighbor after "
-            "accepted frame completion, and ab runs both as isolated workers"
+            "paint keeps the legacy gate, commit releases the complete-unit "
+            "startup runway after accepted frame completion, and ab runs "
+            "both as isolated workers"
         ),
     )
     parser.add_argument(
@@ -1210,9 +1211,9 @@ def main() -> int:
                 "ViewerPresentationState"
             ),
             "warmup_ab": (
-                "paint leaves warm-up blocked until paint; commit calls "
-                "release_initial_warmup at accepted completion so exactly one "
-                "nearest unit may run before the same paint boundary"
+                "commit calls release_startup_runway at accepted completion; "
+                "the complete-unit priority runway flows into memory-admitted "
+                "book-wide population while paint remains an ownership ack"
             ),
             "read_operations": (
                 "application-visible file/archive payload opens plus uncached "

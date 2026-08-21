@@ -158,29 +158,44 @@ def test_display_pixmap_materialization_runs_on_gui_thread(
     widget.close()
 
 
-def test_standard_smooth_toggle_rebuilds_cache_with_distinct_key(
+def test_explicit_algorithm_change_rebuilds_cache_with_distinct_key(
     qapp: QApplication,
 ) -> None:
     widget = ViewerWidget()
     widget.resize(800, 600)
+    widget.set_resampling_algorithms(
+        normal_downscale="auto",
+        normal_upscale="auto",
+    )
     widget.set_pages(
         _single(0),
         [_page(0, width=1600, height=1000)],
     )
     assert widget.wait_for_rendering()
     qapp.processEvents()
-    smooth_keys = set(widget._render_cache)
-    assert len(smooth_keys) == 1
-    assert all(key.smooth_transform for key in smooth_keys)
+    automatic_keys = set(widget._render_cache)
+    assert len(automatic_keys) == 1
+    assert all(
+        key.downscale_algorithm == "auto"
+        and key.upscale_algorithm == "auto"
+        for key in automatic_keys
+    )
 
-    widget.set_smooth_scaling(False)
+    widget.set_resampling_algorithms(
+        normal_downscale="fast",
+        normal_upscale="nearest",
+    )
     assert widget.wait_for_rendering()
     qapp.processEvents()
     fast_keys = set(widget._render_cache)
 
     assert len(fast_keys) == 1
-    assert all(not key.smooth_transform for key in fast_keys)
-    assert fast_keys.isdisjoint(smooth_keys)
+    assert all(
+        key.downscale_algorithm == "fast"
+        and key.upscale_algorithm == "nearest"
+        for key in fast_keys
+    )
+    assert fast_keys.isdisjoint(automatic_keys)
     widget.close()
 
 
@@ -912,7 +927,7 @@ def test_byte_limit_does_not_cancel_far_request_used_by_pending_display(
     widget.close()
 
 
-def test_standard_manual_zoom_caps_artifact_to_rotated_split_source_size(
+def test_standard_manual_zoom_targets_exact_rotated_split_physical_size(
     qapp: QApplication,
 ) -> None:
     widget = ViewerWidget()
@@ -934,13 +949,13 @@ def test_standard_manual_zoom_caps_artifact_to_rotated_split_source_size(
     )
 
     assert key is not None
-    assert (key.target_width, key.target_height) == (500, 320)
-    assert key.source_sized
+    assert (key.target_width, key.target_height) == (4000, 5000)
+    assert not key.source_sized
     assert key.layout_generation == 0
     widget.close()
 
 
-def test_standard_source_sized_artifact_is_reused_across_zoom_steps(
+def test_standard_manual_zoom_keeps_old_frame_while_exact_artifact_rebuilds(
     qapp: QApplication,
     monkeypatch,
 ) -> None:
@@ -952,10 +967,9 @@ def test_standard_source_sized_artifact_is_reused_across_zoom_steps(
     widget.set_pages(_single(0), [_page(0)])
     assert widget.wait_for_rendering()
     qapp.processEvents()
-    source_keys = {
-        key for key in widget._render_cache if key.source_sized
-    }
-    assert len(source_keys) == 1
+    original_keys = set(widget._render_cache)
+    assert original_keys
+    assert all(not key.source_sized for key in original_keys)
     queued: list[ViewerRenderKey] = []
     monkeypatch.setattr(
         widget,
@@ -965,8 +979,9 @@ def test_standard_source_sized_artifact_is_reused_across_zoom_steps(
 
     widget.set_manual_zoom(3.0)
 
-    assert queued == []
-    assert source_keys.issubset(widget._render_cache)
+    assert len(queued) == 1
+    assert not queued[0].source_sized
+    assert original_keys.issubset(widget._render_cache)
     assert widget.displayed_page_indexes == (0,)
     widget.close()
 
@@ -1308,8 +1323,8 @@ def test_window_scheduler_reprioritizes_on_direction_reversal(
     config = ConfigManager(tmp_path / "config.json")
     config.load()
     window = ViewerWindow(config_manager=config)
-    window.viewer_resampling_mode = "pixel"
-    window.viewer.set_resampling_modes(normal="pixel")
+    window.set_viewer_downscale_algorithm("nearest")
+    window.set_viewer_upscale_algorithm("nearest")
     window.model.image_ids = [f"page-{index}.png" for index in range(6)]
     window.model.update_options(view_mode="single")
     window.model.current_index = 2
@@ -1699,12 +1714,16 @@ def test_shared_coordinator_shutdown_waits_only_widget_owned_render_tasks(
     widget.close()
 
 
-@pytest.mark.parametrize("mode", ("standard", "pixel"))
+@pytest.mark.parametrize(
+    ("downscale_algorithm", "upscale_algorithm"),
+    (("auto", "auto"), ("nearest", "nearest")),
+)
 def test_custom_prefetch_counts_reach_prepared_scheduler_in_both_directions(
     tmp_path,
     qapp: QApplication,
     monkeypatch,
-    mode: str,
+    downscale_algorithm: str,
+    upscale_algorithm: str,
 ) -> None:
     config = ConfigManager(tmp_path / "config.json")
     config.load()
@@ -1717,8 +1736,8 @@ def test_custom_prefetch_counts_reach_prepared_scheduler_in_both_directions(
     )
     window = ViewerWindow(config_manager=config)
     try:
-        window.viewer_resampling_mode = mode
-        window.viewer.set_resampling_modes(normal=mode)
+        window.set_viewer_downscale_algorithm(downscale_algorithm)
+        window.set_viewer_upscale_algorithm(upscale_algorithm)
         window.model.image_ids = [
             f"page-{index}.png" for index in range(20)
         ]
@@ -1916,8 +1935,8 @@ def test_repeated_split_prepared_plan_reuses_tracked_crop(
     config.load()
     window = ViewerWindow(config_manager=config)
     try:
-        window.viewer_resampling_mode = "pixel"
-        window.viewer.set_resampling_modes(normal="pixel")
+        window.set_viewer_downscale_algorithm("nearest")
+        window.set_viewer_upscale_algorithm("nearest")
         window.split_wide_image = True
         window.model.image_ids = ["wide.png"]
         window.model.update_options(view_mode="single")
@@ -1979,8 +1998,8 @@ def test_window_applies_ready_page_after_raw_cache_eviction(
     config.load()
     window = ViewerWindow(config_manager=config)
     try:
-        window.viewer_resampling_mode = "pixel"
-        window.viewer.set_resampling_modes(normal="pixel")
+        window.set_viewer_downscale_algorithm("nearest")
+        window.set_viewer_upscale_algorithm("nearest")
         window.model.image_ids = [
             f"page-{index}.png" for index in range(6)
         ]
@@ -2204,8 +2223,8 @@ def test_window_scheduler_prefetches_next_spread_as_one_unit_after_commit(
     config = ConfigManager(tmp_path / f"{reading_direction}.json")
     config.load()
     window = ViewerWindow(config_manager=config)
-    window.viewer_resampling_mode = "pixel"
-    window.viewer.set_resampling_modes(normal="pixel")
+    window.set_viewer_downscale_algorithm("nearest")
+    window.set_viewer_upscale_algorithm("nearest")
     window.model.image_ids = [f"page-{index}.png" for index in range(8)]
     window.model.update_options(
         view_mode="spread",

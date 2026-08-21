@@ -909,7 +909,8 @@ def _viewer_case(
         {
             "view_mode": "single",
             "single_first_page": False,
-            "viewer_resampling_mode": "standard",
+            "viewer_downscale_algorithm": "auto",
+            "viewer_upscale_algorithm": "auto",
             "fit_mode": "fit_window",
             "viewer_memory_mode": (
                 "minimal" if int(cache_mib) == 128 else str(int(cache_mib))

@@ -88,44 +88,77 @@ def test_sliding_current_skips_overlapping_topology_units() -> None:
     assert sliding.rank_for_page(2) == 0
 
 
-def test_planner_releases_one_commit_neighbor_then_waits_for_paint() -> None:
-    warmup = RasterWarmupPlanner(plan(5, 0, 1))
+def test_planner_builds_startup_runway_then_continues_book_wide() -> None:
+    warmup = RasterWarmupPlanner(plan(8, 2, 1))
+    ready: set[tuple[int, ...]] = set()
     assert warmup.next_candidate(
         identity_of=lambda unit: unit.identity,
-        is_ready=lambda _unit: False,
+        is_ready=lambda unit: unit.identity in ready,
         is_terminal_failure=lambda _unit: False,
     ) is None
-    assert warmup.stop_reason is WarmupStopReason.WAITING_FOR_PAINT
+    assert warmup.stop_reason is WarmupStopReason.WAITING_FOR_COMMIT
 
-    warmup.release_after_commit(unit_limit=1)
+    warmup.release_startup_runway(preferred_units=4, opposite_units=1)
+    observed: list[tuple[int, ...]] = []
     first = warmup.next_candidate(
         identity_of=lambda unit: unit.identity,
-        is_ready=lambda _unit: False,
+        is_ready=lambda unit: unit.identity in ready,
         is_terminal_failure=lambda _unit: False,
     )
-    assert first is not None and first.pages == (1,)
-    warmup.mark_capacity_skip(first.identity)
-    assert warmup.next_candidate(
-        identity_of=lambda unit: unit.identity,
-        is_ready=lambda _unit: False,
-        is_terminal_failure=lambda _unit: False,
-    ) is None
-    assert warmup.stop_reason is WarmupStopReason.WAITING_FOR_PAINT
-
+    assert first is not None
+    observed.append(first.pages)
+    ready.add(first.identity)
+    # A real paint normally arrives while the runway worker is still active.
+    # It acknowledges ownership but must not skip the remaining priority
+    # prefix in favor of the ordinary alternating book-wide order.
     warmup.release_after_paint()
-    remaining: list[tuple[int, ...]] = []
     while True:
         candidate = warmup.next_candidate(
             identity_of=lambda unit: unit.identity,
-            is_ready=lambda _unit: False,
+            is_ready=lambda unit: unit.identity in ready,
             is_terminal_failure=lambda _unit: False,
         )
         if candidate is None:
             break
-        remaining.append(candidate.pages)
-    assert remaining == [(2,), (3,), (4,)]
-    assert warmup.stop_reason is WarmupStopReason.COMPLETE_WITH_SKIPS
+        observed.append(candidate.pages)
+        ready.add(candidate.identity)
+    # Four units in the reading direction plus one reverse unit are the
+    # priority prefix.  The same cursor then continues through the two
+    # remaining book-wide units without another paint release.
+    assert observed == [(3,), (1,), (4,), (5,), (6,), (0,), (7,)]
+    assert warmup.startup_target_count == 5
+    assert warmup.stop_reason is WarmupStopReason.COMPLETE
     assert warmup.unprocessed_hint == 0
+
+
+def test_startup_runway_counts_complete_spreads_not_source_pages() -> None:
+    spread_topology = RasterBookTopology(
+        (
+            Unit((0, 1)),
+            Unit((2, 3)),
+            Unit((4, 5)),
+            Unit((6, 7)),
+            Unit((8, 9)),
+        ),
+        identity_of=lambda unit: unit.identity,
+        page_indexes_of=lambda unit: unit.pages,
+        page_count=10,
+    )
+    spread_plan = RasterWarmupPlan(
+        spread_topology,
+        current=Unit((2, 3)),
+        identity_of=lambda unit: unit.identity,
+        page_indexes_of=lambda unit: unit.pages,
+        direction=1,
+        background_enabled=True,
+    )
+    assert [
+        unit.pages
+        for unit in spread_plan.startup_runway_units(
+            preferred_units=2,
+            opposite_units=1,
+        )
+    ] == [(4, 5), (0, 1), (6, 7)]
 
 
 def test_capacity_reset_reconsiders_skipped_units_without_rebuilding_topology() -> None:

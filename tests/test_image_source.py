@@ -371,7 +371,7 @@ def test_zip_compatible_jpeg_uses_one_qbytearray_payload(
     try:
         decoded = source.open_compatible_jpeg_at_most(
             "ページ/001.jpg",
-            (600, None),
+            (500, None),
         )
         entry_size = source._zip.NameToInfo["ページ/001.jpg"].file_size
     finally:
@@ -383,7 +383,13 @@ def test_zip_compatible_jpeg_uses_one_qbytearray_payload(
     assert decoded.bytes_read == entry_size
     assert decoded.read_calls >= 2
     assert decoded.original_size == (1200, 800)
+    # The compatible source is the smallest native JPEG tier still above the
+    # 500px physical target, not an arbitrary decoder-resized final frame.
     assert (decoded.qimage.width(), decoded.qimage.height()) == (600, 400)
+    assert source.estimate_compatible_jpeg_size(
+        decoded.original_size,
+        (500, None),
+    ) == (600, 400)
     assert entry_open_calls == 1
 
 

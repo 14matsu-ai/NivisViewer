@@ -312,6 +312,11 @@ def _read_jpeg_qbytearray_at_most(
     maximum_size: JpegMaximumSize,
 ) -> tuple[QImage, tuple[int, int]] | None:
     """Decode one seekable Qt byte buffer without Python QIODevice callbacks."""
+    # Reject a plainly invalid entry before entering Qt's JPEG plugin.  Besides
+    # avoiding native work, this prevents a first-ever worker-side malformed
+    # JPEG probe from hanging plugin error initialization on Windows/offscreen.
+    if data.size() < 3 or not data.startsWith(QByteArray(b"\xff\xd8\xff")):
+        return None
     buffer = QBuffer(data)
     if not buffer.open(QIODevice.OpenModeFlag.ReadOnly):
         return None
@@ -333,7 +338,11 @@ def _read_jpeg_qbytearray_at_most(
             if swaps_axes
             else (raw_width, raw_height)
         )
-        logical_target = jpeg_decode_target_size(logical_size, maximum_size)
+        # Retain the smallest decoder-native tier that is still large enough
+        # for the final physical frame.  The Viewer then owns one deliberate
+        # exact resample with the configured algorithm; an arbitrary decoder
+        # resize here would create a hidden first quality pass.
+        logical_target = jpeg_native_reduction_size(logical_size, maximum_size)
         raw_target = (
             (logical_target[1], logical_target[0])
             if swaps_axes
@@ -989,6 +998,16 @@ class ZipImageSource(ImageSource):
                 cancelled,
             )
             self._raise_if_cancelled(cancelled)
+            if payload.size() < 3 or not payload.startsWith(
+                QByteArray(b"\xff\xd8\xff")
+            ):
+                # A declared JPEG with no JPEG signature is terminal input,
+                # not a reason to reopen/materialize the same ZIP entry through
+                # every fallback decoder.  Failing here also keeps first-use
+                # plugin initialization away from a malformed worker payload.
+                raise ImageSourceError(
+                    f"書庫内のJPEGが破損しています: {image_id}"
+                )
             decoded = _read_jpeg_qbytearray_at_most(
                 payload,
                 maximum_size,
@@ -1012,6 +1031,13 @@ class ZipImageSource(ImageSource):
             return None
         finally:
             self._finish_request(image_id, cancelled)
+
+    def estimate_compatible_jpeg_size(
+        self,
+        logical_size: tuple[int, int],
+        maximum_size: JpegMaximumSize,
+    ) -> tuple[int, int]:
+        return jpeg_native_reduction_size(logical_size, maximum_size)
 
     def probe_image_size(self, image_id: str) -> tuple[int, int] | None:
         """Probe one ZIP image header without allocating its pixel raster."""

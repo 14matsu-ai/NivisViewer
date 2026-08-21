@@ -17,7 +17,7 @@ complete source/method/license map is in docs/ZIPPLAFORK_COMPARISON.md.
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from heapq import heapify, heappop, heappush
 from math import ceil, isfinite
 from pathlib import Path
@@ -44,9 +44,12 @@ from .raster_warmup_planner import (
 from .thumbnail_render import pil_to_qimage
 from .viewer_render import (
     ViewerRenderKey,
+    normalize_downscale_algorithm,
     normalize_resampling_mode,
+    normalize_upscale_algorithm,
     qimage_to_pillow,
     render_qimage,
+    resampling_policy_for_legacy_mode,
 )
 from .viewer_widget import calculate_spread_layout
 
@@ -57,7 +60,30 @@ _FIT_PREVIEW_MODES = frozenset(
     {"fit_window", "fit_no_upscale", "fit_width", "fit_height"}
 )
 _UNKNOWN_JPEG_ASPECT_LIMIT = 4
+_MAX_EXACT_RENDER_PIXELS = 64 * 1024 * 1024
 DecoderMaximumSize = tuple[int | None, int | None]
+
+
+def _bounded_physical_render_size(
+    render_spec: "ZipRasterRenderSpec",
+    target_size: tuple[int, int],
+) -> tuple[int, int]:
+    """Keep ordinary frames exact while bounding pathological manual zoom.
+
+    Fit/actual-size frames always retain their exact physical dimensions.
+    Manual zoom can request a multi-gigabyte monolithic artifact; until the
+    Viewer gains tiled zoom rendering, cap only that exceptional artifact and
+    let QPainter enlarge it.  This safety valve is unrelated to cache page
+    count and does not affect normal-display quality.
+    """
+
+    width = max(1, int(target_size[0]))
+    height = max(1, int(target_size[1]))
+    pixels = width * height
+    if render_spec.fit_mode != "manual_zoom" or pixels <= _MAX_EXACT_RENDER_PIXELS:
+        return width, height
+    scale = (_MAX_EXACT_RENDER_PIXELS / pixels) ** 0.5
+    return max(1, round(width * scale)), max(1, round(height * scale))
 
 
 @dataclass(frozen=True)
@@ -115,8 +141,12 @@ class ZipRasterRenderSpec:
     join_spread_pages: bool = False
     horizontal_alignment: str = "center"
     rotation: int = 0
-    resampling_mode: str = "standard"
-    smooth_scaling: bool = True
+    # The combined mode and smooth flag are constructor-only compatibility
+    # inputs.  Cache equality is owned by the normalized algorithms below.
+    resampling_mode: str = field(default="standard", compare=False)
+    smooth_scaling: bool = field(default=True, compare=False)
+    downscale_algorithm: str | None = None
+    upscale_algorithm: str | None = None
     split_wide_image: bool = False
     reading_direction: str = "ltr"
     brightness: float = 1.0
@@ -173,6 +203,29 @@ class ZipRasterRenderSpec:
             normalize_resampling_mode(self.resampling_mode),
         )
         object.__setattr__(self, "smooth_scaling", bool(self.smooth_scaling))
+        legacy_policy = resampling_policy_for_legacy_mode(self.resampling_mode)
+        legacy_downscale = legacy_policy.downscale_algorithm
+        legacy_upscale = legacy_policy.upscale_algorithm
+        if self.resampling_mode == "standard" and not self.smooth_scaling:
+            legacy_downscale, legacy_upscale = "fast", "nearest"
+        object.__setattr__(
+            self,
+            "downscale_algorithm",
+            normalize_downscale_algorithm(
+                self.downscale_algorithm
+                if self.downscale_algorithm is not None
+                else legacy_downscale
+            ),
+        )
+        object.__setattr__(
+            self,
+            "upscale_algorithm",
+            normalize_upscale_algorithm(
+                self.upscale_algorithm
+                if self.upscale_algorithm is not None
+                else legacy_upscale
+            ),
+        )
         object.__setattr__(
             self,
             "split_wide_image",
@@ -226,6 +279,23 @@ def _size_within_bounds(
         scales.append(max(1, int(maximum_size[1])) / height)
     scale = min(scales)
     return max(1, round(width * scale)), max(1, round(height * scale))
+
+
+def _qimage_satisfies_source_requirement(
+    qimage: QImage,
+    original_size: tuple[int, int],
+    maximum_size: DecoderMaximumSize | None,
+) -> bool:
+    if maximum_size is None:
+        return (qimage.width(), qimage.height()) == original_size
+    required_width, required_height = _size_within_bounds(
+        original_size,
+        maximum_size,
+    )
+    return (
+        qimage.width() >= required_width
+        and qimage.height() >= required_height
+    )
 
 
 def _add_decoder_headroom(
@@ -307,20 +377,10 @@ def _display_frame_bytes_for_sizes(
     for (_logical_size, source_size), rect in zip(expanded, layout.rects):
         target_width = max(1, round(rect.width() * dpr))
         target_height = max(1, round(rect.height() * dpr))
-        if source_size is not None:
-            source_width, source_height = source_size
-            if rotation in {90, 270}:
-                source_width, source_height = source_height, source_width
-            if render_spec.resampling_mode == "standard" and (
-                target_width > source_width or target_height > source_height
-            ):
-                scale = min(
-                    1.0,
-                    target_width / max(1, source_width),
-                    target_height / max(1, source_height),
-                )
-                target_width = max(1, round(source_width * scale))
-                target_height = max(1, round(source_height * scale))
+        target_width, target_height = _bounded_physical_render_size(
+            render_spec,
+            (target_width, target_height),
+        )
         frame_bytes += target_width * target_height * 4
     return max(1, frame_bytes)
 
@@ -525,7 +585,7 @@ class ZipRasterRuntimeMetrics:
     source_cache_hits: int = 0
     source_cache_misses: int = 0
     source_cache_evictions: int = 0
-    commit_warmup_releases: int = 0
+    startup_runway_releases: int = 0
     prefetch_admission_stops: int = 0
     oversized_prefetch_skips: int = 0
 
@@ -1194,17 +1254,12 @@ class _ZipRasterSourceStore:
         source: _CachedSource,
         maximum_size: DecoderMaximumSize | None,
     ) -> bool:
-        if maximum_size is None:
-            return not source.source_is_preview
         if not source.source_is_preview:
             return True
-        required_width, required_height = _size_within_bounds(
+        return _qimage_satisfies_source_requirement(
+            source.qimage,
             source.original_size,
             maximum_size,
-        )
-        return (
-            source.qimage.width() >= required_width
-            and source.qimage.height() >= required_height
         )
 
     @staticmethod
@@ -1700,23 +1755,10 @@ class _ZipRasterUnitJob(QRunnable):
                 1,
                 round(target_rect.height() * self.key.render_spec.device_pixel_ratio),
             )
-            source_width, source_height = (
-                (split_range[2], split_range[3])
-                if split_range is not None
-                else (page.qimage.width(), page.qimage.height())
+            target_width, target_height = _bounded_physical_render_size(
+                self.key.render_spec,
+                (target_width, target_height),
             )
-            if rotation in {90, 270}:
-                source_width, source_height = source_height, source_width
-            if self.key.render_spec.resampling_mode == "standard" and (
-                target_width > source_width or target_height > source_height
-            ):
-                scale = min(
-                    1.0,
-                    target_width / max(1, source_width),
-                    target_height / max(1, source_height),
-                )
-                target_width = max(1, round(source_width * scale))
-                target_height = max(1, round(source_height * scale))
             render_key = ViewerRenderKey(
                 image_id=image_id,
                 source_cache_key=int(page.qimage.cacheKey()),
@@ -1729,6 +1771,10 @@ class _ZipRasterUnitJob(QRunnable):
                 ),
                 split_range=split_range,
                 smooth_transform=self.key.render_spec.smooth_scaling,
+                downscale_algorithm=(
+                    self.key.render_spec.downscale_algorithm
+                ),
+                upscale_algorithm=self.key.render_spec.upscale_algorithm,
             )
             try:
                 display_qimage, _resized = render_qimage(page.qimage, render_key)
@@ -1780,26 +1826,43 @@ class _ZipRasterUnitJob(QRunnable):
                     page.known_size or (360, 520),
                     False,
                 )
-            if (
-                decoder_maximum is not None
-                and suffix in _JPEG_SUFFIXES
-            ):
+            if suffix in _JPEG_SUFFIXES:
+                # Keep JPEGs on the same bounded/native decoder path even when
+                # the caller requests the full source.  Besides avoiding a
+                # second payload materialization through Pillow, this lets an
+                # archive source reject a malformed declared-JPEG before the
+                # generic fallback reopens the same entry.
                 compatible = self.source.open_compatible_jpeg_at_most(
                     page.image_id,
-                    decoder_maximum,
+                    decoder_maximum or (None, None),
                 )
                 decoded = None
                 if compatible is not None:
                     qimage = compatible.qimage
                     original_size = compatible.original_size
-                else:
+                    if not _qimage_satisfies_source_requirement(
+                        qimage,
+                        original_size,
+                        decoder_maximum,
+                    ):
+                        # A decoder backend is allowed to ignore or coarsen a
+                        # scaled-size hint.  Never admit that undersized fresh
+                        # result: fall through to the full-source path once so
+                        # normal display cannot silently upscale a preview.
+                        qimage = None
+                        original_size = None
+                elif decoder_maximum is not None:
                     decoded = self.source.open_qimage_at_most(
                         page.image_id,
                         decoder_maximum,
                     )
                 if decoded is not None:
                     qimage, original_size = decoded
-                if qimage is not None and original_size is not None:
+                if (
+                    decoder_maximum is not None
+                    and qimage is not None
+                    and original_size is not None
+                ):
                     qimage = self._contain_preview_source(
                         qimage,
                         original_size,
@@ -2014,13 +2077,10 @@ class _ZipRasterUnitJob(QRunnable):
             maximum_size,
         )
         actual = (qimage.width(), qimage.height())
-        if actual == original_size and actual != (target_width, target_height):
-            must_reduce = True
-        else:
-            must_reduce = (
-                actual[0] > target_width * 2
-                or actual[1] > target_height * 2
-            )
+        must_reduce = (
+            actual[0] > target_width * 2
+            or actual[1] > target_height * 2
+        )
         if not must_reduce:
             return qimage
         return qimage.scaled(
@@ -2181,7 +2241,7 @@ class RasterBookRuntime(QObject):
             ZipRasterDisplayUnit,
             tuple[tuple[int, str], ...],
         ] | None = None
-        self._commit_warmup_released_request_id: int | None = None
+        self._startup_runway_released_request_id: int | None = None
         self._prefetch_released_request_id: int | None = None
         self._prefetch_admission_stopped_request_id: int | None = None
         self._dispatch_suspended = False
@@ -2317,11 +2377,14 @@ class RasterBookRuntime(QObject):
             "capacity_skip_count": (
                 len(planner.capacity_skips) if planner is not None else 0
             ),
+            "startup_runway_target_units": (
+                planner.startup_target_count if planner is not None else 0
+            ),
             "cache_hits": self._metrics.cache_hits,
             "cache_misses": self._metrics.cache_misses,
             "jobs_submitted": self._metrics.jobs_submitted,
-            "commit_warmup_releases": (
-                self._metrics.commit_warmup_releases
+            "startup_runway_releases": (
+                self._metrics.startup_runway_releases
             ),
             "cancel_requests": self._metrics.cancel_requests,
             "stale_results": self._metrics.stale_results,
@@ -2540,7 +2603,7 @@ class RasterBookRuntime(QObject):
         self._current_request = request
         self._current_key = current_key
         self._warmup_planner = RasterWarmupPlanner(request.warmup_plan)
-        self._commit_warmup_released_request_id = None
+        self._startup_runway_released_request_id = None
         self._prefetch_released_request_id = None
         self._prefetch_admission_stopped_request_id = None
         self._dispatch_suspended = bool(suspend_dispatch)
@@ -2575,24 +2638,42 @@ class RasterBookRuntime(QObject):
                 not suspend_dispatch
                 and not active_cancelled
                 and current_key in self._frame_store
-                and self._background_rank(active.key) in {1, 2}
+                and active.key == self._first_missing_startup_key(request)
             ):
-                # Preserve a background decode only when it is still the next
-                # missing unit in the replacement order.  A full-book warm-up
-                # may keep the old key somewhere far in the order; adopting it
-                # merely because it remains present would delay the new
-                # current-side frontier after navigation or reversal.
+                # Preserve a background decode only when it is the exact first
+                # missing complete unit in the replacement runway.  Merely
+                # remaining rank 1/2 is insufficient after direction reversal:
+                # an obsolete reverse-side job must not delay the new frontier.
                 active.adopt_request(request.request_id)
             else:
                 self._cancel_active_job()
 
-    def release_initial_warmup(self, *, request_id: int) -> bool:
-        """Start one nearest display-ready unit after accepted first commit.
+    def _first_missing_startup_key(
+        self,
+        request: ZipRasterRequest,
+    ) -> _UnitKey | None:
+        for unit in request.warmup_plan.startup_runway_units(
+            preferred_units=4,
+            opposite_units=1,
+        ):
+            key = self._key_for(unit, request.render_spec)
+            if key in self._frame_store or key in self._failed_prefetch:
+                continue
+            return key
+        return None
 
-        This is the narrow book-open fast path.  It keeps the existing paint
-        acknowledgement as the ownership boundary for the displayed frame and
-        as the gate for PageList/noncritical work, while avoiding an otherwise
-        idle Viewer worker between atomic commit and physical paint.
+    def release_startup_runway(self, *, request_id: int) -> bool:
+        """Build a memory-admitted ready runway after an accepted commit.
+
+        The desired four reading-direction units plus one reverse unit are
+        complete display units, not a retention cap.  ``_drive`` still admits
+        every unit against the combined source+frame byte policy, and the
+        single active Viewer worker continues from one completion to the next
+        without waiting for a physical paint acknowledgement between units.
+        Once that runway is exhausted the same planner continues into
+        book-wide population without another scheduler gate.  Paint remains
+        only the ownership boundary for non-critical UI projection and
+        retirement cleanup.
         """
 
         request = self._current_request
@@ -2603,13 +2684,16 @@ class RasterBookRuntime(QObject):
             or self._current_key not in self._frame_store
         ):
             return False
-        if self._commit_warmup_released_request_id == request.request_id:
+        if self._startup_runway_released_request_id == request.request_id:
             return True
-        self._commit_warmup_released_request_id = request.request_id
-        self._bump("commit_warmup_releases")
+        self._startup_runway_released_request_id = request.request_id
+        self._bump("startup_runway_releases")
         planner = self._warmup_planner
         if planner is not None:
-            planner.release_after_commit(unit_limit=1)
+            planner.release_startup_runway(
+                preferred_units=4,
+                opposite_units=1,
+            )
         self._drive()
         return True
 
@@ -2653,7 +2737,7 @@ class RasterBookRuntime(QObject):
         self._current_request = None
         self._current_key = None
         self._warmup_planner = None
-        self._commit_warmup_released_request_id = None
+        self._startup_runway_released_request_id = None
         self._prefetch_released_request_id = None
         self._prefetch_admission_stopped_request_id = None
         self._dispatch_suspended = False
@@ -2732,7 +2816,7 @@ class RasterBookRuntime(QObject):
             self._submit(self._current_key, ImageWorkPriority.VIEWER_CURRENT)
             return
         if (
-            self._commit_warmup_released_request_id != request.request_id
+            self._startup_runway_released_request_id != request.request_id
             and self._prefetch_released_request_id != request.request_id
         ):
             return

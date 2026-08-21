@@ -104,7 +104,7 @@ def _wait_until(
     assert predicate()
 
 
-def test_folder_runtime_orders_one_lane_bypasses_ready_hits_and_skips_single_prefetch(
+def test_folder_runtime_builds_startup_runway_bypasses_hits_and_skips_single_prefetch(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
@@ -128,7 +128,7 @@ def test_folder_runtime_orders_one_lane_bypasses_ready_hits_and_skips_single_pre
                 with self.guard:
                     self.active -= 1
 
-    source = CountingFolderSource(_write_folder(tmp_path / "book", pages=3))
+    source = CountingFolderSource(_write_folder(tmp_path / "book", pages=7))
     runtime = FolderRasterBookRuntime(source, 1)
     frames: list[RasterFrame] = []
     runtime.frameReady.connect(frames.append)
@@ -139,6 +139,10 @@ def test_folder_runtime_orders_one_lane_bypasses_ready_hits_and_skips_single_pre
         current,
         _unit(source, 2),
         _unit(source, 0),
+        _unit(source, 3),
+        _unit(source, 4),
+        _unit(source, 5),
+        _unit(source, 6),
         direction=1,
     )
     try:
@@ -147,13 +151,36 @@ def test_folder_runtime_orders_one_lane_bypasses_ready_hits_and_skips_single_pre
         assert source.order == ["1.png"]
         assert runtime.metrics.jobs_submitted == 1
 
-        assert runtime.release_prefetch(request_id=1)
+        assert runtime.release_startup_runway(request_id=1)
         _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
-        assert source.order == ["1.png", "2.png", "0.png"]
+        assert source.order == [
+            "1.png",
+            "2.png",
+            "0.png",
+            "3.png",
+            "4.png",
+            "5.png",
+            "6.png",
+        ]
+        assert runtime.metrics.jobs_submitted == 7
+        assert runtime.metrics.startup_runway_releases == 1
         assert source.max_active == 1
 
+        # Paint remains an ownership acknowledgement, not a decode gate.
+        jobs_before_paint = runtime.metrics.jobs_submitted
+        assert runtime.release_prefetch(request_id=1)
+        qapp.processEvents()
+        assert runtime.metrics.jobs_submitted == jobs_before_paint
+
         jobs_before_hit = runtime.metrics.jobs_submitted
-        assert runtime.request(_request(2, _unit(source, 2), _unit(source, 2)))
+        assert runtime.request(
+            _request(
+                2,
+                _unit(source, 2),
+                *(_unit(source, index) for index in range(7)),
+                direction=1,
+            )
+        )
         qapp.processEvents()
         assert frames[-1].request_id == 2
         assert frames[-1].cache_hit
@@ -169,6 +196,7 @@ def test_folder_runtime_orders_one_lane_bypasses_ready_hits_and_skips_single_pre
         only = _unit(single, 0)
         assert single_runtime.request(_request(1, only, only))
         _wait_until(qapp, lambda: len(single_frames) == 1)
+        assert single_runtime.release_startup_runway(request_id=1)
         assert single_runtime.release_prefetch(request_id=1)
         qapp.processEvents()
         assert single.order == ["0.png"]
@@ -304,7 +332,7 @@ def test_folder_prefetch_budgets_native_preview_and_allows_lazy_one_axis_fit(
         _wait_until(qapp, lambda: len(frames) == 1)
         current_bytes = runtime.cache_bytes
         runtime.set_cache_limits(byte_budget=current_bytes + 100_000)
-        assert runtime.release_prefetch(request_id=1)
+        assert runtime.release_startup_runway(request_id=1)
         qapp.processEvents()
 
         # Pillow retains a 150x225 native JPEG tier here.  Budget that tier,
@@ -328,7 +356,7 @@ def test_folder_prefetch_budgets_native_preview_and_allows_lazy_one_axis_fit(
         second = _request(2, current, current, lazy_neighbor, spec=one_axis)
         assert runtime.request(second)
         _wait_until(qapp, lambda: frames[-1].request_id == 2)
-        assert runtime.release_prefetch(request_id=2)
+        assert runtime.release_startup_runway(request_id=2)
         _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
 
         # A bounded provisional estimate keeps lazy one-axis neighbors useful;
@@ -358,7 +386,7 @@ def test_folder_prefetch_budgets_native_preview_and_allows_lazy_one_axis_fit(
         _wait_until(qapp, lambda: frames[-1].request_id == 3)
         runtime.set_cache_limits(byte_budget=runtime.cache_bytes + 1_500_000)
         jobs_before_probe = runtime.metrics.jobs_submitted
-        assert runtime.release_prefetch(request_id=3)
+        assert runtime.release_startup_runway(request_id=3)
         _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
 
         assert source.header_probes[-1] == "2.jpg"
@@ -457,7 +485,7 @@ def test_folder_one_axis_prefetch_budgets_complete_display_unit(
                 byte_budget=runtime.cache_bytes + free_bytes,
             )
             jobs_before = runtime.metrics.jobs_submitted
-            assert runtime.release_prefetch(request_id=1)
+            assert runtime.release_startup_runway(request_id=1)
             _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
             assert runtime.metrics.jobs_submitted == jobs_before + 1
             assert runtime.metrics.prefetch_admission_stops == int(
@@ -476,19 +504,21 @@ def test_folder_one_axis_prefetch_budgets_complete_display_unit(
         finally:
             assert runtime.shutdown(wait_msecs=3000)
 
-    # Standard rendering clamps the apparent 200x2000 fit-width target to its
-    # retained 10x100 source.  The worker must admit that real 10x100 frame.
+    # Normal rendering now owns the exact 200x2000 physical artifact.  A tiny
+    # retained source is deliberately enlarged once by the configured final
+    # filter rather than hidden behind a later QPainter stretch, so admission
+    # must account for the real frame and reject this small budget.
     exercise(
         tmp_path / "standard-no-upscale",
         sizes=((10, 100), (10, 100)),
         viewport=(200, 200),
         decoder_maximum=(10, None),
         free_bytes=200_000,
-        expect_admitted=True,
+        expect_admitted=False,
     )
 
-    # High-quality rendering does create the 200x2000 target, so the same
-    # source and budget remain correctly rejected before pixel decode.
+    # Legacy high-quality compatibility resolves to the same exact-size frame,
+    # and therefore remains rejected under the same budget.
     exercise(
         tmp_path / "high-quality-upscale",
         sizes=((200, 200), (10, 100)),

@@ -1223,15 +1223,16 @@ frames. The old `ZipRasterBookRuntime._frames`, `_frame_bytes`, and
 - `_retention_rank` represents the remaining full-book order by page distance
   and direction, avoiding an O(all pages) Python allocation on every wheel
   event;
-- `put` retains a completed frame until the unit limit or byte budget is
-  actually exceeded;
+- `put` retains a completed frame until the combined source/frame hard or soft
+  byte policy actually requires reduction; there is no retained-unit cap;
 - `_prune` evicts the lowest-ranked non-current frame only under real pressure;
 - `can_admit_prefetch` allows a newly important neighbor to replace a farther
   frame, but stops low-priority decode before it would merely evict an
   equal-or-better retained frame;
-- the active execution frontier remains bounded to current, next and previous,
-  stays one-worker-wide, and remains paint-gated. The replacement therefore
-  does not turn idle time into an unbounded whole-book decoder.
+- the active execution stays one-worker-wide.  The final production policy in
+  sections 19--20 releases a four-forward/one-reverse complete-unit startup
+  runway at commit and then walks the book lazily under the combined byte
+  policy; physical paint is not a scheduling gate.
 
 The adapted processing source is:
 
@@ -1702,7 +1703,8 @@ ViewerForm input / command
   -> showCurrentPage + pbView_Paint / pbView_PaintToCanvas
 ```
 
-The production NivisViewer ZIP path at the start of this audit is:
+The production NivisViewer ZIP path at the start of this audit was the
+following historical path (its paint gate is superseded by sections 19--20):
 
 ```text
 wheel / shortcut / slider / virtual PageList
@@ -1741,8 +1743,8 @@ worker/cache and independently opened thumbnail source.
 | Page loading | **+** Entry read through display bitmap is one literal worker job. **-** Page arrays and UI form own many responsibilities. | **+** ZIP uses one display-unit QRunnable and publishes only terminal units. **-** Other raster sources still use the legacy multi-stage pipeline. | ZIP **C, already adopted**. A source-independent raster runtime is the next cross-format design. |
 | Decode | **+** Direct stream-to-GDI decode and retained prefiltered source. **-** `System.Drawing`, .NET 4.5.2 and old external WebP/Susie/ffmpeg choices are not a modern decoder strategy; the stream/bitmap lifetime assumption is unsafe to translate literally. | **+** target-sized JPEG via `QImageReader`, EXIF auto transform, Pillow fallback and WebP support. **-** extension/backend branching is embedded in source methods; valid JPEG still has a compressed-payload copy. | **D.** Future capability-driven decoder registry with owned output pixels; do not translate GDI+ or Python `QIODevice` callbacks literally. |
 | Resize | **+** Reuses retained source and creates resized output in the page job. **-** CPU/GDI-oriented implementation and manual bitmap lifetime. | **+** Qt/Pillow resampling modes, physical DPR target and same ZIP unit job. **-** source and layout frame shared one invalidation key at audit start. | **C/D.** Keep Qt render semantics; separate decoded source from display variants (implemented below). |
-| Worker / scheduler | **+** One Viewer page job and replaceable `SetWorksOrder`; current/next/previous simplicity. **-** active stale work is not cancelled, reordering waits for its completion, all-page ordering/sorting remains, and `WorkSetGuid` is effectively `Guid.Empty` rather than a generation fence. Resize may use internal parallel execution, so this is not a one-compute-thread design. | **+** One ZIP lane, latest current, cooperative entry cancel, request/source epoch stale fence and paint-gated prefetch. **-** legacy formats still have load/render/prepared stages. | ZIP **C, already superior Hybrid**. Keep the ordering principle, not `BackgroundWorker`, ineffective generation or thread-priority details. |
-| Prefetch | **+** One page job at a time and priority is rebuilt around current; exact `ResizedImageArray` hits bypass new work. **-** priority is always current then index-increasing neighbor then index-decreasing neighbor, not navigation-direction aware; active stale work finishes first, work eventually covers the book, and there is no paint acknowledgement. | **+** only current/directional next/previous, current before neighbor, post-paint release, exact-frame worker bypass and combined source/frame memory admission. **-** a 250 ms no-paint fallback and coordinator bookkeeping remain. | **C.** Preserve the bounded/direction-aware Nivis implementation while retaining ZipPla's simple ordered frontier. |
+| Worker / scheduler | **+** One Viewer page job and replaceable `SetWorksOrder`; current/next/previous simplicity. **-** active stale work is not cancelled, reordering waits for its completion, all-page ordering/sorting remains, and `WorkSetGuid` is effectively `Guid.Empty` rather than a generation fence. Resize may use internal parallel execution, so this is not a one-compute-thread design. | **+** One raster lane, latest current, cooperative entry cancel, request/source epoch stale fence, 4 + 1 startup runway and seamless lazy book-wide continuation. **-** legacy non-raster formats still have load/render/prepared stages. | ZIP/Folder **C, superior Hybrid**. Keep the completion-order principle, not `BackgroundWorker`, ineffective generation or thread-priority details. |
+| Prefetch | **+** One page job at a time and priority is rebuilt around current; exact `ResizedImageArray` hits bypass new work. **-** priority is always current then index-increasing neighbor then index-decreasing neighbor, not navigation-direction aware; active stale work finishes first, work eventually covers the book, and there is no paint acknowledgement. | **+** accepted commit releases a direction-aware four-forward/one-reverse complete-unit priority prefix, then the one worker continues the lazy book-wide iterator under combined byte admission. Exact-frame hits bypass worker/upload; paint remains an ownership/UI boundary. | **C.** Preserve Nivis complete-unit, direction-aware, byte-driven scheduling while retaining ZipPla's simple completion-boundary frontier. |
 | Cache | **+** `PreFilteredImageArray` and `ResizedImageArray` separate source/display while sharing page lifecycle; an exact ready hit paints without a worker. **-** array ownership and manual dispose are form-wide and tied to GDI objects. | **+** deterministic unit/byte budget and ready frame worker bypass. **-** `_UnitKey` previously coupled decoded QImage to viewport/DPR/rotation/zoom frame identity. | **D.** Book-scoped decoded-source store plus layout-specific frame store, with paired validity and one combined budget (implemented). |
 | Memory management | **+** source plus resized bytes are counted and least-useful pages are reduced. **-** budget changes with `ActiveForm` and volatile physical memory, eviction runs from an approximately 500 ms GUI timer, several pages can remain over the nominal budget, and scaled/source artifacts for one page are discarded together. | **+** explicit byte/unit settings and protected current complete frame. **-** Qt/plugin/transient compressed allocations remain unobservable; PageList has a separate budget. | **D.** Deterministic combined ledger now covers ZIP QImage+QPixmap without double-counting implicit shares; future runtimes need reservations and soft OS-pressure input. |
 | Page state | **+** simple current page. **-** `currentPage`, trackbar and status can move before the target bitmap is ready; old CPU canvas is gray-masked as loading. | **+** `ViewerPresentationState` separates requested/displayed and commits slider/status/history/progress with a complete frame. **-** bookmark/export commands still use the requested `PageModel.current_index` in a few paths. | **B.** Preserve PresentationState; later move bookmark/export defaults to committed state. |
@@ -2317,7 +2319,7 @@ ViewerWidget wheel/key signal
 | Rapid cold input | Stops at the ready frontier; no final-target coalescing | One adaptive rule delayed discrete input and wheel alike | **Hybrid/new design:** discrete and the leading/low-rate wheel packet dispatch immediately. The second same-direction rapid packet proves a burst; only then is the latest target staged. Input is not dropped. |
 | Work-order reversal | Reorders unstarted work around latest `currentPage`; active work finishes | New order reached the runtime only after the timer | **ZipPla principle adopted:** order, retention and obsolete cancellation change at input time. Nivis epoch/serial cancellation remains stronger. |
 | Ready hit | Reads completed resized image directly | Already bypassed timer, worker, decode and `QPixmap.fromImage` | **Nivis maintained:** synchronous atomic commit remains; per-input cache-limit pruning was removed. |
-| Cold current / prefetch | One worker, active work not preempted | One active job and paint-gated prefetch, but delayed staging could let old-direction work continue | **Nivis Hybrid maintained/improved:** current first, cancel/stale fence, prefetch only after matching paint. |
+| Cold current / prefetch | One worker, active work not preempted | One active job; delayed staging could let old-direction work continue | **Nivis Hybrid maintained/improved:** current first, cancel/stale fence, then a memory-admitted 4 + 1 complete-unit runway and seamless lazy book-wide warm-up from accepted commit. Paint acknowledges ownership but no longer gates scheduling. |
 | Source vs display retention | Original/resized artifacts have a simple page lifecycle | Source eviction also deleted a still-valid QPixmap frame | **Modern design:** a display frame survives source eviction; last painted and requested frames are protected until replacement paint. Magnifier rehydrates a missing source on demand. |
 | Commit UI work | WinForms updates current controls in `showCurrentPage` | PageList scroll/work, all menu QAction writes and metadata staging ran synchronously before paint | **Modern design:** slider/status and semantic commit stay synchronous; invariant full-action sync is removed; PageList scroll/work and persistence are serial-guarded/coalesced side effects. |
 | Replacement open | Old form state remains until new open completes | Provisional open cleared old runtime artifacts before success | **Nivis ownership fix:** stop old work but retain completed artifacts until replacement success; failed open restores a ready hit. |
@@ -2582,10 +2584,10 @@ the source request is now based on the layout that will consume it:
 
 | Boundary | New contract |
 |---|---|
-| Preview target | Fit mode, logical display unit, per-page spread/split slot, physical viewport, DPR and application rotation determine the required decoder pixels. Rotation 90/270 maps the target back to decoder axes. Quality headroom is explicit: `standard` 1.0, `smooth` 1.25, and `moire_reduction` / `high_quality` 2.0. This permits quality-oriented reuse without making the original raster the normal cache unit. |
-| ZIP JPEG | The ordinary/two-axis selected entry is read once into one reserved `QByteArray`; a seekable `QBuffer` and `QImageReader` perform decoder scaling. Unknown one-axis prefetch is the deliberate exception: it first reads only the JPEG header to validate allocation. A backend that returns an unnecessarily oversized raster is contained before it enters the normal preview store. |
-| Folder JPEG | Pillow uses the JPEG decoder's native `draft` reduction tier. Orientation and optional adjustment operate on that reduced source; the redundant post-`exif_transpose` full-size copy is removed. The final layout scale remains in the unit job. |
-| Transform order | Preview-eligible fit requests reduce decoded pixels before application rotation and final layout scaling. Full decode is reserved for actual-size, manual zoom, magnifier and `pixel` mode, or a decoder/format fallback whose semantics require original pixels. |
+| Preview target | Fit mode, logical display unit, per-page spread/split slot, physical viewport, DPR and application rotation determine the exact final physical-pixel target. Rotation 90/270 maps that target back to decoder axes. Decoder headroom is uniformly 1.0: the retained JPEG source is the smallest decoder-native tier that is still at least as large as the final target, not an arbitrary algorithm-specific intermediate. |
+| ZIP JPEG | The ordinary/two-axis selected entry is read once into one reserved `QByteArray`; a seekable `QBuffer` and `QImageReader` request the smallest native JPEG reduction tier sufficient for the physical target. Unknown one-axis prefetch is the deliberate exception: it first reads only the JPEG header to validate allocation. A decoder that ignores the tier and returns more than twice the required edge is contained before that oversized raster enters the preview store. |
+| Folder JPEG | Pillow uses the same 1/2, 1/4 or 1/8 native `draft` tier rule. Orientation and optional adjustment operate on that sufficient source; the redundant post-`exif_transpose` full-size copy is removed. The configured renderer then owns the one exact final layout scale. |
+| Transform order | Preview-eligible fit requests perform at most one decoder-native integer reduction, then application rotation/crop/adjustment and exactly one configured resize to the exact DPR-aware physical target. The former arbitrary decoder-sized resize followed by another render resize is removed. Full decode is reserved for actual-size, manual zoom, magnifier-source promotion and nearest-neighbor semantics, or a decoder/format fallback that requires original pixels. |
 | Source cache | Preview and full are distinct tiers and may coexist for the same page. Normal fit selects the smallest sufficient preview; a full promotion no longer destroys the useful fit preview or an already completed QPixmap. |
 | Magnifier | Original-pixel promotion uses a current-only order. It does not start full-resolution next/previous prefetch. Cancelling the lens synchronously adopts the normal preview key, stales/cancels an incompatible full job, and returns through the retained frame without clearing either cache tier. |
 | Admission / eviction | Admission uses decoded-source bytes plus frame bytes, not compressed entry length. Folder estimates its retained native JPEG reduction tier rather than the smaller exact target. Lazy one-axis fit uses a bounded provisional estimate to enter the worker, then a worker-only JPEG header probe checks the complete display unit's missing retained sources plus layout frame bytes before allocating pixels; over-budget/probe-failed prefetch is suppressed for that work order. Current preview, visible spread partner and last-painted frame are protected; optional full sources are preferred eviction candidates when normal-fit work needs room. |
@@ -2596,9 +2598,11 @@ compact current-first worker discipline, improves on its full-source pixel
 cost, and keeps NivisViewer's high-DPI, spread/RTL, magnifier, atomic
 presentation and virtual PageList UX boundaries.
 
-### 17.4 Standard-fit production A/B
+### 17.4 Historical standard-fit production A/B
 
-A and B ran in fresh offscreen child processes with the same alternating
+This run predates both the final independent resampling authority in section
+17.8 and the Startup Ready Runway in section 20.  A and B ran in fresh
+offscreen child processes with the same alternating
 1,200 x 1,800 / 4,500 x 7,000 solid-JPEG fixture, 1,200 x 800 viewport, five
 retained units and 256 MiB budget.  A is the immediately preceding production
 implementation; B is the production implementation after this replacement.
@@ -2638,18 +2642,22 @@ The extra ZIP attempt is one cancelled attempt without another completed
 entry read; the extra Folder attempt/read comes from scheduling around the
 reversal.  Neither side duplicates a successful decode of the same active
 target.  A ready hit still creates zero critical-path jobs and zero decodes;
-the one scenario-total job is neighbor prefetch released only after paint.
+in that measured predecessor, the one scenario-total job was neighbor prefetch
+released only after paint.  That paint-gated scheduler is not the current
+contract.
 
-### 17.5 Former full-transform A/B
+### 17.5 Historical former full-transform A/B
 
-The standard-fit fixture above cannot demonstrate the main improvement because
-that path was already reduced.  A separate isolated-worker A/B therefore uses
-one 4,500 x 7,000 ZIP JPEG, rotation 90 degrees, brightness 1.2,
-`high_quality`, and a 1,200 x 800 viewport.  A reconstructs the former
-full-source transform demand; B uses the production layout-aware preview with
-2.0 quality headroom.  Both generate the same 1,200 x 771 display frame.
+This comparison predates the final independent resampling authority in section
+17.8.  The standard-fit fixture above could not demonstrate the then-current
+main improvement because that path was already reduced.  A separate
+isolated-worker A/B therefore used one 4,500 x 7,000 ZIP JPEG, rotation 90
+degrees, brightness 1.2, the legacy `high_quality` mode and a 1,200 x 800
+viewport.  A reconstructed the former full-source transform demand; B used the
+intermediate layout-aware preview with 2.0 quality headroom.  Both generated
+the same 1,200 x 771 display frame.
 
-| Metric | A: former full transform | B: production preview transform |
+| Metric | A: former full transform | B: intermediate preview transform |
 |---|---:|---:|
 | Decoded source dimensions | 4,500 x 7,000 | 1,543 x 2,400 |
 | Cold runtime completion ms | 507.020 | 95.235 |
@@ -2659,10 +2667,14 @@ full-source transform demand; B uses the production layout-aware preview with
 | Sampled peak growth MiB | 423.066 | 54.781 |
 | Jobs / decodes / reads / QPixmap creations | 1 / 1 / 1 / 1 | 1 / 1 / 1 / 1 |
 
-The reduction comes from doing less pixel work, not from skipping a job or
-changing presentation semantics.  The preview is sized by the 2.0
-high-quality headroom policy for the rotated output, while avoiding the 94.5
-MB source and its full-sized transform intermediates in the normal fit path.
+The reduction came from doing less pixel work, not from skipping a job or
+changing presentation semantics.  At that stage the preview was sized by the
+2.0 high-quality headroom policy for the rotated output, while avoiding the
+94.5 MB source and its full-sized transform intermediates in the normal fit
+path.  The final production contract no longer uses that algorithm-specific
+headroom; section 17.8 records the sufficient native JPEG tier plus one exact
+configured final resize.  These values therefore remain historical evidence,
+not a benchmark of the final filter authority.
 
 ### 17.6 Preview/full layout reuse A/B
 
@@ -2703,7 +2715,7 @@ pixel detail of the user's books.  Pillow native draft deliberately retains a
 coarser decoder tier than the exact ZIP scaler, so the standard Folder memory
 aggregate can rise even when transform latency falls.  QPixmap/native backing
 allocations and transient decoder peaks are sampled rather than exhaustively
-observable.  Actual-size, manual zoom, magnifier and `pixel` mode still require
+observable.  Actual-size, manual zoom, magnifier and nearest-neighbor mode still require
 full pixels, and a protected current page may temporarily exceed the budget.
 An unindexed `fit_width`/`fit_height` prefetch performs one extra header-only
 entry/file access before decode so an extreme aspect cannot allocate beyond
@@ -2714,8 +2726,89 @@ page; physical-device checks must therefore include that case.
 Accordingly, no physical-device improvement is inferred solely from these
 offscreen timings.  The acceptance check remains repeated turns, reversal and
 rapid wheel input on the user's 4,000-5,000-pixel and larger ZIP/Folder books,
-including rotation, brightness/high-quality rendering, magnifier enter/leave,
+including rotation, brightness/sharp or Lanczos rendering, magnifier enter/leave,
 spread, DPR change and return to a previously completed normal-fit frame.
+
+### 17.8 Final independent resampling authority
+
+This subsection supersedes the older combined-mode and quality-headroom
+wording elsewhere in section 17.  The production authority is now four
+independent settings rather than one label that ambiguously controls both
+reduction and enlargement:
+
+| Surface | Reduction authority | Enlargement authority | Defaults |
+|---|---|---|---|
+| Normal Viewer | `viewer_downscale_algorithm`: `auto`, `fast`, `smooth`, `sharp`, `area`, `nearest` | `viewer_upscale_algorithm`: `auto`, `bilinear`, `bicubic`, `lanczos`, `nearest` | `auto` / `auto` |
+| Magnifier | `magnifier_downscale_algorithm`: the same reduction set | `magnifier_upscale_algorithm`: the same enlargement set | `sharp` / `lanczos` |
+
+`ResamplingPolicy` in `app/viewer_render.py` is the value contract.  Explicit
+algorithms are part of `ViewerRenderKey` and `ZipRasterRenderSpec` equality, so
+a cache hit can never silently reuse output produced by another filter.
+`ViewerWindow` and `ViewerWidget` pass the normal pair to complete display-unit
+rendering and the magnifier pair to lens rendering.  Equal-size output takes a
+copy without a resampling pass.  A real size change uses one native Pillow
+filter: `BOX`, `BILINEAR`, `BICUBIC`, `LANCZOS` or `NEAREST`; `auto` chooses
+BOX for a reduction of at least one half, Lanczos for a moderate reduction and
+bicubic for enlargement.  The compatibility-only legacy standard caller may
+still use Qt's native `QImage.scaled` path.  No Python pixel loop, custom SIMD
+resizer, new native library or GPU dependency was introduced: this remains a
+Qt/Pillow-only design.
+
+The final frame size is no longer clamped to a decoder result that is smaller
+than the requested target.  The old sequence could accept such a source,
+produce a target-underfilled frame and then let QPainter/device DPR enlarge it;
+another path requested an arbitrary exact decoder size and subsequently ran
+the selected resize filter again.  `jpeg_native_reduction_size`, the ZIP/Folder
+JPEG readers, `RasterBookRuntime._contain_preview_source`, uniform decoder
+headroom 1.0 and exact physical render targets now establish one rule: retain
+the smallest native JPEG tier sufficient for the DPR-aware target, then run
+exactly one deliberate final resize.  This keeps the selected filter
+authoritative and prevents hidden double scaling without forcing normal fit to
+retain the original raster.  A fresh decoder result is checked against the
+same source-sufficiency postcondition used by the cache; if a backend returns
+even one axis below the required size, that preview is not admitted and the
+job promotes once to the full source.
+
+The GUI creates one `QPixmap` from the exact display `QImage`, assigns the
+request DPR and uses point-form painting for both normal frames and the
+magnifier whenever the natural device-independent size matches the layout.
+This removes the former destination-rectangle resample caused by fractional
+DPR rounding.  The explicit exception is a `manual_zoom` artifact above
+64 MiPixels: until tiled zoom rendering exists, it is proportionally bounded
+and may be enlarged by QPainter to avoid a single multi-gigabyte allocation.
+Ordinary fit and actual-size frames do not use that safety cap.
+
+`ConfigManager._migrate_legacy_resampling_settings` performs a one-way
+translation from `viewer_resampling_mode`, `magnifier_resampling_mode` and
+`smooth_scaling`.  If both new keys for a surface already exist they win;
+otherwise the legacy pair is translated once.  The legacy keys are then
+removed during load/normalization/update and are never saved again.  Old API
+setters expose only a compatibility view over the new settings, so there are
+not two writable authorities.
+
+The performance provenance remains ZipPlaFork fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, AGPL-3.0-or-later:
+
+- `source/ZipPla/ViewerForm.cs`, `bmwLoadEachPage_DoWork`
+  (`:3177-3550`) and its scaling selection (`:3405-3449`), plus
+  `GetResizedSize` (`:5273`), informed the structural rule that one page job
+  owns decode/filter/resize through a complete display artifact;
+- `source/ZipPla/ViewerForm.cs`, `SetNewResizedImage` (`:5451-5468`), and
+  the `PreFilteredImageArray` / `ResizedImageArray` fields informed retained
+  source versus completed-output reuse; and
+- `source/ZipPla/ImageLoader.cs`, `GetJpegOrientation` / `LoadRotateBitmap`
+  (`:382-400`) and `GetFullBitmap(Stream)` (`:559-689`), together with
+  `source/ZipPla/BitmapResizer.cs`, were evaluated for its decode/orientation/
+  resize order.
+
+The independent normal/magnifier reduction/enlargement policy, fractional-DPR
+target, native JPEG tier selection, exact one-final-resize rule, immutable Qt
+cache identity and one-way settings migration are NivisViewer modernizations,
+not copied WinForms/GDI code.  ZipPlaFork's full-GDI-source policy and its
+legacy resizer choices were deliberately not adopted.  The retained license
+and copyright files at `licenses/ZipPlaFork/AGPL.txt` and
+`licenses/ZipPlaFork/About.txt`, section 1 and `THIRD_PARTY_NOTICES.md` cover
+the AGPL-derived structural principles.
 
 ## 18. ZIP initial warm-up and automatic memory budget (2026-08-21)
 
@@ -2802,7 +2895,13 @@ NivisViewer instead uses a stable modern Windows snapshot and listed buckets.
 No C# statement was translated literally in this change; the all-book
 memory-driven work-order structure is recorded as AGPL-derived.
 
-### 18.3 New Hybrid production contract
+### 18.3 First Hybrid replacement contract (historical predecessor)
+
+This subsection and its probe record the first all-book replacement.  Sections
+19--20 supersede its post-paint release, materialized finite order and
+book-length safety ceiling with a count-free lazy plan, the commit-released
+Startup Ready Runway and seamless book-wide continuation.  The memory-mode
+resolution and combined-byte principles below remain applicable.
 
 `viewer_memory_mode` is now an independent saved string with `minimal`
 (128 MiB), fixed 256/512 MiB and 1/2/4/8/16/32 GiB modes, plus `auto`. Fixed
@@ -3037,16 +3136,27 @@ revision.  A page turn then creates a small `RasterWarmupPlan`; it does not
 materialize or sort a new all-page list.
 
 After the first complete frame is accepted by the presentation commit, the
-plan may release exactly one nearest missing display unit.  The matching paint
-acknowledgement then releases the full lazy walk: preferred-direction neighbor,
-opposite neighbor and both sides at increasing distance.  It represents every
-single/spread display unit in the book, but creates candidates only as the one
-worker asks for them.  Section 20 records this bounded two-stage gate and the
-book-open critical-path reason for it.
-Direction reversal replaces the plan and therefore the unstarted cursor.
-Capacity skips, the unprocessed hint and explicit waiting/running/soft-target/
-hard-limit/complete/suspended stop reasons belong to `RasterWarmupPlanner`, not
-to a timer or to cache membership.
+plan releases a **Startup Ready Runway** of up to four complete display units
+in the preferred/navigation direction plus one in the reverse direction, in
+`F1, R1, F2, F3, F4` priority order.  It
+then continues seamlessly through the same lazy book-wide walk without waiting
+for physical paint.  Paint acknowledgement remains the displayed-frame
+ownership/reclamation and deferred-UI boundary; it is no longer a scheduling
+gate.  Section 20 records why the preceding one-neighbor/paint-gated contract
+made the available byte budget appear ineffective and how this runway replaces
+it.
+
+The 4 + 1 values are a startup minimum target, not a page-count ceiling.  Each
+candidate is still admitted against the combined decoded-source plus
+layout-frame byte policy, so a hard/soft limit, an oversized unit, a book end
+or an already-ready/terminal unit can yield fewer new artifacts.  The normal
+iterator still represents every single/spread display unit in the book and
+creates candidates only as the one worker asks for them.  Direction reversal
+or any navigation creates a new current-centered plan and therefore replaces
+the unstarted cursor; completed artifacts remain reusable.  Capacity skips,
+the unprocessed hint and explicit waiting/running/soft-target/hard-limit/
+complete/suspended stop reasons belong to `RasterWarmupPlanner`, not to a
+timer, paint event or cache membership.
 
 Neither source nor frame store accepts a maximum page/unit count.
 `cache_unit_limit` and the `set_cache_limits(unit_limit=...)` compatibility
@@ -3078,7 +3188,7 @@ not copied from ZipPlaFork:
   actual byte costs form one combined ledger at the runtime boundary.
 - Normal fit warm-up stores a sufficient preview source and a display-ready
   frame.  Full decoded source is promoted for the current page only when
-  magnifier, actual size, manual zoom, pixel mode or another explicit
+  magnifier, actual size, manual zoom, nearest-neighbor source semantics or another explicit
   full-resolution demand requires it.  A sufficient preview/full tier can
   survive a frame-layout invalidation and avoid another archive/file decode.
 - Retention rank comes from the current lazy plan and direction.  Current
@@ -3183,14 +3293,15 @@ checks must still cover long idle warm-up, a page turn during that warm-up,
 direction reversal, magnifier/full-source promotion, window deactivation and
 returning to an already warmed page.
 
-## 20. ZIP book-open critical path and commit-bounded warm-up (2026-08-21 worktree)
+## 20. Raster book-open critical path and Startup Ready Runway (2026-08-21 worktree)
 
-This section narrows the next performance change to the interval from an open
-request through the first current-page commit and the first useful neighbor.
-It supersedes only the initial warm-up gate described in sections 18.3 and
-19.3.  The byte-driven stores, lazy whole-book order, PresentationState,
-complete-frame atomic swap and full post-paint population remain in force.
-Physical-device behavior is not inferred from this structural change.
+This section covers the shared ZIP/Folder `RasterBookRuntime` interval from an
+open or navigation request through the first current-page commit, a useful
+ready runway and continuing book-wide population.  It supersedes the
+one-neighbor/paint gate described by the earlier wording in sections 18.3 and
+19.3.  The byte-driven stores, lazy whole-book order, PresentationState and
+complete-frame atomic swap remain in force.  Physical-device behavior is not
+inferred from this structural change.
 
 ### 20.1 Fixed-revision ZipPlaFork book-open call sequence
 
@@ -3320,9 +3431,11 @@ ViewerWindow.open_path
   -> worker read/decode/render -> validated complete RasterFrame
   -> atomic PresentationState/ViewerWidget commit
      -> slider/status/displayed state update together
-     -> release_initial_warmup(request_id): at most one nearest missing unit
+     -> release_startup_runway(request_id)
+        -> prioritize up to four forward + one reverse complete display units
+        -> continue through the lazy book-wide order with the same one worker
   -> matching ViewerWidget paint acknowledgement
-     -> release_prefetch(request_id): release the remaining lazy book-wide order
+     -> release_prefetch(request_id): mark painted ownership / reclaim safely
      -> start the zero-delay presentation-side-effect timer
   -> after paintEvent returns
      -> construct/activate the virtual PageList runtime
@@ -3331,17 +3444,47 @@ ViewerWindow.open_path
      -> project page history/actions/PageList selection and persist committed progress
 ```
 
-`ViewerWindow._on_zip_runtime_frame_ready` releases the bounded early work only
-after the request/book epoch, source identity, complete display-unit identity,
-layout/DPR contract, accepted presentation token and positive committed frame
-serial have all survived validation.  `RasterBookRuntime.release_initial_warmup`
-is idempotent per request and also requires the current complete frame to exist
-in the frame store.  `RasterWarmupPlanner.release_after_commit(unit_limit=1)`
-consumes at most one useful missing display unit, then returns to
-`waiting_for_paint`; a spread counts as one complete display unit, never one
-slot.  A matching `release_after_paint` opens the remaining memory-driven
-walk.  Ready/terminal neighbors are skipped without spending the one useful
-unit allowance.
+`ViewerWindow._on_zip_runtime_frame_ready` releases startup work only after the
+request/book epoch, source identity, complete display-unit identity, layout/DPR
+contract, accepted presentation token and positive committed frame serial have
+all survived validation.  `RasterBookRuntime.release_startup_runway` is
+idempotent per request and also requires the current complete frame to exist in
+the frame store.  `RasterWarmupPlanner.release_startup_runway` makes up to four
+preferred-direction and one reverse-direction **complete display units** the
+priority prefix, ordered `F1, R1, F2, F3, F4`.  When those topology units exist
+and pass byte admission, making all five ready before lower-ranked work is the
+startup guarantee.  A two-page spread consumes one unit, not two slots; a split
+wide page is never exposed half-complete.  When this prefix is ready, terminal
+or safely declined by byte admission, `next_candidate` proceeds directly into
+the ordinary lazy whole-book iterator.  It does not return to a paint-waiting
+state.
+
+The exact cause of the former “only one neighbor is ready” symptom was the
+intermediate `release_after_commit(unit_limit=1)` contract: after one useful
+missing display unit it explicitly restored `waiting_for_paint`, leaving the
+single worker idle until a matching physical-paint acknowledgement opened the
+remaining order.  The combined cache still had free bytes, so increasing its
+budget could not create work hidden behind this scheduler admission gate.  The
+new 4 + 1 runway removes that gate; it is a startup minimum target and priority
+prefix, **not** a retention limit.  Every candidate is still admitted against
+the combined decoded-source plus layout-frame hard/soft byte policy.  A small
+budget, oversized artifact or a book boundary may therefore produce fewer than
+five newly ready units, while a large budget can retain and warm far more than
+five.
+
+The runway is topology-based rather than screen-coordinate-based.  In single
+or spread mode it follows complete `RasterDisplayUnit` entries; LTR/RTL and the
+current navigation direction determine the preferred side; wide/split units
+remain atomic; and a start/end boundary neither wraps nor duplicates units.
+Every accepted navigation or direction reversal constructs a fresh
+current-centered plan.  Unstarted old-direction work disappears, an active job
+is adopted only when it is the exact first missing unit of the new runway, and
+otherwise it is cancelled/stale-rejected.  Completed old-direction artifacts
+remain reusable under the byte budget.  After the runway, the same worker
+continues the lazy book-wide order without a scheduler gap.  Physical paint
+still acknowledges ownership, releases the preceding displayed-frame
+protection and gates PageList/metadata/history/Browser projection and retired
+resource cleanup; it no longer decides whether raster warm-up may continue.
 
 This is intentionally Hybrid.  It adopts ZipPlaFork's useful completion-boundary
 continuation but keeps NivisViewer's Qt publication boundary: QPixmap creation,
@@ -3374,8 +3517,10 @@ The concrete NivisViewer owners are `app/viewer_window.py`
 `ensure_page_list_runtime`, `set_viewer_runtime_memory_limits` and
 `release_retired_book_resources`); `app/image_cache.py`
 (`suspend_for_book_runtime`); `app/zip_raster_book_runtime.py`
-(`RasterBookRuntime.release_initial_warmup`, `retire` and `_drive`);
-`app/raster_warmup_planner.py` (`release_after_commit` /
+(`RasterBookRuntime.release_startup_runway`, `_first_missing_startup_key`,
+`release_prefetch`, `_adopt_request`, `retire` and `_drive`);
+`app/raster_warmup_planner.py` (`RasterWarmupPlan.startup_runway_units`,
+`RasterWarmupPlanner.release_startup_runway`, `next_candidate` and
 `release_after_paint`); `app/viewer_page_list_runtime.py` (`retire`); and
 `app/config_manager.py` (legacy memory-key migration and removal).
 
@@ -3390,30 +3535,37 @@ boundaries rather than relying on object finalizers.
 
 | Fixed-revision source / method | Principle evaluated | NivisViewer result |
 |---|---|---|
-| `ViewerForm.cs`, `bmwLoadEachPage_RunWorkerStarting`, `SetBackgroundMode`, `priorityLevel`; `GenerarClasses.cs`, `SetWorksOrder` / completion selection | One Viewer lane receives current-centered work and chooses the next useful item at a completion boundary without a paint-idle gap. | **Hybrid structural port:** `RasterBookRuntime.release_initial_warmup`, `RasterWarmupPlanner.release_after_commit` and `_drive` release exactly one nearest complete unit at accepted first commit; full book population remains paint-gated. |
+| `ViewerForm.cs`, `bmwLoadEachPage_RunWorkerStarting`, `SetBackgroundMode`, `priorityLevel`; `GenerarClasses.cs`, `SetWorksOrder` / completion selection | One Viewer lane receives current-centered work and chooses the next useful item at a completion boundary without a paint-idle gap. | **Hybrid structural port:** `RasterBookRuntime.release_startup_runway`, `RasterWarmupPlan.startup_runway_units`, `RasterWarmupPlanner.next_candidate` and `_drive` give the accepted current a four-forward/one-reverse complete-unit priority runway, then continue seamlessly into lazy book-wide population. |
 | `PackedImageLoader.cs`, constructor, `getZipArchiveEntries`, `OpenImageStream` / `OpenInnerImageStream` | One book-scoped archive handle/index and entry-local page work. | **Already adopted/maintained:** `ZipImageSource.__init__`, `list_images`, entry-read methods and `ZipRasterBookRuntime` keep structured lifetime, cancellation and stale fences. No new archive copy is added. |
 | `ViewerForm.cs`, `OpenFile`, `clearResizedImageArray` | Replacement preparation and old ownership disposal before new work. | **Not adopted:** old complete output is retained; `BookSession` retires work immediately but moves bulk cache destruction after successful replacement paint. |
 | No ZipPlaFork counterpart | Async archive listing, PresentationState, PageList virtualization, post-paint side effects, migration-only settings and callback-drained rapid switching. | **NivisViewer/New design maintained:** these are modern Qt/UX/lifetime structures, not translations of WinForms code. |
 
-The one-worker completion-order principle in the first row is derived from the
-fixed AGPL-3.0-or-later ZipPlaFork source and is recorded as a direct structural
-port.  No C# statement, GDI type or WinForms control code was copied literally
-for this change.  The retained license and copyright material at
+The one-worker completion-order and replaceable current-centered order
+principles in the first row are derived from the fixed AGPL-3.0-or-later
+ZipPlaFork source and are recorded as a direct structural port.  The exact
+4 + 1 startup shape, navigation-direction awareness, complete-display-unit
+topology, combined Qt byte admission, epoch/request stale cancellation and
+paint-independent promotion to a lazy iterator are NivisViewer
+modernizations; ZipPlaFork does not contain that Qt contract.  No C# statement,
+GDI type or WinForms control code was copied literally for this change.  The
+retained license and copyright material at
 `licenses/ZipPlaFork/AGPL.txt` and `licenses/ZipPlaFork/About.txt`, section 1
 and `THIRD_PARTY_NOTICES.md` apply.
 
-### 20.6 Controlled offscreen A/B boundary
+### 20.6 Historical controlled A/B that exposed the paint-idle cause
 
-The current validation compares only the new scheduling boundary, not a
-checkout of the removed GUI ownership path.  Both sides use the same generated
-large ZIP, fixed memory policy, decoded/frame stores and one-worker runtime in
-fresh offscreen child processes:
+This A/B predates the final Startup Ready Runway and is retained as diagnosis,
+not as a benchmark of the current 4 + 1 contract.  It compared only the then-new
+one-neighbor scheduling boundary, not a checkout of the removed GUI ownership
+path.  Both sides used the same generated large ZIP, fixed memory policy,
+decoded/frame stores and one-worker runtime in fresh offscreen child processes:
 
 - **A / paint gate:** accept the current frame, withhold
-  `release_initial_warmup`, acknowledge paint, then call normal
+  the then-current `release_initial_warmup`, acknowledge paint, then call normal
   `release_prefetch`.
-- **B / commit-bounded gate:** accept the same current frame, call production
-  `release_initial_warmup`, permit exactly one nearest missing unit, then
+- **B / one-neighbor predecessor:** accept the same current frame, call the
+  then-production `release_initial_warmup`, permit exactly one nearest missing
+  unit through `release_after_commit(unit_limit=1)`, then
   acknowledge paint and release the remaining order normally.
 
 The intended matrix is a 100--300-page large-image ZIP under fixed 256 MiB,
@@ -3440,7 +3592,8 @@ boundary.  Values below are milliseconds; each A and B ran in a fresh process.
 First-paint latency was 35.013 -> 35.285 ms (256 MiB), 36.410 -> 37.413 ms
 (4 GiB) and 35.673 -> 36.220 ms (Auto).  Those 0.272--1.003-ms differences
 are within isolated-run noise; the controlled result does not show a material
-first-frame regression.  B retains one additional 1,920,000-byte complete
+first-frame regression for the one-neighbor predecessor.  B retained one
+additional 1,920,000-byte complete
 source+frame artifact before paint.  At one second B retained 186,240,000 /
 193,920,000 / 205,440,000 bytes and its working-set deltas were 98,160,640 /
 102,424,576 / 107,077,632 bytes for 256 MiB / 4 GiB / Auto respectively.  A's
@@ -3454,7 +3607,10 @@ drained callbacks, closed the source and removed the temporary fixture at
 shutdown.  The first-neighbor gap fell from 31--32 ms to 8--11 ms and the
 post-paint three-ready gap from 18.6--21.6 ms to 10.5--10.8 ms.  The synthetic
 20-ms boundary deliberately amplifies otherwise platform-dependent paint idle;
-it is not claimed as physical presentation latency.
+it is not claimed as physical presentation latency.  More importantly, this
+run isolated the former scheduler cause: a useful job could execute at commit,
+but `unit_limit=1` deliberately put the worker back behind the paint gate.  It
+did not justify retaining that one-unit restriction.
 
 A separate three-second commit-gate reach run verifies that memory mode, not a
 hidden page/unit count, remains authoritative:
@@ -3467,9 +3623,59 @@ hidden page/unit count, remains authoritative:
 
 All three reach cases had one archive open, one listing, zero evictions and a
 clean callback/source/temporary-file shutdown.  Offscreen evidence establishes
-the eliminated idle gap and absence of a hidden count cap only; native ZIP I/O,
-decoder, QPixmap upload, DWM/GPU presentation and physical wheel feel still
-require the user's real-device check.
+the paint-idle diagnosis and absence of a hidden count cap only.  The final
+4-forward/1-reverse runway and seamless book-wide promotion supersede both A
+and B; no new physical latency number is inferred from this historical table.
+Native ZIP I/O, decoder, QPixmap upload, DWM/GPU presentation and physical
+wheel feel still require the user's real-device check.
+
+#### 20.6.1 Final runway validation
+
+The final implementation was rerun with a temporary 200-page ZIP containing
+identical 2,400 x 3,600 detailed JPEG entries, a 400 x 600 viewport, 256 MiB
+hard / 224 MiB soft raster policy, one worker and a deterministic 20 ms
+commit-to-paint interval.  Each side ran in a fresh offscreen process.  This
+first table isolates the scheduler on the final code: A withholds the commit
+release until paint; B calls the production Startup Ready Runway.
+
+| Final-code scheduler A/B | A: paint gate | B: Startup Ready Runway |
+|---|---:|---:|
+| Request -> first commit ms | 17.836 | 16.797 |
+| Request -> first paint ms | 38.842 | 37.274 |
+| Commit -> next ready ms | 34.371 | 13.728 |
+| Paint -> three ready ms | 26.130 | 7.807 |
+| Ready units at first paint / 50 / 100 / 250 ms | 1 / 4 / 8 / 19 | 2 / 6 / 10 / 21 |
+| First-five forward hits at first paint / 50 ms | 0 / 3 | 1 / 5 |
+| Cache bytes at first paint / 50 / 100 / 250 ms | 3,120,000 / 12,480,000 / 24,960,000 / 59,280,000 | 6,240,000 / 18,720,000 / 31,200,000 / 65,520,000 |
+| Duplicate successful decodes | 0 | 0 |
+
+The first-commit difference is isolated-process noise because B is released
+only after that commit.  The useful result is the eliminated scheduler idle:
+the next and third complete units arrive about 20.6 and 18.3 ms earlier in this
+controlled boundary.  B performs exactly the additional reads/decodes needed
+for its two extra ready units; job, callback and QPixmap counts remain one per
+completed unit.
+
+A separate 100 ms pre-paint reach probe compares the task-start production
+(`release_after_commit(unit_limit=1)`) with the final production.  The old
+runtime stopped at two ready units (current plus one neighbor), so only one of
+the first five forward turns was a hit.  The final runtime reached eight ready
+units, making all first five turns hits, and had already submitted the ninth
+single-worker job.  The corresponding exact combined-cache values were
+3,840,000 versus 24,960,000 bytes.  Both sides reported zero duplicate decode,
+drained callbacks, closed sources and unlocked/removed temporary fixtures.
+
+This holistic predecessor/final comparison also contains the resampling
+correctness change: the 2,400 x 3,600 JPEG source retained for a 400 x 600
+frame is now the sufficient native 600 x 900 tier (2,160,000 pixel bytes), not
+the former arbitrary 400 x 600 decoder output (960,000 bytes).  The final
+QPixmap remains exactly 400 x 600 (960,000 bytes).  In the 20 ms runs that
+changed task-start predecessor versus final population from 2 / 7 / 11 / 28
+ready units at first paint / 50 / 100 / 250 ms to 2 / 6 / 10 / 21 and raised
+the sampled working-set delta at 250 ms from 31,473,664 to 71,028,736 bytes.
+That throughput/memory cost buys a non-undersized reusable source and the
+configured one-final-resize quality contract; it is not attributed to the
+runway scheduler and still requires physical quality/latency evaluation.
 
 ### 20.7 Remaining risk and physical-device boundary
 
@@ -3477,9 +3683,12 @@ require the user's real-device check.
   still precede the first current request, although they run in the book-open
   worker.  If open latency remains proportional to entry count, that index path
   is the next measured boundary.
-- One nearest neighbor can now consume CPU/memory bandwidth before the current
-  paint.  The one-unit bound is deliberate; a real-device regression in first
-  paint should remove or narrow this release rather than expand it.
+- Up to four preferred-direction and one reverse complete display units can now
+  consume CPU/memory bandwidth before the current paint, followed by seamless
+  book-wide warm-up.  The combined hard/soft byte policy remains the actual
+  retention/admission ceiling; a real-device first-paint or immediate-input
+  regression should tune the startup runway/admission policy, not restore a
+  paint-dependent scheduler gate.
 - PageList construction and retired-cache disposal move after paint, not out of
   the process.  They may affect the immediately following interaction and need
   a physical rapid-open/page-turn check.
@@ -3489,3 +3698,31 @@ require the user's real-device check.
 - The persistent ZIP handle and one active decode still depend on Python/Qt
   backend behavior.  Matching ZipPlaFork's work order does not by itself prove
   matching native decoder or renderer latency.
+
+### 20.8 Final validation and shutdown observations
+
+Final syntax/import checks and `git diff --check` passed.  The focused runway,
+source-tier, resampling, configuration-migration, Folder/ZIP runtime and Viewer
+integration group passed 205 tests.  The complete repository suite was then
+split across fresh pytest processes and passed **1,516 tests** across all 89
+test files; lifecycle-sensitive partitions were rerun one file per process.
+This process boundary is intentional: two earlier broad multi-file processes
+aborted during Python/Qt teardown while old Pdfium or Windows shell-preview
+workers from preceding tests still existed, although every affected file
+passed in a fresh process.  That remains a suite-process lifetime risk rather
+than evidence of a raster assertion failure.
+
+Two older integration tests had treated complete-frame commit as if post-paint
+metadata/PageList projection had already run.  Their bounded waits now observe
+the public reading-progress or PageList epoch/row result, preserving the
+production `commit -> paint -> noncritical projection` boundary.  The run also
+found and fixed an unrelated real shutdown race: `FileOperationPanel` scheduled
+an idle close without a QObject context, so the callable could reach a deleted
+`WA_DeleteOnClose` wrapper.  The callback is now context-bound; 76 related file
+operation tests passed.
+
+All task-owned pytest and benchmark PIDs were identified by executable,
+command line and parent PID, terminated where an aborted process had remained,
+and rechecked.  No pytest, benchmark or compile process from this work remains;
+unrelated pre-existing Python processes were not touched.  Named benchmark and
+stranded pytest temporary directories created by this validation were removed.
