@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication
 
 from app.image_source import ImageSourceError, ZipImageSource
 from app.image_work_coordinator import ImageWorkCoordinator
+from app.raster_warmup_planner import RasterBookTopology, RasterWarmupPlan
 from app.zip_raster_book_runtime import (
     ZipRasterBookRuntime,
     ZipRasterDisplayUnit,
@@ -59,11 +60,38 @@ def _request(
     spec: ZipRasterRenderSpec | None = None,
     direction: int = 0,
 ) -> ZipRasterRequest:
+    units = tuple(
+        sorted(
+            dict.fromkeys(work_order or (current,)),
+            key=lambda unit: min(page.page_index for page in unit.pages),
+        )
+    )
+    topology = RasterBookTopology(
+        units,
+        identity_of=lambda unit: unit.identity,
+        page_indexes_of=lambda unit: (
+            page.page_index for page in unit.pages
+        ),
+        page_count=max(
+            (page.page_index for unit in units for page in unit.pages),
+            default=-1,
+        )
+        + 1,
+    )
     return ZipRasterRequest(
         1,
         request_id,
         current,
-        work_order or (current,),
+        RasterWarmupPlan(
+            topology,
+            current=current,
+            identity_of=lambda unit: unit.identity,
+            page_indexes_of=lambda unit: (
+                page.page_index for page in unit.pages
+            ),
+            direction=direction,
+            background_enabled=len(units) > 1,
+        ),
         spec or ZipRasterRenderSpec((640, 480)),
         navigation_direction=direction,
     )
@@ -82,7 +110,7 @@ def _wait_until(
     assert predicate()
 
 
-def test_book_wide_cache_store_ledgers_stay_exact_across_mutations(
+def test_book_wide_artifact_store_ledgers_have_no_count_ceiling(
     qapp: QApplication,
 ) -> None:
     del qapp  # QPixmap construction only requires the shared application.
@@ -90,7 +118,8 @@ def test_book_wide_cache_store_ledgers_stay_exact_across_mutations(
     spec = ZipRasterRenderSpec((640, 480))
     units = tuple(_unit(index) for index in range(artifact_count))
 
-    source_store = _ZipRasterSourceStore(page_limit=artifact_count * 2)
+    plan = _request(1, units[0], *units, spec=spec, direction=-1).warmup_plan
+    source_store = _ZipRasterSourceStore()
     source_keys: list[_SourceKey] = []
     for index in range(artifact_count):
         width = 24 + index % 11
@@ -123,9 +152,8 @@ def test_book_wide_cache_store_ledgers_stay_exact_across_mutations(
         ) == source_store.page_count
 
     assert_source_ledger()
-    reordered_units = (units[0],) + tuple(reversed(units[1:]))
-    source_store.set_retention_order(
-        reordered_units,
+    source_store.set_retention_plan(
+        plan,
         units[0],
         spec,
         -1,
@@ -141,17 +169,17 @@ def test_book_wide_cache_store_ledgers_stay_exact_across_mutations(
             False,
         )
     )
-    assert source_store.set_page_limit(96) == artifact_count - 96
+    # Count is observational only. Even a book much larger than the old
+    # 96-page store limit remains resident until the shared byte policy asks
+    # the runtime to reclaim a ranked artifact.
+    assert source_store.page_count == artifact_count
     assert source_store.evict_one()
-    assert source_store.page_count == 95
+    assert source_store.page_count == artifact_count - 1
     assert_source_ledger()
     source_store.clear()
     assert_source_ledger()
 
-    frame_store = _ZipRasterFrameStore(
-        unit_limit=artifact_count * 2,
-        byte_budget=1 << 40,
-    )
+    frame_store = _ZipRasterFrameStore()
     frame_keys: list[_UnitKey] = []
     for index, unit in enumerate(units):
         width = 30 + index % 17
@@ -191,8 +219,7 @@ def test_book_wide_cache_store_ledgers_stay_exact_across_mutations(
         assert frame_store.largest_frame_bytes == max(sizes, default=0)
 
     assert_frame_ledger()
-    reordered_keys = (frame_keys[0],) + tuple(reversed(frame_keys[1:]))
-    frame_store.set_retention_order(reordered_keys, frame_keys[0], -1)
+    frame_store.set_retention_plan(plan, frame_keys[0], -1)
     frame_store.set_displayed_key(frame_keys[1])
     taken = frame_store.take(frame_keys[5])
     assert taken is not None
@@ -220,12 +247,146 @@ def test_book_wide_cache_store_ledgers_stay_exact_across_mutations(
     )
     assert retained
     assert evicted == 0
-    assert frame_store.set_limits(unit_limit=96) == artifact_count - 96
+    assert frame_store.unit_count == artifact_count
     assert frame_store.evict_one()
-    assert frame_store.unit_count == 95
+    assert frame_store.unit_count == artifact_count - 1
     assert_frame_ledger()
     frame_store.clear()
     assert_frame_ledger()
+
+
+def test_combined_byte_eviction_prefers_old_layout_and_protects_near_plan(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    del qapp  # QPixmap construction only requires the shared application.
+    source = ZipImageSource(_write_zip(tmp_path, pages=5))
+    runtime = ZipRasterBookRuntime(
+        source,
+        1,
+        cache_byte_budget=1 << 30,
+    )
+    units = tuple(
+        ZipRasterDisplayUnit(
+            index,
+            (ZipRasterPage(index, f"{index}.png", (16, 16)),),
+            True,
+        )
+        for index in range(5)
+    )
+    spec = ZipRasterRenderSpec(
+        (16, 16),
+        decoder_maximum_size=(16, 16),
+    )
+    old_layout_spec = ZipRasterRenderSpec(
+        (32, 32),
+        decoder_maximum_size=(16, 16),
+    )
+    request = _request(
+        1,
+        units[2],
+        *units,
+        spec=spec,
+        direction=1,
+    )
+    current_key = runtime._key_for(units[2], spec)
+    runtime._current_request = request
+    runtime._current_key = current_key
+    runtime._frame_store.set_retention_plan(
+        request.warmup_plan,
+        current_key,
+        1,
+    )
+    runtime._frame_store.set_displayed_key(current_key)
+    runtime._source_store.set_retention_plan(
+        request.warmup_plan,
+        units[2],
+        spec,
+        1,
+    )
+    runtime._source_store.set_displayed_unit(units[2], spec)
+
+    source_keys: dict[int, _SourceKey] = {}
+    for index in (2, 3, 1, 0):
+        image = QImage(16, 16, QImage.Format.Format_ARGB32)
+        image.fill(index)
+        key = _SourceKey(
+            1,
+            runtime._source_identity,
+            f"{index}.png",
+            spec.adjustments,
+            (16, 16),
+            False,
+        )
+        source_keys[index] = key
+        runtime._source_store.put(
+            _CachedSource(key, index, image, (16, 16), True)
+        )
+
+    def put_frame(index: int, render_spec: ZipRasterRenderSpec) -> _UnitKey:
+        key = runtime._key_for(units[index], render_spec)
+        pixmap = QPixmap(16, 16)
+        pixmap.fill()
+        retained, evicted = runtime._frame_store.put(
+            _CachedFrame(
+                key,
+                units[index],
+                (
+                    ZipRasterFramePage(
+                        index,
+                        f"{index}.png",
+                        f"{index}.png",
+                        (16, 16),
+                        pixmap,
+                        None,
+                    ),
+                ),
+                (source_keys.get(index),),
+                0.0,
+                0.0,
+            )
+        )
+        assert retained
+        assert evicted == 0
+        return key
+
+    try:
+        protected_keys = {
+            put_frame(2, spec),
+            put_frame(3, spec),
+            put_frame(1, spec),
+        }
+        far_frame_key = put_frame(0, spec)
+        old_layout_key = put_frame(4, old_layout_spec)
+        old_layout_bytes = runtime._frame_store._frame_bytes(
+            runtime._frame_store.get(old_layout_key, touch=False)
+        )
+
+        # The stores together exceed the new byte target by exactly one old
+        # layout frame. Unified ranking must evict that frame, not blindly
+        # discard a reusable decoded source first.
+        runtime.set_cache_limits(
+            byte_budget=runtime.cache_bytes - old_layout_bytes
+        )
+        assert old_layout_key not in runtime._frame_store
+        assert far_frame_key in runtime._frame_store
+        assert runtime._source_store.get(source_keys[0]) is not None
+
+        # Under an impossible byte target, current/next/previous frame and
+        # source artifacts form the protected minimum; only farther artifacts
+        # are reclaimed.
+        runtime.set_cache_limits(byte_budget=1)
+        assert all(key in runtime._frame_store for key in protected_keys)
+        assert far_frame_key not in runtime._frame_store
+        assert all(
+            runtime._source_store.get(source_keys[index]) is not None
+            for index in (2, 3, 1)
+        )
+        assert runtime._source_store.get(source_keys[0]) is None
+        assert runtime.cache_bytes > runtime.cache_byte_budget
+    finally:
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()
 
 
 def test_runtime_uses_one_ordered_job_lane_and_paint_gates_prefetch(
@@ -295,7 +456,6 @@ def test_paint_ack_reclaims_old_frame_from_combined_soft_overflow(
     runtime = ZipRasterBookRuntime(
         source,
         1,
-        cache_unit_limit=2,
         cache_byte_budget=64 * 1024 * 1024,
     )
     frames: list[ZipRasterFrame] = []
@@ -339,7 +499,6 @@ def test_painted_book_warmup_resumes_on_budget_increase_and_fills_broad_order(
     runtime = ZipRasterBookRuntime(
         source,
         1,
-        cache_unit_limit=8,
     )
     frames: list[ZipRasterFrame] = []
     runtime.frameReady.connect(frames.append)
@@ -359,7 +518,6 @@ def test_painted_book_warmup_resumes_on_budget_increase_and_fills_broad_order(
     )
     request = _request(1, units[0], *units, direction=1)
     try:
-        assert runtime.cache_unit_limit == 8
         assert runtime.request(request)
         _wait_until(qapp, lambda: len(frames) == 1)
 
@@ -389,6 +547,52 @@ def test_painted_book_warmup_resumes_on_budget_increase_and_fills_broad_order(
         source.close()
 
 
+def test_soft_target_keeps_near_minimum_then_expansion_resumes_book(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    source = ZipImageSource(_write_zip(tmp_path, pages=8))
+    runtime = ZipRasterBookRuntime(
+        source,
+        1,
+        cache_byte_budget=64 * 1024 * 1024,
+        cache_soft_target_bytes=1,
+    )
+    frames: list[ZipRasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    units = tuple(_unit(index) for index in range(8))
+    request = _request(1, units[3], *units, direction=1)
+    try:
+        assert runtime.request(request)
+        _wait_until(qapp, lambda: len(frames) == 1)
+        assert runtime.release_prefetch(request_id=1)
+        _wait_until(
+            qapp,
+            lambda: not runtime.has_unfinished_tasks()
+            and runtime.warmup_stop_reason == "soft_target",
+        )
+
+        # The soft target is intentionally below one image. Current and the
+        # immediate forward/reverse display units are a minimum guarantee,
+        # never a maximum count.
+        assert set(runtime.cached_page_indexes) == {2, 3, 4}
+        assert runtime.cache_bytes > runtime.cache_soft_target_bytes
+
+        runtime.set_memory_limits(
+            hard_limit_bytes=64 * 1024 * 1024,
+            soft_target_bytes=64 * 1024 * 1024,
+        )
+        _wait_until(
+            qapp,
+            lambda: set(runtime.cached_page_indexes) == set(range(8))
+            and not runtime.has_unfinished_tasks(),
+        )
+        assert runtime.warmup_stop_reason == "complete"
+    finally:
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()
+
+
 def test_budget_shrink_cancels_running_background_snapshot(
     tmp_path: Path,
     qapp: QApplication,
@@ -411,7 +615,6 @@ def test_budget_shrink_cancels_running_background_snapshot(
     runtime = ZipRasterBookRuntime(
         source,
         1,
-        cache_unit_limit=3,
         cache_byte_budget=64 * 1024 * 1024,
     )
     frames: list[ZipRasterFrame] = []
@@ -458,6 +661,58 @@ def test_budget_shrink_cancels_running_background_snapshot(
         source.close()
 
 
+def test_soft_target_recovery_keeps_unrelated_background_decode(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    archive = _write_zip(tmp_path, pages=4)
+
+    class BlockingSource(ZipImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.far_started = Event()
+            self.release_far = Event()
+
+        def open_image(self, image_id: str) -> Image.Image:
+            if image_id == "2.png":
+                self.far_started.set()
+                self.release_far.wait(2.0)
+            return super().open_image(image_id)
+
+    source = BlockingSource(archive)
+    runtime = ZipRasterBookRuntime(
+        source,
+        1,
+        cache_byte_budget=64 * 1024 * 1024,
+        cache_soft_target_bytes=32 * 1024 * 1024,
+    )
+    frames: list[ZipRasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    units = tuple(_unit(index) for index in range(4))
+    request = _request(1, units[0], *units, direction=1)
+    try:
+        assert runtime.request(request)
+        _wait_until(qapp, lambda: len(frames) == 1)
+        assert runtime.release_prefetch(request_id=1)
+        _wait_until(qapp, source.far_started.is_set)
+
+        cancels_before = runtime.metrics.cancel_requests
+        runtime.set_memory_limits(
+            hard_limit_bytes=64 * 1024 * 1024,
+            soft_target_bytes=48 * 1024 * 1024,
+        )
+        assert runtime.metrics.cancel_requests == cancels_before
+
+        source.release_far.set()
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+        assert set(runtime.cached_page_indexes) == set(range(4))
+        assert runtime.metrics.jobs_submitted == 4
+    finally:
+        source.release_far.set()
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()
+
+
 def test_full_cache_navigation_reclaims_only_lower_rank_for_new_neighbor(
     tmp_path: Path,
     qapp: QApplication,
@@ -480,7 +735,6 @@ def test_full_cache_navigation_reclaims_only_lower_rank_for_new_neighbor(
     runtime = ZipRasterBookRuntime(
         source,
         1,
-        cache_unit_limit=3,
         cache_byte_budget=64 * 1024 * 1024,
     )
     frames: list[ZipRasterFrame] = []
@@ -504,6 +758,10 @@ def test_full_cache_navigation_reclaims_only_lower_rank_for_new_neighbor(
     try:
         assert runtime.request(initial)
         _wait_until(qapp, lambda: len(frames) == 1)
+        # Fit the current plus its first two progressively larger neighbors,
+        # but not a fourth page. The deprecated unit limit of one must not
+        # truncate this byte-driven warm-up.
+        runtime.set_cache_limits(byte_budget=runtime.cache_bytes * 4)
         assert runtime.release_prefetch(request_id=1)
         _wait_until(
             qapp,
@@ -513,9 +771,9 @@ def test_full_cache_navigation_reclaims_only_lower_rank_for_new_neighbor(
         assert set(runtime.cached_page_indexes) == {0, 1, 2}
 
         # Freeze the combined store at its exact full size, then move the
-        # ready current to page 2.  Page 3 outranks far page 0 in the new order
-        # and must slide the retained window despite there being zero free
-        # bytes at admission time.
+        # ready current to page 2. Page 3 outranks far page 0 in the new order.
+        # A small byte-only expansion makes that replacement affordable; the
+        # deprecated unit limit remains irrelevant.
         full_budget = runtime.cache_bytes
         runtime.set_cache_limits(byte_budget=full_budget)
         evictions_before = runtime.metrics.cache_evictions
@@ -535,6 +793,10 @@ def test_full_cache_navigation_reclaims_only_lower_rank_for_new_neighbor(
         assert frames[-1].request_id == 2
         assert frames[-1].cache_hit
         assert runtime.release_prefetch(request_id=2)
+        shifted_budget = (
+            full_budget + runtime._frame_store.largest_frame_bytes
+        )
+        runtime.set_cache_limits(byte_budget=shifted_budget)
         _wait_until(qapp, source.background_started.is_set)
 
         # Reversal cancels the decoded-but-uncommitted candidate.  Admission
@@ -573,7 +835,7 @@ def test_full_cache_navigation_reclaims_only_lower_rank_for_new_neighbor(
             spec,
             unit=units[2],
         ) is not None
-        assert runtime.cache_bytes <= full_budget
+        assert runtime.cache_bytes <= shifted_budget
         assert runtime.metrics.jobs_submitted == jobs_before + 2
         assert runtime.metrics.cache_evictions > evictions_before
     finally:
@@ -582,7 +844,7 @@ def test_full_cache_navigation_reclaims_only_lower_rank_for_new_neighbor(
         source.close()
 
 
-def test_reordered_warmup_cancels_background_that_is_no_longer_next(
+def test_direction_reversal_rejects_queued_old_serial_and_reorders_cursor(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
@@ -595,7 +857,7 @@ def test_reordered_warmup_cancels_background_that_is_no_longer_next(
             self.release_background = Event()
 
         def open_image(self, image_id: str) -> Image.Image:
-            if image_id == "1.png":
+            if image_id == "2.png":
                 self.background_started.set()
                 self.release_background.wait(2.0)
             return super().open_image(image_id)
@@ -604,7 +866,6 @@ def test_reordered_warmup_cancels_background_that_is_no_longer_next(
     runtime = ZipRasterBookRuntime(
         source,
         1,
-        cache_unit_limit=4,
     )
     frames: list[ZipRasterFrame] = []
     artifacts: list[int] = []
@@ -615,7 +876,7 @@ def test_reordered_warmup_cancels_background_that_is_no_longer_next(
     try:
         first = _request(
             1,
-            _unit(0),
+            _unit(1),
             _unit(0),
             _unit(1),
             _unit(2),
@@ -632,12 +893,13 @@ def test_reordered_warmup_cancels_background_that_is_no_longer_next(
         # order, but its immutable result still carries request 1.
         assert runtime.wait_for_done(3000)
 
-        # Page 1 remains somewhere in the replacement full-book order, but
-        # page 3 is now the highest-priority missing background unit.  The old
-        # job must be cancelled rather than adopted under the new serial.
+        # Reverse around the same ready current. The finished page-2 job is
+        # still an immediate neighbor, so retaining the worker object is
+        # useful; however, its already-built request-1 result must remain
+        # stale. The replacement lazy cursor starts with page 0.
         second = _request(
             2,
-            _unit(0),
+            _unit(1),
             _unit(0),
             _unit(3),
             _unit(2),
@@ -646,10 +908,10 @@ def test_reordered_warmup_cancels_background_that_is_no_longer_next(
         )
         assert runtime.request(second)
         assert runtime.release_prefetch(request_id=2)
-        assert runtime.metrics.cancel_requests == 1
-        _wait_until(qapp, lambda: 3 in artifacts)
+        assert runtime.metrics.cancel_requests == 0
+        _wait_until(qapp, lambda: 0 in artifacts)
 
-        assert artifacts[:2] == [0, 3]
+        assert artifacts[:2] == [1, 0]
         assert runtime.metrics.stale_results >= 1
         _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
     finally:
@@ -663,7 +925,7 @@ def test_completed_frames_outlive_active_frontier_and_make_roundtrip_ready(
     qapp: QApplication,
 ) -> None:
     source = ZipImageSource(_write_zip(tmp_path, pages=6))
-    runtime = ZipRasterBookRuntime(source, 1, cache_unit_limit=5)
+    runtime = ZipRasterBookRuntime(source, 1)
     frames: list[ZipRasterFrame] = []
     runtime.frameReady.connect(frames.append)
     try:
@@ -693,8 +955,14 @@ def test_completed_frames_outlive_active_frontier_and_make_roundtrip_ready(
         # remain valid completed artifacts because no cache limit is exceeded.
         assert set(runtime.cached_page_indexes) == {0, 1, 2, 3, 4}
 
-        # At capacity, the newly adjacent page replaces the farthest retained
-        # page instead of purging every frame outside the three active keys.
+        # Give the byte store enough headroom for most, but not all, of page 5.
+        # The newly adjacent frame then replaces the lowest-value far frame;
+        # no page-count ceiling participates in the decision.
+        capacity_budget = (
+            runtime.cache_bytes
+            + runtime._frame_store.largest_frame_bytes // 2
+        )
+        runtime.set_cache_limits(byte_budget=capacity_budget)
         assert runtime.request(
             _request(5, _unit(4), _unit(4), _unit(5), _unit(3), direction=1)
         )
@@ -704,7 +972,8 @@ def test_completed_frames_outlive_active_frontier_and_make_roundtrip_ready(
         assert runtime.release_prefetch(request_id=5)
         _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
         assert set(runtime.cached_page_indexes) == {1, 2, 3, 4, 5}
-        assert runtime.metrics.cache_evictions == 1
+        assert runtime.metrics.cache_evictions >= 1
+        assert runtime.cache_bytes <= capacity_budget
 
         submitted_before_roundtrip = runtime.metrics.jobs_submitted
         assert runtime.request(
@@ -874,7 +1143,11 @@ def test_layout_changes_reuse_book_scoped_decoded_source(
                 qapp,
                 lambda expected=request_id: frames[-1].request_id == expected,
             )
-            assert runtime.decoded_source_count == 1
+            assert runtime.release_prefetch(request_id=request_id)
+            # Count is not a policy boundary: the new current variant may
+            # coexist with one reusable preview while frames/older variants
+            # are reclaimed to the byte budget.
+            assert runtime.decoded_source_count <= 2
             assert runtime.cache_bytes <= one_variant_budget
     finally:
         assert runtime.shutdown(wait_msecs=3000)
@@ -1113,6 +1386,7 @@ def test_unknown_non_jpeg_prefetch_is_header_budgeted_before_pixel_decode(
         assert source.opens == ["0.png", "2.png"]
         assert runtime.metrics.jobs_submitted == 3
         assert runtime.metrics.prefetch_admission_stops == 1
+        assert runtime.metrics.oversized_prefetch_skips == 1
         assert runtime.cached_page_indexes == (0, 2)
         jobs_after_decline = runtime.metrics.jobs_submitted
         QTest.qWait(25)
@@ -1140,8 +1414,7 @@ def test_source_eviction_keeps_last_painted_frame_ready_for_reversal(
     runtime = ZipRasterBookRuntime(
         source,
         1,
-        cache_unit_limit=3,
-        cache_byte_budget=100_000,
+        cache_byte_budget=64 * 1024 * 1024,
     )
     frames: list[ZipRasterFrame] = []
     runtime.frameReady.connect(frames.append)
@@ -1156,7 +1429,24 @@ def test_source_eviction_keeps_last_painted_frame_ready_for_reversal(
         assert runtime.request(second)
         _wait_until(qapp, lambda: bool(frames) and frames[-1].request_id == 2)
         assert 0 in runtime.cached_page_indexes
-        assert runtime.metrics.source_cache_evictions >= 1
+        old_source = runtime._source_store.find(
+            first.current.pages[0],
+            spec,
+            unit=first.current,
+        )
+        assert old_source is not None
+        target_budget = runtime.cache_bytes - old_source.qimage.sizeInBytes()
+        runtime.set_cache_limits(byte_budget=target_budget)
+        # The prior painted source remains protected until the replacement
+        # paint acknowledgement transfers displayed ownership.
+        assert runtime._source_store.get(old_source.key) is not None
+        source_evictions_before = runtime.metrics.source_cache_evictions
+        assert runtime.release_prefetch(request_id=2)
+        assert (
+            runtime.metrics.source_cache_evictions
+            == source_evictions_before + 1
+        )
+        assert runtime.cache_bytes <= target_budget
 
         jobs_before_reversal = runtime.metrics.jobs_submitted
         assert runtime.request(_request(3, _unit(0), _unit(0), spec=spec))
@@ -1220,12 +1510,25 @@ def test_source_eviction_keeps_last_painted_frame_ready_for_reversal(
         # after request 12, even though full-book work orders can keep the same
         # key relevant by identity.  The next source consumer therefore asks
         # for a fresh hydration rather than accepting stale work.
-        assert runtime.decoded_source_count == 0
+        assert runtime._source_store.find(
+            _unit(0).pages[0],
+            spec,
+            unit=_unit(0),
+        ) is None
         fresh_hydration = _request(13, _unit(0), _unit(0), spec=spec)
         assert runtime.require_cached_current_source(fresh_hydration)
         jobs_before_fresh_hydration = runtime.metrics.jobs_submitted
         assert runtime.request(fresh_hydration)
-        _wait_until(qapp, lambda: runtime.decoded_source_count > 0)
+        _wait_until(
+            qapp,
+            lambda: runtime._source_store.find(
+                fresh_hydration.current.pages[0],
+                spec,
+                unit=fresh_hydration.current,
+            )
+            is not None
+            and not runtime.has_unfinished_tasks(),
+        )
         assert (
             runtime.metrics.jobs_submitted
             == jobs_before_fresh_hydration + 1

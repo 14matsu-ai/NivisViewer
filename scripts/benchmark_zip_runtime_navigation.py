@@ -748,7 +748,7 @@ def _runtime_quiet(window: ViewerWindow) -> bool:
     return bool(
         isinstance(runtime, ZipRasterBookRuntime)
         and not runtime.has_unfinished_tasks()
-        and runtime._active_job is None
+        and runtime.active_job_count == 0
         and window._pending_zip_runtime_request is None
         and not window._zip_runtime_request_timer.isActive()
     )
@@ -866,31 +866,6 @@ def _ensure_anchor_and_clear(
     gc.collect()
 
 
-def _install_legacy_frontier_purge(runtime: ZipRasterBookRuntime) -> None:
-    """Benchmark-only reproduction of the superseded three-unit purge.
-
-    This does not add a production fallback. It lets the same process fixture,
-    decoder and Viewer path measure only the cache-ownership policy changed by
-    ``_ZipRasterFrameStore``.
-    """
-
-    original_request = runtime.request
-
-    def request_with_frontier_purge(
-        current_runtime: ZipRasterBookRuntime,
-        request,
-    ) -> bool:
-        accepted = original_request(request)
-        desired = set(current_runtime._work_keys)
-        frames = current_runtime._frame_store._frames
-        for key in tuple(frames):
-            if desired and key not in desired:
-                frames.pop(key, None)
-        return accepted
-
-    runtime.request = MethodType(request_with_frontier_purge, runtime)
-
-
 def _finish_regular_scenario(
     application: QApplication,
     window: ViewerWindow,
@@ -927,7 +902,6 @@ def _viewer_case(
     viewport: tuple[int, int],
     cache_mib: int,
     timeout_seconds: float,
-    cache_policy: str,
 ) -> Iterator[tuple[ViewerWindow, _ViewerProbe]]:
     config = ConfigManager(root / "benchmark-config.json")
     config.load()
@@ -937,7 +911,9 @@ def _viewer_case(
             "single_first_page": False,
             "viewer_resampling_mode": "standard",
             "fit_mode": "fit_window",
-            "viewer_cache_max_memory_mib": int(cache_mib),
+            "viewer_memory_mode": (
+                "minimal" if int(cache_mib) == 128 else str(int(cache_mib))
+            ),
             "show_page_list": False,
         },
         save=True,
@@ -986,8 +962,6 @@ def _viewer_case(
         if not window._zip_runtime_active:
             raise AssertionError("production ZIP runtime was not selected")
         probe = _ViewerProbe(window)
-        if cache_policy == "legacy-frontier-purge":
-            _install_legacy_frontier_purge(probe.runtime)
         if not _wait_for_quiet(
             application,
             window,
@@ -1221,12 +1195,15 @@ def _run_scenarios(
 
     # Bound this case independently: if pressure causes repeated neighbor
     # submissions, report that fact and cancel only this runtime's request.
-    normal_budget = window.image_cache.cache_byte_budget_bytes
+    normal_budget = probe.runtime.cache_byte_budget
     _ensure_anchor_and_clear(
         application, window, probe, 9, timeout_seconds=timeout_seconds
     )
     pressure_bytes = max(1, int(pressure_mib) * _MIB)
-    window.image_cache.set_cache_byte_budget_bytes(pressure_bytes)
+    probe.runtime.set_memory_limits(
+        hard_limit_bytes=pressure_bytes,
+        soft_target_bytes=pressure_bytes,
+    )
     snapshot = probe.begin()
     starting_jobs = probe.runtime.metrics.jobs_submitted
     pressure_leg = _execute_leg(
@@ -1266,8 +1243,10 @@ def _run_scenarios(
         cleanup_cancelled=cleanup_cancelled,
     )
     results["memory_pressure"]["configured_budget_bytes"] = pressure_bytes
-    window.image_cache.set_cache_byte_budget_bytes(normal_budget)
-    probe.runtime.set_cache_limits(byte_budget=normal_budget)
+    probe.runtime.set_memory_limits(
+        hard_limit_bytes=normal_budget,
+        soft_target_bytes=normal_budget,
+    )
 
     return results
 
@@ -1287,16 +1266,22 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--viewport-width", type=int, default=1200)
     parser.add_argument("--viewport-height", type=int, default=800)
-    parser.add_argument("--cache-mib", type=int, default=256)
+    parser.add_argument(
+        "--cache-mib",
+        type=int,
+        choices=(128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768),
+        default=256,
+        help="hard raster cache limit; background population uses its soft target",
+    )
     parser.add_argument("--pressure-mib", type=int, default=6)
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument(
         "--cache-policy",
-        choices=("retention", "legacy-frontier-purge"),
-        default="retention",
+        choices=("memory-budget", "retention"),
+        default="memory-budget",
         help=(
-            "retention is production B; legacy-frontier-purge is a "
-            "benchmark-only reproduction of superseded A"
+            "memory-budget is the sole production policy; retention remains "
+            "as a deprecated command-line alias"
         ),
     )
     parser.add_argument(
@@ -1343,7 +1328,6 @@ def main() -> int:
             viewport=viewport,
             cache_mib=int(args.cache_mib),
             timeout_seconds=float(args.timeout),
-            cache_policy=str(args.cache_policy),
         ) as (window, probe):
             scenarios = _run_scenarios(
                 application,
@@ -1353,9 +1337,10 @@ def main() -> int:
                 pressure_mib=int(args.pressure_mib),
             )
         report = {
-            "schema_version": 2,
+            "schema_version": 3,
             "path": "ViewerWindow -> ZipRasterBookRuntime",
-            "cache_policy": str(args.cache_policy),
+            "cache_policy": "memory-budget",
+            "memory_policy": window.viewer_memory_debug_values(),
             "qt_platform": os.environ.get("QT_QPA_PLATFORM"),
             "fixture": {
                 "temporary_directory": True,
@@ -1368,10 +1353,10 @@ def main() -> int:
                 "viewport": list(viewport),
             },
             "measurement_scope": {
-                "legacy_ab": (
-                    "cache-policy A/B only: both modes use the production ZIP "
-                    "runtime, decoder and render path; legacy-frontier-purge "
-                    "reproduces only the superseded cache-membership rule"
+                "cache_policy": (
+                    "the production lazy book-wide warm-up plan is bounded "
+                    "only by resolved soft/hard byte targets; no benchmark "
+                    "page-count or three-unit purge adapter is installed"
                 ),
                 "retained_roundtrip": (
                     "walks four pages beyond the old three-unit frontier and "

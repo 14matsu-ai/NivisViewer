@@ -403,16 +403,19 @@ class SettingsDialog(QDialog):
         )
         spread_form.addRow(self.viewer_slider_wheel_single_page_checkbox)
 
-        prefetch_group = QGroupBox("Viewer先読みとメモリ", tab)
-        prefetch_layout = QVBoxLayout(prefetch_group)
-        prefetch_form = QFormLayout()
-        self.viewer_memory_mode_combo = QComboBox(prefetch_group)
+        memory_group = QGroupBox("Viewerメモリ", tab)
+        memory_form = QFormLayout(memory_group)
+        self.viewer_memory_mode_combo = QComboBox(memory_group)
         for label, value in VIEWER_MEMORY_MODE_LABELS:
             self.viewer_memory_mode_combo.addItem(label, value)
-        prefetch_form.addRow(
+        memory_form.addRow(
             "ビューワーのメモリ使用量:",
             self.viewer_memory_mode_combo,
         )
+
+        prefetch_group = QGroupBox("PDF・旧形式の先読み", tab)
+        prefetch_layout = QVBoxLayout(prefetch_group)
+        prefetch_form = QFormLayout()
         self.prefetch_preset_combo = QComboBox(prefetch_group)
         for label, value in (
             ("無効", "disabled"),
@@ -456,8 +459,8 @@ class SettingsDialog(QDialog):
         custom_form.addRow("PDF 逆方向:", self.prefetch_pdf_backward_spin)
         prefetch_layout.addWidget(self.prefetch_custom_group)
         display_unit_note = QLabel(
-            "ZIP・Folderは、無効以外ではメモリ上限まで近い順に"
-            "先読みします。上の画像件数はその他の形式用です。\n"
+            "ZIP・Folderは上のメモリ量だけで保持量を決めます。"
+            "この先読み設定はPDFと旧pipeline形式だけに適用されます。\n"
             "単ページ表示では1表示単位＝1ページ、"
             "見開き表示では1表示単位＝1見開きです。",
             prefetch_group,
@@ -511,6 +514,7 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(behavior_group)
         layout.addWidget(spread_group)
+        layout.addWidget(memory_group)
         layout.addWidget(prefetch_group)
         layout.addWidget(fullscreen_group)
         layout.addStretch(1)

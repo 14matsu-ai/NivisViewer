@@ -2921,13 +2921,13 @@ by this optional-prefetch rule and retains the existing protected-current soft
 overflow contract.
 
 The reservation phase removes nothing. Only a successful result that still
-matches the active request re-plans from its actual QImage sizes and reclaims
-the required lower-rank source/frame artifacts immediately before QPixmap
-upload and store insertion. Cancellation, stale completion and exact admission
-decline therefore preserve the old ready cache; a successful page turn can
-still slide a full cache window toward the new current page. The bounded
-transient is at most the single active worker result outside the retained-cache
-ledger.
+matches the active request re-plans from its actual QImage sizes. It completes
+every QPixmap upload first, then reclaims the required lower-rank source/frame
+artifacts immediately before store insertion. Cancellation, stale completion,
+upload failure and exact admission decline therefore preserve the old ready
+cache; a successful page turn can still slide a full cache window toward the
+new current page. The bounded transient is the single active worker result and
+its GUI upload outside the retained-cache ledger.
 
 Both source and frame stores now maintain aggregate bytes incrementally on
 insert, replacement and removal. Their largest-artifact query uses a bounded
@@ -2936,9 +2936,11 @@ worst-first candidate order avoid rescanning and sorting the full store for
 every item removed during one pressure event. Protection remains store-aware:
 current/required sources and current/last-painted frames are excluded from
 their respective candidate orders. A live budget reduction first cancels a
-non-current job carrying the obsolete larger admission snapshot, applies unit
-and byte eviction, then re-drives the latest order under the new limit. A live
-increase clears only capacity declines and resumes the paint-released order.
+non-current job carrying the obsolete larger admission snapshot, applies
+byte-ranked eviction, then re-drives the latest order under the new limit. A
+live increase clears only capacity declines and resumes the paint-released
+order. An in-flight job adopts the larger allowance and is cancelled only when
+a newly affordable, higher-priority skipped unit must overtake it.
 These are NivisViewer scaling and lifetime changes; no additional ZipPlaFork
 C# statement was copied for them.
 
@@ -2947,10 +2949,233 @@ The remaining boundaries are explicit:
 | Residual | Current behavior and risk |
 |---|---|
 | Lazy-size wide/spread topology | A decoded preview/full source survives size discovery and can be reused. If the newly known aspect changes single, spread-partner or wide-split topology, however, the old layout key is not a complete frame for the new unit. A display-ready frame must be generated again, without another source decode when the retained tier is sufficient. |
-| Very large books | `ViewerWindow._zip_runtime_request` currently materializes the complete display-unit work order on every navigation request. This is O(N); at roughly 10,000 pages and above it may re-enter the ready-hit critical path. That physical-device risk has not been quantified, and a compact/lazy order representation remains follow-up work. |
+| Very large books | Resolved in section 19: topology is built once per layout revision and navigation replaces only a lazy current-centered cursor. Physical-device responsiveness around 10,000 pages remains unverified, but the former per-input full-order materialization is gone. |
 | PageList live memory update | `ViewerPageListRuntime` remains deliberately separate, with a creation-time QImage budget of one quarter of the main budget clamped to 8–64 MiB. It has no live resize API, so changing `viewer_memory_mode` immediately resizes the main Viewer cache/Raster boundary but not an already open PageList runtime; a subsequently created book/runtime receives the new derived value. |
 
 These residuals do not change the 24-page results in section 18.4. They limit
 the claim to the measured ordinary book and establish the next optimization
 boundaries rather than asserting constant-time ready hits for every book size
 or topology transition.
+
+## 19. Memory-driven raster cache ownership (2026-08-21 worktree)
+
+This section records the cache-subsystem replacement visible in the current
+worktree. It supersedes the count/frontier descriptions in sections 18.3 and
+18.5 where they conflict. The policy, lazy planner, admission owner and
+count-free source/frame stores are connected to the ZIP/Folder production
+runtime and `ViewerWindow`; physical-device behavior remains explicitly
+unverified.
+
+### 19.1 Fixed-revision provenance and adopted boundary
+
+The source reference remains
+[`himamon/ZipPlaFork`](https://github.com/himamon/ZipPlaFork) revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, AGPL-3.0-or-later.  Its retained
+license and copyright material remain at `licenses/ZipPlaFork/AGPL.txt` and
+`licenses/ZipPlaFork/About.txt`; the notices in section 1 and
+`THIRD_PARTY_NOTICES.md` apply to this structural port.
+
+The following table records the actual fixed-revision methods, not only the
+general idea of a memory-aware cache:
+
+| ZipPlaFork source / method | Fixed-revision behavior | Adopted NivisViewer principle |
+|---|---|---|
+| `source/ZipPla/ViewerForm.cs`, `GetUserMemoryUBound` (`:5442-5449`) | Caps the requested Viewer memory by physical RAM and process address-space constraints. | Resolve one explicit Viewer hard ceiling from the saved mode and machine snapshot rather than deriving residency from a page count. |
+| `ViewerForm.SetMemoryUBound` (`:5424-5439`) | Recalculates a usable bound from process working set, available physical memory and active/inactive coefficients of 0.7/0.3. | Keep separate active/inactive population targets and react to physical-memory pressure, while using stable modern policy state rather than copying the exact formula. |
+| `ViewerForm.SetNewResizedImage` (`:5451-5468`) | Recomputes the bound, makes room with `ReduceUsingMemory`, publishes a completed `VirtualBitmapEx` only if it can be admitted, otherwise disposes and requeues it. | Perform non-mutating admission before decode where possible and commit replacement/eviction only for a successful, still-relevant completed artifact. |
+| `ViewerForm.ReduceUsingMemory` (`:5471-5524`) | Walks the low-priority tail of the latest work order, disposes resized and retained original ownership together, and uses a small count only as a minimum-neighborhood guarantee. | Evict from the least useful retention rank under byte pressure; current, spread partner and the last painted frame remain protected.  Page count is not a maximum-residency contract. |
+| `ViewerForm.SetBackgroundMode` (`:5558-5582`) and `priorityLevel` (`:5586-5605`) | Builds an all-page order around current/next/previous/remaining bands, installs it, reduces memory, and runs the Viewer worker with thread count one. | Represent the whole book as current-centered work, re-prioritize it on navigation and run one active display-unit job. |
+| `source/ZipPla/GenerarClasses.cs`, `BackgroundMultiWorker.SetWorksOrder` (`:247-264`) and completion selection (`:266-303`) | Replaces the permutation while work is active; at a completion boundary it skips already-started entries and selects the first unfinished item from the newest order. | Replace unstarted background work around the latest current unit, while keeping NivisViewer's cooperative cancellation and request/epoch stale fences. |
+
+This remains a direct AGPL-derived **structural** port, not a line-for-line C#
+translation.  NivisViewer does not adopt `ulong.MaxValue` as an Auto sentinel,
+GDI `Bitmap` arrays, WinForms active-form checks, the exact 0.7/0.3 equation,
+or a full-array sort on every page turn.
+
+### 19.2 Resolved memory policy
+
+`app/viewer_memory_policy.py` now separates the configured ceiling from the
+normal background-population target:
+
+- `ViewerMemoryResolution.hard_limit_bytes` is the byte-exact fixed mode or the
+  stable Auto bucket.  Compatibility properties `bytes` and `mib` expose the
+  same hard ceiling to callers not yet migrated to the explicit names.
+- `active_soft_target_bytes` is seven eighths (87.5%) of the hard ceiling and
+  leaves room for one decoder result, QImage/QPixmap upload and Qt/native
+  allocations that are not fully visible to the retained-artifact ledger.
+- `inactive_soft_target_bytes` is one half of the hard ceiling.  Changing
+  active state selects a different soft target; it does not reinterpret the
+  saved setting or change the hard ceiling.
+- The OS reserve is the larger of 2 GiB or 20% of total physical RAM, bounded
+  by total RAM.  Existing cache is added back once when available memory is
+  evaluated, while non-cache process working set is charged separately.
+- Auto still resolves to a stable 128 MiB through 32 GiB bucket.  A live
+  pressure sample may lower the pressure ceiling immediately, in 16 MiB
+  granularity, but does not make Auto's hard ceiling flap.  Recovery requires
+  meaningful headroom and grows by at most the larger of 64 MiB or one eighth
+  of the hard ceiling per observation.  Only an explicit setting
+  `reconfigure` resolves a different Auto hard ceiling.
+- `ResolvedViewerMemoryPolicy.debug_values()` exposes saved mode, hard limit,
+  both soft targets, selected target, reserve, pressure ceiling, cache bytes
+  and the physical-memory snapshot to tests/benchmarks.  It emits no
+  production log.
+
+The current `ViewerWindow` worktree owns one `ResolvedViewerMemoryPolicy`,
+samples physical memory on a five-second timer and on active/inactive changes,
+and exposes both the hard budget and selected soft target.  `minimal` and the
+fixed modes therefore remain hard ceilings even under pressure; pressure
+changes how far optional background population may proceed.  Required current
+display work remains outside the optional-background soft gate and may
+temporarily overflow it, subject to subsequent low-priority reduction.
+
+### 19.3 Lazy book-wide planner and page-count removal
+
+`app/raster_warmup_planner.py` separates immutable book topology from one
+navigation plan.  `ViewerWindow._raster_book_topology` walks the PageModel
+display-unit boundary once per book generation, source identity and topology
+revision.  A page turn then creates a small `RasterWarmupPlan`; it does not
+materialize or sort a new all-page list.
+
+After the current complete frame's paint acknowledgement, the plan lazily
+enumerates the preferred-direction neighbor, the opposite neighbor and then
+both sides at increasing distance.  It represents every single/spread display
+unit in the book, but creates candidates only as the one worker asks for them.
+Direction reversal replaces the plan and therefore the unstarted cursor.
+Capacity skips, the unprocessed hint and explicit waiting/running/soft-target/
+hard-limit/complete/suspended stop reasons belong to `RasterWarmupPlanner`, not
+to a timer or to cache membership.
+
+Neither source nor frame store accepts a maximum page/unit count.
+`cache_unit_limit` and the `set_cache_limits(unit_limit=...)` compatibility
+surface have also been removed from `RasterBookRuntime`; callers, tests and
+current runtime benchmarks use byte limits only. `BookSession` constructs ZIP
+and Folder runtimes from the combined byte budget without supplying a page
+count. Thus the removal boundary is explicit:
+
+| Count-like value | Current classification |
+|---|---|
+| Raster artifact count | Diagnostic only; no constructor/property/setter count limit remains. |
+| Book topology length | Finite iteration and identity safety boundary; not a cache cap. |
+| current/spread/next/previous neighborhood | Minimum protection/priority band; not a maximum. |
+| `ImageCache.cache_size` and legacy image prefetch counts | Retained for PDF, RAR/7z, custom sources and the non-raster pipeline; not the ZIP/Folder runtime membership rule. |
+| PageList thumbnail count/range | Separate virtualized PageList ownership, outside the main raster source/frame ledger. |
+
+Consequently a small-page book may retain hundreds or thousands of completed
+units until the byte target is reached, while a large-image book naturally
+retains fewer.  Reaching 24, 32 or 64 units is not itself a reason for the
+raster worker to become idle.
+
+### 19.4 NivisViewer-specific modern cache contract
+
+The memory/work-order principle is combined with NivisViewer behavior that is
+not copied from ZipPlaFork:
+
+- `_ZipRasterSourceStore` owns decoded QImages separately from
+  `_ZipRasterFrameStore`'s layout/DPR/rotation-specific complete frames; their
+  actual byte costs form one combined ledger at the runtime boundary.
+- Normal fit warm-up stores a sufficient preview source and a display-ready
+  frame.  Full decoded source is promoted for the current page only when
+  magnifier, actual size, manual zoom, pixel mode or another explicit
+  full-resolution demand requires it.  A sufficient preview/full tier can
+  survive a frame-layout invalidation and avoid another archive/file decode.
+- Retention rank comes from the current lazy plan and direction.  Current
+  display unit, complete spread partner and last-painted frame are protected;
+  obsolete layout/DPR/rotation variants, unnecessary full sources and distant
+  opposite-side artifacts are natural low-priority candidates.
+- Admission calculates free bytes plus reclaimable strictly lower-rank
+  artifacts without first deleting them.  Unknown-cost background pages are
+  header-probed by the one worker.  A stale, cancelled, failed or oversized
+  result leaves the existing ready cache intact; one skipped oversized page
+  does not end the remaining book-wide walk.
+- A successful relevant result is rechecked using actual QImage/frame costs.
+  Every QPixmap upload must then succeed before lower-rank ownership is
+  reclaimed and the new artifact is inserted. This preserves ready-hit reuse
+  and avoids destroying the old frame for a speculative decode or failed GUI
+  upload.
+- Request/source epoch, layout and DPR validation, complete-spread atomic
+  commit, old-frame retention through replacement paint, high-DPI targets,
+  virtual PageList isolation and callback-drained shutdown remain authoritative
+  NivisViewer contracts.
+
+`app/raster_admission_policy.py` is the standalone soft/hard decision owner
+(`ADMIT`, reclaim, exact probe, soft stop, hard refusal and oversized skip) used
+by `RasterBookRuntime`. Known costs are decided before dispatch; unknown PNG/
+WebP-like sizes are header-probed by the one worker and reported through the
+same capacity/oversized diagnostics before pixel decode. The lazy planner
+pauses at soft target without consuming the deferred unit, and a later target
+increase resets that cursor and resumes immediately. Final 200-500-page
+population figures are recorded below after the reproducible CLI run;
+physical-device responsiveness remains validation work rather than an inferred
+result.
+
+### 19.5 Reproducible 300-page population result
+
+`scripts/benchmark_raster_memory_population.py` drives the production ZIP or
+Folder runtime directly in a fresh offscreen child process. It paints and
+acknowledges the first complete frame, then samples at 1, 3 and 10 seconds.
+Fixtures live only in a temporary directory; no application window or native
+input is created. The default safe matrix uses 300 JPEG pages, a 400 x 600
+physical-pixel target, small 240 x 360 images, large 2400 x 3600 images, and an
+alternating mixed book. The 4 GiB/Auto cases remain bounded to at most
+576,000,000 retained source+frame pixel bytes and do not reserve their hard
+limit up front.
+
+On the measured 128-GiB host, resolved hard/active-soft values were:
+
+| Mode | Hard limit | Active soft target |
+|---|---:|---:|
+| 256 MiB | 268,435,456 B | 234,881,024 B |
+| 4 GiB | 4,294,967,296 B | 3,758,096,384 B |
+| Auto | 34,359,738,368 B (32 GiB bucket) | 30,064,771,072 B (28 GiB) |
+
+Every first-paint sample had exactly one ready page, one running worker and
+stop reason `running`. The following values are from the second complete run:
+
+| Source/profile/mode | First paint / cache | Ready at 1s / 3s / 10s | 10s cache | Final state / capacity skips | Read / decode / duplicate | WS delta |
+|---|---:|---:|---:|---|---:|---:|
+| ZIP small 256 | 6.498 ms / 691,200 B | 155 / 300 / 300 | 207,360,000 B | complete / 0 | 300 / 300 / 0 | 108,257,280 B |
+| ZIP large 256 | 14.600 ms / 1,920,000 B | 87 / 122 / 122 | 234,240,000 B | complete_with_skips / 178 | 122 / 122 / 0 | 121,462,784 B |
+| ZIP mixed 256 | 7.377 ms / 691,200 B | 112 / 179 / 179 | 233,088,000 B | complete_with_skips / 121 | 179 / 179 / 0 | 129,900,544 B |
+| Folder small 256 | 8.339 ms / 604,800 B | 154 / 300 / 300 | 181,440,000 B | complete / 0 | 300 / 300 / 0 | 186,617,856 B |
+| Folder large 256 | 18.065 ms / 2,580,000 B | 81 / 89 / 89 | 229,620,000 B | complete_with_skips / 211 | 89 / 89 / 0 | 235,204,608 B |
+| Folder mixed 256 | 8.619 ms / 604,800 B | 110 / 144 / 144 | 229,305,600 B | complete_with_skips / 156 | 144 / 144 / 0 | 239,611,904 B |
+| ZIP mixed 4 GiB | 6.659 ms / 691,200 B | 112 / 300 / 300 | 391,680,000 B | complete / 0 | 300 / 300 / 0 | 217,829,376 B |
+| ZIP mixed Auto | 6.458 ms / 691,200 B | 111 / 299 / 300 | 391,680,000 B | complete / 0 | 300 / 300 / 0 | 219,541,504 B |
+| Folder mixed 4 GiB | 10.664 ms / 604,800 B | 109 / 296 / 300 | 477,720,000 B | complete / 0 | 300 / 300 / 0 | 500,289,536 B |
+| Folder mixed Auto | 8.538 ms / 604,800 B | 109 / 297 / 300 | 477,720,000 B | complete / 0 | 300 / 300 / 0 | 500,363,264 B |
+
+All cases finished with source-only count zero, no duplicate decode, no
+eviction, no oversized skip, no stale/cancel result and no soft/hard overflow.
+In the 256-MiB large/mixed cases, `complete_with_skips` means that the planner
+visited the complete book and skipped units that could not be admitted below
+the active soft target; `missing_ready_page_count` records those pages while
+`unprocessed_unit_count` correctly reaches zero. One page did not halt later
+smaller work. The 4-GiB and Auto mixed books populated all 300 pages, proving
+that 24/32/64 pages are not hidden stop conditions.
+
+Every child exited normally. Runtime callbacks drained, active job count and
+unfinished task count reached zero, ZIP/folder sources closed, fixtures were
+renameable before teardown, and temporary directories were removed. Shutdown
+took 12.950--29.778 ms.
+
+The pre-change ad-hoc baseline is not a valid numeric A/B for ready counts: it
+used 160 x 240 small pages and populated the 256-MiB hard limit, whereas this
+benchmark uses 240 x 360 pages and intentionally stops optional work at the
+active soft target. Its `195 ready / 266,014,320 B` therefore must not be
+compared with `122` or `179` as a regression. The valid contract comparison is
+that both old and new 4-GiB/Auto runs can retain all 300 pages, while the new
+path additionally has no count cap, an explicit soft/hard boundary, lazy
+book-wide completion and exact skip/restart diagnostics.
+
+### 19.6 Remaining validation boundary
+
+The offscreen results demonstrate memory-driven population and resource
+lifetime, not physical-device smoothness. Task-local decoder buffers, QPixmap
+upload and Qt/native allocations are transient and cannot be charged exactly
+to the retained ledger; process working set is therefore expected to differ
+from `cache_used_bytes`. The five-second pressure sampler, active/inactive
+shrink and incremental recovery are covered by policy/runtime tests, including
+preservation of an unrelated in-flight decode during recovery. Real-device
+checks must still cover long idle warm-up, a page turn during that warm-up,
+direction reversal, magnifier/full-source promotion, window deactivation and
+returning to an already warmed page.

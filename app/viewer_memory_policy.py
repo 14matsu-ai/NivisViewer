@@ -47,6 +47,18 @@ _MODE_MIB: Final[dict[str, int]] = {
 }
 _AUTO_BUCKETS_MIB: Final[tuple[int, ...]] = tuple(_MODE_MIB.values())
 
+# The user-selected value is a hard cache ceiling, not an allocation request.
+# Background work stays below the active soft target so a decoder result and Qt
+# native allocations have headroom.  An inactive Viewer releases substantially
+# more distant cache without changing the user's configured ceiling.
+_ACTIVE_SOFT_NUMERATOR: Final = 7
+_ACTIVE_SOFT_DENOMINATOR: Final = 8
+_INACTIVE_SOFT_NUMERATOR: Final = 1
+_INACTIVE_SOFT_DENOMINATOR: Final = 2
+_PRESSURE_GRANULARITY_BYTES: Final = 16 * MIB
+_MIN_RECOVERY_STEP_BYTES: Final = 64 * MIB
+_MIN_RECOVERY_HEADROOM_BYTES: Final = 32 * MIB
+
 
 @dataclass(frozen=True, slots=True)
 class PhysicalMemorySnapshot:
@@ -58,14 +70,122 @@ class PhysicalMemorySnapshot:
 @dataclass(frozen=True, slots=True)
 class ViewerMemoryResolution:
     mode: str
-    bytes: int
+    hard_limit_bytes: int
+    active_soft_target_bytes: int
+    inactive_soft_target_bytes: int
     snapshot: PhysicalMemorySnapshot | None
     current_cache_bytes: int
     os_reserve_bytes: int
+    pressure_ceiling_bytes: int
+
+    @property
+    def bytes(self) -> int:
+        """Backward-compatible alias for the former single budget."""
+        return self.hard_limit_bytes
 
     @property
     def mib(self) -> int:
-        return self.bytes // MIB
+        """Backward-compatible MiB view of :attr:`hard_limit_bytes`."""
+        return self.hard_limit_bytes // MIB
+
+    def target_bytes_for(self, *, active: bool) -> int:
+        """Return the background population target for the Viewer state."""
+        if active:
+            return self.active_soft_target_bytes
+        return self.inactive_soft_target_bytes
+
+    def debug_values(self, *, active: bool = True) -> dict[str, int | str | None]:
+        """Return benchmark/debug data without producing a production log."""
+        snapshot = self.snapshot
+        return {
+            "mode": self.mode,
+            "hard_limit_bytes": self.hard_limit_bytes,
+            "active_soft_target_bytes": self.active_soft_target_bytes,
+            "inactive_soft_target_bytes": self.inactive_soft_target_bytes,
+            "selected_soft_target_bytes": self.target_bytes_for(active=active),
+            "pressure_ceiling_bytes": self.pressure_ceiling_bytes,
+            "os_reserve_bytes": self.os_reserve_bytes,
+            "current_cache_bytes": self.current_cache_bytes,
+            "total_physical_bytes": (
+                snapshot.total_physical_bytes if snapshot is not None else None
+            ),
+            "available_physical_bytes": (
+                snapshot.available_physical_bytes if snapshot is not None else None
+            ),
+            "process_working_set_bytes": (
+                snapshot.process_working_set_bytes if snapshot is not None else None
+            ),
+        }
+
+
+def _soft_target_bytes(hard_limit_bytes: int, *, active: bool) -> int:
+    hard_limit = max(0, int(hard_limit_bytes))
+    if active:
+        return (
+            hard_limit * _ACTIVE_SOFT_NUMERATOR // _ACTIVE_SOFT_DENOMINATOR
+        )
+    return hard_limit * _INACTIVE_SOFT_NUMERATOR // _INACTIVE_SOFT_DENOMINATOR
+
+
+def _os_reserve_bytes(total_physical_bytes: int) -> int:
+    total = max(0, int(total_physical_bytes))
+    return min(total, max(2 * GIB, total // 5))
+
+
+def _safe_cache_capacity_bytes(
+    snapshot: PhysicalMemorySnapshot,
+    *,
+    current_cache_bytes: int,
+) -> tuple[int, int]:
+    """Return cache capacity that preserves the OS reserve and its reserve.
+
+    The cache is part of both process working set and unavailable physical
+    memory.  Add it back exactly once before calculating how much cache can
+    remain, while charging non-cache process memory separately.
+    """
+    total = max(0, int(snapshot.total_physical_bytes))
+    available = min(total, max(0, int(snapshot.available_physical_bytes)))
+    working_set = max(0, int(snapshot.process_working_set_bytes))
+    cache_bytes = max(0, int(current_cache_bytes))
+    reserve = _os_reserve_bytes(total)
+    non_cache_working_set = max(0, working_set - cache_bytes)
+    available_bound = max(0, cache_bytes + available - reserve)
+    total_bound = max(0, total - reserve - non_cache_working_set)
+    return min(available_bound, total_bound), reserve
+
+
+def _resolution(
+    mode: str,
+    hard_limit_bytes: int,
+    *,
+    snapshot: PhysicalMemorySnapshot | None,
+    current_cache_bytes: int,
+    os_reserve_bytes: int,
+    pressure_ceiling_bytes: int | None = None,
+) -> ViewerMemoryResolution:
+    hard_limit = max(0, int(hard_limit_bytes))
+    pressure_ceiling = hard_limit
+    if pressure_ceiling_bytes is not None:
+        pressure_ceiling = max(
+            0,
+            min(hard_limit, int(pressure_ceiling_bytes)),
+        )
+    return ViewerMemoryResolution(
+        mode=mode,
+        hard_limit_bytes=hard_limit,
+        active_soft_target_bytes=min(
+            _soft_target_bytes(hard_limit, active=True),
+            pressure_ceiling,
+        ),
+        inactive_soft_target_bytes=min(
+            _soft_target_bytes(hard_limit, active=False),
+            pressure_ceiling,
+        ),
+        snapshot=snapshot,
+        current_cache_bytes=max(0, int(current_cache_bytes)),
+        os_reserve_bytes=max(0, int(os_reserve_bytes)),
+        pressure_ceiling_bytes=pressure_ceiling,
+    )
 
 
 def normalize_viewer_memory_mode(value: object) -> str:
@@ -178,43 +298,188 @@ def resolve_viewer_memory_budget(
     normalized = normalize_viewer_memory_mode(mode)
     cache_bytes = max(0, int(current_cache_bytes))
     if normalized != "auto":
-        budget_bytes = _MODE_MIB[normalized] * MIB
-        return ViewerMemoryResolution(
+        hard_limit_bytes = _MODE_MIB[normalized] * MIB
+        pressure_ceiling = hard_limit_bytes
+        reserve = 0
+        if snapshot is not None and snapshot.total_physical_bytes > 0:
+            capacity, reserve = _safe_cache_capacity_bytes(
+                snapshot,
+                current_cache_bytes=cache_bytes,
+            )
+            pressure_ceiling = min(hard_limit_bytes, capacity)
+        return _resolution(
             normalized,
-            budget_bytes,
-            snapshot,
-            cache_bytes,
-            0,
+            hard_limit_bytes,
+            snapshot=snapshot,
+            current_cache_bytes=cache_bytes,
+            os_reserve_bytes=reserve,
+            pressure_ceiling_bytes=pressure_ceiling,
         )
 
     actual_snapshot = snapshot if snapshot is not None else read_physical_memory_snapshot()
     if actual_snapshot is None or actual_snapshot.total_physical_bytes <= 0:
         # A safe, useful fallback for non-Windows tests and API failure.  It is
         # intentionally a stable bucket rather than a guessed live value.
-        return ViewerMemoryResolution("auto", 512 * MIB, None, cache_bytes, 0)
+        return _resolution(
+            "auto",
+            512 * MIB,
+            snapshot=None,
+            current_cache_bytes=cache_bytes,
+            os_reserve_bytes=0,
+        )
 
-    total = max(0, int(actual_snapshot.total_physical_bytes))
-    available = min(total, max(0, int(actual_snapshot.available_physical_bytes)))
-    working_set = max(0, int(actual_snapshot.process_working_set_bytes))
-    reserve = min(total, max(2 * GIB, total // 5))
-    non_cache_working_set = max(0, working_set - cache_bytes)
-    # Existing cache is already reflected in ``available``. Add it back once
-    # to avoid self-shrink, but still charge any reserve shortfall against the
-    # cache so a large resident cache cannot be frozen under OS pressure. The
-    # total-RAM bound also guards an inconsistent/stale available reading.
-    available_bound = max(0, cache_bytes + available - reserve)
-    total_bound = max(0, total - reserve - non_cache_working_set)
-    candidate = min(available_bound, total_bound)
+    candidate, reserve = _safe_cache_capacity_bytes(
+        actual_snapshot,
+        current_cache_bytes=cache_bytes,
+    )
     candidate_mib = candidate // MIB
     selected_mib = 128
     for bucket_mib in _AUTO_BUCKETS_MIB:
         if bucket_mib > candidate_mib:
             break
         selected_mib = bucket_mib
-    return ViewerMemoryResolution(
+    return _resolution(
         "auto",
         selected_mib * MIB,
-        actual_snapshot,
-        cache_bytes,
-        reserve,
+        snapshot=actual_snapshot,
+        current_cache_bytes=cache_bytes,
+        os_reserve_bytes=reserve,
+        pressure_ceiling_bytes=candidate,
     )
+
+
+class ResolvedViewerMemoryPolicy:
+    """Stable hard ceiling plus live, pressure-aware population targets.
+
+    ``hard_limit_bytes`` changes only when :meth:`reconfigure` is called.  A
+    memory-pressure observation can lower the active/inactive soft targets
+    immediately, but recovery is hysteretic and incremental so transient
+    available-memory changes do not repeatedly prune and refill the cache.
+    """
+
+    __slots__ = (
+        "_active",
+        "_pressure_ceiling_bytes",
+        "_resolution",
+    )
+
+    def __init__(
+        self,
+        mode: object,
+        *,
+        snapshot: PhysicalMemorySnapshot | None = None,
+        current_cache_bytes: int = 0,
+        active: bool = True,
+    ) -> None:
+        self._active = bool(active)
+        self._resolution = resolve_viewer_memory_budget(
+            mode,
+            snapshot=snapshot,
+            current_cache_bytes=current_cache_bytes,
+        )
+        self._pressure_ceiling_bytes = (
+            self._resolution.pressure_ceiling_bytes
+        )
+
+    @property
+    def resolution(self) -> ViewerMemoryResolution:
+        return self._resolution
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    @property
+    def hard_limit_bytes(self) -> int:
+        return self._resolution.hard_limit_bytes
+
+    @property
+    def target_bytes(self) -> int:
+        return self._resolution.target_bytes_for(active=self._active)
+
+    def set_active(self, active: bool) -> int:
+        """Select active/inactive target without changing the hard ceiling."""
+        self._active = bool(active)
+        return self.target_bytes
+
+    def reconfigure(
+        self,
+        mode: object,
+        *,
+        snapshot: PhysicalMemorySnapshot | None = None,
+        current_cache_bytes: int = 0,
+    ) -> ViewerMemoryResolution:
+        """Explicitly re-resolve a changed setting and reset pressure state."""
+        self._resolution = resolve_viewer_memory_budget(
+            mode,
+            snapshot=snapshot,
+            current_cache_bytes=current_cache_bytes,
+        )
+        self._pressure_ceiling_bytes = (
+            self._resolution.pressure_ceiling_bytes
+        )
+        return self._resolution
+
+    def observe_memory_pressure(
+        self,
+        snapshot: PhysicalMemorySnapshot,
+        *,
+        current_cache_bytes: int,
+    ) -> ViewerMemoryResolution:
+        """Apply one live pressure sample to soft targets.
+
+        Pressure shrinks immediately.  Recovery requires meaningful headroom
+        and grows by at most one eighth of the configured hard limit per
+        observation.  The owner decides the observation cadence; no timer or
+        logging is hidden in this policy object.
+        """
+        cache_bytes = max(0, int(current_cache_bytes))
+        capacity, reserve = _safe_cache_capacity_bytes(
+            snapshot,
+            current_cache_bytes=cache_bytes,
+        )
+        hard_limit = self._resolution.hard_limit_bytes
+        desired_ceiling = min(hard_limit, capacity)
+        if desired_ceiling < hard_limit:
+            desired_ceiling = (
+                desired_ceiling // _PRESSURE_GRANULARITY_BYTES
+            ) * _PRESSURE_GRANULARITY_BYTES
+
+        current_ceiling = self._pressure_ceiling_bytes
+        if desired_ceiling < current_ceiling:
+            next_ceiling = desired_ceiling
+        else:
+            recovery_headroom = max(
+                _MIN_RECOVERY_HEADROOM_BYTES,
+                hard_limit // 32,
+            )
+            if desired_ceiling < current_ceiling + recovery_headroom:
+                next_ceiling = current_ceiling
+            else:
+                recovery_step = max(
+                    _MIN_RECOVERY_STEP_BYTES,
+                    hard_limit // 8,
+                )
+                next_ceiling = min(
+                    desired_ceiling,
+                    current_ceiling + recovery_step,
+                )
+
+        self._pressure_ceiling_bytes = next_ceiling
+        self._resolution = _resolution(
+            self._resolution.mode,
+            hard_limit,
+            snapshot=snapshot,
+            current_cache_bytes=cache_bytes,
+            os_reserve_bytes=reserve,
+            pressure_ceiling_bytes=next_ceiling,
+        )
+        return self._resolution
+
+    def debug_values(self) -> dict[str, int | str | bool | None]:
+        """Expose the resolved policy to tests/benchmarks without logging."""
+        values: dict[str, int | str | bool | None] = dict(
+            self._resolution.debug_values(active=self._active)
+        )
+        values["active"] = self._active
+        return values

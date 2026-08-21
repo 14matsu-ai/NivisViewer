@@ -33,6 +33,7 @@ class PageModel:
         self._spread_start_by_index: list[int] = []
         self._focused_page_identity: str | None = None
         self._sliding_spread = False
+        self._topology_revision = 0
 
     @property
     def total_pages(self) -> int:
@@ -61,6 +62,12 @@ class PageModel:
     @property
     def sliding_spread(self) -> bool:
         return self._sliding_spread
+
+    @property
+    def topology_revision(self) -> int:
+        """Revision of display-unit boundaries/order, not page position."""
+
+        return self._topology_revision
 
     def set_source(self, source: ImageSource, selected_image: str | None = None) -> None:
         image_ids = source.list_images()
@@ -103,6 +110,7 @@ class PageModel:
         self._spread_start_by_index = []
         self._focused_page_identity = None
         self._sliding_spread = False
+        self._topology_revision += 1
 
     def update_options(
         self,
@@ -241,6 +249,7 @@ class PageModel:
         return self._spread_start_by_index[target_index]
 
     def _rebuild_spread_boundaries(self) -> None:
+        self._topology_revision += 1
         total = self.total_pages
         if total == 0:
             self._spread_start_by_index = []

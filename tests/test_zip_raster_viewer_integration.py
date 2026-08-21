@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication
 from app.book_session import BookSession
 from app.config_manager import ConfigManager
 from app.image_source import ImageSourceError, ZipImageSource
+from app.raster_warmup_planner import RasterBookTopology, RasterWarmupPlan
 from app.viewer_navigation_policy import NavigationInputKind
 from app.viewer_window import ViewerWindow
 from app.zip_raster_book_runtime import (
@@ -22,6 +23,13 @@ from app.zip_raster_book_runtime import (
     ZipRasterRenderSpec,
     ZipRasterRequest,
 )
+
+
+def _planned_units(request: ZipRasterRequest) -> tuple[ZipRasterDisplayUnit, ...]:
+    return (
+        request.current,
+        *tuple(request.warmup_plan.iter_background_units()),
+    )
 
 
 def _write_zip(tmp_path: Path, *, pages: int = 3) -> Path:
@@ -79,12 +87,15 @@ def test_zip_first_paint_populates_book_wide_display_ready_cache(
 
         request = window._zip_runtime_request(window.model.spread_at())
         assert request is not None
+        initial_topology = request.warmup_plan.topology
         assert [
-            unit.pages[0].page_index for unit in request.work_order
+            unit.pages[0].page_index for unit in _planned_units(request)
         ] == list(range(12))
         assert window.viewer_cache_budget_bytes == 4096 * 1024 * 1024
         assert runtime.cache_byte_budget == window.viewer_cache_budget_bytes
-        assert runtime.cache_unit_limit >= 12
+        assert runtime.cache_soft_target_bytes == (
+            window.viewer_cache_soft_target_bytes
+        )
 
         _wait_until(
             qapp,
@@ -111,17 +122,25 @@ def test_zip_first_paint_populates_book_wide_display_ready_cache(
             window.model.spread_at()
         )
         assert reversed_request is not None
+        assert reversed_request.warmup_plan.topology is initial_topology
         assert [
             unit.pages[0].page_index
-            for unit in reversed_request.work_order[:5]
+            for unit in _planned_units(reversed_request)[:5]
         ] == [6, 5, 7, 4, 8]
 
+        # Raster population is byte-budget driven.  The legacy preset remains
+        # available to PDF/legacy paths but no longer narrows this plan.
         window.prefetch_preset = "disabled"
         disabled_request = window._zip_runtime_request(
             window.model.spread_at()
         )
         assert disabled_request is not None
-        assert disabled_request.work_order == (disabled_request.current,)
+        assert disabled_request.warmup_plan.background_enabled
+        assert disabled_request.warmup_plan.topology is initial_topology
+        assert [
+            unit.pages[0].page_index
+            for unit in _planned_units(disabled_request)[:5]
+        ] == [6, 5, 7, 4, 8]
 
         window.prefetch_preset = "standard"
         window.fit_mode = "actual_size"
@@ -130,8 +149,20 @@ def test_zip_first_paint_populates_book_wide_display_ready_cache(
         )
         assert full_source_request is not None
         assert full_source_request.render_spec.decoder_maximum_size is None
-        assert full_source_request.work_order == (
-            full_source_request.current,
+        assert not full_source_request.warmup_plan.background_enabled
+        assert tuple(full_source_request.warmup_plan.iter_background_units()) == ()
+
+        window.set_view_mode("spread")
+        layout_request = window._zip_runtime_request(window.model.spread_at())
+        assert layout_request is not None
+        assert layout_request.warmup_plan.topology is not initial_topology
+        repeated_layout_request = window._zip_runtime_request(
+            window.model.spread_at()
+        )
+        assert repeated_layout_request is not None
+        assert (
+            repeated_layout_request.warmup_plan.topology
+            is layout_request.warmup_plan.topology
         )
     finally:
         window.close()
@@ -456,7 +487,8 @@ def test_zip_runtime_commits_complete_spread_and_retains_source_for_magnifier(
             window.model.spread_at()
         )
         assert magnifier_request is not None
-        assert magnifier_request.work_order == (magnifier_request.current,)
+        assert not magnifier_request.warmup_plan.background_enabled
+        assert tuple(magnifier_request.warmup_plan.iter_background_units()) == ()
         assert magnifier_request.render_spec.decoder_maximum_size is None
         window.viewer._request_magnifier_render()
         _wait_until(qapp, lambda: window.viewer.magnifier_active)
@@ -565,12 +597,30 @@ def test_book_switch_keeps_archive_alive_until_runtime_job_stops(
             (ZipRasterPage(0, page),),
             True,
         )
+        topology = RasterBookTopology(
+            (unit,),
+            identity_of=lambda item: item.identity,
+            page_indexes_of=lambda item: (
+                raster_page.page_index for raster_page in item.pages
+            ),
+            page_count=1,
+        )
+        warmup_plan = RasterWarmupPlan(
+            topology,
+            current=unit,
+            identity_of=lambda item: item.identity,
+            page_indexes_of=lambda item: (
+                raster_page.page_index for raster_page in item.pages
+            ),
+            direction=0,
+            background_enabled=True,
+        )
         assert runtime.request(
             ZipRasterRequest(
                 session.generation,
                 1,
                 unit,
-                (unit,),
+                warmup_plan,
                 ZipRasterRenderSpec((640, 480)),
             )
         )

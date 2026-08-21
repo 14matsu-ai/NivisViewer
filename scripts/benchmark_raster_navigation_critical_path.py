@@ -1252,7 +1252,6 @@ class _Driver:
         *,
         timeout: float,
         page_sizes: tuple[tuple[int, int], ...],
-        cache_units: int,
     ) -> None:
         self.application = application
         self.window = window
@@ -1260,7 +1259,6 @@ class _Driver:
         self.runtime = probe.runtime
         self.timeout = float(timeout)
         self.page_sizes = page_sizes
-        self.cache_units = int(cache_units)
         self._synthetic_wheel_timestamp_ms = 100_000
 
     def _quiet(self) -> bool:
@@ -1585,7 +1583,7 @@ class _Driver:
             snapshot,
             inputs,
             metadata={
-                "configured_unit_limit": self.cache_units,
+                "configured_hard_limit_bytes": self.runtime.cache_byte_budget,
                 "walked_pages": walk_count,
                 "return_page_zero_based": return_page,
                 "return_frame_cached_before_request": cached_before,
@@ -1672,8 +1670,9 @@ def _run_worker(args: argparse.Namespace) -> dict[str, object]:
             "single_first_page": False,
             "fit_mode": "fit_window",
             "viewer_resampling_mode": "standard",
-            "viewer_cache_max_memory_mib": int(args.cache_mib),
-            "cache_size": int(args.cache_units),
+            "viewer_memory_mode": (
+                "minimal" if int(args.cache_mib) == 128 else str(args.cache_mib)
+            ),
             "show_page_list": False,
         },
         save=True,
@@ -1725,7 +1724,6 @@ def _run_worker(args: argparse.Namespace) -> dict[str, object]:
             probe,
             timeout=float(args.timeout),
             page_sizes=page_sizes,
-            cache_units=int(args.cache_units),
         )
         driver.wait_quiet()
         worker_memory_start = _process_memory_bytes()
@@ -1837,8 +1835,6 @@ def _worker_command(
         str(args.viewport_height),
         "--cache-mib",
         str(args.cache_mib),
-        "--cache-units",
-        str(args.cache_units),
         "--timeout",
         str(args.timeout),
     ]
@@ -1892,8 +1888,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--large-height", type=int, default=3600)
     parser.add_argument("--viewport-width", type=int, default=1200)
     parser.add_argument("--viewport-height", type=int, default=800)
-    parser.add_argument("--cache-mib", type=int, default=256)
-    parser.add_argument("--cache-units", type=int, default=5)
+    parser.add_argument(
+        "--cache-mib",
+        type=int,
+        choices=(128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768),
+        default=256,
+    )
     parser.add_argument("--timeout", type=float, default=45.0)
     parser.add_argument("--solid", action="store_true")
     parser.add_argument("--quick", action="store_true")
@@ -1927,7 +1927,7 @@ def _parse_args() -> argparse.Namespace:
         args.large_height = 1350
         args.viewport_width = 640
         args.viewport_height = 420
-        args.cache_mib = 64
+        args.cache_mib = 128
     if args.pages < 24:
         parser.error("--pages must be at least 24")
     for name in (
@@ -1938,7 +1938,6 @@ def _parse_args() -> argparse.Namespace:
         "viewport_width",
         "viewport_height",
         "cache_mib",
-        "cache_units",
     ):
         if int(getattr(args, name)) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -1999,7 +1998,7 @@ def main() -> int:
                     int(args.viewport_height),
                 ],
                 "cache_mib": int(args.cache_mib),
-                "cache_units": int(args.cache_units),
+                "cache_policy": "combined source/frame bytes only",
             },
             "measurement_scope": {
                 "input": (

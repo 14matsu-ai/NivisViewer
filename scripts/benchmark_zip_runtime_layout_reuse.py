@@ -54,6 +54,7 @@ from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
 from app.image_source import ZipImageSource
+from app.raster_warmup_planner import RasterBookTopology, RasterWarmupPlan
 import app.zip_raster_book_runtime as runtime_module
 from app.zip_raster_book_runtime import (
     ZipRasterBookRuntime,
@@ -464,7 +465,6 @@ def _run_worker_case(args: argparse.Namespace) -> dict[str, Any]:
     runtime = ZipRasterBookRuntime(
         source,
         1,
-        cache_unit_limit=3,
         cache_byte_budget=int(args.cache_mib) * _MIB,
     )
     probe = _CaseProbe(runtime)
@@ -473,6 +473,14 @@ def _run_worker_case(args: argparse.Namespace) -> dict[str, Any]:
     image_size = (int(args.width), int(args.height))
     page = ZipRasterPage(0, _ENTRY_NAME, known_size=image_size)
     unit = ZipRasterDisplayUnit(0, (page,), True)
+    topology = RasterBookTopology(
+        (unit,),
+        identity_of=lambda item: item.identity,
+        page_indexes_of=lambda item: (
+            raster_page.page_index for raster_page in item.pages
+        ),
+        page_count=1,
+    )
     gc.collect()
     memory_start = _process_memory_bytes()
     probe.observe()
@@ -516,7 +524,16 @@ def _run_worker_case(args: argparse.Namespace) -> dict[str, Any]:
                 1,
                 request_id,
                 unit,
-                (unit,),
+                RasterWarmupPlan(
+                    topology,
+                    current=unit,
+                    identity_of=lambda item: item.identity,
+                    page_indexes_of=lambda item: (
+                        raster_page.page_index for raster_page in item.pages
+                    ),
+                    direction=0,
+                    background_enabled=False,
+                ),
                 spec,
             )
             if not runtime.request(request):
