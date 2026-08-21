@@ -366,6 +366,8 @@ class FolderListingSnapshot:
     fingerprints: tuple[tuple[str, int | None, int | None], ...] = ()
     generation: int = 0
     sort_identity: str = "name:ascending"
+    selected_index: int | None = None
+    filter_identity: str = "browser-visible-items"
 
 
 @dataclass(frozen=True)
@@ -577,12 +579,20 @@ class FolderImageSource(ImageSource):
         sort_descending: bool = False,
         image_snapshot: tuple[str, ...] | None = None,
         file_size_snapshot: tuple[tuple[str, int | None], ...] | None = None,
+        listing_snapshot: FolderListingSnapshot | None = None,
     ) -> None:
         super().__init__(folder_path)
         self.recursive = recursive
         self.sort_descending = sort_descending
         self._image_snapshot = (
             tuple(image_snapshot) if image_snapshot is not None else None
+        )
+        # Browser order is a book topology snapshot, not merely an open-time
+        # directory-listing optimization.  Retain its identity for the whole
+        # source lifetime so a plain Viewer reload can preserve the same page
+        # order instead of silently falling back to natural filename order.
+        self.listing_snapshot = (
+            listing_snapshot if self._image_snapshot is not None else None
         )
         self._listed_images: tuple[str, ...] | None = self._image_snapshot
         self._size_cache: dict[str, tuple[int, int]] = {}
@@ -767,6 +777,7 @@ class FolderImageSource(ImageSource):
             recursive=self.recursive,
             sort_descending=self.sort_descending,
             image_snapshot=tuple(self.list_images()),
+            listing_snapshot=self.listing_snapshot,
         )
 
 
@@ -1513,6 +1524,9 @@ def create_image_source(
             sort_descending=sort_descending,
             image_snapshot=snapshot_paths,
             file_size_snapshot=snapshot_file_sizes,
+            listing_snapshot=(
+                folder_snapshot if snapshot_paths is not None else None
+            ),
         )
         selected_image = selected_from_snapshot or str(target)
         return source, selected_image

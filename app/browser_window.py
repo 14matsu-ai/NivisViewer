@@ -1212,6 +1212,7 @@ class BrowserWindow(QMainWindow):
         )
         if str(item.path) not in image_ids:
             return None
+        selected_index = image_ids.index(str(item.path))
         return FolderListingSnapshot(
             self.current_path,
             image_ids,
@@ -1231,17 +1232,46 @@ class BrowserWindow(QMainWindow):
                 f"{self.browser_sort_order.value}:"
                 f"folders_first={int(self.browser_folders_first)}"
             ),
+            selected_index=selected_index,
+            filter_identity=(
+                f"hidden={int(self.browser_show_hidden_items)}:"
+                f"unsupported={int(self.browser_show_unsupported_files)}:"
+                f"system={int(self.browser_show_system_items)}"
+            ),
         )
+
+    def _folder_snapshot_for_path(
+        self,
+        path: str | Path,
+    ) -> FolderListingSnapshot | None:
+        """Snapshot the current visible Browser order for one image path."""
+
+        row = self.item_model.row_for_path(path)
+        if row < 0:
+            return None
+        item = self.item_model.item_at(self.item_model.index(row, 0))
+        if item is None:
+            return None
+        return self._folder_snapshot_for_item(item)
 
     def _invoke_open_path_handler(
         self,
         path: str,
         open_in_new_window: bool,
         folder_snapshot: FolderListingSnapshot | None = None,
+        *,
+        use_browser_order: bool = True,
     ) -> object | None:
         handler = self._open_path_handler
         if handler is None:
             return None
+        if folder_snapshot is None and use_browser_order:
+            # Every open originating from the current Browser model must use
+            # the model's visible image order, including bookmark/history
+            # entry points that happen to target the displayed folder.  Paths
+            # dropped from outside explicitly opt out below and keep direct-
+            # open semantics.
+            folder_snapshot = self._folder_snapshot_for_path(path)
         try:
             import inspect
 
@@ -4579,7 +4609,12 @@ class BrowserWindow(QMainWindow):
         if self._open_path_handler is None:
             return
         for offset, path in enumerate(paths):
-            self._invoke_open_path_handler(path, offset > 0, None)
+            self._invoke_open_path_handler(
+                path,
+                offset > 0,
+                None,
+                use_browser_order=False,
+            )
 
     def _probe_dropped_folders(
         self,

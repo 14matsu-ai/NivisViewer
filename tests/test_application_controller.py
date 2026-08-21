@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from time import monotonic
 from PIL import Image
@@ -8,6 +9,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidget
 
 from app.application_controller import ApplicationController
+from app.browser_model import BrowserItemKind
 from app.config_manager import ConfigManager
 
 
@@ -559,6 +561,173 @@ def test_book_candidates_include_external_archives_and_hide_later_rar_volumes(
     assert wait_until(qapp, lambda: bool(opened))
     assert opened == [tmp_path / "books" / "book2.rar"]
     close_controller(controller, qapp)
+
+
+def test_browser_image_open_uses_visible_sort_order_as_viewer_topology(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "browser-order"
+    images = [
+        folder / "page1.jpg",
+        folder / "page02.jpg",
+        folder / "page2.jpg",
+        folder / "page10.jpg",
+    ]
+    for index, path in enumerate(images):
+        write_image(path)
+        with path.open("ab") as stream:
+            stream.write(b"x" * (index * 31))
+        timestamp = (1, 1, 3, 2)[index] * 1_000_000_000
+        path.touch()
+        os.utime(path, ns=(timestamp, timestamp))
+
+    controller = make_controller(tmp_path, qapp)
+    controller._restore_on_start = False
+    controller.config.apply({"view_mode": "single"})
+    browser = controller.create_browser_window()
+    try:
+        assert browser.set_current_folder(folder)
+        assert browser.wait_for_scan()
+        qapp.processEvents()
+
+        for sort_key, sort_order in (
+            ("name", "ascending"),
+            ("name", "descending"),
+            ("modified_time", "ascending"),
+            ("modified_time", "descending"),
+            ("file_size", "ascending"),
+        ):
+            controller.config.apply(
+                {
+                    "browser_sort_key": sort_key,
+                    "browser_sort_order": sort_order,
+                }
+            )
+            qapp.processEvents()
+            ordered = tuple(
+                str(item.path)
+                for item in browser.items
+                if item.kind is BrowserItemKind.IMAGE
+            )
+            assert len(ordered) == len(images)
+            selected = ordered[1]
+            row = browser.item_model.row_for_path(selected)
+            assert row >= 0
+
+            browser.open_item(browser.item_model.index(row, 0))
+            viewer = controller.get_active_viewer()
+            assert viewer is not None
+            finish_viewer_open(qapp, viewer)
+
+            assert tuple(viewer.model.image_ids) == ordered
+            assert viewer.model.focused_index == 1
+            assert viewer.book_session.folder_listing_snapshot is not None
+            assert (
+                viewer.book_session.folder_listing_snapshot.selected_index
+                == 1
+            )
+            runtime = viewer.book_session.page_list_runtime
+            assert runtime is not None and runtime.image_ids == ordered
+
+            viewer.next_page()
+            assert wait_until(
+                qapp,
+                lambda: viewer.presentation_state.displayed_page == 2,
+            )
+            viewer.previous_page()
+            assert wait_until(
+                qapp,
+                lambda: viewer.presentation_state.displayed_page == 1,
+            )
+    finally:
+        close_controller(controller, qapp)
+
+
+def test_browser_order_snapshot_survives_reload_and_filter_until_reopen(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "browser-snapshot"
+    paths = [folder / name for name in ("1.jpg", "2.jpg", "10.jpg")]
+    for path in paths:
+        write_image(path)
+
+    controller = make_controller(tmp_path, qapp)
+    controller._restore_on_start = False
+    controller.config.apply(
+        {
+            "view_mode": "single",
+            "browser_sort_key": "name",
+            "browser_sort_order": "descending",
+        }
+    )
+    browser = controller.create_browser_window()
+    try:
+        assert browser.set_current_folder(folder)
+        assert browser.wait_for_scan()
+        qapp.processEvents()
+        descending = tuple(
+            str(item.path)
+            for item in browser.items
+            if item.kind is BrowserItemKind.IMAGE
+        )
+        selected = descending[1]
+        row = browser.item_model.row_for_path(selected)
+        browser.open_item(browser.item_model.index(row, 0))
+        viewer = controller.get_active_viewer()
+        assert viewer is not None
+        finish_viewer_open(qapp, viewer)
+        assert tuple(viewer.model.image_ids) == descending
+
+        # Browser changes do not mutate the already-open book, and a plain
+        # Viewer reload retains the immutable open-time topology snapshot.
+        controller.config.apply({"browser_sort_order": "ascending"})
+        qapp.processEvents()
+        ascending = tuple(
+            str(item.path)
+            for item in browser.items
+            if item.kind is BrowserItemKind.IMAGE
+        )
+        assert ascending == tuple(reversed(descending))
+        assert tuple(viewer.model.image_ids) == descending
+        viewer.reload_current_book()
+        finish_viewer_open(qapp, viewer)
+        assert tuple(viewer.model.image_ids) == descending
+
+        # A fresh Browser-originated open takes the new visible order.
+        row = browser.item_model.row_for_path(selected)
+        browser.open_item(browser.item_model.index(row, 0))
+        finish_viewer_open(qapp, viewer)
+        assert tuple(viewer.model.image_ids) == ascending
+
+        # Simulate a Browser filter by retaining only the visible rows. The
+        # Viewer must not rediscover the omitted on-disk image.
+        hidden = Path(ascending[0])
+        visible_items = tuple(
+            item for item in browser.items if item.path != hidden
+        )
+        browser.item_model.set_items(visible_items)
+        visible = tuple(
+            str(item.path)
+            for item in browser.items
+            if item.kind is BrowserItemKind.IMAGE
+        )
+        selected = visible[0]
+        row = browser.item_model.row_for_path(selected)
+        browser.open_item(browser.item_model.index(row, 0))
+        finish_viewer_open(qapp, viewer)
+        assert tuple(viewer.model.image_ids) == visible
+        assert str(hidden) not in viewer.model.image_ids
+
+        # A controller/direct open has no Browser authority and preserves the
+        # existing FolderImageSource default listing behavior.
+        controller.open_path(hidden)
+        finish_viewer_open(qapp, viewer)
+        assert viewer.book_session.folder_listing_snapshot is None
+        assert set(viewer.model.image_ids) == {str(path) for path in paths}
+    finally:
+        close_controller(controller, qapp)
 
 
 def test_browser_folder_gesture_uses_browser_path_not_viewer_source(

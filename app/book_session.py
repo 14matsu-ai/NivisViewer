@@ -272,6 +272,15 @@ class BookSession(QObject):
             return ""
         return str(self.source.source_path)
 
+    @property
+    def folder_listing_snapshot(self) -> FolderListingSnapshot | None:
+        """Return the immutable Browser order owned by the active folder book."""
+
+        source = self.source
+        if not isinstance(source, FolderImageSource):
+            return None
+        return source.listing_snapshot
+
     def open_book(
         self,
         path: str | Path,
