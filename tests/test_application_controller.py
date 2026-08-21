@@ -620,6 +620,7 @@ def test_settings_changes_apply_to_existing_browser_and_viewer(
             "gap": 37,
             "thumbnail_size": 230,
             "viewer_prefetch_preset": "memory_saver",
+            "viewer_memory_mode": "minimal",
         }
     )
     qapp.processEvents()
@@ -630,6 +631,7 @@ def test_settings_changes_apply_to_existing_browser_and_viewer(
     assert viewer.prefetch_preset == "memory_saver"
     assert viewer.image_prefetch_forward_units == 2
     assert viewer.pdf_prefetch_backward_units == 0
+    assert viewer.viewer_memory_mode == "minimal"
     assert viewer.image_cache.cache_byte_budget_mib == 128
     assert browser.thumbnail_size == 230
     assert browser.list_view.iconSize().width() == 230

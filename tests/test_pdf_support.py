@@ -698,20 +698,19 @@ def test_pdf_idle_timer_eventually_completes_default_prefetch(
 
 
 @pytest.mark.parametrize(
-    ("preset", "expected_pages", "memory_mib"),
+    ("preset", "expected_pages"),
     (
-        ("disabled", [0], 128),
-        ("memory_saver", [0, 1], 128),
-        ("standard", [0, 1, 2, 3], 256),
-        ("more", [0, 1, 2, 3, 4], 512),
+        ("disabled", [0]),
+        ("memory_saver", [0, 1]),
+        ("standard", [0, 1, 2, 3]),
+        ("more", [0, 1, 2, 3, 4]),
     ),
 )
-def test_pdf_prefetch_presets_control_display_unit_range_and_memory(
+def test_pdf_prefetch_presets_control_display_unit_range_independently_of_memory(
     tmp_path,
     qapp,
     preset,
     expected_pages,
-    memory_mib,
 ):
     window, session, service, backend = _open_many_page_pdf_window(
         tmp_path,
@@ -719,6 +718,7 @@ def test_pdf_prefetch_presets_control_display_unit_range_and_memory(
         settings={
             "view_mode": "single",
             "viewer_prefetch_preset": preset,
+            "viewer_memory_mode": "256",
         },
         complete_prefetch=False,
     )
@@ -729,11 +729,11 @@ def test_pdf_prefetch_presets_control_display_unit_range_and_memory(
         assert [
             request.page_index for request in backend.rendered
         ] == expected_pages
-        assert window.viewer_cache_memory_mib == memory_mib
+        assert window.viewer_cache_memory_mib == 256
         assert (
             window.image_cache.cache_bytes
             + window.viewer.render_cache_bytes()
-            <= memory_mib * 1024 * 1024
+            <= 256 * 1024 * 1024
         )
         if preset == "disabled":
             assert not window._pdf_prefetch_timer.isActive()
@@ -837,14 +837,19 @@ def test_custom_pdf_forward_zero_disables_rolling_and_live_apply_is_non_destruct
                 "viewer_prefetch_preset": "custom",
                 "viewer_prefetch_pdf_forward_units": 0,
                 "viewer_prefetch_pdf_backward_units": 2,
-                "viewer_cache_max_memory_mib": 64,
+                "viewer_memory_mode": "minimal",
             }
         )
         qapp.processEvents()
 
         assert window.image_cache.generation == generation
         assert window.image_cache.get(0) is current
-        assert window.image_cache.cache_byte_budget_mib == 64
+        assert window.viewer_cache_budget_bytes == 128 * 1024 * 1024
+        assert (
+            window.image_cache.cache_bytes
+            + window.viewer.render_cache_bytes()
+            <= window.viewer_cache_budget_bytes
+        )
         assert not window._pdf_prefetch_timer.isActive()
 
         backend.rendered.clear()

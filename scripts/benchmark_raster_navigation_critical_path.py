@@ -1,12 +1,12 @@
 """Measure the production ZIP/Folder raster navigation critical path.
 
 The parent process builds one deterministic mixed-size fixture in a temporary
-directory and starts fresh offscreen children for each source/admission pair.
-The benchmark-only A path reconstructs the former 6 ms Window-owned admission;
-B uses current production staging.  Each child opens the normal
-``ViewerWindow -> RasterBookRuntime`` production path and drives it with
-synthetic Qt wheel events or direct page jumps.  No window is shown and no
-native input is generated.
+directory and starts a fresh offscreen child for each source kind.  Each child
+opens the normal ``ViewerWindow -> RasterBookRuntime`` production path and
+drives it with synthetic Qt wheel events or direct page jumps.  The historical
+admission variants are not reconstructed: reported values always describe the
+current production policy.  No window is shown and no native input is
+generated.
 
 Timing probes are benchmark-only instance wrappers.  They deliberately avoid
 adding production logging to the page-turn path and use ``perf_counter_ns`` so
@@ -67,7 +67,7 @@ from app.viewer_window import ViewerWindow
 
 _MIB = 1024 * 1024
 _SOURCE_KINDS = ("zip", "folder")
-_ADMISSION_MODES = ("baseline", "current")
+_ADMISSION_MODES = ("current",)
 
 
 def _now_ns() -> int:
@@ -231,6 +231,21 @@ def _successful_decode(result: object) -> bool:
     return False
 
 
+def _decoded_output_size(result: object) -> tuple[int | None, int | None]:
+    image: object = result
+    if isinstance(result, StreamedJpegDecode):
+        image = result.qimage
+    elif isinstance(result, tuple) and result:
+        image = result[0]
+    if isinstance(image, QImage):
+        if image.isNull():
+            return None, None
+        return int(image.width()), int(image.height())
+    if isinstance(image, Image.Image):
+        return int(image.width), int(image.height)
+    return None, None
+
+
 @dataclass(frozen=True)
 class _DecodeEvent:
     image_id: str
@@ -238,6 +253,8 @@ class _DecodeEvent:
     started_ns: int
     completed_ns: int
     success: bool
+    output_width: int | None
+    output_height: int | None
 
 
 class _SourceProbe:
@@ -330,9 +347,12 @@ class _SourceProbe:
                 started = _now_ns()
                 probe._bump("decode_attempts")
                 success = False
+                output_width: int | None = None
+                output_height: int | None = None
                 try:
                     result = __original(image_id, *args, **kwargs)
                     success = _successful_decode(result)
+                    output_width, output_height = _decoded_output_size(result)
                     if success:
                         probe._bump("decode_successes")
                     if (
@@ -365,6 +385,8 @@ class _SourceProbe:
                                 started,
                                 completed,
                                 bool(success),
+                                output_width,
+                                output_height,
                             )
                         )
 
@@ -1063,6 +1085,15 @@ class _NavigationProbe:
                 "decode_successes": source_delta.get("decode_successes", 0),
                 "decode_failures": source_delta.get("decode_failures", 0),
                 "decode_image_ids": [event.image_id for event in successful_decodes],
+                "decode_outputs": [
+                    {
+                        "image_id": event.image_id,
+                        "backend": event.backend,
+                        "width": event.output_width,
+                        "height": event.output_height,
+                    }
+                    for event in successful_decodes
+                ],
                 "unique_decoded_pages": len(
                     {event.image_id for event in successful_decodes}
                 ),
@@ -1230,6 +1261,7 @@ class _Driver:
         self.timeout = float(timeout)
         self.page_sizes = page_sizes
         self.cache_units = int(cache_units)
+        self._synthetic_wheel_timestamp_ms = 100_000
 
     def _quiet(self) -> bool:
         request_timer = getattr(self.window, "_zip_runtime_request_timer", None)
@@ -1287,7 +1319,12 @@ class _Driver:
             completed,
         )
 
-    def wheel(self, direction: int) -> _InputRecord:
+    def wheel(
+        self,
+        direction: int,
+        *,
+        timestamp_ms: int | None = None,
+    ) -> _InputRecord:
         angle_y = -120 if int(direction) > 0 else 120
 
         def action() -> None:
@@ -1301,6 +1338,8 @@ class _Driver:
                 Qt.ScrollPhase.ScrollUpdate,
                 False,
             )
+            if timestamp_ms is not None:
+                event.setTimestamp(int(timestamp_ms))
             QApplication.sendEvent(self.window.viewer, event)
             if not event.isAccepted():
                 raise AssertionError("Viewer wheel input was not accepted")
@@ -1413,8 +1452,8 @@ class _Driver:
         # cold boundary.
         self.runtime.cancel(clear_artifacts=True)
         # The anchor move is fixture setup, not part of the measured user's
-        # input burst.  Start each cold scenario from an idle admission state.
-        self.window._last_raster_navigation_input_ns = 0
+        # input burst. Start each cold scenario from an idle input sequence.
+        self.window._clear_pending_raster_navigation(reset_policy=True)
         if self.runtime.cached_unit_count or self.runtime.decoded_source_count:
             raise AssertionError("cold reset retained runtime artifacts")
 
@@ -1466,17 +1505,31 @@ class _Driver:
         self.prepare_cold(0)
         snapshot = self.probe.begin()
         inputs: list[_InputRecord] = []
-        for _ in range(12):
-            item = self.wheel(1)
+        timestamp_base = self._synthetic_wheel_timestamp_ms
+        for index in range(12):
+            item = self.wheel(
+                1,
+                timestamp_ms=timestamp_base + index * int(interval_ms),
+            )
             inputs.append(item)
             if interval_ms > 0:
                 _pump_for(self.application, interval_ms)
+        self._synthetic_wheel_timestamp_ms = (
+            timestamp_base + max(1, 12 * int(interval_ms)) + 100
+        )
         self.wait_input(inputs[-1])
         return self.finish(
             snapshot,
             inputs,
             metadata={"inter_input_event_pump_ms": int(interval_ms)},
         )
+
+    def cold_single_wheel(self) -> dict[str, object]:
+        self.prepare_cold(0)
+        snapshot = self.probe.begin()
+        item = self.wheel(1)
+        self.wait_input(item)
+        return self.finish(snapshot, [item])
 
     def reversal(self) -> dict[str, object]:
         self.prepare_cold(8)
@@ -1633,9 +1686,6 @@ def _run_worker(args: argparse.Namespace) -> dict[str, object]:
     probe: _NavigationProbe | None = None
     shutdown: dict[str, object] = {}
     admission_mode = str(args.worker_admission)
-    admission_patches: list[
-        tuple[object, str, bool, object | None]
-    ] = []
     try:
         window.resize(int(args.viewport_width), int(args.viewport_height))
         if not window.open_path(source_path):
@@ -1668,30 +1718,6 @@ def _run_worker(args: argparse.Namespace) -> dict[str, object]:
             runtime, FolderRasterBookRuntime
         ):
             raise AssertionError("Folder child did not select FolderRasterBookRuntime")
-        if admission_mode == "baseline":
-            for owner, name in (
-                (runtime, "stage"),
-                (window, "_raster_cold_dispatch_delay"),
-            ):
-                namespace = getattr(owner, "__dict__", {})
-                admission_patches.append(
-                    (owner, name, name in namespace, namespace.get(name))
-                )
-
-            def baseline_stage(_runtime, _request):
-                # Benchmark-only reconstruction of the former Window-owned
-                # 6 ms replaceable timer.  The old path did not let Runtime
-                # adopt/cancel work until the timer actually dispatched.
-                return True
-
-            def baseline_delay(_window, _navigation):
-                return 6
-
-            runtime.stage = MethodType(baseline_stage, runtime)
-            window._raster_cold_dispatch_delay = MethodType(
-                baseline_delay,
-                window,
-            )
         probe = _NavigationProbe(window)
         driver = _Driver(
             application,
@@ -1703,17 +1729,26 @@ def _run_worker(args: argparse.Namespace) -> dict[str, object]:
         )
         driver.wait_quiet()
         worker_memory_start = _process_memory_bytes()
-        scenarios = {
-            "ready_hit": driver.ready(),
-            "forward_10": driver.forward_10(),
-            "paced_wheel_12_0ms": driver.paced_wheel(0),
-            "paced_wheel_12_4ms": driver.paced_wheel(4),
-            "paced_wheel_12_8ms": driver.paced_wheel(8),
-            "direction_reversal": driver.reversal(),
-            "two_page_roundtrip": driver.two_page_roundtrip(),
-            "outside_cache_return": driver.outside_cache_return(),
-            "mixed_size_direction_changes": driver.mixed_size_direction_changes(),
-        }
+        if args.minimal:
+            scenarios = {
+                "cold_single_wheel": driver.cold_single_wheel(),
+                "ready_hit": driver.ready(),
+                "paced_wheel_12_8ms": driver.paced_wheel(8),
+                "direction_reversal": driver.reversal(),
+            }
+        else:
+            scenarios = {
+                "cold_single_wheel": driver.cold_single_wheel(),
+                "ready_hit": driver.ready(),
+                "forward_10": driver.forward_10(),
+                "paced_wheel_12_0ms": driver.paced_wheel(0),
+                "paced_wheel_12_4ms": driver.paced_wheel(4),
+                "paced_wheel_12_8ms": driver.paced_wheel(8),
+                "direction_reversal": driver.reversal(),
+                "two_page_roundtrip": driver.two_page_roundtrip(),
+                "outside_cache_return": driver.outside_cache_return(),
+                "mixed_size_direction_changes": driver.mixed_size_direction_changes(),
+            }
         worker_memory_end = _process_memory_bytes()
         return {
             "source_kind": source_kind,
@@ -1762,14 +1797,6 @@ def _run_worker(args: argparse.Namespace) -> dict[str, object]:
         window.prepare_shutdown(wait_msecs=10_000)
         if probe is not None:
             probe.close()
-        for owner, name, had_value, previous in reversed(admission_patches):
-            namespace = getattr(owner, "__dict__", None)
-            if not isinstance(namespace, dict):
-                continue
-            if had_value:
-                setattr(owner, name, previous)
-            else:
-                namespace.pop(name, None)
         window.close()
         application.processEvents()
         coordinator_complete = coordinator.shutdown(wait_msecs=10_000)
@@ -1795,7 +1822,7 @@ def _worker_command(
     source_kind: str,
     admission_mode: str,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(Path(__file__).resolve()),
         "--worker-source",
@@ -1815,6 +1842,9 @@ def _worker_command(
         "--timeout",
         str(args.timeout),
     ]
+    if args.minimal:
+        command.append("--minimal")
+    return command
 
 
 def _run_isolated(
@@ -1867,6 +1897,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=45.0)
     parser.add_argument("--solid", action="store_true")
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument(
+        "--minimal",
+        action="store_true",
+        help="run only cold-single, ready, 8 ms wheel, and reversal",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--worker-source",
@@ -1947,7 +1982,7 @@ def main() -> int:
             for admission_mode in _ADMISSION_MODES
         }
         report = {
-            "schema_version": 1,
+            "schema_version": 2,
             "benchmark": "raster-navigation-critical-path",
             "clock": "time.perf_counter_ns",
             "qt_platform": os.environ.get("QT_QPA_PLATFORM"),
@@ -1974,7 +2009,10 @@ def main() -> int:
                 "request": "ViewerPresentationState request completion",
                 "cache_decision": "RasterBookRuntime.has_cached_current return",
                 "decode": "application-visible ImageSource decoder call",
-                "commit": "presentationCommitted after synchronous UI projections",
+                "commit": (
+                    "presentationCommitted after atomic slider/status projection; "
+                    "page-list/history/persistence projection follows paint"
+                ),
                 "paint": "framePainted after explicit offscreen QWidget.render",
                 "read": (
                     "ZIP entry materialization or Folder decoder file-open call; "
@@ -1986,14 +2024,10 @@ def main() -> int:
                 ),
             },
             "ab_variants": {
-                "baseline": (
-                    "benchmark-child-only legacy admission: runtime.stage "
-                    "returns without adopting work and every cold request "
-                    "uses the former 6 ms replaceable timer"
-                ),
                 "current": (
-                    "production staged work-order adoption with the current "
-                    "adaptive cold-dispatch gate"
+                    "production input-kind admission: discrete/leading input "
+                    "dispatches immediately; only rapid wheel or key-repeat "
+                    "bursts stage"
                 ),
             },
             "variants": variants,

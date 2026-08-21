@@ -18,7 +18,8 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, replace
-from math import isfinite
+from heapq import heapify, heappop, heappush
+from math import ceil, isfinite
 from pathlib import Path
 from threading import Event, Lock
 from time import monotonic
@@ -31,11 +32,22 @@ from .archive_backend import ArchiveErrorCode
 from .image_source import ImageSource, ImageSourceError, ZipImageSource
 from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
 from .thumbnail_render import pil_to_qimage
-from .viewer_render import ViewerRenderKey, normalize_resampling_mode, render_qimage
+from .viewer_render import (
+    ViewerRenderKey,
+    normalize_resampling_mode,
+    qimage_to_pillow,
+    render_qimage,
+)
 from .viewer_widget import calculate_spread_layout
 
 
 _DEFAULT_CACHE_BYTES = 256 * 1024 * 1024
+_JPEG_SUFFIXES = frozenset({".jpg", ".jpeg", ".jpe"})
+_FIT_PREVIEW_MODES = frozenset(
+    {"fit_window", "fit_no_upscale", "fit_width", "fit_height"}
+)
+_UNKNOWN_JPEG_ASPECT_LIMIT = 4
+DecoderMaximumSize = tuple[int | None, int | None]
 
 
 @dataclass(frozen=True)
@@ -100,7 +112,9 @@ class ZipRasterRenderSpec:
     brightness: float = 1.0
     contrast: float = 1.0
     gamma: float = 1.0
-    decoder_maximum_size: tuple[int, int] | None = None
+    decoder_maximum_size: DecoderMaximumSize | None = None
+    decoder_headroom: float = 1.0
+    decoder_layout_sized: bool = False
 
     def __post_init__(self) -> None:
         viewport = (
@@ -118,10 +132,15 @@ class ZipRasterRenderSpec:
             direction = "ltr"
         decoder_size = self.decoder_maximum_size
         if decoder_size is not None:
-            decoder_size = (
-                max(1, int(decoder_size[0])),
-                max(1, int(decoder_size[1])),
+            decoder_size = tuple(
+                None if value is None else max(1, int(value))
+                for value in decoder_size
             )
+            if decoder_size == (None, None):
+                decoder_size = None
+        decoder_headroom = float(self.decoder_headroom)
+        if not isfinite(decoder_headroom):
+            raise ValueError("decoder_headroom must be finite")
         object.__setattr__(self, "viewport_size", viewport)
         object.__setattr__(self, "device_pixel_ratio", dpr)
         object.__setattr__(self, "fit_mode", str(self.fit_mode))
@@ -166,10 +185,270 @@ class ZipRasterRenderSpec:
             min(5.0, max(0.1, float(self.gamma))),
         )
         object.__setattr__(self, "decoder_maximum_size", decoder_size)
+        object.__setattr__(
+            self,
+            "decoder_headroom",
+            min(2.0, max(1.0, decoder_headroom)),
+        )
+        object.__setattr__(
+            self,
+            "decoder_layout_sized",
+            bool(self.decoder_layout_sized),
+        )
 
     @property
     def adjustments(self) -> tuple[float, float, float]:
         return self.brightness, self.contrast, self.gamma
+
+
+def _size_within_bounds(
+    logical_size: tuple[int, int],
+    maximum_size: DecoderMaximumSize,
+) -> tuple[int, int]:
+    """Return the aspect-preserving raster size required by axis bounds."""
+
+    width = max(1, int(logical_size[0]))
+    height = max(1, int(logical_size[1]))
+    scales = [1.0]
+    if maximum_size[0] is not None:
+        scales.append(max(1, int(maximum_size[0])) / width)
+    if maximum_size[1] is not None:
+        scales.append(max(1, int(maximum_size[1])) / height)
+    scale = min(scales)
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
+def _add_decoder_headroom(
+    maximum_size: DecoderMaximumSize,
+    headroom: float,
+) -> DecoderMaximumSize:
+    return tuple(
+        None if value is None else max(1, ceil(value * headroom))
+        for value in maximum_size
+    )
+
+
+def _display_frame_bytes_for_sizes(
+    unit: ZipRasterDisplayUnit,
+    render_spec: ZipRasterRenderSpec,
+    logical_sizes: tuple[tuple[int, int], ...],
+    *,
+    source_sizes: tuple[tuple[int, int], ...] | None = None,
+) -> int:
+    """Estimate the complete display artifact from final layout geometry."""
+
+    expanded: list[tuple[tuple[int, int], tuple[int, int] | None]] = []
+    for index, size in enumerate(logical_sizes):
+        width, height = size
+        source_size = None if source_sizes is None else source_sizes[index]
+        if (
+            render_spec.split_wide_image
+            and unit.is_single
+            and width >= 2
+            and width / max(1, height) >= 1.25
+        ):
+            left = width // 2
+            if source_size is not None and source_size[0] < 2:
+                expanded.append(((width, height), source_size))
+            elif source_size is None:
+                expanded.extend(
+                    (
+                        ((left, height), source_size),
+                        ((width - left, height), source_size),
+                    )
+                )
+            else:
+                source_width, source_height = source_size
+                left_pixels = max(
+                    1,
+                    min(
+                        source_width - 1,
+                        round(source_width * left / width),
+                    ),
+                )
+                expanded.extend(
+                    (
+                        ((left, height), (left_pixels, source_height)),
+                        (
+                            (width - left, height),
+                            (source_width - left_pixels, source_height),
+                        ),
+                    )
+                )
+        else:
+            expanded.append(((width, height), source_size))
+    rotation = render_spec.rotation
+    layout_sizes = [
+        (height, width) if rotation in {90, 270} else (width, height)
+        for (width, height), _source_size in expanded
+    ]
+    layout = calculate_spread_layout(
+        layout_sizes,
+        render_spec.viewport_size,
+        fit_mode=render_spec.fit_mode,
+        manual_zoom=render_spec.manual_zoom,
+        gap=render_spec.gap,
+        join_spread_pages=render_spec.join_spread_pages,
+        spread_is_single=unit.is_single,
+        horizontal_alignment=render_spec.horizontal_alignment,
+    )
+    dpr = render_spec.device_pixel_ratio
+    frame_bytes = 0
+    for (_logical_size, source_size), rect in zip(expanded, layout.rects):
+        target_width = max(1, round(rect.width() * dpr))
+        target_height = max(1, round(rect.height() * dpr))
+        if source_size is not None:
+            source_width, source_height = source_size
+            if rotation in {90, 270}:
+                source_width, source_height = source_height, source_width
+            if render_spec.resampling_mode == "standard" and (
+                target_width > source_width or target_height > source_height
+            ):
+                scale = min(
+                    1.0,
+                    target_width / max(1, source_width),
+                    target_height / max(1, source_height),
+                )
+                target_width = max(1, round(source_width * scale))
+                target_height = max(1, round(source_height * scale))
+        frame_bytes += target_width * target_height * 4
+    return max(1, frame_bytes)
+
+
+def _decoder_maximum_for_page(
+    render_spec: ZipRasterRenderSpec,
+    unit: ZipRasterDisplayUnit,
+    page: ZipRasterPage,
+) -> DecoderMaximumSize | None:
+    """Plan one page's decoder-sized source from the final physical slot.
+
+    The old path used the whole Viewer rectangle for every page and disabled
+    scaled decode for rotation, split pages and one-axis fit modes.  Production
+    requests opt into this layout-aware plan; explicit low-level specs keep the
+    historical box semantics for compatibility.
+    """
+
+    maximum_size = render_spec.decoder_maximum_size
+    if maximum_size is None:
+        return None
+    headroom = render_spec.decoder_headroom
+    rotation = render_spec.rotation % 360
+    if not render_spec.decoder_layout_sized:
+        planned = _add_decoder_headroom(maximum_size, headroom)
+        return (planned[1], planned[0]) if rotation in {90, 270} else planned
+
+    all_sizes_known = all(candidate.known_size is not None for candidate in unit.pages)
+    if all_sizes_known and render_spec.fit_mode in _FIT_PREVIEW_MODES:
+        expanded: list[
+            tuple[ZipRasterPage, tuple[int, int], tuple[int, int]]
+        ] = []
+        for candidate in unit.pages:
+            assert candidate.known_size is not None
+            logical_width, logical_height = candidate.known_size
+            if (
+                render_spec.split_wide_image
+                and unit.is_single
+                and logical_width >= 2
+                and logical_width / max(1, logical_height) >= 1.25
+            ):
+                left_width = logical_width // 2
+                for part_width in (left_width, logical_width - left_width):
+                    expanded.append(
+                        (
+                            candidate,
+                            (part_width, logical_height),
+                            (logical_width, logical_height),
+                        )
+                    )
+            else:
+                expanded.append(
+                    (
+                        candidate,
+                        (logical_width, logical_height),
+                        (logical_width, logical_height),
+                    )
+                )
+        layout_sizes = tuple(
+            (part_height, part_width)
+            if rotation in {90, 270}
+            else (part_width, part_height)
+            for _candidate, (part_width, part_height), _source_size in expanded
+        )
+        layout = calculate_spread_layout(
+            layout_sizes,
+            render_spec.viewport_size,
+            fit_mode=render_spec.fit_mode,
+            manual_zoom=render_spec.manual_zoom,
+            gap=render_spec.gap,
+            join_spread_pages=render_spec.join_spread_pages,
+            spread_is_single=unit.is_single,
+            horizontal_alignment=render_spec.horizontal_alignment,
+        )
+        required_scale = 0.0
+        source_size = page.known_size
+        assert source_size is not None
+        for expanded_part, target_rect in zip(expanded, layout.rects):
+            candidate, (part_width, part_height), _whole_size = expanded_part
+            if candidate.image_id != page.image_id:
+                continue
+            target_width = max(
+                1,
+                ceil(target_rect.width() * render_spec.device_pixel_ratio),
+            )
+            target_height = max(
+                1,
+                ceil(target_rect.height() * render_spec.device_pixel_ratio),
+            )
+            if rotation in {90, 270}:
+                target_width, target_height = target_height, target_width
+            required_scale = max(
+                required_scale,
+                target_width / max(1, part_width),
+                target_height / max(1, part_height),
+            )
+        required_scale = min(1.0, max(0.0, required_scale) * headroom)
+        if required_scale > 0:
+            return (
+                max(1, ceil(source_size[0] * required_scale)),
+                max(1, ceil(source_size[1] * required_scale)),
+            )
+
+    viewport_width, viewport_height = render_spec.viewport_size
+    dpr = render_spec.device_pixel_ratio
+    physical_width = max(1, ceil(viewport_width * dpr))
+    physical_height = max(1, ceil(viewport_height * dpr))
+    if len(unit.pages) == 2:
+        effective_gap = 0 if render_spec.join_spread_pages else render_spec.gap
+        slot_width = max(1, (viewport_width - effective_gap) // 2)
+        planned: DecoderMaximumSize = (
+            max(1, ceil(slot_width * dpr)),
+            physical_height,
+        )
+    elif render_spec.split_wide_image and unit.is_single:
+        if rotation in {90, 270}:
+            planned = (physical_height * 2, physical_width)
+        else:
+            planned = (physical_width, physical_height)
+        return _add_decoder_headroom(planned, headroom)
+    else:
+        planned = maximum_size
+    planned = _add_decoder_headroom(planned, headroom)
+    return (planned[1], planned[0]) if rotation in {90, 270} else planned
+
+
+def _requires_exact_prefetch_admission(
+    page: ZipRasterPage,
+    decoder_maximum: DecoderMaximumSize | None,
+    *,
+    has_cached_source: bool,
+) -> bool:
+    if has_cached_source or page.known_size is not None:
+        return False
+    suffix = Path(page.image_id).suffix.casefold()
+    return suffix not in _JPEG_SUFFIXES or (
+        decoder_maximum is not None
+        and sum(value is None for value in decoder_maximum) == 1
+    )
 
 
 @dataclass(frozen=True)
@@ -310,6 +589,7 @@ class _JobResult:
     unit: ZipRasterDisplayUnit
     pages: tuple[_RenderedPage, ...]
     cancelled: bool
+    admission_declined: bool
     completed_at: float
 
 
@@ -321,6 +601,77 @@ class _CachedFrame:
     source_keys: tuple[_SourceKey | None, ...]
     worker_completed_at: float
     gui_ready_at: float
+
+
+class _ByteLedger:
+    """Track aggregate and largest artifact sizes without rescanning a store."""
+
+    def __init__(self) -> None:
+        self.total = 0
+        self._largest_heap: list[int] = []
+        self._removed_sizes: dict[int, int] = {}
+        self._live_sizes: dict[int, int] = {}
+        self._item_count = 0
+
+    @property
+    def largest(self) -> int:
+        while self._largest_heap:
+            size = -self._largest_heap[0]
+            removed = self._removed_sizes.get(size, 0)
+            if removed <= 0:
+                return size
+            heappop(self._largest_heap)
+            if removed == 1:
+                self._removed_sizes.pop(size, None)
+            else:
+                self._removed_sizes[size] = removed - 1
+        return 0
+
+    def add(self, size: int) -> None:
+        normalized = max(0, int(size))
+        self.total += normalized
+        self._item_count += 1
+        if normalized:
+            self._live_sizes[normalized] = (
+                self._live_sizes.get(normalized, 0) + 1
+            )
+            heappush(self._largest_heap, -normalized)
+
+    def remove(self, size: int) -> None:
+        normalized = max(0, int(size))
+        self.total -= normalized
+        self._item_count -= 1
+        if normalized:
+            live = self._live_sizes[normalized]
+            if live == 1:
+                self._live_sizes.pop(normalized)
+            else:
+                self._live_sizes[normalized] = live - 1
+            self._removed_sizes[normalized] = (
+                self._removed_sizes.get(normalized, 0) + 1
+            )
+        self._compact_if_needed()
+
+    def _compact_if_needed(self) -> None:
+        # A long-lived large artifact can otherwise keep tombstones for many
+        # smaller replacements below the heap root indefinitely.  Rebuilding
+        # at a bounded ratio keeps add/remove amortized O(log N) and memory O(N).
+        if len(self._largest_heap) <= max(64, self._item_count * 2):
+            return
+        self._largest_heap = [
+            -size
+            for size, count in self._live_sizes.items()
+            for _unused in range(count)
+        ]
+        heapify(self._largest_heap)
+        self._removed_sizes.clear()
+
+    def clear(self) -> None:
+        self.total = 0
+        self._largest_heap.clear()
+        self._removed_sizes.clear()
+        self._live_sizes.clear()
+        self._item_count = 0
 
 
 class _ZipRasterSourceStore:
@@ -336,9 +687,16 @@ class _ZipRasterSourceStore:
 
     def __init__(self, *, page_limit: int) -> None:
         self._sources: OrderedDict[_SourceKey, _CachedSource] = OrderedDict()
+        self._sources_by_identity: dict[
+            tuple[str, tuple[float, float, float]],
+            OrderedDict[_SourceKey, None],
+        ] = {}
+        self._bytes = _ByteLedger()
+        self._eviction_order: list[_SourceKey] | None = None
         self._page_limit = max(1, int(page_limit))
-        self._active_order: tuple[tuple[int, str], ...] = ()
-        self._current_pages: tuple[ZipRasterPage, ...] = ()
+        self._active_rank: dict[str, int] = {}
+        self._active_anchor: int | None = None
+        self._current_unit: ZipRasterDisplayUnit | None = None
         self._current_render_spec: ZipRasterRenderSpec | None = None
         self._direction = 0
 
@@ -348,14 +706,11 @@ class _ZipRasterSourceStore:
 
     @property
     def byte_size(self) -> int:
-        return sum(source.qimage.sizeInBytes() for source in self._sources.values())
+        return self._bytes.total
 
     @property
     def largest_source_bytes(self) -> int:
-        return max(
-            (source.qimage.sizeInBytes() for source in self._sources.values()),
-            default=0,
-        )
+        return self._bytes.largest
 
     @property
     def page_indexes(self) -> tuple[int, ...]:
@@ -363,6 +718,9 @@ class _ZipRasterSourceStore:
 
     def clear(self) -> None:
         self._sources.clear()
+        self._sources_by_identity.clear()
+        self._bytes.clear()
+        self._eviction_order = None
 
     def set_page_limit(self, page_limit: int) -> int:
         self._page_limit = max(1, int(page_limit))
@@ -383,11 +741,16 @@ class _ZipRasterSourceStore:
                     continue
                 seen.add(page.image_id)
                 order.append((page.page_index, page.image_id))
-        self._active_order = tuple(order)
-        self._current_pages = current.pages if current is not None else ()
+        self._active_rank = {
+            image_id: index
+            for index, (_page_index, image_id) in enumerate(order)
+        }
+        self._active_anchor = order[0][0] if order else None
+        self._current_unit = current
         self._current_render_spec = render_spec
         normalized = int(direction)
         self._direction = -1 if normalized < 0 else 1 if normalized > 0 else 0
+        self._eviction_order = None
         return self._prune_count()
 
     def find(
@@ -395,23 +758,41 @@ class _ZipRasterSourceStore:
         page: ZipRasterPage,
         render_spec: ZipRasterRenderSpec,
         *,
+        unit: ZipRasterDisplayUnit | None = None,
         touch: bool = False,
     ) -> _CachedSource | None:
+        display_unit = unit or ZipRasterDisplayUnit(
+            page.page_index,
+            (page,),
+            True,
+        )
+        required_size = _decoder_maximum_for_page(
+            render_spec,
+            display_unit,
+            page,
+        )
+        group = self._sources_by_identity.get(
+            (page.image_id, render_spec.adjustments)
+        )
         candidates = tuple(
-            source
-            for source in self._sources.values()
-            if source.key.image_id == page.image_id
-            and source.key.adjustments == render_spec.adjustments
-            and self._satisfies(source, render_spec.decoder_maximum_size)
+            self._sources[key]
+            for key in group or ()
+            if self._satisfies(self._sources[key], required_size)
         )
         if not candidates:
             return None
+        if required_size is not None:
+            preview_candidates = tuple(
+                source for source in candidates if source.source_is_preview
+            )
+            if preview_candidates:
+                candidates = preview_candidates
         # Prefer the smallest sufficient source.  This avoids making normal
         # fit-window rendering walk a full-resolution image while a retained
         # decoder-sized source is still sufficient.
         selected = min(candidates, key=lambda source: source.qimage.sizeInBytes())
         if touch:
-            self._sources.move_to_end(selected.key)
+            self._touch(selected.key)
         return selected
 
     def get(
@@ -424,32 +805,180 @@ class _ZipRasterSourceStore:
             return None
         source = self._sources.get(key)
         if source is not None and touch:
-            self._sources.move_to_end(key)
+            self._touch(key)
         return source
 
     def put(self, source: _CachedSource) -> int:
         evicted = 0
+        group = self._sources_by_identity.get(self._identity_for(source.key))
         dominated = tuple(
             key
-            for key, existing in self._sources.items()
+            for key in group or ()
+            for existing in (self._sources[key],)
             if key != source.key
-            and key.image_id == source.key.image_id
-            and key.adjustments == source.key.adjustments
             and self._dominates(source, existing)
         )
         for key in dominated:
-            self._sources.pop(key, None)
+            self._remove(key)
             evicted += 1
-        self._sources[source.key] = source
-        self._sources.move_to_end(source.key)
+        self._store(source)
         return evicted + self._prune_count()
 
     def evict_one(self) -> bool:
-        candidate = self._eviction_candidate()
+        self._ensure_eviction_order()
+        candidate = (
+            self._eviction_order.pop()
+            if self._eviction_order
+            else None
+        )
         if candidate is None:
             return False
-        self._sources.pop(candidate, None)
+        self._remove(candidate, invalidate_eviction_order=False)
         return True
+
+    def lower_rank_reclaim_candidates(
+        self,
+        unit: ZipRasterDisplayUnit,
+        render_spec: ZipRasterRenderSpec,
+        *,
+        excluded_keys: frozenset[_SourceKey] = frozenset(),
+    ) -> tuple[tuple[_SourceKey, int], ...]:
+        """Return worst-first sources strictly below a pending unit's rank."""
+
+        candidate_ranks: list[tuple[int, int, int, int]] = []
+        protected = set(self._protected_keys())
+        for page in unit.pages:
+            active_rank = self._active_rank.get(page.image_id)
+            if active_rank is None:
+                return ()
+            decoder_maximum = _decoder_maximum_for_page(
+                render_spec,
+                unit,
+                page,
+            )
+            candidate_ranks.append(
+                (0, int(decoder_maximum is None), active_rank, 0)
+            )
+            reusable = self.find(page, render_spec, unit=unit, touch=False)
+            if reusable is not None:
+                # Admission estimates this page as a source hit and _submit()
+                # passes the same variant to the worker.  Never reclaim it
+                # between the estimate and job construction.
+                protected.add(reusable.key)
+        if not candidate_ranks:
+            return ()
+        candidate_boundary = max(candidate_ranks)
+        self._ensure_eviction_order()
+        return tuple(
+            (key, self._sources[key].qimage.sizeInBytes())
+            for key in reversed(self._eviction_order or ())
+            if key not in protected
+            and key not in excluded_keys
+            and self._retention_rank(self._sources[key]) > candidate_boundary
+        )
+
+    def projected_put_delta(
+        self,
+        sources: tuple[_CachedSource, ...],
+    ) -> tuple[int, frozenset[_SourceKey]]:
+        """Return exact byte delta and keys superseded by ordered puts."""
+
+        projected_groups: dict[
+            tuple[str, tuple[float, float, float]],
+            dict[_SourceKey, _CachedSource],
+        ] = {}
+        original_keys: set[_SourceKey] = set()
+        for source in sources:
+            identity = self._identity_for(source.key)
+            projected = projected_groups.get(identity)
+            if projected is None:
+                group = self._sources_by_identity.get(identity)
+                projected = {
+                    key: self._sources[key] for key in group or ()
+                }
+                projected_groups[identity] = projected
+                original_keys.update(projected)
+            for key, existing in tuple(projected.items()):
+                if key == source.key or self._dominates(source, existing):
+                    projected.pop(key, None)
+            projected[source.key] = source
+        original_bytes = sum(
+            self._sources[key].qimage.sizeInBytes()
+            for key in original_keys
+        )
+        projected_bytes = sum(
+            source.qimage.sizeInBytes()
+            for projected in projected_groups.values()
+            for source in projected.values()
+        )
+        projected_keys = {
+            key
+            for projected in projected_groups.values()
+            for key in projected
+        }
+        return (
+            projected_bytes - original_bytes,
+            frozenset(original_keys - projected_keys),
+        )
+
+    def remove_reclaim_candidates(
+        self,
+        keys: tuple[_SourceKey, ...],
+    ) -> tuple[int, int]:
+        removed = 0
+        freed = 0
+        for key in keys:
+            source = self._remove(key, invalidate_eviction_order=False)
+            if source is None:
+                continue
+            removed += 1
+            freed += source.qimage.sizeInBytes()
+        self._eviction_order = None
+        return removed, freed
+
+    @staticmethod
+    def _identity_for(
+        key: _SourceKey,
+    ) -> tuple[str, tuple[float, float, float]]:
+        return (key.image_id, key.adjustments)
+
+    def _store(self, source: _CachedSource) -> None:
+        self._remove(source.key)
+        self._sources[source.key] = source
+        group = self._sources_by_identity.setdefault(
+            self._identity_for(source.key),
+            OrderedDict(),
+        )
+        group[source.key] = None
+        self._bytes.add(source.qimage.sizeInBytes())
+        self._eviction_order = None
+
+    def _remove(
+        self,
+        key: _SourceKey,
+        *,
+        invalidate_eviction_order: bool = True,
+    ) -> _CachedSource | None:
+        source = self._sources.pop(key, None)
+        if source is None:
+            return None
+        self._bytes.remove(source.qimage.sizeInBytes())
+        identity = self._identity_for(key)
+        group = self._sources_by_identity.get(identity)
+        if group is not None:
+            group.pop(key, None)
+            if not group:
+                self._sources_by_identity.pop(identity, None)
+        if invalidate_eviction_order:
+            self._eviction_order = None
+        return source
+
+    def _touch(self, key: _SourceKey) -> None:
+        self._sources.move_to_end(key)
+        group = self._sources_by_identity.get(self._identity_for(key))
+        if group is not None:
+            group.move_to_end(key)
+        self._eviction_order = None
 
     def _prune_count(self) -> int:
         evicted = 0
@@ -460,66 +989,86 @@ class _ZipRasterSourceStore:
         return evicted
 
     def _eviction_candidate(self) -> _SourceKey | None:
+        self._ensure_eviction_order()
+        return self._eviction_order[-1] if self._eviction_order else None
+
+    def _ensure_eviction_order(self) -> None:
+        if self._eviction_order is not None:
+            return
         protected = self._protected_keys()
-        candidates = tuple(
+        candidates = [
             key
             for key in self._sources
             if key not in protected
-        )
-        if not candidates:
-            return None
+        ]
         positions = {key: index for index, key in enumerate(self._sources)}
-        return max(
-            candidates,
+        candidates.sort(
             key=lambda key: (
                 self._retention_rank(self._sources[key]),
                 -positions[key],
             ),
         )
+        self._eviction_order = candidates
 
     def _protected_keys(self) -> frozenset[_SourceKey]:
         render_spec = self._current_render_spec
-        if render_spec is None:
+        current_unit = self._current_unit
+        if render_spec is None or current_unit is None:
             return frozenset()
         protected: set[_SourceKey] = set()
-        for page in self._current_pages:
-            source = self.find(page, render_spec)
+        for page in current_unit.pages:
+            source = self.find(page, render_spec, unit=current_unit)
             if source is not None:
                 protected.add(source.key)
+            if render_spec.decoder_maximum_size is None:
+                group = self._sources_by_identity.get(
+                    (page.image_id, render_spec.adjustments)
+                )
+                previews = tuple(
+                    self._sources[key]
+                    for key in group or ()
+                    if self._sources[key].source_is_preview
+                )
+                if previews:
+                    protected.add(
+                        min(
+                            previews,
+                            key=lambda candidate: candidate.qimage.sizeInBytes(),
+                        ).key
+                    )
         return frozenset(protected)
 
-    def _retention_rank(self, source: _CachedSource) -> tuple[int, int, int]:
-        for index, (_page_index, image_id) in enumerate(self._active_order):
-            if image_id == source.key.image_id:
-                return (0, index, 0)
-        if not self._active_order:
-            return (1, 0, 0)
-        current_anchor = self._active_order[0][0]
-        delta = source.page_index - current_anchor
+    def _retention_rank(self, source: _CachedSource) -> tuple[int, int, int, int]:
+        # Full sources are interactive promotion artifacts.  Outside an active
+        # full-source request, evict them before the smaller navigation preview
+        # at the same locality so a magnifier session cannot poison page turns.
+        full_tier_penalty = int(not source.source_is_preview)
+        active_rank = self._active_rank.get(source.key.image_id)
+        if active_rank is not None:
+            return (0, full_tier_penalty, active_rank, 0)
+        if self._active_anchor is None:
+            return (1, full_tier_penalty, 0, 0)
+        delta = source.page_index - self._active_anchor
         direction_penalty = int(
             self._direction != 0
             and delta != 0
             and (1 if delta > 0 else -1) != self._direction
         )
-        return (1, abs(delta), direction_penalty)
+        return (1, full_tier_penalty, abs(delta), direction_penalty)
 
     @staticmethod
     def _satisfies(
         source: _CachedSource,
-        maximum_size: tuple[int, int] | None,
+        maximum_size: DecoderMaximumSize | None,
     ) -> bool:
         if maximum_size is None:
             return not source.source_is_preview
         if not source.source_is_preview:
             return True
-        original_width, original_height = source.original_size
-        scale = min(
-            1.0,
-            max(1, int(maximum_size[0])) / max(1, original_width),
-            max(1, int(maximum_size[1])) / max(1, original_height),
+        required_width, required_height = _size_within_bounds(
+            source.original_size,
+            maximum_size,
         )
-        required_width = max(1, round(original_width * scale))
-        required_height = max(1, round(original_height * scale))
         return (
             source.qimage.width() >= required_width
             and source.qimage.height() >= required_height
@@ -527,9 +1076,7 @@ class _ZipRasterSourceStore:
 
     @staticmethod
     def _dominates(candidate: _CachedSource, existing: _CachedSource) -> bool:
-        if not candidate.source_is_preview:
-            return True
-        if not existing.source_is_preview:
+        if candidate.source_is_preview != existing.source_is_preview:
             return False
         return (
             candidate.qimage.width() >= existing.qimage.width()
@@ -555,9 +1102,11 @@ class _ZipRasterFrameStore:
 
     def __init__(self, *, unit_limit: int, byte_budget: int) -> None:
         self._frames: OrderedDict[_UnitKey, _CachedFrame] = OrderedDict()
+        self._bytes = _ByteLedger()
+        self._eviction_order: list[_UnitKey] | None = None
         self._unit_limit = max(1, int(unit_limit))
         self._byte_budget = max(1, int(byte_budget))
-        self._active_order: tuple[_UnitKey, ...] = ()
+        self._active_rank: dict[_UnitKey, int] = {}
         self._current_key: _UnitKey | None = None
         self._displayed_key: _UnitKey | None = None
         self._direction = 0
@@ -579,19 +1128,17 @@ class _ZipRasterFrameStore:
 
     @property
     def byte_size(self) -> int:
-        return sum(self._frame_bytes(frame) for frame in self._frames.values())
+        return self._bytes.total
 
     @property
     def largest_frame_bytes(self) -> int:
-        return max(
-            (self._frame_bytes(frame) for frame in self._frames.values()),
-            default=0,
-        )
+        return self._bytes.largest
 
     def get(self, key: _UnitKey, *, touch: bool = False) -> _CachedFrame | None:
         frame = self._frames.get(key)
         if frame is not None and touch:
             self._frames.move_to_end(key)
+            self._eviction_order = None
         return frame
 
     def values(self) -> tuple[_CachedFrame, ...]:
@@ -599,9 +1146,11 @@ class _ZipRasterFrameStore:
 
     def clear(self) -> None:
         self._frames.clear()
+        self._bytes.clear()
+        self._eviction_order = None
 
     def take(self, key: _UnitKey) -> _CachedFrame | None:
-        return self._frames.pop(key, None)
+        return self._remove(key)
 
     def set_limits(
         self,
@@ -621,7 +1170,10 @@ class _ZipRasterFrameStore:
         current_key: _UnitKey | None,
         direction: int,
     ) -> int:
-        self._active_order = tuple(active_order)
+        self._active_rank = {
+            key: index for index, key in enumerate(active_order)
+        }
+        self._eviction_order = None
         self._current_key = current_key
         normalized_direction = int(direction)
         if normalized_direction < 0:
@@ -636,11 +1188,15 @@ class _ZipRasterFrameStore:
         """Protect the last painted frame until its replacement paints."""
 
         self._displayed_key = key
+        self._eviction_order = None
         return self._prune()
 
     def put(self, frame: _CachedFrame) -> tuple[bool, int]:
+        self._remove(frame.key)
         self._frames[frame.key] = frame
         self._frames.move_to_end(frame.key)
+        self._bytes.add(self._frame_bytes(frame))
+        self._eviction_order = None
         evicted = self._prune()
         return frame.key in self._frames, evicted
 
@@ -660,11 +1216,58 @@ class _ZipRasterFrameStore:
         return self._retention_rank(key) < self._retention_rank(victim)
 
     def evict_one(self) -> bool:
-        candidate = self._eviction_candidate()
+        self._ensure_eviction_order()
+        candidate = (
+            self._eviction_order.pop()
+            if self._eviction_order
+            else None
+        )
         if candidate is None:
             return False
-        self._frames.pop(candidate, None)
+        self._remove(candidate, invalidate_eviction_order=False)
         return True
+
+    def lower_rank_reclaim_candidates(
+        self,
+        key: _UnitKey,
+    ) -> tuple[tuple[_UnitKey, int], ...]:
+        """Return complete frames strictly below a pending unit's rank."""
+
+        candidate_rank = self._retention_rank(key)
+        self._ensure_eviction_order()
+        return tuple(
+            (candidate, self._frame_bytes(self._frames[candidate]))
+            for candidate in reversed(self._eviction_order or ())
+            if self._retention_rank(candidate) > candidate_rank
+        )
+
+    def remove_reclaim_candidates(
+        self,
+        keys: tuple[_UnitKey, ...],
+    ) -> tuple[int, int]:
+        removed = 0
+        freed = 0
+        for key in keys:
+            frame = self._remove(key, invalidate_eviction_order=False)
+            if frame is None:
+                continue
+            removed += 1
+            freed += self._frame_bytes(frame)
+        self._eviction_order = None
+        return removed, freed
+
+    def _remove(
+        self,
+        key: _UnitKey,
+        *,
+        invalidate_eviction_order: bool = True,
+    ) -> _CachedFrame | None:
+        frame = self._frames.pop(key, None)
+        if frame is not None:
+            self._bytes.remove(self._frame_bytes(frame))
+            if invalidate_eviction_order:
+                self._eviction_order = None
+        return frame
 
     def _prune(self) -> int:
         evicted = 0
@@ -678,32 +1281,38 @@ class _ZipRasterFrameStore:
                 # budget. Keeping it is required by the old-frame/atomic
                 # commit contract; no background frame is admitted beside it.
                 break
-            self._frames.pop(removable, None)
+            self._ensure_eviction_order()
+            if self._eviction_order:
+                self._eviction_order.pop()
+            self._remove(removable, invalidate_eviction_order=False)
             evicted += 1
         return evicted
 
     def _eviction_candidate(self) -> _UnitKey | None:
-        candidates = tuple(
+        self._ensure_eviction_order()
+        return self._eviction_order[-1] if self._eviction_order else None
+
+    def _ensure_eviction_order(self) -> None:
+        if self._eviction_order is not None:
+            return
+        candidates = [
             key
             for key in self._frames
             if key not in {self._current_key, self._displayed_key}
-        )
-        if not candidates:
-            return None
+        ]
         positions = {key: index for index, key in enumerate(self._frames)}
-        return max(
-            candidates,
+        candidates.sort(
             key=lambda key: (
                 self._retention_rank(key),
                 -positions[key],
             ),
         )
+        self._eviction_order = candidates
 
     def _retention_rank(self, key: _UnitKey) -> tuple[int, int, int]:
-        try:
-            return (0, self._active_order.index(key), 0)
-        except ValueError:
-            pass
+        active_rank = self._active_rank.get(key)
+        if active_rank is not None:
+            return (0, active_rank, 0)
         current = self._current_key
         if current is None:
             return (1, 0, 0)
@@ -745,6 +1354,7 @@ class _ZipRasterUnitJob(QRunnable):
         source: ImageSource,
         unit: ZipRasterDisplayUnit,
         cached_sources: dict[str, _CachedSource] | None = None,
+        prefetch_budget_bytes: int | None = None,
     ) -> None:
         super().__init__()
         self.setAutoDelete(False)
@@ -753,16 +1363,52 @@ class _ZipRasterUnitJob(QRunnable):
         self.source = source
         self.unit = unit
         self.cached_sources = dict(cached_sources or {})
+        self.prefetch_budget_bytes = (
+            None
+            if prefetch_budget_bytes is None
+            else max(0, int(prefetch_budget_bytes))
+        )
         self.signals = _JobSignals()
         self.cancelled = Event()
+        self.admission_declined = False
         self.started = Event()
         self.finished = Event()
         self._token_lock = Lock()
         self._request_id = int(request_id)
 
-    def adopt_request(self, request_id: int) -> None:
+    def adopt_request(
+        self,
+        request_id: int,
+        *,
+        as_current: bool = False,
+    ) -> None:
         with self._token_lock:
             self._request_id = int(request_id)
+            if as_current:
+                # A neighbor prefetch can become the interactive target while
+                # its header probe is running.  Current work is never rejected
+                # by the prefetch budget snapshot.  Keep a decline that the
+                # worker has already decided: its completion will drive a
+                # fresh, unrestricted current request instead of publishing an
+                # error frame for a valid image.
+                self.prefetch_budget_bytes = None
+
+    def expand_prefetch_budget(self, byte_budget: int) -> bool:
+        """Expand a running background job's snapshot atomically.
+
+        Return ``True`` when the worker had already decided to decline under
+        the previous snapshot.  The runtime then retries that key once after
+        consuming the empty declined result.
+        """
+
+        with self._token_lock:
+            already_declined = self.admission_declined
+            if self.prefetch_budget_bytes is not None:
+                self.prefetch_budget_bytes = max(
+                    self.prefetch_budget_bytes,
+                    max(0, int(byte_budget)),
+                )
+            return already_declined
 
     def cancel(self) -> bool:
         if self.cancelled.is_set():
@@ -816,6 +1462,7 @@ class _ZipRasterUnitJob(QRunnable):
             self.unit,
             pages,
             self.cancelled.is_set(),
+            self.admission_declined,
             monotonic(),
         )
         # Worker completion and GUI-result drainage are separate lifetime
@@ -826,8 +1473,15 @@ class _ZipRasterUnitJob(QRunnable):
         self.signals.completed.emit(result)
 
     def _render_unit(self) -> tuple[_RenderedPage, ...]:
-        decoded = tuple(self._decode_page(page) for page in self.unit.pages)
-        if self.cancelled.is_set():
+        if not self._admit_unknown_prefetch_unit():
+            return ()
+        decoded_pages: list[_DecodedPage] = []
+        for page in self.unit.pages:
+            decoded_pages.append(self._decode_page(page))
+            if self.cancelled.is_set() or self.admission_declined:
+                return ()
+        decoded = tuple(decoded_pages)
+        if self.cancelled.is_set() or self.admission_declined:
             return ()
         expanded: list[
             tuple[
@@ -977,26 +1631,54 @@ class _ZipRasterUnitJob(QRunnable):
         try:
             qimage: QImage | None = None
             original_size: tuple[int, int] | None = None
-            if (
-                spec.decoder_maximum_size is not None
-                and spec.adjustments == (1.0, 1.0, 1.0)
-                and Path(page.image_id).suffix.casefold()
-                in {".jpg", ".jpeg", ".jpe"}
-            ):
-                decoded = self.source.open_qimage_at_most(
-                    page.image_id,
-                    spec.decoder_maximum_size,
+            decoder_maximum = _decoder_maximum_for_page(spec, self.unit, page)
+            suffix = Path(page.image_id).suffix.casefold()
+            if self.cancelled.is_set():
+                return _DecodedPage(
+                    page,
+                    None,
+                    page.known_size or (360, 520),
+                    False,
                 )
+            if (
+                decoder_maximum is not None
+                and suffix in _JPEG_SUFFIXES
+            ):
+                compatible = self.source.open_compatible_jpeg_at_most(
+                    page.image_id,
+                    decoder_maximum,
+                )
+                decoded = None
+                if compatible is not None:
+                    qimage = compatible.qimage
+                    original_size = compatible.original_size
+                else:
+                    decoded = self.source.open_qimage_at_most(
+                        page.image_id,
+                        decoder_maximum,
+                    )
                 if decoded is not None:
                     qimage, original_size = decoded
+                if qimage is not None and original_size is not None:
+                    qimage = self._contain_preview_source(
+                        qimage,
+                        original_size,
+                        decoder_maximum,
+                    )
             if (
                 (qimage is None or qimage.isNull())
                 and spec.adjustments == (1.0, 1.0, 1.0)
-                and Path(page.image_id).suffix.casefold() == ".webp"
+                and suffix == ".webp"
             ):
                 qimage = self.source.open_qimage(page.image_id)
                 if qimage is not None and not qimage.isNull():
                     original_size = (qimage.width(), qimage.height())
+            if (
+                qimage is not None
+                and not qimage.isNull()
+                and spec.adjustments != (1.0, 1.0, 1.0)
+            ):
+                qimage = self._adjust_qimage(qimage, spec.adjustments)
             if qimage is None or qimage.isNull():
                 image = self.source.open_image(page.image_id)
                 adjusted: Image.Image | None = None
@@ -1062,6 +1744,163 @@ class _ZipRasterUnitJob(QRunnable):
                 str(exc) or exc.__class__.__name__,
             )
 
+    def _admit_unknown_prefetch_unit(self) -> bool:
+        """Probe and budget an unindexed prefetch as one complete unit.
+
+        GUI-side admission deliberately uses a bounded provisional aspect ratio
+        (or a book-local observed size) so ordinary lazy books can prefetch
+        without eager header I/O.  Once the work reaches this worker, probe any
+        unknown source whose retained raster cannot be bounded exactly, then
+        calculate every missing source plus the complete layout-dependent frame
+        before any pixel decode.  A per-page comparison could admit an
+        over-budget spread, and decoder bounds cannot estimate a fit-width or
+        fit-height frame because layout may upscale it.
+        """
+
+        with self._token_lock:
+            if self.prefetch_budget_bytes is None:
+                return True
+
+        candidates: list[
+            tuple[ZipRasterPage, DecoderMaximumSize | None, str]
+        ] = []
+        needs_exact_prefetch_admission = False
+        for page in self.unit.pages:
+            suffix = Path(page.image_id).suffix.casefold()
+            decoder_maximum = _decoder_maximum_for_page(
+                self.key.render_spec,
+                self.unit,
+                page,
+            )
+            candidates.append((page, decoder_maximum, suffix))
+            if _requires_exact_prefetch_admission(
+                page,
+                decoder_maximum,
+                has_cached_source=page.image_id in self.cached_sources,
+            ):
+                needs_exact_prefetch_admission = True
+        if not needs_exact_prefetch_admission:
+            return True
+
+        logical_sizes: list[tuple[int, int]] = []
+        source_sizes: list[tuple[int, int]] = []
+        missing_source_bytes = 0
+        for page, decoder_maximum, suffix in candidates:
+            cached = self.cached_sources.get(page.image_id)
+            if cached is not None:
+                logical_sizes.append(cached.original_size)
+                source_sizes.append(
+                    (cached.qimage.width(), cached.qimage.height())
+                )
+                continue
+            logical_size = page.known_size
+            if logical_size is None:
+                try:
+                    logical_size = (
+                        self.source.probe_jpeg_size(page.image_id)
+                        if suffix in _JPEG_SUFFIXES
+                        else self.source.probe_image_size(page.image_id)
+                    )
+                except Exception:
+                    logical_size = None
+            if logical_size is None or self.cancelled.is_set():
+                return self._decline_prefetch_if_still_bounded()
+            logical_size = (
+                max(1, int(logical_size[0])),
+                max(1, int(logical_size[1])),
+            )
+            logical_sizes.append(logical_size)
+            if suffix in _JPEG_SUFFIXES and decoder_maximum is not None:
+                source_width, source_height = (
+                    self.source.estimate_compatible_jpeg_size(
+                        logical_size,
+                        decoder_maximum,
+                    )
+                )
+            else:
+                source_width, source_height = logical_size
+            missing_source_bytes += (
+                max(1, source_width) * max(1, source_height) * 4
+            )
+            source_sizes.append(
+                (max(1, source_width), max(1, source_height))
+            )
+
+        frame_bytes = _display_frame_bytes_for_sizes(
+            self.unit,
+            self.key.render_spec,
+            tuple(logical_sizes),
+            source_sizes=tuple(source_sizes),
+        )
+        with self._token_lock:
+            budget = self.prefetch_budget_bytes
+            if budget is None:
+                return True
+            if missing_source_bytes + frame_bytes <= budget:
+                return True
+            if not self.cancelled.is_set():
+                self.admission_declined = True
+        return False
+
+    def _decline_prefetch_if_still_bounded(self) -> bool:
+        with self._token_lock:
+            if self.prefetch_budget_bytes is None:
+                return True
+            if not self.cancelled.is_set():
+                self.admission_declined = True
+        return False
+
+    @staticmethod
+    def _contain_preview_source(
+        qimage: QImage,
+        original_size: tuple[int, int],
+        maximum_size: DecoderMaximumSize,
+    ) -> QImage:
+        """Keep a decoder that ignored scaled output out of the source store.
+
+        Native JPEG tiers may be up to just under twice the requested edge and
+        are intentionally retained so the display performs the only exact
+        resize.  A full/oversized fallback is reduced immediately on the worker
+        before adjustment, rotation or format conversion can multiply it.
+        """
+
+        target_width, target_height = _size_within_bounds(
+            original_size,
+            maximum_size,
+        )
+        actual = (qimage.width(), qimage.height())
+        if actual == original_size and actual != (target_width, target_height):
+            must_reduce = True
+        else:
+            must_reduce = (
+                actual[0] > target_width * 2
+                or actual[1] > target_height * 2
+            )
+        if not must_reduce:
+            return qimage
+        return qimage.scaled(
+            target_width,
+            target_height,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+    @classmethod
+    def _adjust_qimage(
+        cls,
+        qimage: QImage,
+        adjustments: tuple[float, float, float],
+    ) -> QImage:
+        image = qimage_to_pillow(qimage)
+        adjusted: Image.Image | None = None
+        try:
+            adjusted = cls._apply_adjustments(image, adjustments)
+            return pil_to_qimage(adjusted)
+        finally:
+            if adjusted is not None and adjusted is not image:
+                adjusted.close()
+            image.close()
+
     def _split_ranges(
         self,
         page: _DecodedPage,
@@ -1108,10 +1947,22 @@ class _ZipRasterUnitJob(QRunnable):
     ) -> Image.Image:
         brightness, contrast, gamma = adjustments
         adjusted = image
+
+        def replace_adjusted(replacement: Image.Image) -> None:
+            nonlocal adjusted
+            previous = adjusted
+            adjusted = replacement
+            if previous is not image:
+                previous.close()
+
         if brightness != 1.0:
-            adjusted = ImageEnhance.Brightness(adjusted).enhance(brightness)
+            replace_adjusted(
+                ImageEnhance.Brightness(adjusted).enhance(brightness)
+            )
         if contrast != 1.0:
-            adjusted = ImageEnhance.Contrast(adjusted).enhance(contrast)
+            replace_adjusted(
+                ImageEnhance.Contrast(adjusted).enhance(contrast)
+            )
         if gamma != 1.0:
             inverse_gamma = 1.0 / gamma
             lut = [
@@ -1125,20 +1976,18 @@ class _ZipRasterUnitJob(QRunnable):
                 for value in range(256)
             ]
             if adjusted.mode == "RGBA":
-                red, green, blue, alpha = adjusted.split()
-                adjusted = Image.merge(
-                    "RGBA",
-                    (red.point(lut), green.point(lut), blue.point(lut), alpha),
-                )
+                gamma_image = adjusted.point(lut * 3 + list(range(256)))
             elif adjusted.mode == "RGB":
-                adjusted = Image.merge(
-                    "RGB",
-                    tuple(channel.point(lut) for channel in adjusted.split()),
-                )
+                gamma_image = adjusted.point(lut * 3)
             elif adjusted.mode == "L":
-                adjusted = adjusted.point(lut)
+                gamma_image = adjusted.point(lut)
             else:
-                adjusted = adjusted.convert("RGBA")
+                converted = adjusted.convert("RGBA")
+                try:
+                    gamma_image = converted.point(lut * 3 + list(range(256)))
+                finally:
+                    converted.close()
+            replace_adjusted(gamma_image)
         return adjusted
 
 
@@ -1194,6 +2043,11 @@ class RasterBookRuntime(QObject):
         self._active_job: _ZipRasterUnitJob | None = None
         self._jobs: set[_ZipRasterUnitJob] = set()
         self._failed_prefetch: set[_UnitKey] = set()
+        # Admission rejection is capacity state, not a broken page.  Keep it
+        # separate so a later budget increase can retry the same paint-
+        # released work order without also looping terminal/start failures.
+        self._admission_declined_prefetch: set[_UnitKey] = set()
+        self._capacity_retry_after_completion: set[_UnitKey] = set()
         self._cache_unit_limit = max(1, int(cache_unit_limit))
         self._cache_byte_budget = max(1, int(cache_byte_budget))
         self._frame_store = _ZipRasterFrameStore(
@@ -1201,7 +2055,9 @@ class RasterBookRuntime(QObject):
             byte_budget=self._cache_byte_budget,
         )
         self._source_store = _ZipRasterSourceStore(
-            page_limit=max(2, self._cache_unit_limit * 2),
+            # One preview per nearby slot plus an interactive full tier for the
+            # current page.  The combined byte budget remains authoritative.
+            page_limit=max(4, self._cache_unit_limit * 3),
         )
         self._metrics = ZipRasterRuntimeMetrics()
 
@@ -1253,16 +2109,42 @@ class RasterBookRuntime(QObject):
     def decoded_source_bytes(self) -> int:
         return self._source_store.byte_size
 
+    @property
+    def cache_unit_limit(self) -> int:
+        """Resolved display-artifact ceiling for diagnostics/benchmarks."""
+
+        return self._cache_unit_limit
+
+    @property
+    def cache_byte_budget(self) -> int:
+        """Resolved combined source/frame budget for diagnostics/benchmarks."""
+
+        return self._cache_byte_budget
+
     def set_cache_limits(
         self,
         *,
         unit_limit: int | None = None,
         byte_budget: int | None = None,
     ) -> None:
+        previous_unit_limit = self._cache_unit_limit
+        previous_byte_budget = self._cache_byte_budget
         if unit_limit is not None:
             self._cache_unit_limit = max(1, int(unit_limit))
         if byte_budget is not None:
             self._cache_byte_budget = max(1, int(byte_budget))
+        limits_shrunk = (
+            self._cache_unit_limit < previous_unit_limit
+            or self._cache_byte_budget < previous_byte_budget
+        )
+        if limits_shrunk:
+            active = self._active_job
+            if active is not None and active.key != self._current_key:
+                # A background worker carries a snapshot of its admission
+                # budget.  Invalidate that snapshot immediately; otherwise a
+                # live 32-GiB -> minimal change could still publish work that
+                # the newly authoritative budget would never start.
+                self._cancel_active_job()
         evicted = self._frame_store.set_limits(
             unit_limit=self._cache_unit_limit,
             byte_budget=self._cache_byte_budget,
@@ -1270,10 +2152,53 @@ class RasterBookRuntime(QObject):
         if evicted:
             self._bump("cache_evictions", evicted)
         source_evicted = self._source_store.set_page_limit(
-            max(2, self._cache_unit_limit * 2)
+            max(4, self._cache_unit_limit * 3)
         )
         self._record_source_evictions(source_evicted)
         self._enforce_combined_budget()
+        limits_expanded = (
+            self._cache_unit_limit > previous_unit_limit
+            or self._cache_byte_budget > previous_byte_budget
+        )
+        if not limits_expanded:
+            if limits_shrunk:
+                self._prefetch_admission_stopped_request_id = None
+                self._drive()
+            return
+
+        if self._cache_byte_budget > previous_byte_budget:
+            # Only exact worker-side capacity declines are retriable here.
+            # Broken images and worker-start failures stay suppressed for the
+            # current work order, avoiding a background retry loop.
+            self._failed_prefetch.difference_update(
+                self._admission_declined_prefetch
+            )
+            self._admission_declined_prefetch.clear()
+        self._prefetch_admission_stopped_request_id = None
+
+        # A newly affordable earlier unit must regain its work-order priority.
+        # Running work cannot be preempted synchronously, but cancellation and
+        # stale-result rejection ensure that the one worker lane next starts
+        # the highest-priority missing background unit.
+        active = self._active_job
+        highest_missing = self._highest_priority_missing_background_key()
+        if (
+            active is not None
+            and active.key != self._current_key
+            and active.key == highest_missing
+            and self._cache_byte_budget > previous_byte_budget
+            and active.expand_prefetch_budget(
+                self._prefetch_worker_budget(active.key)
+            )
+        ):
+            self._capacity_retry_after_completion.add(active.key)
+        if (
+            active is not None
+            and active.key != self._current_key
+            and active.key != highest_missing
+        ):
+            self._cancel_active_job()
+        self._drive()
 
     def has_cached_current(self, request: ZipRasterRequest) -> bool:
         return (
@@ -1407,20 +2332,26 @@ class RasterBookRuntime(QObject):
         # A later navigation may make a previously rejected neighbor current,
         # and must get a fresh attempt.
         self._failed_prefetch.clear()
+        self._admission_declined_prefetch.clear()
+        self._capacity_retry_after_completion.clear()
 
         active = self._active_job
         if active is not None:
             active_cancelled = active.cancelled.is_set()
             if active.key == current_key and not active_cancelled:
-                active.adopt_request(request.request_id)
+                active.adopt_request(request.request_id, as_current=True)
             elif (
                 not suspend_dispatch
                 and not active_cancelled
                 and current_key in self._frame_store
-                and active.key in work_keys
+                and active.key
+                == self._highest_priority_missing_background_key()
             ):
-                # A same-current refresh or a compatible work-order change can
-                # adopt an already useful neighbor instead of restarting it.
+                # Preserve a background decode only when it is still the next
+                # missing unit in the replacement order.  A full-book warm-up
+                # may keep the old key somewhere far in the order; adopting it
+                # merely because it remains present would delay the new
+                # current-side frontier after navigation or reversal.
                 active.adopt_request(request.request_id)
             else:
                 self._cancel_active_job()
@@ -1438,6 +2369,13 @@ class RasterBookRuntime(QObject):
         evicted = self._frame_store.set_displayed_key(self._painted_key)
         if evicted:
             self._bump("cache_evictions", evicted)
+        # A cold atomic commit temporarily protects both the last painted
+        # frame and its replacement.  Once the replacement has painted, the
+        # old frame is removable; enforce the combined source+frame budget at
+        # that exact ownership boundary rather than waiting for another
+        # successful prefetch (which may never exist at an end page or with
+        # prefetch disabled).
+        self._enforce_combined_budget()
         self._prefetch_released_request_id = request.request_id
         self._drive()
         return True
@@ -1457,6 +2395,8 @@ class RasterBookRuntime(QObject):
         self._dispatch_suspended = False
         self._painted_key = None
         self._failed_prefetch.clear()
+        self._admission_declined_prefetch.clear()
+        self._capacity_retry_after_completion.clear()
         self._cancel_active_job()
         if clear_artifacts:
             self._frame_store.clear()
@@ -1516,13 +2456,20 @@ class RasterBookRuntime(QObject):
             if key in self._frame_store or key in self._failed_prefetch:
                 continue
             if not self._can_admit_prefetch(key):
+                # Capacity rejection belongs to this replaceable work order,
+                # not to the whole warm-up frontier.  A single exceptionally
+                # large page must not prevent later small pages from using the
+                # remaining byte budget.  A new request or larger limit clears
+                # only these capacity entries and makes them eligible again.
+                self._failed_prefetch.add(key)
+                self._admission_declined_prefetch.add(key)
                 if (
                     self._prefetch_admission_stopped_request_id
                     != request.request_id
                 ):
                     self._prefetch_admission_stopped_request_id = request.request_id
                     self._bump("prefetch_admission_stops")
-                return
+                continue
             priority = (
                 ImageWorkPriority.VIEWER_NEXT
                 if rank == 0
@@ -1531,22 +2478,64 @@ class RasterBookRuntime(QObject):
             self._submit(key, priority)
             return
 
+    def _highest_priority_missing_background_key(self) -> _UnitKey | None:
+        for key in self._work_keys[1:]:
+            if key in self._frame_store or key in self._failed_prefetch:
+                continue
+            if self._can_admit_prefetch(key):
+                return key
+        return None
+
     def _can_admit_prefetch(self, key: _UnitKey) -> bool:
         """Reject work that cannot coexist with the protected current unit.
 
         The frame store alone cannot see the usually larger decoded source
         allocation.  Admission therefore uses the combined book budget and a
-        conservative estimate of both missing sources and the display frame.
-        Admission does not pre-evict completed artifacts or assume that a
-        running/stale job will reach commit.  Replacement under a full budget
-        is deferred until that page becomes current, where atomic-frame
-        semantics deliberately allow one soft overflow before eviction.
+        conservative estimate of both missing sources and the display frame. A
+        full store may reserve only whole artifacts that rank below this
+        candidate.  This phase is deliberately non-mutating: cancellation or
+        stale completion must leave every prior ready artifact intact.  Actual
+        bytes are replanned and reclaimed only for a relevant successful GUI
+        result immediately before it enters the stores.
         """
         if not self._frame_store.can_admit_prefetch(key):
             return False
         unit = self._unit_by_key.get(key)
         if unit is None:
             return False
+        frame_slots_needed = max(
+            0,
+            self._frame_store.unit_count + 1 - self._cache_unit_limit,
+        )
+        requires_exact_worker_admission = any(
+            _requires_exact_prefetch_admission(
+                page,
+                _decoder_maximum_for_page(key.render_spec, unit, page),
+                has_cached_source=self._source_store.find(
+                    page,
+                    key.render_spec,
+                    unit=unit,
+                    touch=False,
+                )
+                is not None,
+            )
+            for page in unit.pages
+        )
+        if requires_exact_worker_admission:
+            # A prior giant lazy PNG must not make every later unknown page
+            # inherit its observed provisional cost and skip the header probe.
+            # Prove only rank/unit replaceability here; the worker compares its
+            # exact header cost against free + strictly lower-rank allowance.
+            return bool(
+                self._prefetch_worker_budget(key) > 0
+                and self._lower_rank_reclaim_plan(
+                    key,
+                    unit,
+                    bytes_needed=0,
+                    frame_slots_needed=frame_slots_needed,
+                )
+                is not None
+            )
         source_bytes = self._estimated_missing_source_bytes(
             unit,
             key.render_spec,
@@ -1557,7 +2546,112 @@ class RasterBookRuntime(QObject):
             source_bytes=source_bytes,
         )
         free = max(0, self._cache_byte_budget - self.cache_bytes)
-        return source_bytes + frame_bytes <= free
+        required_bytes = source_bytes + frame_bytes
+        bytes_needed = max(0, required_bytes - free)
+        if frame_slots_needed == 0 and bytes_needed == 0:
+            return True
+        return self._lower_rank_reclaim_plan(
+            key,
+            unit,
+            bytes_needed=bytes_needed,
+            frame_slots_needed=frame_slots_needed,
+        ) is not None
+
+    def _lower_rank_reclaim_plan(
+        self,
+        key: _UnitKey,
+        unit: ZipRasterDisplayUnit,
+        *,
+        bytes_needed: int,
+        frame_slots_needed: int,
+        excluded_source_keys: frozenset[_SourceKey] = frozenset(),
+    ) -> tuple[tuple[_SourceKey, ...], tuple[_UnitKey, ...]] | None:
+        frame_candidates = self._frame_store.lower_rank_reclaim_candidates(key)
+        source_candidates = self._source_store.lower_rank_reclaim_candidates(
+            unit,
+            key.render_spec,
+            excluded_keys=excluded_source_keys,
+        )
+        if len(frame_candidates) < frame_slots_needed:
+            return None
+
+        selected_frames = list(frame_candidates[:frame_slots_needed])
+        selected_frame_keys = {candidate for candidate, _size in selected_frames}
+        reclaimed_bytes = sum(size for _candidate, size in selected_frames)
+        selected_sources: list[tuple[_SourceKey, int]] = []
+        for candidate in source_candidates:
+            if reclaimed_bytes >= bytes_needed:
+                break
+            selected_sources.append(candidate)
+            reclaimed_bytes += candidate[1]
+        if reclaimed_bytes < bytes_needed:
+            for candidate in frame_candidates[frame_slots_needed:]:
+                if reclaimed_bytes >= bytes_needed:
+                    break
+                if candidate[0] in selected_frame_keys:
+                    continue
+                selected_frames.append(candidate)
+                selected_frame_keys.add(candidate[0])
+                reclaimed_bytes += candidate[1]
+        if reclaimed_bytes < bytes_needed:
+            return None
+        return (
+            tuple(candidate for candidate, _size in selected_sources),
+            tuple(candidate for candidate, _size in selected_frames),
+        )
+
+    def _prefetch_worker_budget(self, key: _UnitKey) -> int:
+        """Return free bytes plus every strictly lower-rank reservation."""
+
+        unit = self._unit_by_key.get(key)
+        if unit is None:
+            return 0
+        free = max(0, self._cache_byte_budget - self.cache_bytes)
+        source_allowance = sum(
+            size
+            for _candidate, size in (
+                self._source_store.lower_rank_reclaim_candidates(
+                    unit,
+                    key.render_spec,
+                )
+            )
+        )
+        frame_allowance = sum(
+            size
+            for _candidate, size in (
+                self._frame_store.lower_rank_reclaim_candidates(key)
+            )
+        )
+        return free + source_allowance + frame_allowance
+
+    def _apply_reclaim_plan(
+        self,
+        plan: tuple[tuple[_SourceKey, ...], tuple[_UnitKey, ...]],
+    ) -> None:
+        source_keys, frame_keys = plan
+        source_evicted, _source_freed = (
+            self._source_store.remove_reclaim_candidates(source_keys)
+        )
+        self._record_source_evictions(source_evicted)
+        frame_evicted, _frame_freed = (
+            self._frame_store.remove_reclaim_candidates(frame_keys)
+        )
+        if frame_evicted:
+            self._bump("cache_evictions", frame_evicted)
+
+    def _decline_completed_prefetch(self, key: _UnitKey) -> None:
+        self._failed_prefetch.add(key)
+        self._admission_declined_prefetch.add(key)
+        request = self._current_request
+        if (
+            request is not None
+            and self._prefetch_admission_stopped_request_id
+            != request.request_id
+        ):
+            self._prefetch_admission_stopped_request_id = request.request_id
+            self._bump("prefetch_admission_stops")
+        self._drive()
+        self._emit_idle_if_needed()
 
     def _estimated_missing_source_bytes(
         self,
@@ -1567,39 +2661,82 @@ class RasterBookRuntime(QObject):
         observed = self._source_store.largest_source_bytes
         estimate = 0
         for page in unit.pages:
-            if self._source_store.find(page, render_spec) is not None:
+            if self._source_store.find(page, render_spec, unit=unit) is not None:
                 continue
             known_size = page.known_size
             suffix = Path(page.image_id).suffix.casefold()
-            decoder_size = render_spec.decoder_maximum_size
+            decoder_size = _decoder_maximum_for_page(
+                render_spec,
+                unit,
+                page,
+            )
             if known_size is not None:
                 width, height = known_size
                 if (
-                    suffix in {".jpg", ".jpeg", ".jpe"}
+                    suffix in _JPEG_SUFFIXES
                     and decoder_size is not None
-                    and render_spec.adjustments == (1.0, 1.0, 1.0)
                 ):
-                    scale = min(
-                        1.0,
-                        decoder_size[0] / max(1, width),
-                        decoder_size[1] / max(1, height),
+                    width, height = self.source.estimate_compatible_jpeg_size(
+                        (width, height),
+                        decoder_size,
                     )
-                    width = max(1, round(width * scale))
-                    height = max(1, round(height * scale))
                 estimate += width * height * 4
                 continue
             if (
-                suffix in {".jpg", ".jpeg", ".jpe"}
+                suffix in _JPEG_SUFFIXES
                 and decoder_size is not None
-                and render_spec.adjustments == (1.0, 1.0, 1.0)
             ):
-                unknown = decoder_size[0] * decoder_size[1] * 4
-            else:
-                unknown = observed
-            if unknown <= 0:
+                maximum_width, maximum_height = decoder_size
+                if maximum_width is None and maximum_height is None:
+                    unknown = self._cache_byte_budget + 1
+                else:
+                    # Lazy ZIP/folder indexes do not read every JPEG header on
+                    # the GUI thread.  For a one-axis fit, admit a bounded
+                    # provisional page rather than disabling all neighbor
+                    # prefetch.  A 4:1 decoded aspect cap covers ordinary
+                    # comic pages; more extreme sources remain safe because
+                    # the completed artifact is charged at its actual bytes
+                    # and immediately passes through combined-budget eviction.
+                    if maximum_width is None:
+                        maximum_height = max(1, int(maximum_height))
+                        maximum_width = (
+                            maximum_height * _UNKNOWN_JPEG_ASPECT_LIMIT
+                        )
+                    elif maximum_height is None:
+                        maximum_width = max(1, int(maximum_width))
+                        maximum_height = (
+                            maximum_width * _UNKNOWN_JPEG_ASPECT_LIMIT
+                        )
+                    unknown = (
+                        max(1, int(maximum_width))
+                        * max(1, int(maximum_height))
+                        * 4
+                        * max(
+                            1,
+                            int(
+                                self.source.compatible_jpeg_unknown_area_multiplier
+                            ),
+                        )
+                    )
+            elif suffix not in _JPEG_SUFFIXES:
+                # Unknown PNG/WebP/etc. sources are admitted provisionally on
+                # the GUI thread, then header-probed and charged exactly by the
+                # worker before any pixel raster is allocated.  A viewport-
+                # sized floor lets the first such neighbor reach that safety
+                # boundary without using compressed entry bytes as a decode
+                # estimate; a prior retained source remains the better local
+                # estimate when available.
                 viewport_width, viewport_height = render_spec.viewport_size
                 dpr = render_spec.device_pixel_ratio
-                unknown = round(viewport_width * viewport_height * dpr * dpr * 4)
+                viewport_source_bytes = round(
+                    viewport_width * viewport_height * dpr * dpr * 4
+                )
+                unknown = max(1, observed, viewport_source_bytes)
+            else:
+                # Unknown full decodes have no trustworthy upper bound.  Do
+                # not let a compressed-byte or previous-page guess admit a
+                # potentially 100+ MiB neighbor before it is current.
+                unknown = self._cache_byte_budget + 1
             estimate += max(1, int(unknown))
         return estimate
 
@@ -1612,41 +2749,48 @@ class RasterBookRuntime(QObject):
     ) -> int:
         known_sizes = tuple(page.known_size for page in unit.pages)
         if all(size is not None for size in known_sizes):
-            expanded: list[tuple[int, int]] = []
-            for size in known_sizes:
-                assert size is not None
-                width, height = size
-                if (
-                    render_spec.split_wide_image
-                    and unit.is_single
-                    and width >= 2
-                    and width / max(1, height) >= 1.25
-                ):
-                    left = width // 2
-                    expanded.extend(((left, height), (width - left, height)))
-                else:
-                    expanded.append((width, height))
-            if render_spec.rotation in {90, 270}:
-                expanded = [(height, width) for width, height in expanded]
-            layout = calculate_spread_layout(
-                expanded,
-                render_spec.viewport_size,
-                fit_mode=render_spec.fit_mode,
-                manual_zoom=render_spec.manual_zoom,
-                gap=render_spec.gap,
-                join_spread_pages=render_spec.join_spread_pages,
-                spread_is_single=unit.is_single,
-                horizontal_alignment=render_spec.horizontal_alignment,
+            logical_sizes = tuple(
+                size for size in known_sizes if size is not None
             )
-            dpr = render_spec.device_pixel_ratio
-            return max(
-                1,
-                sum(
-                    max(1, round(rect.width() * dpr))
-                    * max(1, round(rect.height() * dpr))
-                    * 4
-                    for rect in layout.rects
-                ),
+            source_sizes: list[tuple[int, int]] = []
+            for page, logical_size in zip(unit.pages, logical_sizes):
+                cached = self._source_store.find(
+                    page,
+                    render_spec,
+                    unit=unit,
+                    touch=False,
+                )
+                if cached is not None:
+                    source_sizes.append(
+                        (cached.qimage.width(), cached.qimage.height())
+                    )
+                    continue
+                decoder_size = _decoder_maximum_for_page(
+                    render_spec,
+                    unit,
+                    page,
+                )
+                if (
+                    Path(page.image_id).suffix.casefold() in _JPEG_SUFFIXES
+                    and decoder_size is not None
+                ):
+                    source_sizes.append(
+                        self.source.estimate_compatible_jpeg_size(
+                            logical_size,
+                            decoder_size,
+                        )
+                    )
+                else:
+                    # Missing non-JPEG sources decode to their logical raster;
+                    # standard resampling then clamps the display artifact to
+                    # that source instead of charging a fictitious viewport
+                    # upscale that QPixmap will never receive.
+                    source_sizes.append(logical_size)
+            return _display_frame_bytes_for_sizes(
+                unit,
+                render_spec,
+                logical_sizes,
+                source_sizes=tuple(source_sizes),
             )
 
         viewport_width, viewport_height = render_spec.viewport_size
@@ -1672,6 +2816,7 @@ class RasterBookRuntime(QObject):
             cached = self._source_store.find(
                 page,
                 key.render_spec,
+                unit=unit,
                 touch=True,
             )
             if cached is None:
@@ -1687,6 +2832,11 @@ class RasterBookRuntime(QObject):
             source=self.source,
             unit=unit,
             cached_sources=cached_sources,
+            prefetch_budget_bytes=(
+                None
+                if key == self._current_key
+                else self._prefetch_worker_budget(key)
+            ),
         )
         job.signals.completed.connect(
             self._on_job_completed,
@@ -1806,15 +2956,40 @@ class RasterBookRuntime(QObject):
                 self._jobs.discard(job)
                 break
         if not self._result_is_relevant(result):
+            self._capacity_retry_after_completion.discard(result.key)
             self._bump("stale_results")
             self._drive()
             self._emit_idle_if_needed()
             return
+        if result.admission_declined:
+            request = self._current_request
+            retry_after_capacity_change = (
+                result.key in self._capacity_retry_after_completion
+            )
+            self._capacity_retry_after_completion.discard(result.key)
+            if (
+                result.key != self._current_key
+                and not retry_after_capacity_change
+            ):
+                self._failed_prefetch.add(result.key)
+                self._admission_declined_prefetch.add(result.key)
+                if (
+                    request is not None
+                    and self._prefetch_admission_stopped_request_id
+                    != request.request_id
+                ):
+                    self._prefetch_admission_stopped_request_id = request.request_id
+                    self._bump("prefetch_admission_stops")
+            self._drive()
+            self._emit_idle_if_needed()
+            return
         if result.cancelled:
+            self._capacity_retry_after_completion.discard(result.key)
             self._drive()
             self._emit_idle_if_needed()
             return
 
+        self._capacity_retry_after_completion.discard(result.key)
         existing_before_result = self._frame_store.get(
             result.key,
             touch=False,
@@ -1825,6 +3000,7 @@ class RasterBookRuntime(QObject):
         )
 
         stored_sources: set[_SourceKey] = set()
+        pending_sources: list[_CachedSource] = []
         for rendered in result.pages:
             if (
                 rendered.source_key is None
@@ -1833,7 +3009,7 @@ class RasterBookRuntime(QObject):
             ):
                 continue
             stored_sources.add(rendered.source_key)
-            source_evicted = self._source_store.put(
+            pending_sources.append(
                 _CachedSource(
                     rendered.source_key,
                     rendered.page_index,
@@ -1842,7 +3018,59 @@ class RasterBookRuntime(QObject):
                     rendered.source_is_preview,
                 )
             )
-            self._record_source_evictions(source_evicted)
+
+        result_succeeded = bool(result.pages) and all(
+            rendered.error is None
+            and rendered.display_qimage is not None
+            and not rendered.display_qimage.isNull()
+            for rendered in result.pages
+        )
+        if result.key != self._current_key and result_succeeded:
+            source_delta, superseded_source_keys = (
+                self._source_store.projected_put_delta(tuple(pending_sources))
+            )
+            display_bytes = sum(
+                rendered.display_qimage.width()
+                * rendered.display_qimage.height()
+                * 4
+                for rendered in result.pages
+                if rendered.display_qimage is not None
+            )
+            existing_frame_bytes = (
+                self._frame_store._frame_bytes(existing_before_result)
+                if existing_before_result is not None
+                else 0
+            )
+            projected_bytes = (
+                self.cache_bytes
+                + source_delta
+                + display_bytes
+                - existing_frame_bytes
+            )
+            bytes_needed = max(
+                0,
+                projected_bytes - self._cache_byte_budget,
+            )
+            frame_slots_needed = max(
+                0,
+                self._frame_store.unit_count
+                + int(existing_before_result is None)
+                - self._cache_unit_limit,
+            )
+            reclaim_plan = self._lower_rank_reclaim_plan(
+                result.key,
+                result.unit,
+                bytes_needed=bytes_needed,
+                frame_slots_needed=frame_slots_needed,
+                excluded_source_keys=superseded_source_keys,
+            )
+            if reclaim_plan is None:
+                self._decline_completed_prefetch(result.key)
+                return
+            # The immutable result has passed exact request/relevance and
+            # worker-success checks.  Reclaim now, before QPixmap upload, so
+            # only one worker result is the bounded transient memory peak.
+            self._apply_reclaim_plan(reclaim_plan)
 
         frame_pages: list[ZipRasterFramePage] = []
         source_keys: list[_SourceKey | None] = []
@@ -1884,6 +3112,14 @@ class RasterBookRuntime(QObject):
             return
         if terminal_errors:
             self._bump("terminal_errors", terminal_errors)
+            if result.key != self._current_key:
+                # A failed background result never displaces a ready frame.
+                # The next work order may retry it as current without carrying
+                # a cached error artifact through the navigation window.
+                self._failed_prefetch.add(result.key)
+                self._drive()
+                self._emit_idle_if_needed()
+                return
             if self._source_hydration_key == result.key:
                 hydration_frame = self._source_hydration_frame
                 self._restore_source_hydration_frame()
@@ -1912,6 +3148,9 @@ class RasterBookRuntime(QObject):
                 self._drive()
                 self._emit_idle_if_needed()
                 return
+        for source in pending_sources:
+            source_evicted = self._source_store.put(source)
+            self._record_source_evictions(source_evicted)
         gui_ready = monotonic()
         cached = _CachedFrame(
             result.key,
@@ -1954,6 +3193,14 @@ class RasterBookRuntime(QObject):
         return bool(
             self._accepting_requests
             and request is not None
+            # Full-book work orders deliberately keep most old keys present.
+            # Key membership alone therefore cannot distinguish a useful
+            # adopted job from a result that was already emitted before the
+            # navigation replacement reached the GUI thread.  adopt_request()
+            # updates the worker token before result construction; anything
+            # still carrying the old token must be drained without QPixmap
+            # upload or cache mutation so it cannot delay the new current.
+            and result.request_id == request.request_id
             and result.key.source_epoch == self.source_epoch
             and result.key.source_identity == self._source_identity
             and result.key in self._work_keys
@@ -2043,6 +3290,7 @@ class RasterBookRuntime(QObject):
         return self._source_store.find(
             logical_page,
             cached.key.render_spec,
+            unit=cached.unit,
             touch=touch,
         )
 

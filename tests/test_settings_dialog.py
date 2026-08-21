@@ -180,7 +180,22 @@ def test_viewer_prefetch_presets_and_custom_controls(
     assert dialog.prefetch_image_backward_spin.value() == 3
     assert dialog.prefetch_pdf_forward_spin.value() == 3
     assert dialog.prefetch_pdf_backward_spin.value() == 3
-    assert dialog.viewer_cache_memory_spin.value() == 256
+    assert [
+        dialog.viewer_memory_mode_combo.itemText(index)
+        for index in range(dialog.viewer_memory_mode_combo.count())
+    ] == [
+        "最小限",
+        "256 MB前後",
+        "512 MB前後",
+        "1 GB前後",
+        "2 GB前後",
+        "4 GB前後",
+        "8 GB前後",
+        "16 GB前後",
+        "32 GB前後",
+        "自動",
+    ]
+    assert dialog.viewer_memory_mode_combo.currentData() == "auto"
 
     more_index = dialog.prefetch_preset_combo.findData("more")
     dialog.prefetch_preset_combo.setCurrentIndex(more_index)
@@ -188,7 +203,7 @@ def test_viewer_prefetch_presets_and_custom_controls(
     assert dialog.prefetch_image_backward_spin.value() == 2
     assert dialog.prefetch_pdf_forward_spin.value() == 4
     assert dialog.prefetch_pdf_backward_spin.value() == 1
-    assert dialog.viewer_cache_memory_spin.value() == 512
+    assert dialog.viewer_memory_mode_combo.currentData() == "auto"
     assert not dialog.prefetch_custom_group.isEnabled()
 
     custom_index = dialog.prefetch_preset_combo.findData("custom")
@@ -199,7 +214,6 @@ def test_viewer_prefetch_presets_and_custom_controls(
     assert dialog.prefetch_image_backward_spin.value() == 8
     assert dialog.prefetch_pdf_forward_spin.value() == 7
     assert dialog.prefetch_pdf_backward_spin.value() == 6
-    assert dialog.viewer_cache_memory_spin.value() == 768
     dialog.reject()
 
 
@@ -239,7 +253,9 @@ def test_custom_viewer_prefetch_applies_and_cancel_does_not_save(
     dialog.prefetch_image_backward_spin.setValue(2)
     dialog.prefetch_pdf_forward_spin.setValue(5)
     dialog.prefetch_pdf_backward_spin.setValue(1)
-    dialog.viewer_cache_memory_spin.setValue(640)
+    dialog.viewer_memory_mode_combo.setCurrentIndex(
+        dialog.viewer_memory_mode_combo.findData("4096")
+    )
 
     changed = dialog.apply_settings()
 
@@ -247,7 +263,7 @@ def test_custom_viewer_prefetch_applies_and_cancel_does_not_save(
     assert changed["viewer_prefetch_direction_priority_enabled"] is False
     assert config.viewer_prefetch_settings()["image_forward_units"] == 4
     assert config.viewer_prefetch_settings()["pdf_backward_units"] == 1
-    assert config.viewer_prefetch_settings()["cache_memory_mib"] == 640
+    assert config.viewer_memory_mode() == "4096"
 
     dialog.prefetch_image_forward_spin.setValue(20)
     dialog.reject()

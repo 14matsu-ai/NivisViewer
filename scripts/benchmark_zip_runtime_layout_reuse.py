@@ -69,6 +69,14 @@ _MIB = 1024 * 1024
 _ENTRY_NAME = "日本語ページ/000.jpg"
 _CASE_CLEAR_ALL = "A-clear-all"
 _CASE_REUSE_SOURCE = "B-reuse-source"
+_CASE_TRANSFORM_FULL = "A-transform-full"
+_CASE_TRANSFORM_PREVIEW = "B-transform-preview"
+_WORKER_CASES = (
+    _CASE_CLEAR_ALL,
+    _CASE_REUSE_SOURCE,
+    _CASE_TRANSFORM_FULL,
+    _CASE_TRANSFORM_PREVIEW,
+)
 
 
 def _jpeg_bytes(size: tuple[int, int], *, pattern: str) -> bytes:
@@ -161,6 +169,7 @@ class _CountingZipSource(ZipImageSource):
         super().__init__(archive_path)
         self._probe_lock = threading.Lock()
         self.counts: Counter[str] = Counter()
+        self.decode_outputs: list[dict[str, object]] = []
 
     def _bump(self, name: str, amount: int = 1) -> None:
         with self._probe_lock:
@@ -169,6 +178,31 @@ class _CountingZipSource(ZipImageSource):
     def snapshot(self) -> dict[str, int]:
         with self._probe_lock:
             return dict(self.counts)
+
+    def output_snapshot(self) -> list[dict[str, object]]:
+        with self._probe_lock:
+            return list(self.decode_outputs)
+
+    def _record_output(
+        self,
+        *,
+        backend: str,
+        width: int,
+        height: int,
+        original_size: tuple[int, int],
+    ) -> None:
+        with self._probe_lock:
+            self.decode_outputs.append(
+                {
+                    "backend": str(backend),
+                    "width": int(width),
+                    "height": int(height),
+                    "original_width": int(original_size[0]),
+                    "original_height": int(original_size[1]),
+                    "preview": (int(width), int(height))
+                    != (int(original_size[0]), int(original_size[1])),
+                }
+            )
 
     def _read_entry_stream(self, image_id, cancelled):
         try:
@@ -183,6 +217,23 @@ class _CountingZipSource(ZipImageSource):
         self._bump("bytesio_payload_bytes", size)
         return stream
 
+    def _read_entry_qbytearray(self, image_id, cancelled):
+        try:
+            payload, read_calls = super()._read_entry_qbytearray(
+                image_id,
+                cancelled,
+            )
+        except Exception:
+            self._bump("zip_entry_read_failures")
+            raise
+        size = int(payload.size())
+        self._bump("zip_entry_read_count")
+        self._bump("zip_entry_read_bytes", size)
+        self._bump("qbytearray_payload_count")
+        self._bump("qbytearray_payload_bytes", size)
+        self._bump("qbytearray_read_calls", int(read_calls))
+        return payload, read_calls
+
     def open_qimage_at_most(self, image_id, maximum_size):
         self._bump("decode_calls")
         self._bump("qimage_reader_decode_calls")
@@ -193,6 +244,32 @@ class _CountingZipSource(ZipImageSource):
         self._bump("whole_payload_copy_bytes", size)
         if result is not None and not result[0].isNull():
             self._bump("source_qimage_outputs")
+            image, original_size = result
+            self._record_output(
+                backend="qimage-reader-bytesio",
+                width=image.width(),
+                height=image.height(),
+                original_size=original_size,
+            )
+        return result
+
+    def open_compatible_jpeg_at_most(self, image_id, maximum_size):
+        self._bump("decode_calls")
+        self._bump("qimage_reader_decode_calls")
+        result = super().open_compatible_jpeg_at_most(
+            image_id,
+            maximum_size,
+        )
+        if result is not None and not result.qimage.isNull():
+            self._bump("source_qimage_outputs")
+            self._bump("whole_payload_copy_count")
+            self._bump("whole_payload_copy_bytes", int(result.bytes_read))
+            self._record_output(
+                backend=str(result.backend),
+                width=result.qimage.width(),
+                height=result.qimage.height(),
+                original_size=result.original_size,
+            )
         return result
 
     def open_image(self, image_id: str) -> Image.Image:
@@ -200,6 +277,12 @@ class _CountingZipSource(ZipImageSource):
         self._bump("pillow_decode_calls")
         image = super().open_image(image_id)
         self._bump("source_pil_outputs")
+        self._record_output(
+            backend="pillow-full",
+            width=image.width,
+            height=image.height,
+            original_size=image.size,
+        )
         return image
 
 
@@ -211,6 +294,7 @@ class _CaseProbe:
         self.display_qimage_outputs = 0
         self.pil_to_qimage_outputs = 0
         self.peak_working_set: int | None = None
+        self.step_peak_working_set: int | None = None
         self.peak_source_bytes = 0
         self.peak_frame_bytes = 0
         self.peak_total_cache_bytes = 0
@@ -249,6 +333,10 @@ class _CaseProbe:
                 self.peak_working_set or 0,
                 memory[0],
             )
+            self.step_peak_working_set = max(
+                self.step_peak_working_set or 0,
+                memory[0],
+            )
         source_bytes = self.runtime.decoded_source_bytes
         total_bytes = self.runtime.cache_bytes
         frame_bytes = max(0, total_bytes - source_bytes)
@@ -258,6 +346,10 @@ class _CaseProbe:
             self.peak_total_cache_bytes,
             total_bytes,
         )
+
+    def reset_step_peak(self) -> None:
+        memory = _process_memory_bytes()
+        self.step_peak_working_set = memory[0] if memory is not None else None
 
     def close(self) -> None:
         runtime_module.render_qimage = self._original_render_qimage
@@ -291,8 +383,30 @@ def _pump_until(
 
 def _layout_specs(
     viewport: tuple[int, int],
+    worker_case: str,
 ) -> tuple[tuple[str, ZipRasterRenderSpec, str], ...]:
     width, height = viewport
+    if worker_case in {_CASE_TRANSFORM_FULL, _CASE_TRANSFORM_PREVIEW}:
+        preview = worker_case == _CASE_TRANSFORM_PREVIEW
+        return (
+            (
+                "rotation_brightness_high_quality",
+                ZipRasterRenderSpec(
+                    viewport,
+                    rotation=90,
+                    resampling_mode="high_quality",
+                    brightness=1.2,
+                    decoder_maximum_size=viewport if preview else None,
+                    decoder_headroom=2.0,
+                    decoder_layout_sized=preview,
+                ),
+                (
+                    "production layout-sized preview demand"
+                    if preview
+                    else "legacy full-resolution transform demand"
+                ),
+            ),
+        )
     smaller = (max(1, width * 3 // 4), max(1, height * 3 // 4))
     return (
         (
@@ -376,7 +490,10 @@ def _run_worker_case(args: argparse.Namespace) -> dict[str, Any]:
     source_closed = False
     try:
         for request_id, (name, spec, description) in enumerate(
-            _layout_specs((int(args.viewport_width), int(args.viewport_height))),
+            _layout_specs(
+                (int(args.viewport_width), int(args.viewport_height)),
+                str(args.worker_case),
+            ),
             start=1,
         ):
             step_started_at = time.perf_counter()
@@ -392,6 +509,9 @@ def _run_worker_case(args: argparse.Namespace) -> dict[str, Any]:
             before_artifact_callbacks = probe.artifact_callbacks
             before_display_qimages = probe.display_qimage_outputs
             before_pil_qimages = probe.pil_to_qimage_outputs
+            before_decode_outputs = len(source.output_snapshot())
+            step_memory_start = _process_memory_bytes()
+            probe.reset_step_peak()
             request = ZipRasterRequest(
                 1,
                 request_id,
@@ -424,6 +544,9 @@ def _run_worker_case(args: argparse.Namespace) -> dict[str, Any]:
             counts_delta = _delta(source.snapshot(), before_counts)
             source_bytes = runtime.decoded_source_bytes
             total_cache_bytes = runtime.cache_bytes
+            step_memory_end = _process_memory_bytes()
+            source_qimage = frame.pages[0].source_qimage
+            pixmap = frame.pages[0].pixmap
             steps.append(
                 {
                     "name": name,
@@ -458,6 +581,53 @@ def _run_worker_case(args: argparse.Namespace) -> dict[str, Any]:
                     "pil_to_qimage_outputs": (
                         probe.pil_to_qimage_outputs - before_pil_qimages
                     ),
+                    "decode_outputs": source.output_snapshot()[
+                        before_decode_outputs:
+                    ],
+                    "frame_source_qimage_size": (
+                        [source_qimage.width(), source_qimage.height()]
+                        if source_qimage is not None
+                        and not source_qimage.isNull()
+                        else None
+                    ),
+                    "frame_display_pixmap_size": (
+                        [pixmap.width(), pixmap.height()]
+                        if pixmap is not None and not pixmap.isNull()
+                        else None
+                    ),
+                    "frame_source_is_preview": bool(
+                        frame.pages[0].source_is_preview
+                    ),
+                    "memory": {
+                        "working_set_start_mib": _mib(
+                            step_memory_start[0]
+                            if step_memory_start is not None
+                            else None
+                        ),
+                        "working_set_end_mib": _mib(
+                            step_memory_end[0]
+                            if step_memory_end is not None
+                            else None
+                        ),
+                        "working_set_delta_mib": (
+                            _mib(step_memory_end[0] - step_memory_start[0])
+                            if step_memory_start is not None
+                            and step_memory_end is not None
+                            else None
+                        ),
+                        "sampled_peak_working_set_mib": _mib(
+                            probe.step_peak_working_set
+                        ),
+                        "sampled_peak_delta_mib": (
+                            _mib(
+                                probe.step_peak_working_set
+                                - step_memory_start[0]
+                            )
+                            if probe.step_peak_working_set is not None
+                            and step_memory_start is not None
+                            else None
+                        ),
+                    },
                     "source_cache_hits": metrics_delta.get(
                         "source_cache_hits", 0
                     ),
@@ -488,7 +658,17 @@ def _run_worker_case(args: argparse.Namespace) -> dict[str, Any]:
             "policy": (
                 "cancel(clear_artifacts=True) before every layout change"
                 if args.worker_case == _CASE_CLEAR_ALL
-                else "invalidate_layout() preserves decoded sources"
+                else (
+                    "invalidate_layout() preserves decoded sources"
+                    if args.worker_case == _CASE_REUSE_SOURCE
+                    else (
+                        "legacy decoder_maximum_size=None full transform"
+                        if args.worker_case == _CASE_TRANSFORM_FULL
+                        else (
+                            "production decoder_layout_sized preview transform"
+                        )
+                    )
+                )
             ),
             "total_elapsed_ms": total_elapsed_ms,
             "steps": steps,
@@ -716,10 +896,18 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="use a smaller detailed JPEG for a fast smoke benchmark",
     )
+    parser.add_argument(
+        "--transform-ab",
+        action="store_true",
+        help=(
+            "compare one legacy full transform with the production "
+            "layout-sized preview transform in isolated workers"
+        ),
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--worker-case",
-        choices=(_CASE_CLEAR_ALL, _CASE_REUSE_SOURCE),
+        choices=_WORKER_CASES,
         help=argparse.SUPPRESS,
     )
     parser.add_argument("--archive", type=Path, help=argparse.SUPPRESS)
@@ -766,11 +954,25 @@ def main() -> int:
             image_size=image_size,
             pattern=str(args.pattern),
         )
-        old_case = _run_isolated_case(args, archive_path, _CASE_CLEAR_ALL)
-        new_case = _run_isolated_case(args, archive_path, _CASE_REUSE_SOURCE)
+        old_worker_case = (
+            _CASE_TRANSFORM_FULL
+            if args.transform_ab
+            else _CASE_CLEAR_ALL
+        )
+        new_worker_case = (
+            _CASE_TRANSFORM_PREVIEW
+            if args.transform_ab
+            else _CASE_REUSE_SOURCE
+        )
+        old_case = _run_isolated_case(args, archive_path, old_worker_case)
+        new_case = _run_isolated_case(args, archive_path, new_worker_case)
         report = {
             "schema_version": 1,
-            "benchmark": "ZipRasterBookRuntime layout source reuse",
+            "benchmark": (
+                "ZipRasterBookRuntime large transform preview A/B"
+                if args.transform_ab
+                else "ZipRasterBookRuntime layout source reuse"
+            ),
             "qt_platform": "offscreen",
             "fixture": {
                 "temporary_directory": True,
@@ -784,12 +986,22 @@ def main() -> int:
             },
             "measurement_scope": {
                 "A": (
-                    "separate source/runtime/process; cancel(clear_artifacts=True) "
-                    "before each layout change"
+                    "separate source/runtime/process; legacy full-resolution "
+                    "rotation/brightness/high-quality transform"
+                    if args.transform_ab
+                    else (
+                        "separate source/runtime/process; "
+                        "cancel(clear_artifacts=True) before each layout change"
+                    )
                 ),
                 "B": (
-                    "separate source/runtime/process; invalidate_layout() keeps "
-                    "decoded QImage sources while clearing QPixmap frames"
+                    "separate source/runtime/process; production layout-sized "
+                    "preview rotation/brightness/high-quality transform"
+                    if args.transform_ab
+                    else (
+                        "separate source/runtime/process; invalidate_layout() "
+                        "keeps decoded QImage sources while clearing QPixmap frames"
+                    )
                 ),
                 "magnifier_equivalent": (
                     "full-resolution source demand plus a distinct manual-zoom "
@@ -804,8 +1016,16 @@ def main() -> int:
                     "during event pumping and the OS process peak is also reported"
                 ),
             },
-            "A_old_clear_all": old_case,
-            "B_new_reuse_source": new_case,
+            (
+                "A_legacy_full_transform"
+                if args.transform_ab
+                else "A_old_clear_all"
+            ): old_case,
+            (
+                "B_production_preview_transform"
+                if args.transform_ab
+                else "B_new_reuse_source"
+            ): new_case,
             "comparison": _comparison(old_case, new_case),
         }
 

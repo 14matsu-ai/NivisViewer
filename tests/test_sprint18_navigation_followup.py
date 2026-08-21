@@ -238,7 +238,10 @@ def test_display_unit_navigation_leaves_sliding_mode() -> None:
 def test_page_navigation_controller_never_opens_books() -> None:
     model = _model([(80, 120)] * 3)
     changes: list[int] = []
-    controller = ViewerPageNavigationController(model, changes.append)
+    controller = ViewerPageNavigationController(
+        model,
+        lambda previous, _kind: changes.append(previous),
+    )
 
     assert controller.next_single_page()
     assert changes == [0]
@@ -1129,15 +1132,15 @@ def test_hidden_bottom_overlay_does_not_claim_qwindow_then_viewer_wheel(
     original_next_page = ViewerWindow.next_page
     original_next_or_scroll = ViewerWindow.next_page_or_scroll
 
-    def counted_next_page(self: ViewerWindow) -> None:
+    def counted_next_page(self: ViewerWindow, **kwargs) -> None:
         nonlocal next_page_calls
         next_page_calls += 1
-        original_next_page(self)
+        original_next_page(self, **kwargs)
 
-    def counted_next_or_scroll(self: ViewerWindow) -> None:
+    def counted_next_or_scroll(self: ViewerWindow, **kwargs) -> None:
         nonlocal next_or_scroll_calls
         next_or_scroll_calls += 1
-        original_next_or_scroll(self)
+        original_next_or_scroll(self, **kwargs)
 
     monkeypatch.setattr(ViewerWindow, "next_page", counted_next_page)
     monkeypatch.setattr(
@@ -1181,10 +1184,10 @@ def test_hidden_bottom_overlay_does_not_claim_qwindow_then_viewer_wheel(
         process_calls += 1
         return original_process(angle_delta, pixel_delta)
 
-    def counted_display_move() -> bool:
+    def counted_display_move(**kwargs) -> bool:
         nonlocal display_move_calls
         display_move_calls += 1
-        return original_display_move()
+        return original_display_move(**kwargs)
 
     monkeypatch.setattr(
         window.slider,

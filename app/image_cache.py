@@ -353,7 +353,7 @@ class ImageCache(QObject):
         self.set_cache_byte_budget_bytes(
             max(
                 64,
-                min(4096, int(memory_mib)),
+                min(32768, int(memory_mib)),
             )
             * 1024
             * 1024

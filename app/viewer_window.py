@@ -15,6 +15,7 @@ from PySide6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
     QIcon,
+    QKeyEvent,
     QKeySequence,
     QPixmap,
     QShortcut,
@@ -84,6 +85,15 @@ from .viewer_page_list_runtime import (
 )
 from .viewer_page_navigation import ViewerPageNavigationController
 from .viewer_page_slider import ViewerPageSlider
+from .viewer_navigation_policy import (
+    NavigationAdmissionDecision,
+    NavigationAdmissionPolicy,
+    NavigationInputKind,
+)
+from .viewer_memory_policy import (
+    ViewerMemoryResolution,
+    resolve_viewer_memory_budget,
+)
 from .viewer_display_unit import (
     ViewerDisplayUnit,
     ViewerSlotState,
@@ -111,12 +121,6 @@ _PREPARED_DISPLAY_IDLE_GRACE_MS = 16
 _DISPLAY_DEMAND_IDLE_GRACE_MS = 16
 _RASTER_PAINT_FALLBACK_MS = 250
 _ZIP_RUNTIME_BROWSER_RESUME_GRACE_MS = 500
-_ZIP_RUNTIME_DEMAND_IDLE_GRACE_MS = 6
-_RASTER_NAVIGATION_BURST_WINDOW_MS = 120
-_RASTER_NAVIGATION_BURST_MIN_TRAILING_MS = 8
-_RASTER_NAVIGATION_BURST_MAX_TRAILING_MS = 32
-
-
 class ViewerWindow(QMainWindow):
     activated = Signal(object)
     closing = Signal(object)
@@ -367,9 +371,13 @@ class ViewerWindow(QMainWindow):
         )
         self._zip_runtime_request_timer = QTimer(self)
         self._zip_runtime_request_timer.setSingleShot(True)
-        self._zip_runtime_request_timer.setInterval(
-            _ZIP_RUNTIME_DEMAND_IDLE_GRACE_MS
+        self._zip_runtime_request_timer.setTimerType(
+            Qt.TimerType.PreciseTimer
         )
+        # Runtime idle can be emitted synchronously from stage()->tryTake().
+        # This timer is only a re-entry/release boundary: zero for idle key
+        # work, or a short device-cadence interval for a proven wheel burst.
+        self._zip_runtime_request_timer.setInterval(0)
         self._zip_runtime_request_timer.timeout.connect(
             self._dispatch_pending_zip_runtime_request
         )
@@ -413,6 +421,12 @@ class ViewerWindow(QMainWindow):
         self._raster_viewport_timer.timeout.connect(
             self._refresh_raster_decode_bounds
         )
+        self._raster_magnifier_cancel_timer = QTimer(self)
+        self._raster_magnifier_cancel_timer.setSingleShot(True)
+        self._raster_magnifier_cancel_timer.setInterval(0)
+        self._raster_magnifier_cancel_timer.timeout.connect(
+            self._refresh_after_raster_magnifier_cancel
+        )
         self._pdf_prefetch_source: PdfImageSource | None = None
         self._pdf_prefetch_generation = -1
         self._pdf_prefetch_center = 0
@@ -431,7 +445,11 @@ class ViewerWindow(QMainWindow):
         self._zip_runtime_current_frame_serial = 0
         self._zip_runtime_last_painted_serial = 0
         self._pending_zip_runtime_request: RasterRequest | None = None
-        self._last_raster_navigation_input_ns = 0
+        self._pending_raster_input_kind: NavigationInputKind | None = None
+        self._pending_raster_repeat_key: int | None = None
+        self._navigation_repeat_key: int | None = None
+        self._navigation_wheel_timestamp_ns: int | None = None
+        self._navigation_admission = NavigationAdmissionPolicy()
         self._pending_presentation_side_effect_token: (
             PresentationFrameToken | None
         ) = None
@@ -544,6 +562,7 @@ class ViewerWindow(QMainWindow):
         elif event.type() == QEvent.Type.WindowDeactivate and hasattr(self, "viewer"):
             self.viewer.cancel_mouse_gesture()
             self.viewer.cancel_pending_canvas_click()
+            self._finish_pending_navigation_sequence()
         if (
             hasattr(self, "fullscreen_chrome")
             and event.type()
@@ -620,8 +639,22 @@ class ViewerWindow(QMainWindow):
 
         self._create_menus()
 
-        self.viewer.nextRequested.connect(self.next_page_or_scroll)
-        self.viewer.previousRequested.connect(self.previous_page_or_scroll)
+        self.viewer.nextRequested.connect(
+            lambda: self.next_page_or_scroll(
+                input_kind=NavigationInputKind.WHEEL
+            )
+        )
+        self.viewer.previousRequested.connect(
+            lambda: self.previous_page_or_scroll(
+                input_kind=NavigationInputKind.WHEEL
+            )
+        )
+        self.viewer.wheelInputObserved.connect(
+            self._observe_wheel_input
+        )
+        self.viewer.wheelSequenceFinished.connect(
+            self._finish_wheel_navigation
+        )
         self.viewer.fullscreenToggleRequested.connect(
             lambda: self.dispatch_command(commands.TOGGLE_FULLSCREEN)
         )
@@ -651,16 +684,29 @@ class ViewerWindow(QMainWindow):
         self.viewer.magnifierSourceResolutionRequested.connect(
             self._request_raster_magnifier_resolution
         )
-        self.viewer.magnifierCancelled.connect(self._clear_pdf_magnifier_resolution)
+        self.viewer.magnifierCancelled.connect(self._on_magnifier_cancelled)
         self.slider.focusedPageRequested.connect(self._on_slider_changed)
+        self.slider.wheelInputObserved.connect(self._observe_wheel_input)
         self.slider.nextSinglePageRequested.connect(
-            self.page_navigation.next_single_page
+            lambda: self.page_navigation.next_single_page(
+                input_kind=NavigationInputKind.WHEEL
+            )
         )
         self.slider.previousSinglePageRequested.connect(
-            self.page_navigation.previous_single_page
+            lambda: self.page_navigation.previous_single_page(
+                input_kind=NavigationInputKind.WHEEL
+            )
         )
-        self.slider.nextDisplayUnitRequested.connect(self.next_page)
-        self.slider.previousDisplayUnitRequested.connect(self.previous_page)
+        self.slider.nextDisplayUnitRequested.connect(
+            lambda: self.next_page(input_kind=NavigationInputKind.WHEEL)
+        )
+        self.slider.previousDisplayUnitRequested.connect(
+            lambda: self.previous_page(input_kind=NavigationInputKind.WHEEL)
+        )
+        self.slider.wheelSequenceFinished.connect(
+            self._finish_wheel_navigation
+        )
+        self.slider.sliderReleased.connect(self._finish_slider_navigation)
         self.fullscreen_chrome = FullscreenChromeController(
             self,
             viewer=self.viewer,
@@ -694,6 +740,10 @@ class ViewerWindow(QMainWindow):
             self.status,
         )
         self._drop_targets = drop_targets
+        # Keep raw navigation-key handling away from editable controls and the
+        # virtual page list. Those remain discrete UI commands. The canvas is
+        # the only surface that needs press/repeat/release identity.
+        self._navigation_key_targets = (self.viewer, central)
         for target in drop_targets:
             target.setAcceptDrops(True)
             target.installEventFilter(self)
@@ -1084,8 +1134,8 @@ class ViewerWindow(QMainWindow):
 
     def _apply_settings_to_widgets(self) -> None:
         self.viewer.set_background_color(self.background_color)
-        self.viewer.set_render_cache_byte_limit_mib(
-            self.viewer_cache_memory_mib
+        self.viewer.set_render_cache_byte_limit_bytes(
+            self.viewer_cache_budget_bytes
         )
         self._enforce_combined_cache_budget()
         self.viewer.set_gap(self.gap)
@@ -1289,6 +1339,7 @@ class ViewerWindow(QMainWindow):
                 "viewer_prefetch_pdf_forward_units",
                 "viewer_prefetch_pdf_backward_units",
                 "viewer_cache_max_memory_mib",
+                "viewer_memory_mode",
             }.intersection(changed)
         )
         if prefetch_settings_changed:
@@ -1309,18 +1360,48 @@ class ViewerWindow(QMainWindow):
         self.image_prefetch_backward_units = int(values["image_backward_units"])
         self.pdf_prefetch_forward_units = int(values["pdf_forward_units"])
         self.pdf_prefetch_backward_units = int(values["pdf_backward_units"])
-        self.viewer_cache_memory_mib = int(values["cache_memory_mib"])
-        self.image_cache.set_cache_byte_budget_mib(
-            self.viewer_cache_memory_mib
+        memory_mode = self.config.viewer_memory_mode()
+        previous_resolution = getattr(
+            self,
+            "viewer_memory_resolution",
+            None,
+        )
+        if (
+            not isinstance(previous_resolution, ViewerMemoryResolution)
+            or previous_resolution.mode != memory_mode
+        ):
+            runtime = getattr(self, "_zip_runtime", None)
+            current_cache_bytes = (
+                runtime.cache_bytes
+                if isinstance(runtime, RasterBookRuntime)
+                else self.image_cache.cache_bytes
+                + (
+                    self.viewer.render_cache_bytes()
+                    if hasattr(self, "viewer")
+                    else 0
+                )
+            )
+            previous_resolution = resolve_viewer_memory_budget(
+                memory_mode,
+                current_cache_bytes=current_cache_bytes,
+            )
+        self.viewer_memory_mode = memory_mode
+        self.viewer_memory_resolution = previous_resolution
+        self.viewer_cache_budget_bytes = previous_resolution.bytes
+        # Compatibility for status/tests which still expose the resolved MiB
+        # value.  Runtime propagation below is byte-exact up to 32 GiB.
+        self.viewer_cache_memory_mib = previous_resolution.mib
+        self.image_cache.set_cache_byte_budget_bytes(
+            self.viewer_cache_budget_bytes
         )
         if getattr(self, "_zip_runtime", None) is not None:
             self._zip_runtime.set_cache_limits(
-                unit_limit=max(3, self.cache_size),
-                byte_budget=self.image_cache.cache_byte_budget_bytes,
+                unit_limit=max(3, self.model.total_pages),
+                byte_budget=self.viewer_cache_budget_bytes,
             )
         if hasattr(self, "viewer"):
-            self.viewer.set_render_cache_byte_limit_mib(
-                self.viewer_cache_memory_mib
+            self.viewer.set_render_cache_byte_limit_bytes(
+                self.viewer_cache_budget_bytes
             )
             self._enforce_combined_cache_budget()
 
@@ -1332,13 +1413,10 @@ class ViewerWindow(QMainWindow):
             return
         self._enforcing_combined_cache_budget = True
         try:
-            total_bytes = max(
-                64,
-                min(4096, int(self.viewer_cache_memory_mib)),
-            ) * 1024 * 1024
+            total_bytes = max(1, int(self.viewer_cache_budget_bytes))
             if self._zip_runtime_active and self._zip_runtime is not None:
                 self._zip_runtime.set_cache_limits(
-                    unit_limit=max(3, self.cache_size),
+                    unit_limit=max(3, self.model.total_pages),
                     byte_budget=total_bytes,
                 )
                 return
@@ -1379,8 +1457,8 @@ class ViewerWindow(QMainWindow):
         elif self._zip_runtime_active:
             if self._zip_runtime is not None:
                 self._zip_runtime.set_cache_limits(
-                    unit_limit=max(3, self.cache_size),
-                    byte_budget=self.image_cache.cache_byte_budget_bytes,
+                    unit_limit=max(3, self.model.total_pages),
+                    byte_budget=self.viewer_cache_budget_bytes,
                 )
             self._refresh_view()
         else:
@@ -1734,7 +1812,13 @@ class ViewerWindow(QMainWindow):
         self.presentation_state.clear_history()
         self._sync_page_history_actions()
 
-    def _go_to_index_with_history(self, page_index: int, *, raw: bool = False) -> bool:
+    def _go_to_index_with_history(
+        self,
+        page_index: int,
+        *,
+        raw: bool = False,
+        input_kind: NavigationInputKind = NavigationInputKind.DISCRETE,
+    ) -> bool:
         if self.model.total_pages <= 0:
             return False
         old = self.model.focused_index
@@ -1745,10 +1829,18 @@ class ViewerWindow(QMainWindow):
             self.model.go_to_index(page_index)
         if self.model.current_index == old_start and self.model.focused_index == old:
             return False
-        self._refresh_view(navigation=PresentationNavigation.NORMAL)
+        self._refresh_view(
+            navigation=PresentationNavigation.NORMAL,
+            input_kind=input_kind,
+        )
         return True
 
-    def _go_to_model_move_with_history(self, move) -> bool:
+    def _go_to_model_move_with_history(
+        self,
+        move,
+        *,
+        input_kind: NavigationInputKind = NavigationInputKind.DISCRETE,
+    ) -> bool:
         if self.model.total_pages <= 0:
             return False
         old = self.model.focused_index
@@ -1756,12 +1848,28 @@ class ViewerWindow(QMainWindow):
         move()
         if self.model.current_index == old_start and self.model.focused_index == old:
             return False
-        self._refresh_view(navigation=PresentationNavigation.NORMAL)
+        self._refresh_view(
+            navigation=PresentationNavigation.NORMAL,
+            input_kind=input_kind,
+        )
         return True
 
-    def _on_page_navigation_changed(self, _previous_index: int) -> None:
+    def _on_page_navigation_changed(
+        self,
+        _previous_index: int,
+        input_kind: NavigationInputKind,
+    ) -> None:
         self.viewer.cancel_pending_canvas_click()
-        self._refresh_view(navigation=PresentationNavigation.NORMAL)
+        self._refresh_view(
+            navigation=PresentationNavigation.NORMAL,
+            input_kind=input_kind,
+            repeat_key=self._navigation_repeat_key,
+            input_timestamp_ns=(
+                self._navigation_wheel_timestamp_ns
+                if input_kind is NavigationInputKind.WHEEL
+                else None
+            ),
+        )
 
     def go_back_in_page_history(self) -> None:
         target = self.presentation_state.history_target(
@@ -2063,8 +2171,6 @@ class ViewerWindow(QMainWindow):
         self.cache_size = cache_size
         self._update_shared_setting("cache_size", cache_size)
         self.image_cache.set_cache_size(cache_size)
-        if self._zip_runtime is not None:
-            self._zip_runtime.set_cache_limits(unit_limit=max(3, cache_size))
         if self.model.total_pages > 0:
             self._refresh_view()
 
@@ -2400,14 +2506,12 @@ class ViewerWindow(QMainWindow):
             or token.book.source_identity != id(source)
         ):
             return
+        self._sync_page_history_actions()
         if self.page_list_dock.isVisible():
-            current = self.page_list.currentIndex()
-            if current.isValid():
-                self.page_list.scrollTo(
-                    current,
-                    QAbstractItemView.ScrollHint.EnsureVisible,
-                )
-            self._schedule_page_list_visible_work()
+            self._sync_page_list_selection(
+                ensure_visible=True,
+                schedule_visible_work=True,
+            )
         # Persistence is based on the already committed immutable snapshot,
         # but does not block the ViewerWidget's first paint of that frame.
         self.book_session.notify_page_changed()
@@ -2595,6 +2699,10 @@ class ViewerWindow(QMainWindow):
                 previous.frameReady.disconnect(self._on_zip_runtime_frame_ready)
             except (RuntimeError, TypeError):
                 pass
+            try:
+                previous.idle.disconnect(self._on_raster_runtime_idle)
+            except (RuntimeError, TypeError):
+                pass
         if previous is not runtime:
             # Deactivate while ``previous`` is still the bound owner.  This
             # avoids cancelling the newly installed book runtime merely as a
@@ -2604,9 +2712,14 @@ class ViewerWindow(QMainWindow):
             runtime if isinstance(runtime, RasterBookRuntime) else None
         )
         if self._zip_runtime is not None:
+            self._zip_runtime.set_cache_limits(
+                unit_limit=max(3, self.model.total_pages),
+                byte_budget=self.viewer_cache_budget_bytes,
+            )
             self._zip_runtime.frameReady.connect(
                 self._on_zip_runtime_frame_ready
             )
+            self._zip_runtime.idle.connect(self._on_raster_runtime_idle)
 
     def _zip_display_unit(
         self,
@@ -2656,19 +2769,71 @@ class ViewerWindow(QMainWindow):
         )
         center = self.model.focused_index
         direction = self.presentation_state.direction
-        steps = (direction, -direction) if direction else (1, -1)
+        steps = (
+            (direction, -direction)
+            if self.prefetch_direction_priority_enabled and direction
+            else (1, -1)
+        )
         work_order: list[RasterDisplayUnit] = [current]
         seen = {current.identity}
+        decoder_bound = self._current_book_runtime_decode_bounds()
+        if self.viewer.magnifier_selecting or self.viewer.magnifier_active:
+            decoder_bound = None
         source_interactive = (
             self.viewer.magnifier_selecting
             or self.viewer.magnifier_active
+            or decoder_bound is None
         )
-        if not source_interactive:
-            for step in steps:
-                units = self._display_units_from(center, step, 1)
-                if not units:
-                    continue
-                indexes = units[0]
+        if not source_interactive and self.prefetch_preset != "disabled":
+            preferred = self._display_units_from(
+                center,
+                steps[0],
+                self.model.total_pages,
+            )
+            opposite = self._display_units_from(
+                center,
+                steps[1],
+                self.model.total_pages,
+            )
+            ordered_indexes: list[tuple[int, ...]] = []
+            if preferred:
+                ordered_indexes.append(preferred[0])
+            if opposite:
+                ordered_indexes.append(opposite[0])
+            # Both directional walks are already nearest-to-farthest.  Merge
+            # them linearly instead of sorting the whole book on every page
+            # turn; equal distance keeps the requested direction first.
+            preferred_rank = 1
+            opposite_rank = 1
+            while (
+                preferred_rank < len(preferred)
+                or opposite_rank < len(opposite)
+            ):
+                preferred_unit = (
+                    preferred[preferred_rank]
+                    if preferred_rank < len(preferred)
+                    else None
+                )
+                opposite_unit = (
+                    opposite[opposite_rank]
+                    if opposite_rank < len(opposite)
+                    else None
+                )
+                if opposite_unit is None or (
+                    preferred_unit is not None
+                    and min(
+                        abs(index - center) for index in preferred_unit
+                    )
+                    <= min(
+                        abs(index - center) for index in opposite_unit
+                    )
+                ):
+                    ordered_indexes.append(preferred_unit)
+                    preferred_rank += 1
+                else:
+                    ordered_indexes.append(opposite_unit)
+                    opposite_rank += 1
+            for indexes in ordered_indexes:
                 unit = self._zip_display_unit(
                     indexes,
                     start_index=self.model.spread_start_for_index(indexes[0]),
@@ -2679,16 +2844,6 @@ class ViewerWindow(QMainWindow):
                 seen.add(unit.identity)
                 work_order.append(unit)
 
-        decoder_bound = self._current_raster_decode_bounds()
-        if (
-            self.rotation_angle % 360
-            or self.split_wide_image
-            or self.viewer.magnifier_selecting
-            or self.viewer.magnifier_active
-            or (self.brightness, self.contrast, self.gamma)
-            != (1.0, 1.0, 1.0)
-        ):
-            decoder_bound = None
         render_spec = RasterRenderSpec(
             viewport_size=(
                 max(1, self.viewer.width()),
@@ -2712,6 +2867,8 @@ class ViewerWindow(QMainWindow):
             contrast=self.contrast,
             gamma=self.gamma,
             decoder_maximum_size=decoder_bound,
+            decoder_headroom=self._current_book_runtime_decode_headroom(),
+            decoder_layout_sized=True,
         )
         return RasterRequest(
             self.book_session.generation,
@@ -2742,9 +2899,8 @@ class ViewerWindow(QMainWindow):
         *,
         clear_artifacts: bool = False,
     ) -> None:
-        self._zip_runtime_request_timer.stop()
-        self._pending_zip_runtime_request = None
-        self._last_raster_navigation_input_ns = 0
+        self._raster_magnifier_cancel_timer.stop()
+        self._clear_pending_raster_navigation(reset_policy=True)
         if not self._zip_runtime_active:
             if clear_artifacts and self._zip_runtime is not None:
                 self._zip_runtime.cancel(clear_artifacts=True)
@@ -2758,9 +2914,78 @@ class ViewerWindow(QMainWindow):
         self.viewer.set_direct_display_mode(False)
         self._release_raster_interactive_lane()
 
+    def _clear_pending_raster_navigation(
+        self,
+        *,
+        reset_policy: bool = False,
+    ) -> None:
+        self._zip_runtime_request_timer.stop()
+        self._pending_zip_runtime_request = None
+        self._pending_raster_input_kind = None
+        self._pending_raster_repeat_key = None
+        if reset_policy:
+            self._navigation_wheel_timestamp_ns = None
+            self._navigation_admission.reset()
+
+    @Slot(object)
+    def _on_raster_runtime_idle(self, runtime: object) -> None:
+        if (
+            runtime is not self._zip_runtime
+            or self._pending_zip_runtime_request is None
+            or self._shutdown_prepared
+            or not self._zip_runtime_active
+        ):
+            return
+        if self._pending_raster_input_kind is NavigationInputKind.SLIDER_SCRUB:
+            # Slider drag owns its final boundary. Runtime idle must not turn
+            # every intermediate slider value back into a decode request.
+            return
+        if self._pending_raster_input_kind is NavigationInputKind.WHEEL:
+            # A rapid wheel sequence owns a short cadence-derived trailing
+            # boundary. Worker idle alone must not restart transit-page work.
+            if not self._zip_runtime_request_timer.isActive():
+                self._zip_runtime_request_timer.start(
+                    self._navigation_admission.wheel_flush_delay_ms
+                )
+            return
+        # ``stage`` can synchronously remove a queued job and emit idle.  The
+        # zero timer is solely a re-entry guard; it is not an admission wait.
+        self._zip_runtime_request_timer.start(0)
+
+    def _stage_raster_runtime_request(
+        self,
+        runtime: RasterBookRuntime,
+        request: RasterRequest,
+        *,
+        input_kind: NavigationInputKind,
+        repeat_key: int | None,
+    ) -> bool:
+        self._zip_runtime_request_timer.stop()
+        # Set ownership before Runtime.stage(): cancelling a not-yet-started
+        # job can synchronously emit idle back into this Window.
+        self._pending_zip_runtime_request = request
+        self._pending_raster_input_kind = input_kind
+        self._pending_raster_repeat_key = repeat_key
+        if not runtime.stage(request):
+            self._fail_raster_runtime_request(runtime)
+            return False
+        if input_kind is NavigationInputKind.WHEEL:
+            self._zip_runtime_request_timer.start(
+                self._navigation_admission.wheel_flush_delay_ms
+            )
+            return True
+        if (
+            input_kind is not NavigationInputKind.SLIDER_SCRUB
+            and not runtime.has_unfinished_tasks()
+        ):
+            self._zip_runtime_request_timer.start(0)
+        return True
+
     def _dispatch_pending_zip_runtime_request(self) -> None:
         request = self._pending_zip_runtime_request
-        self._pending_zip_runtime_request = None
+        if request is None:
+            return
+        self._clear_pending_raster_navigation(reset_policy=False)
         runtime = self._zip_runtime
         current_identity = tuple(
             (slot.page_index, slot.image_id)
@@ -2775,57 +3000,65 @@ class ViewerWindow(QMainWindow):
             or request.source_epoch != self.book_session.generation
             or request.current.identity != current_identity
         ):
-            if runtime is not None and request is not None:
-                runtime.cancel(clear_artifacts=False)
-            self._release_raster_interactive_lane()
+            # A queued idle callback can belong to an input superseded by a
+            # ready hit or book transition.  Never cancel a newer Runtime
+            # request merely because this pending serial is obsolete.
             return
         if runtime.request(request):
             return
         self._fail_raster_runtime_request(runtime)
 
+    def _finish_wheel_navigation(self) -> None:
+        self._navigation_admission.finish_wheel()
+        self._navigation_wheel_timestamp_ns = None
+        if self._pending_raster_input_kind is NavigationInputKind.WHEEL:
+            self._zip_runtime_request_timer.stop()
+            self._dispatch_pending_zip_runtime_request()
+
+    def _finish_key_repeat_navigation(self, key: int) -> None:
+        self._navigation_admission.finish_key_repeat(key)
+        if (
+            self._pending_raster_input_kind is NavigationInputKind.KEY_REPEAT
+            and self._pending_raster_repeat_key == int(key)
+        ):
+            self._zip_runtime_request_timer.stop()
+            self._dispatch_pending_zip_runtime_request()
+
+    def _finish_slider_navigation(self) -> None:
+        if self._pending_raster_input_kind is NavigationInputKind.SLIDER_SCRUB:
+            self._zip_runtime_request_timer.stop()
+            self._dispatch_pending_zip_runtime_request()
+
+    @Slot(object)
+    def _observe_wheel_input(self, timestamp_ms: object) -> None:
+        observed = int(timestamp_ms)
+        self._navigation_wheel_timestamp_ns = (
+            observed * 1_000_000 if observed > 0 else perf_counter_ns()
+        )
+
+    def _finish_pending_navigation_sequence(self) -> None:
+        if self._pending_raster_input_kind in {
+            NavigationInputKind.WHEEL,
+            NavigationInputKind.KEY_REPEAT,
+            NavigationInputKind.SLIDER_SCRUB,
+        }:
+            self._zip_runtime_request_timer.stop()
+            self._dispatch_pending_zip_runtime_request()
+        self._navigation_repeat_key = None
+        self._navigation_wheel_timestamp_ns = None
+        self._navigation_admission.reset()
+
     def _fail_raster_runtime_request(
         self,
         runtime: RasterBookRuntime | None,
     ) -> None:
-        self._zip_runtime_request_timer.stop()
-        self._pending_zip_runtime_request = None
+        self._clear_pending_raster_navigation(reset_policy=True)
         if runtime is not None:
             runtime.cancel(clear_artifacts=False)
         self._release_raster_interactive_lane()
         message = "Raster Viewer runtimeは要求を受け付けられません。"
         self.presentation_state.fail_pending(message)
         self._set_status_override(message)
-
-    def _raster_cold_dispatch_delay(
-        self,
-        navigation: PresentationNavigation,
-    ) -> int:
-        if navigation is not PresentationNavigation.NORMAL:
-            self._last_raster_navigation_input_ns = 0
-            return _ZIP_RUNTIME_DEMAND_IDLE_GRACE_MS
-        now = perf_counter_ns()
-        previous = self._last_raster_navigation_input_ns
-        self._last_raster_navigation_input_ns = now
-        within_burst = bool(
-            previous
-            and now - previous
-            <= _RASTER_NAVIGATION_BURST_WINDOW_MS * 1_000_000
-        )
-        if within_burst:
-            interval_ms = (now - previous) / 1_000_000
-            # Wait only just beyond the observed cadence.  A fixed 18-48 ms
-            # floor reduced transit work but made already-coalesced 0-4 ms
-            # bursts needlessly slower; this adaptive margin preserves the
-            # final-target gate without turning admission wait into the new
-            # dominant latency.
-            return max(
-                _RASTER_NAVIGATION_BURST_MIN_TRAILING_MS,
-                min(
-                    _RASTER_NAVIGATION_BURST_MAX_TRAILING_MS,
-                    round(interval_ms * 1.25) + 2,
-                ),
-            )
-        return _ZIP_RUNTIME_DEMAND_IDLE_GRACE_MS
 
     def _on_zip_runtime_frame_ready(
         self,
@@ -3138,11 +3371,18 @@ class ViewerWindow(QMainWindow):
         )
         self._update_slider()
         self._update_status()
-        self._sync_page_list_selection(
-            ensure_visible=False,
-            schedule_visible_work=False,
-        )
-        self._sync_page_history_actions()
+        if not self._zip_runtime_active:
+            # Legacy/PDF callers keep their historical synchronous projection
+            # contract. Raster runtimes defer these page-invariant widgets
+            # until the complete frame's paint acknowledgement below.
+            self._sync_page_list_selection(
+                ensure_visible=False,
+                schedule_visible_work=False,
+            )
+            self._sync_page_history_actions()
+        # Raster PageList selection/scroll, action projection, thumbnail work,
+        # and persistence stay outside commit->paint. PresentationState has
+        # already atomically committed their semantic page here.
         self._pending_presentation_side_effect_token = commit.frame.token
         if self._zip_runtime_active:
             # A previous frame may already have armed its post-paint zero
@@ -3163,9 +3403,20 @@ class ViewerWindow(QMainWindow):
         self,
         *,
         navigation: PresentationNavigation = PresentationNavigation.REFRESH,
+        input_kind: NavigationInputKind = NavigationInputKind.REFRESH,
+        repeat_key: int | None = None,
+        input_timestamp_ns: int | None = None,
     ) -> None:
-        self._cancel_pending_display_demand()
-        self.viewer.supersede_pending_display()
+        # A caller that cancelled the magnifier in order to navigate or change
+        # layout owns this refresh.  Suppress the cancel signal's zero-timer
+        # fallback so the same display unit is not requested twice.
+        self._raster_magnifier_cancel_timer.stop()
+        # Once a raster book owns direct display, legacy prepared-display
+        # timers/tasks are already suspended.  Avoid touching that scheduler
+        # on every ready page turn.
+        if not self._zip_runtime_active:
+            self._cancel_pending_display_demand()
+            self.viewer.supersede_pending_display()
         if self._awaiting_first_frame:
             focused_image_id = self.model.image_id_at(self.model.focused_index)
             if focused_image_id is not None:
@@ -3186,34 +3437,47 @@ class ViewerWindow(QMainWindow):
             and self.viewer.magnifier_source_page != self.model.focused_index
         ):
             self.viewer.cancel_magnifier()
+            self._raster_magnifier_cancel_timer.stop()
         zip_request = self._zip_runtime_request(spread)
         if zip_request is not None:
+            # Every raster request already captures the live viewport/DPR in
+            # its render spec. A resize timer queued before this navigation is
+            # therefore obsolete; letting it fire mid-burst would invalidate
+            # freshly built frames and reset the input work order.
+            self._raster_viewport_timer.stop()
+            self._presentation_viewport_refresh_required = False
             self._activate_zip_runtime()
             self._raster_paint_fallback_timer.stop()
             self._zip_runtime_current_frame_serial = 0
             runtime = self._zip_runtime
             if runtime is None:
                 return
+            admission = self._navigation_admission.decide(
+                input_kind,
+                direction=zip_request.navigation_direction,
+                repeat_key=repeat_key,
+                slider_drag_active=self.slider.isSliderDown(),
+                now_ns=input_timestamp_ns,
+            )
             if not runtime.has_cached_current(zip_request):
                 self._hold_raster_interactive_lane()
-                self._pending_zip_runtime_request = zip_request
-                if not runtime.stage(zip_request):
-                    self._fail_raster_runtime_request(runtime)
+                if admission is NavigationAdmissionDecision.STAGE:
+                    self._stage_raster_runtime_request(
+                        runtime,
+                        zip_request,
+                        input_kind=input_kind,
+                        repeat_key=repeat_key,
+                    )
                     return
-                # The runtime adopts/fences the new work order immediately.
-                # Only cold dispatch is replaceable: the leading request keeps
-                # single-turn latency, while a detected wheel/key burst waits
-                # for its final target instead of decoding every transit page.
-                self._zip_runtime_request_timer.setInterval(
-                    self._raster_cold_dispatch_delay(navigation)
-                )
-                self._zip_runtime_request_timer.start()
+                self._clear_pending_raster_navigation(reset_policy=False)
+                if runtime.request(zip_request):
+                    return
+                self._fail_raster_runtime_request(runtime)
                 return
-            self._zip_runtime_request_timer.stop()
-            self._pending_zip_runtime_request = None
-            # A ready frame terminates any preceding cold-input burst.  A
-            # later unrelated miss should receive discrete-request latency.
-            self._last_raster_navigation_input_ns = 0
+            # Ready artifacts ignore a STAGE decision.  They never enter a
+            # timer/worker/upload path, but observing the input above lets a
+            # later cold page in the same wheel/repeat sequence coalesce.
+            self._clear_pending_raster_navigation(reset_policy=False)
             if runtime.request(zip_request):
                 return
             self._fail_raster_runtime_request(runtime)
@@ -4885,6 +5149,67 @@ class ViewerWindow(QMainWindow):
             return
         super().dragEnterEvent(event)
 
+    def _navigation_key_action(
+        self,
+        event: QKeyEvent,
+    ) -> Callable[[NavigationInputKind], None] | None:
+        modifiers = event.modifiers()
+        key = event.key()
+        if modifiers == Qt.KeyboardModifier.NoModifier:
+            if key in {Qt.Key.Key_Space, Qt.Key.Key_PageDown}:
+                return lambda kind: self.next_page_or_scroll(input_kind=kind)
+            if key in {Qt.Key.Key_Backspace, Qt.Key.Key_PageUp}:
+                return lambda kind: self.previous_page_or_scroll(input_kind=kind)
+            if key == Qt.Key.Key_Right:
+                return lambda kind: self.next_page(input_kind=kind)
+            if key == Qt.Key.Key_Left:
+                return lambda kind: self.previous_page(input_kind=kind)
+            if key == Qt.Key.Key_Home:
+                return lambda kind: self.first_page(input_kind=kind)
+            if key == Qt.Key.Key_End:
+                return lambda kind: self.last_page(input_kind=kind)
+        if modifiers == Qt.KeyboardModifier.ShiftModifier:
+            if key == Qt.Key.Key_Right:
+                return lambda kind: self.next_one_page(input_kind=kind)
+            if key == Qt.Key.Key_Left:
+                return lambda kind: self.previous_one_page(input_kind=kind)
+        return None
+
+    def _handle_navigation_key_event(self, event: QKeyEvent) -> bool:
+        action = self._navigation_key_action(event)
+        if action is None:
+            return False
+        event_type = event.type()
+        if event_type == QEvent.Type.ShortcutOverride:
+            # Suppress the legacy zero-argument QShortcut/QAction route so the
+            # following QKeyEvent retains initial/repeat/release identity.
+            event.accept()
+            return True
+        key = int(event.key())
+        if event_type == QEvent.Type.KeyRelease:
+            if not event.isAutoRepeat():
+                self._finish_key_repeat_navigation(key)
+                if self._navigation_repeat_key == key:
+                    self._navigation_repeat_key = None
+            event.accept()
+            return True
+        if event_type != QEvent.Type.KeyPress:
+            return False
+        input_kind = (
+            NavigationInputKind.KEY_REPEAT
+            if event.isAutoRepeat()
+            else NavigationInputKind.KEY_INITIAL
+        )
+        self._navigation_repeat_key = key
+        try:
+            action(input_kind)
+        finally:
+            # The page-navigation callback reads this synchronously. Keep no
+            # ambient key identity after the request has been constructed.
+            self._navigation_repeat_key = None
+        event.accept()
+        return True
+
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
         if watched is getattr(self, "_page_list_viewport", None):
             if event.type() in {
@@ -4893,6 +5218,18 @@ class ViewerWindow(QMainWindow):
                 QEvent.Type.LayoutRequest,
             }:
                 self._schedule_page_list_visible_work()
+        if (
+            watched in getattr(self, "_navigation_key_targets", ())
+            and event.type()
+            in {
+                QEvent.Type.ShortcutOverride,
+                QEvent.Type.KeyPress,
+                QEvent.Type.KeyRelease,
+            }
+            and isinstance(event, QKeyEvent)
+            and self._handle_navigation_key_event(event)
+        ):
+            return True
         if watched in getattr(self, "_drop_targets", ()):
             if event.type() in {QEvent.Type.DragEnter, QEvent.Type.DragMove}:
                 if ExternalDropOpenController.local_paths(event.mimeData()):
@@ -5043,7 +5380,15 @@ class ViewerWindow(QMainWindow):
         return f"{value:.1f} {unit}"
 
     def _on_slider_changed(self, value: int) -> None:
-        self.page_navigation.go_to_focused_page_index(value)
+        input_kind = (
+            NavigationInputKind.SLIDER_SCRUB
+            if self.slider.isSliderDown()
+            else NavigationInputKind.DISCRETE
+        )
+        self.page_navigation.go_to_focused_page_index(
+            value,
+            input_kind=input_kind,
+        )
         # A dragged QSlider moves before valueChanged. Restore the committed
         # page until the requested frame reaches the atomic commit boundary.
         self._update_slider()
@@ -5075,6 +5420,40 @@ class ViewerWindow(QMainWindow):
             max(1, round(self.viewer.width() * dpr)),
             max(1, round(self.viewer.height() * dpr)),
         )
+
+    def _current_book_runtime_decode_bounds(
+        self,
+    ) -> tuple[int | None, int | None] | None:
+        """Return the physical preview constraints for ZIP/folder runtimes.
+
+        RasterBookRuntime can size each page from its final slot, so rotation,
+        spread, split and image adjustments no longer require a full source.
+        Actual/manual/pixel views retain their explicit full-pixel semantics.
+        """
+
+        if self.fit_mode not in {
+            "fit_window",
+            "fit_no_upscale",
+            "fit_width",
+            "fit_height",
+        } or self.viewer_resampling_mode == "pixel":
+            return None
+        dpr = max(1.0, float(self.viewer.devicePixelRatioF()))
+        width = max(1, round(self.viewer.width() * dpr))
+        height = max(1, round(self.viewer.height() * dpr))
+        if self.fit_mode == "fit_width":
+            return width, None
+        if self.fit_mode == "fit_height":
+            return None, height
+        return width, height
+
+    def _current_book_runtime_decode_headroom(self) -> float:
+        return {
+            "standard": 1.0,
+            "smooth": 1.25,
+            "moire_reduction": 2.0,
+            "high_quality": 2.0,
+        }.get(self.viewer_resampling_mode, 1.0)
 
     def _on_viewport_changed(self) -> None:
         pending_page = self.presentation_state.frame_loading
@@ -5243,6 +5622,39 @@ class ViewerWindow(QMainWindow):
             return
         if not self.image_cache.ensure_full_resolution(page_index):
             self.viewer.resume_magnifier_after_source_render()
+
+    def _on_magnifier_cancelled(self) -> None:
+        """Return an interactive raster promotion to the retained preview.
+
+        ``stage`` adopts the normal display key immediately, which fences and
+        cancels an incompatible full-source job without clearing either frame
+        tier.  The zero-timer then creates the presentation request that may
+        atomically publish the retained preview.  Callers that cancel before
+        an explicit page/layout refresh stop that timer at ``_refresh_view``.
+        """
+
+        self._clear_pdf_magnifier_resolution()
+        if (
+            self._shutdown_prepared
+            or not self._zip_runtime_active
+            or isinstance(self.book_session.source, PdfImageSource)
+        ):
+            return
+        runtime = self._zip_runtime
+        request = self._zip_runtime_request(self.model.spread_at())
+        if runtime is None or request is None or not runtime.stage(request):
+            return
+        self._raster_magnifier_cancel_timer.start()
+
+    def _refresh_after_raster_magnifier_cancel(self) -> None:
+        if (
+            self._shutdown_prepared
+            or not self._zip_runtime_active
+            or not self.model.total_pages
+            or isinstance(self.book_session.source, PdfImageSource)
+        ):
+            return
+        self._refresh_view()
 
     def _clear_pdf_magnifier_resolution(self) -> None:
         if not self._pdf_magnifier_targets:
@@ -5430,34 +5842,58 @@ class ViewerWindow(QMainWindow):
 
     def _advance_slideshow(self) -> None:
         old = self.model.current_index
-        self.next_page()
+        self.next_page(input_kind=NavigationInputKind.REFRESH)
         if self.model.current_index == old:
             self.slideshow_timer.stop()
             self._sync_actions()
 
-    def next_page(self) -> None:
-        moved = self.page_navigation.next_display_unit()
+    def next_page(
+        self,
+        *,
+        input_kind: NavigationInputKind = NavigationInputKind.DISCRETE,
+    ) -> None:
+        moved = self.page_navigation.next_display_unit(input_kind=input_kind)
         if not moved and self.auto_open_adjacent_book:
             self.open_next_book()
 
-    def previous_page(self) -> None:
-        moved = self.page_navigation.previous_display_unit()
+    def previous_page(
+        self,
+        *,
+        input_kind: NavigationInputKind = NavigationInputKind.DISCRETE,
+    ) -> None:
+        moved = self.page_navigation.previous_display_unit(input_kind=input_kind)
         if not moved and self.auto_open_adjacent_book:
             self.open_previous_book()
 
-    def next_page_or_scroll(self) -> None:
+    def next_page_or_scroll(
+        self,
+        *,
+        input_kind: NavigationInputKind = NavigationInputKind.DISCRETE,
+    ) -> None:
         if not self.viewer.scroll_forward():
-            self.next_page()
+            self.next_page(input_kind=input_kind)
 
-    def previous_page_or_scroll(self) -> None:
+    def previous_page_or_scroll(
+        self,
+        *,
+        input_kind: NavigationInputKind = NavigationInputKind.DISCRETE,
+    ) -> None:
         if not self.viewer.scroll_backward():
-            self.previous_page()
+            self.previous_page(input_kind=input_kind)
 
-    def next_one_page(self) -> None:
-        self.page_navigation.next_single_page()
+    def next_one_page(
+        self,
+        *,
+        input_kind: NavigationInputKind = NavigationInputKind.DISCRETE,
+    ) -> None:
+        self.page_navigation.next_single_page(input_kind=input_kind)
 
-    def previous_one_page(self) -> None:
-        self.page_navigation.previous_single_page()
+    def previous_one_page(
+        self,
+        *,
+        input_kind: NavigationInputKind = NavigationInputKind.DISCRETE,
+    ) -> None:
+        self.page_navigation.previous_single_page(input_kind=input_kind)
 
     def go_to_page_dialog(self) -> None:
         if self.model.total_pages <= 0:
@@ -5474,15 +5910,25 @@ class ViewerWindow(QMainWindow):
         if accepted:
             self._go_to_index_with_history(page - 1)
 
-    def first_page(self) -> None:
+    def first_page(
+        self,
+        *,
+        input_kind: NavigationInputKind = NavigationInputKind.DISCRETE,
+    ) -> None:
         self.slideshow_timer.stop()
-        self._sync_actions()
-        self.page_navigation.first_page()
+        if self.slideshow_action.isChecked():
+            self.slideshow_action.setChecked(False)
+        self.page_navigation.first_page(input_kind=input_kind)
 
-    def last_page(self) -> None:
+    def last_page(
+        self,
+        *,
+        input_kind: NavigationInputKind = NavigationInputKind.DISCRETE,
+    ) -> None:
         self.slideshow_timer.stop()
-        self._sync_actions()
-        self.page_navigation.last_page()
+        if self.slideshow_action.isChecked():
+            self.slideshow_action.setChecked(False)
+        self.page_navigation.last_page(input_kind=input_kind)
 
     def toggle_fullscreen(self) -> None:
         if self.isFullScreen():
@@ -5526,6 +5972,7 @@ class ViewerWindow(QMainWindow):
         self._pending_zip_runtime_request = None
         self._presentation_side_effect_timer.stop()
         self._pending_presentation_side_effect_token = None
+        self._raster_magnifier_cancel_timer.stop()
         self._page_list_filter_timer.stop()
         self._page_list_viewport_timer.stop()
         self._set_page_list_paused(True)
