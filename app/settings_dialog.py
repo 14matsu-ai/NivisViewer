@@ -46,6 +46,10 @@ from .thumbnail_render import (
 from .seven_zip_locator import SevenZipInfo, SevenZipLocator
 from .viewer_commands import COMMAND_CHOICES
 from .viewer_memory_policy import VIEWER_MEMORY_MODE_LABELS
+from .viewer_render import (
+    DOWNSCALE_ALGORITHM_LABELS,
+    UPSCALE_ALGORITHM_LABELS,
+)
 from .winrar_locator import WinRARInfo, WinRARLocator
 from .windows_file_registration import WindowsFileRegistrationService
 
@@ -413,6 +417,61 @@ class SettingsDialog(QDialog):
             self.viewer_memory_mode_combo,
         )
 
+        resampling_group = QGroupBox("画像の拡大縮小", tab)
+        resampling_layout = QVBoxLayout(resampling_group)
+
+        normal_resampling_group = QGroupBox("通常表示", resampling_group)
+        normal_resampling_form = QFormLayout(normal_resampling_group)
+        self.viewer_downscale_algorithm_combo = QComboBox(
+            normal_resampling_group
+        )
+        self.viewer_upscale_algorithm_combo = QComboBox(
+            normal_resampling_group
+        )
+        for value, label in DOWNSCALE_ALGORITHM_LABELS.items():
+            self.viewer_downscale_algorithm_combo.addItem(label, value)
+        for value, label in UPSCALE_ALGORITHM_LABELS.items():
+            self.viewer_upscale_algorithm_combo.addItem(label, value)
+        normal_resampling_form.addRow(
+            "縮小方式:",
+            self.viewer_downscale_algorithm_combo,
+        )
+        normal_resampling_form.addRow(
+            "拡大方式:",
+            self.viewer_upscale_algorithm_combo,
+        )
+        resampling_layout.addWidget(normal_resampling_group)
+
+        magnifier_resampling_group = QGroupBox("拡大鏡", resampling_group)
+        magnifier_resampling_form = QFormLayout(magnifier_resampling_group)
+        self.magnifier_downscale_algorithm_combo = QComboBox(
+            magnifier_resampling_group
+        )
+        self.magnifier_upscale_algorithm_combo = QComboBox(
+            magnifier_resampling_group
+        )
+        for value, label in DOWNSCALE_ALGORITHM_LABELS.items():
+            self.magnifier_downscale_algorithm_combo.addItem(label, value)
+        for value, label in UPSCALE_ALGORITHM_LABELS.items():
+            self.magnifier_upscale_algorithm_combo.addItem(label, value)
+        magnifier_resampling_form.addRow(
+            "縮小方式:",
+            self.magnifier_downscale_algorithm_combo,
+        )
+        magnifier_resampling_form.addRow(
+            "拡大方式:",
+            self.magnifier_upscale_algorithm_combo,
+        )
+        resampling_layout.addWidget(magnifier_resampling_group)
+
+        resampling_note = QLabel(
+            "自動は倍率に応じて方式を選びます。設定の適用後は、"
+            "開いている画像を再読込せずに表示用フレームだけを作り直します。",
+            resampling_group,
+        )
+        resampling_note.setWordWrap(True)
+        resampling_layout.addWidget(resampling_note)
+
         prefetch_group = QGroupBox("PDF・旧形式の先読み", tab)
         prefetch_layout = QVBoxLayout(prefetch_group)
         prefetch_form = QFormLayout()
@@ -515,6 +574,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(behavior_group)
         layout.addWidget(spread_group)
         layout.addWidget(memory_group)
+        layout.addWidget(resampling_group)
         layout.addWidget(prefetch_group)
         layout.addWidget(fullscreen_group)
         layout.addStretch(1)
@@ -1081,6 +1141,22 @@ class SettingsDialog(QDialog):
             self.viewer_memory_mode_combo,
             self.config.get("viewer_memory_mode", "auto"),
         )
+        self._select_data(
+            self.viewer_downscale_algorithm_combo,
+            self.config.get("viewer_downscale_algorithm", "auto"),
+        )
+        self._select_data(
+            self.viewer_upscale_algorithm_combo,
+            self.config.get("viewer_upscale_algorithm", "auto"),
+        )
+        self._select_data(
+            self.magnifier_downscale_algorithm_combo,
+            self.config.get("magnifier_downscale_algorithm", "sharp"),
+        )
+        self._select_data(
+            self.magnifier_upscale_algorithm_combo,
+            self.config.get("magnifier_upscale_algorithm", "lanczos"),
+        )
         self.prefetch_direction_priority_checkbox.setChecked(
             bool(
                 self.config.get(
@@ -1514,6 +1590,20 @@ class SettingsDialog(QDialog):
             ),
             "viewer_memory_mode": str(
                 self.viewer_memory_mode_combo.currentData() or "auto"
+            ),
+            "viewer_downscale_algorithm": str(
+                self.viewer_downscale_algorithm_combo.currentData() or "auto"
+            ),
+            "viewer_upscale_algorithm": str(
+                self.viewer_upscale_algorithm_combo.currentData() or "auto"
+            ),
+            "magnifier_downscale_algorithm": str(
+                self.magnifier_downscale_algorithm_combo.currentData()
+                or "sharp"
+            ),
+            "magnifier_upscale_algorithm": str(
+                self.magnifier_upscale_algorithm_combo.currentData()
+                or "lanczos"
             ),
             "viewer_prefetch_image_forward_units": custom_prefetch[
                 "image_forward_units"

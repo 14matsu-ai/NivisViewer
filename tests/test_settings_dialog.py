@@ -15,6 +15,10 @@ from app.seven_zip_locator import SevenZipInfo
 from app.settings_dialog import SettingsDialog, _RETIRED_SETTINGS_DIALOGS
 from app.thumbnail_disk_cache import ThumbnailDiskCache
 from app.thumbnail_provider import BrowserThumbnailProvider
+from app.viewer_render import (
+    DOWNSCALE_ALGORITHM_LABELS,
+    UPSCALE_ALGORITHM_LABELS,
+)
 
 
 def make_config(tmp_path: Path) -> ConfigManager:
@@ -135,6 +139,67 @@ def test_apply_and_ok_persist_settings(tmp_path: Path, qapp: QApplication) -> No
         == "center_crop"
     )
     reopened.reject()
+
+
+def test_resampling_controls_expose_backend_authority_and_apply(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    config = make_config(tmp_path)
+    config.apply(
+        {
+            "viewer_downscale_algorithm": "smooth",
+            "viewer_upscale_algorithm": "bilinear",
+            "magnifier_downscale_algorithm": "area",
+            "magnifier_upscale_algorithm": "nearest",
+        }
+    )
+    published: list[dict[str, object]] = []
+    config.settings_changed.connect(published.append)
+    dialog = SettingsDialog(config)
+
+    def combo_items(combo) -> dict[str, str]:
+        return {
+            str(combo.itemData(index)): combo.itemText(index)
+            for index in range(combo.count())
+        }
+
+    assert combo_items(
+        dialog.viewer_downscale_algorithm_combo
+    ) == DOWNSCALE_ALGORITHM_LABELS
+    assert combo_items(
+        dialog.viewer_upscale_algorithm_combo
+    ) == UPSCALE_ALGORITHM_LABELS
+    assert dialog.viewer_downscale_algorithm_combo.currentData() == "smooth"
+    assert dialog.viewer_upscale_algorithm_combo.currentData() == "bilinear"
+    assert dialog.magnifier_downscale_algorithm_combo.currentData() == "area"
+    assert dialog.magnifier_upscale_algorithm_combo.currentData() == "nearest"
+
+    dialog.viewer_downscale_algorithm_combo.setCurrentIndex(
+        dialog.viewer_downscale_algorithm_combo.findData("sharp")
+    )
+    dialog.viewer_upscale_algorithm_combo.setCurrentIndex(
+        dialog.viewer_upscale_algorithm_combo.findData("lanczos")
+    )
+    dialog.magnifier_downscale_algorithm_combo.setCurrentIndex(
+        dialog.magnifier_downscale_algorithm_combo.findData("fast")
+    )
+    dialog.magnifier_upscale_algorithm_combo.setCurrentIndex(
+        dialog.magnifier_upscale_algorithm_combo.findData("bicubic")
+    )
+    changed = dialog.apply_settings()
+
+    assert changed["viewer_downscale_algorithm"] == "sharp"
+    assert changed["viewer_upscale_algorithm"] == "lanczos"
+    assert changed["magnifier_downscale_algorithm"] == "fast"
+    assert changed["magnifier_upscale_algorithm"] == "bicubic"
+    assert published[-1] == changed
+    restored = ConfigManager(config.path).load()
+    assert restored["viewer_downscale_algorithm"] == "sharp"
+    assert restored["viewer_upscale_algorithm"] == "lanczos"
+    assert restored["magnifier_downscale_algorithm"] == "fast"
+    assert restored["magnifier_upscale_algorithm"] == "bicubic"
+    dialog.reject()
 
 
 def test_cancel_does_not_apply_changes(tmp_path: Path, qapp: QApplication) -> None:

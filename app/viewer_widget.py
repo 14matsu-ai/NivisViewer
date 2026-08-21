@@ -2,11 +2,22 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import math
 from time import monotonic
 
-from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, QSize, QThreadPool, QTimer, Qt, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QPoint,
+    QPointF,
+    QRect,
+    QRectF,
+    QSize,
+    QThreadPool,
+    QTimer,
+    Qt,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QCloseEvent,
@@ -45,6 +56,8 @@ from .viewer_presentation_state import (
 
 
 _MAX_EXACT_RENDER_PIXELS = 64 * 1024 * 1024
+_MAX_MAGNIFIER_ARTIFACT_PIXELS = 32 * 1024 * 1024
+_MAX_MAGNIFIER_CACHE_BYTES = 160 * 1024 * 1024
 
 
 @dataclass
@@ -89,6 +102,20 @@ class SpreadLayout:
     content_size: QSize
     rects: tuple[QRect, ...]
     effective_gap: int
+
+
+@dataclass
+class ViewTransform:
+    """Viewport-only state kept separate from display artifact generation."""
+
+    zoom_factor: float = 1.0
+    pan_offset: QPoint = field(default_factory=QPoint)
+    zoom_anchor: QPointF | None = None
+    viewport_physical_size: QSize = field(default_factory=QSize)
+    display_unit_physical_bounds: QSize = field(default_factory=QSize)
+    rotation: int = 0
+    device_pixel_ratio: float = 1.0
+    generation: int = 0
 
 
 @dataclass
@@ -292,6 +319,7 @@ class ViewerWidget(QWidget):
         self.background_color = QColor("#000000")
         self.fit_mode = "fit_window"
         self.manual_zoom = 1.0
+        self._view_transform = ViewTransform()
         self.gap = 24
         self.join_spread_pages = False
         self.rotation_angle = 0
@@ -344,6 +372,11 @@ class ViewerWidget(QWidget):
         self._direct_frame_serial = 0
         self._direct_current_frame_serial = 0
         self._direct_current_frame_token: object | None = None
+        # A viewport-only repaint (magnifier motion or manual pan) is not a
+        # newly presented page.  Keep the expensive after-paint projection
+        # boundary tied to one completed frame commit instead of emitting it
+        # for every pointer move.
+        self._content_paint_ack_pending = False
         self._prepared_units: OrderedDict[
             PreparedDisplayUnitKey,
             _PreparedDisplayUnit,
@@ -378,6 +411,10 @@ class ViewerWidget(QWidget):
         self._magnifier_selection_rect: QRect | None = None
         self._magnifier_pixmap: QPixmap | None = None
         self._magnifier_key: ViewerRenderKey | None = None
+        self._magnifier_artifact_cache: OrderedDict[
+            ViewerRenderKey,
+            QPixmap,
+        ] = OrderedDict()
         self._magnifier_waiting_for_pdf = False
         self._magnifier_pdf_source_key = 0
         self.mouse_gestures_enabled = True
@@ -403,6 +440,18 @@ class ViewerWidget(QWidget):
         self.canvas_pointer.doubleClickConfirmed.connect(
             self.fullscreenToggleRequested
         )
+
+    @property
+    def view_transform(self) -> ViewTransform:
+        return self._view_transform
+
+    @property
+    def _pan(self) -> QPoint:
+        return self._view_transform.pan_offset
+
+    @_pan.setter
+    def _pan(self, value: QPoint) -> None:
+        self._view_transform.pan_offset = QPoint(value)
 
     def set_canvas_input_context(
         self,
@@ -625,14 +674,21 @@ class ViewerWidget(QWidget):
             self.cancel_magnifier()
 
     def set_magnifier_options(self, *, zoom: float | None = None, size: int | None = None) -> None:
+        rerender = False
         if zoom is not None:
             normalized_zoom = min(4.0, max(1.5, float(zoom)))
             if not math.isclose(normalized_zoom, self.magnifier_zoom):
                 self.magnifier_zoom = normalized_zoom
-                if self.magnifier_selecting or self.magnifier_active:
-                    self.cancel_magnifier()
+                rerender = self.magnifier_selecting or self.magnifier_active
         if size is not None:
             self.magnifier_size = min(600, max(80, int(size)))
+        if rerender:
+            position = self._mouse_pos
+            if position is None and self._magnifier_selection_rect is not None:
+                position = self._magnifier_selection_rect.center()
+            if position is not None:
+                self._update_magnifier_selection(position)
+            self._request_magnifier_render()
         self.update()
 
     def cancel_magnifier(self) -> bool:
@@ -767,6 +823,8 @@ class ViewerWidget(QWidget):
             self.cancel_magnifier()
         self.rotation_angle = normalized
         self._pan = QPoint(0, 0)
+        self._view_transform.rotation = normalized
+        self._view_transform.generation += 1
         self._refresh_current_render()
 
     def set_fit_mode(self, fit_mode: str) -> None:
@@ -775,12 +833,61 @@ class ViewerWidget(QWidget):
         self.fit_mode = fit_mode
         if fit_mode in {"fit_window", "fit_no_upscale", "fit_width", "fit_height"}:
             self._pan = QPoint(0, 0)
+            self._view_transform.generation += 1
         self._refresh_current_render()
 
-    def set_manual_zoom(self, zoom: float) -> None:
+    def set_manual_zoom(
+        self,
+        zoom: float,
+        *,
+        anchor: QPoint | None = None,
+    ) -> None:
         self.cancel_magnifier()
-        self.manual_zoom = min(8.0, max(0.05, zoom))
+        normalized = min(8.0, max(0.05, zoom))
+        anchor_point = QPoint(
+            anchor if anchor is not None else self.rect().center()
+        )
+        old_layout = self._layout_for_current_images()
+        old_bounds = self._layout_bounds(old_layout)
+        if old_bounds.isEmpty():
+            relative_x = relative_y = 0.5
+        else:
+            relative_x = min(
+                1.0,
+                max(
+                    0.0,
+                    (anchor_point.x() - old_bounds.left())
+                    / max(1, old_bounds.width()),
+                ),
+            )
+            relative_y = min(
+                1.0,
+                max(
+                    0.0,
+                    (anchor_point.y() - old_bounds.top())
+                    / max(1, old_bounds.height()),
+                ),
+            )
+
+        self.manual_zoom = normalized
         self.fit_mode = "manual_zoom"
+        self._pan = QPoint(0, 0)
+        base_layout = self._layout_for_current_images()
+        base_bounds = self._layout_bounds(base_layout)
+        anchored_pan = QPoint(
+            round(
+                anchor_point.x()
+                - (base_bounds.left() + relative_x * base_bounds.width())
+            ),
+            round(
+                anchor_point.y()
+                - (base_bounds.top() + relative_y * base_bounds.height())
+            ),
+        )
+        self._set_pan(anchored_pan)
+        self._view_transform.zoom_factor = normalized
+        self._view_transform.zoom_anchor = QPointF(anchor_point)
+        self._view_transform.generation += 1
         self.zoomChanged.emit(self.manual_zoom)
         self._refresh_current_render()
 
@@ -789,6 +896,9 @@ class ViewerWidget(QWidget):
         self.fit_mode = "fit_window"
         self.manual_zoom = 1.0
         self._pan = QPoint(0, 0)
+        self._view_transform.zoom_factor = 1.0
+        self._view_transform.zoom_anchor = None
+        self._view_transform.generation += 1
         self._refresh_current_render()
 
     def scroll_forward(self) -> bool:
@@ -814,6 +924,8 @@ class ViewerWidget(QWidget):
         if not same_display_unit:
             self.cancel_magnifier()
             self._pan = QPoint(0, 0)
+            self._view_transform.zoom_anchor = None
+            self._view_transform.generation += 1
         if same_display_unit and self._magnifier_waiting_for_pdf:
             self._resume_magnifier_after_pdf_render()
         self._prepare_display(spread, pages, frame_token=frame_token)
@@ -859,6 +971,7 @@ class ViewerWidget(QWidget):
         else:
             self._direct_current_frame_serial = 0
             self._direct_current_frame_token = None
+        self._content_paint_ack_pending = False
         self._direct_display_mode = normalized
 
     def commit_display_ready_single(
@@ -941,6 +1054,8 @@ class ViewerWidget(QWidget):
         )
         if not same_display_unit:
             self._pan = QPoint(0, 0)
+            self._view_transform.zoom_anchor = None
+            self._view_transform.generation += 1
 
         self._direct_frame_serial += 1
         frame_serial = self._direct_frame_serial
@@ -963,6 +1078,7 @@ class ViewerWidget(QWidget):
         self._direct_current_frame_token = frame_token
         self._spread = spread
         self._images = list(committed_images)
+        self._content_paint_ack_pending = True
         self.update()
         self._emit_frame_committed(
             spread,
@@ -1015,6 +1131,7 @@ class ViewerWidget(QWidget):
         self._invalidate_render_requests(clear_cache=True)
         self._direct_current_frame_serial = 0
         self._direct_current_frame_token = None
+        self._content_paint_ack_pending = False
         self._spread = DisplaySpread(0, tuple(), True)
         self._images = []
         self._last_draw_layout.clear()
@@ -1096,6 +1213,7 @@ class ViewerWidget(QWidget):
             return
 
         layout = self._layout_for_current_images()
+        self._sync_view_transform(layout)
         self._last_draw_layout = []
         self._last_image_layout = []
         painted_image_ids: list[str] = []
@@ -1129,8 +1247,9 @@ class ViewerWidget(QWidget):
                     painted_image_ids.append(image.image_id)
         self._draw_magnifier(painter)
         self._draw_gesture_trail(painter)
-        if painted_image_ids:
+        if painted_image_ids and self._content_paint_ack_pending:
             painted_ids = tuple(painted_image_ids)
+            self._content_paint_ack_pending = False
             self.contentPainted.emit(painted_ids)
             if (
                 self._direct_display_mode
@@ -1178,6 +1297,8 @@ class ViewerWidget(QWidget):
                 self._resize_render_timer.start()
         if self.fit_mode in {"fit_window", "fit_no_upscale", "fit_width", "fit_height"}:
             self._pan = QPoint(0, 0)
+        elif self.fit_mode == "manual_zoom":
+            self._set_pan(self._pan)
         super().resizeEvent(event)
         self.viewportChanged.emit()
 
@@ -1195,7 +1316,10 @@ class ViewerWidget(QWidget):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             factor = 1.15 if delta > 0 else 1 / 1.15
             base = self._scale_for_current_mode() if self.fit_mode != "manual_zoom" else self.manual_zoom
-            self.set_manual_zoom(base * factor)
+            self.set_manual_zoom(
+                base * factor,
+                anchor=event.position().toPoint(),
+            )
             if sequence_finished:
                 self.wheelSequenceFinished.emit()
             event.accept()
@@ -1276,7 +1400,6 @@ class ViewerWidget(QWidget):
             )
         ):
             self._update_magnifier_selection(self._mouse_pos)
-            self._request_magnifier_render()
             event.accept()
             return
         if self._right_button_down:
@@ -1297,10 +1420,17 @@ class ViewerWidget(QWidget):
             if state is ViewerCanvasPointerState.PANNING:
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
                 if self._can_pan():
-                    self._pan = self._drag_origin + delta
-                    self.update()
+                    if self._set_pan(self._drag_origin + delta):
+                        self.update()
                 event.accept()
                 return
+        if self._can_pan():
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        elif self.cursor().shape() in {
+            Qt.CursorShape.OpenHandCursor,
+            Qt.CursorShape.ClosedHandCursor,
+        }:
+            self.unsetCursor()
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event) -> None:  # type: ignore[override]
@@ -1408,9 +1538,109 @@ class ViewerWidget(QWidget):
     def contextMenuEvent(self, event: QContextMenuEvent) -> None:  # type: ignore[override]
         event.accept()
 
+    @staticmethod
+    def _layout_bounds(layout: SpreadLayout) -> QRect:
+        if not layout.rects:
+            return QRect()
+        bounds = QRect(layout.rects[0])
+        for rect in layout.rects[1:]:
+            bounds = bounds.united(rect)
+        return bounds
+
+    def _clamped_pan(self, proposed: QPoint) -> QPoint:
+        base_layout = self._layout_for_images(
+            self._spread,
+            self._images,
+            pan=QPoint(0, 0),
+        )
+        bounds = self._layout_bounds(base_layout)
+        x = int(proposed.x())
+        y = int(proposed.y())
+        if bounds.width() <= self.width():
+            x = 0
+        else:
+            x = max(
+                self.width() - (bounds.x() + bounds.width()),
+                min(-bounds.x(), x),
+            )
+        if bounds.height() <= self.height():
+            y = 0
+        else:
+            y = max(
+                self.height() - (bounds.y() + bounds.height()),
+                min(-bounds.y(), y),
+            )
+        return QPoint(x, y)
+
+    def _set_pan(self, proposed: QPoint) -> bool:
+        clamped = self._clamped_pan(proposed)
+        if clamped == self._pan:
+            return False
+        self._pan = clamped
+        self._view_transform.generation += 1
+        return True
+
+    def _sync_view_transform(self, layout: SpreadLayout) -> None:
+        dpr = max(1.0, float(self.devicePixelRatioF()))
+        self._view_transform.zoom_factor = float(self.manual_zoom)
+        self._view_transform.viewport_physical_size = QSize(
+            max(1, round(self.width() * dpr)),
+            max(1, round(self.height() * dpr)),
+        )
+        self._view_transform.display_unit_physical_bounds = QSize(
+            max(0, round(layout.content_size.width() * dpr)),
+            max(0, round(layout.content_size.height() * dpr)),
+        )
+        self._view_transform.rotation = self.rotation_angle % 360
+        self._view_transform.device_pixel_ratio = dpr
+
     def _can_pan(self) -> bool:
         content_size = self._layout_for_current_images().content_size
-        return content_size.width() > self.width() or content_size.height() > self.height()
+        return (
+            self.fit_mode in {"manual_zoom", "actual_size"}
+            and (
+                content_size.width() > self.width()
+                or content_size.height() > self.height()
+            )
+        )
+
+    def can_pan_with_key(
+        self,
+        key: int,
+        modifiers: Qt.KeyboardModifier,
+    ) -> bool:
+        if not self._can_pan() or modifiers not in {
+            Qt.KeyboardModifier.NoModifier,
+            Qt.KeyboardModifier.ShiftModifier,
+        }:
+            return False
+        return key in {
+            Qt.Key.Key_Left,
+            Qt.Key.Key_Right,
+            Qt.Key.Key_Up,
+            Qt.Key.Key_Down,
+        }
+
+    def pan_with_key(
+        self,
+        key: int,
+        modifiers: Qt.KeyboardModifier,
+    ) -> bool:
+        if not self.can_pan_with_key(key, modifiers):
+            return False
+        large = modifiers == Qt.KeyboardModifier.ShiftModifier
+        horizontal_step = max(40, round(self.width() * (0.4 if large else 0.1)))
+        vertical_step = max(40, round(self.height() * (0.4 if large else 0.1)))
+        delta = {
+            Qt.Key.Key_Left: QPoint(horizontal_step, 0),
+            Qt.Key.Key_Right: QPoint(-horizontal_step, 0),
+            Qt.Key.Key_Up: QPoint(0, vertical_step),
+            Qt.Key.Key_Down: QPoint(0, -vertical_step),
+        }[Qt.Key(key)]
+        if not self._set_pan(self._pan + delta):
+            return False
+        self.update()
+        return True
 
     def _scroll_vertical(self, direction: int) -> bool:
         if not self._images:
@@ -1428,7 +1658,8 @@ class ViewerWidget(QWidget):
         new_y = max(min_pan, min(max_pan, new_y))
         if new_y == old_y:
             return False
-        self._pan.setY(new_y)
+        if not self._set_pan(QPoint(self._pan.x(), new_y)):
+            return False
         self.update()
         return True
 
@@ -1452,6 +1683,8 @@ class ViewerWidget(QWidget):
         self,
         spread: DisplaySpread,
         images: list[ViewerImage] | tuple[ViewerImage, ...],
+        *,
+        pan: QPoint | None = None,
     ) -> SpreadLayout:
         sizes = [
             (self._base_size(image).width(), self._base_size(image).height())
@@ -1466,7 +1699,10 @@ class ViewerWidget(QWidget):
             join_spread_pages=self.join_spread_pages,
             spread_is_single=spread.is_single,
             horizontal_alignment=self.horizontal_alignment,
-            pan=(self._pan.x(), self._pan.y()),
+            pan=(
+                (pan if pan is not None else self._pan).x(),
+                (pan if pan is not None else self._pan).y(),
+            ),
         )
 
     def _effective_gap(self) -> int:
@@ -2101,6 +2337,7 @@ class ViewerWidget(QWidget):
         self._images = list(images)
         self._discard_stale_cached_generations()
         self._enforce_render_cache_limit()
+        self._content_paint_ack_pending = True
         self.update()
         self._emit_frame_committed(
             spread,
@@ -2165,9 +2402,9 @@ class ViewerWidget(QWidget):
     ) -> None:
         # Book runtimes own normal display artifacts in direct mode.  The
         # magnifier is a separate NivisViewer UX projection over the committed
-        # source QImage, so it still needs one cropped render job.  Blocking it
-        # here made the ZIP magnifier wait for full resolution and then never
-        # produce a lens frame.
+        # source QImage, so it still needs one page/zoom artifact job. Cursor
+        # movement only changes the paint source rectangle and never returns
+        # to this worker boundary.
         if self._direct_display_mode and key.purpose != "magnifier":
             return
         if self._render_pending.get(key) == self._render_generation:
@@ -2200,9 +2437,9 @@ class ViewerWidget(QWidget):
         priority: int,
     ) -> None:
         if self._direct_display_mode and task.key.purpose == "magnifier":
-            # A lens crop is an optional projection of an already committed
-            # source.  Keep it off the single book-runtime Viewer lane so a
-            # non-interruptible Pillow/Lanczos crop cannot delay the next page.
+            # A magnifier artifact is an optional projection of an already
+            # committed source. Keep it off the single book-runtime Viewer
+            # lane so its one native resize cannot delay the next page.
             self._local_render_tasks.add(task)
             self._render_pool.start(task, int(priority))
         elif self._render_coordinator is not None:
@@ -2279,9 +2516,21 @@ class ViewerWidget(QWidget):
                 max(1.0, result.key.device_pixel_ratio_milli / 1000.0)
             )
             self._magnifier_pixmap = pixmap
+            self._magnifier_artifact_cache[result.key] = pixmap
+            self._magnifier_artifact_cache.move_to_end(result.key)
+            while len(self._magnifier_artifact_cache) > 2 or sum(
+                cached.width() * cached.height() * 4
+                for cached in self._magnifier_artifact_cache.values()
+            ) > _MAX_MAGNIFIER_CACHE_BYTES:
+                self._magnifier_artifact_cache.popitem(last=False)
             self.magnifier_selecting = False
             self.magnifier_active = True
-            self._magnifier_waiting_for_pdf = False
+            if (
+                not self._magnifier_waiting_for_pdf
+                or result.key.source_cache_key
+                != self._magnifier_pdf_source_key
+            ):
+                self._magnifier_waiting_for_pdf = False
             self.update()
             return
 
@@ -2528,6 +2777,7 @@ class ViewerWidget(QWidget):
     def shutdown_rendering(self, msecs: int = 5000) -> bool:
         self._resize_render_timer.stop()
         self.cancel_magnifier()
+        self._magnifier_artifact_cache.clear()
         self._invalidate_render_requests(clear_cache=True)
         if self._render_coordinator is not None:
             return self._wait_for_owned_render_tasks(msecs)
@@ -2715,8 +2965,21 @@ class ViewerWidget(QWidget):
             min(source_size.height(), math.ceil(source_rect.bottom())),
         )
         dpr = max(1.0, float(self.devicePixelRatioF()))
-        target_width = max(1, round(self.width() * dpr))
-        target_height = max(1, round(self.height() * dpr))
+        normalized_width = source_rect.width() / max(1, source_size.width())
+        normalized_height = source_rect.height() / max(1, source_size.height())
+        target_width = max(
+            1,
+            round(self.width() * dpr / max(0.0001, normalized_width)),
+        )
+        target_height = max(
+            1,
+            round(self.height() * dpr / max(0.0001, normalized_height)),
+        )
+        target_pixels = target_width * target_height
+        if target_pixels > _MAX_MAGNIFIER_ARTIFACT_PIXELS:
+            scale = (_MAX_MAGNIFIER_ARTIFACT_PIXELS / target_pixels) ** 0.5
+            target_width = max(1, round(target_width * scale))
+            target_height = max(1, round(target_height * scale))
 
         if image.qimage is None:
             if (
@@ -2734,16 +2997,19 @@ class ViewerWidget(QWidget):
             return
 
         if allow_pdf_request and image.source_is_preview:
-            self._magnifier_waiting_for_pdf = True
-            self._magnifier_pdf_source_key = int(image.qimage.cacheKey())
-            self.magnifierSourceResolutionRequested.emit(
-                image.page_index,
-                QSize(target_width, target_height),
-            )
-            self.update()
-            return
+            source_key = int(image.qimage.cacheKey())
+            if not (
+                self._magnifier_waiting_for_pdf
+                and self._magnifier_pdf_source_key == source_key
+            ):
+                self._magnifier_waiting_for_pdf = True
+                self._magnifier_pdf_source_key = source_key
+                self.magnifierSourceResolutionRequested.emit(
+                    image.page_index,
+                    QSize(target_width, target_height),
+                )
 
-        if allow_pdf_request and image.rendered_size is not None:
+        elif allow_pdf_request and image.rendered_size is not None:
             required_width = max(
                 source_size.width(),
                 math.ceil(target_width * source_size.width() / (right - left)),
@@ -2756,21 +3022,17 @@ class ViewerWidget(QWidget):
                 required_width > source_size.width()
                 or required_height > source_size.height()
             ):
-                self._magnifier_waiting_for_pdf = True
-                self._magnifier_pdf_source_key = int(image.qimage.cacheKey())
-                self.magnifierPdfResolutionRequested.emit(
-                    image.page_index,
-                    QSize(required_width, required_height),
-                )
-                self.update()
-                return
-
-        self.magnifier_request_generation += 1
-        for task in tuple(self._render_tasks):
-            if task.key.purpose != "magnifier":
-                continue
-            if self._try_take_render_task(task):
-                self._discard_render_task(task)
+                source_key = int(image.qimage.cacheKey())
+                if not (
+                    self._magnifier_waiting_for_pdf
+                    and self._magnifier_pdf_source_key == source_key
+                ):
+                    self._magnifier_waiting_for_pdf = True
+                    self._magnifier_pdf_source_key = source_key
+                    self.magnifierPdfResolutionRequested.emit(
+                        image.page_index,
+                        QSize(required_width, required_height),
+                    )
 
         rotation = 0 if image.pre_rotated else self.rotation_angle
         key = ViewerRenderKey(
@@ -2781,9 +3043,13 @@ class ViewerWidget(QWidget):
             mode=self.magnifier_resampling_mode,
             rotation=rotation,
             device_pixel_ratio_milli=round(dpr * 1000),
-            crop=(left, top, right, bottom),
+            crop=None,
             purpose="magnifier",
-            request_generation=self.magnifier_request_generation,
+            # Artifact validity belongs to source/layout/algorithm identity.
+            # Session staleness is fenced by ``_magnifier_key`` and the
+            # Widget render generation, so cursor movement never changes this
+            # reusable key.
+            request_generation=0,
             split_range=image.split_range,
             downscale_algorithm=(
                 self.magnifier_downscale_algorithm
@@ -2796,7 +3062,29 @@ class ViewerWidget(QWidget):
                 else None
             ),
         )
+        if (
+            key == self._magnifier_key
+            and (
+                self._magnifier_pixmap is not None
+                or key in self._render_pending
+            )
+        ):
+            return
+        self.magnifier_request_generation += 1
+        for task in tuple(self._render_tasks):
+            if task.key.purpose != "magnifier" or task.key == key:
+                continue
+            if self._try_take_render_task(task):
+                self._discard_render_task(task)
         self._magnifier_key = key
+        cached = self._magnifier_artifact_cache.get(key)
+        if cached is not None:
+            self._magnifier_artifact_cache.move_to_end(key)
+            self._magnifier_pixmap = cached
+            self.magnifier_selecting = False
+            self.magnifier_active = True
+            self.update()
+            return
         self._queue_render(
             image.qimage,
             key,
@@ -2828,16 +3116,23 @@ class ViewerWidget(QWidget):
 
     def _draw_magnifier(self, painter: QPainter) -> None:
         if self.magnifier_active and self._magnifier_pixmap is not None:
-            natural_size = self._magnifier_pixmap.deviceIndependentSize()
-            if (
-                abs(natural_size.width() - self.width()) <= 0.51
-                and abs(natural_size.height() - self.height()) <= 0.51
-            ):
-                # The lens render already has exact physical pixels and DPR.
-                # Point-form drawing avoids a fractional-DPR second resample.
-                painter.drawPixmap(self.rect().topLeft(), self._magnifier_pixmap)
-            else:
-                painter.drawPixmap(self.rect(), self._magnifier_pixmap)
+            normalized = self._magnifier_source_normalized
+            if normalized is None:
+                return
+            source = QRectF(
+                normalized.left() * self._magnifier_pixmap.width(),
+                normalized.top() * self._magnifier_pixmap.height(),
+                normalized.width() * self._magnifier_pixmap.width(),
+                normalized.height() * self._magnifier_pixmap.height(),
+            ).intersected(
+                QRectF(
+                    0,
+                    0,
+                    self._magnifier_pixmap.width(),
+                    self._magnifier_pixmap.height(),
+                )
+            )
+            painter.drawPixmap(QRectF(self.rect()), self._magnifier_pixmap, source)
             return
         if self.magnifier_selecting and self._magnifier_selection_rect is not None:
             painter.fillRect(

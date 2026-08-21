@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from PIL import Image
-from PySide6.QtCore import QEvent, QPointF, QRectF, Qt
+from PIL import Image, ImageDraw
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt
 from PySide6.QtGui import QImage, QMouseEvent, QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
@@ -120,6 +120,102 @@ def test_explicit_policy_selects_one_final_native_filter(
     expected: Image.Resampling,
 ) -> None:
     assert pillow_resampling_for_policy(policy, (200, 200), target) == expected
+
+
+def _resampling_fixture(kind: str) -> QImage:
+    image = Image.new("RGB", (64, 64), "white")
+    draw = ImageDraw.Draw(image)
+    if kind == "manga":
+        for offset in range(3, 64, 7):
+            draw.line((0, offset, 63, max(0, offset - 3)), fill="black", width=1)
+        draw.text((7, 21), "Aa12", fill="black")
+    elif kind == "photo":
+        for y in range(64):
+            for x in range(64):
+                image.putpixel(
+                    (x, y),
+                    ((x * 4 + y) % 256, (y * 4 + x * 2) % 256, (x * y) % 256),
+                )
+    elif kind == "screenshot":
+        draw.rectangle(
+            (3, 3, 60, 60),
+            fill=(238, 241, 247),
+            outline=(30, 40, 55),
+        )
+        draw.rectangle((3, 3, 60, 13), fill=(40, 95, 180))
+        for y in (21, 29, 37, 45, 53):
+            draw.line((9, y, 53, y), fill=(35, 35, 35), width=1)
+    else:
+        colors = (
+            (20, 20, 25),
+            (245, 80, 65),
+            (65, 180, 245),
+            (245, 220, 70),
+        )
+        for y in range(8):
+            for x in range(8):
+                draw.rectangle(
+                    (x * 8, y * 8, x * 8 + 7, y * 8 + 7),
+                    fill=colors[(x + y * 3) % len(colors)],
+                )
+    try:
+        return viewer_render_module.pil_to_qimage(image)
+    finally:
+        image.close()
+
+
+@pytest.mark.parametrize(
+    "fixture_kind",
+    ("manga", "photo", "screenshot", "pixel_art"),
+)
+def test_supported_resampling_choices_change_representative_frames(
+    fixture_kind: str,
+) -> None:
+    source = _resampling_fixture(fixture_kind)
+
+    def output_bytes(
+        target: tuple[int, int],
+        downscale: str,
+        upscale: str,
+    ) -> bytes:
+        rendered, resized = render_qimage(
+            source,
+            ViewerRenderKey(
+                fixture_kind,
+                source.cacheKey(),
+                target[0],
+                target[1],
+                "standard",
+                0,
+                1000,
+                downscale_algorithm=downscale,
+                upscale_algorithm=upscale,
+            ),
+        )
+        assert resized
+        pixels = viewer_render_module.qimage_to_pillow(rendered)
+        try:
+            return pixels.tobytes()
+        finally:
+            pixels.close()
+
+    downscaled = {
+        algorithm: output_bytes((23, 21), algorithm, "auto")
+        for algorithm in DOWNSCALE_ALGORITHM_LABELS
+    }
+    upscaled = {
+        algorithm: output_bytes((117, 103), "auto", algorithm)
+        for algorithm in UPSCALE_ALGORITHM_LABELS
+    }
+
+    # Auto deliberately aliases the scale-appropriate explicit native filter;
+    # the other choices must still expose visibly distinct output families.
+    assert downscaled["auto"] == downscaled["area"]
+    assert upscaled["auto"] == upscaled["bicubic"]
+    assert len(set(downscaled.values())) >= 3
+    assert len(set(upscaled.values())) >= 3
+    assert downscaled["nearest"] != downscaled["sharp"]
+    assert upscaled["nearest"] != upscaled["lanczos"]
 
 
 def test_render_key_carries_target_algorithm_rotation_dpr_and_crop() -> None:
@@ -740,7 +836,7 @@ def test_active_magnifier_rebuilds_without_discarding_last_complete_lens(
     widget.close()
 
 
-def test_rapid_magnifier_requests_and_cancel_clear_all_task_tracking(
+def test_repeated_magnifier_viewport_updates_reuse_one_artifact_job(
     qapp: QApplication,
 ) -> None:
     class FakeCoordinator:
@@ -813,12 +909,13 @@ def test_rapid_magnifier_requests_and_cancel_clear_all_task_tracking(
         assert len(widget._render_task_by_key) == 1
         assert len(widget._render_priorities) == 1
 
-    assert len(pool.taken) == 2
+    assert len(pool.started) == 1
+    assert not pool.taken
     # Direct-mode magnifier work must not occupy the one book-runtime Viewer
     # lane. A running high-quality crop cannot then queue ahead of a page turn.
     assert not coordinator.started
     assert widget.cancel_magnifier()
-    assert len(pool.taken) == 3
+    assert len(pool.taken) == 1
     assert not widget._render_tasks
     assert not widget._render_pending
     assert not widget._render_task_by_key
@@ -867,6 +964,16 @@ def test_magnifier_worker_failure_clears_waiting_state(
 def test_middle_button_immediately_starts_tracks_and_toggles_magnifier(
     qapp: QApplication,
 ) -> None:
+    class PaintCounter(QObject):
+        def __init__(self) -> None:
+            super().__init__()
+            self.count = 0
+
+        def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
+            if event.type() == QEvent.Type.Paint:
+                self.count += 1
+            return super().eventFilter(watched, event)
+
     widget = ViewerWidget()
     widget.resize(480, 320)
     widget.show()
@@ -893,22 +1000,37 @@ def test_middle_button_immediately_starts_tracks_and_toggles_magnifier(
     qapp.processEvents()
     assert widget.magnifier_active
     first_key = widget._magnifier_key
+    first_pixmap_key = widget._magnifier_pixmap.cacheKey()
     first_rect = QRectF(widget.magnifier_source_rect)
-
-    _mouse(
-        widget,
-        QEvent.Type.MouseMove,
-        300,
-        170,
-        button=Qt.MouseButton.NoButton,
-        buttons=Qt.MouseButton.NoButton,
+    paints: list[object] = []
+    promotions: list[object] = []
+    widget.contentPainted.connect(paints.append)
+    widget.magnifierSourceResolutionRequested.connect(
+        lambda page, size: promotions.append((page, size))
     )
+    paint_counter = PaintCounter()
+    widget.installEventFilter(paint_counter)
+
+    for offset in range(100):
+        _mouse(
+            widget,
+            QEvent.Type.MouseMove,
+            180 + offset,
+            150 + offset % 20,
+            button=Qt.MouseButton.NoButton,
+            buttons=Qt.MouseButton.NoButton,
+        )
     assert widget.wait_for_rendering()
     qapp.processEvents()
     assert widget.magnifier_active
     assert widget._magnifier_pixmap is not None
-    assert widget._magnifier_key != first_key
+    assert widget._magnifier_key == first_key
+    assert widget._magnifier_pixmap.cacheKey() == first_pixmap_key
+    assert not widget._render_tasks
     assert widget.magnifier_source_rect != first_rect
+    assert paint_counter.count <= 1
+    assert paints == []
+    assert promotions == []
 
     _mouse(
         widget,
@@ -1129,8 +1251,17 @@ def test_pdf_magnifier_requests_higher_resolution_before_crop(
         button=Qt.MouseButton.MiddleButton,
         buttons=Qt.MouseButton.NoButton,
     )
+    for offset in range(100):
+        _mouse(
+            widget,
+            QEvent.Type.MouseMove,
+            180 + offset,
+            150 + offset % 20,
+            button=Qt.MouseButton.NoButton,
+            buttons=Qt.MouseButton.NoButton,
+        )
 
-    assert requests
+    assert len(requests) == 1
     assert requests[0][0] == 0
     assert requests[0][1].width() > 240
     assert widget._magnifier_waiting_for_pdf
@@ -1180,15 +1311,24 @@ def test_raster_preview_magnifier_requests_full_source_before_crop(
         button=Qt.MouseButton.MiddleButton,
         buttons=Qt.MouseButton.NoButton,
     )
+    for offset in range(100):
+        _mouse(
+            widget,
+            QEvent.Type.MouseMove,
+            180 + offset,
+            150 + offset % 20,
+            button=Qt.MouseButton.NoButton,
+            buttons=Qt.MouseButton.NoButton,
+        )
 
-    assert requests
+    assert len(requests) == 1
     assert requests[0][0] == 0
     assert widget._magnifier_waiting_for_pdf
-    assert not widget.magnifier_active
-    assert not any(
-        task.key.purpose == "magnifier"
-        for task in widget._render_tasks
-    )
+    assert widget.wait_for_rendering()
+    qapp.processEvents()
+    assert widget.magnifier_active
+    assert widget._magnifier_pixmap is not None
+    assert not widget._render_tasks
     widget.close()
 
 

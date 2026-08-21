@@ -156,6 +156,154 @@ def test_viewer_vertical_angle_navigates_once_and_accepts(
     widget.close()
 
 
+def test_manual_zoom_drag_updates_only_clamped_view_transform(
+    qapp: QApplication,
+) -> None:
+    widget = ViewerWidget()
+    widget.resize(300, 200)
+    widget.show()
+    source = QImage(400, 300, QImage.Format.Format_RGB32)
+    source.fill(Qt.GlobalColor.white)
+    widget.set_pages(
+        DisplaySpread(0, (PageSlot("page", 0),), True),
+        [ViewerWidget.from_qimage(0, "page", source, (400, 300))],
+    )
+    widget.set_manual_zoom(2.0)
+    assert widget.wait_for_rendering()
+    qapp.processEvents()
+    widget.render(QPixmap(widget.size()))
+    dpr = max(1.0, float(widget.devicePixelRatioF()))
+    assert widget.view_transform.viewport_physical_size == QSize(
+        round(300 * dpr),
+        round(200 * dpr),
+    )
+    assert widget.view_transform.display_unit_physical_bounds == QSize(
+        round(800 * dpr),
+        round(600 * dpr),
+    )
+    render_generation = widget._render_generation
+    render_keys = set(widget._render_cache)
+    clicks: list[str] = []
+    page_paint_acks: list[object] = []
+    widget.rightSideClicked.connect(lambda: clicks.append("right"))
+    widget.contentPainted.connect(page_paint_acks.append)
+
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseButtonPress,
+        QPoint(150, 100),
+        button=Qt.MouseButton.LeftButton,
+        buttons=Qt.MouseButton.LeftButton,
+    )
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseMove,
+        QPoint(210, 140),
+        button=Qt.MouseButton.NoButton,
+        buttons=Qt.MouseButton.LeftButton,
+    )
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseButtonRelease,
+        QPoint(210, 140),
+        button=Qt.MouseButton.LeftButton,
+        buttons=Qt.MouseButton.NoButton,
+    )
+
+    assert widget._pan == QPoint(60, 40)
+    assert widget.view_transform.pan_offset == QPoint(60, 40)
+    assert widget._render_generation == render_generation
+    assert set(widget._render_cache) == render_keys
+    assert not widget._render_tasks
+    assert clicks == []
+    assert page_paint_acks == []
+
+    # A drag cannot overscroll, and a later sub-threshold click keeps the
+    # existing side-click navigation contract.
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseButtonPress,
+        QPoint(0, 0),
+        button=Qt.MouseButton.LeftButton,
+        buttons=Qt.MouseButton.LeftButton,
+    )
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseMove,
+        QPoint(299, 199),
+        button=Qt.MouseButton.NoButton,
+        buttons=Qt.MouseButton.LeftButton,
+    )
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseButtonRelease,
+        QPoint(299, 199),
+        button=Qt.MouseButton.LeftButton,
+        buttons=Qt.MouseButton.NoButton,
+    )
+    assert widget._pan == QPoint(250, 200)
+
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseButtonPress,
+        QPoint(250, 100),
+        button=Qt.MouseButton.LeftButton,
+        buttons=Qt.MouseButton.LeftButton,
+    )
+    send_mouse_event(
+        widget,
+        QEvent.Type.MouseButtonRelease,
+        QPoint(250, 100),
+        button=Qt.MouseButton.LeftButton,
+        buttons=Qt.MouseButton.NoButton,
+    )
+    assert clicks == ["right"]
+    widget.close()
+
+
+def test_manual_zoom_preserves_cursor_anchor_and_keyboard_pan(
+    qapp: QApplication,
+) -> None:
+    widget = ViewerWidget()
+    widget.resize(300, 200)
+    widget.show()
+    source = QImage(400, 300, QImage.Format.Format_RGB32)
+    source.fill(Qt.GlobalColor.white)
+    widget.set_pages(
+        DisplaySpread(0, (PageSlot("page", 0),), True),
+        [ViewerWidget.from_qimage(0, "page", source, (400, 300))],
+    )
+    assert widget.wait_for_rendering()
+    qapp.processEvents()
+    anchor = QPoint(70, 60)
+    widget.set_manual_zoom(1.0, anchor=anchor)
+
+    def anchor_ratio() -> tuple[float, float]:
+        bounds = widget._layout_bounds(widget._layout_for_current_images())
+        return (
+            (anchor.x() - bounds.left()) / bounds.width(),
+            (anchor.y() - bounds.top()) / bounds.height(),
+        )
+
+    before = anchor_ratio()
+    widget.set_manual_zoom(2.0, anchor=anchor)
+    assert widget.wait_for_rendering()
+    qapp.processEvents()
+    after = anchor_ratio()
+
+    assert after == pytest.approx(before, abs=0.005)
+    assert widget.view_transform.zoom_anchor == QPointF(anchor)
+    pan_before_key = QPoint(widget._pan)
+    assert widget.pan_with_key(
+        Qt.Key.Key_Right,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    assert widget._pan.x() < pan_before_key.x()
+    assert widget._pan.y() == pan_before_key.y()
+    assert not widget._render_tasks
+    widget.close()
+
+
 def test_clear_releases_images_from_last_draw_layout_and_can_repaint(
     qapp: QApplication,
 ) -> None:
@@ -597,15 +745,16 @@ def test_rotated_spread_dimensions_fit_independently(angle: int) -> None:
 def send_mouse_event(
     widget: ViewerWidget,
     event_type: QEvent.Type,
-    position: tuple[int, int],
+    position: tuple[int, int] | QPoint,
     button: Qt.MouseButton,
     buttons: Qt.MouseButton,
 ) -> None:
-    point = QPointF(*position)
+    local = QPoint(position) if isinstance(position, QPoint) else QPoint(*position)
+    point = QPointF(local)
     event = QMouseEvent(
         event_type,
         point,
-        point,
+        QPointF(widget.mapToGlobal(local)),
         button,
         buttons,
         Qt.KeyboardModifier.NoModifier,
