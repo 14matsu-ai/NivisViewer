@@ -31,6 +31,16 @@ from PySide6.QtGui import QImage, QPixmap
 from .archive_backend import ArchiveErrorCode
 from .image_source import ImageSource, ImageSourceError, ZipImageSource
 from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
+from .raster_admission_policy import (
+    RasterAdmissionAction,
+    RasterAdmissionDecision,
+    RasterAdmissionPolicy,
+)
+from .raster_warmup_planner import (
+    RasterWarmupPlan,
+    RasterWarmupPlanner,
+    WarmupStopReason,
+)
 from .thumbnail_render import pil_to_qimage
 from .viewer_render import (
     ViewerRenderKey,
@@ -456,28 +466,18 @@ class ZipRasterRequest:
     source_epoch: int
     request_id: int
     current: ZipRasterDisplayUnit
-    work_order: tuple[ZipRasterDisplayUnit, ...]
+    warmup_plan: RasterWarmupPlan[
+        ZipRasterDisplayUnit,
+        tuple[tuple[int, str], ...],
+    ]
     render_spec: ZipRasterRenderSpec
     navigation_direction: int = 0
 
     def __post_init__(self) -> None:
-        order = tuple(self.work_order)
-        if not order:
-            order = (self.current,)
-        if order[0].identity != self.current.identity:
-            order = (self.current,) + tuple(
-                unit for unit in order if unit.identity != self.current.identity
-            )
-        seen: set[tuple[tuple[int, str], ...]] = set()
-        normalized: list[ZipRasterDisplayUnit] = []
-        for unit in order:
-            if unit.identity in seen:
-                continue
-            seen.add(unit.identity)
-            normalized.append(unit)
+        if self.warmup_plan.current_identity != self.current.identity:
+            raise ValueError("warm-up plan current must match request current")
         object.__setattr__(self, "source_epoch", int(self.source_epoch))
         object.__setattr__(self, "request_id", int(self.request_id))
-        object.__setattr__(self, "work_order", tuple(normalized))
         direction = int(self.navigation_direction)
         object.__setattr__(
             self,
@@ -526,6 +526,7 @@ class ZipRasterRuntimeMetrics:
     source_cache_misses: int = 0
     source_cache_evictions: int = 0
     prefetch_admission_stops: int = 0
+    oversized_prefetch_skips: int = 0
 
 
 @dataclass(frozen=True)
@@ -590,6 +591,7 @@ class _JobResult:
     pages: tuple[_RenderedPage, ...]
     cancelled: bool
     admission_declined: bool
+    oversized_prefetch: bool
     completed_at: float
 
 
@@ -601,6 +603,9 @@ class _CachedFrame:
     source_keys: tuple[_SourceKey | None, ...]
     worker_completed_at: float
     gui_ready_at: float
+
+
+_ArtifactRetentionRank = tuple[int, int, int, int, int]
 
 
 class _ByteLedger:
@@ -685,7 +690,7 @@ class _ZipRasterSourceStore:
     source can satisfy every later layout, rotation, DPI, or magnifier request.
     """
 
-    def __init__(self, *, page_limit: int) -> None:
+    def __init__(self) -> None:
         self._sources: OrderedDict[_SourceKey, _CachedSource] = OrderedDict()
         self._sources_by_identity: dict[
             tuple[str, tuple[float, float, float]],
@@ -693,11 +698,15 @@ class _ZipRasterSourceStore:
         ] = {}
         self._bytes = _ByteLedger()
         self._eviction_order: list[_SourceKey] | None = None
-        self._page_limit = max(1, int(page_limit))
-        self._active_rank: dict[str, int] = {}
+        self._retention_plan: RasterWarmupPlan[
+            ZipRasterDisplayUnit,
+            tuple[tuple[int, str], ...],
+        ] | None = None
         self._active_anchor: int | None = None
         self._current_unit: ZipRasterDisplayUnit | None = None
         self._current_render_spec: ZipRasterRenderSpec | None = None
+        self._displayed_unit: ZipRasterDisplayUnit | None = None
+        self._displayed_render_spec: ZipRasterRenderSpec | None = None
         self._direction = 0
 
     @property
@@ -721,37 +730,42 @@ class _ZipRasterSourceStore:
         self._sources_by_identity.clear()
         self._bytes.clear()
         self._eviction_order = None
+        self._displayed_unit = None
+        self._displayed_render_spec = None
 
-    def set_page_limit(self, page_limit: int) -> int:
-        self._page_limit = max(1, int(page_limit))
-        return self._prune_count()
-
-    def set_retention_order(
+    def set_retention_plan(
         self,
-        work_order: tuple[ZipRasterDisplayUnit, ...],
+        plan: RasterWarmupPlan[
+            ZipRasterDisplayUnit,
+            tuple[tuple[int, str], ...],
+        ] | None,
         current: ZipRasterDisplayUnit | None,
         render_spec: ZipRasterRenderSpec | None,
         direction: int,
     ) -> int:
-        seen: set[str] = set()
-        order: list[tuple[int, str]] = []
-        for unit in work_order:
-            for page in unit.pages:
-                if page.image_id in seen:
-                    continue
-                seen.add(page.image_id)
-                order.append((page.page_index, page.image_id))
-        self._active_rank = {
-            image_id: index
-            for index, (_page_index, image_id) in enumerate(order)
-        }
-        self._active_anchor = order[0][0] if order else None
+        self._retention_plan = plan
+        self._active_anchor = (
+            min((page.page_index for page in current.pages), default=0)
+            if current is not None
+            else None
+        )
         self._current_unit = current
         self._current_render_spec = render_spec
         normalized = int(direction)
         self._direction = -1 if normalized < 0 else 1 if normalized > 0 else 0
         self._eviction_order = None
-        return self._prune_count()
+        return 0
+
+    def set_displayed_unit(
+        self,
+        unit: ZipRasterDisplayUnit | None,
+        render_spec: ZipRasterRenderSpec | None,
+    ) -> None:
+        """Protect source pixels still referenced by the painted frame."""
+
+        self._displayed_unit = unit
+        self._displayed_render_spec = render_spec
+        self._eviction_order = None
 
     def find(
         self,
@@ -822,7 +836,7 @@ class _ZipRasterSourceStore:
             self._remove(key)
             evicted += 1
         self._store(source)
-        return evicted + self._prune_count()
+        return evicted
 
     def evict_one(self) -> bool:
         self._ensure_eviction_order()
@@ -842,13 +856,16 @@ class _ZipRasterSourceStore:
         render_spec: ZipRasterRenderSpec,
         *,
         excluded_keys: frozenset[_SourceKey] = frozenset(),
-    ) -> tuple[tuple[_SourceKey, int], ...]:
+    ) -> tuple[tuple[_SourceKey, int, _ArtifactRetentionRank], ...]:
         """Return worst-first sources strictly below a pending unit's rank."""
 
-        candidate_ranks: list[tuple[int, int, int, int]] = []
+        candidate_ranks: list[_ArtifactRetentionRank] = []
         protected = set(self._protected_keys())
         for page in unit.pages:
-            active_rank = self._active_rank.get(page.image_id)
+            plan = self._retention_plan
+            active_rank = (
+                plan.rank_for_page(page.page_index) if plan is not None else None
+            )
             if active_rank is None:
                 return ()
             decoder_maximum = _decoder_maximum_for_page(
@@ -857,7 +874,11 @@ class _ZipRasterSourceStore:
                 page,
             )
             candidate_ranks.append(
-                (0, int(decoder_maximum is None), active_rank, 0)
+                self._rank_for_request(
+                    page.page_index,
+                    render_spec,
+                    source_is_preview=decoder_maximum is not None,
+                )
             )
             reusable = self.find(page, render_spec, unit=unit, touch=False)
             if reusable is not None:
@@ -870,7 +891,11 @@ class _ZipRasterSourceStore:
         candidate_boundary = max(candidate_ranks)
         self._ensure_eviction_order()
         return tuple(
-            (key, self._sources[key].qimage.sizeInBytes())
+            (
+                key,
+                self._sources[key].qimage.sizeInBytes(),
+                self._retention_rank(self._sources[key]),
+            )
             for key in reversed(self._eviction_order or ())
             if key not in protected
             and key not in excluded_keys
@@ -980,17 +1005,22 @@ class _ZipRasterSourceStore:
             group.move_to_end(key)
         self._eviction_order = None
 
-    def _prune_count(self) -> int:
-        evicted = 0
-        while len(self._sources) > self._page_limit:
-            if not self.evict_one():
-                break
-            evicted += 1
-        return evicted
-
     def _eviction_candidate(self) -> _SourceKey | None:
         self._ensure_eviction_order()
         return self._eviction_order[-1] if self._eviction_order else None
+
+    def worst_reclaim_candidate(
+        self,
+    ) -> tuple[_SourceKey, int, _ArtifactRetentionRank] | None:
+        key = self._eviction_candidate()
+        if key is None:
+            return None
+        source = self._sources[key]
+        return (
+            key,
+            source.qimage.sizeInBytes(),
+            self._retention_rank(source),
+        )
 
     def _ensure_eviction_order(self) -> None:
         if self._eviction_order is not None:
@@ -1013,48 +1043,150 @@ class _ZipRasterSourceStore:
     def _protected_keys(self) -> frozenset[_SourceKey]:
         render_spec = self._current_render_spec
         current_unit = self._current_unit
-        if render_spec is None or current_unit is None:
-            return frozenset()
         protected: set[_SourceKey] = set()
-        for page in current_unit.pages:
-            source = self.find(page, render_spec, unit=current_unit)
-            if source is not None:
-                protected.add(source.key)
-            if render_spec.decoder_maximum_size is None:
-                group = self._sources_by_identity.get(
-                    (page.image_id, render_spec.adjustments)
+        if render_spec is not None and current_unit is not None:
+            self._protect_unit_sources(
+                protected,
+                current_unit,
+                render_spec,
+                keep_navigation_preview=True,
+            )
+        displayed_unit = self._displayed_unit
+        displayed_render_spec = self._displayed_render_spec
+        if displayed_unit is not None and displayed_render_spec is not None:
+            self._protect_unit_sources(
+                protected,
+                displayed_unit,
+                displayed_render_spec,
+                keep_navigation_preview=True,
+            )
+        plan = self._retention_plan
+        if (
+            plan is not None
+            and plan.background_enabled
+            and render_spec is not None
+        ):
+            for unit in plan.iter_background_units():
+                rank = plan.rank_for_identity(unit.identity)
+                if rank not in {1, 2}:
+                    if rank is not None and rank > 2:
+                        break
+                    continue
+                self._protect_unit_sources(
+                    protected,
+                    unit,
+                    render_spec,
+                    keep_navigation_preview=False,
                 )
-                previews = tuple(
-                    self._sources[key]
-                    for key in group or ()
-                    if self._sources[key].source_is_preview
-                )
-                if previews:
-                    protected.add(
-                        min(
-                            previews,
-                            key=lambda candidate: candidate.qimage.sizeInBytes(),
-                        ).key
-                    )
+                if rank == 2:
+                    break
         return frozenset(protected)
 
-    def _retention_rank(self, source: _CachedSource) -> tuple[int, int, int, int]:
+    def _protect_unit_sources(
+        self,
+        protected: set[_SourceKey],
+        unit: ZipRasterDisplayUnit,
+        render_spec: ZipRasterRenderSpec,
+        *,
+        keep_navigation_preview: bool,
+    ) -> None:
+        for page in unit.pages:
+            source = self.find(page, render_spec, unit=unit)
+            if source is not None:
+                protected.add(source.key)
+            if not keep_navigation_preview or render_spec.decoder_maximum_size is not None:
+                continue
+            group = self._sources_by_identity.get(
+                (page.image_id, render_spec.adjustments)
+            )
+            previews = tuple(
+                self._sources[key]
+                for key in group or ()
+                if self._sources[key].source_is_preview
+            )
+            if previews:
+                protected.add(
+                    min(
+                        previews,
+                        key=lambda candidate: candidate.qimage.sizeInBytes(),
+                    ).key
+                )
+
+    def _rank_for_request(
+        self,
+        page_index: int,
+        render_spec: ZipRasterRenderSpec,
+        *,
+        source_is_preview: bool,
+    ) -> _ArtifactRetentionRank:
+        plan = self._retention_plan
+        active_rank = (
+            plan.rank_for_page(page_index) if plan is not None else None
+        )
+        adjustments_match = (
+            self._current_render_spec is not None
+            and render_spec.adjustments == self._current_render_spec.adjustments
+        )
+        if active_rank is not None and adjustments_match:
+            scope = 0
+            locality = active_rank
+        else:
+            scope = 1 if adjustments_match else 2
+            locality = self._fallback_distance(page_index)
+        return (
+            scope,
+            locality,
+            int(not source_is_preview),
+            0,
+            self._direction_penalty(page_index),
+        )
+
+    def _retention_rank(
+        self,
+        source: _CachedSource,
+    ) -> _ArtifactRetentionRank:
         # Full sources are interactive promotion artifacts.  Outside an active
         # full-source request, evict them before the smaller navigation preview
         # at the same locality so a magnifier session cannot poison page turns.
-        full_tier_penalty = int(not source.source_is_preview)
-        active_rank = self._active_rank.get(source.key.image_id)
+        render_spec = self._current_render_spec
+        adjustments_match = bool(
+            render_spec is not None
+            and source.key.adjustments == render_spec.adjustments
+        )
+        plan = self._retention_plan
+        active_rank = (
+            plan.rank_for_page(source.page_index)
+            if plan is not None and adjustments_match
+            else None
+        )
         if active_rank is not None:
-            return (0, full_tier_penalty, active_rank, 0)
+            scope = 0
+            locality = active_rank
+        else:
+            scope = 1 if adjustments_match else 2
+            locality = self._fallback_distance(source.page_index)
+        return (
+            scope,
+            locality,
+            int(not source.source_is_preview),
+            0,
+            self._direction_penalty(source.page_index),
+        )
+
+    def _fallback_distance(self, page_index: int) -> int:
         if self._active_anchor is None:
-            return (1, full_tier_penalty, 0, 0)
-        delta = source.page_index - self._active_anchor
-        direction_penalty = int(
+            return 0
+        return abs(int(page_index) - self._active_anchor)
+
+    def _direction_penalty(self, page_index: int) -> int:
+        if self._active_anchor is None:
+            return 0
+        delta = int(page_index) - self._active_anchor
+        return int(
             self._direction != 0
             and delta != 0
             and (1 if delta > 0 else -1) != self._direction
         )
-        return (1, full_tier_penalty, abs(delta), direction_penalty)
 
     @staticmethod
     def _satisfies(
@@ -1091,22 +1223,24 @@ class _ZipRasterFrameStore:
     priority used by ``ViewerForm.ReduceUsingMemory``.  The previous runtime
     incorrectly treated the three currently scheduled units as the complete
     cache membership and discarded every other completed frame on each page
-    request.  This store keeps completed work until the configured unit/byte
-    budget actually requires eviction, while the current -> next -> previous
-    order ranks the protected neighborhood.
+    request.  This store keeps completed work until the book-wide byte policy
+    requires eviction, while the current -> next -> previous order ranks the
+    protected neighborhood.  Artifact count is diagnostic only; it never
+    limits residency.
 
-    The full-book order is represented as a distance/direction rank instead of
-    allocating a Python object for every page on every wheel event.  Only the
-    small active frontier is materialized by ``ZipRasterRequest``.
+    The full-book order is represented by one immutable topology plus a lazy
+    distance/direction cursor instead of allocating and sorting a work object
+    for every page on every wheel event.
     """
 
-    def __init__(self, *, unit_limit: int, byte_budget: int) -> None:
+    def __init__(self) -> None:
         self._frames: OrderedDict[_UnitKey, _CachedFrame] = OrderedDict()
         self._bytes = _ByteLedger()
         self._eviction_order: list[_UnitKey] | None = None
-        self._unit_limit = max(1, int(unit_limit))
-        self._byte_budget = max(1, int(byte_budget))
-        self._active_rank: dict[_UnitKey, int] = {}
+        self._retention_plan: RasterWarmupPlan[
+            ZipRasterDisplayUnit,
+            tuple[tuple[int, str], ...],
+        ] | None = None
         self._current_key: _UnitKey | None = None
         self._displayed_key: _UnitKey | None = None
         self._direction = 0
@@ -1152,27 +1286,16 @@ class _ZipRasterFrameStore:
     def take(self, key: _UnitKey) -> _CachedFrame | None:
         return self._remove(key)
 
-    def set_limits(
+    def set_retention_plan(
         self,
-        *,
-        unit_limit: int | None = None,
-        byte_budget: int | None = None,
-    ) -> int:
-        if unit_limit is not None:
-            self._unit_limit = max(1, int(unit_limit))
-        if byte_budget is not None:
-            self._byte_budget = max(1, int(byte_budget))
-        return self._prune()
-
-    def set_retention_order(
-        self,
-        active_order: tuple[_UnitKey, ...],
+        plan: RasterWarmupPlan[
+            ZipRasterDisplayUnit,
+            tuple[tuple[int, str], ...],
+        ] | None,
         current_key: _UnitKey | None,
         direction: int,
     ) -> int:
-        self._active_rank = {
-            key: index for index, key in enumerate(active_order)
-        }
+        self._retention_plan = plan
         self._eviction_order = None
         self._current_key = current_key
         normalized_direction = int(direction)
@@ -1182,14 +1305,14 @@ class _ZipRasterFrameStore:
             self._direction = 1
         else:
             self._direction = 0
-        return self._prune()
+        return 0
 
     def set_displayed_key(self, key: _UnitKey | None) -> int:
         """Protect the last painted frame until its replacement paints."""
 
         self._displayed_key = key
         self._eviction_order = None
-        return self._prune()
+        return 0
 
     def put(self, frame: _CachedFrame) -> tuple[bool, int]:
         self._remove(frame.key)
@@ -1197,23 +1320,10 @@ class _ZipRasterFrameStore:
         self._frames.move_to_end(frame.key)
         self._bytes.add(self._frame_bytes(frame))
         self._eviction_order = None
-        evicted = self._prune()
-        return frame.key in self._frames, evicted
+        return True, 0
 
     def can_admit_prefetch(self, key: _UnitKey) -> bool:
-        if key in self._frames:
-            return False
-        if (
-            len(self._frames) < self._unit_limit
-            and self.byte_size < self._byte_budget
-        ):
-            return True
-        victim = self._eviction_candidate()
-        if victim is None:
-            return False
-        # A newly relevant neighbor may replace an older/farther frame, but a
-        # background request never churns an equal-or-better retained frame.
-        return self._retention_rank(key) < self._retention_rank(victim)
+        return key not in self._frames
 
     def evict_one(self) -> bool:
         self._ensure_eviction_order()
@@ -1230,13 +1340,17 @@ class _ZipRasterFrameStore:
     def lower_rank_reclaim_candidates(
         self,
         key: _UnitKey,
-    ) -> tuple[tuple[_UnitKey, int], ...]:
+    ) -> tuple[tuple[_UnitKey, int, _ArtifactRetentionRank], ...]:
         """Return complete frames strictly below a pending unit's rank."""
 
         candidate_rank = self._retention_rank(key)
         self._ensure_eviction_order()
         return tuple(
-            (candidate, self._frame_bytes(self._frames[candidate]))
+            (
+                candidate,
+                self._frame_bytes(self._frames[candidate]),
+                self._retention_rank(candidate),
+            )
             for candidate in reversed(self._eviction_order or ())
             if self._retention_rank(candidate) > candidate_rank
         )
@@ -1269,28 +1383,18 @@ class _ZipRasterFrameStore:
                 self._eviction_order = None
         return frame
 
-    def _prune(self) -> int:
-        evicted = 0
-        while (
-            len(self._frames) > self._unit_limit
-            or self.byte_size > self._byte_budget
-        ):
-            removable = self._eviction_candidate()
-            if removable is None:
-                # A single current frame may legitimately exceed the byte
-                # budget. Keeping it is required by the old-frame/atomic
-                # commit contract; no background frame is admitted beside it.
-                break
-            self._ensure_eviction_order()
-            if self._eviction_order:
-                self._eviction_order.pop()
-            self._remove(removable, invalidate_eviction_order=False)
-            evicted += 1
-        return evicted
-
     def _eviction_candidate(self) -> _UnitKey | None:
         self._ensure_eviction_order()
         return self._eviction_order[-1] if self._eviction_order else None
+
+    def worst_reclaim_candidate(
+        self,
+    ) -> tuple[_UnitKey, int, _ArtifactRetentionRank] | None:
+        key = self._eviction_candidate()
+        if key is None:
+            return None
+        frame = self._frames[key]
+        return key, self._frame_bytes(frame), self._retention_rank(key)
 
     def _ensure_eviction_order(self) -> None:
         if self._eviction_order is not None:
@@ -1298,7 +1402,7 @@ class _ZipRasterFrameStore:
         candidates = [
             key
             for key in self._frames
-            if key not in {self._current_key, self._displayed_key}
+            if not self._is_protected(key)
         ]
         positions = {key: index for index, key in enumerate(self._frames)}
         candidates.sort(
@@ -1309,13 +1413,34 @@ class _ZipRasterFrameStore:
         )
         self._eviction_order = candidates
 
-    def _retention_rank(self, key: _UnitKey) -> tuple[int, int, int]:
-        active_rank = self._active_rank.get(key)
-        if active_rank is not None:
-            return (0, active_rank, 0)
+    def _is_protected(self, key: _UnitKey) -> bool:
+        if key in {self._current_key, self._displayed_key}:
+            return True
         current = self._current_key
+        plan = self._retention_plan
+        if (
+            current is None
+            or plan is None
+            or key.render_spec != current.render_spec
+        ):
+            return False
+        return plan.rank_for_identity(key.unit_identity) in {1, 2}
+
+    def _retention_rank(self, key: _UnitKey) -> _ArtifactRetentionRank:
+        plan = self._retention_plan
+        current = self._current_key
+        same_layout = bool(
+            current is not None and key.render_spec == current.render_spec
+        )
+        active_rank = (
+            plan.rank_for_identity(key.unit_identity)
+            if plan is not None and same_layout
+            else None
+        )
+        if active_rank is not None:
+            return (0, active_rank, 0, 1, 0)
         if current is None:
-            return (1, 0, 0)
+            return (2, 0, 0, 1, 0)
         current_anchor = self._unit_anchor(current)
         candidate_anchor = self._unit_anchor(key)
         delta = candidate_anchor - current_anchor
@@ -1324,7 +1449,13 @@ class _ZipRasterFrameStore:
             and delta != 0
             and (1 if delta > 0 else -1) != self._direction
         )
-        return (1, abs(delta), direction_penalty)
+        return (
+            1 if same_layout else 2,
+            abs(delta),
+            0,
+            1,
+            direction_penalty,
+        )
 
     @staticmethod
     def _unit_anchor(key: _UnitKey) -> int:
@@ -1355,6 +1486,7 @@ class _ZipRasterUnitJob(QRunnable):
         unit: ZipRasterDisplayUnit,
         cached_sources: dict[str, _CachedSource] | None = None,
         prefetch_budget_bytes: int | None = None,
+        prefetch_hard_limit_bytes: int | None = None,
     ) -> None:
         super().__init__()
         self.setAutoDelete(False)
@@ -1368,9 +1500,15 @@ class _ZipRasterUnitJob(QRunnable):
             if prefetch_budget_bytes is None
             else max(0, int(prefetch_budget_bytes))
         )
+        self.prefetch_hard_limit_bytes = (
+            None
+            if prefetch_hard_limit_bytes is None
+            else max(1, int(prefetch_hard_limit_bytes))
+        )
         self.signals = _JobSignals()
         self.cancelled = Event()
         self.admission_declined = False
+        self.oversized_prefetch = False
         self.started = Event()
         self.finished = Event()
         self._token_lock = Lock()
@@ -1463,6 +1601,7 @@ class _ZipRasterUnitJob(QRunnable):
             pages,
             self.cancelled.is_set(),
             self.admission_declined,
+            self.oversized_prefetch,
             monotonic(),
         )
         # Worker completion and GUI-result drainage are separate lifetime
@@ -1832,14 +1971,19 @@ class _ZipRasterUnitJob(QRunnable):
             tuple(logical_sizes),
             source_sizes=tuple(source_sizes),
         )
+        required_bytes = missing_source_bytes + frame_bytes
         with self._token_lock:
             budget = self.prefetch_budget_bytes
             if budget is None:
                 return True
-            if missing_source_bytes + frame_bytes <= budget:
+            if required_bytes <= budget:
                 return True
             if not self.cancelled.is_set():
                 self.admission_declined = True
+                hard_limit = self.prefetch_hard_limit_bytes
+                self.oversized_prefetch = bool(
+                    hard_limit is not None and required_bytes > hard_limit
+                )
         return False
 
     def _decline_prefetch_if_still_bounded(self) -> bool:
@@ -2013,8 +2157,8 @@ class RasterBookRuntime(QObject):
         parent: QObject | None = None,
         *,
         image_work_coordinator: ImageWorkCoordinator | None = None,
-        cache_unit_limit: int = 3,
         cache_byte_budget: int = _DEFAULT_CACHE_BYTES,
+        cache_soft_target_bytes: int | None = None,
     ) -> None:
         if not isinstance(source, self._source_type):
             raise TypeError(
@@ -2032,8 +2176,10 @@ class RasterBookRuntime(QObject):
         self._serial = 0
         self._current_request: ZipRasterRequest | None = None
         self._current_key: _UnitKey | None = None
-        self._work_keys: tuple[_UnitKey, ...] = ()
-        self._unit_by_key: dict[_UnitKey, ZipRasterDisplayUnit] = {}
+        self._warmup_planner: RasterWarmupPlanner[
+            ZipRasterDisplayUnit,
+            tuple[tuple[int, str], ...],
+        ] | None = None
         self._prefetch_released_request_id: int | None = None
         self._prefetch_admission_stopped_request_id: int | None = None
         self._dispatch_suspended = False
@@ -2048,17 +2194,22 @@ class RasterBookRuntime(QObject):
         # released work order without also looping terminal/start failures.
         self._admission_declined_prefetch: set[_UnitKey] = set()
         self._capacity_retry_after_completion: set[_UnitKey] = set()
-        self._cache_unit_limit = max(1, int(cache_unit_limit))
         self._cache_byte_budget = max(1, int(cache_byte_budget))
-        self._frame_store = _ZipRasterFrameStore(
-            unit_limit=self._cache_unit_limit,
-            byte_budget=self._cache_byte_budget,
+        self._cache_soft_target_bytes = max(
+            1,
+            min(
+                self._cache_byte_budget,
+                int(cache_soft_target_bytes)
+                if cache_soft_target_bytes is not None
+                else self._cache_byte_budget * 7 // 8,
+            ),
         )
-        self._source_store = _ZipRasterSourceStore(
-            # One preview per nearby slot plus an interactive full tier for the
-            # current page.  The combined byte budget remains authoritative.
-            page_limit=max(4, self._cache_unit_limit * 3),
+        self._admission_policy = RasterAdmissionPolicy(
+            hard_limit_bytes=self._cache_byte_budget,
+            soft_target_bytes=self._cache_soft_target_bytes,
         )
+        self._frame_store = _ZipRasterFrameStore()
+        self._source_store = _ZipRasterSourceStore()
         self._metrics = ZipRasterRuntimeMetrics()
 
     @property
@@ -2110,32 +2261,106 @@ class RasterBookRuntime(QObject):
         return self._source_store.byte_size
 
     @property
-    def cache_unit_limit(self) -> int:
-        """Resolved display-artifact ceiling for diagnostics/benchmarks."""
-
-        return self._cache_unit_limit
-
-    @property
     def cache_byte_budget(self) -> int:
         """Resolved combined source/frame budget for diagnostics/benchmarks."""
 
         return self._cache_byte_budget
 
+    @property
+    def cache_soft_target_bytes(self) -> int:
+        """Background population target inside the hard byte limit."""
+
+        return self._cache_soft_target_bytes
+
+    @property
+    def warmup_stop_reason(self) -> str:
+        planner = self._warmup_planner
+        return (
+            planner.stop_reason.value
+            if planner is not None
+            else WarmupStopReason.SUSPENDED.value
+        )
+
+    @property
+    def unprocessed_unit_count(self) -> int:
+        planner = self._warmup_planner
+        return planner.unprocessed_hint if planner is not None else 0
+
+    def cache_debug_values(self) -> dict[str, int | str | bool]:
+        """Expose population state to offscreen benchmarks without logging."""
+
+        ready_pages = set(self._frame_store.page_indexes)
+        source_pages = set(self._source_store.page_indexes)
+        planner = self._warmup_planner
+        return {
+            "hard_limit_bytes": self._cache_byte_budget,
+            "soft_target_bytes": self._cache_soft_target_bytes,
+            "cache_used_bytes": self.cache_bytes,
+            "cache_over_hard_bytes": max(
+                0,
+                self.cache_bytes - self._cache_byte_budget,
+            ),
+            "cache_over_soft_bytes": max(
+                0,
+                self.cache_bytes - self._cache_soft_target_bytes,
+            ),
+            "ready_page_count": len(ready_pages),
+            "ready_unit_count": self.cached_unit_count,
+            "source_page_count": len(source_pages),
+            "source_only_page_count": len(source_pages - ready_pages),
+            "unprocessed_unit_count": self.unprocessed_unit_count,
+            "worker_running": bool(self.active_job_count),
+            "warmup_stop_reason": self.warmup_stop_reason,
+            "book_complete": bool(planner is not None and planner.book_complete),
+            "capacity_skip_count": (
+                len(planner.capacity_skips) if planner is not None else 0
+            ),
+            "cache_hits": self._metrics.cache_hits,
+            "cache_misses": self._metrics.cache_misses,
+            "jobs_submitted": self._metrics.jobs_submitted,
+            "cancel_requests": self._metrics.cancel_requests,
+            "stale_results": self._metrics.stale_results,
+            "cache_evictions": self._metrics.cache_evictions,
+            "oversized_prefetch_skips": (
+                self._metrics.oversized_prefetch_skips
+            ),
+        }
+
     def set_cache_limits(
         self,
         *,
-        unit_limit: int | None = None,
         byte_budget: int | None = None,
     ) -> None:
-        previous_unit_limit = self._cache_unit_limit
+        if byte_budget is None:
+            return
+        # Compatibility API for old tests/adapters: one limit means its
+        # background target is the same hard boundary. Production uses the
+        # explicit soft/hard method below.
+        self.set_memory_limits(
+            hard_limit_bytes=byte_budget,
+            soft_target_bytes=byte_budget,
+        )
+
+    def set_memory_limits(
+        self,
+        *,
+        hard_limit_bytes: int,
+        soft_target_bytes: int,
+    ) -> None:
         previous_byte_budget = self._cache_byte_budget
-        if unit_limit is not None:
-            self._cache_unit_limit = max(1, int(unit_limit))
-        if byte_budget is not None:
-            self._cache_byte_budget = max(1, int(byte_budget))
+        previous_soft_target = self._cache_soft_target_bytes
+        self._cache_byte_budget = max(1, int(hard_limit_bytes))
+        self._cache_soft_target_bytes = max(
+            1,
+            min(self._cache_byte_budget, int(soft_target_bytes)),
+        )
+        self._admission_policy.set_limits(
+            hard_limit_bytes=self._cache_byte_budget,
+            soft_target_bytes=self._cache_soft_target_bytes,
+        )
         limits_shrunk = (
-            self._cache_unit_limit < previous_unit_limit
-            or self._cache_byte_budget < previous_byte_budget
+            self._cache_byte_budget < previous_byte_budget
+            or self._cache_soft_target_bytes < previous_soft_target
         )
         if limits_shrunk:
             active = self._active_job
@@ -2145,59 +2370,64 @@ class RasterBookRuntime(QObject):
                 # live 32-GiB -> minimal change could still publish work that
                 # the newly authoritative budget would never start.
                 self._cancel_active_job()
-        evicted = self._frame_store.set_limits(
-            unit_limit=self._cache_unit_limit,
-            byte_budget=self._cache_byte_budget,
+        self._enforce_combined_budget(
+            limit_bytes=(
+                self._cache_soft_target_bytes
+                if self._cache_soft_target_bytes < previous_soft_target
+                else self._cache_byte_budget
+            )
         )
-        if evicted:
-            self._bump("cache_evictions", evicted)
-        source_evicted = self._source_store.set_page_limit(
-            max(4, self._cache_unit_limit * 3)
-        )
-        self._record_source_evictions(source_evicted)
-        self._enforce_combined_budget()
         limits_expanded = (
-            self._cache_unit_limit > previous_unit_limit
-            or self._cache_byte_budget > previous_byte_budget
+            self._cache_byte_budget > previous_byte_budget
+            or self._cache_soft_target_bytes > previous_soft_target
         )
         if not limits_expanded:
             if limits_shrunk:
+                planner = self._warmup_planner
+                if planner is not None:
+                    planner.reset_capacity()
                 self._prefetch_admission_stopped_request_id = None
                 self._drive()
             return
 
-        if self._cache_byte_budget > previous_byte_budget:
+        retry_keys: tuple[_UnitKey, ...] = ()
+        if limits_expanded:
             # Only exact worker-side capacity declines are retriable here.
             # Broken images and worker-start failures stay suppressed for the
             # current work order, avoiding a background retry loop.
+            retry_keys = tuple(self._admission_declined_prefetch)
             self._failed_prefetch.difference_update(
                 self._admission_declined_prefetch
             )
             self._admission_declined_prefetch.clear()
+        planner = self._warmup_planner
+        if planner is not None:
+            planner.reset_capacity()
         self._prefetch_admission_stopped_request_id = None
 
-        # A newly affordable earlier unit must regain its work-order priority.
-        # Running work cannot be preempted synchronously, but cancellation and
-        # stale-result rejection ensure that the one worker lane next starts
-        # the highest-priority missing background unit.
+        # A newly affordable *earlier* unit must regain its work-order
+        # priority.  Merely raising the pressure target must not throw away an
+        # unrelated far decode already in flight: that converts gradual Auto
+        # recovery into duplicate work every five-second pressure sample.
         active = self._active_job
-        highest_missing = self._highest_priority_missing_background_key()
-        if (
-            active is not None
-            and active.key != self._current_key
-            and active.key == highest_missing
-            and self._cache_byte_budget > previous_byte_budget
-            and active.expand_prefetch_budget(
-                self._prefetch_worker_budget(active.key)
+        if active is not None and active.key != self._current_key:
+            active_rank = self._background_rank(active.key)
+            retry_ranks = tuple(
+                rank
+                for key in retry_keys
+                if (rank := self._background_rank(key)) is not None
             )
-        ):
-            self._capacity_retry_after_completion.add(active.key)
-        if (
-            active is not None
-            and active.key != self._current_key
-            and active.key != highest_missing
-        ):
-            self._cancel_active_job()
+            earliest_retry_rank = min(retry_ranks, default=None)
+            should_reprioritize = active_rank is None or (
+                earliest_retry_rank is not None
+                and earliest_retry_rank < active_rank
+            )
+            if should_reprioritize:
+                self._cancel_active_job()
+            elif active.expand_prefetch_budget(
+                self._prefetch_worker_budget(active.key)
+            ):
+                self._capacity_retry_after_completion.add(active.key)
         self._drive()
 
     def has_cached_current(self, request: ZipRasterRequest) -> bool:
@@ -2302,26 +2532,21 @@ class RasterBookRuntime(QObject):
             and self._source_hydration_key != current_key
         ):
             self._restore_source_hydration_frame()
-        work_keys = tuple(
-            self._key_for(unit, request.render_spec)
-            for unit in request.work_order
-        )
         self._current_request = request
         self._current_key = current_key
-        self._work_keys = work_keys
-        self._unit_by_key = dict(zip(work_keys, request.work_order))
+        self._warmup_planner = RasterWarmupPlanner(request.warmup_plan)
         self._prefetch_released_request_id = None
         self._prefetch_admission_stopped_request_id = None
         self._dispatch_suspended = bool(suspend_dispatch)
-        evicted = self._frame_store.set_retention_order(
-            work_keys,
+        evicted = self._frame_store.set_retention_plan(
+            request.warmup_plan,
             current_key,
             request.navigation_direction,
         )
         if evicted:
             self._bump("cache_evictions", evicted)
-        source_evicted = self._source_store.set_retention_order(
-            request.work_order,
+        source_evicted = self._source_store.set_retention_plan(
+            request.warmup_plan,
             request.current,
             request.render_spec,
             request.navigation_direction,
@@ -2344,8 +2569,7 @@ class RasterBookRuntime(QObject):
                 not suspend_dispatch
                 and not active_cancelled
                 and current_key in self._frame_store
-                and active.key
-                == self._highest_priority_missing_background_key()
+                and self._background_rank(active.key) in {1, 2}
             ):
                 # Preserve a background decode only when it is still the next
                 # missing unit in the replacement order.  A full-book warm-up
@@ -2369,6 +2593,10 @@ class RasterBookRuntime(QObject):
         evicted = self._frame_store.set_displayed_key(self._painted_key)
         if evicted:
             self._bump("cache_evictions", evicted)
+        self._source_store.set_displayed_unit(
+            request.current,
+            request.render_spec,
+        )
         # A cold atomic commit temporarily protects both the last painted
         # frame and its replacement.  Once the replacement has painted, the
         # old frame is removable; enforce the combined source+frame budget at
@@ -2377,6 +2605,9 @@ class RasterBookRuntime(QObject):
         # prefetch disabled).
         self._enforce_combined_budget()
         self._prefetch_released_request_id = request.request_id
+        planner = self._warmup_planner
+        if planner is not None:
+            planner.release_after_paint()
         self._drive()
         return True
 
@@ -2388,8 +2619,7 @@ class RasterBookRuntime(QObject):
             self._restore_source_hydration_frame()
         self._current_request = None
         self._current_key = None
-        self._work_keys = ()
-        self._unit_by_key.clear()
+        self._warmup_planner = None
         self._prefetch_released_request_id = None
         self._prefetch_admission_stopped_request_id = None
         self._dispatch_suspended = False
@@ -2401,9 +2631,10 @@ class RasterBookRuntime(QObject):
         if clear_artifacts:
             self._frame_store.clear()
             self._source_store.clear()
-        self._frame_store.set_retention_order((), None, 0)
+        self._frame_store.set_retention_plan(None, None, 0)
         self._frame_store.set_displayed_key(None)
-        self._source_store.set_retention_order((), None, None, 0)
+        self._source_store.set_retention_plan(None, None, None, 0)
+        self._source_store.set_displayed_unit(None, None)
 
     def invalidate_layout(self) -> None:
         # Layout-dependent QPixmaps are invalid, but decoded archive content
@@ -2439,10 +2670,12 @@ class RasterBookRuntime(QObject):
 
     def _drive(self) -> None:
         request = self._current_request
+        planner = self._warmup_planner
         if (
             not self._accepting_requests
             or request is None
             or self._current_key is None
+            or planner is None
             or self._dispatch_suspended
             or self._active_job is not None
         ):
@@ -2452,10 +2685,29 @@ class RasterBookRuntime(QObject):
             return
         if self._prefetch_released_request_id != request.request_id:
             return
-        for rank, key in enumerate(self._work_keys[1:]):
-            if key in self._frame_store or key in self._failed_prefetch:
-                continue
-            if not self._can_admit_prefetch(key):
+        while True:
+            unit = planner.next_candidate(
+                identity_of=lambda candidate: candidate.identity,
+                is_ready=lambda candidate: (
+                    self._key_for(candidate, request.render_spec)
+                    in self._frame_store
+                ),
+                is_terminal_failure=lambda candidate: (
+                    self._key_for(candidate, request.render_spec)
+                    in self._failed_prefetch
+                ),
+            )
+            if unit is None:
+                return
+            key = self._key_for(unit, request.render_spec)
+            decision = self._prefetch_admission_decision(key)
+            if not decision.admitted:
+                if (
+                    decision.action is RasterAdmissionAction.SOFT_TARGET_REACHED
+                    and self.cache_bytes >= decision.target_bytes
+                ):
+                    planner.stop_for_soft_target()
+                    return
                 # Capacity rejection belongs to this replaceable work order,
                 # not to the whole warm-up frontier.  A single exceptionally
                 # large page must not prevent later small pages from using the
@@ -2463,6 +2715,9 @@ class RasterBookRuntime(QObject):
                 # only these capacity entries and makes them eligible again.
                 self._failed_prefetch.add(key)
                 self._admission_declined_prefetch.add(key)
+                planner.mark_capacity_skip(unit.identity)
+                if decision.action is RasterAdmissionAction.SKIP_OVERSIZED:
+                    self._bump("oversized_prefetch_skips")
                 if (
                     self._prefetch_admission_stopped_request_id
                     != request.request_id
@@ -2470,23 +2725,36 @@ class RasterBookRuntime(QObject):
                     self._prefetch_admission_stopped_request_id = request.request_id
                     self._bump("prefetch_admission_stops")
                 continue
+            rank = request.warmup_plan.rank_for_identity(unit.identity) or 1
             priority = (
                 ImageWorkPriority.VIEWER_NEXT
-                if rank == 0
+                if rank == 1
                 else ImageWorkPriority.VIEWER_PREVIOUS
             )
             self._submit(key, priority)
             return
 
-    def _highest_priority_missing_background_key(self) -> _UnitKey | None:
-        for key in self._work_keys[1:]:
-            if key in self._frame_store or key in self._failed_prefetch:
-                continue
-            if self._can_admit_prefetch(key):
-                return key
-        return None
+    def _background_rank(self, key: _UnitKey) -> int | None:
+        request = self._current_request
+        if request is None or key.render_spec != request.render_spec:
+            return None
+        return request.warmup_plan.rank_for_identity(key.unit_identity)
 
-    def _can_admit_prefetch(self, key: _UnitKey) -> bool:
+    def _unit_for_key(self, key: _UnitKey) -> ZipRasterDisplayUnit | None:
+        request = self._current_request
+        if (
+            request is None
+            or key.source_epoch != self.source_epoch
+            or key.source_identity != self._source_identity
+            or key.render_spec != request.render_spec
+        ):
+            return None
+        return request.warmup_plan.unit_for_identity(key.unit_identity)
+
+    def _prefetch_admission_decision(
+        self,
+        key: _UnitKey,
+    ) -> RasterAdmissionDecision:
         """Reject work that cannot coexist with the protected current unit.
 
         The frame store alone cannot see the usually larger decoded source
@@ -2498,14 +2766,31 @@ class RasterBookRuntime(QObject):
         bytes are replanned and reclaimed only for a relevant successful GUI
         result immediately before it enters the stores.
         """
-        if not self._frame_store.can_admit_prefetch(key):
-            return False
-        unit = self._unit_by_key.get(key)
+        rank = self._background_rank(key)
+        if not self._frame_store.can_admit_prefetch(key) or rank is None:
+            return self._admission_policy.decide_background(
+                retained_bytes=self.cache_bytes,
+                estimated_bytes=self._cache_byte_budget + 1,
+                reclaimable_lower_rank_bytes=0,
+                rank=self._admission_policy.minimum_protected_rank + 1,
+            )
+        unit = self._unit_for_key(key)
         if unit is None:
-            return False
-        frame_slots_needed = max(
-            0,
-            self._frame_store.unit_count + 1 - self._cache_unit_limit,
+            return self._admission_policy.decide_background(
+                retained_bytes=self.cache_bytes,
+                estimated_bytes=self._cache_byte_budget + 1,
+                reclaimable_lower_rank_bytes=0,
+                rank=rank,
+            )
+        source_candidates = self._source_store.lower_rank_reclaim_candidates(
+            unit,
+            key.render_spec,
+        )
+        frame_candidates = self._frame_store.lower_rank_reclaim_candidates(key)
+        reclaimable_bytes = sum(
+            size for _candidate, size, _retention in source_candidates
+        ) + sum(
+            size for _candidate, size, _retention in frame_candidates
         )
         requires_exact_worker_admission = any(
             _requires_exact_prefetch_admission(
@@ -2526,15 +2811,11 @@ class RasterBookRuntime(QObject):
             # inherit its observed provisional cost and skip the header probe.
             # Prove only rank/unit replaceability here; the worker compares its
             # exact header cost against free + strictly lower-rank allowance.
-            return bool(
-                self._prefetch_worker_budget(key) > 0
-                and self._lower_rank_reclaim_plan(
-                    key,
-                    unit,
-                    bytes_needed=0,
-                    frame_slots_needed=frame_slots_needed,
-                )
-                is not None
+            return self._admission_policy.decide_background(
+                retained_bytes=self.cache_bytes,
+                estimated_bytes=None,
+                reclaimable_lower_rank_bytes=reclaimable_bytes,
+                rank=rank,
             )
         source_bytes = self._estimated_missing_source_bytes(
             unit,
@@ -2545,17 +2826,13 @@ class RasterBookRuntime(QObject):
             key.render_spec,
             source_bytes=source_bytes,
         )
-        free = max(0, self._cache_byte_budget - self.cache_bytes)
         required_bytes = source_bytes + frame_bytes
-        bytes_needed = max(0, required_bytes - free)
-        if frame_slots_needed == 0 and bytes_needed == 0:
-            return True
-        return self._lower_rank_reclaim_plan(
-            key,
-            unit,
-            bytes_needed=bytes_needed,
-            frame_slots_needed=frame_slots_needed,
-        ) is not None
+        return self._admission_policy.decide_background(
+            retained_bytes=self.cache_bytes,
+            estimated_bytes=required_bytes,
+            reclaimable_lower_rank_bytes=reclaimable_bytes,
+            rank=rank,
+        )
 
     def _lower_rank_reclaim_plan(
         self,
@@ -2563,7 +2840,6 @@ class RasterBookRuntime(QObject):
         unit: ZipRasterDisplayUnit,
         *,
         bytes_needed: int,
-        frame_slots_needed: int,
         excluded_source_keys: frozenset[_SourceKey] = frozenset(),
     ) -> tuple[tuple[_SourceKey, ...], tuple[_UnitKey, ...]] | None:
         frame_candidates = self._frame_store.lower_rank_reclaim_candidates(key)
@@ -2572,44 +2848,53 @@ class RasterBookRuntime(QObject):
             key.render_spec,
             excluded_keys=excluded_source_keys,
         )
-        if len(frame_candidates) < frame_slots_needed:
-            return None
+        # Source and frame residency share one byte authority.  Pick the
+        # globally lowest-value artifacts regardless of which store owns them
+        # instead of exhausting decoded sources before considering frames.
+        combined: list[
+            tuple[
+                _ArtifactRetentionRank,
+                str,
+                _SourceKey | _UnitKey,
+                int,
+            ]
+        ] = [
+            (rank, "source", candidate, size)
+            for candidate, size, rank in source_candidates
+        ]
+        combined.extend(
+            (rank, "frame", candidate, size)
+            for candidate, size, rank in frame_candidates
+        )
+        combined.sort(key=lambda candidate: candidate[0], reverse=True)
 
-        selected_frames = list(frame_candidates[:frame_slots_needed])
-        selected_frame_keys = {candidate for candidate, _size in selected_frames}
-        reclaimed_bytes = sum(size for _candidate, size in selected_frames)
-        selected_sources: list[tuple[_SourceKey, int]] = []
-        for candidate in source_candidates:
+        selected_sources: list[_SourceKey] = []
+        selected_frames: list[_UnitKey] = []
+        reclaimed_bytes = 0
+        for _rank, kind, candidate, size in combined:
             if reclaimed_bytes >= bytes_needed:
                 break
-            selected_sources.append(candidate)
-            reclaimed_bytes += candidate[1]
-        if reclaimed_bytes < bytes_needed:
-            for candidate in frame_candidates[frame_slots_needed:]:
-                if reclaimed_bytes >= bytes_needed:
-                    break
-                if candidate[0] in selected_frame_keys:
-                    continue
-                selected_frames.append(candidate)
-                selected_frame_keys.add(candidate[0])
-                reclaimed_bytes += candidate[1]
+            if kind == "source":
+                selected_sources.append(candidate)  # type: ignore[arg-type]
+            else:
+                selected_frames.append(candidate)  # type: ignore[arg-type]
+            reclaimed_bytes += size
         if reclaimed_bytes < bytes_needed:
             return None
-        return (
-            tuple(candidate for candidate, _size in selected_sources),
-            tuple(candidate for candidate, _size in selected_frames),
-        )
+        return tuple(selected_sources), tuple(selected_frames)
 
     def _prefetch_worker_budget(self, key: _UnitKey) -> int:
         """Return free bytes plus every strictly lower-rank reservation."""
 
-        unit = self._unit_by_key.get(key)
-        if unit is None:
+        unit = self._unit_for_key(key)
+        rank = self._background_rank(key)
+        if unit is None or rank is None:
             return 0
-        free = max(0, self._cache_byte_budget - self.cache_bytes)
+        target = self._admission_policy.target_for_rank(rank)
+        free = max(0, target - self.cache_bytes)
         source_allowance = sum(
             size
-            for _candidate, size in (
+            for _candidate, size, _rank in (
                 self._source_store.lower_rank_reclaim_candidates(
                     unit,
                     key.render_spec,
@@ -2618,7 +2903,7 @@ class RasterBookRuntime(QObject):
         )
         frame_allowance = sum(
             size
-            for _candidate, size in (
+            for _candidate, size, _rank in (
                 self._frame_store.lower_rank_reclaim_candidates(key)
             )
         )
@@ -2642,6 +2927,9 @@ class RasterBookRuntime(QObject):
     def _decline_completed_prefetch(self, key: _UnitKey) -> None:
         self._failed_prefetch.add(key)
         self._admission_declined_prefetch.add(key)
+        planner = self._warmup_planner
+        if planner is not None:
+            planner.mark_capacity_skip(key.unit_identity)
         request = self._current_request
         if (
             request is not None
@@ -2808,7 +3096,7 @@ class RasterBookRuntime(QObject):
 
     def _submit(self, key: _UnitKey, priority: ImageWorkPriority) -> None:
         request = self._current_request
-        unit = self._unit_by_key.get(key)
+        unit = self._unit_for_key(key)
         if request is None or unit is None:
             return
         cached_sources: dict[str, _CachedSource] = {}
@@ -2836,6 +3124,11 @@ class RasterBookRuntime(QObject):
                 None
                 if key == self._current_key
                 else self._prefetch_worker_budget(key)
+            ),
+            prefetch_hard_limit_bytes=(
+                None
+                if key == self._current_key
+                else self._cache_byte_budget
             ),
         )
         job.signals.completed.connect(
@@ -2963,6 +3256,8 @@ class RasterBookRuntime(QObject):
             return
         if result.admission_declined:
             request = self._current_request
+            if result.oversized_prefetch:
+                self._bump("oversized_prefetch_skips")
             retry_after_capacity_change = (
                 result.key in self._capacity_retry_after_completion
             )
@@ -2973,6 +3268,9 @@ class RasterBookRuntime(QObject):
             ):
                 self._failed_prefetch.add(result.key)
                 self._admission_declined_prefetch.add(result.key)
+                planner = self._warmup_planner
+                if planner is not None:
+                    planner.mark_capacity_skip(result.key.unit_identity)
                 if (
                     request is not None
                     and self._prefetch_admission_stopped_request_id
@@ -3025,6 +3323,9 @@ class RasterBookRuntime(QObject):
             and not rendered.display_qimage.isNull()
             for rendered in result.pages
         )
+        reclaim_plan: (
+            tuple[tuple[_SourceKey, ...], tuple[_UnitKey, ...]] | None
+        ) = None
         if result.key != self._current_key and result_succeeded:
             source_delta, superseded_source_keys = (
                 self._source_store.projected_put_delta(tuple(pending_sources))
@@ -3047,30 +3348,25 @@ class RasterBookRuntime(QObject):
                 + display_bytes
                 - existing_frame_bytes
             )
+            result_rank = self._background_rank(result.key)
+            result_target = self._admission_policy.target_for_rank(
+                result_rank
+                if result_rank is not None
+                else self._admission_policy.minimum_protected_rank + 1
+            )
             bytes_needed = max(
                 0,
-                projected_bytes - self._cache_byte_budget,
-            )
-            frame_slots_needed = max(
-                0,
-                self._frame_store.unit_count
-                + int(existing_before_result is None)
-                - self._cache_unit_limit,
+                projected_bytes - result_target,
             )
             reclaim_plan = self._lower_rank_reclaim_plan(
                 result.key,
                 result.unit,
                 bytes_needed=bytes_needed,
-                frame_slots_needed=frame_slots_needed,
                 excluded_source_keys=superseded_source_keys,
             )
             if reclaim_plan is None:
                 self._decline_completed_prefetch(result.key)
                 return
-            # The immutable result has passed exact request/relevance and
-            # worker-success checks.  Reclaim now, before QPixmap upload, so
-            # only one worker result is the bounded transient memory peak.
-            self._apply_reclaim_plan(reclaim_plan)
 
         frame_pages: list[ZipRasterFramePage] = []
         source_keys: list[_SourceKey | None] = []
@@ -3148,6 +3444,10 @@ class RasterBookRuntime(QObject):
                 self._drive()
                 self._emit_idle_if_needed()
                 return
+        if reclaim_plan is not None:
+            # Commit reclaim only after every QPixmap upload succeeded.  A
+            # GUI-backend failure must not destroy previously ready artifacts.
+            self._apply_reclaim_plan(reclaim_plan)
         for source in pending_sources:
             source_evicted = self._source_store.put(source)
             self._record_source_evictions(source_evicted)
@@ -3170,7 +3470,7 @@ class RasterBookRuntime(QObject):
         retained = result.key in self._frame_store
         if result.key != self._current_key and not retained:
             # The artifact could not coexist with the protected current frame
-            # under the byte/unit budget.  Do not immediately decode the same
+            # under the byte budget.  Do not immediately decode the same
             # prefetch forever; a new request/work order may retry it.
             self._failed_prefetch.add(result.key)
         self.artifactReady.emit(cached)
@@ -3193,17 +3493,15 @@ class RasterBookRuntime(QObject):
         return bool(
             self._accepting_requests
             and request is not None
-            # Full-book work orders deliberately keep most old keys present.
-            # Key membership alone therefore cannot distinguish a useful
-            # adopted job from a result that was already emitted before the
-            # navigation replacement reached the GUI thread.  adopt_request()
-            # updates the worker token before result construction; anything
-            # still carrying the old token must be drained without QPixmap
-            # upload or cache mutation so it cannot delay the new current.
+            # The request token distinguishes an adopted job from a callback
+            # already queued before navigation replaced the lazy warm-up plan.
             and result.request_id == request.request_id
             and result.key.source_epoch == self.source_epoch
             and result.key.source_identity == self._source_identity
-            and result.key in self._work_keys
+            and result.key.render_spec == request.render_spec
+            and request.warmup_plan.contains_identity(
+                result.key.unit_identity
+            )
         )
 
     def _key_for(
@@ -3311,18 +3609,41 @@ class RasterBookRuntime(QObject):
         self._bump("source_cache_evictions", amount)
         self._bump("cache_evictions", amount)
 
-    def _enforce_combined_budget(self) -> None:
-        while self.cache_bytes > self._cache_byte_budget:
-            if self._source_store.evict_one():
-                self._record_source_evictions(1)
+    def _enforce_combined_budget(self, *, limit_bytes: int | None = None) -> None:
+        limit = (
+            self._cache_byte_budget
+            if limit_bytes is None
+            else max(1, min(self._cache_byte_budget, int(limit_bytes)))
+        )
+        while self.cache_bytes > limit:
+            source_candidate = self._source_store.worst_reclaim_candidate()
+            frame_candidate = self._frame_store.worst_reclaim_candidate()
+            if source_candidate is None and frame_candidate is None:
+                # Current, displayed and rank-1/rank-2 neighborhood artifacts
+                # are the minimum navigation working set.  Like ZipPlaFork's
+                # minimum count, that set may exceed a very small byte target.
+                break
+            if frame_candidate is None or (
+                source_candidate is not None
+                and source_candidate[2] >= frame_candidate[2]
+            ):
+                source_evicted, _freed = (
+                    self._source_store.remove_reclaim_candidates(
+                        (source_candidate[0],)
+                    )
+                )
+                if not source_evicted:
+                    break
+                self._record_source_evictions(source_evicted)
                 continue
-            if self._frame_store.evict_one():
-                self._bump("cache_evictions")
-                continue
-            # The complete current frame and its current source are protected.
-            # One exceptionally large page may therefore exceed the soft book
-            # budget, matching the old-frame/atomic-commit guarantee.
-            break
+            frame_evicted, _freed = (
+                self._frame_store.remove_reclaim_candidates(
+                    (frame_candidate[0],)
+                )
+            )
+            if not frame_evicted:
+                break
+            self._bump("cache_evictions", frame_evicted)
 
     def _emit_idle_if_needed(self) -> None:
         if self._active_job is None and not self.has_unfinished_tasks():

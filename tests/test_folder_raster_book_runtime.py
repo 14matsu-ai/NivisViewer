@@ -12,6 +12,7 @@ from app.book_session import BookSession
 from app.config_manager import ConfigManager
 from app.folder_raster_book_runtime import FolderRasterBookRuntime
 from app.image_source import FolderImageSource
+from app.raster_warmup_planner import RasterBookTopology, RasterWarmupPlan
 from app.raster_book_runtime import (
     RasterDisplayUnit,
     RasterFrame,
@@ -53,11 +54,38 @@ def _request(
     spec: RasterRenderSpec | None = None,
     direction: int = 0,
 ) -> RasterRequest:
+    units = tuple(
+        sorted(
+            dict.fromkeys(work_order or (current,)),
+            key=lambda unit: min(page.page_index for page in unit.pages),
+        )
+    )
+    topology = RasterBookTopology(
+        units,
+        identity_of=lambda unit: unit.identity,
+        page_indexes_of=lambda unit: (
+            page.page_index for page in unit.pages
+        ),
+        page_count=max(
+            (page.page_index for unit in units for page in unit.pages),
+            default=-1,
+        )
+        + 1,
+    )
     return RasterRequest(
         1,
         request_id,
         current,
-        work_order or (current,),
+        RasterWarmupPlan(
+            topology,
+            current=current,
+            identity_of=lambda unit: unit.identity,
+            page_indexes_of=lambda unit: (
+                page.page_index for page in unit.pages
+            ),
+            direction=direction,
+            background_enabled=len(units) > 1,
+        ),
         spec or RasterRenderSpec((640, 480)),
         navigation_direction=direction,
     )

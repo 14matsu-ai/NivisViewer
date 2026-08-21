@@ -618,12 +618,6 @@ class BookSession(QObject):
                 self.generation,
                 self,
                 image_work_coordinator=self._image_work_coordinator,
-                # The raster runtime has one combined source+frame byte
-                # budget.  The legacy ImageCache page-count setting must not
-                # cap a multi-GiB budget to (typically) ten display units.
-                # The finite book size remains a safety ceiling while byte
-                # admission and eviction decide what stays resident.
-                cache_unit_limit=max(3, self.model.total_pages),
                 cache_byte_budget=self.image_cache.cache_byte_budget_bytes,
             )
             if runtime_type is not None and source is not None

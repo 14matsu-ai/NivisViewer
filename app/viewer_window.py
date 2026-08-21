@@ -76,6 +76,7 @@ from .raster_book_runtime import (
     RasterRenderSpec,
     RasterRequest,
 )
+from .raster_warmup_planner import RasterBookTopology, RasterWarmupPlan
 from . import viewer_commands as commands
 from .viewer_page_list_runtime import (
     ViewerPageListModel,
@@ -91,8 +92,8 @@ from .viewer_navigation_policy import (
     NavigationInputKind,
 )
 from .viewer_memory_policy import (
-    ViewerMemoryResolution,
-    resolve_viewer_memory_budget,
+    ResolvedViewerMemoryPolicy,
+    read_physical_memory_snapshot,
 )
 from .viewer_display_unit import (
     ViewerDisplayUnit,
@@ -427,6 +428,12 @@ class ViewerWindow(QMainWindow):
         self._raster_magnifier_cancel_timer.timeout.connect(
             self._refresh_after_raster_magnifier_cancel
         )
+        self._viewer_memory_pressure_timer = QTimer(self)
+        self._viewer_memory_pressure_timer.setInterval(5000)
+        self._viewer_memory_pressure_timer.timeout.connect(
+            self._sample_viewer_memory_pressure
+        )
+        self._viewer_memory_pressure_timer.start()
         self._pdf_prefetch_source: PdfImageSource | None = None
         self._pdf_prefetch_generation = -1
         self._pdf_prefetch_center = 0
@@ -442,6 +449,11 @@ class ViewerWindow(QMainWindow):
         # tests.  The owner is now the shared RasterBookRuntime used by ZIP and
         # folder-backed books alike.
         self._zip_runtime: RasterBookRuntime | None = None
+        self._raster_topology_cache_key: tuple[int, int, int] | None = None
+        self._raster_topology: RasterBookTopology[
+            RasterDisplayUnit,
+            tuple[tuple[int, str], ...],
+        ] | None = None
         self._zip_runtime_current_frame_serial = 0
         self._zip_runtime_last_painted_serial = 0
         self._pending_zip_runtime_request: RasterRequest | None = None
@@ -558,8 +570,10 @@ class ViewerWindow(QMainWindow):
     def event(self, event: QEvent) -> bool:  # type: ignore[override]
         handled = super().event(event)
         if event.type() == QEvent.Type.WindowActivate:
+            self._set_viewer_memory_active(True)
             self.activated.emit(self)
         elif event.type() == QEvent.Type.WindowDeactivate and hasattr(self, "viewer"):
+            self._set_viewer_memory_active(False)
             self.viewer.cancel_mouse_gesture()
             self.viewer.cancel_pending_canvas_click()
             self._finish_pending_navigation_sequence()
@@ -993,8 +1007,6 @@ class ViewerWindow(QMainWindow):
         settings_menu = menu_bar.addMenu("設定")
         gap_action = QAction("画像間の余白", self)
         gap_action.triggered.connect(self.set_gap_dialog)
-        cache_size_action = QAction("キャッシュ上限", self)
-        cache_size_action.triggered.connect(self.set_cache_size_dialog)
         background_color_action = QAction("背景色", self)
         background_color_action.triggered.connect(self.set_background_color_dialog)
         thumbnail_size_action = QAction("サムネイルサイズ", self)
@@ -1008,7 +1020,6 @@ class ViewerWindow(QMainWindow):
         reset_adjustments_action = QAction("画像補正をリセット", self)
         reset_adjustments_action.triggered.connect(self.reset_image_adjustments)
         settings_menu.addAction(gap_action)
-        settings_menu.addAction(cache_size_action)
         settings_menu.addAction(background_color_action)
         settings_menu.addAction(thumbnail_size_action)
         settings_menu.addSeparator()
@@ -1338,7 +1349,6 @@ class ViewerWindow(QMainWindow):
                 "viewer_prefetch_image_backward_units",
                 "viewer_prefetch_pdf_forward_units",
                 "viewer_prefetch_pdf_backward_units",
-                "viewer_cache_max_memory_mib",
                 "viewer_memory_mode",
             }.intersection(changed)
         )
@@ -1361,33 +1371,41 @@ class ViewerWindow(QMainWindow):
         self.pdf_prefetch_forward_units = int(values["pdf_forward_units"])
         self.pdf_prefetch_backward_units = int(values["pdf_backward_units"])
         memory_mode = self.config.viewer_memory_mode()
-        previous_resolution = getattr(
+        memory_policy = getattr(
             self,
-            "viewer_memory_resolution",
+            "viewer_memory_policy",
             None,
         )
-        if (
-            not isinstance(previous_resolution, ViewerMemoryResolution)
-            or previous_resolution.mode != memory_mode
-        ):
-            runtime = getattr(self, "_zip_runtime", None)
-            current_cache_bytes = (
-                runtime.cache_bytes
-                if isinstance(runtime, RasterBookRuntime)
-                else self.image_cache.cache_bytes
-                + (
-                    self.viewer.render_cache_bytes()
-                    if hasattr(self, "viewer")
-                    else 0
-                )
+        runtime = getattr(self, "_zip_runtime", None)
+        current_cache_bytes = (
+            runtime.cache_bytes
+            if isinstance(runtime, RasterBookRuntime)
+            else self.image_cache.cache_bytes
+            + (
+                self.viewer.render_cache_bytes()
+                if hasattr(self, "viewer")
+                else 0
             )
-            previous_resolution = resolve_viewer_memory_budget(
+        )
+        snapshot = read_physical_memory_snapshot()
+        if not isinstance(memory_policy, ResolvedViewerMemoryPolicy):
+            memory_policy = ResolvedViewerMemoryPolicy(
                 memory_mode,
+                snapshot=snapshot,
                 current_cache_bytes=current_cache_bytes,
             )
+        elif memory_policy.resolution.mode != memory_mode:
+            memory_policy.reconfigure(
+                memory_mode,
+                snapshot=snapshot,
+                current_cache_bytes=current_cache_bytes,
+            )
+        self.viewer_memory_policy = memory_policy
+        previous_resolution = memory_policy.resolution
         self.viewer_memory_mode = memory_mode
         self.viewer_memory_resolution = previous_resolution
-        self.viewer_cache_budget_bytes = previous_resolution.bytes
+        self.viewer_cache_budget_bytes = previous_resolution.hard_limit_bytes
+        self.viewer_cache_soft_target_bytes = memory_policy.target_bytes
         # Compatibility for status/tests which still expose the resolved MiB
         # value.  Runtime propagation below is byte-exact up to 32 GiB.
         self.viewer_cache_memory_mib = previous_resolution.mib
@@ -1395,15 +1413,74 @@ class ViewerWindow(QMainWindow):
             self.viewer_cache_budget_bytes
         )
         if getattr(self, "_zip_runtime", None) is not None:
-            self._zip_runtime.set_cache_limits(
-                unit_limit=max(3, self.model.total_pages),
-                byte_budget=self.viewer_cache_budget_bytes,
-            )
+            self._apply_raster_memory_policy()
         if hasattr(self, "viewer"):
             self.viewer.set_render_cache_byte_limit_bytes(
                 self.viewer_cache_budget_bytes
             )
             self._enforce_combined_cache_budget()
+
+    def _apply_raster_memory_policy(self) -> None:
+        runtime = getattr(self, "_zip_runtime", None)
+        policy = getattr(self, "viewer_memory_policy", None)
+        if not isinstance(runtime, RasterBookRuntime) or not isinstance(
+            policy,
+            ResolvedViewerMemoryPolicy,
+        ):
+            return
+        self.viewer_cache_budget_bytes = policy.hard_limit_bytes
+        self.viewer_cache_soft_target_bytes = policy.target_bytes
+        self.viewer_memory_resolution = policy.resolution
+        self.viewer_cache_memory_mib = policy.hard_limit_bytes // (1024 * 1024)
+        runtime.set_memory_limits(
+            hard_limit_bytes=policy.hard_limit_bytes,
+            soft_target_bytes=policy.target_bytes,
+        )
+
+    def _set_viewer_memory_active(self, active: bool) -> None:
+        policy = getattr(self, "viewer_memory_policy", None)
+        if not isinstance(policy, ResolvedViewerMemoryPolicy):
+            return
+        policy.set_active(active)
+        self._sample_viewer_memory_pressure()
+
+    @Slot()
+    def _sample_viewer_memory_pressure(self) -> None:
+        if getattr(self, "_shutdown_prepared", False):
+            return
+        policy = getattr(self, "viewer_memory_policy", None)
+        if not isinstance(policy, ResolvedViewerMemoryPolicy):
+            return
+        snapshot = read_physical_memory_snapshot()
+        if snapshot is None:
+            self._apply_raster_memory_policy()
+            return
+        runtime = getattr(self, "_zip_runtime", None)
+        current_cache_bytes = (
+            runtime.cache_bytes
+            if isinstance(runtime, RasterBookRuntime)
+            else self.image_cache.cache_bytes
+            + (
+                self.viewer.render_cache_bytes()
+                if hasattr(self, "viewer")
+                else 0
+            )
+        )
+        policy.observe_memory_pressure(
+            snapshot,
+            current_cache_bytes=current_cache_bytes,
+        )
+        self._apply_raster_memory_policy()
+
+    def viewer_memory_debug_values(self) -> dict[str, int | str | bool | None]:
+        """Expose resolved policy state to CLI benchmarks without logging."""
+
+        policy = getattr(self, "viewer_memory_policy", None)
+        return (
+            policy.debug_values()
+            if isinstance(policy, ResolvedViewerMemoryPolicy)
+            else {}
+        )
 
     def _enforce_combined_cache_budget(self) -> None:
         if (
@@ -1415,10 +1492,7 @@ class ViewerWindow(QMainWindow):
         try:
             total_bytes = max(1, int(self.viewer_cache_budget_bytes))
             if self._zip_runtime_active and self._zip_runtime is not None:
-                self._zip_runtime.set_cache_limits(
-                    unit_limit=max(3, self.model.total_pages),
-                    byte_budget=total_bytes,
-                )
+                self._apply_raster_memory_policy()
                 return
             # ZipPlaFork evicts the prefiltered source and display artifact for
             # a page together under one display-driven memory policy. Rebalance
@@ -1456,11 +1530,7 @@ class ViewerWindow(QMainWindow):
             self._prepare_deferred_pdf_prefetch(center, visible_indexes)
         elif self._zip_runtime_active:
             if self._zip_runtime is not None:
-                self._zip_runtime.set_cache_limits(
-                    unit_limit=max(3, self.model.total_pages),
-                    byte_budget=self.viewer_cache_budget_bytes,
-                )
-            self._refresh_view()
+                self._apply_raster_memory_policy()
         else:
             self.image_cache.set_raster_decode_bounds(
                 self._current_raster_decode_bounds()
@@ -2156,24 +2226,6 @@ class ViewerWindow(QMainWindow):
         self.viewer.set_gap(gap)
         self._refresh_view()
 
-    def set_cache_size_dialog(self) -> None:
-        cache_size, accepted = QInputDialog.getInt(
-            self,
-            "キャッシュ上限",
-            "ページ数:",
-            self.cache_size,
-            1,
-            100,
-            1,
-        )
-        if not accepted:
-            return
-        self.cache_size = cache_size
-        self._update_shared_setting("cache_size", cache_size)
-        self.image_cache.set_cache_size(cache_size)
-        if self.model.total_pages > 0:
-            self._refresh_view()
-
     def set_background_color_dialog(self) -> None:
         color = QColorDialog.getColor(self.viewer.background_color, self, "背景色")
         if not color.isValid():
@@ -2708,14 +2760,13 @@ class ViewerWindow(QMainWindow):
             # avoids cancelling the newly installed book runtime merely as a
             # side effect of retiring the old book.
             self._deactivate_zip_runtime(clear_artifacts=False)
+            self._raster_topology_cache_key = None
+            self._raster_topology = None
         self._zip_runtime = (
             runtime if isinstance(runtime, RasterBookRuntime) else None
         )
         if self._zip_runtime is not None:
-            self._zip_runtime.set_cache_limits(
-                unit_limit=max(3, self.model.total_pages),
-                byte_budget=self.viewer_cache_budget_bytes,
-            )
+            self._apply_raster_memory_policy()
             self._zip_runtime.frameReady.connect(
                 self._on_zip_runtime_frame_ready
             )
@@ -2746,6 +2797,62 @@ class ViewerWindow(QMainWindow):
             is_single,
         )
 
+    def _raster_book_topology(
+        self,
+        source: ZipImageSource | FolderImageSource,
+    ) -> RasterBookTopology[
+        RasterDisplayUnit,
+        tuple[tuple[int, str], ...],
+    ]:
+        """Return the immutable display-unit topology for this layout.
+
+        Page turns only create a small current-centered ``RasterWarmupPlan``.
+        The O(book pages) boundary walk is paid once per source/layout
+        revision, including a revision caused by lazy wide-page discovery.
+        """
+
+        cache_key = (
+            int(self.book_session.generation),
+            id(source),
+            int(self.model.topology_revision),
+        )
+        cached = self._raster_topology
+        if self._raster_topology_cache_key == cache_key and cached is not None:
+            return cached
+
+        units: list[RasterDisplayUnit] = []
+        visited_starts: set[int] = set()
+        start = 0
+        total_pages = self.model.total_pages
+        while 0 <= start < total_pages and start not in visited_starts:
+            visited_starts.add(start)
+            spread = self.model.spread_at(start)
+            indexes = tuple(slot.page_index for slot in spread.slots)
+            if indexes:
+                units.append(
+                    self._zip_display_unit(
+                        indexes,
+                        start_index=spread.start_index,
+                        is_single=spread.is_single,
+                    )
+                )
+            next_start = self.model.next_index_from(start)
+            if next_start == start:
+                break
+            start = next_start
+
+        topology = RasterBookTopology(
+            units,
+            identity_of=lambda unit: unit.identity,
+            page_indexes_of=lambda unit: (
+                page.page_index for page in unit.pages
+            ),
+            page_count=total_pages,
+        )
+        self._raster_topology_cache_key = cache_key
+        self._raster_topology = topology
+        return topology
+
     def _zip_runtime_request(
         self,
         spread: DisplaySpread,
@@ -2767,15 +2874,7 @@ class ViewerWindow(QMainWindow):
             start_index=spread.start_index,
             is_single=spread.is_single,
         )
-        center = self.model.focused_index
         direction = self.presentation_state.direction
-        steps = (
-            (direction, -direction)
-            if self.prefetch_direction_priority_enabled and direction
-            else (1, -1)
-        )
-        work_order: list[RasterDisplayUnit] = [current]
-        seen = {current.identity}
         decoder_bound = self._current_book_runtime_decode_bounds()
         if self.viewer.magnifier_selecting or self.viewer.magnifier_active:
             decoder_bound = None
@@ -2784,65 +2883,19 @@ class ViewerWindow(QMainWindow):
             or self.viewer.magnifier_active
             or decoder_bound is None
         )
-        if not source_interactive and self.prefetch_preset != "disabled":
-            preferred = self._display_units_from(
-                center,
-                steps[0],
-                self.model.total_pages,
-            )
-            opposite = self._display_units_from(
-                center,
-                steps[1],
-                self.model.total_pages,
-            )
-            ordered_indexes: list[tuple[int, ...]] = []
-            if preferred:
-                ordered_indexes.append(preferred[0])
-            if opposite:
-                ordered_indexes.append(opposite[0])
-            # Both directional walks are already nearest-to-farthest.  Merge
-            # them linearly instead of sorting the whole book on every page
-            # turn; equal distance keeps the requested direction first.
-            preferred_rank = 1
-            opposite_rank = 1
-            while (
-                preferred_rank < len(preferred)
-                or opposite_rank < len(opposite)
-            ):
-                preferred_unit = (
-                    preferred[preferred_rank]
-                    if preferred_rank < len(preferred)
-                    else None
-                )
-                opposite_unit = (
-                    opposite[opposite_rank]
-                    if opposite_rank < len(opposite)
-                    else None
-                )
-                if opposite_unit is None or (
-                    preferred_unit is not None
-                    and min(
-                        abs(index - center) for index in preferred_unit
-                    )
-                    <= min(
-                        abs(index - center) for index in opposite_unit
-                    )
-                ):
-                    ordered_indexes.append(preferred_unit)
-                    preferred_rank += 1
-                else:
-                    ordered_indexes.append(opposite_unit)
-                    opposite_rank += 1
-            for indexes in ordered_indexes:
-                unit = self._zip_display_unit(
-                    indexes,
-                    start_index=self.model.spread_start_for_index(indexes[0]),
-                    is_single=len(indexes) == 1,
-                )
-                if unit.identity in seen:
-                    continue
-                seen.add(unit.identity)
-                work_order.append(unit)
+        warmup_plan = RasterWarmupPlan(
+            self._raster_book_topology(source),
+            current=current,
+            identity_of=lambda unit: unit.identity,
+            page_indexes_of=lambda unit: (
+                page.page_index for page in unit.pages
+            ),
+            direction=direction,
+            # Full-source promotion is an explicit current-page demand.
+            # Raster warm-up is governed by memory, not the legacy prefetch
+            # preset/count controls used by PDF and the retained old pipeline.
+            background_enabled=not source_interactive,
+        )
 
         render_spec = RasterRenderSpec(
             viewport_size=(
@@ -2874,7 +2927,7 @@ class ViewerWindow(QMainWindow):
             self.book_session.generation,
             self._active_request_id,
             current,
-            tuple(work_order),
+            warmup_plan,
             render_spec,
             navigation_direction=direction,
         )
@@ -5973,6 +6026,7 @@ class ViewerWindow(QMainWindow):
         self._presentation_side_effect_timer.stop()
         self._pending_presentation_side_effect_token = None
         self._raster_magnifier_cancel_timer.stop()
+        self._viewer_memory_pressure_timer.stop()
         self._page_list_filter_timer.stop()
         self._page_list_viewport_timer.stop()
         self._set_page_list_paused(True)
