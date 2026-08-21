@@ -2310,10 +2310,22 @@ class ViewerWindow(QMainWindow):
         if not self.viewer.grab().save(path, "PNG"):
             QMessageBox.warning(self, "保存エラー", "現在の表示を保存できませんでした。")
 
-    def reload_current_book(self) -> None:
+    def reload_current_book(
+        self,
+        *,
+        preserve_order_snapshot: bool = True,
+    ) -> None:
         if self._opened_path:
             self._reload_page_index = self.model.focused_index
-            self.open_path(self._opened_path, preserve_current_page=True)
+            self.open_path(
+                self._opened_path,
+                folder_snapshot=(
+                    self.book_session.folder_listing_snapshot
+                    if preserve_order_snapshot
+                    else None
+                ),
+                preserve_current_page=True,
+            )
 
     def set_reopen_last_on_start(self, checked: bool) -> None:
         self.reopen_last_on_start = checked
@@ -2324,13 +2336,17 @@ class ViewerWindow(QMainWindow):
         self.recursive_folder = checked
         self._update_shared_setting("recursive_folder", checked)
         self._sync_actions()
-        self.reload_current_book()
+        # This is an explicit topology change, so the non-recursive Browser
+        # snapshot must not constrain the recursive source listing.
+        self.reload_current_book(preserve_order_snapshot=False)
 
     def set_sort_descending(self, checked: bool) -> None:
         self.sort_descending = checked
         self._update_shared_setting("sort_descending", checked)
         self._sync_actions()
-        self.reload_current_book()
+        # An explicit Viewer-side ordering command intentionally overrides the
+        # Browser snapshot.  Plain reload keeps the snapshot unchanged.
+        self.reload_current_book(preserve_order_snapshot=False)
 
     def set_auto_open_adjacent_book(self, checked: bool) -> None:
         self.auto_open_adjacent_book = checked
