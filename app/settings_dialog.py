@@ -702,6 +702,16 @@ class SettingsDialog(QDialog):
             list_group,
         )
         list_form.addRow(self.browser_folders_first_checkbox)
+        self.browser_location_history_limit_combo = QComboBox(list_group)
+        for count in (10, 20, 30, 50, 100, 200):
+            self.browser_location_history_limit_combo.addItem(
+                f"{count}件",
+                count,
+            )
+        list_form.addRow(
+            "場所の履歴を保持する件数:",
+            self.browser_location_history_limit_combo,
+        )
         self.browser_spacing_preset_checkbox = QCheckBox(
             "密度プリセットに従う",
             list_group,
@@ -1257,6 +1267,10 @@ class SettingsDialog(QDialog):
         self.browser_folders_first_checkbox.setChecked(
             bool(self.config.get("browser_folders_first", True))
         )
+        self._select_data(
+            self.browser_location_history_limit_combo,
+            int(self.config.get("browser_location_history_limit", 50)),
+        )
         self.browser_spacing_preset_checkbox.setChecked(
             self.config.get("browser_item_spacing_mode", "preset") == "preset"
         )
@@ -1657,6 +1671,9 @@ class SettingsDialog(QDialog):
             ),
             "browser_folders_first": (
                 self.browser_folders_first_checkbox.isChecked()
+            ),
+            "browser_location_history_limit": int(
+                self.browser_location_history_limit_combo.currentData()
             ),
             "browser_item_spacing_mode": (
                 "preset"

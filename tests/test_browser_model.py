@@ -11,6 +11,7 @@ from app.browser_model import (
     BrowserItemKind,
     BrowserItemModel,
 )
+from app.browser_filter import BrowserFilterState, RatingFilterMode
 
 
 def test_discovery_lists_supported_items_in_stable_natural_order(tmp_path: Path) -> None:
@@ -209,6 +210,105 @@ def test_incremental_model_ignores_old_generation_and_accepts_sort_change(
         "small.jpg",
     ]
     assert not model.finish_directory_scan(generation=7)
+
+
+def test_search_rating_and_sort_share_one_visible_item_pipeline(
+    tmp_path: Path,
+) -> None:
+    model = BrowserItemModel()
+    items = [
+        BrowserItem(
+            "abc old.jpg",
+            tmp_path / "abc old {zpi$r=5}.jpg",
+            BrowserItemKind.IMAGE,
+            1.0,
+            modified_time_ns=1,
+            rating=5,
+        ),
+        BrowserItem(
+            "ABC new.jpg",
+            tmp_path / "ABC new {zpi$r=3}.jpg",
+            BrowserItemKind.IMAGE,
+            3.0,
+            modified_time_ns=3,
+            rating=3,
+        ),
+        BrowserItem(
+            "abc unrated.jpg",
+            tmp_path / "abc unrated.jpg",
+            BrowserItemKind.IMAGE,
+            4.0,
+            modified_time_ns=4,
+        ),
+        BrowserItem(
+            "日本語 abc.jpg",
+            tmp_path / "日本語 abc {zpi$r=4}.jpg",
+            BrowserItemKind.IMAGE,
+            2.0,
+            modified_time_ns=2,
+            rating=4,
+        ),
+        BrowserItem(
+            "unrelated.jpg",
+            tmp_path / "unrelated {zpi$r=5}.jpg",
+            BrowserItemKind.IMAGE,
+            5.0,
+            modified_time_ns=5,
+            rating=5,
+        ),
+    ]
+    model.set_items(items)
+    model.configure_sort("modified_time", "descending", False)
+
+    assert model.configure_filter(
+        BrowserFilterState.normalized(
+            search_text="AbC",
+            rating_mode=RatingFilterMode.AT_LEAST,
+            rating_reference=3,
+        )
+    )
+    assert [item.display_name for item in model.items] == [
+        "ABC new.jpg",
+        "日本語 abc.jpg",
+        "abc old.jpg",
+    ]
+    assert model.source_count == 5
+
+    assert model.configure_filter(
+        BrowserFilterState.normalized(
+            search_text="日本語",
+            rating_mode=RatingFilterMode.AT_LEAST,
+            rating_reference=3,
+        )
+    )
+    assert [item.display_name for item in model.items] == ["日本語 abc.jpg"]
+
+    assert model.configure_filter(
+        BrowserFilterState.normalized(
+            search_text="abc",
+            rating_mode=RatingFilterMode.UNRATED,
+        )
+    )
+    assert [item.display_name for item in model.items] == ["abc unrated.jpg"]
+
+    model.configure_sort("name", "ascending", False)
+    assert model.configure_filter(
+        BrowserFilterState.normalized(
+            search_text="abc",
+            rating_mode=RatingFilterMode.EQUAL,
+            rating_reference=5,
+        )
+    )
+    assert [item.display_name for item in model.items] == ["abc old.jpg"]
+
+    model.configure_sort("rating", "descending", False)
+    assert model.configure_filter(
+        BrowserFilterState.normalized(
+            rating_mode=RatingFilterMode.AT_LEAST,
+            rating_reference=2,
+        )
+    )
+    assert [item.rating for item in model.items] == [5, 5, 4, 3]
 
 
 def test_final_scan_appends_pre_sorted_remainder_without_reset_or_resort(

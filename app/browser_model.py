@@ -15,6 +15,7 @@ from .browser_sort import (
     normalize_browser_sort_key,
     normalize_browser_sort_order,
 )
+from .browser_filter import BrowserFilterState
 from .file_operation_artifact import FileOperationArtifactPolicy
 from .browser_scanner import BrowserScanEntry, scan_entry_from_dir_entry
 from .image_source import ARCHIVE_EXTENSIONS, PDF_EXTENSIONS, SUPPORTED_EXTENSIONS
@@ -162,6 +163,7 @@ class BrowserItemModel(QAbstractListModel):
         self._source_items: list[BrowserItem] = []
         self._items: list[BrowserItem] = []
         self._sort_policy = BrowserSortPolicy()
+        self._filter_state = BrowserFilterState()
         self._scan_generation: int | None = None
         self._source_keys: set[str] = set()
         self._icons: dict[str, QIcon] = {}
@@ -179,6 +181,18 @@ class BrowserItemModel(QAbstractListModel):
     @property
     def items(self) -> tuple[BrowserItem, ...]:
         return tuple(self._items)
+
+    @property
+    def filter_state(self) -> BrowserFilterState:
+        return self._filter_state
+
+    @property
+    def source_items(self) -> tuple[BrowserItem, ...]:
+        return tuple(self._source_items)
+
+    @property
+    def source_count(self) -> int:
+        return len(self._source_items)
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
         return 0 if parent.isValid() else len(self._items)
@@ -260,6 +274,22 @@ class BrowserItemModel(QAbstractListModel):
         ]
         return tuple(self._sort_policy.sorted_items(source_items))
 
+    def visible_items(
+        self,
+        items: tuple[BrowserItem, ...] | list[BrowserItem],
+    ) -> tuple[BrowserItem, ...]:
+        source_items = [
+            item
+            for item in items
+            if (
+                not FileOperationArtifactPolicy.is_internal_operation_artifact(
+                    item.path
+                )
+                and self._filter_state.matches(item)
+            )
+        ]
+        return tuple(self._sort_policy.sorted_items(source_items))
+
     def set_sorted_items(
         self,
         items: tuple[BrowserItem, ...] | list[BrowserItem],
@@ -269,7 +299,11 @@ class BrowserItemModel(QAbstractListModel):
         self.beginResetModel()
         self._source_items = list(items)
         self._source_keys = {self._key(item.path) for item in self._source_items}
-        self._items = list(self._source_items)
+        # Scanner results supplied here are already in current sort order.
+        # Predicates preserve that order and avoid a redundant full sort.
+        self._items = [
+            item for item in self._source_items if self._filter_state.matches(item)
+        ]
         self._icons.clear()
         if preserve_thumbnails:
             self._retain_compatible_thumbnails()
@@ -295,7 +329,9 @@ class BrowserItemModel(QAbstractListModel):
         self.beginResetModel()
         self._source_items = list(items)
         self._source_keys = {self._key(item.path) for item in self._source_items}
-        self._items = list(self._source_items)
+        self._items = [
+            item for item in self._source_items if self._filter_state.matches(item)
+        ]
         self._icons.clear()
         self._thumbnail_images.clear()
         self._thumbnail_signatures.clear()
@@ -327,14 +363,21 @@ class BrowserItemModel(QAbstractListModel):
             addition_keys.append(key)
         if not additions:
             return 0
-        first = len(self._items)
-        last = first + len(additions) - 1
-        self.beginInsertRows(QModelIndex(), first, last)
         self._source_items.extend(additions)
-        self._items.extend(additions)
-        for row, key in enumerate(addition_keys, start=first):
-            self._row_by_key[key] = row
-        self.endInsertRows()
+        visible_pairs = [
+            (item, key)
+            for item, key in zip(additions, addition_keys)
+            if self._filter_state.matches(item)
+        ]
+        visible_additions = [item for item, _key in visible_pairs]
+        if visible_additions:
+            first = len(self._items)
+            last = first + len(visible_additions) - 1
+            self.beginInsertRows(QModelIndex(), first, last)
+            self._items.extend(visible_additions)
+            for row, (_item, key) in enumerate(visible_pairs, start=first):
+                self._row_by_key[key] = row
+            self.endInsertRows()
         return len(additions)
 
     def begin_directory_scan(self, *, generation: int) -> None:
@@ -377,7 +420,7 @@ class BrowserItemModel(QAbstractListModel):
             return 0
         self.beginResetModel()
         self._source_items.extend(additions)
-        self._items = self._sort_policy.sorted_items(self._source_items)
+        self._items = list(self.visible_items(self._source_items))
         self._rebuild_row_index()
         self.endResetModel()
         return len(additions)
@@ -409,7 +452,22 @@ class BrowserItemModel(QAbstractListModel):
             return False
         self.beginResetModel()
         self._sort_policy = policy
-        self._items = policy.sorted_items(self._source_items)
+        self._items = list(self.visible_items(self._source_items))
+        self._rebuild_row_index()
+        self.endResetModel()
+        return True
+
+    def configure_filter(self, state: BrowserFilterState) -> bool:
+        normalized = BrowserFilterState.normalized(
+            search_text=state.search_text,
+            rating_mode=state.rating_mode,
+            rating_reference=state.rating_reference,
+        )
+        if normalized == self._filter_state:
+            return False
+        self.beginResetModel()
+        self._filter_state = normalized
+        self._items = list(self.visible_items(self._source_items))
         self._rebuild_row_index()
         self.endResetModel()
         return True
@@ -634,28 +692,16 @@ class BrowserItemModel(QAbstractListModel):
                     for key in self._cut_keys
                 )
 
-        self.layoutAboutToBeChanged.emit()
+        # A rating edit can both reorder rows and add/remove a row from the
+        # active predicate result.  Publish one reset rather than claiming a
+        # layout-only change while the row count changes.  Path-keyed image
+        # artifacts above remain intact across this visible-list reset.
+        self.beginResetModel()
         self._source_items = new_source
         self._source_keys = {self._key(item.path) for item in new_source}
-        self._items = self._sort_policy.sorted_items(new_source)
+        self._items = list(self.visible_items(new_source))
         self._rebuild_row_index()
-        self.layoutChanged.emit()
-        for _old, new, _rating in replacements:
-            row = self.row_for_path(new)
-            if row >= 0:
-                index = self.index(row, 0)
-                self.dataChanged.emit(
-                    index,
-                    index,
-                    [
-                        int(Qt.ItemDataRole.DisplayRole),
-                        int(Qt.ItemDataRole.ToolTipRole),
-                        self.PathRole,
-                        self.ItemRole,
-                        self.RatingRole,
-                        self.RatingPreviewRole,
-                    ],
-                )
+        self.endResetModel()
         return True
 
     @staticmethod

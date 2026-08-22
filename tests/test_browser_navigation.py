@@ -37,6 +37,7 @@ def test_consecutive_duplicate_and_windows_case_variant_are_not_added() -> None:
     history.visit(location("c:/漫画/本/"))
 
     assert len(history) == 1
+    assert len(history.recent_unique()) == 1
 
 
 def test_history_limit_drops_oldest_entries() -> None:
@@ -84,6 +85,47 @@ def test_empty_history_operations_are_safe() -> None:
     assert history.go_forward() is None
     assert not history.can_go_back()
     assert not history.can_go_forward()
+
+
+def test_direct_jump_and_recent_locations_reuse_the_timeline() -> None:
+    history = BrowserNavigationHistory()
+    for name in ("A", "B", "A", "C"):
+        history.visit(location(name))
+
+    assert history.current_index == 3
+    assert history.go_to(1) == location("B")
+    assert history.current_index == 1
+    assert history.go_to(99) is None
+    assert history.current_index == 1
+    assert history.entries == (
+        location("A"),
+        location("B"),
+        location("A"),
+        location("C"),
+    )
+    assert [item.path for _index, item in history.recent_unique()] == [
+        "C",
+        "A",
+        "B",
+    ]
+
+
+def test_recent_limit_only_trims_mru_and_preserves_navigation_timeline() -> None:
+    history = BrowserNavigationHistory(max_entries=300, recent_limit=200)
+    for index in range(60):
+        history.visit(location(f"place-{index:03}"))
+
+    assert len(history) == 60
+    assert len(history.recent_unique()) == 60
+    assert history.set_recent_limit(10)
+    assert len(history.recent_unique()) == 10
+    assert len(history) == 60
+    assert history.go_back() == location("place-058")
+    assert history.mark_recent(history.current()) is None
+    assert history.recent_unique()[0][1] == location("place-058")
+    assert history.remove_recent("place-058")
+    assert history.recent_unique()[0][1] == location("place-059")
+    assert not history.remove_recent("missing")
 
 
 def test_relocate_path_updates_folder_and_selected_path() -> None:

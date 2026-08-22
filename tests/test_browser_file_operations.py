@@ -641,7 +641,8 @@ def test_shortcuts_do_not_steal_address_bar_text_editing(
         recycle_bin=recycle,
     )
     window.address_bar.setText("abcdef")
-    window.address_bar.setFocus()
+    window.focus_address_bar()
+    window.address_bar.setText("abcdef")
     window.address_bar.setSelection(1, 2)
 
     QTest.keyClick(
@@ -688,6 +689,16 @@ def test_context_menu_has_exact_labels_and_separator_order(
         def addSeparator(self) -> None:
             items.append(None)
 
+        def addMenu(self, text: str):
+            items.append(text)
+
+            class FakeSubMenu:
+                @staticmethod
+                def addAction(label: str):
+                    return FakeAction(label)
+
+            return FakeSubMenu()
+
         def exec(self, _position):
             return None
 
@@ -705,6 +716,7 @@ def test_context_menu_has_exact_labels_and_separator_order(
         "貼り付け",
         None,
         "削除",
+        "レート",
         None,
         "プロパティ",
     ]
@@ -750,6 +762,9 @@ def test_context_menu_open_calls_existing_open_item_not_system_opener(
 
         def addSeparator(self) -> None:
             pass
+
+        def addMenu(self, _text: str):
+            return self
 
         def exec(self, _position):
             return actions["開く"]
@@ -810,6 +825,9 @@ def test_context_menu_open_with_picker_calls_explicit_picker_for_file(
         def addSeparator(self) -> None:
             pass
 
+        def addMenu(self, _text: str):
+            return self
+
         def exec(self, _position):
             return actions["関連付けで開く..."]
 
@@ -867,6 +885,14 @@ def test_context_menu_open_with_picker_enablement(
         def addSeparator(self) -> None:
             pass
 
+        def addMenu(self, _text: str):
+            class FakeSubMenu:
+                @staticmethod
+                def addAction(label: str):
+                    return FakeAction(label)
+
+            return FakeSubMenu()
+
         def exec(self, _position):
             return None
 
@@ -920,6 +946,9 @@ def test_context_menu_explorer_uses_clicked_item_with_multiple_selection(
 
         def addSeparator(self) -> None:
             pass
+
+        def addMenu(self, _text: str):
+            return self
 
         def exec(self, _position):
             return actions["エクスプローラーで開く"]

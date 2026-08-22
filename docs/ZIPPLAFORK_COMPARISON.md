@@ -4620,10 +4620,16 @@ has completed. Horizontal position maps linearly and clamps to 1..5. Hover is
 preview-only; left click changes the pointed item even when other rows are
 selected, middle click clears it, and context-menu commands apply none/1..5 to
 all selected items. Rating sorting leaves unrated entries behind rated entries
-in both directions. The fixed revision contains rating filtering, but
-NivisViewer has no existing Browser query/filter authority into which it can
-be added without inventing a new language, so filter support remains a future
-UX unit.
+in both directions.
+
+The same `CatalogForm.cs` registers `SortMode.RatingInAsc` and
+`SortMode.RatingInDesc` as ordinary `cbSortBy` entries beside name, created,
+accessed, modified and size modes. `GetSortArray` calls
+`ZipPlaInfo.GetOnlyRating`; ascending replaces its `-1` unrated sentinel with
+`int.MaxValue`, while descending keeps `-1`, so unrated rows sort last in both
+directions. `dgvFileList_ColumnHeaderMouseClick` toggles the Rating column
+between descending and ascending by selecting the matching `cbSortBy` mode,
+and `setNonVolatilitySort` mirrors that mode to the Rating header glyph.
 
 ### 24.2 NivisViewer Hybrid implementation
 
@@ -4642,6 +4648,14 @@ rating change performs no image read/decode and no QPixmap construction.
 Selection/current/scroll identities are remapped after a rating sort move.
 Browser navigation snapshots already derive from the model's visible order,
 so rating-sorted Folder Viewer next/previous retains that same topology.
+NivisViewer keeps its existing split controls rather than copying ZipPlaFork's
+combined enum labels: the upper `browser_sort_key_combo` contains one
+`レート` key and the adjacent existing order combo supplies ascending or
+descending. `ConfigManager` accepts and persists `rating` through the same
+normalization contract as other keys; unknown future/legacy values still fall
+back safely to `name`. Rating changes invoke the model's stable in-memory sort
+and restore path-based selection/current/scroll state without scanning the
+filesystem.
 
 `BrowserItemDelegate` provides a DPR-aware upper-left overlay, five-way hit
 test and hover preview while preserving IconMode virtualization. A direct
@@ -4673,4 +4687,242 @@ AGPL-3.0-or-later. Original notices and license text remain in
 `licenses/ZipPlaFork/About.txt`, `licenses/ZipPlaFork/AGPL.txt`, and
 `THIRD_PARTY_NOTICES.md`. Qt delegate painting, asynchronous header probing,
 model cache relocation, stale fences and status-bar placement are
+NivisViewer-specific modernizations.
+
+### 24.4 Browser location breadcrumb and timeline projection (2026-08-22)
+
+#### 24.4.1 Fixed-revision ZipPlaFork structure
+
+The location UI was audited at fixed ZipPlaFork revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`. In
+`source/ZipPla/ZipPlaAddressBar.cs`, `ZipPlaAddressBar.makeButtonList` validates
+the current text, splits ordinary paths on the Windows directory separator,
+special-cases the UNC prefix, and creates one `DirectoryButton` plus one
+separator button for every component. Each directory button retains its full
+path. `directoryButton_Click` replaces the text with that path, rebuilds the
+buttons and raises `TextChangedByButton`; the current component instead raises
+`CurrentLocationButtonClick`. `separatorButton_Click` derives the path to the
+left of the separator and opens the items returned by
+`getDirectorySeekingMenuItemArray2`. That method enumerates child directories,
+marks the currently selected child and recursively supplies deeper dropdowns.
+The original control also attaches one `FileSystemWatcher` per usable
+separator and implements drag/drop on components and dropdown items.
+
+`source/ZipPla/CatalogForm.cs` constructs `zabLocation` over editable
+`cbLocation`, wires `TextChangedByButton` to Catalog navigation, and persists
+the combo's `locationHistory`. Back/forward use one `undoBuffer` timeline and
+`undoBufferIndex`; `gotToUnderBuffer` changes the index and restores
+`UndoBufferClass.Location`, `SelectedFileName`, `ThumbnailPosition` and
+`FileListPosition` while also carrying Catalog profile/color state.
+`btnGoToBack_Click` and `btnGoToForward_Click` move one entry. Right mouse-down
+on either button calls `showUndoBufferList`, which builds the full reverse
+timeline, marks the current entry and jumps through `gotToUnderBuffer`.
+`readme_original.txt` records the modern location bar, back/forward commands,
+right-click timeline popup, removal of missing location-history paths, UNC
+fixes and high-DPI navigation-button corrections.
+
+#### 24.4.2 NivisViewer Hybrid implementation
+
+NivisViewer retains its existing `BrowserNavigationHistory` as the only
+navigation timeline. `BrowserLocation` already owned the filesystem location,
+selected absolute path and vertical/horizontal grid scroll values, and
+Browser scan commit already restored them after row topology became available.
+The history now exposes immutable entries, current index, direct `go_to` and a
+deduplicated recent projection; it does not gain sort, search or rating state.
+Failed asynchronous direct jumps restore the previous timeline index.
+
+`BrowserLocationBreadcrumb` replaces the always-visible text field in normal
+mode. Every Qt segment stores its absolute path; an ancestor click uses the
+ordinary `BrowserWindow.navigate_to` path, while clicking the current segment
+is a no-op. Each separator requests visible child directories from a
+latest-request background worker and immediately shows a loading popup, so
+`os.scandir`, attribute access and natural sorting do not block the GUI
+thread. Hidden/system visibility uses the same `BrowserVisibilityPolicy` as
+the main scan. The worker is generation-fenced and close-cancelled; it does
+not add a watcher or persistent filesystem handle.
+
+Deep paths keep the current component and nearest ancestors, folding older
+components into an ellipsis menu. Component text is middle-elided from Qt
+font metrics and remains device-independent at high DPI. `Path.parts` retains
+drive roots, UNC share roots, Japanese components and absolute path identity.
+Archive-internal breadcrumbs and breadcrumb drag/drop are deliberately not
+introduced in this unit.
+
+Ctrl+L or blank-area/double click switches the same toolbar location slot to
+the existing editable `BrowserAddressBar`. Enter uses the established
+directory/image/archive path handling; Escape and focus loss discard edits
+and restore the committed breadcrumb. Back/forward QAction shortcuts and
+extra mouse buttons remain unchanged. Their QToolButtons now expose
+directional right-click menus projected from the same timeline. A separate
+recent-location button deduplicates that timeline by normalized path; choosing
+one performs a normal new visit rather than mutating a second history store.
+Missing locations use the existing asynchronous scan failure/rollback UX.
+
+Directory navigation still follows one production path:
+
+```text
+breadcrumb / text / back-forward / timeline / recent location
+  -> BrowserWindow.navigate_to
+  -> BrowserDirectoryScanner with current visibility + sort policy
+  -> BrowserItemModel source snapshot
+  -> search AND rating predicates
+  -> stable visible order
+  -> selected path + grid scroll restoration
+  -> immutable Browser-to-Viewer folder snapshot
+```
+
+Thus breadcrumb and history navigation do not introduce alternate sort,
+filter, selection or Viewer topology authorities. Thumbnail completion is not
+a restoration gate.
+
+#### 24.4.3 Provenance
+
+The breadcrumb component/path and separator-dropdown concepts derive from
+[`himamon/ZipPlaFork`](https://github.com/himamon/ZipPlaFork), fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, specifically
+`source/ZipPla/ZipPlaAddressBar.cs` (`ZipPlaAddressBar`, `makeButtonList`,
+`DirectoryButton`, `directoryButton_Click`, `separatorButton_Click`,
+`getDirectorySeekingMenuItemArray2`, `TextChangedByButton`,
+`CurrentLocationButtonClick`) and `source/ZipPla/CatalogForm.cs`
+(`zabLocation`, `cbLocation`, `locationHistory`, `btnGoToBack`,
+`btnGoToForward`, `undoBuffer`, `gotToUnderBuffer`, `showUndoBufferList`). The
+release-history statements cited above derive from `readme_original.txt`.
+That source is AGPL-3.0-or-later; notices and license text remain in
+`licenses/ZipPlaFork/About.txt`, `licenses/ZipPlaFork/AGPL.txt` and
+`THIRD_PARTY_NOTICES.md`. Qt layout elision, the cancellable worker, immutable
+history projections, structured scan rollback and integration with
+NivisViewer's model/filter/Viewer snapshot are NivisViewer-specific
+modernizations. WinForms controls, per-separator watchers, GDI painting,
+Catalog profile switching and breadcrumb drag/drop were not copied.
+
+#### 24.4.4 Windows popup lifetime correction and toolbar placement
+
+The first Qt breadcrumb implementation opened a disabled one-row `QMenu`
+immediately and then called `clear()` on that visible popup when asynchronous
+directory enumeration completed. On Windows this mutated the native popup
+while it owned popup focus and transiently reduced it to a zero-action frame.
+Rapid arrow clicks also closed and replaced parent-owned menus without a
+same-request admission guard. The resulting focus/regeometry window was the
+empty framed popup observed on hardware; directory enumeration itself was
+already outside the GUI thread.
+
+The corrected path performs no popup creation while the worker is running.
+Repeated clicks for the same component coalesce into one generation-fenced
+request. Completion re-resolves the separator button from the current
+breadcrumb (so resize cannot leave a stale anchor), constructs the complete
+list before showing it, clamps the final non-empty popup to the anchor's
+current screen, and shows it non-modally exactly once. Escape, outside click,
+Browser resize, location commit and shutdown release the single owned popup
+and restore Browser focus. A changed path cancels the pending generation. The
+rating quick-filter context menu likewise remains an owned non-modal popup.
+
+The controls retain their existing authorities but now use exactly two top
+rows. The first is the existing File/View/Bookmarks/History menu row with the
+five-star rating quick filter as its vertically centred top-right corner
+widget. The single toolbar row underneath contains back/forward/up/refresh,
+the expanding breadcrumb, recent locations, sort key/direction,
+folders-first, density and a compact Unicode search edit. Search has a
+220-logical-pixel preferred width, may shrink to 140 and never exceeds 300;
+the breadcrumb receives remaining width at wide window sizes. The layout does
+not wrap at narrow widths and uses Qt size policies rather than physical-pixel
+positions.
+
+#### 24.4.5 Bounded location/history projection and retention
+
+Directory children, recent locations and back/forward timeline jumps now use
+the same `BrowserLocationListPopup`: an owned `QFrame(Qt.Popup)` containing a
+uniform `QListWidget`, not a native action-per-row `QMenu`. Its height is
+derived from the active font and capped at 14 visible rows independently of
+the number retained. Overflow uses the list's vertical scrollbar and normal
+Qt wheel, arrow, Page Up/Page Down, Home/End and Enter handling; Escape and
+outside click close the popup. Geometry is clamped to the available geometry
+of the anchor's screen and flips above the anchor when necessary. Navigation,
+resize and shutdown also close it. No nested `exec()` loop or synchronous
+path validation is introduced.
+
+`BrowserNavigationHistory` remains the sole navigation authority but now
+owns two explicitly different projections. Its session timeline continues to
+hold the current index and back/forward branches. A bounded normalized-path
+MRU supplies the recent-location popup. Successful normal visits and restored
+timeline visits move that location to the MRU front; a duplicate path is
+removed first. `browser_location_history_limit` controls only this MRU with
+choices 10, 20, 30, 50, 100 and 200 (default 50). Changing it trims the MRU
+tail immediately without changing timeline entries or the current timeline
+index. Popup height remains 14 rows even when 200 locations are retained.
+
+The recent popup does not synchronously call `exists()`/`stat()` across its
+entries, which avoids blocking the GUI thread on UNC and unavailable network
+paths. A selected location travels through the existing asynchronous Browser
+scan. If that scan reports the location missing, only that MRU entry is
+removed and the existing non-modal failure status is shown; the active folder
+and back/forward timeline remain intact.
+
+This layout and scrolling behavior is derived from
+[`himamon/ZipPlaFork`](https://github.com/himamon/ZipPlaFork), fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`:
+`source/ZipPla/CatalogForm.Designer.cs` supplies the menu-row plus combined
+location/sort/filter-row structure, while `readme_original.txt` records the
+modern location bar, removal of missing location-history paths, and mouse
+wheel/Page Up/Page Down scrolling when location folder lists exceed the
+screen. That source is AGPL-3.0-or-later; its notices remain in
+`licenses/ZipPlaFork/About.txt`, `licenses/ZipPlaFork/AGPL.txt` and
+`THIRD_PARTY_NOTICES.md`. The finite Qt popup, split timeline/MRU lifetime,
+asynchronous click-time validation and DPI-derived geometry are
+NivisViewer-specific modernizations.
+
+### 24.5 Independent rating quick filter and plain search
+
+The fixed revision's upper Catalog UI has three separate authorities.
+`source/ZipPla/CatalogForm.Designer.cs` places
+`menuStripForTagFilter` and its Gold `ratingFilterToolStripMenuItem`
+(`★★★★★`) on the upper row, while `cbSortBy` and `cbFilter` occupy the row
+below. In `source/ZipPla/CatalogForm.cs`,
+`ratingFilterToolStripMenuItem_Click`, its mouse-down helpers and
+`ratingFilterToolStripMenuItem_MouseMove` map the pointed star to
+`ratingReferenceValue` 1..5 and produce `r>=X` or `r=X`; modifier variants
+append AND/OR forms to the generic filter. `readme_original.txt` documents
+quoted text, wildcard matching, `+` OR, `-` NOT, `+-` OR-NOT, and rating
+comparisons such as `r=3` and `r<2`.
+
+NivisViewer adopts the separation, not the complete query grammar. The
+expanding session-only plain filename/display-name search occupies the right
+side of the existing sort row; the fixed five-star quick filter occupies the
+right side of the File/View/Bookmarks/History menu row. Left-clicking star X
+selects `rating >= X` and clicking the same condition again clears it. The
+context menu supplies `>= X`, `= X`, unrated and clear. Hover paints the
+prospective threshold without modifying filename metadata. Search uses
+stripped Unicode `casefold()` substring matching and a 100 ms UI debounce;
+Escape or the line-edit clear affordance clears it. Search text and rating
+filter are deliberately not persisted, so a later application start cannot
+unexpectedly hide files. Existing sort key/order persistence is unchanged.
+
+`BrowserItemModel` is the sole owner of the in-memory visible list. Its
+pipeline is the current scanned source snapshot, internal/visibility policy,
+search predicate AND rating predicate, stable Browser sort, then the visible
+ordered rows. The visibility settings that require filesystem attributes
+(hidden/system/unsupported) remain inputs to the scanner and are represented
+in the same final snapshot identity; typing never starts another scan. A
+future parser can replace `BrowserSearchPredicate` behind the
+`BrowserItemPredicate` boundary without adding a second list authority.
+
+Rating renames update the source item, relocate its existing thumbnail and
+other path-keyed caches, rerun the predicates and sort, then restore the
+nearest surviving selection/current row and scroll anchor. No thumbnail
+decode or directory scan is requested merely to reevaluate the filter. Folder
+Viewer open snapshots are built from this exact final visible order and stamp
+search/rating mode into `filter_identity`; main navigation and virtual
+PageList therefore retain the same filtered/sorted topology for that book
+session.
+
+This UI/predicate structure derives from
+[`himamon/ZipPlaFork`](https://github.com/himamon/ZipPlaFork), fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, specifically
+`source/ZipPla/CatalogForm.Designer.cs` (`menuStripForTagFilter`,
+`ratingFilterToolStripMenuItem`, `cbSortBy`, `cbFilter`),
+`source/ZipPla/CatalogForm.cs` (rating filter click/move and `r>=X`/`r=X`
+generation), and `readme_original.txt` (comparison, wildcard, quoted-search,
+OR/NOT grammar). It is AGPL-3.0-or-later; preserved license and copyright
+notices remain in the locations listed in section 24.3. The compact Qt
+control, composable predicate boundary, Unicode plain-search policy, debounce,
+session-only state and immutable Browser-to-Viewer snapshot are
 NivisViewer-specific modernizations.

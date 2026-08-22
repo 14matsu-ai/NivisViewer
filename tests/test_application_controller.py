@@ -9,6 +9,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidget
 
 from app.application_controller import ApplicationController
+from app.browser_filter import BrowserFilterState, RatingFilterMode
 from app.browser_model import BrowserItemKind
 from app.config_manager import ConfigManager
 
@@ -569,10 +570,10 @@ def test_browser_image_open_uses_visible_sort_order_as_viewer_topology(
 ) -> None:
     folder = tmp_path / "browser-order"
     images = [
-        folder / "page1.jpg",
+        folder / "page1 {zpi$r=1}.jpg",
         folder / "page02.jpg",
-        folder / "page2.jpg",
-        folder / "page10.jpg",
+        folder / "page2 {zpi$r=5}.jpg",
+        folder / "page10 {zpi$r=3}.jpg",
     ]
     for index, path in enumerate(images):
         write_image(path)
@@ -597,6 +598,8 @@ def test_browser_image_open_uses_visible_sort_order_as_viewer_topology(
             ("modified_time", "ascending"),
             ("modified_time", "descending"),
             ("file_size", "ascending"),
+            ("rating", "ascending"),
+            ("rating", "descending"),
         ):
             controller.config.apply(
                 {
@@ -649,7 +652,15 @@ def test_browser_order_snapshot_survives_reload_and_filter_until_reopen(
     qapp: QApplication,
 ) -> None:
     folder = tmp_path / "browser-snapshot"
-    paths = [folder / name for name in ("1.jpg", "2.jpg", "10.jpg")]
+    paths = [
+        folder / name
+        for name in (
+            "keep1 {zpi$r=5}.jpg",
+            "drop2 {zpi$r=5}.jpg",
+            "keep10 {zpi$r=3}.jpg",
+            "keep20 {zpi$r=4}.jpg",
+        )
+    ]
     for path in paths:
         write_image(path)
 
@@ -701,24 +712,31 @@ def test_browser_order_snapshot_survives_reload_and_filter_until_reopen(
         finish_viewer_open(qapp, viewer)
         assert tuple(viewer.model.image_ids) == ascending
 
-        # Simulate a Browser filter by retaining only the visible rows. The
-        # Viewer must not rediscover the omitted on-disk image.
-        hidden = Path(ascending[0])
-        visible_items = tuple(
-            item for item in browser.items if item.path != hidden
+        # Search and rating predicates compose before sorting. The Viewer
+        # receives this final order and does not rediscover omitted files.
+        browser._set_browser_filter(
+            BrowserFilterState.normalized(
+                search_text="keep",
+                rating_mode=RatingFilterMode.AT_LEAST,
+                rating_reference=4,
+            )
         )
-        browser.item_model.set_items(visible_items)
+        qapp.processEvents()
         visible = tuple(
             str(item.path)
             for item in browser.items
             if item.kind is BrowserItemKind.IMAGE
         )
+        assert visible == (str(paths[0]), str(paths[3]))
+        hidden = paths[1]
         selected = visible[0]
         row = browser.item_model.row_for_path(selected)
         browser.open_item(browser.item_model.index(row, 0))
         finish_viewer_open(qapp, viewer)
         assert tuple(viewer.model.image_ids) == visible
         assert str(hidden) not in viewer.model.image_ids
+        assert viewer.book_session.page_list_runtime is not None
+        assert viewer.book_session.page_list_runtime.image_ids == visible
 
         # A controller/direct open has no Browser authority and preserves the
         # existing FolderImageSource default listing behavior.
