@@ -30,6 +30,7 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
     assert manager.data["browser_sort_order"] == "ascending"
     assert manager.data["browser_folders_first"] is True
     assert manager.data["browser_display_density"] == "standard"
+    assert manager.data["browser_location_history_limit"] == 50
     assert manager.data["join_spread_pages"] is False
     assert manager.data["thumbnail_disk_cache_enabled"] is True
     assert manager.data["thumbnail_cache_limit_mb"] == 512
@@ -377,6 +378,41 @@ def test_browser_setting_values_are_not_shared_between_instances(
 
     assert second.get("browser_sort_key") == "name"
     assert second.get("browser_display_density") == "standard"
+
+
+def test_rating_sort_setting_is_saved_and_restored(tmp_path: Path) -> None:
+    path = tmp_path / "rating-sort.json"
+    manager = ConfigManager(path)
+    manager.load()
+
+    manager.apply(
+        {
+            "browser_sort_key": "rating",
+            "browser_sort_order": "descending",
+        },
+        save=True,
+    )
+
+    restored = ConfigManager(path)
+    restored.load()
+    assert restored.get("browser_sort_key") == "rating"
+    assert restored.get("browser_sort_order") == "descending"
+
+
+def test_browser_location_history_limit_round_trips_and_normalizes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "location-history.json"
+    manager = ConfigManager(path)
+    manager.load()
+    manager.apply({"browser_location_history_limit": 200}, save=True)
+    assert ConfigManager(path).load()["browser_location_history_limit"] == 200
+
+    path.write_text(
+        '{"browser_location_history_limit": 17}',
+        encoding="utf-8",
+    )
+    assert ConfigManager(path).load()["browser_location_history_limit"] == 50
 
 
 def test_sprint4_settings_are_normalized_and_changes_are_emitted(tmp_path: Path) -> None:

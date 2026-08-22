@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QContextMenuEvent, QMouseEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QToolButton
 
 from app.browser_window import BrowserWindow
+from app.browser_filter import BrowserFilterState, RatingFilterMode
 from app.config_manager import ConfigManager
 
 
@@ -108,6 +110,7 @@ def test_navigation_actions_and_address_follow_current_folder(
     window = make_window(tmp_path, first, qapp)
 
     assert window.address_bar.text() == str(first.absolute())
+    assert window.location_stack.currentWidget() is window.location_breadcrumb
     assert not window.back_action.isEnabled()
     assert not window.forward_action.isEnabled()
     assert window.up_action.isEnabled()
@@ -156,6 +159,240 @@ def test_back_restores_selection_and_scroll_position(
     )
     window.close()
     qapp.processEvents()
+
+
+def test_breadcrumb_separator_text_mode_and_filtered_viewer_snapshot(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    a = tmp_path / "A"
+    b = a / "B"
+    c = b / "C"
+    d = c / "D"
+    d.mkdir(parents=True)
+    write_image(c / "abc {zpi$r=3}.jpg")
+    write_image(c / "xyz {zpi$r=5}.jpg")
+    window = make_window(tmp_path, d, qapp)
+    window.config.apply(
+        {
+            "browser_sort_key": "name",
+            "browser_sort_order": "descending",
+        }
+    )
+    window._set_browser_filter(
+        BrowserFilterState.normalized(
+            search_text="abc",
+            rating_mode=RatingFilterMode.AT_LEAST,
+            rating_reference=3,
+        )
+    )
+
+    try:
+        window._navigate_from_breadcrumb(str(b))
+        finish_scan(window, qapp)
+        assert window.current_path == b.absolute()
+        assert window.browser_filter_state.search_text == "abc"
+        assert window.browser_sort_order.value == "descending"
+
+        QTest.keyClick(
+            window,
+            Qt.Key.Key_L,
+            Qt.KeyboardModifier.ControlModifier,
+        )
+        assert window.location_stack.currentWidget() is window.address_bar
+        assert window.address_bar.selectedText() == str(b.absolute())
+        QTest.keyClick(window.address_bar, Qt.Key.Key_Escape)
+        assert window.location_stack.currentWidget() is window.location_breadcrumb
+
+        window._show_breadcrumb_children(str(b))
+        for _ in range(100):
+            qapp.processEvents()
+            menu = window._location_directory_menu
+            if menu is not None and any(
+                menu.list_widget.item(row).text() == "C"
+                for row in range(menu.entry_count)
+            ):
+                break
+            QTest.qWait(5)
+        assert menu is not None
+        child_item = next(
+            menu.list_widget.item(row)
+            for row in range(menu.entry_count)
+            if menu.list_widget.item(row).text() == "C"
+        )
+        menu.list_widget.itemClicked.emit(child_item)
+        finish_scan(window, qapp)
+        assert window.current_path == c.absolute()
+        assert [item.display_name for item in window.items] == ["abc.jpg"]
+
+        snapshot = window._folder_snapshot_for_path(c / "abc {zpi$r=3}.jpg")
+        assert snapshot is not None
+        assert snapshot.image_ids == (str(c / "abc {zpi$r=3}.jpg"),)
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_breadcrumb_arrow_coalesces_clicks_and_never_shows_an_empty_popup(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "folder"
+    (folder / "child2").mkdir(parents=True)
+    (folder / "child10").mkdir()
+    window = make_window(tmp_path, folder, qapp)
+    current_index = len(window.location_breadcrumb.segments) - 1
+    arrow = window.location_breadcrumb.findChild(
+        QToolButton,
+        f"browser_location_separator_{current_index}",
+    )
+    assert arrow is not None
+
+    try:
+        with patch.object(
+            window.location_directory_loader,
+            "request",
+            wraps=window.location_directory_loader.request,
+        ) as request:
+            for _ in range(10):
+                QTest.mouseClick(arrow, Qt.MouseButton.LeftButton)
+            assert request.call_count == 1
+            assert window._location_directory_menu is None
+
+            for _ in range(100):
+                qapp.processEvents()
+                menu = window._location_directory_menu
+                if menu is not None:
+                    break
+                QTest.qWait(5)
+            assert menu is not None and menu.isVisible()
+            assert [
+                menu.list_widget.item(row).text()
+                for row in range(menu.entry_count)
+            ] == [
+                "child2",
+                "child10",
+            ]
+            assert menu.width() > 0
+            assert menu.height() > 0
+
+            QTest.keyClick(menu, Qt.Key.Key_Escape)
+            qapp.processEvents()
+            assert window._location_directory_menu is None
+
+            QTest.mouseClick(arrow, Qt.MouseButton.LeftButton)
+            for _ in range(100):
+                qapp.processEvents()
+                if window._location_directory_menu is not None:
+                    break
+                QTest.qWait(5)
+            assert window._location_directory_menu is not None
+            window.resize(800, 420)
+            qapp.processEvents()
+            assert window._location_directory_menu is None
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_history_popup_direct_jump_restores_selection_scroll_and_recent_menu(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    third = tmp_path / "third"
+    for number in range(50):
+        write_image(first / f"{number:02}.jpg")
+    second.mkdir()
+    third.mkdir()
+    window = make_window(tmp_path, first, qapp)
+    selected = first / "35.jpg"
+    index = window.item_model.index(window.item_model.row_for_path(selected), 0)
+    window.list_view.setCurrentIndex(index)
+    window.list_view.scrollTo(index)
+    qapp.processEvents()
+    saved_scroll = window.list_view.verticalScrollBar().value()
+    assert window.navigate_to(second)
+    finish_scan(window, qapp)
+    assert window.navigate_to(third)
+    finish_scan(window, qapp)
+
+    try:
+        history_menu = window._show_navigation_history_menu(
+            "back",
+            QPoint(1, 1),
+        )
+        assert history_menu is not None
+        first_item = next(
+            history_menu.list_widget.item(row)
+            for row in range(history_menu.entry_count)
+            if history_menu.list_widget.item(row).toolTip()
+            == str(first.absolute())
+        )
+        history_menu.list_widget.itemClicked.emit(first_item)
+        finish_scan(window, qapp)
+        assert window.current_path == first.absolute()
+        restored = window.item_model.item_at(window.list_view.currentIndex())
+        assert restored is not None and restored.path == selected.absolute()
+        assert abs(
+            window.list_view.verticalScrollBar().value() - saved_scroll
+        ) <= window.list_view.gridSize().height()
+
+        recent_menu = window._show_recent_location_menu()
+        assert recent_menu is not None
+        assert {
+            recent_menu.list_widget.item(row).toolTip()
+            for row in range(recent_menu.entry_count)
+        } == {
+            str(first.absolute()),
+            str(second.absolute()),
+            str(third.absolute()),
+        }
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_failed_direct_history_jump_restores_the_timeline_index(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    window = make_window(tmp_path, first, qapp)
+    assert window.navigate_to(second)
+    finish_scan(window, qapp)
+    first.rmdir()
+
+    try:
+        assert window.navigation_history.current_index == 1
+        assert window.go_to_history_index(0)
+        finish_scan(window, qapp)
+        assert window.current_path == second.absolute()
+        assert window.navigation_history.current_index == 1
+        assert window.statusBar().currentMessage() == "フォルダが見つかりません"
+
+        recent_menu = window._show_recent_location_menu()
+        assert recent_menu is not None
+        missing_item = next(
+            recent_menu.list_widget.item(row)
+            for row in range(recent_menu.entry_count)
+            if recent_menu.list_widget.item(row).toolTip()
+            == str(first.absolute())
+        )
+        recent_menu.list_widget.itemClicked.emit(missing_item)
+        finish_scan(window, qapp)
+        assert all(
+            location.path != str(first.absolute())
+            for _index, location in window.navigation_history.recent_unique()
+        )
+        assert window.navigation_history.current_index == 1
+    finally:
+        window.close()
+        qapp.processEvents()
 
 
 def test_back_with_deleted_selection_continues_without_selection(
@@ -532,7 +769,8 @@ def test_address_relative_path_ctrl_l_escape_and_backspace_editing(
     assert window.current_path == child.absolute()
 
     window.address_bar.setText("abc")
-    window.address_bar.setFocus()
+    window.focus_address_bar()
+    window.address_bar.setText("abc")
     QTest.keyClick(window.address_bar, Qt.Key.Key_Backspace)
     assert window.address_bar.text() == "ab"
     assert window.current_path == child.absolute()
@@ -555,7 +793,7 @@ def test_address_bar_first_click_selects_all_then_preserves_normal_editing(
     window.list_view.setFocus()
     qapp.processEvents()
     assert not address.hasFocus()
-    QTest.mouseClick(address, Qt.MouseButton.LeftButton, pos=center)
+    window.focus_address_bar()
     assert address.selectedText() == full_path
 
     later_click = QPoint(max(2, address.width() // 4), center.y())
@@ -590,6 +828,7 @@ def test_address_bar_first_click_selects_all_then_preserves_normal_editing(
     QTest.keyClick(address, Qt.Key.Key_Return)
     finish_scan(window, qapp)
     assert window.current_path == child.absolute()
+    window.focus_address_bar()
     address.setText("temporary")
     QTest.keyClick(address, Qt.Key.Key_Escape)
     assert address.text() == str(child.absolute())

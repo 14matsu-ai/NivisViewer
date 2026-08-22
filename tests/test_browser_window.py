@@ -8,16 +8,19 @@ from unittest.mock import Mock, PropertyMock, patch
 
 import pytest
 from PIL import Image
-from PySide6.QtCore import QItemSelectionModel, QSize
-from PySide6.QtGui import QImage
+from PySide6.QtCore import QItemSelectionModel, QPoint, QSize, Qt
+from PySide6.QtGui import QContextMenuEvent, QImage
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QListView,
     QMessageBox,
+    QSizePolicy,
     QTabWidget,
 )
 
 from app.browser_model import BrowserItemKind, BrowserItemModel
+from app.browser_filter import BrowserFilterState, RatingFilterMode
 from app.browser_window import BrowserWindow
 from app.browser_image_detail import BrowserImageDetailResult
 from app.config_manager import ConfigManager
@@ -134,6 +137,320 @@ def test_direct_rating_target_preserves_multiselection_and_thumbnail_cache(
             renamed_index,
             BrowserItemModel.ThumbnailImageRole,
         ).cacheKey() == thumbnail_key
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_top_rating_sort_controls_live_resort_without_thumbnail_decode(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "rating-sort"
+    one = folder / "one {zpi$r=1}.jpg"
+    three = folder / "three {zpi$r=3}.jpg"
+    unrated = folder / "none.jpg"
+    for path in (one, three, unrated):
+        write_image(path)
+    preserved_mtime = 1_234_567_890_123_456_700
+    os.utime(one, ns=(preserved_mtime, preserved_mtime))
+    window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    finish_scan(window, qapp)
+    assert window.thumbnail_provider.wait_for_done()
+    qapp.processEvents()
+    scan_generation = window._scan_generation
+
+    try:
+        rating_index = window.browser_sort_key_combo.findData("rating")
+        assert rating_index >= 0
+        window.browser_sort_key_combo.setCurrentIndex(rating_index)
+        window.browser_sort_order_combo.setCurrentIndex(
+            window.browser_sort_order_combo.findData("ascending")
+        )
+        qapp.processEvents()
+        assert window.browser_sort_key_combo.currentData() == "rating"
+        assert [item.display_name for item in window.items] == [
+            "one.jpg",
+            "three.jpg",
+            "none.jpg",
+        ]
+
+        window.browser_sort_order_combo.setCurrentIndex(
+            window.browser_sort_order_combo.findData("descending")
+        )
+        qapp.processEvents()
+        assert window.browser_sort_order_combo.currentData() == "descending"
+        assert [item.display_name for item in window.items] == [
+            "three.jpg",
+            "one.jpg",
+            "none.jpg",
+        ]
+
+        window.browser_sort_order_combo.setCurrentIndex(
+            window.browser_sort_order_combo.findData("ascending")
+        )
+        qapp.processEvents()
+        selection = window.list_view.selectionModel()
+        one_index = window.item_model.index(window.item_model.row_for_path(one), 0)
+        selection.select(
+            one_index,
+            QItemSelectionModel.SelectionFlag.ClearAndSelect,
+        )
+        selection.setCurrentIndex(
+            one_index,
+            QItemSelectionModel.SelectionFlag.NoUpdate,
+        )
+        seeded_thumbnail = QImage(12, 8, QImage.Format.Format_ARGB32)
+        seeded_thumbnail.fill(0xFF335577)
+        window.item_model.set_thumbnail_image(one, seeded_thumbnail)
+        thumbnail_key = window.item_model.data(
+            one_index,
+            BrowserItemModel.ThumbnailImageRole,
+        ).cacheKey()
+
+        with patch.object(
+            window.thumbnail_provider,
+            "request",
+            wraps=window.thumbnail_provider.request,
+        ) as thumbnail_request:
+            assert window.set_rating_for_paths((str(one),), 5) is True
+            qapp.processEvents()
+            assert thumbnail_request.call_count == 0
+
+        renamed = folder / "one {zpi$r=5}.jpg"
+        assert [item.display_name for item in window.items] == [
+            "three.jpg",
+            "one.jpg",
+            "none.jpg",
+        ]
+        assert [
+            str(window.item_model.item_at(index).path)
+            for index in selection.selectedIndexes()
+        ] == [str(renamed)]
+        renamed_index = window.item_model.index(
+            window.item_model.row_for_path(renamed),
+            0,
+        )
+        assert window.item_model.data(
+            renamed_index,
+            BrowserItemModel.ThumbnailImageRole,
+        ).cacheKey() == thumbnail_key
+        assert renamed.stat().st_mtime_ns == preserved_mtime
+        assert window._scan_generation == scan_generation
+        assert window.config.get("browser_sort_key") == "rating"
+        assert window.config.get("browser_sort_order") == "ascending"
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_search_and_rating_quick_filter_compose_without_changing_sort(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "search-rating"
+    paths = (
+        folder / "alpha {zpi$r=5}.jpg",
+        folder / "日本語 high {zpi$r=3}.jpg",
+        folder / "日本語 low {zpi$r=2}.jpg",
+        folder / "日本語 none.jpg",
+    )
+    for index, path in enumerate(paths, start=1):
+        write_image(path)
+        os.utime(path, ns=(index * 1_000_000_000,) * 2)
+    config = make_config(tmp_path, folder)
+    config.apply(
+        {
+            "browser_sort_key": "modified_time",
+            "browser_sort_order": "descending",
+        }
+    )
+    opened = []
+    window = BrowserWindow(
+        config_manager=config,
+        open_path_handler=(
+            lambda path, new, snapshot: opened.append((path, new, snapshot))
+        ),
+    )
+    finish_scan(window, qapp)
+    window.resize(800, 600)
+    window.show()
+    qapp.processEvents()
+
+    try:
+        assert window.navigation_toolbar.isVisibleTo(window)
+        assert window.menuBar().cornerWidget(Qt.Corner.TopRightCorner) is (
+            window.rating_filter_container
+        )
+        assert window.rating_filter_widget.parentWidget() is (
+            window.rating_filter_container
+        )
+        assert window.browser_search_edit.parentWidget() is window.browser_sort_row
+        assert window.browser_sort_row.parentWidget() is (
+            window.browser_toolbar_content
+        )
+        assert window.browser_search_edit.sizePolicy().horizontalPolicy() == (
+            QSizePolicy.Policy.Preferred
+        )
+        assert window.browser_sort_row.layout().indexOf(
+            window.browser_search_edit
+        ) > window.browser_sort_row.layout().indexOf(
+            window.browser_display_density_combo
+        )
+        assert window.browser_search_edit.isVisibleTo(window)
+        assert 140 <= window.browser_search_edit.width() <= 300
+        assert window.location_stack.parentWidget() is (
+            window.browser_toolbar_content
+        )
+        narrow_location_width = window.location_stack.width()
+        menu_center = window.menuBar().rect().center().y()
+        rating_center = window.rating_filter_container.geometry().center().y()
+        assert abs(menu_center - rating_center) <= 1
+        assert window.rating_filter_container.geometry().right() >= (
+            window.menuBar().width() - 8
+        )
+        for width in (1024, 1920, 3840):
+            window.resize(width, 700)
+            qapp.processEvents()
+            assert 140 <= window.browser_search_edit.width() <= 300
+        assert window.location_stack.width() > narrow_location_width
+        assert window.browser_sort_key_combo.currentData() == "modified_time"
+        star_three = QPoint(
+            window.rating_filter_widget.width() // 2,
+            window.rating_filter_widget.height() // 2,
+        )
+        assert window.rating_filter_widget.rating_at(star_three) == 3
+        QTest.mouseClick(
+            window.rating_filter_widget,
+            Qt.MouseButton.LeftButton,
+            pos=star_three,
+        )
+        assert window.browser_filter_state.rating_mode is RatingFilterMode.AT_LEAST
+        assert window.browser_filter_state.rating_reference == 3
+        QTest.mouseClick(
+            window.rating_filter_widget,
+            Qt.MouseButton.LeftButton,
+            pos=star_three,
+        )
+        assert window.browser_filter_state.rating_mode is RatingFilterMode.OFF
+
+        context_event = QContextMenuEvent(
+            QContextMenuEvent.Reason.Mouse,
+            star_three,
+            window.rating_filter_widget.mapToGlobal(star_three),
+        )
+        QApplication.sendEvent(window.rating_filter_widget, context_event)
+        rating_menu = window.rating_filter_widget._context_menu
+        assert rating_menu is not None and rating_menu.isVisible()
+        equal_action = next(
+            action for action in rating_menu.actions() if action.text() == "★3のみ"
+        )
+        equal_action.trigger()
+        rating_menu.close()
+        qapp.processEvents()
+        assert window.browser_filter_state.rating_mode is RatingFilterMode.EQUAL
+        assert window.browser_filter_state.rating_reference == 3
+        window.rating_filter_widget.clear_filter()
+
+        window.browser_search_edit.setText("日本語")
+        QTest.mouseClick(
+            window.rating_filter_widget,
+            Qt.MouseButton.LeftButton,
+            pos=star_three,
+        )
+        qapp.processEvents()
+
+        assert window.browser_filter_state == BrowserFilterState.normalized(
+            search_text="日本語",
+            rating_mode=RatingFilterMode.AT_LEAST,
+            rating_reference=3,
+        )
+        assert window.browser_sort_key_combo.currentData() == "modified_time"
+        assert [item.display_name for item in window.items] == [
+            "日本語 high.jpg"
+        ]
+        row = window.item_model.row_for_path(paths[1])
+        window.open_item(window.item_model.index(row, 0))
+        assert len(opened) == 1
+        snapshot = opened[0][2]
+        assert snapshot is not None
+        assert snapshot.image_ids == (str(paths[1]),)
+        assert "search='日本語'" in snapshot.filter_identity
+        assert "rating=at_least" in snapshot.filter_identity
+
+        window.browser_search_edit.clear()
+        window._apply_pending_browser_search()
+        window.rating_filter_widget.set_filter(RatingFilterMode.UNRATED)
+        qapp.processEvents()
+        assert [item.display_name for item in window.items] == [
+            "日本語 none.jpg"
+        ]
+        assert window.browser_sort_key_combo.currentData() == "modified_time"
+
+        window.rating_filter_widget.clear_filter()
+        window.browser_search_edit.setText("ALPHA")
+        QTest.qWait(120)
+        qapp.processEvents()
+        assert [item.display_name for item in window.items] == ["alpha.jpg"]
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_rating_change_live_filters_without_rescan_or_thumbnail_decode(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "rating-live-filter"
+    high = folder / "high {zpi$r=5}.jpg"
+    middle = folder / "middle {zpi$r=3}.jpg"
+    low = folder / "low {zpi$r=1}.jpg"
+    for path in (high, middle, low):
+        write_image(path)
+    preserved_mtime = middle.stat().st_mtime_ns
+    window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    finish_scan(window, qapp)
+    assert window.thumbnail_provider.wait_for_done()
+    qapp.processEvents()
+    scan_generation = window._scan_generation
+    window.rating_filter_widget.set_filter(RatingFilterMode.AT_LEAST, 3)
+    qapp.processEvents()
+    middle_index = window.item_model.index(
+        window.item_model.row_for_path(middle),
+        0,
+    )
+    selection = window.list_view.selectionModel()
+    selection.select(
+        middle_index,
+        QItemSelectionModel.SelectionFlag.ClearAndSelect,
+    )
+    selection.setCurrentIndex(
+        middle_index,
+        QItemSelectionModel.SelectionFlag.NoUpdate,
+    )
+
+    try:
+        with patch.object(
+            window.thumbnail_provider,
+            "request",
+            wraps=window.thumbnail_provider.request,
+        ) as thumbnail_request:
+            assert window.set_rating_for_paths((str(middle),), 2)
+            qapp.processEvents()
+            assert thumbnail_request.call_count == 0
+
+        renamed = folder / "middle {zpi$r=2}.jpg"
+        assert renamed.exists()
+        assert [item.display_name for item in window.items] == ["high.jpg"]
+        current = window.item_model.item_at(window.list_view.currentIndex())
+        assert current is not None and current.path == high
+        assert [
+            window.item_model.item_at(index).path
+            for index in selection.selectedIndexes()
+        ] == [high]
+        assert renamed.stat().st_mtime_ns == preserved_mtime
+        assert window._scan_generation == scan_generation
+        assert window.item_model.source_count == 3
     finally:
         window.close()
         qapp.processEvents()

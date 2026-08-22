@@ -110,6 +110,7 @@ class ConfigManager(QObject):
         "browser_sort_key": "name",
         "browser_sort_order": "ascending",
         "browser_folders_first": True,
+        "browser_location_history_limit": 50,
         "browser_display_density": "standard",
         "browser_item_spacing_mode": "preset",
         "browser_item_spacing": 2,
@@ -460,12 +461,22 @@ class ConfigManager(QObject):
             "modified_time",
             "item_type",
             "file_size",
+            "rating",
         }:
             normalized["browser_sort_key"] = cls.DEFAULTS["browser_sort_key"]
         if normalized.get("browser_sort_order") not in {"ascending", "descending"}:
             normalized["browser_sort_order"] = cls.DEFAULTS["browser_sort_order"]
         if not isinstance(normalized.get("browser_folders_first"), bool):
             normalized["browser_folders_first"] = cls.DEFAULTS["browser_folders_first"]
+        location_history_limit = normalized.get("browser_location_history_limit")
+        if (
+            isinstance(location_history_limit, bool)
+            or not isinstance(location_history_limit, int)
+            or location_history_limit not in {10, 20, 30, 50, 100, 200}
+        ):
+            normalized["browser_location_history_limit"] = cls.DEFAULTS[
+                "browser_location_history_limit"
+            ]
         if normalized.get("browser_display_density") not in {
             "extra_compact",
             "compact",
