@@ -8,15 +8,18 @@ from unittest.mock import Mock, PropertyMock, patch
 
 import pytest
 from PIL import Image
-from PySide6.QtCore import QItemSelectionModel, QPoint, QSize, Qt
+from PySide6.QtCore import QItemSelectionModel, QModelIndex, QPoint, QSize, Qt
 from PySide6.QtGui import QContextMenuEvent, QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QApplication,
+    QComboBox,
     QListView,
     QMessageBox,
     QSizePolicy,
     QTabWidget,
+    QToolButton,
 )
 
 from app.browser_model import BrowserItemKind, BrowserItemModel
@@ -285,7 +288,12 @@ def test_search_and_rating_quick_filter_compose_without_changing_sort(
         assert window.rating_filter_widget.parentWidget() is (
             window.rating_filter_container
         )
-        assert window.browser_search_edit.parentWidget() is window.browser_sort_row
+        assert window.browser_search_edit.parentWidget() is (
+            window.browser_search_container
+        )
+        assert window.browser_search_container.parentWidget() is (
+            window.browser_sort_row
+        )
         assert window.browser_sort_row.parentWidget() is (
             window.browser_toolbar_content
         )
@@ -293,32 +301,118 @@ def test_search_and_rating_quick_filter_compose_without_changing_sort(
             QSizePolicy.Policy.Preferred
         )
         assert window.browser_sort_row.layout().indexOf(
-            window.browser_search_edit
+            window.browser_search_container
         ) > window.browser_sort_row.layout().indexOf(
-            window.browser_display_density_combo
+            window.browser_sort_order_combo
         )
+        assert not hasattr(window, "browser_folders_first_checkbox")
+        assert not hasattr(window, "browser_display_density_combo")
         assert window.browser_search_edit.isVisibleTo(window)
-        assert 140 <= window.browser_search_edit.width() <= 300
-        assert window.location_stack.parentWidget() is (
+        assert isinstance(window.browser_search_container, QComboBox)
+        assert window.browser_search_container.drop_down_rect().isValid()
+        assert window.browser_search_container.style().metaObject().className() == (
+            window.browser_sort_key_combo.style().metaObject().className()
+        )
+        assert all(
+            button.text() not in {"▼", "▽", "˅", "V"}
+            for button in window.browser_search_container.findChildren(QToolButton)
+        )
+        assert window.location_stack.parentWidget() is window.browser_location_control
+        assert window.browser_location_control.parentWidget() is (
             window.browser_toolbar_content
         )
-        narrow_location_width = window.location_stack.width()
+        assert isinstance(window.browser_location_control, QComboBox)
+        assert window.browser_location_control.drop_down_rect().isValid()
+        assert window.browser_location_control.style().metaObject().className() == (
+            window.browser_sort_key_combo.style().metaObject().className()
+        )
+        assert not hasattr(window, "location_history_button")
+        assert not hasattr(window, "recent_location_button")
         menu_center = window.menuBar().rect().center().y()
         rating_center = window.rating_filter_container.geometry().center().y()
         assert abs(menu_center - rating_center) <= 1
         assert window.rating_filter_container.geometry().right() >= (
             window.menuBar().width() - 8
         )
-        for width in (1024, 1920, 3840):
+        assert not hasattr(window, "rating_filter_mode_label")
+        assert not hasattr(window, "rating_filter_clear_button")
+        window.browser_search_edit.setText(
+            "2026 summer illustration character reference sheet"
+        )
+        measured_widths: dict[int, tuple[int, int, int, int]] = {}
+        for width in (800, 1024, 1280, 1600, 1920, 2560, 3840):
             window.resize(width, 700)
             qapp.processEvents()
-            assert 140 <= window.browser_search_edit.width() <= 300
-        assert window.location_stack.width() > narrow_location_width
+            search_outer = window.browser_search_container.width()
+            search_editor = window.browser_search_edit.width()
+            clear_width = sum(
+                button.geometry()
+                .intersected(window.browser_search_edit.rect())
+                .width()
+                for button in window.browser_search_edit.findChildren(
+                    QAbstractButton
+                )
+                if button.isVisible()
+            )
+            margins = window.browser_search_edit.textMargins()
+            usable_width = (
+                search_editor
+                - clear_width
+                - margins.left()
+                - margins.right()
+            )
+            measured_widths[width] = (
+                search_outer,
+                search_editor,
+                usable_width,
+                window.location_stack.width(),
+            )
+            assert 150 <= search_outer <= 230
+            assert window.browser_search_edit.geometry() == (
+                window.browser_search_container.edit_field_rect()
+            )
+            assert search_editor <= search_outer
+            assert usable_width >= 100
+            search_left = window.browser_search_container.mapTo(
+                window,
+                QPoint(0, 0),
+            ).x()
+            location_right = window.browser_location_control.mapTo(
+                window,
+                QPoint(window.browser_location_control.width(), 0),
+            ).x()
+            assert location_right <= search_left
+        assert 180 <= measured_widths[1920][0] <= 200
+        assert measured_widths[1920][2] >= 130
+        assert measured_widths[3840][0] == measured_widths[1920][0]
+        assert measured_widths[3840][3] > measured_widths[1920][3]
         assert window.browser_sort_key_combo.currentData() == "modified_time"
-        star_three = QPoint(
-            window.rating_filter_widget.width() // 2,
-            window.rating_filter_widget.height() // 2,
+        stars_rect = window.rating_filter_widget._stars_rect()
+
+        def star_point(reference: int) -> QPoint:
+            return QPoint(
+                stars_rect.left()
+                + round((reference - 0.5) * stars_rect.width() / 5),
+                stars_rect.center().y(),
+            )
+
+        star_one = star_point(1)
+        star_three = star_point(3)
+        star_four = star_point(4)
+        star_five = star_point(5)
+        QTest.mouseClick(
+            window.rating_filter_widget,
+            Qt.MouseButton.LeftButton,
+            pos=star_one,
         )
+        assert window.browser_filter_state.rating_reference == 1
+        QTest.mouseClick(
+            window.rating_filter_widget,
+            Qt.MouseButton.LeftButton,
+            pos=star_one,
+        )
+        assert window.browser_filter_state.rating_mode is RatingFilterMode.OFF
+
         assert window.rating_filter_widget.rating_at(star_three) == 3
         QTest.mouseClick(
             window.rating_filter_widget,
@@ -327,30 +421,76 @@ def test_search_and_rating_quick_filter_compose_without_changing_sort(
         )
         assert window.browser_filter_state.rating_mode is RatingFilterMode.AT_LEAST
         assert window.browser_filter_state.rating_reference == 3
+        assert "現在: ★3以上" in window.rating_filter_widget.toolTip()
+        QTest.mouseClick(
+            window.rating_filter_widget,
+            Qt.MouseButton.LeftButton,
+            pos=star_five,
+        )
+        assert window.browser_filter_state.rating_reference == 5
+        QTest.mouseClick(
+            window.rating_filter_widget,
+            Qt.MouseButton.LeftButton,
+            pos=star_five,
+        )
+        assert window.browser_filter_state.rating_mode is RatingFilterMode.OFF
+
         QTest.mouseClick(
             window.rating_filter_widget,
             Qt.MouseButton.LeftButton,
             pos=star_three,
         )
+        QTest.mousePress(
+            window.rating_filter_widget,
+            Qt.MouseButton.LeftButton,
+            pos=star_three,
+        )
+        QTest.mouseRelease(
+            window.rating_filter_widget,
+            Qt.MouseButton.LeftButton,
+            pos=star_four,
+        )
         assert window.browser_filter_state.rating_mode is RatingFilterMode.OFF
 
-        context_event = QContextMenuEvent(
-            QContextMenuEvent.Reason.Mouse,
-            star_three,
-            window.rating_filter_widget.mapToGlobal(star_three),
-        )
-        QApplication.sendEvent(window.rating_filter_widget, context_event)
-        rating_menu = window.rating_filter_widget._context_menu
-        assert rating_menu is not None and rating_menu.isVisible()
-        equal_action = next(
-            action for action in rating_menu.actions() if action.text() == "★3のみ"
-        )
-        equal_action.trigger()
-        rating_menu.close()
-        qapp.processEvents()
+        def trigger_rating_menu(text: str) -> None:
+            context_event = QContextMenuEvent(
+                QContextMenuEvent.Reason.Mouse,
+                star_three,
+                window.rating_filter_widget.mapToGlobal(star_three),
+            )
+            QApplication.sendEvent(window.rating_filter_widget, context_event)
+            rating_menu = window.rating_filter_widget._context_menu
+            assert rating_menu is not None and rating_menu.isVisible()
+            action = next(
+                action for action in rating_menu.actions() if action.text() == text
+            )
+            action.trigger()
+            rating_menu.close()
+            qapp.processEvents()
+
+        trigger_rating_menu("★3のみ")
         assert window.browser_filter_state.rating_mode is RatingFilterMode.EQUAL
         assert window.browser_filter_state.rating_reference == 3
-        window.rating_filter_widget.clear_filter()
+        assert "現在: ★3のみ" in window.rating_filter_widget.toolTip()
+        trigger_rating_menu("フィルタ解除")
+        assert window.browser_filter_state.rating_mode is RatingFilterMode.OFF
+        trigger_rating_menu("未評価")
+        assert window.browser_filter_state.rating_mode is RatingFilterMode.UNRATED
+        assert "現在: 未評価" in window.rating_filter_widget.toolTip()
+        trigger_rating_menu("フィルタ解除")
+        assert window.browser_filter_state.rating_mode is RatingFilterMode.OFF
+
+        QTest.mouseClick(
+            window.rating_filter_widget,
+            Qt.MouseButton.LeftButton,
+            pos=star_three,
+        )
+        QTest.mouseClick(
+            window.rating_filter_widget,
+            Qt.MouseButton.MiddleButton,
+            pos=star_three,
+        )
+        assert window.browser_filter_state.rating_mode is RatingFilterMode.OFF
 
         window.browser_search_edit.setText("日本語")
         QTest.mouseClick(
@@ -394,6 +534,118 @@ def test_search_and_rating_quick_filter_compose_without_changing_sort(
         assert [item.display_name for item in window.items] == ["alpha.jpg"]
     finally:
         window.close()
+        qapp.processEvents()
+
+
+def test_search_history_records_only_commits_persists_and_reuses_popup(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "search-history"
+    write_image(folder / "背景 character.jpg")
+    config = make_config(tmp_path, folder)
+    window = BrowserWindow(config_manager=config)
+    finish_scan(window, qapp)
+    window.show()
+    qapp.processEvents()
+
+    try:
+        window.browser_search_edit.setFocus()
+        for partial in ("c", "ch", "cha", "char"):
+            window.browser_search_edit.setText(partial)
+        assert window.search_history.entries == ()
+
+        window.browser_search_edit.setText("character")
+        QTest.keyClick(window.browser_search_edit, Qt.Key.Key_Return)
+        assert window.search_history.entries == ("character",)
+        assert window.browser_filter_state.search_text == "character"
+
+        window.browser_search_edit.setText("背景")
+        window.list_view.setFocus()
+        qapp.processEvents()
+        assert window.search_history.entries == ("character",)
+
+        window.browser_search_edit.setFocus()
+        QTest.mouseClick(
+            window.browser_search_container,
+            Qt.MouseButton.LeftButton,
+            pos=window.browser_search_container.drop_down_rect().center(),
+        )
+        qapp.processEvents()
+        popup = window._search_history_popup
+        assert popup is not None
+        popup.close()
+        qapp.processEvents()
+        assert window.search_history.entries[:2] == ("背景", "character")
+
+        window.browser_search_edit.setText("Foo")
+        QTest.keyClick(window.browser_search_edit, Qt.Key.Key_Return)
+        window.browser_search_edit.setText("foo")
+        QTest.keyClick(window.browser_search_edit, Qt.Key.Key_Return)
+        assert window.search_history.entries[0] == "foo"
+        assert sum(
+            query.casefold() == "foo"
+            for query in window.search_history.entries
+        ) == 1
+
+        for index in range(20):
+            window.search_history.record(f"履歴-{index:02}")
+        window._persist_browser_search_history()
+        QTest.mouseClick(
+            window.browser_search_container,
+            Qt.MouseButton.LeftButton,
+            pos=window.browser_search_container.drop_down_rect().center(),
+        )
+        qapp.processEvents()
+        popup = window._search_history_popup
+        assert popup is not None and popup.isVisible()
+        assert popup.list_widget.verticalScrollBar().maximum() > 0
+        background_item = next(
+            popup.list_widget.item(row)
+            for row in range(popup.entry_count)
+            if popup.list_widget.item(row).text() == "背景"
+        )
+        popup.list_widget.itemClicked.emit(background_item)
+        qapp.processEvents()
+        assert window.browser_search_edit.text() == "背景"
+        assert window.browser_filter_state.search_text == "背景"
+        assert window.search_history.entries[0] == "背景"
+
+        persisted = ConfigManager(config.path).load()
+        assert persisted["browser_search_history"][0] == "背景"
+        assert "character" in persisted["browser_search_history"]
+    finally:
+        window.close()
+        qapp.processEvents()
+
+    reopened_config = ConfigManager(config.path)
+    reopened_config.load()
+    reopened = BrowserWindow(config_manager=reopened_config)
+    finish_scan(reopened, qapp)
+    reopened.show()
+    qapp.processEvents()
+    try:
+        assert reopened.browser_search_edit.text() == ""
+        assert reopened.browser_filter_state.search_text == ""
+        assert reopened.search_history.entries[0] == "背景"
+        reopened_config.apply(
+            {"browser_search_history_limit": 1},
+            save=True,
+        )
+        assert len(reopened.search_history.entries) == 1
+        popup = reopened._show_search_history_popup()
+        assert popup is not None
+        clear_item = next(
+            popup.list_widget.item(row)
+            for row in range(popup.entry_count)
+            if popup.list_widget.item(row).text() == "検索履歴を消去"
+        )
+        popup.list_widget.itemClicked.emit(clear_item)
+        qapp.processEvents()
+        assert reopened.search_history.entries == ()
+        assert ConfigManager(config.path).load()["browser_search_history"] == []
+    finally:
+        reopened.close()
         qapp.processEvents()
 
 
@@ -828,6 +1080,44 @@ def test_thumbnail_size_change_preserves_selection_and_uses_new_generation(
     qapp.processEvents()
 
 
+def test_thumbnail_size_change_preserves_unselected_anchor_offset(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "サイズ変更位置"
+    for index in range(1, 81):
+        write_image(folder / f"page{index:03}.jpg")
+    window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    window.resize(760, 480)
+    window.show()
+    finish_scan(window, qapp)
+    target = folder / "page055.jpg"
+    target_index = window.item_model.index(
+        window.item_model.row_for_path(target),
+        0,
+    )
+    window.list_view.scrollTo(target_index, QListView.ScrollHint.PositionAtCenter)
+    window.list_view.clearSelection()
+    window.list_view.setCurrentIndex(QModelIndex())
+    qapp.processEvents()
+    state = window._capture_list_view_state()
+    assert state.anchor_path is not None
+    before_row = window.item_model.row_for_path(state.anchor_path)
+    before_rect = window.list_view.visualRect(window.item_model.index(before_row, 0))
+
+    window.config.apply({"thumbnail_size": 260})
+    qapp.processEvents()
+    qapp.processEvents()
+
+    after_row = window.item_model.row_for_path(state.anchor_path)
+    after_rect = window.list_view.visualRect(window.item_model.index(after_row, 0))
+    assert abs(after_rect.y() - before_rect.y()) <= 1
+    assert window.list_view.selectionModel().selectedIndexes() == []
+    assert not window.list_view.currentIndex().isValid()
+    window.close()
+    qapp.processEvents()
+
+
 def test_display_density_changes_layout_without_changing_thumbnail_size(
     tmp_path: Path,
     qapp: QApplication,
@@ -846,9 +1136,7 @@ def test_display_density_changes_layout_without_changing_thumbnail_size(
         "large": QSize(231, 195),
     }
     for density, grid_size in expectations.items():
-        window.browser_display_density_combo.setCurrentIndex(
-            window.browser_display_density_combo.findData(density)
-        )
+        window.config.apply({"browser_display_density": density})
         qapp.processEvents()
         assert window.list_view.gridSize() == grid_size
         assert window.list_view.iconSize() == QSize(180, 180)
@@ -857,7 +1145,7 @@ def test_display_density_changes_layout_without_changing_thumbnail_size(
     qapp.processEvents()
 
 
-def test_folders_first_control_keeps_folder_group_at_front(
+def test_folders_first_setting_keeps_folder_group_at_front(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
@@ -871,7 +1159,7 @@ def test_folders_first_control_keeps_folder_group_at_front(
         "z-folder",
         "a.jpg",
     ]
-    window.browser_folders_first_checkbox.setChecked(False)
+    window.config.apply({"browser_folders_first": False})
     qapp.processEvents()
 
     assert [entry.display_name for entry in window.items] == [
@@ -883,34 +1171,92 @@ def test_folders_first_control_keeps_folder_group_at_front(
     qapp.processEvents()
 
 
-def test_sort_keeps_visible_anchor_item_on_screen(
+def test_folders_first_roundtrip_restores_unselected_viewport_anchor_and_offset(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
     folder = tmp_path / "スクロール"
     for index in range(1, 61):
-        write_image(folder / f"book{index}.jpg")
+        write_image(folder / f"book{index:03}.jpg")
+    for index in range(1, 21):
+        (folder / f"folder{index:03}").mkdir()
     window = BrowserWindow(config_manager=make_config(tmp_path, folder))
     window.resize(640, 420)
     window.show()
     finish_scan(window, qapp)
-    anchor_row = window.item_model.row_for_path(folder / "book40.jpg")
+    anchor_row = window.item_model.row_for_path(folder / "book040.jpg")
     anchor = window.item_model.index(anchor_row, 0)
     window.list_view.scrollTo(anchor, QListView.ScrollHint.PositionAtCenter)
+    window.list_view.clearSelection()
+    window.list_view.setCurrentIndex(QModelIndex())
     qapp.processEvents()
-    visible_anchor = window.item_model.item_at(window._visible_anchor_index())
-    assert visible_anchor is not None
+    before = window._capture_list_view_state()
+    assert before.selected_paths == ()
+    assert before.current_path is None
+    assert before.anchor_path is not None
+    initial_generation = window.thumbnail_provider.generation
+    initial_scan_generation = window._scan_generation
 
-    window.browser_sort_order_combo.setCurrentIndex(
-        window.browser_sort_order_combo.findData("descending")
+    with patch.object(window, "_schedule_thumbnail_requests") as schedule:
+        window.config.apply({"browser_folders_first": False})
+        qapp.processEvents()
+        window.config.apply({"browser_folders_first": True})
+        qapp.processEvents()
+        qapp.processEvents()
+
+    after = window._capture_list_view_state()
+    assert after.anchor_path == before.anchor_path
+    assert abs(after.anchor_y - before.anchor_y) <= 1
+    assert abs(after.vertical_scroll - before.vertical_scroll) <= 1
+    assert window.list_view.selectionModel().selectedIndexes() == []
+    assert not window.list_view.currentIndex().isValid()
+    assert window.thumbnail_provider.generation == initial_generation
+    assert window._scan_generation == initial_scan_generation
+    schedule.assert_not_called()
+    window.close()
+    qapp.processEvents()
+
+
+def test_sort_moves_explicit_selection_only_enough_to_make_it_visible(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "選択スクロール"
+    for index in range(1, 81):
+        write_image(folder / f"book{index:03}.jpg")
+    window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    window.resize(640, 420)
+    window.show()
+    finish_scan(window, qapp)
+    selected_path = folder / "book060.jpg"
+    selected = window.item_model.index(
+        window.item_model.row_for_path(selected_path),
+        0,
     )
+    window.list_view.scrollTo(selected, QListView.ScrollHint.PositionAtCenter)
+    window.list_view.selectionModel().select(
+        selected,
+        QItemSelectionModel.SelectionFlag.ClearAndSelect,
+    )
+    window.list_view.setCurrentIndex(selected)
     qapp.processEvents()
 
-    restored_row = window.item_model.row_for_path(visible_anchor.path)
+    window.config.apply({"browser_sort_order": "descending"})
+    qapp.processEvents()
+
+    restored_row = window.item_model.row_for_path(selected_path)
     restored = window.item_model.index(restored_row, 0)
-    assert window.list_view.visualRect(restored).intersects(
-        window.list_view.viewport().rect()
-    )
+    restored_rect = window.list_view.visualRect(restored)
+    viewport_rect = window.list_view.viewport().rect()
+    assert viewport_rect.contains(restored_rect)
+    assert min(
+        abs(restored_rect.top() - viewport_rect.top()),
+        abs(restored_rect.bottom() - viewport_rect.bottom()),
+    ) <= window.list_view.gridSize().height()
+    assert {
+        window.item_model.item_at(index).path
+        for index in window.list_view.selectionModel().selectedIndexes()
+    } == {selected_path.absolute()}
     window.close()
     qapp.processEvents()
 

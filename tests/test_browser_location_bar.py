@@ -69,8 +69,10 @@ def test_breadcrumb_clicks_ancestors_and_keeps_current_visible(
     qapp.processEvents()
     activated: list[str] = []
     children: list[str] = []
+    edits: list[bool] = []
     breadcrumb.locationActivated.connect(activated.append)
     breadcrumb.childrenRequested.connect(children.append)
+    breadcrumb.editRequested.connect(lambda: edits.append(True))
 
     segments = breadcrumb.segments
     ancestor_index = next(
@@ -92,6 +94,7 @@ def test_breadcrumb_clicks_ancestors_and_keeps_current_visible(
     assert current_button.toolTip() == str(current.absolute())
     QTest.mouseClick(current_button, Qt.MouseButton.LeftButton)
     assert len(activated) == 1
+    assert edits == [True]
 
     separator = breadcrumb.findChild(
         QToolButton,

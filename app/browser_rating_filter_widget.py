@@ -16,15 +16,13 @@ class BrowserRatingFilterWidget(QWidget):
         super().__init__(parent)
         self.setObjectName("browser_rating_quick_filter")
         self.setMouseTracking(True)
-        self.setToolTip(
-            "クリック: ★X以上で絞り込み（同じ条件で解除）\n"
-            "右クリック: ★Xのみ／未評価／解除"
-        )
         self._mode = RatingFilterMode.OFF
         self._reference = 0
         self._hover_reference = 0
+        self._pressed_reference = 0
         self._context_menu: QMenu | None = None
         self.setFixedWidth(self.sizeHint().width())
+        self._update_tool_tip()
 
     @property
     def mode(self) -> RatingFilterMode:
@@ -63,6 +61,7 @@ class BrowserRatingFilterWidget(QWidget):
         self._mode = normalized_mode
         self._reference = normalized_reference
         self._hover_reference = 0
+        self._update_tool_tip()
         self.update()
         self.filterChanged.emit(self._mode.value, self._reference)
         return True
@@ -83,19 +82,39 @@ class BrowserRatingFilterWidget(QWidget):
             self.update()
         super().leaveEvent(event)
 
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._pressed_reference = (
+                self.rating_at(event.position().toPoint()) or 0
+            )
+            if self._pressed_reference:
+                event.accept()
+                return
+        elif event.button() == Qt.MouseButton.MiddleButton:
+            self._pressed_reference = 0
+            self.clear_filter()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            rating = self.rating_at(event.position().toPoint())
-            if rating is not None:
+            pressed = self._pressed_reference
+            self._pressed_reference = 0
+            if pressed and self.rating_at(event.position().toPoint()) is not None:
                 if (
                     self._mode is RatingFilterMode.AT_LEAST
-                    and self._reference == rating
+                    and self._reference == pressed
                 ):
                     self.clear_filter()
                 else:
-                    self.set_filter(RatingFilterMode.AT_LEAST, rating)
+                    self.set_filter(RatingFilterMode.AT_LEAST, pressed)
                 event.accept()
                 return
+        elif event.button() == Qt.MouseButton.MiddleButton:
+            self._pressed_reference = 0
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
 
     def contextMenuEvent(self, event: QContextMenuEvent) -> None:  # noqa: N802
@@ -140,13 +159,25 @@ class BrowserRatingFilterWidget(QWidget):
             self._context_menu = None
         menu.deleteLater()
 
+    def _update_tool_tip(self) -> None:
+        if self._mode is RatingFilterMode.AT_LEAST:
+            state = f"現在: ★{self._reference}以上"
+        elif self._mode is RatingFilterMode.EQUAL:
+            state = f"現在: ★{self._reference}のみ"
+        elif self._mode is RatingFilterMode.UNRATED:
+            state = "現在: 未評価"
+        else:
+            state = "現在: 絞り込みなし"
+        self.setToolTip(
+            f"{state}\n"
+            "クリック: ★X以上で絞り込み（同じ条件で解除）\n"
+            "右クリック: ★Xのみ／未評価／解除"
+        )
+
     def paintEvent(self, event) -> None:  # noqa: N802
         del event
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(0, 0, 0, 218))
-        painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 4, 4)
         stars = self._stars_rect()
         preview = self._hover_reference
         filled = preview or (
@@ -158,7 +189,7 @@ class BrowserRatingFilterWidget(QWidget):
         painter.drawText(
             stars,
             int(Qt.AlignmentFlag.AlignCenter),
-            "★★★★★",
+            "☆☆☆☆☆",
         )
         if filled:
             painter.setPen(QColor("#ffd700"))

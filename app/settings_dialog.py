@@ -702,15 +702,20 @@ class SettingsDialog(QDialog):
             list_group,
         )
         list_form.addRow(self.browser_folders_first_checkbox)
-        self.browser_location_history_limit_combo = QComboBox(list_group)
-        for count in (10, 20, 30, 50, 100, 200):
-            self.browser_location_history_limit_combo.addItem(
-                f"{count}件",
-                count,
-            )
+        self.browser_location_history_limit_spin = QSpinBox(list_group)
+        self.browser_location_history_limit_spin.setRange(1, 1000)
+        self.browser_location_history_limit_spin.setSuffix(" 件")
         list_form.addRow(
             "場所の履歴を保持する件数:",
-            self.browser_location_history_limit_combo,
+            self.browser_location_history_limit_spin,
+        )
+        self.browser_search_history_limit_spin = QSpinBox(list_group)
+        self.browser_search_history_limit_spin.setRange(0, 1000)
+        self.browser_search_history_limit_spin.setSuffix(" 件")
+        self.browser_search_history_limit_spin.setSpecialValueText("保存しない")
+        list_form.addRow(
+            "検索履歴の保持件数:",
+            self.browser_search_history_limit_spin,
         )
         self.browser_spacing_preset_checkbox = QCheckBox(
             "密度プリセットに従う",
@@ -1267,9 +1272,11 @@ class SettingsDialog(QDialog):
         self.browser_folders_first_checkbox.setChecked(
             bool(self.config.get("browser_folders_first", True))
         )
-        self._select_data(
-            self.browser_location_history_limit_combo,
-            int(self.config.get("browser_location_history_limit", 50)),
+        self.browser_location_history_limit_spin.setValue(
+            int(self.config.get("browser_location_history_limit", 50))
+        )
+        self.browser_search_history_limit_spin.setValue(
+            int(self.config.get("browser_search_history_limit", 50))
         )
         self.browser_spacing_preset_checkbox.setChecked(
             self.config.get("browser_item_spacing_mode", "preset") == "preset"
@@ -1673,7 +1680,10 @@ class SettingsDialog(QDialog):
                 self.browser_folders_first_checkbox.isChecked()
             ),
             "browser_location_history_limit": int(
-                self.browser_location_history_limit_combo.currentData()
+                self.browser_location_history_limit_spin.value()
+            ),
+            "browser_search_history_limit": int(
+                self.browser_search_history_limit_spin.value()
             ),
             "browser_item_spacing_mode": (
                 "preset"

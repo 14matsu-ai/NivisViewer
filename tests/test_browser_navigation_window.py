@@ -194,6 +194,17 @@ def test_breadcrumb_separator_text_mode_and_filtered_viewer_snapshot(
         assert window.browser_filter_state.search_text == "abc"
         assert window.browser_sort_order.value == "descending"
 
+        current_index = len(window.location_breadcrumb.segments) - 1
+        current_button = window.location_breadcrumb.findChild(
+            QToolButton,
+            f"browser_location_segment_{current_index}",
+        )
+        assert current_button is not None
+        QTest.mouseClick(current_button, Qt.MouseButton.LeftButton)
+        assert window.location_stack.currentWidget() is window.address_bar
+        assert window.address_bar.selectedText() == str(b.absolute())
+        QTest.keyClick(window.address_bar, Qt.Key.Key_Escape)
+
         QTest.keyClick(
             window,
             Qt.Key.Key_L,
@@ -339,7 +350,13 @@ def test_history_popup_direct_jump_restores_selection_scroll_and_recent_menu(
             window.list_view.verticalScrollBar().value() - saved_scroll
         ) <= window.list_view.gridSize().height()
 
-        recent_menu = window._show_recent_location_menu()
+        QTest.mouseClick(
+            window.browser_location_control,
+            Qt.MouseButton.LeftButton,
+            pos=window.browser_location_control.drop_down_rect().center(),
+        )
+        qapp.processEvents()
+        recent_menu = window._location_history_popup
         assert recent_menu is not None
         assert {
             recent_menu.list_widget.item(row).toolTip()
@@ -375,7 +392,7 @@ def test_failed_direct_history_jump_restores_the_timeline_index(
         assert window.navigation_history.current_index == 1
         assert window.statusBar().currentMessage() == "フォルダが見つかりません"
 
-        recent_menu = window._show_recent_location_menu()
+        recent_menu = window._show_location_history_popup()
         assert recent_menu is not None
         missing_item = next(
             recent_menu.list_widget.item(row)
@@ -736,6 +753,14 @@ def test_address_input_handles_missing_supported_and_unsupported_files(
     finish_scan(window, qapp)
     selected = window.item_model.item_at(window.list_view.currentIndex())
     assert selected is not None and selected.path == archive.absolute()
+    assert {
+        Path(location.path)
+        for _index, location in window.navigation_history.recent_unique()
+    } == {current.absolute(), target.absolute()}
+    assert all(
+        Path(location.path).suffix == ""
+        for _index, location in window.navigation_history.recent_unique()
+    )
 
     window.address_bar.setText(str(unsupported))
     window._navigate_from_address_bar()

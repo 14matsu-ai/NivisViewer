@@ -344,6 +344,12 @@ class BrowserItemDelegate(QStyledItemDelegate):
                     display_mode=self.thumbnail_display_mode,
                 )
             else:
+                if self._uses_folder_fallback_canvas(item, thumbnail_image):
+                    self._paint_folder_fallback_canvas(
+                        painter,
+                        thumbnail_rect,
+                        option,
+                    )
                 icon = index.data(Qt.ItemDataRole.DecorationRole)
                 if item.kind is BrowserItemKind.OTHER or not isinstance(icon, QIcon):
                     icon_size = max(
@@ -380,6 +386,60 @@ class BrowserItemDelegate(QStyledItemDelegate):
                 painter,
                 option,
                 self.grid_metrics.selection_rect(cell),
+            )
+        finally:
+            painter.restore()
+
+    @staticmethod
+    def _uses_folder_fallback_canvas(
+        item: BrowserItem,
+        thumbnail_image: object,
+    ) -> bool:
+        return bool(
+            item.kind is BrowserItemKind.FOLDER
+            and not (
+                isinstance(thumbnail_image, QImage)
+                and not thumbnail_image.isNull()
+            )
+        )
+
+    @staticmethod
+    def _paint_folder_fallback_canvas(
+        painter: QPainter,
+        thumbnail_rect: QRect,
+        option: QStyleOptionViewItem,
+    ) -> None:
+        """Paint a flat, square thumbnail surface behind a folder icon."""
+
+        def blend(first: QColor, second: QColor, second_weight: float) -> QColor:
+            weight = max(0.0, min(1.0, float(second_weight)))
+            return QColor(
+                round(first.red() * (1.0 - weight) + second.red() * weight),
+                round(first.green() * (1.0 - weight) + second.green() * weight),
+                round(first.blue() * (1.0 - weight) + second.blue() * weight),
+                round(first.alpha() * (1.0 - weight) + second.alpha() * weight),
+            )
+
+        dpr = max(0.5, painter.device().devicePixelRatioF())
+        base = option.palette.base().color()
+        canvas_color = blend(base, option.palette.alternateBase().color(), 0.58)
+        border_color = blend(
+            option.palette.mid().color(),
+            option.palette.midlight().color(),
+            0.35,
+        )
+        canvas = snap_logical_rect_to_physical_pixels(
+            QRectF(thumbnail_rect.adjusted(7, 7, -8, -8)),
+            dpr,
+        )
+
+        painter.save()
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            painter.setPen(QPen(border_color, 1.0 / dpr))
+            painter.setBrush(canvas_color)
+            painter.drawRect(
+                canvas.adjusted(0, 0, -1.0 / dpr, -1.0 / dpr)
             )
         finally:
             painter.restore()
