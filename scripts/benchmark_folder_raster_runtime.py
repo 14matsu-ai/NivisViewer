@@ -1,15 +1,15 @@
-"""Offscreen A/B benchmark for folder-backed Viewer production paths.
+"""Offscreen benchmark for the production folder-backed Viewer runtime.
 
-Case A wraps the real ``FolderImageSource`` in a benchmark-only generic
-``ImageSource`` adapter.  That deliberately makes the Viewer use the retained
-non-folder ``ImageCache -> ViewerRenderTask -> prepared display`` path without
-adding a production feature flag.  Case B passes the same folder source to the
-normal production selector and requires ``FolderRasterBookRuntime``.
+The maintained case passes a real ``FolderImageSource`` through the normal
+production selector and requires ``FolderRasterBookRuntime``.  The former
+benchmark-only generic ``ImageSource`` adapter has been retired: it forced an
+architecture that production folder books no longer use, and its resize wait
+no longer represented a supported path.
 
-Both cases run in fresh child processes, use the same temporary JPEG files,
-never show a window, never synthesize native input, and explicitly drain only
-the Viewer/coordinator work they create.  Counts are application-visible; Qt
-plugin-internal copies and native decoder allocations are outside Python's
+The maintained case runs in a fresh child process, uses temporary JPEG files,
+never shows a window, never synthesizes native input, and explicitly drains
+only the Viewer/coordinator work it creates.  Counts are application-visible;
+Qt plugin-internal copies and native decoder allocations are outside Python's
 observable boundary and are labelled as such in the report.
 """
 
@@ -31,7 +31,6 @@ import sys
 from tempfile import TemporaryDirectory
 import threading
 import time
-from types import MethodType
 from typing import Any, Callable
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -49,7 +48,6 @@ _EXTRA_SITE_PACKAGES = os.environ.get("NIVIS_BENCHMARK_EXTRA_SITE_PACKAGES")
 if _EXTRA_SITE_PACKAGES and _EXTRA_SITE_PACKAGES not in sys.path:
     sys.path.insert(0, _EXTRA_SITE_PACKAGES)
 
-from PySide6.QtCore import QEvent, QRectF
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QApplication
 
@@ -61,7 +59,7 @@ import app.zip_raster_book_runtime as runtime_module
 from app.book_session import BookSession
 from app.config_manager import ConfigManager
 from app.folder_raster_book_runtime import FolderRasterBookRuntime
-from app.image_source import FolderImageSource, ImageSource
+from app.image_source import FolderImageSource
 from app.image_work_coordinator import ImageWorkCoordinator
 from app.raster_book_runtime import RasterBookRuntime, RasterFrame
 from app.viewer_memory_policy import viewer_memory_mode_from_legacy_mib
@@ -69,8 +67,7 @@ from app.viewer_window import ViewerWindow
 
 
 _MIB = 1024 * 1024
-_CASE_A = "A-legacy-two-stage"
-_CASE_B = "B-folder-runtime"
+_CASE_CURRENT = "folder-runtime"
 
 
 def _jpeg_bytes(size: tuple[int, int], *, detail: bool) -> bytes:
@@ -365,55 +362,6 @@ class _CountingFolderSource(FolderImageSource):
         with self.tracker.lock:
             self.tracker.counts["source_close_calls"] += 1
         super().close()
-
-
-class _LegacyFolderAdapter(ImageSource):
-    """Benchmark-only type fence that selects the retained generic path."""
-
-    # Preserve Folder production's lazy-size contract; only the Viewer engine
-    # type fence may differ between A and B.
-    load_sizes_lazily = FolderImageSource.load_sizes_lazily
-
-    def __init__(self, delegate: _CountingFolderSource) -> None:
-        super().__init__(delegate.source_path)
-        self.delegate = delegate
-
-    def list_images(self) -> list[str]:
-        return self.delegate.list_images()
-
-    def open_image(self, image_id: str) -> Image.Image:
-        return self.delegate.open_image(image_id)
-
-    def open_qimage(self, image_id: str) -> QImage | None:
-        return self.delegate.open_qimage(image_id)
-
-    def open_qimage_at_most(
-        self,
-        image_id: str,
-        maximum_size: tuple[int, int],
-    ) -> tuple[QImage, tuple[int, int]] | None:
-        return self.delegate.open_qimage_at_most(image_id, maximum_size)
-
-    def display_path(self, image_id: str) -> str:
-        return self.delegate.display_path(image_id)
-
-    def file_size(self, image_id: str) -> int | None:
-        return self.delegate.file_size(image_id)
-
-    def logical_size(self, image_id: str) -> tuple[int, int] | None:
-        return self.delegate.logical_size(image_id)
-
-    def page_identity(self, image_id: str) -> str:
-        return self.delegate.page_identity(image_id)
-
-    def index_for_identity(self, identity: str) -> int:
-        return self.delegate.index_for_identity(identity)
-
-    def path_for_index(self, index: int) -> str | None:
-        return self.delegate.path_for_index(index)
-
-    def close(self) -> None:
-        self.delegate.close()
 
 
 @dataclass(frozen=True)
@@ -1272,112 +1220,6 @@ def _ready(
     )
 
 
-def _layout_action(
-    application: QApplication,
-    window: ViewerWindow,
-    probe: _ViewerProbe,
-    action: Callable[[], object],
-    *,
-    timeout: float,
-) -> dict[str, Any]:
-    page = window.presentation_state.displayed_page
-    if page is None:
-        raise AssertionError("layout scenario has no committed page")
-    image_id = window.model.image_id_at(page)
-    if image_id is None:
-        raise AssertionError("layout scenario page has no image identity")
-    snapshot = probe.begin()
-    offset = len(probe.events)
-    started = time.monotonic()
-    action()
-    handler = (time.monotonic() - started) * 1000
-    settled = _wait_quiet(application, window, probe, timeout=timeout)
-    if not settled:
-        raise TimeoutError("layout replacement did not settle")
-    _render_once(window)
-    application.processEvents()
-    _pump_until(
-        application,
-        lambda: _has_event(
-            probe, "content_painted", image_id, offset=offset
-        ),
-        timeout=timeout,
-        observer=probe.observe,
-    )
-    return probe.finish(
-        snapshot,
-        requested_ids=(image_id,),
-        final_id=image_id,
-        final_request_started_at=started,
-        handler_ms=(handler,),
-        settled=True,
-    )
-
-
-def _magnifier(
-    application: QApplication,
-    window: ViewerWindow,
-    probe: _ViewerProbe,
-    *,
-    timeout: float,
-) -> dict[str, Any]:
-    image = next(
-        (candidate for candidate in window.viewer._images if candidate.qimage),
-        None,
-    )
-    if image is None or image.qimage is None:
-        raise AssertionError("magnifier scenario requires a committed source")
-    snapshot = probe.begin()
-    offset = len(probe.events)
-    started = time.monotonic()
-    window.viewer.magnifier_selecting = True
-    window.viewer.magnifier_source_page = image.page_index
-    window.viewer._magnifier_source_image_id = image.image_id
-    window.viewer.magnifier_source_rect = QRectF(
-        0,
-        0,
-        max(1, image.qimage.width() // 2),
-        max(1, image.qimage.height() // 2),
-    )
-    # Legacy preview images upgrade to a full-resolution ImageCache source
-    # before the crop is rendered.  The real gesture records this normalized
-    # rectangle in _begin_magnifier_selection(); reproduce that contract here
-    # so the synthetic offscreen request can resume after the upgrade.
-    window.viewer._magnifier_source_normalized = QRectF(0.0, 0.0, 0.5, 0.5)
-    window.viewer._request_magnifier_render()
-    handler = (time.monotonic() - started) * 1000
-    _pump_until(
-        application,
-        lambda: (
-            window.viewer.magnifier_active
-            and window.viewer._magnifier_pixmap is not None
-        ),
-        timeout=timeout,
-        observer=probe.observe,
-    )
-    _render_once(window)
-    application.processEvents()
-    _pump_until(
-        application,
-        lambda: _has_event(
-            probe, "content_painted", image.image_id, offset=offset
-        ),
-        timeout=timeout,
-        observer=probe.observe,
-    )
-    settled = _wait_quiet(application, window, probe, timeout=timeout)
-    result = probe.finish(
-        snapshot,
-        requested_ids=(image.image_id,),
-        final_id=image.image_id,
-        final_request_started_at=started,
-        handler_ms=(handler,),
-        settled=settled,
-    )
-    window.viewer.cancel_magnifier()
-    return result
-
-
 def _switch_book(
     application: QApplication,
     window: ViewerWindow,
@@ -1518,7 +1360,7 @@ def _run_worker(args: argparse.Namespace) -> dict[str, Any]:
         recursive_folder: bool = False,
         sort_descending: bool = False,
         **_kwargs: object,
-    ) -> tuple[ImageSource, str | None]:
+    ) -> tuple[FolderImageSource, str | None]:
         target = Path(path)
         selected = str(target) if target.is_file() else None
         folder = target.parent if selected is not None else target
@@ -1528,10 +1370,7 @@ def _run_worker(args: argparse.Namespace) -> dict[str, Any]:
             recursive=recursive_folder,
             sort_descending=sort_descending,
         )
-        return (
-            _LegacyFolderAdapter(source) if case == _CASE_A else source,
-            selected,
-        )
+        return source, selected
 
     config = ConfigManager(
         Path(args.fixture_manifest).parent / f"config-{case}.json"
@@ -1606,16 +1445,10 @@ def _run_worker(args: argparse.Namespace) -> dict[str, Any]:
             folders["small"],
             timeout=float(args.timeout),
         )
-        if case == _CASE_A:
-            if session.viewer_runtime is not None or window._zip_runtime_active:
-                raise AssertionError("A did not select the legacy two-stage path")
-            if window.viewer._direct_display_mode:
-                raise AssertionError("A unexpectedly selected direct display")
-        else:
-            if not isinstance(session.viewer_runtime, FolderRasterBookRuntime):
-                raise AssertionError("B did not install FolderRasterBookRuntime")
-            if not window._zip_runtime_active or not window.viewer._direct_display_mode:
-                raise AssertionError("B did not select production direct display")
+        if not isinstance(session.viewer_runtime, FolderRasterBookRuntime):
+            raise AssertionError("production FolderRasterBookRuntime was not installed")
+        if not window._zip_runtime_active or not window.viewer._direct_display_mode:
+            raise AssertionError("production folder direct display was not selected")
 
         scenarios: dict[str, Any] = {
             "small": {
@@ -1667,56 +1500,6 @@ def _run_worker(args: argparse.Namespace) -> dict[str, Any]:
             ),
         }
 
-        _ensure_anchor(
-            application, window, probe, 1, timeout=float(args.timeout)
-        )
-        _clear_artifacts(window)
-        _execute(
-            application,
-            window,
-            probe,
-            window._refresh_view,
-            target_page=1,
-            timeout=float(args.timeout),
-        )
-        _wait_quiet(application, window, probe, timeout=float(args.timeout))
-        scenarios["layout"] = {}
-        scenarios["layout"]["resize"] = _layout_action(
-            application,
-            window,
-            probe,
-            lambda: window.resize(
-                max(320, int(args.viewport_width) - 180),
-                max(240, int(args.viewport_height) - 120),
-            ),
-            timeout=float(args.timeout),
-        )
-        scenarios["layout"]["rotation"] = _layout_action(
-            application,
-            window,
-            probe,
-            window.rotate_right,
-            timeout=float(args.timeout),
-        )
-        window.viewer.devicePixelRatioF = MethodType(
-            lambda _viewer: 2.0, window.viewer
-        )
-        scenarios["layout"]["dpi_change"] = _layout_action(
-            application,
-            window,
-            probe,
-            lambda: QApplication.sendEvent(
-                window.viewer, QEvent(QEvent.Type.DevicePixelRatioChange)
-            ),
-            timeout=float(args.timeout),
-        )
-        scenarios["layout"]["magnifier"] = _magnifier(
-            application,
-            window,
-            probe,
-            timeout=float(args.timeout),
-        )
-
         scenarios["book_switch_to_single"] = _switch_book(
             application,
             window,
@@ -1735,12 +1518,8 @@ def _run_worker(args: argparse.Namespace) -> dict[str, Any]:
         totals["close_time_ms"] = close_result["elapsed_ms"]
         return {
             "case": case,
-            "path": (
-                "ImageCache -> ViewerRenderTask -> prepared display"
-                if case == _CASE_A
-                else "FolderRasterBookRuntime -> direct atomic display"
-            ),
-            "production_runtime_required": case == _CASE_B,
+            "path": "FolderRasterBookRuntime -> direct atomic display",
+            "production_runtime_required": True,
             "scenarios": scenarios,
             "totals": totals,
             "shutdown": close_result,
@@ -1753,7 +1532,7 @@ def _run_worker(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _worker_command(args: argparse.Namespace, case: str) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(Path(__file__).resolve()),
         "--worker-case",
@@ -1769,6 +1548,7 @@ def _worker_command(args: argparse.Namespace, case: str) -> list[str]:
         "--timeout",
         str(args.timeout),
     ]
+    return command
 
 
 def _run_isolated(args: argparse.Namespace, case: str) -> dict[str, Any]:
@@ -1801,56 +1581,6 @@ def _run_isolated(args: argparse.Namespace, case: str) -> dict[str, Any]:
         ) from exc
 
 
-def _comparison(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
-    old = a["totals"]
-    new = b["totals"]
-    integer_metrics = (
-        "file_read_calls",
-        "file_read_bytes",
-        "observable_full_payload_copy_calls",
-        "observable_full_payload_copy_bytes",
-        "decode_calls",
-        "source_qimage_outputs",
-        "source_pil_outputs",
-        "pil_to_qimage_outputs",
-        "display_qimage_outputs",
-        "duplicate_decode_calls",
-        "transit_decode_calls",
-        "viewer_jobs",
-        "gui_callbacks",
-        "qpixmap_from_image",
-        "display_commits",
-        "content_paints",
-        "peak_sampled_cache_bytes",
-    )
-    differences = {
-        f"{name}_A_minus_B": int(old[name]) - int(new[name])
-        for name in integer_metrics
-    }
-    a_elapsed = float(old["scenario_elapsed_ms"])
-    b_elapsed = float(new["scenario_elapsed_ms"])
-    return {
-        **differences,
-        "scenario_elapsed_ms_A_minus_B": round(a_elapsed - b_elapsed, 3),
-        "scenario_elapsed_speedup_A_over_B": (
-            round(a_elapsed / b_elapsed, 3) if b_elapsed > 0 else None
-        ),
-        "close_time_ms_A_minus_B": round(
-            float(old["close_time_ms"]) - float(new["close_time_ms"]), 3
-        ),
-        "peak_sampled_working_set_delta_mib_A_minus_B": (
-            round(
-                float(old["peak_sampled_working_set_delta_mib"])
-                - float(new["peak_sampled_working_set_delta_mib"]),
-                3,
-            )
-            if old["peak_sampled_working_set_delta_mib"] is not None
-            and new["peak_sampled_working_set_delta_mib"] is not None
-            else None
-        ),
-    }
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pages", type=int, default=8)
@@ -1866,7 +1596,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument(
-        "--worker-case", choices=(_CASE_A, _CASE_B), help=argparse.SUPPRESS
+        "--worker-case", choices=(_CASE_CURRENT,), help=argparse.SUPPRESS
     )
     parser.add_argument("--fixture-manifest", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -1919,19 +1649,28 @@ def main() -> int:
             encoding="utf-8",
         )
         args.fixture_manifest = manifest
-        old_case = _run_isolated(args, _CASE_A)
-        new_case = _run_isolated(args, _CASE_B)
+        current_case = _run_isolated(args, _CASE_CURRENT)
         report = {
-            "schema_version": 1,
-            "benchmark": "Folder ImageCache two-stage A / FolderRasterBookRuntime B",
+            "schema_version": 2,
+            "benchmark": "FolderRasterBookRuntime production path",
             "qt_platform": "offscreen",
             "fixture": fixture,
+            "retired_cases": {
+                "legacy-two-stage": (
+                    "retired: benchmark-only generic ImageSource adapter; "
+                    "production folder books use FolderRasterBookRuntime"
+                )
+            },
+            "retired_scenarios": {
+                "legacy-layout-resize-rotation-dpi-magnifier": (
+                    "retired from this navigation benchmark because its old "
+                    "content-painted waits modeled the removed two-stage path; "
+                    "current layout and magnifier contracts are covered by "
+                    "focused Viewer tests"
+                )
+            },
             "measurement_scope": {
-                "A": (
-                    "benchmark-only non-Folder ImageSource adapter around the "
-                    "same FolderImageSource decoder; no production fallback flag"
-                ),
-                "B": (
+                "current": (
                     "normal production FolderImageSource selection; worker fails "
                     "unless FolderRasterBookRuntime and direct display are active"
                 ),
@@ -1944,8 +1683,8 @@ def main() -> int:
                     "payload handoffs; implicit Qt/Python sharing is not claimed"
                 ),
                 "qpixmap": (
-                    "runtime QPixmap.fromImage metrics plus successful legacy or "
-                    "magnifier render callbacks"
+                    "runtime QPixmap.fromImage metrics on the maintained folder "
+                    "navigation path"
                 ),
                 "paint": (
                     "contentPainted/framePainted caused by explicit offscreen "
@@ -1953,12 +1692,10 @@ def main() -> int:
                 ),
                 "memory": (
                     "Windows working-set samples at about 5 ms; process peak is "
-                    "process-lifetime-wide and each A/B case is isolated"
+                    "process-lifetime-wide and the maintained worker is isolated"
                 ),
             },
-            "A": old_case,
-            "B": new_case,
-            "comparison": _comparison(old_case, new_case),
+            "current": current_case,
         }
     encoded = json.dumps(report, ensure_ascii=False, indent=2)
     print(encoded)

@@ -4,9 +4,11 @@ import hashlib
 import os
 from pathlib import Path
 
+import pytest
 from PySide6.QtCore import QRect, QPoint
 from PySide6.QtGui import QImage
 
+from app.browser_filter import BrowserFilterState, RatingFilterMode
 from app.browser_item_delegate import BrowserItemDelegate
 from app.browser_model import BrowserItem, BrowserItemKind, BrowserItemModel
 from app.browser_sort import BrowserSortKey, BrowserSortOrder
@@ -45,6 +47,43 @@ def test_malformed_rating_is_an_ordinary_filename() -> None:
         assert parsed.matched is False
         assert parsed.rating is None
         assert parsed.display_name == name
+
+
+@pytest.mark.parametrize(
+    ("name", "rating", "expected_set", "expected_clear"),
+    (
+        ("Folder", None, "Folder {zpi$r=3}", "Folder"),
+        ("Folder.Name", None, "Folder.Name {zpi$r=3}", "Folder.Name"),
+        ("Folder {zpi$r=3}", 3, "Folder {zpi$r=3}", "Folder"),
+        (
+            "Folder {zpi$t=foo}",
+            None,
+            "Folder {zpi$r=3;t=foo}",
+            "Folder {zpi$t=foo}",
+        ),
+        (
+            "Folder {zpi$r=3;t=foo}",
+            3,
+            "Folder {zpi$r=3;t=foo}",
+            "Folder {zpi$t=foo}",
+        ),
+    ),
+)
+def test_zippla_folder_grammar_preserves_dots_and_unrelated_metadata(
+    name: str,
+    rating: int | None,
+    expected_set: str,
+    expected_clear: str,
+) -> None:
+    parsed = ZipPlaFilenameMetadata.parse(name)
+
+    assert parsed.rating == rating
+    assert parsed.with_rating(3).serialized_path(is_directory=True).name == (
+        expected_set
+    )
+    assert parsed.with_rating(None).serialized_path(is_directory=True).name == (
+        expected_clear
+    )
 
 
 def test_rating_rename_preserves_timestamp_and_content(tmp_path: Path) -> None:
@@ -109,6 +148,42 @@ def test_rating_sort_keeps_unrated_last_in_both_directions(tmp_path: Path) -> No
 
     model.configure_sort(BrowserSortKey.RATING, BrowserSortOrder.DESCENDING, False)
     assert [item.rating for item in model.items] == [5, 3, 1, None]
+
+
+def test_folder_ratings_participate_in_sort_and_all_rating_filters(
+    tmp_path: Path,
+) -> None:
+    rated = BrowserItem(
+        "rated folder",
+        tmp_path / "rated folder {zpi$r=4}",
+        BrowserItemKind.FOLDER,
+        1.0,
+        rating=4,
+    )
+    unrated = BrowserItem(
+        "unrated folder",
+        tmp_path / "unrated folder",
+        BrowserItemKind.FOLDER,
+        1.0,
+        rating=None,
+    )
+    model = BrowserItemModel()
+    model.set_items([unrated, rated])
+
+    model.configure_sort(BrowserSortKey.RATING, BrowserSortOrder.ASCENDING, False)
+    assert [item.rating for item in model.items] == [4, None]
+    assert model.configure_filter(
+        BrowserFilterState(rating_mode=RatingFilterMode.AT_LEAST, rating_reference=3)
+    )
+    assert [item.path for item in model.items] == [rated.path]
+    assert model.configure_filter(
+        BrowserFilterState(rating_mode=RatingFilterMode.EQUAL, rating_reference=4)
+    )
+    assert [item.path for item in model.items] == [rated.path]
+    assert model.configure_filter(
+        BrowserFilterState(rating_mode=RatingFilterMode.UNRATED)
+    )
+    assert [item.path for item in model.items] == [unrated.path]
 
 
 def test_rating_model_relocation_retains_thumbnail_and_dimensions(tmp_path: Path) -> None:

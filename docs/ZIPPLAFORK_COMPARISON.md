@@ -4604,8 +4604,9 @@ The rating source was re-audited at fixed revision
 `07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`. `source/ZipPla/ZipPlaInfo.cs`
 class `ZipPlaInfo` constructs `fileNameRegex`, parses the first valid block in
 its constructor, exposes `Rating`, serializes known values with
-`GetInfoString`, and places the canonical block before the final extension in
-`GetPathOfCurrentInfo`. The grammar is a case-insensitive, optional
+`GetInfoString`, and places the canonical block before the final extension for
+files or after the whole name for directories in
+`GetPathOfCurrentInfo(bool isDir)`. The grammar is a case-insensitive, optional
 single-leading-space block `{zpi$...}`. Known semicolon-separated parameters
 are serialized in `c`, `b`, `r`, `t`, `d` order. Rating is `r=1` through
 `r=5`; no token means unrated, and zero is not a separately persisted state.
@@ -4619,8 +4620,8 @@ LightSlateGray over a black background. It also draws before thumbnail loading
 has completed. Horizontal position maps linearly and clamps to 1..5. Hover is
 preview-only; left click changes the pointed item even when other rows are
 selected, middle click clears it, and context-menu commands apply none/1..5 to
-all selected items. Rating sorting leaves unrated entries behind rated entries
-in both directions.
+all selected items, including directories. Rating sorting leaves unrated
+entries behind rated entries in both directions.
 
 The same `CatalogForm.cs` registers `SortMode.RatingInAsc` and
 `SortMode.RatingInDesc` as ordinary `cbSortBy` entries beside name, created,
@@ -4634,11 +4635,13 @@ and `setNonVolatilitySort` mirrors that mode to the Rating header glyph.
 ### 24.2 NivisViewer Hybrid implementation
 
 `app/zippla_filename_metadata.py` is a direct Python structural translation of
-the parser/serializer contract above. `app/rating_rename_service.py` performs a
-same-directory rename only: it checks collision, never rewrites payload bytes,
-verifies nanosecond mtime after rename, and restores only if the backend
-changed it. Browser scanning parses the filename without opening the file and
-separates physical path from the metadata-free display name.
+the parser/serializer contract above. `app/rating_rename_service.py` performs
+the file-rating same-directory rename: it checks collision, never rewrites
+payload bytes, verifies nanosecond mtime after rename, and restores only if the
+backend changed it. Directory ratings use the existing
+`FileOperationCoordinator` rename authority described in 24.3.1. Browser
+scanning parses the filename without opening the item and separates physical
+path from the metadata-free display name.
 
 `BrowserItemModel` owns the parsed value, preview value and rating sort. Its
 rating-rename relocation changes the path identity in place, migrates the
@@ -4660,12 +4663,12 @@ filesystem.
 `BrowserItemDelegate` provides a DPR-aware upper-left overlay, five-way hit
 test and hover preview while preserving IconMode virtualization. A direct
 left/middle click is consumed before Qt changes the multiselection, so it
-changes that one file only. The context menu is the explicit batch authority.
-Files owned by a live Viewer use the existing affected-Viewer confirmation and
-close contract; the current immutable Folder book topology has no safe live
-path-relocation API. NivisViewer has no filesystem watcher in this Browser, so
-there is no duplicate self-event to suppress; the model is updated
-synchronously and a later explicit refresh reads the filename authority.
+changes that one Browser item only; this includes a child folder. The context
+menu is the explicit batch authority for files and folders. Affected live
+Viewers use the existing confirmation and close contract before either rename
+path. NivisViewer has no filesystem watcher in this Browser, so there is no
+duplicate self-event to suppress; file results update the model synchronously,
+and folder coordinator results update it on completion without a rescan.
 
 The status bar's permanent right-hand `browser_file_detail_label` contains
 only file size and logical image dimensions. Dimensions reuse the Browser
@@ -4688,6 +4691,120 @@ AGPL-3.0-or-later. Original notices and license text remain in
 `THIRD_PARTY_NOTICES.md`. Qt delegate painting, asynchronous header probing,
 model cache relocation, stale fences and status-bar placement are
 NivisViewer-specific modernizations.
+
+#### 24.3.1 Full-rectangle folder fallback and directory rating metadata
+
+This comparison is fixed to `himamon/ZipPlaFork` revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`. The relevant upstream source is:
+
+- `source/ZipPla/CatalogForm.cs`: `setColors`,
+  `tvCatalog_ThumbnailPaint`, `drawFileImage`, `drawFileIconImage`,
+  `SetRating`, `SetSelectedArchiveRating`, and nested
+  `ThumbViewer.getThumbnailRectangle`/`ThumbViewer.DrawItem`;
+- `source/ZipPla/ZipPlaInfo.cs`: constructor parsing, `Rating`,
+  `GetInfoString`, and `GetPathOfCurrentInfo(bool isDir)`.
+
+These upstream files and the behavior translated below are
+AGPL-3.0-or-later-derived. ZipPlaFork copyright/license notices and the license
+text remain in `licenses/ZipPlaFork/About.txt`,
+`licenses/ZipPlaFork/AGPL.txt`, and `THIRD_PARTY_NOTICES.md`.
+
+##### 24.3.1.1 Exact fallback geometry and color
+
+`ThumbViewer.getThumbnailRectangle` computes one `thumbWidthCurrent` by
+`thumbHeight` rectangle. `ThumbViewer.DrawItem` creates a canvas of exactly
+that size, fills its entire area with `BackColorBrush`, then draws a real or
+dummy image unscaled into the same rectangle. `CatalogForm.setColors` calls
+`tvCatalog.SetBackAndForeColor(Color.Black)`, so the operational Catalog
+default is solid black. For the not-yet/error branch,
+`tvCatalog_ThumbnailPaint` passes that same `e.ThumbnailRectangle` to
+`drawFileImage`; the fixed-revision method immediately returns, so it does not
+add a smaller card or large icon. The optional lower-left associated icon is
+drawn separately by `drawFileIconImage` after a completed thumbnail.
+
+`BrowserItemDelegate` now derives one physical-pixel-snapped
+`thumbnail_content_rect` from `BrowserGridMetrics.thumbnail_frame_rect` and
+uses it both as the maximum target for a successfully loaded thumbnail and as
+the placeholder canvas. It preserves the existing real-image geometry: four
+logical pixels inside the frame in fit mode and one in center-crop mode, with
+edges snapped to physical pixels. Thus the placeholder has no independently
+computed edge and cannot bleed outside the real-image target. There is no
+placeholder-specific inset, rounded edge, internal outline, shadow, or back
+plate. The normal thumbnail-frame outline remains common to placeholder and
+real-thumbnail items. Automatic/default resolves to `#000000`;
+a custom `#RRGGBB` value is persisted as
+`browser_folder_fallback_background`, and restore-default serializes `auto`.
+An open Browser applies either value through delegate configuration and a
+viewport repaint only. Thumbnail provider generation, requests, decoded image
+caches, and directory scan generation are not changed.
+
+NivisViewer retains its large folder icon as a usability modernization. The
+icon target is aspect-fitted within at most 50% of each shared content-rectangle
+dimension and centered from that rectangle at 100%, 125%, 150%, and 200%
+device scaling. Broken/unreadable archive
+states with no valid image use the same canvas and icon layout authority; the
+existing error badge remains separate. The former translucent lower-left plate
+was NivisViewer's own `_paint_type_icon` operation: a 105-alpha black brush
+painted a rounded rectangle expanded two logical pixels around the badge.
+That operation alone is removed. The associated image is still drawn at the
+same lower-left target and its source alpha remains authoritative.
+
+##### 24.3.1.2 Exact directory rating grammar
+
+`CatalogForm.SetRating` and `SetSelectedArchiveRating` construct
+`ZipPlaInfo`, assign `Rating`, and call
+`GetPathOfCurrentInfo(name.Last() == Path.DirectorySeparatorChar)`. Folder
+rating is therefore part of the fixed-revision Catalog behavior, including
+multi-selection. `ZipPlaInfo.Rating` accepts null or integers 1 through 5.
+The case-insensitive metadata block consumes at most one leading space and
+semicolon-separated recognized parameters; serialization follows prototype
+order `c`, `b`, `r`, `t`, `d`.
+
+The important directory rule is the `isDir` branch of
+`GetPathOfCurrentInfo`: it removes metadata from `Path.GetFileName(path)` and
+uses no suffix. The file branch instead separates
+`Path.GetFileNameWithoutExtension` and `Path.GetExtension`. Consequently a
+directory dot is ordinary name content, not an extension. NivisViewer's
+existing `ZipPlaFilenameMetadata` parser/serializer is reused with
+`is_directory=True`; no folder-rating database exists. Representative results
+are:
+
+- `Folder` -> `Folder {zpi$r=3}`;
+- `Folder.Name` -> `Folder.Name {zpi$r=3}`;
+- `Folder {zpi$r=3}` -> clear -> `Folder`;
+- `Folder {zpi$t=foo}` -> `Folder {zpi$r=3;t=foo}`;
+- `Folder {zpi$r=3;t=foo}` -> clear -> `Folder {zpi$t=foo}`.
+
+Changing a rating thus canonicalizes known parameters without losing cover,
+binding, tags, or direction; clearing removes only `r` and removes the block
+only if no other known parameter remains.
+
+##### 24.3.1.3 NivisViewer rename and relocation mapping
+
+Folder rating does not call the file-only `RatingRenameService` and does not
+introduce another `os.rename` path. `BrowserWindow.set_rating_for_paths`
+serializes the destination name, then submits sequential
+`FileOperationKind.RENAME` requests through the existing
+`FileOperationCoordinator`/`FileOperationService`. This retains existing
+Windows filename validation and collision policy. Coordinator completion
+relocates the full `MetadataStore` tree, including child metadata and Browser
+bookmarks; Browser completion relocates `BrowserNavigationHistory`, including
+timeline paths, selected paths, and recent-directory entries.
+
+Successful destinations are then applied to the existing
+`BrowserItemModel.apply_rating_renames` authority. That method relocates
+path-keyed thumbnail/dimension state, reruns rating filter/sort, and publishes
+one model reset. The captured Browser selection, current item, viewport anchor,
+and scroll values are remapped through the same replacement list and restored
+with the existing minimal-movement policy. No directory rescan or thumbnail
+decode/request is initiated by the rating update.
+
+Before a rename, `FileOperationService` records the source timestamp. After a
+successful rename it restores the original `st_mtime_ns` when the platform
+changed it, using a no-follow `os.utime`; an inability to restore is logged as
+a best-effort warning because the filesystem rename has already succeeded.
+The operation never opens or rewrites descendants, so child bytes and child
+timestamps are not modified.
 
 ### 24.4 Browser location breadcrumb and timeline projection (2026-08-22)
 
@@ -4974,16 +5091,19 @@ additional label-free clear gesture. Search and sort state remain unchanged.
 ZipPlaFork's `CatalogForm.cs` `ThumbViewer` paint path distinguishes
 `LoadResult.NotYet`/error from completed thumbnails and uses
 `drawFileIconImage` for an optional small associated icon. Its large
-`drawFileImage` fallback is disabled by an early return at this revision, so
-there is no modern neutral card suitable for direct adoption. NivisViewer adds
-one in `BrowserItemDelegate` only when a folder has no `ThumbnailImageRole`:
-a flat square thumbnail canvas blended solely from the active palette's Base,
-AlternateBase, Mid and Midlight roles, followed by the existing folder icon.
-There is no rounded corner, offset back plate or shadow. Pending/loading
-folders may show the stable canvas;
-a completed preview takes the existing image branch and removes it. Image
-files never use the folder card. This is delegate-only paint: it adds no scan,
-read, decode, thumbnail request, per-folder pixmap or cache-key state.
+`drawFileImage` fallback is disabled by an early return at this revision.
+`ThumbViewer.DrawItem`, however, first fills the complete rectangle returned
+by `getThumbnailRectangle` with `BackColorBrush`, and `setColors` supplies
+black through `tvCatalog.SetBackAndForeColor(Color.Black)`. NivisViewer uses
+that black canvas as its automatic folder-fallback reference. The existing
+centered folder icon is a deliberate Qt addition; it is painted directly on
+the same square-cornered, physical-pixel-snapped maximum image target used by
+the active fit or center-crop mode, with no placeholder-specific inset,
+rounded card, internal border, back plate or shadow. Pending/loading folders may show the
+stable fallback; broken/unreadable archives use it when their thumbnail has no
+valid image; a completed preview takes the existing image branch. This is
+delegate-only paint: it adds no scan, read, decode, thumbnail request,
+per-folder pixmap or cache-key state.
 
 The ZipPlaFork comparison above is against repository
 `himamon/ZipPlaFork`, fixed revision
@@ -5072,11 +5192,24 @@ For unavailable thumbnails, fixed-revision `CatalogForm.cs`
 (`:6478-6499`) places an optional small associated icon at bottom-left after a
 real thumbnail. Its large `drawFileImage` fallback (`:6546-6588`) returns
 immediately at this revision because the old loader state could otherwise
-overlay icons on completed thumbnails. NivisViewer keeps its clearer
-pending/loading/no-preview versus completed-preview state boundary, but
-renders the fallback as a theme-aware square canvas with one subtle border and
-the existing centered folder icon. This remains delegate-only paint and adds
-no filesystem access, decode, thumbnail request or cache entry.
+overlay icons on completed thumbnails. The underlying `ThumbViewer.DrawItem`
+canvas is nevertheless the exact thumbnail rectangle and is filled black by
+the Catalog color setup. NivisViewer keeps its clearer pending/loading/no-
+preview versus completed-preview state boundary and now uses the real
+thumbnail's shared content rectangle, black in automatic mode, plus its
+centered large icon. Broken/unreadable archives enter the same shared
+placeholder branch. No extra internal border is added; the normal
+thumbnail-frame outline is shared with real thumbnails. This remains
+delegate-only paint and adds no filesystem access, decode, thumbnail request
+or cache entry.
+
+Filter changes also preserve selected identities rather than proxy row
+numbers. If a selected path becomes invisible, restoration clears that path
+without manufacturing a replacement selection; the captured visible anchor
+may still preserve viewport offset. A real selection made while filtered is
+captured by the next transition and remains authoritative when the filter is
+cleared. This corrects NivisViewer's generic list-view restoration rather than
+adding a rating-filter-specific selection system.
 
 All source references in this subsection are from repository
 `himamon/ZipPlaFork`, fixed revision

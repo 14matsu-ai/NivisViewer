@@ -8,9 +8,12 @@ from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import QListView, QStyle, QStyleOptionViewItem
 
 from app.browser_item_delegate import (
+    BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR,
+    BROWSER_PLACEHOLDER_ICON_MAX_RATIO,
     BrowserItemDelegate,
     browser_item_type_key,
     quantize_thumbnail_size,
+    thumbnail_content_rect,
     thumbnail_image_rects,
     thumbnail_rect_for_cell,
     type_badge_rect,
@@ -62,6 +65,27 @@ class FixedShellIconProvider:
 
     def icon_for(self, _item):
         return self.icon
+
+
+class AlphaShellIconProvider:
+    def image_for(
+        self,
+        _item,
+        *,
+        logical_size: int,
+        device_pixel_ratio: float,
+    ) -> QImage:
+        size = max(1, round(logical_size * device_pixel_ratio))
+        image = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent)
+        inset = max(1, size // 4)
+        painter = QPainter(image)
+        painter.fillRect(
+            QRect(inset, inset, size - inset * 2, size - inset * 2),
+            QColor("#e03030"),
+        )
+        painter.end()
+        return image
 
 
 def make_item(path: Path, kind: BrowserItemKind) -> BrowserItem:
@@ -164,7 +188,7 @@ def test_center_crop_delegate_fills_frame_from_image_center(qapp):
 
 
 @pytest.mark.parametrize("dark", [False, True])
-def test_folder_without_preview_paints_square_canvas_until_preview_arrives(
+def test_folder_without_preview_uses_exact_black_thumbnail_rectangle(
     qapp,
     tmp_path,
     dark,
@@ -201,7 +225,8 @@ def test_folder_without_preview_paints_square_canvas_until_preview_arrives(
     option.palette = palette
     option.state = QStyle.StateFlag.State_Enabled
     thumbnail = delegate.grid_metrics.thumbnail_frame_rect(option.rect)
-    probe = thumbnail.topLeft() + QPoint(12, 12)
+    content = thumbnail_content_rect(thumbnail).toRect()
+    probe = content.topLeft() + QPoint(1, 1)
 
     def render(row: int, *, selected: bool = False) -> QImage:
         canvas = QImage(
@@ -222,27 +247,241 @@ def test_folder_without_preview_paints_square_canvas_until_preview_arrives(
         return canvas
 
     pending = render(0)
-    assert pending.pixelColor(probe) != palette.base().color()
-    assert pending.pixelColor(thumbnail.topLeft() + QPoint(7, 7)) != (
-        palette.base().color()
+    assert pending.pixelColor(probe) == QColor(
+        BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR
+    )
+    assert pending.pixelColor(thumbnail.topLeft() - QPoint(1, 0)) == (
+        palette.window().color()
     )
     assert model.data(model.index(0, 0), model.ThumbnailImageRole) is None
-    assert delegate._uses_folder_fallback_canvas(folder, None)
-    assert not delegate._uses_folder_fallback_canvas(image_file, None)
+    assert delegate._uses_placeholder_canvas(folder, None)
+    assert not delegate._uses_placeholder_canvas(image_file, None)
 
     model.set_preview_status(folder.path, "loading")
     loading = render(0, selected=True)
-    assert loading.pixelColor(probe) != palette.base().color()
+    assert loading.pixelColor(probe) == QColor(
+        BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR
+    )
 
     preview = QImage(
         delegate.frame_size,
         QImage.Format.Format_RGB32,
     )
     preview.fill(QColor("#20a050"))
-    assert not delegate._uses_folder_fallback_canvas(folder, preview)
+    assert not delegate._uses_placeholder_canvas(folder, preview)
     model.set_thumbnail_image(folder.path, preview)
     completed = render(0)
-    assert completed.pixelColor(probe) == QColor("#20a050")
+    assert completed.pixelColor(thumbnail.center()) == QColor("#20a050")
+
+
+@pytest.mark.parametrize("device_pixel_ratio", [1.0, 1.25, 1.5, 2.0])
+@pytest.mark.parametrize("background", ["auto", "#31597d"])
+@pytest.mark.parametrize("display_mode", ["fit", "center_crop"])
+def test_folder_fallback_fill_matches_normal_thumbnail_rect_at_all_dpi(
+    qapp,
+    device_pixel_ratio: float,
+    background: str,
+    display_mode: str,
+) -> None:
+    del qapp
+    delegate = BrowserItemDelegate(
+        folder_fallback_background=background,
+        thumbnail_display_mode=display_mode,
+    )
+    logical_size = QSize(120, 96)
+    physical_size = QSize(
+        round(logical_size.width() * device_pixel_ratio),
+        round(logical_size.height() * device_pixel_ratio),
+    )
+    actual = QImage(physical_size, QImage.Format.Format_ARGB32_Premultiplied)
+    expected = QImage(physical_size, QImage.Format.Format_ARGB32_Premultiplied)
+    actual.setDevicePixelRatio(device_pixel_ratio)
+    expected.setDevicePixelRatio(device_pixel_ratio)
+    actual.fill(QColor("#d020e0"))
+    expected.fill(QColor("#d020e0"))
+    thumbnail = QRect(17, 13, 73, 61)
+
+    content = thumbnail_content_rect(
+        thumbnail,
+        display_mode=display_mode,
+        device_pixel_ratio=device_pixel_ratio,
+    )
+    matching_image_size = QSize(
+        round(content.width() * device_pixel_ratio),
+        round(content.height() * device_pixel_ratio),
+    )
+    real_target, _source = thumbnail_image_rects(
+        thumbnail,
+        matching_image_size,
+        display_mode,
+        device_pixel_ratio=device_pixel_ratio,
+    )
+    assert content == real_target
+    painter = QPainter(actual)
+    delegate._paint_placeholder_canvas(painter, content)
+    painter.end()
+    painter = QPainter(expected)
+    painter.fillRect(
+        content,
+        QColor(
+            BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR
+            if background == "auto"
+            else background
+        ),
+    )
+    painter.end()
+
+    assert actual == expected
+
+
+@pytest.mark.parametrize("background", ["auto", "#31597d"])
+def test_broken_archive_uses_shared_placeholder_canvas(
+    qapp,
+    tmp_path: Path,
+    background: str,
+) -> None:
+    delegate = BrowserItemDelegate(
+        thumbnail_size=180,
+        density=BrowserDisplayDensity.STANDARD,
+        folder_fallback_background=background,
+        shell_icon_provider=AlphaShellIconProvider(),
+    )
+    archive = make_item(tmp_path / "broken.cbz", BrowserItemKind.ARCHIVE)
+    model = BrowserItemModel()
+    model.set_items([archive])
+    fallback = QPixmap(30, 20)
+    fallback.fill(QColor("#d6a928"))
+    model.set_fallback_icons({BrowserItemKind.ARCHIVE: QIcon(fallback)})
+    assert model.set_thumbnail_error(archive.path, "unreadable archive")
+    option = QStyleOptionViewItem()
+    option.rect = QRect(QPoint(), delegate.cell_size)
+    option.palette = qapp.palette()
+    option.state = QStyle.StateFlag.State_Enabled
+    thumbnail = delegate.grid_metrics.thumbnail_frame_rect(option.rect)
+    content = thumbnail_content_rect(
+        thumbnail,
+        display_mode=delegate.thumbnail_display_mode,
+    ).toRect()
+    expected = QColor(
+        BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR
+        if background == "auto"
+        else background
+    )
+    canvas = QImage(
+        delegate.cell_size,
+        QImage.Format.Format_ARGB32_Premultiplied,
+    )
+    canvas.fill(option.palette.window().color())
+
+    painter = QPainter(canvas)
+    delegate.paint(painter, option, model.index(0, 0))
+    painter.end()
+
+    assert delegate._uses_placeholder_canvas(
+        archive,
+        None,
+        "unreadable archive",
+    )
+    assert canvas.pixelColor(content.bottomRight() - QPoint(2, 2)) == expected
+    assert canvas.pixelColor(
+        QPoint(thumbnail.left(), thumbnail.center().y())
+    ) != expected
+
+
+@pytest.mark.parametrize("device_pixel_ratio", [1.0, 1.25, 1.5, 2.0])
+def test_large_placeholder_icon_is_modestly_sized_and_centered_at_all_dpi(
+    qapp,
+    tmp_path: Path,
+    device_pixel_ratio: float,
+) -> None:
+    del tmp_path
+    delegate = BrowserItemDelegate()
+    thumbnail = QRect(11, 7, 81, 67)
+    content = thumbnail_content_rect(
+        thumbnail,
+        display_mode=delegate.thumbnail_display_mode,
+        device_pixel_ratio=device_pixel_ratio,
+    )
+    physical_size = QSize(
+        round(110 * device_pixel_ratio),
+        round(90 * device_pixel_ratio),
+    )
+    canvas = QImage(physical_size, QImage.Format.Format_ARGB32_Premultiplied)
+    canvas.setDevicePixelRatio(device_pixel_ratio)
+    canvas.fill(Qt.GlobalColor.transparent)
+    option = QStyleOptionViewItem()
+    option.state = QStyle.StateFlag.State_Enabled
+    pixmap = QPixmap(30, 18)
+    pixmap.fill(QColor("#e0b020"))
+    icon = QIcon(pixmap)
+
+    painter = QPainter(canvas)
+    delegate._paint_fallback_icon(painter, content, icon, option)
+    painter.end()
+
+    opaque = [
+        QPoint(x, y)
+        for y in range(canvas.height())
+        for x in range(canvas.width())
+        if canvas.pixelColor(x, y).alpha() > 0
+    ]
+    assert opaque
+    left = min(point.x() for point in opaque) / device_pixel_ratio
+    right = (max(point.x() for point in opaque) + 1) / device_pixel_ratio
+    top = min(point.y() for point in opaque) / device_pixel_ratio
+    bottom = (max(point.y() for point in opaque) + 1) / device_pixel_ratio
+    painted_width = right - left
+    painted_height = bottom - top
+    assert (left + right) / 2 == pytest.approx(content.center().x(), abs=1.0)
+    assert (top + bottom) / 2 == pytest.approx(content.center().y(), abs=1.0)
+    assert painted_width == pytest.approx(
+        content.width() * BROWSER_PLACEHOLDER_ICON_MAX_RATIO,
+        abs=1.0,
+    )
+    assert painted_height <= (
+        content.height() * BROWSER_PLACEHOLDER_ICON_MAX_RATIO
+        + 1.0 / device_pixel_ratio
+    )
+    assert painted_width < content.width() - 8
+    assert painted_height < content.height() - 8
+
+
+@pytest.mark.parametrize("device_pixel_ratio", [1.0, 1.25, 1.5, 2.0])
+def test_type_icon_keeps_alpha_without_translucent_backing_plate(
+    qapp,
+    tmp_path: Path,
+    device_pixel_ratio: float,
+) -> None:
+    del qapp
+    item = make_item(tmp_path / "book.pdf", BrowserItemKind.PDF)
+    delegate = BrowserItemDelegate(shell_icon_provider=AlphaShellIconProvider())
+    thumbnail = QRect(12, 9, 80, 80)
+    logical_size = QSize(110, 105)
+    canvas = QImage(
+        QSize(
+            round(logical_size.width() * device_pixel_ratio),
+            round(logical_size.height() * device_pixel_ratio),
+        ),
+        QImage.Format.Format_ARGB32_Premultiplied,
+    )
+    canvas.setDevicePixelRatio(device_pixel_ratio)
+    canvas.fill(QColor("white"))
+
+    painter = QPainter(canvas)
+    delegate._paint_type_icon(painter, thumbnail, item)
+    painter.end()
+
+    badge = type_badge_rect(thumbnail, 18)
+    outside_icon = QPoint(
+        round((badge.left() + 1) * device_pixel_ratio),
+        round((badge.top() + 1) * device_pixel_ratio),
+    )
+    icon_center = QPoint(
+        round(badge.center().x() * device_pixel_ratio),
+        round(badge.center().y() * device_pixel_ratio),
+    )
+    assert canvas.pixelColor(outside_icon) == QColor("white")
+    assert canvas.pixelColor(icon_center).red() > 180
 
 
 def test_type_badges_distinguish_supported_item_types_and_are_bottom_left(tmp_path):
@@ -395,6 +634,36 @@ def test_browser_display_mode_repaints_current_images_and_uses_new_cache_variant
         window.item_model.index(0, 0).data(BrowserItemModel.ThumbnailImageRole),
         QImage,
     )
+    window.close()
+    qapp.processEvents()
+
+
+def test_folder_fallback_color_change_is_repaint_only(
+    tmp_path: Path,
+    qapp,
+) -> None:
+    provider = RecordingThumbnailProvider()
+    window = make_window(tmp_path, qapp, provider=provider)
+    folder = make_item(tmp_path / "一覧" / "folder", BrowserItemKind.FOLDER)
+    window.item_model.set_items([folder])
+    window._thumbnail_request_timer.stop()
+    provider.requests.clear()
+    thumbnail_generation = provider.generation
+    scan_generation = window._scan_generation
+
+    window.config.apply({"browser_folder_fallback_background": "#31597d"})
+    qapp.processEvents()
+
+    assert window.item_delegate.folder_fallback_background_color() == QColor(
+        "#31597d"
+    )
+    assert provider.generation == thumbnail_generation
+    assert window._scan_generation == scan_generation
+    assert provider.requests == []
+    assert window.item_model.data(
+        window.item_model.index(0, 0),
+        BrowserItemModel.ThumbnailImageRole,
+    ) is None
     window.close()
     qapp.processEvents()
 

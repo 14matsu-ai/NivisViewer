@@ -30,6 +30,7 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
     assert manager.data["browser_sort_order"] == "ascending"
     assert manager.data["browser_folders_first"] is True
     assert manager.data["browser_display_density"] == "standard"
+    assert manager.data["browser_folder_fallback_background"] == "auto"
     assert manager.data["browser_location_history_limit"] == 50
     assert manager.data["browser_search_history_limit"] == 50
     assert manager.data["browser_search_history"] == []
@@ -361,6 +362,27 @@ def test_thumbnail_quality_settings_are_normalized_and_persisted(
     )
     assert manager.get("thumbnail_quality_mode") == "auto"
     assert manager.get("thumbnail_cache_max_edge") == 2048
+
+
+def test_folder_fallback_background_round_trips_and_invalid_values_restore_auto(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "folder-fallback-color.json"
+    manager = ConfigManager(path)
+    manager.load()
+    manager.apply(
+        {"browser_folder_fallback_background": "#31597D"},
+        save=True,
+    )
+
+    assert ConfigManager(path).load()["browser_folder_fallback_background"] == (
+        "#31597d"
+    )
+
+    manager.apply({"browser_folder_fallback_background": "not-a-color"})
+    assert manager.get("browser_folder_fallback_background") == "auto"
+    manager.apply({"browser_folder_fallback_background": "auto"})
+    assert manager.get("browser_folder_fallback_background") == "auto"
 
 
 def test_browser_setting_values_are_not_shared_between_instances(

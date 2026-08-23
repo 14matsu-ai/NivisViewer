@@ -600,6 +600,10 @@ class FileOperationService:
         new_name: str | None,
         request: FileOperationRequest | None = None,
     ) -> FileOperationItemResult:
+        try:
+            source_stat = os.stat(source, follow_symlinks=False)
+        except OSError:
+            source_stat = None
         validation = validate_windows_filename(new_name or "")
         if not validation.valid:
             return self._failure(
@@ -654,6 +658,28 @@ class FileOperationService:
                 os.rename(source, destination)
         except BaseException as exc:
             return self._exception_failure(source, destination, exc)
+        if source_stat is not None:
+            try:
+                destination_stat = os.stat(destination, follow_symlinks=False)
+                if destination_stat.st_mtime_ns != source_stat.st_mtime_ns:
+                    os.utime(
+                        destination,
+                        ns=(
+                            destination_stat.st_atime_ns,
+                            source_stat.st_mtime_ns,
+                        ),
+                        follow_symlinks=False,
+                    )
+            except (OSError, NotImplementedError, ValueError) as exc:
+                # The rename is already complete. Timestamp restoration is a
+                # best-effort compatibility measure and must not misreport a
+                # successful filesystem move as a failed rename.
+                _LOG.warning(
+                    "rename mtime restore failed source=%s destination=%s: %s",
+                    source,
+                    destination,
+                    exc,
+                )
         return FileOperationItemResult(
             source,
             destination,

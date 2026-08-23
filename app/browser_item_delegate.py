@@ -44,6 +44,9 @@ GRID_PRESET_THUMBNAIL_SIZES = {
     BrowserDisplayDensity.LARGE: 320,
 }
 
+BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR = "#000000"
+BROWSER_PLACEHOLDER_ICON_MAX_RATIO = 0.50
+
 
 def browser_item_type_key(item: BrowserItem) -> str:
     if item.kind is BrowserItemKind.FOLDER:
@@ -104,11 +107,13 @@ def thumbnail_image_rects(
     image_width = max(1, image_size.width())
     image_height = max(1, image_size.height())
     dpr = max(0.5, float(device_pixel_ratio))
+    content_rect = thumbnail_content_rect(
+        thumbnail_rect,
+        display_mode=display_mode,
+        device_pixel_ratio=dpr,
+    )
     if display_mode == "center_crop":
-        target = snap_logical_rect_to_physical_pixels(
-            QRectF(thumbnail_rect.adjusted(1, 1, -1, -1)),
-            dpr,
-        )
+        target = content_rect
         target_ratio = target.width() / max(1.0, target.height())
         source_ratio = image_width / image_height
         if source_ratio > target_ratio:
@@ -129,7 +134,7 @@ def thumbnail_image_rects(
             )
         return target, source
 
-    available = QRectF(thumbnail_rect.adjusted(4, 4, -4, -4))
+    available = content_rect
     source_ratio = image_width / image_height
     target_ratio = available.width() / max(1.0, available.height())
     if source_ratio > target_ratio:
@@ -154,6 +159,21 @@ def thumbnail_image_rects(
     return (
         snap_logical_rect_to_physical_pixels(target, dpr),
         QRectF(0.0, 0.0, float(image_width), float(image_height)),
+    )
+
+
+def thumbnail_content_rect(
+    thumbnail_rect: QRect,
+    *,
+    display_mode: str = "fit",
+    device_pixel_ratio: float = 1.0,
+) -> QRectF:
+    """Return the shared maximum target for real or placeholder content."""
+
+    inset = 1 if display_mode == "center_crop" else 4
+    return snap_logical_rect_to_physical_pixels(
+        QRectF(thumbnail_rect.adjusted(inset, inset, -inset, -inset)),
+        max(0.5, float(device_pixel_ratio)),
     )
 
 
@@ -210,6 +230,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
         filename_gap: int = 0,
         filename_padding_y: int = 0,
         item_spacing: int = 0,
+        folder_fallback_background: str = "auto",
         shell_icon_provider: ShellAssociatedIconProvider | None = None,
     ) -> None:
         super().__init__(parent)
@@ -226,6 +247,9 @@ class BrowserItemDelegate(QStyledItemDelegate):
         self.filename_gap = max(0, min(32, int(filename_gap)))
         self.filename_padding_y = max(0, min(16, int(filename_padding_y)))
         self.item_spacing = max(0, min(32, int(item_spacing)))
+        self.folder_fallback_background = self._normalize_folder_fallback_background(
+            folder_fallback_background
+        )
         self.shell_icon_provider = (
             shell_icon_provider or ShellAssociatedIconProvider()
         )
@@ -273,6 +297,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
         filename_gap: int | None = None,
         filename_padding_y: int | None = None,
         item_spacing: int | None = None,
+        folder_fallback_background: str | None = None,
     ) -> None:
         self.thumbnail_size = int(thumbnail_size)
         self.density = density
@@ -294,6 +319,12 @@ class BrowserItemDelegate(QStyledItemDelegate):
             self.filename_padding_y = max(0, min(16, int(filename_padding_y)))
         if item_spacing is not None:
             self.item_spacing = max(0, min(32, int(item_spacing)))
+        if folder_fallback_background is not None:
+            self.folder_fallback_background = (
+                self._normalize_folder_fallback_background(
+                    folder_fallback_background
+                )
+            )
 
     def sizeHint(
         self,
@@ -326,15 +357,31 @@ class BrowserItemDelegate(QStyledItemDelegate):
             painter.setOpacity(self.content_opacity(index, item))
             cell = option.rect
             thumbnail_rect = self.grid_metrics.thumbnail_frame_rect(cell)
+            thumbnail_image = index.data(BrowserItemModel.ThumbnailImageRole)
+            thumbnail_error = index.data(BrowserItemModel.ThumbnailErrorRole)
+            uses_placeholder = self._uses_placeholder_canvas(
+                item,
+                thumbnail_image,
+                thumbnail_error,
+            )
             dpr = max(0.5, painter.device().devicePixelRatioF())
+            content_rect = thumbnail_content_rect(
+                thumbnail_rect,
+                display_mode=self.thumbnail_display_mode,
+                device_pixel_ratio=dpr,
+            )
             snapped_frame = snap_logical_rect_to_physical_pixels(
                 QRectF(thumbnail_rect),
                 dpr,
             )
             painter.fillRect(snapped_frame, option.palette.base())
+            if uses_placeholder:
+                self._paint_placeholder_canvas(
+                    painter,
+                    content_rect,
+                )
             painter.setPen(QPen(option.palette.mid().color(), 1))
             painter.drawRect(snapped_frame.adjusted(0, 0, -1 / dpr, -1 / dpr))
-            thumbnail_image = index.data(BrowserItemModel.ThumbnailImageRole)
             if isinstance(thumbnail_image, QImage) and not thumbnail_image.isNull():
                 self._paint_thumbnail_image(
                     painter,
@@ -344,12 +391,6 @@ class BrowserItemDelegate(QStyledItemDelegate):
                     display_mode=self.thumbnail_display_mode,
                 )
             else:
-                if self._uses_folder_fallback_canvas(item, thumbnail_image):
-                    self._paint_folder_fallback_canvas(
-                        painter,
-                        thumbnail_rect,
-                        option,
-                    )
                 icon = index.data(Qt.ItemDataRole.DecorationRole)
                 if item.kind is BrowserItemKind.OTHER or not isinstance(icon, QIcon):
                     icon_size = max(
@@ -364,7 +405,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
                         icon_size,
                         dpr,
                     )
-                self._paint_fallback_icon(painter, thumbnail_rect, icon, option)
+                self._paint_fallback_icon(painter, content_rect, icon, option)
             if bool(index.data(BrowserItemModel.ThumbnailLowResolutionRole)):
                 color = option.palette.highlight().color()
                 color.setAlpha(190)
@@ -377,7 +418,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
                     )
                 )
             self._paint_type_icon(painter, thumbnail_rect, item)
-            if index.data(BrowserItemModel.ThumbnailErrorRole):
+            if thumbnail_error:
                 self._paint_error_badge(painter, thumbnail_rect)
             self._paint_rating(painter, option, index)
             self._paint_title(painter, option, thumbnail_rect, item.display_name)
@@ -391,80 +432,74 @@ class BrowserItemDelegate(QStyledItemDelegate):
             painter.restore()
 
     @staticmethod
-    def _uses_folder_fallback_canvas(
+    def _uses_placeholder_canvas(
         item: BrowserItem,
         thumbnail_image: object,
+        thumbnail_error: object = None,
     ) -> bool:
-        return bool(
-            item.kind is BrowserItemKind.FOLDER
-            and not (
-                isinstance(thumbnail_image, QImage)
-                and not thumbnail_image.isNull()
-            )
+        has_thumbnail = bool(
+            isinstance(thumbnail_image, QImage)
+            and not thumbnail_image.isNull()
         )
+        return bool(
+            not has_thumbnail
+            and (item.kind is BrowserItemKind.FOLDER or thumbnail_error)
+        )
+
+    def _paint_placeholder_canvas(
+        self,
+        painter: QPainter,
+        content_rect: QRectF,
+    ) -> None:
+        """Fill the same physical-pixel-snapped content rect as real images."""
+        painter.fillRect(content_rect, self.folder_fallback_background_color())
+
+    def folder_fallback_background_color(self) -> QColor:
+        value = (
+            BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR
+            if self.folder_fallback_background == "auto"
+            else self.folder_fallback_background
+        )
+        return QColor(value)
 
     @staticmethod
-    def _paint_folder_fallback_canvas(
-        painter: QPainter,
-        thumbnail_rect: QRect,
-        option: QStyleOptionViewItem,
-    ) -> None:
-        """Paint a flat, square thumbnail surface behind a folder icon."""
-
-        def blend(first: QColor, second: QColor, second_weight: float) -> QColor:
-            weight = max(0.0, min(1.0, float(second_weight)))
-            return QColor(
-                round(first.red() * (1.0 - weight) + second.red() * weight),
-                round(first.green() * (1.0 - weight) + second.green() * weight),
-                round(first.blue() * (1.0 - weight) + second.blue() * weight),
-                round(first.alpha() * (1.0 - weight) + second.alpha() * weight),
-            )
-
-        dpr = max(0.5, painter.device().devicePixelRatioF())
-        base = option.palette.base().color()
-        canvas_color = blend(base, option.palette.alternateBase().color(), 0.58)
-        border_color = blend(
-            option.palette.mid().color(),
-            option.palette.midlight().color(),
-            0.35,
-        )
-        canvas = snap_logical_rect_to_physical_pixels(
-            QRectF(thumbnail_rect.adjusted(7, 7, -8, -8)),
-            dpr,
-        )
-
-        painter.save()
-        try:
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-            painter.setPen(QPen(border_color, 1.0 / dpr))
-            painter.setBrush(canvas_color)
-            painter.drawRect(
-                canvas.adjusted(0, 0, -1.0 / dpr, -1.0 / dpr)
-            )
-        finally:
-            painter.restore()
+    def _normalize_folder_fallback_background(value: object) -> str:
+        text = str(value or "auto").strip().casefold()
+        if text == "auto":
+            return "auto"
+        color = QColor(text)
+        return color.name() if color.isValid() else "auto"
 
     @staticmethod
     def _paint_fallback_icon(
         painter: QPainter,
-        thumbnail_rect: QRect,
+        content_rect: QRectF,
         icon: object,
         option: QStyleOptionViewItem,
     ) -> None:
+        available_width = max(
+            1.0,
+            content_rect.width() * BROWSER_PLACEHOLDER_ICON_MAX_RATIO,
+        )
+        available_height = max(
+            1.0,
+            content_rect.height() * BROWSER_PLACEHOLDER_ICON_MAX_RATIO,
+        )
         if isinstance(icon, QImage) and not icon.isNull():
             dpr = max(0.5, painter.device().devicePixelRatioF())
             logical_width = icon.width() / dpr
             logical_height = icon.height() / dpr
             scale = min(
                 1.0,
-                max(1.0, thumbnail_rect.width() - 8) / max(1.0, logical_width),
-                max(1.0, thumbnail_rect.height() - 8) / max(1.0, logical_height),
+                available_width / max(1.0, logical_width),
+                available_height / max(1.0, logical_height),
             )
             width = logical_width * scale
             height = logical_height * scale
+            center = content_rect.center()
             target = QRectF(
-                thumbnail_rect.center().x() - width / 2,
-                thumbnail_rect.center().y() - height / 2,
+                center.x() - width / 2,
+                center.y() - height / 2,
                 width,
                 height,
             )
@@ -475,20 +510,34 @@ class BrowserItemDelegate(QStyledItemDelegate):
             )
             return
         if isinstance(icon, QIcon) and not icon.isNull():
-                mode = (
-                    QIcon.Mode.Disabled
-                    if not (option.state & QStyle.StateFlag.State_Enabled)
-                    else QIcon.Mode.Normal
-                )
-                pixmap = icon.pixmap(thumbnail_rect.size(), mode)
-                if not pixmap.isNull():
-                    scaled = pixmap.scaled(
-                        thumbnail_rect.size() - QSize(8, 8),
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
-                    point = thumbnail_rect.center() - scaled.rect().center()
-                    painter.drawPixmap(point, scaled)
+            mode = (
+                QIcon.Mode.Disabled
+                if not (option.state & QStyle.StateFlag.State_Enabled)
+                else QIcon.Mode.Normal
+            )
+            requested = QSize(
+                max(1, round(available_width)),
+                max(1, round(available_height)),
+            )
+            pixmap = icon.pixmap(requested, mode)
+            if pixmap.isNull():
+                return
+            source = QRectF(pixmap.rect())
+            source_ratio = source.width() / max(1.0, source.height())
+            if source_ratio > available_width / available_height:
+                width = available_width
+                height = width / source_ratio
+            else:
+                height = available_height
+                width = height * source_ratio
+            center = content_rect.center()
+            target = QRectF(
+                center.x() - width / 2,
+                center.y() - height / 2,
+                width,
+                height,
+            )
+            painter.drawPixmap(target, pixmap, source)
 
     def _paint_thumbnail_image(
         self,
@@ -609,7 +658,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
         index: QModelIndex,
     ) -> None:
         item = index.data(BrowserItemModel.ItemRole)
-        if item is None or item.kind is BrowserItemKind.FOLDER:
+        if item is None:
             return
         current = index.data(BrowserItemModel.RatingRole)
         preview = index.data(BrowserItemModel.RatingPreviewRole)
@@ -659,11 +708,6 @@ class BrowserItemDelegate(QStyledItemDelegate):
         badge = type_badge_rect(thumbnail_rect, badge_size)
         dpr = max(0.5, painter.device().devicePixelRatioF())
         badge_target = snap_logical_rect_to_physical_pixels(QRectF(badge), dpr)
-        shadow = badge_target.adjusted(-2, -2, 2, 2)
-        shadow_color = QColor(0, 0, 0, 105)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(shadow_color)
-        painter.drawRoundedRect(shadow, 4, 4)
         image = self._association_image(item, badge_size, dpr)
         if image.isNull():
             return
