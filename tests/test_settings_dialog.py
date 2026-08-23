@@ -53,7 +53,8 @@ def test_current_values_are_shown_and_join_disables_gap(
             "browser_sort_key": "modified_time",
             "browser_sort_order": "descending",
             "browser_folders_first": False,
-            "browser_location_history_limit": 100,
+            "browser_location_history_limit": 137,
+            "browser_search_history_limit": 333,
         }
     )
 
@@ -76,7 +77,8 @@ def test_current_values_are_shown_and_join_disables_gap(
     assert dialog.browser_sort_key_combo.currentData() == "modified_time"
     assert dialog.browser_sort_order_combo.currentData() == "descending"
     assert not dialog.browser_folders_first_checkbox.isChecked()
-    assert dialog.browser_location_history_limit_combo.currentData() == 100
+    assert dialog.browser_location_history_limit_spin.value() == 137
+    assert dialog.browser_search_history_limit_spin.value() == 333
     dialog.reject()
 
 
@@ -111,9 +113,8 @@ def test_apply_and_ok_persist_settings(tmp_path: Path, qapp: QApplication) -> No
         dialog.browser_sort_order_combo.findData("descending")
     )
     dialog.browser_folders_first_checkbox.setChecked(False)
-    dialog.browser_location_history_limit_combo.setCurrentIndex(
-        dialog.browser_location_history_limit_combo.findData(200)
-    )
+    dialog.browser_location_history_limit_spin.setValue(217)
+    dialog.browser_search_history_limit_spin.setValue(0)
 
     changed = dialog.apply_settings()
 
@@ -129,7 +130,8 @@ def test_apply_and_ok_persist_settings(tmp_path: Path, qapp: QApplication) -> No
     assert changed["browser_sort_key"] == "file_size"
     assert changed["browser_sort_order"] == "descending"
     assert changed["browser_folders_first"] is False
-    assert changed["browser_location_history_limit"] == 200
+    assert changed["browser_location_history_limit"] == 217
+    assert changed["browser_search_history_limit"] == 0
 
     dialog.join_spread_checkbox.setChecked(True)
     dialog.accept()

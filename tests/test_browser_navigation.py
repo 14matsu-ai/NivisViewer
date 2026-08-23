@@ -111,14 +111,14 @@ def test_direct_jump_and_recent_locations_reuse_the_timeline() -> None:
 
 
 def test_recent_limit_only_trims_mru_and_preserves_navigation_timeline() -> None:
-    history = BrowserNavigationHistory(max_entries=300, recent_limit=200)
+    history = BrowserNavigationHistory(max_entries=300, recent_limit=217)
     for index in range(60):
         history.visit(location(f"place-{index:03}"))
 
     assert len(history) == 60
     assert len(history.recent_unique()) == 60
-    assert history.set_recent_limit(10)
-    assert len(history.recent_unique()) == 10
+    assert history.set_recent_limit(17)
+    assert len(history.recent_unique()) == 17
     assert len(history) == 60
     assert history.go_back() == location("place-058")
     assert history.mark_recent(history.current()) is None

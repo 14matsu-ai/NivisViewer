@@ -111,6 +111,8 @@ class ConfigManager(QObject):
         "browser_sort_order": "ascending",
         "browser_folders_first": True,
         "browser_location_history_limit": 50,
+        "browser_search_history_limit": 50,
+        "browser_search_history": [],
         "browser_display_density": "standard",
         "browser_item_spacing_mode": "preset",
         "browser_item_spacing": 2,
@@ -472,11 +474,37 @@ class ConfigManager(QObject):
         if (
             isinstance(location_history_limit, bool)
             or not isinstance(location_history_limit, int)
-            or location_history_limit not in {10, 20, 30, 50, 100, 200}
+            or not 1 <= location_history_limit <= 1000
         ):
             normalized["browser_location_history_limit"] = cls.DEFAULTS[
                 "browser_location_history_limit"
             ]
+        search_history_limit = normalized.get("browser_search_history_limit")
+        if (
+            isinstance(search_history_limit, bool)
+            or not isinstance(search_history_limit, int)
+            or not 0 <= search_history_limit <= 1000
+        ):
+            search_history_limit = cls.DEFAULTS["browser_search_history_limit"]
+            normalized["browser_search_history_limit"] = search_history_limit
+        raw_search_history = normalized.get("browser_search_history")
+        if not isinstance(raw_search_history, list):
+            raw_search_history = []
+        search_history: list[str] = []
+        seen_searches: set[str] = set()
+        if search_history_limit > 0:
+            for raw_query in raw_search_history:
+                if not isinstance(raw_query, str):
+                    continue
+                query = raw_query.strip()
+                key = query.casefold()
+                if not query or key in seen_searches:
+                    continue
+                seen_searches.add(key)
+                search_history.append(query)
+                if len(search_history) >= search_history_limit:
+                    break
+        normalized["browser_search_history"] = search_history
         if normalized.get("browser_display_density") not in {
             "extra_compact",
             "compact",

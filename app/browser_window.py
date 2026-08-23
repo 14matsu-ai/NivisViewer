@@ -16,6 +16,7 @@ from PySide6.QtCore import (
     QModelIndex,
     QMimeData,
     QPoint,
+    QRect,
     QSize,
     Qt,
     QTimer,
@@ -54,6 +55,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QStyle,
+    QStyleOptionComboBox,
     QTabWidget,
     QToolBar,
     QToolButton,
@@ -111,6 +113,7 @@ from .browser_sort import (
 )
 from .browser_filter import BrowserFilterState, RatingFilterMode
 from .browser_rating_filter_widget import BrowserRatingFilterWidget
+from .browser_search_history import BrowserSearchHistory
 from .browser_image_detail import (
     BrowserImageDetailProbe,
     BrowserImageDetailResult,
@@ -191,6 +194,9 @@ class _ListViewState:
     selected_paths: tuple[str, ...]
     current_path: str | None
     anchor_path: str | None
+    anchor_row: int
+    anchor_x: int
+    anchor_y: int
     vertical_scroll: int
     horizontal_scroll: int
 
@@ -216,15 +222,96 @@ class _PendingDirectoryScan:
 
 
 class _BrowserSearchEdit(QLineEdit):
-    """Compact search field with a shrinkable 220-DIP preferred width."""
+    """Compact search editor hosted by the integrated history control."""
 
     def sizeHint(self) -> QSize:  # noqa: N802
         hint = super().sizeHint()
-        return QSize(220, hint.height())
+        return QSize(170, hint.height())
 
     def minimumSizeHint(self) -> QSize:  # noqa: N802
         hint = super().minimumSizeHint()
-        return QSize(140, hint.height())
+        return QSize(100, hint.height())
+
+
+class _BrowserDropDownShell(QComboBox):
+    """Native combo chrome around a custom Browser content widget."""
+
+    dropDownRequested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._content_widget: QWidget | None = None
+        self._drop_down_available = True
+        self._preferred_width: int | None = None
+        self.addItem("")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def set_preferred_width(self, width: int | None) -> None:
+        self._preferred_width = None if width is None else max(1, int(width))
+        self.updateGeometry()
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        hint = super().sizeHint()
+        if self._preferred_width is None:
+            return hint
+        return QSize(self._preferred_width, hint.height())
+
+    def set_content_widget(self, widget: QWidget) -> None:
+        self._content_widget = widget
+        widget.setParent(self)
+        widget.show()
+        self.setFocusProxy(widget)
+        self._layout_content()
+
+    def set_drop_down_available(self, available: bool) -> None:
+        self._drop_down_available = bool(available)
+
+    def drop_down_rect(self) -> QRect:
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        return self.style().subControlRect(
+            QStyle.ComplexControl.CC_ComboBox,
+            option,
+            QStyle.SubControl.SC_ComboBoxArrow,
+            self,
+        )
+
+    def edit_field_rect(self) -> QRect:
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        return self.style().subControlRect(
+            QStyle.ComplexControl.CC_ComboBox,
+            option,
+            QStyle.SubControl.SC_ComboBoxEditField,
+            self,
+        )
+
+    def _layout_content(self) -> None:
+        content = getattr(self, "_content_widget", None)
+        if content is None:
+            return
+        content.setGeometry(self.edit_field_rect())
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._layout_content()
+
+    def event(self, event: QEvent) -> bool:
+        result = super().event(event)
+        if event.type() in {
+            QEvent.Type.StyleChange,
+            QEvent.Type.FontChange,
+            QEvent.Type.PaletteChange,
+        }:
+            self._layout_content()
+        return result
+
+    def showPopup(self) -> None:  # noqa: N802
+        if self._drop_down_available:
+            self.dropDownRequested.emit()
+
+
+_CLEAR_SEARCH_HISTORY = object()
 
 
 class BrowserWindow(QMainWindow):
@@ -324,7 +411,8 @@ class BrowserWindow(QMainWindow):
         self._location_directory_pending_path: str | None = None
         self._location_directory_menu_path: str | None = None
         self._navigation_history_menu: BrowserLocationListPopup | None = None
-        self._recent_location_menu: BrowserLocationListPopup | None = None
+        self._location_history_popup: BrowserLocationListPopup | None = None
+        self._search_history_popup: BrowserLocationListPopup | None = None
         if thumbnail_provider is None:
             disk_cache = ThumbnailDiskCache(
                 self.config.thumbnail_cache_dir,
@@ -375,6 +463,10 @@ class BrowserWindow(QMainWindow):
                 self.settings.get("browser_location_history_limit", 50)
             )
         )
+        self.search_history = BrowserSearchHistory(
+            self.settings.get("browser_search_history", []),
+            limit=int(self.settings.get("browser_search_history_limit", 50)),
+        )
         self._generation = self.thumbnail_provider.generation
         self._scan_generation = 0
         self._pending_scan: _PendingDirectoryScan | None = None
@@ -387,6 +479,7 @@ class BrowserWindow(QMainWindow):
         self._favorite_release_navigated = False
         self._location_restore_token = 0
         self._list_view_restore_token = 0
+        self._restoring_list_view_state = False
         self._status_message_token = 0
         self._temporary_status_message: str | None = None
         self._screen_tracking_window = None
@@ -1278,17 +1371,17 @@ class BrowserWindow(QMainWindow):
         popup.show_at(global_position)
         return popup
 
-    def _show_recent_location_menu(self) -> BrowserLocationListPopup | None:
+    def _show_location_history_popup(self) -> BrowserLocationListPopup | None:
         recent = self.navigation_history.recent_unique()
         if not recent:
             return None
         if (
-            self._recent_location_menu is not None
-            and self._recent_location_menu.isVisible()
+            self._location_history_popup is not None
+            and self._location_history_popup.isVisible()
         ):
-            self._recent_location_menu.close()
+            self._location_history_popup.close()
             return None
-        self._close_owned_popup("_recent_location_menu")
+        self._close_owned_popup("_location_history_popup")
         current = self.navigation_history.current()
         popup_entries: list[LocationPopupEntry] = []
         for index, location in recent:
@@ -1306,18 +1399,18 @@ class BrowserWindow(QMainWindow):
                 )
             )
         popup = BrowserLocationListPopup(tuple(popup_entries), self)
-        self._recent_location_menu = popup
-        popup.entryActivated.connect(self._activate_recent_location_entry)
+        self._location_history_popup = popup
+        popup.entryActivated.connect(self._activate_location_history_entry)
         popup.closed.connect(
             lambda value=popup: self._release_owned_popup(
-                "_recent_location_menu",
+                "_location_history_popup",
                 value,
             )
         )
-        popup.show_for(self.recent_location_button)
+        popup.show_for(self.browser_location_control)
         return popup
 
-    def _activate_recent_location_entry(self, entry: LocationPopupEntry) -> None:
+    def _activate_location_history_entry(self, entry: LocationPopupEntry) -> None:
         location = entry.value
         if not isinstance(location, BrowserLocation):
             return
@@ -2862,7 +2955,8 @@ class BrowserWindow(QMainWindow):
         self._location_directory_pending_path = None
         self._close_location_directory_popup(cancel_pending=False)
         self._close_owned_popup("_navigation_history_menu")
-        self._close_owned_popup("_recent_location_menu")
+        self._close_owned_popup("_location_history_popup")
+        self._close_owned_popup("_search_history_popup")
         self._thumbnail_request_timer.stop()
         self._browser_search_timer.stop()
         self._scroll_idle_timer.stop()
@@ -2890,7 +2984,21 @@ class BrowserWindow(QMainWindow):
             self.navigation_history.set_recent_limit(
                 int(changed["browser_location_history_limit"])
             )
-            self._close_owned_popup("_recent_location_menu")
+            self._close_owned_popup("_location_history_popup")
+        search_history_changed = False
+        if "browser_search_history_limit" in changed:
+            search_history_changed = self.search_history.set_limit(
+                int(changed["browser_search_history_limit"])
+            )
+        if "browser_search_history" in changed:
+            value = changed["browser_search_history"]
+            if isinstance(value, list):
+                search_history_changed = (
+                    self.search_history.replace(value) or search_history_changed
+                )
+        if search_history_changed:
+            self._close_owned_popup("_search_history_popup")
+            self._sync_search_history_control()
         if "browser_folder_gestures_enabled" in changed:
             self.browser_folder_gestures_enabled = bool(
                 changed["browser_folder_gestures_enabled"]
@@ -3073,23 +3181,30 @@ class BrowserWindow(QMainWindow):
                 if policy_changed and (old_ratio != new_ratio or old_crop_mode != new_crop_mode):
                     self.item_model.clear_thumbnails()
                 self._generation = self.thumbnail_provider.begin_generation()
-        if thumbnail_changed or {
-            "browser_display_density",
-            "browser_item_spacing_mode",
-            "browser_item_spacing",
-            "browser_cell_padding",
-            "browser_filename_display",
-            "browser_filename_gap",
-            "browser_filename_padding_y",
-        }.intersection(changed):
+        geometry_changed = thumbnail_changed or bool(
+            {
+                "browser_display_density",
+                "browser_item_spacing_mode",
+                "browser_item_spacing",
+                "browser_cell_padding",
+                "browser_filename_display",
+                "browser_filename_gap",
+                "browser_filename_padding_y",
+            }.intersection(changed)
+        )
+        if geometry_changed:
             self._apply_list_view_geometry()
 
         if list_changed:
             self._sync_browser_controls()
             if view_state is not None:
-                self._schedule_list_view_state_restore(view_state)
+                self._schedule_list_view_state_restore(
+                    view_state,
+                    request_thumbnails=geometry_changed,
+                )
             self._update_status()
-            self._schedule_thumbnail_requests()
+            if geometry_changed:
+                self._schedule_thumbnail_requests()
         sidebar_keys = {
             "browser_sidebar_layout",
             "browser_sidebar_splitter_sizes",
@@ -3282,12 +3397,6 @@ class BrowserWindow(QMainWindow):
                 "browser_sort_order": str(
                     self.browser_sort_order_combo.currentData()
                 ),
-                "browser_folders_first": (
-                    self.browser_folders_first_checkbox.isChecked()
-                ),
-                "browser_display_density": str(
-                    self.browser_display_density_combo.currentData()
-                ),
             },
             save=True,
         )
@@ -3296,8 +3405,6 @@ class BrowserWindow(QMainWindow):
         controls = (
             self.browser_sort_key_combo,
             self.browser_sort_order_combo,
-            self.browser_folders_first_checkbox,
-            self.browser_display_density_combo,
         )
         for control in controls:
             control.blockSignals(True)
@@ -3310,19 +3417,97 @@ class BrowserWindow(QMainWindow):
                 self.browser_sort_order_combo,
                 self.browser_sort_order.value,
             )
-            self.browser_folders_first_checkbox.setChecked(
-                self.browser_folders_first
-            )
-            self._select_combo_data(
-                self.browser_display_density_combo,
-                self.browser_display_density.value,
-            )
         finally:
             for control in controls:
                 control.blockSignals(False)
 
     def _on_browser_search_text_changed(self, _text: str) -> None:
         self._browser_search_timer.start()
+
+    def _commit_browser_search_history(self) -> bool:
+        if self._shutdown_prepared:
+            return False
+        self._browser_search_timer.stop()
+        self._apply_pending_browser_search()
+        if not self.search_history.record(self.browser_search_edit.text()):
+            return False
+        self._persist_browser_search_history()
+        self._sync_search_history_control()
+        return True
+
+    def _persist_browser_search_history(self) -> None:
+        self.config.apply(
+            {"browser_search_history": list(self.search_history.entries)},
+            save=True,
+        )
+
+    def _sync_search_history_control(self) -> None:
+        if not hasattr(self, "browser_search_container"):
+            return
+        self.browser_search_container.set_drop_down_available(
+            self.search_history.limit > 0
+        )
+        count = len(self.search_history.entries)
+        self.browser_search_container.setToolTip(
+            f"検索履歴を表示（{count}件）"
+        )
+
+    def _show_search_history_popup(
+        self,
+    ) -> BrowserLocationListPopup | None:
+        if (
+            self._search_history_popup is not None
+            and self._search_history_popup.isVisible()
+        ):
+            self._search_history_popup.close()
+            return None
+        self._commit_browser_search_history()
+        entries = self.search_history.entries
+        if not entries:
+            return None
+        self._close_owned_popup("_search_history_popup")
+        popup_entries = [
+            LocationPopupEntry(query, query, query)
+            for query in entries
+        ]
+        popup_entries.extend(
+            (
+                LocationPopupEntry("────────", None, enabled=False),
+                LocationPopupEntry(
+                    "検索履歴を消去",
+                    _CLEAR_SEARCH_HISTORY,
+                ),
+            )
+        )
+        popup = BrowserLocationListPopup(tuple(popup_entries), self)
+        self._search_history_popup = popup
+        popup.entryActivated.connect(self._activate_search_history_entry)
+        popup.closed.connect(
+            lambda value=popup: self._release_owned_popup(
+                "_search_history_popup",
+                value,
+            )
+        )
+        popup.show_for(self.browser_search_container)
+        return popup
+
+    def _activate_search_history_entry(
+        self,
+        entry: LocationPopupEntry,
+    ) -> None:
+        if entry.value is _CLEAR_SEARCH_HISTORY:
+            if self.search_history.clear():
+                self._persist_browser_search_history()
+                self._sync_search_history_control()
+            return
+        query = str(entry.value).strip()
+        if not query:
+            return
+        if self.search_history.record(query):
+            self._persist_browser_search_history()
+        self.browser_search_edit.setText(query)
+        self._browser_search_timer.stop()
+        self._apply_pending_browser_search()
 
     def _apply_pending_browser_search(self) -> None:
         self._set_browser_filter(
@@ -3392,21 +3577,6 @@ class BrowserWindow(QMainWindow):
             )
         finally:
             self.rating_filter_widget.blockSignals(False)
-        mode = self.browser_filter_state.rating_mode
-        reference = self.browser_filter_state.rating_reference
-        if mode is RatingFilterMode.AT_LEAST:
-            text = f"★{reference}以上"
-        elif mode is RatingFilterMode.EQUAL:
-            text = f"★{reference}のみ"
-        elif mode is RatingFilterMode.UNRATED:
-            text = "未評価"
-        else:
-            text = ""
-        self.rating_filter_mode_label.setText(text)
-        self.rating_filter_mode_label.setVisible(bool(text))
-        self.rating_filter_clear_button.setEnabled(
-            mode is not RatingFilterMode.OFF
-        )
 
     def _coerce_list_view_state_to_visible(
         self,
@@ -3422,11 +3592,15 @@ class BrowserWindow(QMainWindow):
         current_path = state.current_path
         if current_path and self.item_model.row_for_path(current_path) < 0:
             current_path = None
-        if current_path is None and self.item_model.rowCount() > 0:
+        if (
+            current_path is None
+            and state.selected_paths
+            and self.item_model.rowCount() > 0
+        ):
             row = max(0, min(preferred_row, self.item_model.rowCount() - 1))
             fallback = self.item_model.item_at(row)
             current_path = str(fallback.path) if fallback is not None else None
-            if state.selected_paths and not selected_paths and current_path:
+            if not selected_paths and current_path:
                 selected_paths = (current_path,)
         return _ListViewState(
             selected_paths=selected_paths,
@@ -3437,6 +3611,9 @@ class BrowserWindow(QMainWindow):
                 and self.item_model.row_for_path(state.anchor_path) >= 0
                 else None
             ),
+            anchor_row=state.anchor_row,
+            anchor_x=state.anchor_x,
+            anchor_y=state.anchor_y,
             vertical_scroll=state.vertical_scroll,
             horizontal_scroll=state.horizontal_scroll,
         )
@@ -3587,6 +3764,9 @@ class BrowserWindow(QMainWindow):
                 ),
                 current_path=relocated(state.current_path),
                 anchor_path=relocated(state.anchor_path),
+                anchor_row=state.anchor_row,
+                anchor_x=state.anchor_x,
+                anchor_y=state.anchor_y,
                 vertical_scroll=state.vertical_scroll,
                 horizontal_scroll=state.horizontal_scroll,
             )
@@ -3898,7 +4078,8 @@ class BrowserWindow(QMainWindow):
         if hasattr(self, "location_directory_loader"):
             self._close_location_directory_popup(cancel_pending=True)
             self._close_owned_popup("_navigation_history_menu")
-            self._close_owned_popup("_recent_location_menu")
+            self._close_owned_popup("_location_history_popup")
+            self._close_owned_popup("_search_history_popup")
         self._schedule_thumbnail_requests()
 
     def _build_ui(self) -> None:
@@ -4184,13 +4365,23 @@ class BrowserWindow(QMainWindow):
         browser_toolbar_layout.setContentsMargins(0, 0, 2, 0)
         browser_toolbar_layout.setSpacing(4)
 
-        self.location_stack = QStackedWidget(self.browser_toolbar_content)
+        self.browser_location_control = _BrowserDropDownShell(
+            self.browser_toolbar_content
+        )
+        self.browser_location_control.setObjectName("browser_location_control")
+        self.browser_location_control.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.browser_location_control.setMinimumWidth(60)
+
+        self.location_stack = QStackedWidget(self.browser_location_control)
         self.location_stack.setObjectName("browser_location_stack")
         self.location_stack.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Preferred,
         )
-        self.location_stack.setMinimumWidth(60)
+        self.location_stack.setMinimumWidth(30)
         self.location_breadcrumb = BrowserLocationBreadcrumb(
             self.location_stack
         )
@@ -4204,6 +4395,7 @@ class BrowserWindow(QMainWindow):
 
         self.address_bar = BrowserAddressBar(self.location_stack)
         self.address_bar.setObjectName("browser_address_bar")
+        self.address_bar.setFrame(False)
         self.address_bar.setClearButtonEnabled(True)
         self.address_bar.setPlaceholderText("フォルダ、画像、ZIP/CBZのパス")
         self.address_bar.setToolTip(
@@ -4215,18 +4407,12 @@ class BrowserWindow(QMainWindow):
         self.location_stack.addWidget(self.location_breadcrumb)
         self.location_stack.addWidget(self.address_bar)
         self.location_stack.setCurrentWidget(self.location_breadcrumb)
-        browser_toolbar_layout.addWidget(self.location_stack, 1)
-
-        self.recent_location_button = QToolButton(self.browser_toolbar_content)
-        self.recent_location_button.setObjectName(
-            "browser_recent_location_button"
+        self.browser_location_control.set_content_widget(self.location_stack)
+        self.browser_location_control.setToolTip("最近表示したフォルダ")
+        self.browser_location_control.dropDownRequested.connect(
+            self._show_location_history_popup
         )
-        self.recent_location_button.setText("履歴 ▾")
-        self.recent_location_button.setToolTip("最近表示したフォルダ")
-        self.recent_location_button.clicked.connect(
-            self._show_recent_location_menu
-        )
-        browser_toolbar_layout.addWidget(self.recent_location_button)
+        browser_toolbar_layout.addWidget(self.browser_location_control, 1)
 
         self.browser_sort_row = QWidget(self.browser_toolbar_content)
         self.browser_sort_row.setObjectName("browser_sort_search_row")
@@ -4252,26 +4438,6 @@ class BrowserWindow(QMainWindow):
             self.browser_sort_order_combo.addItem(label, value.value)
         browser_sort_layout.addWidget(self.browser_sort_order_combo)
 
-        self.browser_folders_first_checkbox = QCheckBox(
-            "フォルダ先頭",
-            self.browser_sort_row,
-        )
-        self.browser_folders_first_checkbox.setObjectName(
-            "browser_folders_first_checkbox"
-        )
-        self.browser_folders_first_checkbox.setToolTip(
-            "昇順・降順にかかわらずフォルダを先頭へ表示"
-        )
-        browser_sort_layout.addWidget(self.browser_folders_first_checkbox)
-
-        self.browser_display_density_combo = QComboBox(self.browser_sort_row)
-        self.browser_display_density_combo.setObjectName(
-            "browser_display_density_combo"
-        )
-        self.browser_display_density_combo.setToolTip("一覧の表示密度")
-        for value, label in BROWSER_DISPLAY_DENSITY_LABELS.items():
-            self.browser_display_density_combo.addItem(label, value.value)
-        browser_sort_layout.addWidget(self.browser_display_density_combo)
         self._sync_browser_controls()
         self.browser_sort_key_combo.currentIndexChanged.connect(
             self._apply_browser_controls
@@ -4279,13 +4445,6 @@ class BrowserWindow(QMainWindow):
         self.browser_sort_order_combo.currentIndexChanged.connect(
             self._apply_browser_controls
         )
-        self.browser_folders_first_checkbox.toggled.connect(
-            self._apply_browser_controls
-        )
-        self.browser_display_density_combo.currentIndexChanged.connect(
-            self._apply_browser_controls
-        )
-
         self.browser_search_edit = _BrowserSearchEdit(self.browser_sort_row)
         self.browser_search_edit.setObjectName("browser_search_edit")
         self.browser_search_edit.setPlaceholderText("ファイル名を検索")
@@ -4294,12 +4453,29 @@ class BrowserWindow(QMainWindow):
             QSizePolicy.Policy.Preferred,
             QSizePolicy.Policy.Preferred,
         )
-        self.browser_search_edit.setMinimumWidth(140)
-        self.browser_search_edit.setMaximumWidth(300)
+        self.browser_search_edit.setFrame(False)
+        self.browser_search_edit.setMinimumWidth(100)
         self.browser_search_edit.textChanged.connect(
             self._on_browser_search_text_changed
         )
-        browser_sort_layout.addWidget(self.browser_search_edit)
+        self.browser_search_edit.returnPressed.connect(
+            self._commit_browser_search_history
+        )
+        self.browser_search_container = _BrowserDropDownShell(
+            self.browser_sort_row
+        )
+        self.browser_search_container.setObjectName("browser_search_container")
+        self.browser_search_container.set_preferred_width(190)
+        self.browser_search_container.setMinimumWidth(150)
+        self.browser_search_container.setMaximumWidth(230)
+        self.browser_search_container.set_content_widget(
+            self.browser_search_edit
+        )
+        self.browser_search_container.dropDownRequested.connect(
+            self._show_search_history_popup
+        )
+        browser_sort_layout.addWidget(self.browser_search_container)
+        self._sync_search_history_control()
         browser_toolbar_layout.addWidget(self.browser_sort_row)
         self.navigation_toolbar.addWidget(self.browser_toolbar_content)
 
@@ -4315,12 +4491,6 @@ class BrowserWindow(QMainWindow):
         rating_layout.setContentsMargins(4, 0, 6, 0)
         rating_layout.setSpacing(4)
         rating_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
-        rating_label = QLabel("レート:", self.rating_filter_container)
-        rating_layout.addWidget(
-            rating_label,
-            0,
-            Qt.AlignmentFlag.AlignVCenter,
-        )
         self.rating_filter_widget = BrowserRatingFilterWidget(
             self.rating_filter_container
         )
@@ -4329,34 +4499,6 @@ class BrowserWindow(QMainWindow):
         )
         rating_layout.addWidget(
             self.rating_filter_widget,
-            0,
-            Qt.AlignmentFlag.AlignVCenter,
-        )
-        self.rating_filter_mode_label = QLabel(
-            "",
-            self.rating_filter_container,
-        )
-        self.rating_filter_mode_label.setObjectName(
-            "browser_rating_filter_mode_label"
-        )
-        rating_layout.addWidget(
-            self.rating_filter_mode_label,
-            0,
-            Qt.AlignmentFlag.AlignVCenter,
-        )
-        self.rating_filter_clear_button = QToolButton(
-            self.rating_filter_container
-        )
-        self.rating_filter_clear_button.setObjectName(
-            "browser_rating_filter_clear_button"
-        )
-        self.rating_filter_clear_button.setText("解除")
-        self.rating_filter_clear_button.setToolTip("レート絞り込みを解除")
-        self.rating_filter_clear_button.clicked.connect(
-            self.rating_filter_widget.clear_filter
-        )
-        rating_layout.addWidget(
-            self.rating_filter_clear_button,
             0,
             Qt.AlignmentFlag.AlignVCenter,
         )
@@ -4574,17 +4716,8 @@ class BrowserWindow(QMainWindow):
         )
         QWidget.setTabOrder(
             self.browser_sort_order_combo,
-            self.browser_folders_first_checkbox,
-        )
-        QWidget.setTabOrder(
-            self.browser_folders_first_checkbox,
-            self.browser_display_density_combo,
-        )
-        QWidget.setTabOrder(
-            self.browser_display_density_combo,
             self.browser_search_edit,
         )
-
         self.statusBar().showMessage("フォルダを選択してください。")
         self.file_detail_label = QLabel(self)
         self.file_detail_label.setObjectName("browser_file_detail_label")
@@ -4903,6 +5036,10 @@ class BrowserWindow(QMainWindow):
 
     def _on_list_scrolled(self, value: int) -> None:
         now = monotonic()
+        if self._restoring_list_view_state:
+            self._last_scroll_value = int(value)
+            self._last_scroll_time = now
+            return
         delta = abs(int(value) - self._last_scroll_value)
         elapsed = now - self._last_scroll_time
         threshold = max(
@@ -5115,12 +5252,26 @@ class BrowserWindow(QMainWindow):
                 item = self.item_model.item_at(index)
                 if item is not None:
                     selected_paths.append(str(item.path))
-        current_item = self.item_model.item_at(self.list_view.currentIndex())
-        anchor_item = self.item_model.item_at(self._visible_anchor_index())
+        current_item = (
+            self.item_model.item_at(self.list_view.currentIndex())
+            if selected_paths
+            else None
+        )
+        if (
+            current_item is not None
+            and str(current_item.path) not in selected_paths
+        ):
+            current_item = None
+        anchor_index = self._visible_anchor_index()
+        anchor_item = self.item_model.item_at(anchor_index)
+        anchor_rect = self.list_view.visualRect(anchor_index)
         return _ListViewState(
             selected_paths=tuple(selected_paths),
             current_path=str(current_item.path) if current_item is not None else None,
             anchor_path=str(anchor_item.path) if anchor_item is not None else None,
+            anchor_row=anchor_index.row() if anchor_index.isValid() else -1,
+            anchor_x=anchor_rect.x() if anchor_rect.isValid() else 0,
+            anchor_y=anchor_rect.y() if anchor_rect.isValid() else 0,
             vertical_scroll=self.list_view.verticalScrollBar().value(),
             horizontal_scroll=self.list_view.horizontalScrollBar().value(),
         )
@@ -5133,9 +5284,14 @@ class BrowserWindow(QMainWindow):
             index = self.list_view.indexAt(QPoint(sample_x, y))
             if index.isValid():
                 return index
-        return self.list_view.currentIndex()
+        return QModelIndex()
 
-    def _schedule_list_view_state_restore(self, state: _ListViewState) -> None:
+    def _schedule_list_view_state_restore(
+        self,
+        state: _ListViewState,
+        *,
+        request_thumbnails: bool = True,
+    ) -> None:
         self._list_view_restore_token += 1
         token = self._list_view_restore_token
         self._restore_list_view_state(state)
@@ -5144,7 +5300,8 @@ class BrowserWindow(QMainWindow):
             if token != self._list_view_restore_token:
                 return
             self._restore_list_view_state(state)
-            self._schedule_thumbnail_requests()
+            if request_thumbnails:
+                self._schedule_thumbnail_requests()
 
         QTimer.singleShot(0, restore_after_layout)
 
@@ -5152,35 +5309,97 @@ class BrowserWindow(QMainWindow):
         selection_model = self.list_view.selectionModel()
         if selection_model is None:
             return
-        selection_model.clearSelection()
-        for path in state.selected_paths:
-            row = self.item_model.row_for_path(path)
-            if row >= 0:
-                selection_model.select(
-                    self.item_model.index(row, 0),
-                    QItemSelectionModel.SelectionFlag.Select,
+        self._restoring_list_view_state = True
+        try:
+            selection_model.clearSelection()
+            restored_selection: list[QModelIndex] = []
+            for path in state.selected_paths:
+                row = self.item_model.row_for_path(path)
+                if row >= 0:
+                    index = self.item_model.index(row, 0)
+                    restored_selection.append(index)
+                    selection_model.select(
+                        index,
+                        QItemSelectionModel.SelectionFlag.Select,
+                    )
+
+            current = QModelIndex()
+            if state.current_path:
+                row = self.item_model.row_for_path(state.current_path)
+                if row >= 0:
+                    current = self.item_model.index(row, 0)
+            if not current.isValid() and restored_selection:
+                current = restored_selection[0]
+            selection_model.setCurrentIndex(
+                current,
+                QItemSelectionModel.SelectionFlag.NoUpdate,
+            )
+
+            if restored_selection and current.isValid():
+                current_rect = self.list_view.visualRect(current)
+                visible_rect = self.list_view.viewport().rect().adjusted(
+                    1,
+                    1,
+                    -1,
+                    -1,
                 )
-
-        current = QModelIndex()
-        if state.current_path:
-            row = self.item_model.row_for_path(state.current_path)
-            if row >= 0:
-                current = self.item_model.index(row, 0)
-        selection_model.setCurrentIndex(
-            current,
-            QItemSelectionModel.SelectionFlag.NoUpdate,
-        )
-
-        anchor = QModelIndex()
-        if state.anchor_path:
-            row = self.item_model.row_for_path(state.anchor_path)
-            if row >= 0:
-                anchor = self.item_model.index(row, 0)
-        if anchor.isValid():
-            self.list_view.scrollTo(anchor, QListView.ScrollHint.PositionAtTop)
-        else:
-            self.list_view.verticalScrollBar().setValue(state.vertical_scroll)
-            self.list_view.horizontalScrollBar().setValue(state.horizontal_scroll)
+                horizontal = self.list_view.horizontalScrollBar()
+                vertical = self.list_view.verticalScrollBar()
+                if current_rect.left() < visible_rect.left():
+                    horizontal.setValue(
+                        horizontal.value()
+                        + current_rect.left()
+                        - visible_rect.left()
+                    )
+                elif current_rect.right() > visible_rect.right():
+                    horizontal.setValue(
+                        horizontal.value()
+                        + current_rect.right()
+                        - visible_rect.right()
+                    )
+                if current_rect.top() < visible_rect.top():
+                    vertical.setValue(
+                        vertical.value()
+                        + current_rect.top()
+                        - visible_rect.top()
+                    )
+                elif current_rect.bottom() > visible_rect.bottom():
+                    vertical.setValue(
+                        vertical.value()
+                        + current_rect.bottom()
+                        - visible_rect.bottom()
+                    )
+            else:
+                anchor = QModelIndex()
+                if state.anchor_path:
+                    row = self.item_model.row_for_path(state.anchor_path)
+                    if row >= 0:
+                        anchor = self.item_model.index(row, 0)
+                if not anchor.isValid() and self.item_model.rowCount() > 0:
+                    row = max(
+                        0,
+                        min(state.anchor_row, self.item_model.rowCount() - 1),
+                    )
+                    anchor = self.item_model.index(row, 0)
+                anchor_rect = self.list_view.visualRect(anchor)
+                if anchor.isValid() and anchor_rect.isValid():
+                    horizontal = self.list_view.horizontalScrollBar()
+                    vertical = self.list_view.verticalScrollBar()
+                    horizontal.setValue(
+                        horizontal.value() + anchor_rect.x() - state.anchor_x
+                    )
+                    vertical.setValue(
+                        vertical.value() + anchor_rect.y() - state.anchor_y
+                    )
+                else:
+                    self.list_view.verticalScrollBar().setValue(
+                        state.vertical_scroll
+                    )
+                    self.list_view.horizontalScrollBar().setValue(
+                        state.horizontal_scroll
+                    )
+        finally:
+            self._restoring_list_view_state = False
         self._update_status()
 
     def _update_current_navigation_state(self) -> None:
@@ -5248,7 +5467,8 @@ class BrowserWindow(QMainWindow):
         if hasattr(self, "location_directory_loader"):
             self._close_location_directory_popup(cancel_pending=True)
             self._close_owned_popup("_navigation_history_menu")
-            self._close_owned_popup("_recent_location_menu")
+            self._close_owned_popup("_location_history_popup")
+            self._close_owned_popup("_search_history_popup")
         path = str(self.current_path) if self.current_path is not None else ""
         self.address_bar.setText(path)
         if hasattr(self, "location_breadcrumb"):
@@ -5257,8 +5477,8 @@ class BrowserWindow(QMainWindow):
     def _update_navigation_actions(self) -> None:
         self.back_action.setEnabled(self.navigation_history.can_go_back())
         self.forward_action.setEnabled(self.navigation_history.can_go_forward())
-        if hasattr(self, "recent_location_button"):
-            self.recent_location_button.setEnabled(
+        if hasattr(self, "browser_location_control"):
+            self.browser_location_control.set_drop_down_available(
                 len(self.navigation_history) > 0
             )
         can_go_up = False

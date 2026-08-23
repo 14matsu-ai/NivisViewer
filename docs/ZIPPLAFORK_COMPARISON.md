@@ -4820,12 +4820,12 @@ The controls retain their existing authorities but now use exactly two top
 rows. The first is the existing File/View/Bookmarks/History menu row with the
 five-star rating quick filter as its vertically centred top-right corner
 widget. The single toolbar row underneath contains back/forward/up/refresh,
-the expanding breadcrumb, recent locations, sort key/direction,
-folders-first, density and a compact Unicode search edit. Search has a
-220-logical-pixel preferred width, may shrink to 140 and never exceeds 300;
-the breadcrumb receives remaining width at wide window sizes. The layout does
-not wrap at narrow widths and uses Qt size policies rather than physical-pixel
-positions.
+the expanding native-combo-chrome breadcrumb/location control, sort
+key/direction, folders-first, density and a compact native-combo-chrome
+Unicode search edit. Search may shrink to 140 logical pixels and the complete
+field including its native dropdown subcontrol never exceeds about 220; the
+location control receives remaining width. The layout does not wrap at narrow
+widths and uses Qt size policies rather than physical-pixel positions.
 
 #### 24.4.5 Bounded location/history projection and retention
 
@@ -4845,10 +4845,10 @@ owns two explicitly different projections. Its session timeline continues to
 hold the current index and back/forward branches. A bounded normalized-path
 MRU supplies the recent-location popup. Successful normal visits and restored
 timeline visits move that location to the MRU front; a duplicate path is
-removed first. `browser_location_history_limit` controls only this MRU with
-choices 10, 20, 30, 50, 100 and 200 (default 50). Changing it trims the MRU
-tail immediately without changing timeline entries or the current timeline
-index. Popup height remains 14 rows even when 200 locations are retained.
+removed first. `browser_location_history_limit` controls only this MRU with a
+custom range of 1 through 1000 (default 50). Changing it trims the MRU tail
+immediately without changing timeline entries or the current timeline index.
+Popup height remains 14 rows even when hundreds of locations are retained.
 
 The recent popup does not synchronously call `exists()`/`stat()` across its
 entries, which avoids blocking the GUI thread on UNC and unavailable network
@@ -4869,6 +4869,221 @@ screen. That source is AGPL-3.0-or-later; its notices remain in
 `THIRD_PARTY_NOTICES.md`. The finite Qt popup, split timeline/MRU lifetime,
 asynchronous click-time validation and DPI-derived geometry are
 NivisViewer-specific modernizations.
+
+#### 24.4.6 Compact rating state and separate search-query history
+
+The menu-row rating control now uses only its five-star visual state. The
+always-visible `レート`, `以上`, `のみ` and `未評価` labels were removed.
+Inactive state uses outline stars, threshold/equality modes fill through the
+selected star. Exact mode, unrated state and threshold remain available in the
+dynamic tooltip and the existing non-modal context menu. There is no separate
+mode label, `未` marker or clear button: clicking the active threshold again
+clears it, while the context menu retains an explicit clear action. This
+changes presentation only; `BrowserFilterState` remains the sole rating/search
+predicate authority.
+
+Location history and file/book metadata history are explicitly not combined.
+The recent-location projection continues to receive only successful Browser
+directory scan targets. Opening an image or archive path through the location
+editor navigates to and records its parent directory while the selected file
+remains restoration state. Individual image/archive paths therefore do not
+appear in the location MRU. The existing first-activation select-all behavior
+of `BrowserAddressBar`, Ctrl+L, Enter and Escape behavior is unchanged.
+
+The search edit is the content widget of a native `QComboBox` shell, backed by
+the same bounded 14-row popup presentation used for directory/history lists.
+Qt style draws the frame, dropdown subcontrol and arrow; no Unicode arrow or
+adjacent `QToolButton` participates. Its data authority is a separate
+`BrowserSearchHistory`, because query strings are
+neither filesystem locations nor navigation timeline entries. It records one
+trimmed non-empty query on Enter, explicit dropdown opening or history
+selection; focus loss and the 100 ms incremental filter states are never
+recorded. Duplicate detection uses Unicode `casefold()` while preserving the
+most recently entered spelling. Selecting a query immediately feeds the
+existing in-memory search predicate without a directory scan. The popup also
+exposes a compact clear-history command and retains wheel, scrollbar, arrow,
+Page Up/Page Down, Home/End, Enter, Escape, outside-click and screen-clamped
+behavior without `exec()`.
+
+`browser_search_history` is persisted as an MRU, while the active search text
+remains session-only and starts empty on every Browser construction.
+`browser_search_history_limit` accepts 0 through 1000 (default 50); zero clears
+and disables query history. The location MRU independently accepts 1 through
+1000. Both settings use custom `QSpinBox` input and trim immediately, but only
+the location MRU belongs to `BrowserNavigationHistory`; its back/forward
+timeline is never truncated by either setting.
+
+#### 24.4.7 ZipPla-style operation-density simplification
+
+At fixed revision `07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`,
+`source/ZipPla/CatalogForm.Designer.cs` keeps `cbLocation` (234 by 20),
+`cbSortBy` (135 by 20) and `cbFilter` (182 by 20) compact on the same Catalog
+row; the rating affordance is the text `★★★★★`, without an adjacent clear
+button. `source/ZipPla/CatalogForm.cs` registers the current filter from
+`cbFilter_DropDown` with `setCurrentFilterToHistory(bringToTop: false)`, while
+back/forward right-click calls `showUndoBufferList`. The fixed revision's
+`source/ZipPla/ZipPlaAddressBar.cs` switches one address-bar region between
+breadcrumb buttons and its editor on focus instead of placing a separate
+recent-history button beside it. These files and behaviors are
+AGPL-3.0-or-later-derived comparison material; notices remain in
+`THIRD_PARTY_NOTICES.md`.
+
+NivisViewer now follows that operation density without copying the WinForms
+widgets. One expanding native `QComboBox` shell owns the breadcrumb/editor
+stack and its style-provided dropdown subcontrol. Clicking the current segment or empty
+breadcrumb area enters path editing; ancestor segments navigate and separator
+chevrons enumerate children. The native final dropdown subcontrol alone projects the
+directory-only MRU. Back/forward right-click continues to project the separate
+timeline, so the two histories are not merged. The removed standalone
+`履歴 ▾` widget has no compatibility alias or hidden replacement.
+
+The sort controls and the integrated search/history field remain on the same
+toolbar row. Search has a 190 device-independent-pixel preferred outer width,
+a 150-pixel responsive minimum and a 230-pixel maximum. The location area
+receives all remaining stretch space. Folders-first and display-density
+controls are no longer duplicated on this high-frequency row; their existing
+Settings authority remains live and persistent.
+The toolbar and menu/rating row remain the only two top UI rows. History
+limits, persistence, bounded non-modal popups, Unicode matching, stable
+filter/sort authority and Browser-to-Viewer visible-order snapshots are
+unchanged.
+
+#### 24.4.8 Native dropdown chrome, stable rating toggle, and folder canvas
+
+The fixed revision uses real WinForms `ComboBox` controls for `cbLocation`,
+`cbSortBy` and owner-drawn `cbFilter` in
+`source/ZipPla/CatalogForm.Designer.cs`; their dropdown arrows are native
+control chrome, not text-glyph buttons. NivisViewer now uses a small
+`QComboBox` shell for both custom fields. Its edit-field subcontrol hosts the
+existing breadcrumb/editor stack or search `QLineEdit`, while `showPopup()`
+projects the existing bounded directory/query MRU. The current Qt style owns
+border, hover, pressed, focus, disabled and high-DPI arrow painting, matching
+the existing sort selectors without a bitmap asset or literal arrow glyph.
+
+At the same revision, `CatalogForm.cs`
+`ratingFilterToolStripMenuItem_MouseMove` derives `ratingReferenceValue` from
+the painted five-star rectangle and `ratingFilterToolStripMenuItem_Click`
+dispatches the selected rating expression. NivisViewer retains its simpler
+`>=` left-click contract, but now captures the pressed star and applies that
+stable reference on release. A small pointer movement across a fractional-DPI
+star boundary therefore cannot turn an intended same-star clear into a new
+threshold. The active `>= X` star toggles off on the same left click; every
+mode remains clearable from the context menu, and middle click is an
+additional label-free clear gesture. Search and sort state remain unchanged.
+
+ZipPlaFork's `CatalogForm.cs` `ThumbViewer` paint path distinguishes
+`LoadResult.NotYet`/error from completed thumbnails and uses
+`drawFileIconImage` for an optional small associated icon. Its large
+`drawFileImage` fallback is disabled by an early return at this revision, so
+there is no modern neutral card suitable for direct adoption. NivisViewer adds
+one in `BrowserItemDelegate` only when a folder has no `ThumbnailImageRole`:
+a flat square thumbnail canvas blended solely from the active palette's Base,
+AlternateBase, Mid and Midlight roles, followed by the existing folder icon.
+There is no rounded corner, offset back plate or shadow. Pending/loading
+folders may show the stable canvas;
+a completed preview takes the existing image branch and removes it. Image
+files never use the folder card. This is delegate-only paint: it adds no scan,
+read, decode, thumbnail request, per-folder pixmap or cache-key state.
+
+The ZipPlaFork comparison above is against repository
+`himamon/ZipPlaFork`, fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, files
+`source/ZipPla/CatalogForm.Designer.cs` and
+`source/ZipPla/CatalogForm.cs`, and is AGPL-3.0-or-later-derived. No source
+method was directly translated for the Qt shell or folder canvas; preserved
+notices remain in the locations listed in section 24.3.
+
+#### 24.4.9 Search width is based on the editable content rectangle
+
+At the fixed revision, `CatalogForm.Designer.cs` gives `cbLocation` a
+left/right anchor and an initial 234 by 20 size, while right-anchored
+`cbSortBy` and `cbFilter` are 135 by 20 and 182 by 20 respectively;
+`cbFilter.MinimumSize` is 153 pixels. Those numbers describe one native
+WinForms ComboBox. They are not directly usable as the outer size of
+NivisViewer's Qt shell, which also contains a native dropdown subcontrol and a
+clearable `QLineEdit`.
+
+The former Qt shell inherited its size hint from one empty ComboBox item and
+therefore collapsed to 30 logical pixels. Its child editor still requested
+140 pixels and was clipped beyond the shell. Although that child reported 118
+pixels after its 22-pixel clear-button allocation, the native shell exposed
+only a 5-pixel edit-field rectangle, so the effective text area was negligible.
+The shell now
+publishes an explicit preferred size and lays out its child from
+`QStyle.SC_ComboBoxEditField`, so the active platform style remains the
+authority for frame and arrow geometry. The first correction used a wide
+360/240/460 preferred/minimum/maximum shell to prove that clipping was gone.
+After real-device density feedback, the final allocation is 190/150/230.
+At 1x offscreen Windows style from an 800 through 3840-pixel Browser, the
+normal result is a 190-pixel outer shell, a 165-pixel edit field and 143
+pixels after the clear-button allocation. Removing the two low-frequency
+toolbar controls lets the location field retain the released space instead of
+forcing the search shell below its preferred width.
+
+This is a NivisViewer responsive-layout correction informed by ZipPlaFork's
+fixed-control-versus-stretch allocation, not a translation of WinForms layout
+code. Search history, Unicode/IME editing, debounce, clear action, filtering,
+sorting and Browser-to-Viewer order authority are unchanged. The comparison
+source remains `himamon/ZipPlaFork` revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, file
+`source/ZipPla/CatalogForm.Designer.cs`, under AGPL-3.0-or-later.
+
+#### 24.4.10 Minimal viewport movement and low-frequency settings ownership
+
+ZipPlaFork's fixed-revision `CatalogForm.cs`
+`cbSortBy_SelectedValueChanged` (`:14745-14805`) keeps the selected data item
+stable while replacing `ThumbViewer.ShowIndexToDataIndex`, then calls
+`ScrollBarToIndexWithMinimalMove` (`:30725-30748`). That method returns without
+scrolling when the selected thumbnail is fully visible and moves only the
+nearer boundary when it is outside. Other refresh paths preserve
+`ThumbViewer.ScrollBarPercentage` (for example `:20746-20748` and
+`:25626-25628`), and Browser history persists the thumbnail percentage at
+`:7311`/`:7512`. `readme_original.txt` records the same contracts: display
+refresh position preservation (`:473`), back/forward scrollbar restoration
+(`:474`), exact minimal list movement (`:519`) and minimal selected-thumbnail
+movement (`:583`).
+
+NivisViewer previously captured the first visible stable path, but every
+model reset restored it with `QListView.PositionAtTop`. This discarded its
+pixel offset, and the next sort captured the already-shifted viewport. It also
+treated a reset-generated `currentIndex` as meaningful even with no actual
+selection. The replacement distinguishes two cases. With selected indexes it
+restores path identity and uses `EnsureVisible` only when the current selected
+cell is not fully contained. With no selection it restores the first visible
+stable path to its captured x/y viewport offset; if that path disappeared it
+uses the nearest surviving row, then the previous clamped scroll values.
+Programmatic restoration suppresses thumbnail scheduling, so sort key,
+direction and folders-first changes retain source/model thumbnails without a
+filesystem scan, cache generation or decode request. Geometry-changing
+Settings such as thumbnail size reuse the same anchor contract and then
+request only the thumbnails needed by the new render specification.
+
+The Browser Settings tab was already the persistent authority for
+`browser_folders_first`, `browser_display_density` and `thumbnail_size`.
+NivisViewer therefore removes only the duplicate folders-first checkbox and
+density ComboBox from the toolbar; Settings changes continue to project into
+the open Browser through `ConfigManager.changed`. This is a Hybrid adoption of
+ZipPlaFork's minimal-movement behavior with Qt stable paths and per-pixel
+scrollbars, not a translation of the WinForms `ThumbViewer` implementation.
+
+For unavailable thumbnails, fixed-revision `CatalogForm.cs`
+`tvCatalog_ThumbnailPaint` (`:24715-24805`) distinguishes
+`LoadResult.NotYet`, errors and completed artifacts. `drawFileIconImage`
+(`:6478-6499`) places an optional small associated icon at bottom-left after a
+real thumbnail. Its large `drawFileImage` fallback (`:6546-6588`) returns
+immediately at this revision because the old loader state could otherwise
+overlay icons on completed thumbnails. NivisViewer keeps its clearer
+pending/loading/no-preview versus completed-preview state boundary, but
+renders the fallback as a theme-aware square canvas with one subtle border and
+the existing centered folder icon. This remains delegate-only paint and adds
+no filesystem access, decode, thumbnail request or cache entry.
+
+All source references in this subsection are from repository
+`himamon/ZipPlaFork`, fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, files
+`source/ZipPla/CatalogForm.cs`, `source/ZipPla/CatalogForm.Designer.cs` and
+`readme_original.txt`, under AGPL-3.0-or-later. The original notices remain in
+the locations listed in section 24.3.
 
 ### 24.5 Independent rating quick filter and plain search
 

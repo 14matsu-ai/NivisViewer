@@ -31,6 +31,8 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
     assert manager.data["browser_folders_first"] is True
     assert manager.data["browser_display_density"] == "standard"
     assert manager.data["browser_location_history_limit"] == 50
+    assert manager.data["browser_search_history_limit"] == 50
+    assert manager.data["browser_search_history"] == []
     assert manager.data["join_spread_pages"] is False
     assert manager.data["thumbnail_disk_cache_enabled"] is True
     assert manager.data["thumbnail_cache_limit_mb"] == 512
@@ -399,20 +401,44 @@ def test_rating_sort_setting_is_saved_and_restored(tmp_path: Path) -> None:
     assert restored.get("browser_sort_order") == "descending"
 
 
-def test_browser_location_history_limit_round_trips_and_normalizes(
+def test_browser_history_limits_and_search_mru_round_trip_and_normalize(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "location-history.json"
     manager = ConfigManager(path)
     manager.load()
-    manager.apply({"browser_location_history_limit": 200}, save=True)
-    assert ConfigManager(path).load()["browser_location_history_limit"] == 200
+    manager.apply(
+        {
+            "browser_location_history_limit": 217,
+            "browser_search_history_limit": 3,
+            "browser_search_history": [" Foo ", "背景", "foo", "third", "fourth"],
+        },
+        save=True,
+    )
+    restored = ConfigManager(path).load()
+    assert restored["browser_location_history_limit"] == 217
+    assert restored["browser_search_history_limit"] == 3
+    assert restored["browser_search_history"] == ["Foo", "背景", "third"]
 
     path.write_text(
-        '{"browser_location_history_limit": 17}',
+        '{"browser_location_history_limit": 0, '
+        '"browser_search_history_limit": 1001, '
+        '"browser_search_history": "bad"}',
         encoding="utf-8",
     )
-    assert ConfigManager(path).load()["browser_location_history_limit"] == 50
+    restored = ConfigManager(path).load()
+    assert restored["browser_location_history_limit"] == 50
+    assert restored["browser_search_history_limit"] == 50
+    assert restored["browser_search_history"] == []
+
+    path.write_text(
+        '{"browser_search_history_limit": 0, '
+        '"browser_search_history": ["hidden"]}',
+        encoding="utf-8",
+    )
+    restored = ConfigManager(path).load()
+    assert restored["browser_search_history_limit"] == 0
+    assert restored["browser_search_history"] == []
 
 
 def test_sprint4_settings_are_normalized_and_changes_are_emitted(tmp_path: Path) -> None:

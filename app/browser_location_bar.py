@@ -500,6 +500,9 @@ class BrowserLocationBreadcrumb(QWidget):
                 font = QFont(button.font())
                 font.setBold(True)
                 button.setFont(font)
+                button.clicked.connect(
+                    lambda _checked=False: self.editRequested.emit()
+                )
             else:
                 button.clicked.connect(
                     lambda _checked=False, value=segment.path: (

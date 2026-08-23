@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QItemSelectionModel, QRect, QSize, Qt
-from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
+from PySide6.QtCore import QItemSelectionModel, QPoint, QRect, QSize, Qt
+from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import QListView, QStyle, QStyleOptionViewItem
 
 from app.browser_item_delegate import (
@@ -163,6 +163,88 @@ def test_center_crop_delegate_fills_frame_from_image_center(qapp):
     assert painter_image.pixelColor(97, 97) == QColor("green")
 
 
+@pytest.mark.parametrize("dark", [False, True])
+def test_folder_without_preview_paints_square_canvas_until_preview_arrives(
+    qapp,
+    tmp_path,
+    dark,
+):
+    palette = QPalette(qapp.palette())
+    if dark:
+        palette.setColor(QPalette.ColorRole.Window, QColor("#202124"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#292a2d"))
+        palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#34363a"))
+        palette.setColor(QPalette.ColorRole.Button, QColor("#3c4043"))
+        palette.setColor(QPalette.ColorRole.Mid, QColor("#666a70"))
+        palette.setColor(QPalette.ColorRole.Midlight, QColor("#4b4f54"))
+
+    delegate = BrowserItemDelegate(
+        thumbnail_size=180,
+        density=BrowserDisplayDensity.STANDARD,
+        shell_icon_provider=FixedShellIconProvider("#d6a928"),
+    )
+    folder = make_item(tmp_path / "folder", BrowserItemKind.FOLDER)
+    image_file = make_item(tmp_path / "page.jpg", BrowserItemKind.IMAGE)
+    model = BrowserItemModel()
+    model.set_items([folder, image_file])
+    fallback = QPixmap(32, 32)
+    fallback.fill(QColor("#d6a928"))
+    model.set_fallback_icons(
+        {
+            BrowserItemKind.FOLDER: QIcon(fallback),
+            BrowserItemKind.IMAGE: QIcon(fallback),
+        }
+    )
+
+    option = QStyleOptionViewItem()
+    option.rect = QRect(QPoint(), delegate.cell_size)
+    option.palette = palette
+    option.state = QStyle.StateFlag.State_Enabled
+    thumbnail = delegate.grid_metrics.thumbnail_frame_rect(option.rect)
+    probe = thumbnail.topLeft() + QPoint(12, 12)
+
+    def render(row: int, *, selected: bool = False) -> QImage:
+        canvas = QImage(
+            delegate.cell_size,
+            QImage.Format.Format_ARGB32_Premultiplied,
+        )
+        canvas.fill(palette.window().color())
+        option.state = QStyle.StateFlag.State_Enabled
+        if selected:
+            option.state |= (
+                QStyle.StateFlag.State_Selected
+                | QStyle.StateFlag.State_MouseOver
+                | QStyle.StateFlag.State_HasFocus
+            )
+        painter = QPainter(canvas)
+        delegate.paint(painter, option, model.index(row, 0))
+        painter.end()
+        return canvas
+
+    pending = render(0)
+    assert pending.pixelColor(probe) != palette.base().color()
+    assert pending.pixelColor(thumbnail.topLeft() + QPoint(7, 7)) != (
+        palette.base().color()
+    )
+    assert model.data(model.index(0, 0), model.ThumbnailImageRole) is None
+    assert delegate._uses_folder_fallback_canvas(folder, None)
+    assert not delegate._uses_folder_fallback_canvas(image_file, None)
+
+    model.set_preview_status(folder.path, "loading")
+    loading = render(0, selected=True)
+    assert loading.pixelColor(probe) != palette.base().color()
+
+    preview = QImage(
+        delegate.frame_size,
+        QImage.Format.Format_RGB32,
+    )
+    preview.fill(QColor("#20a050"))
+    assert not delegate._uses_folder_fallback_canvas(folder, preview)
+    model.set_thumbnail_image(folder.path, preview)
+    completed = render(0)
+    assert completed.pixelColor(probe) == QColor("#20a050")
+
+
 def test_type_badges_distinguish_supported_item_types_and_are_bottom_left(tmp_path):
     cases = {
         "folder": make_item(tmp_path / "folder", BrowserItemKind.FOLDER),
@@ -214,7 +296,7 @@ def test_badge_paints_at_high_dpi(qapp, tmp_path):
     assert color.red() > color.blue()
 
 
-def test_four_density_profiles_keep_selection_and_visible_anchor(
+def test_four_density_profiles_keep_selection_with_minimal_scroll(
     tmp_path, qapp
 ):
     window = make_window(tmp_path, qapp)
@@ -230,9 +312,6 @@ def test_four_density_profiles_keep_selection_and_visible_anchor(
     )
     window.list_view.scrollTo(current, QListView.ScrollHint.PositionAtCenter)
     qapp.processEvents()
-    anchor = window.item_model.item_at(window._visible_anchor_index())
-    assert anchor is not None
-
     window.config.apply({"browser_display_density": "large"})
     for _ in range(3):
         qapp.processEvents()
@@ -240,13 +319,17 @@ def test_four_density_profiles_keep_selection_and_visible_anchor(
     selected = window.item_model.item_at(window.list_view.currentIndex())
     assert selected is not None and selected.path == items[55].path
     assert window.list_view.gridSize() == QSize(231, 195)
-    restored_anchor = window.item_model.index(
-        window.item_model.row_for_path(anchor.path),
+    restored_selected = window.item_model.index(
+        window.item_model.row_for_path(items[55].path),
         0,
     )
-    assert window.list_view.visualRect(restored_anchor).intersects(
-        window.list_view.viewport().rect()
-    )
+    selected_rect = window.list_view.visualRect(restored_selected)
+    viewport_rect = window.list_view.viewport().rect()
+    assert viewport_rect.contains(selected_rect)
+    assert min(
+        abs(selected_rect.top() - viewport_rect.top()),
+        abs(selected_rect.bottom() - viewport_rect.bottom()),
+    ) <= window.list_view.gridSize().height()
     window.close()
     qapp.processEvents()
 

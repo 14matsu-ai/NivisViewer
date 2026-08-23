@@ -245,11 +245,13 @@ class BrowserNavigationHistory:
 
     @staticmethod
     def _normalize_recent_limit(limit: int) -> int:
+        if isinstance(limit, bool):
+            return 50
         try:
             value = int(limit)
         except (TypeError, ValueError):
             value = 50
-        return value if value in {10, 20, 30, 50, 100, 200} else 50
+        return max(1, min(1000, value))
 
     @classmethod
     def _relocated_value(
