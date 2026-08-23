@@ -47,6 +47,7 @@ def test_current_values_are_shown_and_join_disables_gap(
             "thumbnail_frame_ratio": "landscape_16_9",
             "thumbnail_crop_mode": "center_crop",
             "browser_thumbnail_display_mode": "center_crop",
+            "browser_folder_fallback_background": "#31597d",
             "thumbnail_quality_mode": "high",
             "thumbnail_cache_max_edge": 1536,
             "browser_display_density": "comfortable",
@@ -71,6 +72,8 @@ def test_current_values_are_shown_and_join_disables_gap(
         dialog.browser_thumbnail_display_mode_combo.currentData()
         == "center_crop"
     )
+    assert dialog.browser_folder_fallback_background_combo.currentData() == "custom"
+    assert dialog._folder_fallback_custom_color == "#31597d"
     assert dialog.thumbnail_quality_mode_combo.currentData() == "high"
     assert dialog.thumbnail_cache_max_edge_spin.value() == 1536
     assert dialog.browser_display_density_combo.currentData() == "comfortable"
@@ -99,6 +102,11 @@ def test_apply_and_ok_persist_settings(tmp_path: Path, qapp: QApplication) -> No
     dialog.browser_thumbnail_display_mode_combo.setCurrentIndex(
         dialog.browser_thumbnail_display_mode_combo.findData("center_crop")
     )
+    dialog.browser_folder_fallback_background_combo.setCurrentIndex(
+        dialog.browser_folder_fallback_background_combo.findData("custom")
+    )
+    dialog._folder_fallback_custom_color = "#31597d"
+    dialog._sync_folder_fallback_background_controls()
     dialog.thumbnail_quality_mode_combo.setCurrentIndex(
         dialog.thumbnail_quality_mode_combo.findData("economy")
     )
@@ -124,6 +132,7 @@ def test_apply_and_ok_persist_settings(tmp_path: Path, qapp: QApplication) -> No
     assert changed["thumbnail_frame_ratio"] == "portrait_2_3"
     assert changed["thumbnail_crop_mode"] == "letterbox"
     assert changed["browser_thumbnail_display_mode"] == "center_crop"
+    assert changed["browser_folder_fallback_background"] == "#31597d"
     assert changed["thumbnail_quality_mode"] == "economy"
     assert changed["thumbnail_cache_max_edge"] == 768
     assert changed["browser_display_density"] == "compact"
@@ -139,6 +148,7 @@ def test_apply_and_ok_persist_settings(tmp_path: Path, qapp: QApplication) -> No
     restored = ConfigManager(config.path).load()
     assert restored["join_spread_pages"] is True
     assert restored["browser_thumbnail_display_mode"] == "center_crop"
+    assert restored["browser_folder_fallback_background"] == "#31597d"
     reopened_config = ConfigManager(config.path)
     reopened_config.load()
     reopened = SettingsDialog(reopened_config)
@@ -146,7 +156,27 @@ def test_apply_and_ok_persist_settings(tmp_path: Path, qapp: QApplication) -> No
         reopened.browser_thumbnail_display_mode_combo.currentData()
         == "center_crop"
     )
+    assert reopened.browser_folder_fallback_background_combo.currentData() == "custom"
     reopened.reject()
+
+
+def test_folder_fallback_background_restore_default_uses_auto(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    del qapp
+    config = make_config(tmp_path)
+    config.apply({"browser_folder_fallback_background": "#31597d"})
+    dialog = SettingsDialog(config)
+
+    assert dialog.browser_folder_fallback_background_combo.currentData() == "custom"
+    assert dialog.browser_folder_fallback_color_button.isEnabled()
+    dialog.browser_folder_fallback_restore_button.click()
+
+    assert dialog.browser_folder_fallback_background_combo.currentData() == "auto"
+    assert not dialog.browser_folder_fallback_color_button.isEnabled()
+    assert dialog.values()["browser_folder_fallback_background"] == "auto"
+    dialog.reject()
 
 
 def test_resampling_controls_expose_backend_authority_and_apply(

@@ -694,15 +694,130 @@ def test_rating_change_live_filters_without_rescan_or_thumbnail_decode(
         renamed = folder / "middle {zpi$r=2}.jpg"
         assert renamed.exists()
         assert [item.display_name for item in window.items] == ["high.jpg"]
-        current = window.item_model.item_at(window.list_view.currentIndex())
-        assert current is not None and current.path == high
-        assert [
-            window.item_model.item_at(index).path
-            for index in selection.selectedIndexes()
-        ] == [high]
+        assert not window.list_view.currentIndex().isValid()
+        assert selection.selectedIndexes() == []
+        window.rating_filter_widget.clear_filter()
+        qapp.processEvents()
+        assert not window.list_view.currentIndex().isValid()
+        assert selection.selectedIndexes() == []
         assert renamed.stat().st_mtime_ns == preserved_mtime
         assert window._scan_generation == scan_generation
         assert window.item_model.source_count == 3
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_filter_does_not_replace_hidden_selection_with_same_visible_row(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "filter-selection-identity"
+    hidden = folder / "a-hidden {zpi$r=1}.jpg"
+    replacement = folder / "b-replacement {zpi$r=5}.jpg"
+    trailing = folder / "c-trailing {zpi$r=5}.jpg"
+    for path in (hidden, replacement, trailing):
+        write_image(path)
+    window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    finish_scan(window, qapp)
+    selection = window.list_view.selectionModel()
+    hidden_index = window.item_model.index(
+        window.item_model.row_for_path(hidden),
+        0,
+    )
+    selection.select(
+        hidden_index,
+        QItemSelectionModel.SelectionFlag.ClearAndSelect,
+    )
+    selection.setCurrentIndex(
+        hidden_index,
+        QItemSelectionModel.SelectionFlag.NoUpdate,
+    )
+    selected_identities: list[tuple[str, ...]] = []
+
+    def record_selection() -> None:
+        selected_identities.append(
+            tuple(
+                str(item.path)
+                for index in selection.selectedIndexes()
+                if (item := window.item_model.item_at(index)) is not None
+            )
+        )
+
+    selection.selectionChanged.connect(lambda *_args: record_selection())
+
+    try:
+        window.rating_filter_widget.set_filter(RatingFilterMode.AT_LEAST, 5)
+        qapp.processEvents()
+
+        assert [item.path for item in window.items] == [replacement, trailing]
+        assert selection.selectedIndexes() == []
+        assert not window.list_view.currentIndex().isValid()
+        assert (str(replacement),) not in selected_identities
+
+        window.rating_filter_widget.clear_filter()
+        qapp.processEvents()
+
+        assert selection.selectedIndexes() == []
+        assert not window.list_view.currentIndex().isValid()
+        assert (str(replacement),) not in selected_identities
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_explicit_selection_while_filtered_remains_authoritative_after_clear(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "filtered-explicit-selection"
+    hidden = folder / "hidden {zpi$r=1}.jpg"
+    chosen = folder / "chosen {zpi$r=5}.jpg"
+    other = folder / "other {zpi$r=4}.jpg"
+    for path in (hidden, chosen, other):
+        write_image(path)
+    window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    finish_scan(window, qapp)
+    selection = window.list_view.selectionModel()
+    hidden_index = window.item_model.index(
+        window.item_model.row_for_path(hidden),
+        0,
+    )
+    selection.select(
+        hidden_index,
+        QItemSelectionModel.SelectionFlag.ClearAndSelect,
+    )
+    selection.setCurrentIndex(
+        hidden_index,
+        QItemSelectionModel.SelectionFlag.NoUpdate,
+    )
+
+    try:
+        window.rating_filter_widget.set_filter(RatingFilterMode.AT_LEAST, 4)
+        qapp.processEvents()
+        assert selection.selectedIndexes() == []
+        chosen_index = window.item_model.index(
+            window.item_model.row_for_path(chosen),
+            0,
+        )
+        selection.select(
+            chosen_index,
+            QItemSelectionModel.SelectionFlag.ClearAndSelect,
+        )
+        selection.setCurrentIndex(
+            chosen_index,
+            QItemSelectionModel.SelectionFlag.NoUpdate,
+        )
+
+        window.rating_filter_widget.clear_filter()
+        qapp.processEvents()
+
+        current = window.item_model.item_at(window.list_view.currentIndex())
+        assert current is not None and current.path == chosen
+        assert [
+            window.item_model.item_at(index).path
+            for index in selection.selectedIndexes()
+        ] == [chosen]
     finally:
         window.close()
         qapp.processEvents()

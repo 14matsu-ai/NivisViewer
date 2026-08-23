@@ -168,6 +168,7 @@ from .internal_clipboard import (
 from .metadata_store import MetadataStore
 from .path_availability import PathAvailabilityService
 from .rating_rename_service import RatingRenameService
+from .zippla_filename_metadata import ZipPlaFilenameMetadata
 from .performance_trace import performance_trace
 from .settings_dialog import SettingsDialog
 from .sidebar_layout import SidebarLayoutController
@@ -199,6 +200,16 @@ class _ListViewState:
     anchor_y: int
     vertical_scroll: int
     horizontal_scroll: int
+
+
+@dataclass
+class _RatingRenameBatch:
+    rating: int | None
+    view_state: _ListViewState
+    pending_folders: list[tuple[str, str]] = field(default_factory=list)
+    replacements: list[tuple[str, str, int | None]] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
+    active_request_id: int | None = None
 
 
 @dataclass
@@ -550,6 +561,9 @@ class BrowserWindow(QMainWindow):
         self.browser_thumbnail_display_mode = str(
             self.settings.get("browser_thumbnail_display_mode", "fit")
         )
+        self.browser_folder_fallback_background = str(
+            self.settings.get("browser_folder_fallback_background", "auto")
+        )
         self.thumbnail_quality_mode = str(
             self.settings.get("thumbnail_quality_mode", "auto")
         )
@@ -666,6 +680,7 @@ class BrowserWindow(QMainWindow):
         self._hovered_list_path: str | None = None
         self._rating_hover_path: str | None = None
         self._rating_press: tuple[str, int | None, Qt.MouseButton] | None = None
+        self._rating_batch: _RatingRenameBatch | None = None
         self._detail_generation = 0
         self._detail_request_identity: tuple[int, str] | None = None
 
@@ -2371,6 +2386,13 @@ class BrowserWindow(QMainWindow):
                             item.destination_path,
                         )
 
+        if (
+            self._rating_batch is not None
+            and self._rating_batch.active_request_id == result.request_id
+        ):
+            self._complete_folder_rating_rename(result)
+            return
+
         if result.operation is FileOperationKind.MOVE and self._clipboard_cut:
             top_level = {
                 self._path_key(item.source_path): item
@@ -2980,6 +3002,18 @@ class BrowserWindow(QMainWindow):
             self.thumbnail_provider.cleanup_caches_async(force=False)
 
     def apply_settings(self, changed: dict[str, object]) -> None:
+        if "browser_folder_fallback_background" in changed:
+            self.browser_folder_fallback_background = str(
+                changed["browser_folder_fallback_background"]
+            )
+            self.item_delegate.configure(
+                thumbnail_size=self.thumbnail_size,
+                density=self.browser_display_density,
+                folder_fallback_background=(
+                    self.browser_folder_fallback_background
+                ),
+            )
+            self.list_view.viewport().update()
         if "browser_location_history_limit" in changed:
             self.navigation_history.set_recent_limit(
                 int(changed["browser_location_history_limit"])
@@ -3543,16 +3577,12 @@ class BrowserWindow(QMainWindow):
             self._sync_browser_filter_controls()
             return False
         view_state = self._capture_list_view_state()
-        preferred_row = self.list_view.currentIndex().row()
         self.browser_filter_state = normalized
         changed = self.item_model.configure_filter(normalized)
         self._sync_browser_filter_controls()
         if not changed:
             return False
-        restored = self._coerce_list_view_state_to_visible(
-            view_state,
-            preferred_row=preferred_row,
-        )
+        restored = self._coerce_list_view_state_to_visible(view_state)
         self._schedule_list_view_state_restore(restored)
         self._update_status(force=True)
         self._schedule_thumbnail_requests()
@@ -3581,8 +3611,6 @@ class BrowserWindow(QMainWindow):
     def _coerce_list_view_state_to_visible(
         self,
         state: _ListViewState,
-        *,
-        preferred_row: int,
     ) -> _ListViewState:
         selected_paths = tuple(
             path
@@ -3592,16 +3620,6 @@ class BrowserWindow(QMainWindow):
         current_path = state.current_path
         if current_path and self.item_model.row_for_path(current_path) < 0:
             current_path = None
-        if (
-            current_path is None
-            and state.selected_paths
-            and self.item_model.rowCount() > 0
-        ):
-            row = max(0, min(preferred_row, self.item_model.rowCount() - 1))
-            fallback = self.item_model.item_at(row)
-            current_path = str(fallback.path) if fallback is not None else None
-            if not selected_paths and current_path:
-                selected_paths = (current_path,)
         return _ListViewState(
             selected_paths=selected_paths,
             current_path=current_path,
@@ -3633,6 +3651,7 @@ class BrowserWindow(QMainWindow):
                 if self.browser_item_spacing_mode == "preset"
                 else self.browser_item_spacing
             ),
+            folder_fallback_background=self.browser_folder_fallback_background,
         )
         self.list_view.setIconSize(QSize(self.thumbnail_size, self.thumbnail_size))
         self.list_view.setGridSize(self.item_delegate.grid_metrics.grid_size)
@@ -3662,7 +3681,7 @@ class BrowserWindow(QMainWindow):
     def _rating_hit(self, position: QPoint) -> tuple[BrowserItem, int] | None:
         index = self.list_view.indexAt(position)
         item = self.item_model.item_at(index)
-        if item is None or item.kind is BrowserItemKind.FOLDER:
+        if item is None:
             return None
         cell_rect = self.list_view.visualRect(index)
         rating = self.item_delegate.rating_at_position(
@@ -3701,18 +3720,29 @@ class BrowserWindow(QMainWindow):
     ) -> bool:
         """Apply filename ratings without rescanning or decoding thumbnails."""
 
-        if not paths or self.file_operation_coordinator.busy:
+        if (
+            not paths
+            or self.file_operation_coordinator.busy
+            or self._rating_batch is not None
+        ):
             return False
-        existing_list: list[str] = []
+        normalized_rating = (
+            int(rating)
+            if rating is not None and 1 <= int(rating) <= 5
+            else None
+        )
+        existing_items: list[tuple[str, BrowserItemKind]] = []
         for path in paths:
             row = self.item_model.row_for_path(path)
             item = self.item_model.item_at(row) if row >= 0 else None
-            if item is None or item.kind is BrowserItemKind.FOLDER:
+            if item is None:
                 continue
-            existing_list.append(str(self._absolute_browser_path(path)))
-        existing = tuple(existing_list)
-        if not existing:
+            existing_items.append(
+                (str(self._absolute_browser_path(path)), item.kind)
+            )
+        if not existing_items:
             return False
+        existing = tuple(path for path, _kind in existing_items)
         # A selection-triggered Pillow header probe briefly owns a Windows
         # file handle. Retire its stale pending work and drain only the active
         # header read before the same-file rename, otherwise WinError 32 can
@@ -3723,17 +3753,40 @@ class BrowserWindow(QMainWindow):
         # Folder books retain immutable page identities for their lifetime.
         # Reuse the established safety contract instead of leaving an open
         # Viewer with a stale page path after the metadata rename.
-        if not self._confirm_and_close_affected_viewers(existing):
+        direct_file_paths = tuple(
+            path
+            for path, kind in existing_items
+            if kind is not BrowserItemKind.FOLDER
+        )
+        if (
+            direct_file_paths
+            and not self._confirm_and_close_affected_viewers(direct_file_paths)
+        ):
             return False
 
         state = self._capture_list_view_state()
-        preferred_row = self.list_view.currentIndex().row()
-        replacements: list[tuple[str, str, int | None]] = []
-        failures: list[str] = []
-        for path in existing:
-            result = self.rating_rename_service.set_rating(path, rating)
+        batch = _RatingRenameBatch(
+            normalized_rating,
+            state,
+        )
+        for path, kind in existing_items:
+            if kind is BrowserItemKind.FOLDER:
+                destination = (
+                    ZipPlaFilenameMetadata.parse(path)
+                    .with_rating(normalized_rating)
+                    .serialized_path(is_directory=True)
+                )
+                if self._same_path(Path(path), destination):
+                    continue
+                batch.pending_folders.append((path, destination.name))
+                continue
+
+            result = self.rating_rename_service.set_rating(
+                path,
+                normalized_rating,
+            )
             if not result.success:
-                failures.append(
+                batch.failures.append(
                     f"{Path(path).name}: {result.error_message or '変更できません'}"
                 )
                 continue
@@ -3741,11 +3794,74 @@ class BrowserWindow(QMainWindow):
                 continue
             old_path = str(result.source_path)
             new_path = str(result.destination_path)
-            replacements.append((old_path, new_path, result.rating))
+            batch.replacements.append((old_path, new_path, result.rating))
             if self.metadata_store is not None:
                 self.metadata_store.relocate_tree(old_path, new_path)
             self.navigation_history.relocate_tree(old_path, new_path)
 
+        if batch.pending_folders:
+            self._rating_batch = batch
+            if self._start_next_folder_rating_rename():
+                return True
+            return bool(batch.replacements) and not batch.failures
+        return self._finalize_rating_batch(batch)
+
+    def _start_next_folder_rating_rename(self) -> bool:
+        batch = self._rating_batch
+        if batch is None:
+            return False
+        while batch.pending_folders:
+            source_path, new_name = batch.pending_folders.pop(0)
+            if self._start_file_operation(
+                FileOperationKind.RENAME,
+                sources=(source_path,),
+                new_name=new_name,
+            ):
+                batch.active_request_id = self._file_operation_request_id
+                return True
+            batch.failures.append(
+                f"{Path(source_path).name}: 名前変更を開始できませんでした"
+            )
+        self._finalize_rating_batch(batch)
+        return False
+
+    def _complete_folder_rating_rename(
+        self,
+        result: FileOperationResult,
+    ) -> None:
+        batch = self._rating_batch
+        if batch is None or batch.active_request_id != result.request_id:
+            return
+        batch.active_request_id = None
+        item = result.effective_items[0] if result.effective_items else None
+        if (
+            item is not None
+            and item.success
+            and item.source_path
+            and item.destination_path
+        ):
+            batch.replacements.append(
+                (item.source_path, item.destination_path, batch.rating)
+            )
+        else:
+            source = (
+                item.source_path
+                if item is not None and item.source_path
+                else "フォルダ"
+            )
+            message = (
+                item.error_message
+                if item is not None and item.error_message
+                else "変更できません"
+            )
+            batch.failures.append(f"{Path(source).name}: {message}")
+        if not self._start_next_folder_rating_rename():
+            return
+
+    def _finalize_rating_batch(self, batch: _RatingRenameBatch) -> bool:
+        if self._rating_batch is batch:
+            self._rating_batch = None
+        replacements = batch.replacements
         if replacements:
             self._clear_rating_hover()
             self.item_model.apply_rating_renames(tuple(replacements))
@@ -3760,33 +3876,36 @@ class BrowserWindow(QMainWindow):
 
             relocated_state = _ListViewState(
                 selected_paths=tuple(
-                    relocated(path) or path for path in state.selected_paths
+                    relocated(path) or path
+                    for path in batch.view_state.selected_paths
                 ),
-                current_path=relocated(state.current_path),
-                anchor_path=relocated(state.anchor_path),
-                anchor_row=state.anchor_row,
-                anchor_x=state.anchor_x,
-                anchor_y=state.anchor_y,
-                vertical_scroll=state.vertical_scroll,
-                horizontal_scroll=state.horizontal_scroll,
+                current_path=relocated(batch.view_state.current_path),
+                anchor_path=relocated(batch.view_state.anchor_path),
+                anchor_row=batch.view_state.anchor_row,
+                anchor_x=batch.view_state.anchor_x,
+                anchor_y=batch.view_state.anchor_y,
+                vertical_scroll=batch.view_state.vertical_scroll,
+                horizontal_scroll=batch.view_state.horizontal_scroll,
             )
             visible_state = self._coerce_list_view_state_to_visible(
-                relocated_state,
-                preferred_row=preferred_row,
+                relocated_state
             )
             self._schedule_list_view_state_restore(visible_state)
             self._update_selected_detail()
 
         changed_count = len(replacements)
-        if failures:
-            summary = f"レート変更: {changed_count}件成功、{len(failures)}件失敗"
+        if batch.failures:
+            summary = (
+                f"レート変更: {changed_count}件成功、"
+                f"{len(batch.failures)}件失敗"
+            )
             self._show_temporary_status(summary, 5000)
             logging.getLogger("nivisviewer.rating").warning(
-                "%s: %s", summary, "; ".join(failures)
+                "%s: %s", summary, "; ".join(batch.failures)
             )
         elif changed_count:
             self._show_temporary_status(f"{changed_count}件のレートを変更しました")
-        return changed_count > 0 and not failures
+        return changed_count > 0 and not batch.failures
 
     @staticmethod
     def _format_file_size(size: int | None) -> str:
@@ -4236,6 +4355,7 @@ class BrowserWindow(QMainWindow):
             filename_gap=self.browser_filename_gap,
             filename_padding_y=self.browser_filename_padding_y,
             item_spacing=0,
+            folder_fallback_background=self.browser_folder_fallback_background,
         )
         self.list_view.setItemDelegate(self.item_delegate)
         self.list_view.setViewMode(QListView.ViewMode.IconMode)
@@ -5823,8 +5943,7 @@ class BrowserWindow(QMainWindow):
             for path in selected_paths
             if (
                 (row := self.item_model.row_for_path(path)) >= 0
-                and (rating_item := self.item_model.item_at(row)) is not None
-                and rating_item.kind is not BrowserItemKind.FOLDER
+                and self.item_model.item_at(row) is not None
             )
         )
         busy = (

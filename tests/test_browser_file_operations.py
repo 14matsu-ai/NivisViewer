@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 from threading import Event
@@ -10,6 +11,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLineEdit, QMessageBox
 
 from app.browser_window import BrowserWindow
+from app.browser_navigation import BrowserLocation
 from app.config_manager import ConfigManager
 from app.file_operation_coordinator import FileOperationCoordinator
 from app.file_operation_service import (
@@ -20,6 +22,7 @@ from app.file_operation_service import (
 from app.file_operation_worker import FileOperationExecutor
 from app.metadata_store import MetadataStore
 from app.windows_recycle_bin import RecycleBinResult
+from app.zippla_filename_metadata import ZipPlaFilenameMetadata
 
 
 class MovingRecycleBin:
@@ -227,6 +230,255 @@ def test_properties_rename_file_or_folder_updates_metadata_history_and_selection
     current = window.item_model.item_at(window.list_view.currentIndex())
     assert current is not None and current.path == destination.absolute()
     dialog.reject()
+    close_window(window, coordinator, qapp)
+
+
+def test_folder_rating_uses_safe_rename_and_preserves_tree_state_and_content(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "books"
+    folder.mkdir()
+    source = folder / "Folder.Name {zpi$t=foo}"
+    source.mkdir()
+    child = source / "日本語 child.bin"
+    payload = b"folder-rating-content-must-not-change"
+    child.write_bytes(payload)
+    child_mtime_ns = 1_654_321_987_654_321_000
+    directory_mtime_ns = 1_654_322_987_654_321_000
+    os.utime(child, ns=(child_mtime_ns, child_mtime_ns))
+    os.utime(source, ns=(directory_mtime_ns, directory_mtime_ns))
+    child_digest = hashlib.sha256(payload).hexdigest()
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [source])
+    window.metadata_store.set_comment(str(child), "relocate child metadata")
+    window.metadata_store.add_browser_bookmark(
+        str(source),
+        label="folder bookmark",
+        item_type="folder",
+    )
+    window.navigation_history.update_current_view_state(
+        selected_path=str(source),
+        vertical_scroll=17,
+        horizontal_scroll=3,
+    )
+    window.navigation_history.mark_recent(
+        BrowserLocation(str(source), selected_path=str(child))
+    )
+    scan_generation = window._scan_generation
+    thumbnail_generation = window.thumbnail_provider.generation
+
+    assert window.set_rating_for_paths((str(source),), 3)
+    finish_operation(window, coordinator, qapp)
+
+    rated = folder / "Folder.Name {zpi$r=3;t=foo}"
+    rated_child = rated / child.name
+    assert rated.is_dir()
+    assert not source.exists()
+    assert ZipPlaFilenameMetadata.parse(rated).rating == 3
+    assert ZipPlaFilenameMetadata.parse(rated).tags == ("foo",)
+    assert rated.stat().st_mtime_ns == directory_mtime_ns
+    assert rated_child.stat().st_mtime_ns == child_mtime_ns
+    assert hashlib.sha256(rated_child.read_bytes()).hexdigest() == child_digest
+    assert window.metadata_store.get_comment(str(rated_child)) == (
+        "relocate child metadata"
+    )
+    assert window.metadata_store.is_browser_bookmarked(str(rated))
+    current_location = window.navigation_history.current()
+    assert current_location is not None
+    assert current_location.selected_path == str(rated.absolute())
+    recent = tuple(
+        location for _index, location in window.navigation_history.recent_unique()
+    )
+    assert any(
+        location.path == str(rated.absolute())
+        and location.selected_path == str(rated_child.absolute())
+        for location in recent
+    )
+    current = window.item_model.item_at(window.list_view.currentIndex())
+    assert current is not None and current.path == rated.absolute()
+    assert window._scan_generation == scan_generation
+    assert window.thumbnail_provider.generation == thumbnail_generation
+
+    assert window.set_rating_for_paths((str(rated),), 5)
+    finish_operation(window, coordinator, qapp)
+    changed = folder / "Folder.Name {zpi$r=5;t=foo}"
+    assert changed.is_dir()
+    assert window.set_rating_for_paths((str(changed),), None)
+    finish_operation(window, coordinator, qapp)
+    cleared = folder / "Folder.Name {zpi$t=foo}"
+    assert cleared.is_dir()
+    assert ZipPlaFilenameMetadata.parse(cleared).rating is None
+    assert ZipPlaFilenameMetadata.parse(cleared).tags == ("foo",)
+    assert cleared.stat().st_mtime_ns == directory_mtime_ns
+    assert (cleared / child.name).stat().st_mtime_ns == child_mtime_ns
+    assert hashlib.sha256((cleared / child.name).read_bytes()).hexdigest() == (
+        child_digest
+    )
+    close_window(window, coordinator, qapp)
+
+
+def test_folder_rating_collision_keeps_both_directories_unchanged(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "Folder.Name"
+    collision = folder / "Folder.Name {zpi$r=3}"
+    source.mkdir(parents=True)
+    collision.mkdir()
+    write_file(source / "source.txt", "source")
+    write_file(collision / "collision.txt", "collision")
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [source])
+
+    assert window.set_rating_for_paths((str(source),), 3)
+    finish_operation(window, coordinator, qapp)
+
+    assert (source / "source.txt").read_text(encoding="utf-8") == "source"
+    assert (collision / "collision.txt").read_text(encoding="utf-8") == (
+        "collision"
+    )
+    assert window.item_model.row_for_path(source) >= 0
+    assert window.item_model.row_for_path(collision) >= 0
+    close_window(window, coordinator, qapp)
+
+
+def test_folder_rating_applies_to_multiple_selected_folders(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "books"
+    first = folder / "First"
+    second = folder / "Second.Name {zpi$t=keep}"
+    first.mkdir(parents=True)
+    second.mkdir()
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [first, second])
+    scan_generation = window._scan_generation
+
+    assert window.set_rating_for_paths((str(first), str(second)), 4)
+    finish_operation(window, coordinator, qapp)
+    finish_operation(window, coordinator, qapp)
+
+    first_rated = folder / "First {zpi$r=4}"
+    second_rated = folder / "Second.Name {zpi$r=4;t=keep}"
+    assert first_rated.is_dir()
+    assert second_rated.is_dir()
+    assert {
+        item.path for item in window.item_model.items if item.path in {
+            first_rated.absolute(),
+            second_rated.absolute(),
+        }
+    } == {first_rated.absolute(), second_rated.absolute()}
+    assert {
+        window.item_model.item_at(index).path
+        for index in window.list_view.selectionModel().selectedIndexes()
+    } == {first_rated.absolute(), second_rated.absolute()}
+    assert window._scan_generation == scan_generation
+    close_window(window, coordinator, qapp)
+
+
+def test_folder_thumbnail_rating_hover_left_click_and_middle_clear(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "Hover Folder"
+    source.mkdir(parents=True)
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [source])
+
+    def star_position(path: Path, rating: int) -> QPoint:
+        index = window.item_model.index(window.item_model.row_for_path(path), 0)
+        cell = window.list_view.visualRect(index)
+        overlay = window.item_delegate.rating_overlay_rect(cell)
+        for x in range(overlay.left(), overlay.right() + 1):
+            position = QPoint(x, overlay.center().y())
+            if window.item_delegate.rating_at_position(cell, position) == rating:
+                return position
+        raise AssertionError(f"star {rating} has no hit position")
+
+    position = star_position(source, 3)
+    QTest.mouseMove(window.list_view.viewport(), position)
+    qapp.processEvents()
+    source_index = window.item_model.index(
+        window.item_model.row_for_path(source),
+        0,
+    )
+    assert window.item_model.data(
+        source_index,
+        window.item_model.RatingPreviewRole,
+    ) == 3
+
+    QTest.mouseClick(window.list_view.viewport(), Qt.MouseButton.LeftButton, pos=position)
+    finish_operation(window, coordinator, qapp)
+    rated = folder / "Hover Folder {zpi$r=3}"
+    assert rated.is_dir()
+
+    clear_position = star_position(rated, 3)
+    QTest.mouseClick(
+        window.list_view.viewport(),
+        Qt.MouseButton.MiddleButton,
+        pos=clear_position,
+    )
+    finish_operation(window, coordinator, qapp)
+    assert source.is_dir()
+    close_window(window, coordinator, qapp)
+
+
+def test_folder_context_menu_rating_action_is_enabled(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "Context Folder"
+    source.mkdir(parents=True)
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [source])
+    rating_actions: list[object] = []
+
+    class FakeAction:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.enabled = True
+
+        def setEnabled(self, enabled: bool) -> None:
+            self.enabled = enabled
+
+    class FakeMenu:
+        def __init__(self, _parent=None, *, rating_menu: bool = False) -> None:
+            self.rating_menu = rating_menu
+
+        def addAction(self, text: str):
+            action = FakeAction(text)
+            if self.rating_menu:
+                rating_actions.append(action)
+            return action
+
+        def addSeparator(self) -> None:
+            pass
+
+        def addMenu(self, _text: str):
+            return FakeMenu(rating_menu=True)
+
+        def exec(self, _position):
+            return None
+
+    monkeypatch.setattr("app.browser_window.QMenu", FakeMenu)
+    index = window.item_model.index(window.item_model.row_for_path(source), 0)
+    window._show_context_menu(window.list_view.visualRect(index).center())
+
+    assert [action.text for action in rating_actions] == [
+        "なし",
+        "★",
+        "★★",
+        "★★★",
+        "★★★★",
+        "★★★★★",
+    ]
+    assert all(action.enabled for action in rating_actions)
     close_window(window, coordinator, qapp)
 
 

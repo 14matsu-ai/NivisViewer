@@ -97,6 +97,7 @@ class ConfigManager(QObject):
         "thumbnail_frame_ratio": "portrait_1_sqrt2",
         "thumbnail_crop_mode": "smart_crop",
         "browser_thumbnail_display_mode": "fit",
+        "browser_folder_fallback_background": "auto",
         "thumbnail_quality_mode": "auto",
         "thumbnail_cache_max_edge": 1024,
         "text_preview_enabled": True,
@@ -744,6 +745,15 @@ class ConfigManager(QObject):
             default=int(cls.DEFAULTS["pdf_render_base_dpi"]),
             minimum=72,
             maximum=300,
+        )
+        fallback_background = str(
+            normalized.get("browser_folder_fallback_background", "auto")
+        ).strip().casefold()
+        normalized["browser_folder_fallback_background"] = (
+            fallback_background
+            if fallback_background == "auto"
+            or re.fullmatch(r"#[0-9a-f]{6}", fallback_background)
+            else cls.DEFAULTS["browser_folder_fallback_background"]
         )
         return normalized
 

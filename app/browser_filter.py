@@ -57,9 +57,6 @@ class BrowserRatingPredicate:
     def matches(self, item: BrowserItem) -> bool:
         if self.mode is RatingFilterMode.OFF:
             return True
-        # NivisViewer does not expose filename rating edits for folders.
-        if item.is_folder:
-            return False
         if self.mode is RatingFilterMode.UNRATED:
             return item.rating is None
         if item.rating is None:

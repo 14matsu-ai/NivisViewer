@@ -5,10 +5,11 @@ import logging
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal, Slot
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QColor, QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QColorDialog,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -220,6 +221,7 @@ class SettingsDialog(QDialog):
             ),
         }
         self._displayed_prefetch_preset: str | None = None
+        self._folder_fallback_custom_color = "#000000"
         raw_bindings = self.config.get("mouse_gesture_bindings", {})
         self._gesture_bindings_base = (
             dict(raw_bindings) if isinstance(raw_bindings, dict) else {}
@@ -797,6 +799,44 @@ class SettingsDialog(QDialog):
             self.browser_thumbnail_display_mode_combo,
         )
 
+        self.browser_folder_fallback_background_combo = QComboBox(cache_group)
+        self.browser_folder_fallback_background_combo.addItem(
+            "自動（ZipPla互換の黒）",
+            "auto",
+        )
+        self.browser_folder_fallback_background_combo.addItem(
+            "カスタム色",
+            "custom",
+        )
+        self.browser_folder_fallback_background_combo.currentIndexChanged.connect(
+            self._sync_folder_fallback_background_controls
+        )
+        self.browser_folder_fallback_color_button = QPushButton(
+            "色を選択…",
+            cache_group,
+        )
+        self.browser_folder_fallback_color_button.clicked.connect(
+            self._choose_folder_fallback_background_color
+        )
+        self.browser_folder_fallback_restore_button = QPushButton(
+            "既定に戻す",
+            cache_group,
+        )
+        self.browser_folder_fallback_restore_button.clicked.connect(
+            self._restore_folder_fallback_background
+        )
+        folder_fallback_controls = QWidget(cache_group)
+        folder_fallback_layout = QHBoxLayout(folder_fallback_controls)
+        folder_fallback_layout.setContentsMargins(0, 0, 0, 0)
+        folder_fallback_layout.addWidget(
+            self.browser_folder_fallback_background_combo
+        )
+        folder_fallback_layout.addWidget(self.browser_folder_fallback_color_button)
+        folder_fallback_layout.addWidget(
+            self.browser_folder_fallback_restore_button
+        )
+        form.addRow("代替サムネイル背景:", folder_fallback_controls)
+
         self.thumbnail_crop_mode_combo = QComboBox(cache_group)
         for mode, label in CROP_MODES.items():
             self.thumbnail_crop_mode_combo.addItem(label, mode)
@@ -1224,6 +1264,25 @@ class SettingsDialog(QDialog):
             self.browser_thumbnail_display_mode_combo,
             self.config.get("browser_thumbnail_display_mode", "fit"),
         )
+        fallback_background = str(
+            self.config.get("browser_folder_fallback_background", "auto")
+        )
+        if fallback_background == "auto":
+            self._folder_fallback_custom_color = "#000000"
+            self._select_data(
+                self.browser_folder_fallback_background_combo,
+                "auto",
+            )
+        else:
+            color = QColor(fallback_background)
+            self._folder_fallback_custom_color = (
+                color.name() if color.isValid() else "#000000"
+            )
+            self._select_data(
+                self.browser_folder_fallback_background_combo,
+                "custom",
+            )
+        self._sync_folder_fallback_background_controls()
         self._select_data(
             self.thumbnail_quality_mode_combo,
             self.config.get("thumbnail_quality_mode", "auto"),
@@ -1404,6 +1463,47 @@ class SettingsDialog(QDialog):
         self._sync_gesture_controls(self.mouse_gestures_checkbox.isChecked())
         self.refresh_cache_usage()
         self.refresh_registration_status()
+
+    def _choose_folder_fallback_background_color(self) -> None:
+        color = QColorDialog.getColor(
+            QColor(self._folder_fallback_custom_color),
+            self,
+            "代替サムネイル背景色",
+        )
+        if not color.isValid():
+            return
+        self._folder_fallback_custom_color = color.name()
+        self._select_data(
+            self.browser_folder_fallback_background_combo,
+            "custom",
+        )
+        self._sync_folder_fallback_background_controls()
+
+    def _restore_folder_fallback_background(self) -> None:
+        self._folder_fallback_custom_color = "#000000"
+        self._select_data(
+            self.browser_folder_fallback_background_combo,
+            "auto",
+        )
+        self._sync_folder_fallback_background_controls()
+
+    def _sync_folder_fallback_background_controls(
+        self,
+        *_args: object,
+    ) -> None:
+        custom = (
+            self.browser_folder_fallback_background_combo.currentData()
+            == "custom"
+        )
+        self.browser_folder_fallback_color_button.setEnabled(custom)
+        color = QColor(self._folder_fallback_custom_color)
+        text_color = "#000000" if color.lightness() >= 128 else "#ffffff"
+        self.browser_folder_fallback_color_button.setText(color.name().upper())
+        self.browser_folder_fallback_color_button.setStyleSheet(
+            "QPushButton {"
+            f"background-color: {color.name()}; color: {text_color};"
+            "}"
+        )
 
     def _apply_browser_grid_preset(self, index: int) -> None:
         density_value = str(self.browser_grid_preset_combo.itemData(index))
@@ -1664,6 +1764,12 @@ class SettingsDialog(QDialog):
             ),
             "browser_thumbnail_display_mode": str(
                 self.browser_thumbnail_display_mode_combo.currentData()
+            ),
+            "browser_folder_fallback_background": (
+                self._folder_fallback_custom_color
+                if self.browser_folder_fallback_background_combo.currentData()
+                == "custom"
+                else "auto"
             ),
             "thumbnail_quality_mode": str(
                 self.thumbnail_quality_mode_combo.currentData()
