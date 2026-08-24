@@ -26,6 +26,7 @@ class BrowserSortOrder(str, Enum):
 class BrowserDisplayDensity(str, Enum):
     EXTRA_COMPACT = "extra_compact"
     COMPACT = "compact"
+    MEDIUM = "medium"
     STANDARD = "standard"
     COMFORTABLE = "comfortable"
     LARGE = "large"
@@ -47,6 +48,7 @@ BROWSER_SORT_ORDER_LABELS = {
 BROWSER_DISPLAY_DENSITY_LABELS = {
     BrowserDisplayDensity.EXTRA_COMPACT: "極小",
     BrowserDisplayDensity.COMPACT: "コンパクト",
+    BrowserDisplayDensity.MEDIUM: "中",
     BrowserDisplayDensity.STANDARD: "標準",
     BrowserDisplayDensity.COMFORTABLE: "ゆったり",
     BrowserDisplayDensity.LARGE: "大",

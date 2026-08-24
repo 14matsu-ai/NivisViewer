@@ -1090,6 +1090,26 @@ class ViewerWidget(QWidget):
         )
         return frame_serial
 
+    def paint_pending_committed_frame(self) -> bool:
+        """Paint the existing atomic frame once when its update is starved.
+
+        Rapid native input can deliver several navigation messages before Qt
+        services a queued paint event.  The Window calls this only after a
+        newer cold target has been admitted to the background runtime, so it
+        never schedules work or changes frame ownership; it merely lets the
+        latest already-committed ready frame reach the current canvas.
+        """
+
+        if (
+            not self._direct_display_mode
+            or not self._content_paint_ack_pending
+            or not self._images
+            or not self.isVisible()
+        ):
+            return False
+        self.repaint()
+        return not self._content_paint_ack_pending
+
     @staticmethod
     def from_qimage(
         page_index: int,

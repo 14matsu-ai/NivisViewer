@@ -5274,3 +5274,998 @@ notices remain in the locations listed in section 24.3. The compact Qt
 control, composable predicate boundary, Unicode plain-search policy, debounce,
 session-only state and immutable Browser-to-Viewer snapshot are
 NivisViewer-specific modernizations.
+
+## 25. Immediate post-open ZIP navigation and speculative-work preemption
+
+2026-08-23に、固定revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`の次のauthorityを再確認した。
+
+- `source/ZipPla/PackedImageLoader.cs`, class `PackedImageLoader`, fields
+  `stream`, `zipArchive`, `zipArchiveEntries`; constructor
+  `PackedImageLoader(..., PackedImageLoaderOnMemoryMode)`; methods
+  `getZipArchiveEntries`, `OpenImageStream`, `OpenInnerImageStream`, `Dispose`。
+  defaultの`None`は`File.OpenRead(path)`を保持するfile-backed pathである。
+  whole-file `MemoryStream` copyは`OnMemory`だけであり、`Releasable`も最初は
+  file-backedである。ZIPは保持した`ZipArchive(stream, Read)`とentry配列から
+  選択entryだけを`entry.Open()`し、page処理後にentry streamをdisposeする。
+  loader dispose時にarchiveと元streamをまとめて閉じる。
+- `source/ZipPla/ViewerForm.cs`, class `ViewerForm`, open/reload process
+  `RunWorkerAsyncWithInterrupt` / `bmwLoadEachPage_RunWorkerStarting`、page job
+  `bmwLoadEachPage_DoWork`、completion
+  `bmwLoadEachPage_EachRunWorkerCompleted`、scheduler
+  `SetBackgroundMode` / `SetBackgroundModeIfPausing` / `priorityLevel`、memory
+  `SetNewResizedImage` / `ReduceUsingMemory`。open/reloadはpage数のwork arrayを
+  作り、開始時にloader/entry arrayとsource/display配列を切り替える。
+  `bmwLoadEachPage_DoWork`は支配的な`loader.OpenImageStream`が排他的なので
+  multi-threadが有効でないと明記し、entry open、decode/filter、resizeを1 page
+  jobで行う。`SetBackgroundMode`は全pageをcurrentまたはtrackbar pointerからの
+  距離で並べ直し、`priorityLevel`でvisible current、直後、直前、遠方の順にし、
+  `SetWorksOrder`後の`ThreadCount`を1にする。completionでcurrent変更を検出する
+  たびにorderを再計算する。
+- `ReduceUsingMemory`はそのsame work orderの遠方端からartifactを捨て、
+  `SetNewResizedImage`は新artifactを入れる前に容量を作る。current近傍をorder先頭、
+  挿入中indexをprotectedにするため、遠方より小さい実用近傍が先に保持される。
+
+NivisViewerの`ZipImageSource`もbook lifetimeの`zipfile.ZipFile`を1個保持し、
+`list_images()`はcentral directory entry metadataだけを列挙する。page readは
+`ZipExtFile`からそのentryだけを最大1 MiB chunkで`QByteArray`へ読み、cancelを
+chunk境界で確認する。open critical pathにarchive payload全体のcopy、全entry
+image decode、または並列archive readerはない。したがってphysical ZIP total
+bytes自体はpage decode critical pathではなく、entry countに応じたcentral
+directory列挙だけがbook open側で増える。
+
+実際の残存競合は`RasterBookRuntime`のstarted-work adoption policyだった。
+first complete frame commitがcontinuous warmupをreleaseすると、plannerは
+4 forward + 1 reverseのinteraction runwayを先頭にしたall-book orderから
+1 jobをsole laneへ投入する。navigationは毎inputでplannerをrecenterしていたが、
+active jobがnew planとartifact-compatibleなら、new currentがcoldでも常にその
+started jobをadoptした。このため、例えばpage 1 warmup中にrapid inputのfinal
+targetがpage 10になると、page 10はpage 1のread/decode/resize終了まで開始できない。
+
+修正後の`RasterBookRuntime._adopt_request`は同じscheduler/cache authorityを使い、
+started jobを次の場合だけ保持する。
+
+1. active job自身がnew currentである（neighbor prefetchの有益なadoption）。
+2. new current frameが既にframe cacheにある、またはcompleted artifactがGUI publish
+   待ちであり、background jobがpresentation latencyを増やさない。
+
+それ以外のcold currentでは、compatibleであってもunrelated warmupをcooperative
+cancelする。workerは次のsource/decode cancellation boundaryでsole laneを空け、
+final staged requestが先にdispatchされる。ready hitではbackgroundを不要に捨てず、
+currentそのもののstarted prefetchも継続する。all-book warmup、4+1 runway、
+continuous recenter、source/frame分離cache、memory admissionとsingle laneは維持した。
+これはZipPlaForkのpersistent file-backed loader、single lane、current-centered order、
+近傍retentionを採用しつつ、replaceable inputとcooperative cancellationを加えたHybrid
+processであり、C#実装の逐語翻訳ではない。
+
+`scripts/benchmark_viewer_navigation.py` schema 3はproduction
+`ZipRasterBookRuntime`をoffscreenで開き、first-visible直後のrapid wheel finalを
+warm-idle controlより前に測る。benchmark-only source wrapperがentry read byte/call、
+decode start/complete/abandonを記録し、input時active key、cache hit/miss、runtime
+metric deltaも出す。`--archive-padding-mib`はimage count/dimensionsを変えず、sourceが
+無視するstored non-image bytesだけを加える。`--zip-compression`はimage entryの
+deflated/storedを切り替え、`--pages`とpaddingの組合せで近いtotal sizeのpage-count
+比較もできる。production timestamp loggingや別schedulerは追加していない。
+
+同一SHA-256 fixture（13 page、4096 x 6500、1920 x 1053 viewport、final page 10、
+offscreen）の変更直前/直後runでは、first-visibleからrequestまで0.048/0.046 ms、
+request-to-paintは44.111 msから40.036 msへ4.075 ms（9.2%）短縮した。別の最終runの
+warm-idle cache-hit controlは1.786 msだった。timingは短いoffscreen runなので
+実機体感の代替ではないが、blocking fixture testではstarted page 1がcold page 10
+より前に保持されないことを決定的に確認した。一方、started page 1自身へ移動する
+testではcancel 0でadoptionを維持した。
+
+同じ13 page/geometryで64 MiBのignored stored paddingを加えた67,122,561-byte ZIPは、
+open-to-first-paint 42.632 ms、immediate final 49.927 msで、target commit前にpadding
+readは0だった。paddingなし13,525-byte ZIPの別runは38.918/42.526 msであり、差は
+run間変動を含むがcritical intervalのentry bytesはpage 1とtargetの834,793 bytesに
+限定された。stored-image ZIP（5,427,613 bytes）は37.825/34.476 msだった。
+同じ4096 x 6500で約67.2 MBへ揃えた65-page fixtureはopen 57.829 ms、
+immediate 48.079 msだった（13-page側は42.632/49.927 ms）。
+これらはtotal ZIP payloadをcritical pathでcopy/readしていないことを支持し、
+page countはentry metadata列挙量、compressed/storedは選択entry read/decode costへ
+影響するという境界を示す。
+
+このsectionのZipPlaFork由来process provenanceはrepository
+`himamon/ZipPlaFork`、固定revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`、上記
+`ViewerForm.cs` / `PackedImageLoader.cs` methods、AGPL-3.0-or-laterである。
+license本文とcopyright noticeはsection 1記載の
+`licenses/ZipPlaFork/AGPL.txt` / `licenses/ZipPlaFork/About.txt`に保持している。
+
+## 26. Rapid navigation: ready-frame progression and final-target priority
+
+2026-08-23に固定revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`の
+`source/ZipPla/ViewerForm.cs`を、decode orderだけでなくvisual presentationまで
+再確認した。
+
+- `ViewerForm.NextPage`（1773--1817）は必要な`resizedImageArray` elementが
+  `null`またはunknownのとき自然送りを進めず、readyな範囲だけを進む。
+  `moveToNextPage`（11635--11643）はこの`movePageNatural(1)` pathを使う。
+- `movePageNatural`（8735--8813）はlegitimateな各advanceで`currentPage`を更新し、
+  `showCurrentPage`を呼ぶ。したがってready resized artifactを横切るnatural inputは
+  intermediate current pageをvisual pathへ渡す。
+- `showCurrentPage(bool)`（6100--6145）はloading中を含めて
+  `pbPaintInvalidate()`する。background completion
+  `bmwLoadEachPage_EachRunWorkerCompleted`（5103--5138）もcompleted workがcurrentへ
+  関係すると`showCurrentPage(false)`を再度呼ぶ。
+- work側は`SetBackgroundMode` / `priorityLevel`（5278--5323）でcurrent、next、
+  previous、distantの順へsingle workerを並べ直す。つまりZipPlaForkはready resized
+  pagesではcurrent/presentationを段階的に進め、cold boundaryではnatural advanceを
+  止め、そのcurrent近傍をwork priorityへ反映する。
+
+これはNivisViewerのreplaceable rapid inputと同じcontractではない。NivisViewerは
+`NavigationAdmissionPolicy`でfirst wheel packetをimmediateにし、同方向の次packetが
+40 ms以内ならcold requestをreplaceable `STAGE`にする。trailing boundaryはpacket
+cadence + 2 msを6--28 msへclampする。ready frameはこのdecisionを観測してもstageせず、
+existing `RasterBookRuntime.request` cache-hit pathから同期的に
+`PresentationState` / `ViewerWidget.commit_display_ready_frame`へcommitされる。cold transit
+だけが置換され、boundaryで最新targetをdispatchする。
+
+調査前の想定と異なり、ready intermediateはobsolete-request guardによりsemantic commit
+を拒否されてはいなかった。実際のsecond causeはQt paint schedulingだった。tightなnative
+wheel message列の中でcache hit 1、2を順にatomic commitすると、それぞれ`update()`は
+queueされるがevent loopがpaintを処理する前にwidgetのcurrent imageが次へ置換される。
+その直後のfinal cold requestがstageされるため、記録上は`[1, 2]`をcommitしていても
+canvasへ到達したintermediateは`[]`となり、old pageがfinal completionまで残り得た。
+obsolete result rejection、request identity、atomic commit自体は正しかった。
+
+修正はschedulerとpresentationのauthorityを分離したまま行った。
+`ViewerWindow._dispatch_pending_zip_runtime_request`はまず従来どおりfinal cold requestを
+production runtimeへadmitする。その成功後だけ、同じbookの
+`PresentationState.displayed`がdistinct final requestより前にlegitimately commit済みで、
+widgetのatomic frame identityとも一致し、paint acknowledgementがまだpendingの場合に、
+`ViewerWidget.paint_pending_committed_frame`でそのlatest ready frameを1回同期paintする。
+このmethodは既存imagesを既存`paintEvent`へ通すだけで、decode、archive read、upload、
+request、timer、frame queue、placeholderを作らない。final work submissionが常に先なので
+intermediate presentationはfinal decode schedulingを遅らせない。表示可能なready frameが
+なければold legitimate frameを維持し、fake progressionやcold transit decodeを行わない。
+
+fresh offscreen integration fixtureの変更前/変更後sequenceは次のとおりだった。ここで
+`commit`はsemantic atomic commit、`paint`は実際の`paintEvent`到達、`decode`はsource
+decode startを表す。
+
+- ready: input `1,2,3`、ready `{1,2}`、final 3 cold。変更前はintermediate
+  `commit [1,2] / paint []`、変更後は`commit [1,2] / paint [2]`、その後final
+  `commit/paint 3`。final 3はintermediate repaintより先にruntimeへadmitされる。
+- cold: input `1,2,3`、ready `{}`。変更前/後ともtransit commitなし、page 2 decode
+  なし、final 3 decode start。old page 0だけを維持しfake frameを出さない。
+- mixed: input `1,2,3,4`、ready `{1,3}`。変更前はintermediate
+  `commit [1,3] / paint []`、変更後は`commit [1,3] / paint [3]`。cold page 2は
+  decodeせず、final 4をdecode/commit/paintする。
+
+同一SHA-256のmaintained 13-page large-image fixture（4096 x 6500、1920 x 1053、
+final 10、全transit cold）では、変更前の別runでrequest-to-paint 42.526 ms、変更後runで
+36.993 ms、handler 2.378 ms、warm cache-hit control 1.745 msだった。変更後のpresented
+sequenceはfinal `[10]`だけで、decode eventはcancelされたspeculative page 1の後にfinal
+10がstart/completeした。ready transitがないcontrolなので差は短いoffscreen run間変動を
+含み、改善量の主張には使わないが、ready-frame repaint追加によるcold final latency回帰が
+ないことを確認した。focused ready/mixed fixtureはfinal request admissionをrepaintより前に
+固定しており、presentationの追加がsingle decode laneのpriorityを変更しないことを
+決定的に確認する。stale/obsolete frameは既存serial/book/source/unit guardsで拒否される。
+
+このsectionのZipPlaFork由来behavior/process provenanceはrepository
+`himamon/ZipPlaFork`、固定revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`、
+`source/ZipPla/ViewerForm.cs`、class `ViewerForm`、methods/processes
+`NextPage`、`moveToNextPage`、`movePageNatural`、`showCurrentPage`、
+`bmwLoadEachPage_EachRunWorkerCompleted`、`SetBackgroundMode`、`priorityLevel`、
+AGPL-3.0-or-laterである。license本文とcopyright noticeはsection 1記載の
+`licenses/ZipPlaFork/AGPL.txt` / `licenses/ZipPlaFork/About.txt`に保持している。
+
+## 27. Display-ready neighborhood value under combined cache pressure
+
+2026-08-23に、固定revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`をarchive lifetimeからpaintまで
+一体のsystemとして再確認した。
+
+### 27.1 ZipPlaFork integrated model
+
+`source/ZipPla/PackedImageLoader.cs`、class `PackedImageLoader`では、fields
+`stream`、`zipArchive`、`zipArchiveEntries`がbook lifetimeのarchive ownerである。
+constructor `PackedImageLoader(..., PackedImageLoaderOnMemoryMode)`（267--313）は
+default `None`で`File.OpenRead(path)`を保持し、`OnMemory`だけがwhole archiveを
+`MemoryStream`へcopyする。`Releasable`はfile streamから始まり、明示`Release`で
+memoryへ移す。`getZipArchiveEntries`（1143--1179）は保持した
+`ZipArchive(stream, Read)`とentry arrayを作る。`OpenImageStream` /
+`OpenInnerImageStream`（1693--1774）は選択entryだけを`entry.Open()`し、
+`GetImageAndDisposeOriginal`でentry streamを必ずdisposeする。loader `Dispose`
+（2473--2524）がarchiveとowner streamを閉じる。したがってdefault ZIP pathで
+要求外payloadはinteractive decode critical pathへ入らない。
+
+`source/ZipPla/ViewerForm.cs`、class `ViewerForm`では、book open時にpage-lengthの
+`PreFilteredImageArray`、`OriginalImageInfoArray`、`ResizedSizeArray`、
+`ResizedImageArray`と`BackgroundMultiWorker bmwLoadEachPage`を構成する。
+`bmwLoadEachPage_DoWork`（2980以降）はsingle laneで選択entryをextract/decodeし、
+pixel format conversionとpre-filterを`PreFilteredImageArray`へ置き、
+`GetResizedSize`とscaling/filter processを経た`VirtualBitmapEx`を返す。
+`bmwLoadEachPage_EachRunWorkerCompleted`（5103--5145）が
+`SetNewResizedImage`を通じて`ResizedImageArray`へ入れた時点で、entry extraction、
+decode、pre-filter、display-size resize/transformが完了しており、main canvasから
+直ちに描けるdisplay-ready artifactになる。
+
+`SetBackgroundMode` / `priorityLevel`（5271--5323）は全page workをcurrent window、
+next window、previous window、distantのbandに分け、同bandではcurrentまたはtrackbar
+pointerからの距離でsortし、`SetWorksOrder`後のworker countを1にする。completion時に
+`currentPage`が変わっていれば同じorderを再構築する。このload orderは
+`ReduceUsingMemory`のeviction orderでもある。
+
+`SetNewResizedImage` / `ReduceUsingMemory`（5178--5247）はmemory upper boundを使うが、
+`existingImageCount < MaxPageCountInWindow * 4`ならupper boundを越えてもnew resized
+imageを受け入れ、reductionもそのcount floorより下へは落とさない。single-page modeなら
+4 page images、two-page modeなら8 page imagesのfloorであり、commentどおりnavigation
+判定とtrackbarのためのcurrent/near useful setである。これはgeneric LRUの個数上限では
+なく、display-ready `ResizedImageArray`のminimum useful neighborhood contractである。
+evictionは`WorksOrder`の末尾、すなわちcurrent-relative priorityが最低のimageから行い、
+同じpageの`PreFilteredImageArray` sourceも一緒にdisposeして`ReworkOrder`へ戻す。
+
+`NextPage`（1773--1817）はrequired resized size/artifactが未知ならadvanceを止める。
+`movePageNatural`（8735--8813）はreadyなadvanceごとに`currentPage`を動かして
+`showCurrentPage`を呼ぶ。`showCurrentPage`（6100--6145）はloading状態を含め
+`pbPaintInvalidate`し、worker completionもnew artifactがcurrent windowへ入れば
+`showCurrentPage(false)`する。従ってZipPlaForkのsystemは
+`persistent entry access -> current-centered single worker -> display-ready resized array
+-> count floor/current-relative eviction -> ready-only movement/invalidate`として連動する。
+
+### 27.2 NivisViewer difference and root cause
+
+NivisViewerは既にpersistent `ZipImageSource`、single `RasterBookRuntime` lane、
+current-centered `RasterWarmupPlanner`、4 reading-direction + 1 reverseのurgent prefix、
+book-wide continuation、direct-size JPEG preview decode、source/frame store分離、
+combined byte admission、atomic `PresentationState` commitを持つ。warmupはfirst complete
+commit直後に始まり、urgent prefixを終えるまではbroad remainderへ進まない。したがって
+原因はstartup page countやwork iteratorの早過ぎるbook-wide expansionではなかった。
+
+差はcombined cache value orderだった。変更前は同じlocalityのdecoded `QImage` sourceが
+layout-ready `QPixmap` frameより高くrankされ、current/displayed/near sourceも保護された。
+byte budgetがsource + frame pairを全urgent unit分保持できない場合、paint independentな
+QPixmapを増やす前にadmissionが止まるか、pressure reductionでframeをsourceより先に
+捨てた。このため「source-readyだが直ちにpaint不能」なworkへmemory valueを払い、
+ready-intermediate presentationが利用できるframe runwayを小さくしていた。
+
+同一120 x 180 PNG、100 x 100 display、single mode、current page 2のfocused fixtureでは、
+decoded sourceがdisplay frameの2倍超だった。one source + four frame相当のbyte budgetで、
+変更前はready `{2}`だけだった。同一条件の変更後観測ではready `{1,2,3}`となり、
+より広いtwo-source + four-frame相当budgetでは少なくともcurrent-centered
+`{1,2,3,4}`がreadyになり、decoded sourceは2以下、combined budget内だった。
+
+### 27.3 Ported principle and modern adaptation
+
+`app/zip_raster_book_runtime.py`の既存source/frame storesと唯一の
+`RasterAdmissionPolicy`を維持したまま、次を変更した。
+
+1. active layout内ではimmediately paintable frameをrehydratable sourceより高価値にする。
+   frame同士は従来どおりcurrent-relative distance/direction、layout scope、current/displayed
+   ownershipで順位付けする。
+2. background frame admissionはpending frame rankを境界にし、そのunit自身が再利用する
+   sourceを除き、既存navigation sourceをreclaim candidateにできる。successful QPixmap
+   uploadまではreclaimをcommitしないので、cancel/stale/error resultは既存artifactを壊さない。
+3. budgetが十分ならsource/frame separationとpreview reuseは従来どおり両方保持する。
+   pressure時だけsourceを先に落とす。QPixmapはsourceから独立しているためpage turnは
+   cache hitのままで、magnifier/manual source demandは既存
+   `require_cached_current_source` hydration pathで必要な1 unitだけ再取得する。
+
+これは`MaxPageCountInWindow * 4`を定数として移植していない。既存のcurrent-relative
+topology/orderを使い、ready frameのbyte cost、resolved memory budget、page geometry、DPI、
+layoutによって形成可能なrunwayが自動的に変わる。first page、first 10 input、固定startup
+list、prefetch radius増加、parallel worker、second cache/presentation authorityはない。
+new currentは毎navigationでplanとretention valueをrecenterし、cold rapid transitは従来どおり
+decodeせず、final cold targetがunrelated warmupをcancelしてsole laneを先に得る。
+
+### 27.4 Offscreen evidence
+
+maintained benchmark schema 4へtest-only neighborhood snapshotと`artifactReady` sequenceを追加した。
+13 page、4096 x 6500、1920 x 1053、final 10、512 MiBの3 runではfinal
+request-to-paintが33.29--46.12 ms（median 43.775 ms）、以前の同fixture別runは
+36.993 msだった。run variationが大きく速度差は主張しない。全runでfirst-visible時は
+page 0だけready、rapid cold pages 2--9をdecodeせず、started page 1をcancelしてfinal 10を
+先にdecodeした。warm-idle sequenceは`10,11,9,12`、ready setは`{0,9,10,11,12}`、
+source-onlyは0だった。final-target-first contractは維持されている。
+
+65 page、同画像geometry、16 MiB ignored archive padding（16,844,907-byte ZIP）、
+128 MiB budget、final 32ではopen 44.204 ms、immediate final 50.795 ms、warm hit
+2.194 msだった。first-visible `{0}`、target paint `{0,32}`から、current-centered
+`32,33,31,34,35,36,30,...`の順でready artifactが形成され、idle時はpage 12--52の
+41 display frames、source-only 0、116,528,680 bytes / 134,217,728-byte budgetだった。
+single slow page-1 inputの別runはhandler 0.248 ms、commit 46.543 ms、その後
+`1,2,0,3,...,12`のcurrent-relative orderで13 pagesがready、warm hit 2.019 msだった。
+physical paddingは選択entry以外のinteractive readを増やさない。
+
+このsectionのZipPlaFork由来principle/process provenanceはrepository
+`himamon/ZipPlaFork`、固定revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`、AGPL-3.0-or-later、
+`source/ZipPla/PackedImageLoader.cs` class `PackedImageLoader` constructor、
+`getZipArchiveEntries`、`OpenImageStream`、`OpenInnerImageStream`、`Dispose`、および
+`source/ZipPla/ViewerForm.cs` class `ViewerForm` fields `PreFilteredImageArray` /
+`ResizedImageArray`、methods/processes `bmwLoadEachPage_DoWork`、
+`bmwLoadEachPage_EachRunWorkerCompleted`、`SetNewResizedImage`、
+`ReduceUsingMemory`、`SetBackgroundMode`、`priorityLevel`、`NextPage`、
+`movePageNatural`、`showCurrentPage`である。license本文とcopyright noticeはsection 1記載の
+`licenses/ZipPlaFork/AGPL.txt` / `licenses/ZipPlaFork/About.txt`に保持している。
+
+## 28. Viewer mouse XButton book/file navigation（2026-08-23）
+
+### 28.1 ZipPlaFork固定revisionの確認
+
+固定revision `07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`の
+`source/ZipPla/ViewerForm.cs`では、`ViewerForm` constructorが`KeyboardShortcut`
+の`UseX1Button` / `UseX2Button`を有効にし、既定shortcut table
+`ViewerFormConfig.DefaultKeyboardShortcutCommands`がXButton1を`Command.OpenPrevious`、
+XButton2を`Command.OpenNext`へ割り当てる。これらは`NextPage` / `PreviousPage`とは別commandで、
+`getMouseGestureSettingTemplate`から`OpenPrevious` / `OpenNext`へdispatchされる。
+
+`OpenNext` / `OpenPrevious`は`OpenNextOrPrevious(next, loop:false)`を呼ぶ。同methodは
+`getCurrentParent` / `currentArchiveFilePath`から現在位置を得て、parentのfilesとfoldersを
+列挙し、`requestedSortModeDetails`対応の`OpenNextOrPrevious_Comparer`でname、rating、time、
+size、type等を比較・sortする。方向側のcandidateを順に`PackedImageLoader.HasAnyEntry`でprobeし、
+最初に開けるpathを既存`OpenFile`へ渡す。通常のXButton操作はloopしない。candidateが無い場合は
+`BookFolderIsNotFound`のinformation dialogを表示する。XButtonは`KeyboardShortcut` input ownerに
+よってViewer image control上でcommandとして処理され、page moveやmouse gesture commandへ同時に
+fall throughする構造ではない。
+
+採用したreference behaviorは、XButton1/XButton2をprevious/next book commandとして独立所有し、
+既存のsame-window open transitionへ渡す点である。ZipPlaForkのparent再列挙、再sort、candidate
+archive probe、boundary dialogは採用していない。NivisViewerではBrowserのsearch AND rating filter、
+stable sort、folders-firstを通過してViewerを開いた時点のimmutable visible-order snapshotの方が
+強いauthorityだからである。
+
+### 28.2 NivisViewer側の統合
+
+`BrowserWindow.adjacent_book_snapshot`は、既存のsource/filter/stable-sort pipelineから得た
+visible item orderと各itemの`openable_by_nivisviewer`を、sort/filter identityと共に
+`AdjacentBookBrowserSnapshot`へ固定する。`_invoke_open_path_handler` ->
+`ApplicationController._handle_browser_open_request` -> `ApplicationController.open_path` ->
+`ViewerWindow.open_path`の既存Browser-to-Viewer handoffへ同snapshotを追加した。folder、Browser-only
+OTHER、Viewer非対応itemはsnapshot内に残っても`AdjacentBookBrowserSnapshot.viewer_paths`ではeligible
+targetにならない。image targetでは同snapshotから`FolderListingSnapshot`を再構成するため、folder
+sourceのpage topologyにも同じvisible image orderとselected image identityが渡る。
+
+`ApplicationController.open_adjacent_book`はsnapshotがある場合、`adjacent_viewer_path`で現在のrequested
+identityの直前/直後を同期的に選ぶだけで、filesystem scan、Browser live model参照、再filter、再sort、
+archive probeを行わない。既存`ViewerWindow.open_path` / `BookSession.open_book_async` / raster runtime replacement、
+generation cancellation、atomic first-frame presentationをそのまま使い、同じViewer windowで遷移する。
+XButtonのdefault previous/next-book dispatchはsnapshot必須として渡すため、snapshotが無い
+direct/open-dialog起点では安全にno-opとなり、filesystem searchを開始しない。menu/keyboardやbook-end
+auto moveなどXButton以外の既存adjacent-book commandは従来のbackground searchを維持する。
+Viewerのbook-changed同期時も、Browserがcapture元parentを表示中ならsame-folder selectionだけ更新し、
+Browserが別locationへ移動済みならそこをsnapshot元へ戻さないため、XButton操作からBrowser historyを
+追加しない。
+
+`ViewerWindow`はactive snapshot/current pathとは別に最新pending snapshot pathを1個だけ保持する。
+rapid XButtonで前requestのopen完了前に次のinputが来ても、次candidateはpending identityから選ばれ、
+`BookSession`のopen generationが古いsource/runtime completionを拒否する。成功時だけpending snapshotをactiveへ
+promoteし、失敗時は既存bookのsnapshotを維持する。plain reloadはsnapshotを保持し、Viewer側で明示的に
+topologyを変更するreloadは破棄する。
+
+`ViewerWidget.mousePressEvent`はBackButton/ForwardButton pressを`extraMouseButtonPressed`へ1回だけemitして
+acceptし、releaseもacceptする。したがってleft/right canvas click、middle magnifier、right gesture/context、
+wheel/page signalへfall throughしない。default configの`mouse_back_button_action=previous_book`、
+`mouse_forward_button_action=next_book`から既存Viewer command dispatcherへ接続される。boundaryではopenを開始せず、
+既定のnon-modal Viewer statusだけを更新する。`loop_book_navigation`が明示的に有効な既存設定の場合だけ従来どおり
+wrapを許す。
+
+### 28.3 Provenance
+
+参照元repositoryは`himamon/ZipPlaFork`、固定revisionは
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`、licenseはAGPL-3.0-or-laterである。
+materially referencedした箇所は`source/ZipPla/ViewerForm.cs` class `ViewerForm` constructorの
+`KeyboardShortcut` X-button setup、enum/process `Command.OpenNext` / `Command.OpenPrevious`、
+`getMouseGestureSettingTemplate` dispatch、methods `OpenNext`、`OpenPrevious`、
+`OpenNextOrPrevious`、class `OpenNextOrPrevious_Comparer`、および
+`ViewerFormConfig.DefaultKeyboardShortcutCommands`である。NivisViewer側の対応箇所は
+`app/viewer_widget.py` `ViewerWidget.mousePressEvent` / `mouseReleaseEvent`、
+`app/adjacent_book_search.py` `AdjacentBookBrowserSnapshot`、`app/browser_window.py`
+`BrowserWindow.adjacent_book_snapshot` / `_invoke_open_path_handler`、`app/application_controller.py`
+`ApplicationController.open_adjacent_book` / `_open_path_in_viewer`、`app/viewer_window.py`
+`ViewerWindow.open_path` / browser navigation stateである。必要なlicense本文とcopyright noticeは
+section 1記載の`licenses/ZipPlaFork/AGPL.txt` / `licenses/ZipPlaFork/About.txt`に保持している。
+
+
+## 29. Browser viewport-centered thumbnail read-ahead（2026-08-24）
+
+### 29.1 固定revisionのCatalog実装
+
+固定revision `07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`の
+`source/ZipPla/CatalogForm.cs`では、旧来の`CatalogForm.SetBackgroundMode`が
+`ThumbViewer.DisplayedStartShowIndex` / `DisplayedStopShowIndex`を先頭にし、表示範囲の外側を
+近い側から交互に並べるworker orderを構築する。ただし同revisionの実際のfork動作では
+`bmwMakePreview_DoWork`からサムネイル取得が削除され、`ThumbViewer.PaintPart`が描画中の範囲を
+authorityとして`ThumbViewerItem.LoadAsync`を起動する。保持／load範囲は表示行に前後1行を足した
+範囲だけで、それ以外の`ThumbViewerItem.Clear`が進行中loadをcancelしBitmapを破棄する。
+`LoadAsync`はstatic `SemaphoreSlim(1, 1)`で同時生成を1件に制限し、path identityを再確認してから
+resultをpublishする。`ThumbViewer.GetThumbnailCountInScreen`とCatalog側の呼び出しはthumbnail寸法、
+padding、text行高、alignment、`tvCatalog.Size`から画面内個数を計算する。
+
+同fileの`AllowReadAheadProcess` / `PrepareLookAheadProcess` / `StopLookAheadProcess`はCatalogの
+スクロール先サムネイルqueueではない。これはhidden `-LookAheadMode` Viewer processをIPCで準備し、
+選択archiveをViewerで開く前にwarm upする別process contractである。したがってNivisViewerへ
+process modelやkill/wait動作は移植していない。採用したreference principleは、viewport geometryを
+需要の境界にし、表示範囲が変わるたびに近傍だけを再設定し、遠いworkを保持しない点である。
+
+### 29.2 変更前のNivisViewerとの差分
+
+NivisViewerの既存`calculate_grid_visible_range`はQt grid寸法、viewport寸法、vertical offsetから
+visible rowsを計算し、model row/pathだけを扱うためQWidgetを全件生成しない。既存plannerはvisible
+item countの1 screen分を上下両側へ対称に足していたため最大`visible + 2 * visible`件だった。一方、
+providerの`PREFETCH`はmemory/disk cache lookup後、folder/image/archive decodeをskipしていたので、
+通常画像の次viewportはdisk cacheが既にある場合以外readyにならなかった。fast scroll時だけ古い
+PREFETCHをcancelし、方向identityは保持していなかった。
+
+### 29.3 採用したbounded directional policy
+
+`build_thumbnail_request_plan`を既存scheduler authorityのまま次の順序へ変更した。
+
+1. visible missing rows: `VISIBLE`、常に最高priority。
+2. selected offscreen rows: `SELECTED`。既存selection contractを維持する。
+3. recent scroll方向の直後1 viewport: `READ_AHEAD`。個数は現在のvisible row countと同数で、
+   ordinary `BrowserItemKind.IMAGE`だけcache miss時のdecodeを許可する。
+4. 逆方向の直近`ceil(visible_count * 0.25)`件: 既存`PREFETCH`。ordinary image、folder、archiveは
+   memory/disk cache lookupだけ行い、cache missをdecodeしない。既存PDF prefetch contractは維持する。
+
+従って通常時のspeculative rangeは最大`1.25 * visible_count`（端数切り上げ）、要求近傍全体は
+selected offscreenを除き最大`2.25 * visible_count`である。directory総件数はrange計算に使わない。
+初期方向は通常のforward/downwardとし、scroll valueの符号が変わればそのeventで方向を反転する。
+fast scroll中はspeculative rowsを0にし、visibleを`VISIBLE`のまま要求する。idle timer後は最後に観測した
+方向のbounded neighborhoodだけを再開し、その先へ歩かない。
+
+`BrowserWindow._request_visible_thumbnails`は各planのpath集合を作り、既存
+`BrowserThumbnailProvider`へ同じsize/generationのqueue recenterを依頼してからpriority順にrequestする。
+新しいscheduler/thread pool/concurrencyは追加していない。queueに残っている旧visible/speculative workで
+新plan外のものは`QThreadPool.tryTake`で除去する。既に実行中の最大1件（shared coordinator使用時も既存の
+bounded browser worker数まで）は安価な置換よりfinishを優先し、queueを増殖させない。新visibleと同pathの
+queued read-aheadは既存request promotion pathで`VISIBLE`へ上げる。
+
+`READ_AHEAD`は既存memory cache、suitable-thumbnail reuse、disk cacheを先に通る。cache hitならdecodeしない。
+cache miss decodeを許すのはordinary imageだけで、folder cover、ZIP/archive、PDF、video、shell/text previewは
+cache-onlyで終える。folder/archiveがvisibleになった場合は従来どおり`VISIBLE`経路で生成する。
+read-ahead image artifactは既存memory/disk cacheへ保存され、次viewportでmodel-compatible thumbnailとなる。
+directory/spec変更時は既存`begin_generation`がpending workをcancelし、providerとBrowserWindowのgeneration
+checkが旧resultのpublishを拒否する。
+
+### 29.4 Provenance
+
+参照元repositoryは`himamon/ZipPlaFork`、固定revisionは
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`、licenseはAGPL-3.0-or-laterである。
+materially referencedしたfile/class/method/processは`source/ZipPla/CatalogForm.cs` class
+`CatalogForm`の`SetBackgroundMode`、`tvCatalog_DisplayedChanged`、`bmwMakePreview_DoWork`、
+`AllowReadAheadProcess`、`PrepareLookAheadProcess`、`StopLookAheadProcess`、class `ThumbViewer`の
+`OnPaint`、`PaintPart`、`GetThumbnailCountInScreen`、class `ThumbViewerItem`の`LoadAsync` / `Clear`である。
+NivisViewer側の対応箇所は`app/browser_thumbnail_scheduler.py`の
+`build_thumbnail_request_plan`、`app/browser_window.py`の`_request_visible_thumbnails` / `_on_list_scrolled`、
+`app/thumbnail_provider.py`の`BrowserThumbnailProvider.request` / `_load_pipeline` /
+`cancel_requests_except`、`app/image_work_coordinator.py`のBrowser priority mappingである。
+必要なlicense本文とcopyright noticeはsection 1記載の
+`licenses/ZipPlaFork/AGPL.txt` / `licenses/ZipPlaFork/About.txt`に保持している。
+
+## 30. Browser `中` thumbnail preset and Catalog quality pipeline（2026-08-24）
+
+### 30.1 固定revisionのTiny寸法authority
+
+固定revision `07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`の
+`source/ZipPla/CatalogForm.Designer.cs`は`ThumbViewer.ThumbnailSize`のnormal初期値を
+`210 x 297`にする。`source/ZipPla/CatalogForm.cs`の`CatalogForm.ChangeThumbnailSize` /
+`ThumbnailSettingToCatalog`はTiny / Small / Normal / Large / Hugeを内部size
+`-2 / -1 / 0 / 1 / 2`へ対応させ、config `CatalogFormConfig.ThumbnailSize`にはmenu内index
+`0..4`を保存する。default config値はNormalの`2`である。
+
+実寸は`ChangeThumbnailSize_NeutralLength = sqrt(210 * 297)`、default aspect
+`1 / sqrt(2)`、`scale = 2^(size / 2)`から、
+`neutral * scale * sqrt(aspect)`と`neutral * scale / sqrt(aspect)`を求め、
+`source/ZipPla/Program.cs` `Program.DpiScalingX`がDPI倍率適用後に`Math.Round`する。
+従ってTinyは100% DPIで厳密には`105 x 148` logical pxである（高さの中間値は
+.NET既定のto-even roundingで148になる）。125 / 150 / 200%では同じ式から
+`131 x 186`、`158 x 223`、`210 x 297` physical pxになる。これはthumbnail bitmap/contentの
+寸法であり、class `ThumbViewer`の`updateRowsCols`は別途frame、padding、filename text heightを
+grid cellへ足す。
+
+NivisViewerでは既存`BrowserDisplayDensity` / `GRID_PROFILES` /
+`GRID_PRESET_THUMBNAIL_SIZES` authorityへ`MEDIUM = "medium"`、表示名`中`、logical long edge
+`149`を追加した。default `portrait_1_sqrt2`の`frame_size_from_long_edge`は`105 x 149`を返す。
+既存`極小=96`、`コンパクト=128`、`標準=180`、`ゆったり=240`、`大=320`は変更せず、順序は
+`極小 -> コンパクト -> 中 -> 標準 -> ゆったり -> 大`である。`中`はCompactと同じ
+font、1行filename、margin、spacing profileを再利用するため、content以外の新しいlayout policyを
+作っていない。placeholder canvas、fallback icon、associated icon、rating、filenameは同じdelegate
+rect authorityから再計算される。
+
+`ThumbnailRenderSpec`は新presetのlogical edge 149だけをcache request identityへ含める。
+auto qualityとDPIの組合せによって149と180が同じphysical bucketへ量子化されてもgeneration/tokenは
+別になり、旧149/180 requestのpublishを相互に受け付けない。一方`family_token`は従来どおりphysical
+artifact互換性を表すため、既存disk/memory cacheの十分な解像度を再decodeなしで再利用できる。
+149以外のcustom sizeは、同じphysical bucketならgenerationを再利用する既存contractを維持する。
+
+### 30.2 ZipPlaFork Catalog thumbnail pipeline
+
+固定revisionで確認した実経路は次の通りである。
+
+1. `ThumbViewer.PaintPart`がvisible rowsと前後1行だけの`ThumbViewerItem.LoadAsync`を起動し、範囲外を
+   `Clear`する。`LoadAsync`はstatic `SemaphoreSlim(1, 1)`で1件ずつ
+   `CatalogForm.GetThumbnail`を呼び、path変更後の結果を破棄する。
+2. `CatalogForm.GetThumbnail`はdirectory/archiveを`GetArchiveThumbnail`、通常画像を
+   `GetImageThumbnail`、movie/otherを各loaderへ分岐する。
+3. 通常画像の`GetImageThumbnail`は`GPSizeThumbnail.TryGet`を先に試す。miss時はfull decode可能形式を
+   `ImageLoader.GetFullBitmap`、thumbnail-only形式を
+   `ImageLoader.GetAtLeastThumbnailBitmap`で取得し、`GPSizeThumbnail.TrySet`を経由してから
+   `DoJustClipping`で表示寸法へfit/cropする。
+4. `GPSizeThumbnail`はcache画像を小さい順に保持し、`TryGet`がrequested width/heightへ
+   `SIZE_MARGIN = sqrt(2)`を掛けた条件を最初に満たす、最小の十分なsourceを選ぶ。letterboxは少なくとも
+   一辺、cropは両辺を満たすことを要求する。`TrySet` / `GetResizedInfo`はsource aspectとrequestから
+   margin付きsize列を作り、`COMMON_RATIO=2`で大きい画像から順に
+   `BitmapResizer.CreateNew`（WPF `TransformedBitmap`）へ縮小しJPEG XRで保存する。legacy ADS/cache
+   format自体はNivisViewerへ移植しない。
+5. archive/directoryの`GetArchiveThumbnail`はfilename `ZipPlaInfo.ThumbnailInfo`の明示cover pageと
+   crop positionを最優先し、次に特殊entry `{ZipPlaCoverFile}.jpg`を使う。どちらもなければ
+   `PackedImageLoader.GetPackedImageEntries`を順に評価する。current clipがPlaClipなら
+   `GetImagePointAndEtc`がblank avoidance、page/spread/book-layout heuristicを使って代表entryと初期clipを
+   選び、早期終了条件も持つ。単純な「自然順の最初の画像」ではない。
+6. PlaClip/Smart Clipの焦点は`source/ZipPla/BitmapAnalyzer.cs` `BitmapAnalyzer.GetFocus`が求める。
+   対象をlong edge最大128へ縮小してgrayscale化し、対角差分から得たgradient強度をgradient line上へ
+   投票し、最大投票cellをfocus pointへ戻す。`GetArchiveThumbnail`と`DoJustClipping`はfocus中心のcropを
+   source/allowed rectangle内へclampして一度表示bitmapへ描画する。focus座標だけの永続cacheはないが、
+   結果source/cropped thumbnailは`GPSizeThumbnail`に保存されるのでcache hitでは再解析しない。
+7. `DoJustClipping`はcache/source bitmapを最終`tvCatalog.ThumbnailSize`へ1回描画する。既に同寸法なら
+   `needToResize=false`へ落とす。class `ThumbViewer.DrawItem`は完成済みbitmapを
+   `drawImageUnscaled` / `Graphics.DrawImageUnscaled`でcanvasへ描き、最終paintで再filterしない。
+
+### 30.3 現在のNivisViewer pipelineとの差分
+
+NivisViewerは`BrowserWindow._request_visible_thumbnails`がviewport-derived planを既存
+`BrowserThumbnailProvider`へ送り、provider generationとrender-spec tokenで旧結果を拒否する。
+`BrowserThumbnailProvider._load_pipeline`はmemory/disk cache後にitem kindへ分岐する。通常画像はPillow、
+ZIP/CBZはnatural-sortした最初のreadable image、external archiveとPDFは各image sourceの最初のimage/page、
+folderは直下のnatural-sortした最初のreadable imageを使う。whole-folder generationや第2schedulerはない。
+
+`render_pil_thumbnail`はEXIF transpose後、letterbox、center crop、または既存Smart Cropを適用し、Pillow
+LANCZOSでphysical cache specへ1回縮小してQImage化する。既存`detect_smart_crop`は最大256 proxyでalpha/
+corner-color blankを除外し、target aspectの21候補windowをedge-energyとcenter penaltyで比較する。
+normalized cropはsource size/mtime/entry/ratio/version keyのbounded memory `SmartCropCache`へ保存され、完成
+QImageは既存disk cacheへ保存される。このためNivisViewerは「常に幾何学的中央」ではないが、ZipPlaForkの
+gradient-line focus、book/spread heuristic、representative-page scoringとは異なる。
+
+`ThumbnailDiskCache.get_suitable`とprovider `_memory_candidate`は同じfamilyから、十分なものでは最小edge、
+不足時は最大edgeをlow-resolution provisionalとして選ぶ。従ってZipPlaForkのclosest adequate source原則は
+既に実現しており、small cacheの無条件upscaleをfinal resultにはしない。miss時decodeは現在のbucketだけを
+作り、ZipPlaForkのmulti-resolution legacy containerは作らない。
+
+通常のcache missはsourceからcache QImageへのPillow LANCZOSが1段、delegate
+`BrowserItemDelegate._paint_thumbnail_image`のphysical cache QImageからDPI-snapped logical destinationへの
+Qt `SmoothPixmapTransform`が1段で、計2段のresamplingである。disk/memory hitは後段だけである。delegateは
+QIconへの事前縮小を挟まないが、同じitemをrepaintするたび後段filterを実行する点が、表示寸法bitmapを一度
+作って`DrawImageUnscaled`するZipPlaForkと異なる。Browser display `center_crop`ではdelegate source rectも
+計算するが、通常のgenerated imageはframe aspect済みなので追加のbitmap生成stageではない。
+
+archiveの差は画質filter以上に大きい。NivisViewerはnatural first readableをcoverとするのに対し、ZipPlaForkは
+明示metadata、special cover entry、layout/blank/scoreによる候補選択を行う。同じresize/crop品質でもpage選択の
+差が「thumbnail quality」の差として見える場合がある。
+
+### 30.4 Ranked future improvements
+
+1. **Archive cover/page selection（expected benefit: high、cost: medium、complexity: medium）**
+   既存ZipPla filename metadata parserを利用して明示cover pageを尊重し、その次にboundedなspecial-cover/
+   first-few-candidate policyを既存provider内へ接続する案が最も見た目へ効く。cache key/entry pathへ選択結果を
+   含め、visible/selected missだけで評価し、distant read-aheadでは既存cacheだけを見る。誤ったmetadata index、
+   blank preface、two-page spread、encrypted/corrupt entryをfallback可能にする。次に実装する候補として推奨する。
+2. **ZipPla-style focus-aware Smart Clip refinement（benefit: medium-high、cost: medium、complexity: medium-high）**
+   新しいcrop systemを作らず、既存`detect_smart_crop`をversioned algorithmとしてgradient-line focusとbook/spread
+   constraintsで強化する。最大128/256 proxyなら計算量はboundedだが、各edgeからline投票するZipPla方式は概ね
+   proxy pixels × line lengthで、現在の21 window meanよりCPU/cache pressureが増える可能性がある。visible/
+   selectedだけで解析し、normalized cropを既存SmartCropCacheとdisk artifactへ再利用する。顔のないtexture、漫画の
+   枠線集中、文字密集、複数subject、意図的余白では誤focusしうるためcenter fallbackとfixture corpusが必要である。
+3. **Display-ready memory surface（section 32で完了）**
+   physical cache QImageをsource authorityのまま、source image/crop/physical target/DPR単位のbounded
+   display surfaceへ一度準備し、repaintをunscaledにする方式を採用した。disk format/schedulerは増やさず、
+   DPI/size/geometry変更でsurfaceだけ破棄する。実装、memory bound、計測結果はsection 32に記録する。
+4. **Cache source-size selection tuning（benefit: low-medium、cost: low、complexity: low-medium）**
+   現状は既にclosest adequateとlower provisionalを実装しており、ZipPlaForkとの差は小さい。改善するならaspect別の
+   effective width/height判定とdecode proxy hintを追加し、edgeだけ十分でもcrop軸が不足する候補を避ける。既存family
+   tokenとdisk rowsを使い、parallel cacheは不要である。
+5. **Resampling/filter comparison（benefit: uncertain、cost: low for benchmark、complexity: low）**
+   WPF `TransformedBitmap`/GDI+既定filterを盲目的に移植せず、同じfixtureをPillow LANCZOS、Qt smooth、single-stage
+   display-ready pathで比較する。現在の主差はfilter名よりpage/focus選択とfinal repaint resamplingなので、filter交換
+   単独の優先度は低い。
+
+### 30.5 Provenance
+
+参照元repositoryは`himamon/ZipPlaFork`、固定revisionは
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`、licenseはAGPL-3.0-or-laterである。
+materially inspected/referencedしたauthorityは`source/ZipPla/CatalogForm.Designer.cs`
+`tvCatalog.ThumbnailSize`、`source/ZipPla/CatalogForm.cs` class `CatalogForm` fields/methods
+`aspectRatio`、`ChangeThumbnailSize_NeutralLength`、`ChangeThumbnailSize`、
+`ThumbnailSettingToCatalog`、`GetThumbnail`、`GetImageThumbnail`、`GetArchiveThumbnail`、
+`GetImagePointAndEtc`、`DoJustClipping`、class `CatalogFormConfig.ThumbnailSize`、class
+`ThumbViewerItem.LoadAsync` / `Clear`、class `ThumbViewer.PaintPart` / `DrawItem` /
+`drawImageUnscaled`、`source/ZipPla/Program.cs` `Program.DpiScalingX` /
+`GetBlankAvoidRectangle`、`source/ZipPla/GPSizeThumbnail.cs` class `GPSizeThumbnail`
+`TryGet` / `TrySet` / `GetResizedInfo`、`source/ZipPla/BitmapResizer.cs`
+`BitmapResizer.CreateNew`、`source/ZipPla/BitmapAnalyzer.cs` `BitmapAnalyzer.GetFocus`、
+`source/ZipPla/ImageLoader.cs` `ImageLoader.GetAtLeastThumbnailBitmap`である。
+
+今回materially derivedしたbehaviorはTinyの210x297 neutral、size=-2、scale=0.5から新しい`中`の
+105x149に近似する寸法選択で、NivisViewer側対応は`app/browser_sort.py`
+`BrowserDisplayDensity.MEDIUM`、`app/browser_item_delegate.py` `GRID_PROFILES` /
+`GRID_PRESET_THUMBNAIL_SIZES`、`app/config_manager.py`、`app/settings_dialog.py`の既存projection、
+`app/thumbnail_render.py`の既存render/cache identityである。このsection 30のtaskではquality pipelineは監査と
+提案だけだったが、後続のsection 32でfinal unscaled-paint processを採用した。ZipPlaForkのSmart Clip、cache
+format、archive scoring implementationは移植していない。必要なlicense本文と
+copyright noticeはsection 1記載の`licenses/ZipPlaFork/AGPL.txt` /
+`licenses/ZipPlaFork/About.txt`に保持している。
+
+## 31. Browser mouse-wheel scroll amount（2026-08-24）
+
+### 31.1 固定revisionのCatalog wheel実装
+
+固定revision `07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`の
+`source/ZipPla/CatalogForm.cs`では、thumbnail Browserはclass `ThumbViewer :
+ScrollableControl`がwheelを所有し、`OnMouseWheel`でbase implementationを呼ばずに
+`MouseWheelScrollAmount` / `MouseWheelScrollUnit`を適用する。既定値は
+`120` / `ThumbViewerScrollUnit.AbsolutePixel`で、`scrollByAbsolutePixel`は
+`-e.Delta * amount / 120`を現在のvertical positionへ加える。preset menu handlerは
+30 / 60 / 120 / 240 / 480 logical pixelsをTiny / Small / Normal / Large / Hugeとして
+設定する。加速、viewport-height比、OSのwheel-lines設定はthumbnail側では使用しない。
+
+同じmenuには1 / 2 / 3 lineの`GridCeiling` presetもある。
+`scrollByFloorGrid`は`gridSizeV`へalignしながら指定行数を動かすため、thumbnail寸法、
+padding、text行数に追随する。ただし`getScrollCount`は非zeroのpartial deltaを120単位へ
+切り上げるので、高解像度wheel/touchpadを小刻みに保つ方式ではない。
+`preRenderScroll`は既存canvasの再利用と露出領域の再paintを行い、wheel量そのものから
+thumbnail load範囲を広げない。load authorityはsection 29記載の`PaintPart`であり、
+表示範囲と前後1行に限定される。file-list側の`DgvFileList_MouseWheel`は別実装で
+`SystemInformation.MouseWheelScrollLines`を使うが、thumbnail `ThumbViewer`のpolicyではない。
+
+設定は`CatalogForm.setMouseWheelScrollAmount`から`ThumbViewer`へ反映され、
+`CatalogFormConfig.ThumbnailMouseWheelScrollAmount` / `ThumbnailMouseWheelScrollUnit`へ保存される。
+profileにも同じnullable fieldsがあり、profile指定時は同じsetterへ戻す。固定revisionには
+system/default pass-throughや任意数値の設定UIはない。
+
+### 31.2 NivisViewerで採用したmodelと差分
+
+変更前のNivisViewerは`ExplorerListView`に`wheelEvent` overrideがなく、
+`BrowserWindow._build_ui`が`QListView.ScrollPerPixel`を指定するだけだった。したがって
+angle/pixel delta、OS wheel lines、scrollbar single stepはQt/styleの既定処理が所有し、
+page stepはviewport由来だった。Browser grid heightは`BrowserItemDelegate.grid_metrics.grid_size`
+からthumbnail size、frame ratio、density、spacing、filename行数を含めて求められる。
+
+既定の`System / Default`は現在のQt handlerへそのまま委譲し、変更前の挙動を保持する。
+custom policyはZipPlaForkのadaptive `GridCeiling` principleを採用し、標準angle delta 120あたり
+Small=1行、Medium=2行、Large=3行、Custom=1--12行を、現在のlogical grid heightでpixel移動へ
+変換する。従ってthumbnail size、DPI logical scaling、text/grid geometryが変われば自然に移動量も
+追随する。ZipPlaForkと異なりrow boundaryへ強制alignせず、angle deltaを120で比例配分し、
+subpixel remainderを次eventへ保持する。`pixelDelta`があるtouchpad eventとShift-wheelはQtへ委譲し、
+smooth/native inputをcoarse row jumpへ変換しない。mode/custom値の変更時だけremainderをresetする。
+
+設定authorityは既存`ConfigManager` / `SettingsDialog`で、keysは
+`browser_wheel_scroll_mode`と`browser_wheel_scroll_custom_rows`である。modeは
+`system/small/medium/large/custom`以外をsystemへ戻し、Customは1--12行へclampする。
+open Browserは`ConfigManager.settings_changed`から同じ`ExplorerListView`へ即時反映するだけで、
+rescan、thumbnail generation変更、decode request、toolbar controlを追加しない。Viewerの
+`ViewerWidget.wheelEvent`とpage navigationは変更していない。
+
+wheel distanceとthumbnail speculationは独立している。scroll後の既存
+`BrowserWindow._on_list_scrolled`は実scrollbar valueからdirection/fast stateだけを観測し、
+`build_thumbnail_request_plan`は引き続き現在のvisible rangeから最大1 viewport directional +
+25% reverse safetyを計算する。configured rowsをplanner inputにしておらず、大きいCustom値でも
+1 eventの移動先が変わるだけでspeculative neighborhoodはsection 29のviewport boundを越えない。
+
+### 31.3 Provenance
+
+参照元repositoryは`himamon/ZipPlaFork`、固定revisionは
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`、licenseはAGPL-3.0-or-laterである。
+materially referencedしたfile/class/method/processは`source/ZipPla/CatalogForm.cs` class
+`ThumbViewer` fields `MouseWheelScrollAmount` / `MouseWheelScrollUnit`、methods
+`OnMouseWheel`、`scrollByAbsolutePixel`、`scrollByFloorGrid`、`getScrollCount`、
+`preRenderScroll`、enum `ThumbViewerScrollUnit`、class `CatalogForm` methods
+`setMouseWheelScrollAmount`とTiny/Small/Normal/Large/Huge/1--3 line menu click handlers、
+class `CatalogFormConfig` fields `ThumbnailMouseWheelScrollAmount` /
+`ThumbnailMouseWheelScrollUnit`である。NivisViewer側の対応箇所は
+`app/browser_wheel_scroll.py`、`app/explorer_list_view.py` `ExplorerListView.wheelEvent` /
+`set_wheel_scroll_policy`、`app/browser_window.py` Browser settings projection、
+`app/config_manager.py`、`app/settings_dialog.py`である。必要なlicense本文とcopyright noticeは
+section 1記載の`licenses/ZipPlaFork/AGPL.txt` / `licenses/ZipPlaFork/About.txt`に保持している。
+
+## 32. Browser display-ready thumbnail surfaces（2026-08-24）
+
+### 32.1 固定revisionで確認したresampling / final-paint process
+
+参照元は`himamon/ZipPlaFork`、固定revisionは
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`、licenseはAGPL-3.0-or-laterである。
+`source/ZipPla/GPSizeThumbnail.cs`の`SIZE_MARGIN`はLanczos3の再現余裕として`sqrt(2)`、
+`COMMON_RATIO`は2である。`TryGet`はletterboxならmargin付きrequired width/heightの少なくとも一辺、
+cropなら両辺を満たす最初のcache bitmapを読む。`TrySet` / `GetResizedInfo`はsource aspectから
+margin付きsize列を作り、`BitmapResizer.CreateNew`で大きいものから順に縮小する。
+
+`source/ZipPla/CatalogForm.cs`の`GetImageThumbnail`、`GetArchiveThumbnail`等はそのsource/cache bitmapを
+`DoJustClipping`へ渡す。`DoJustClipping`は常に最終`tvCatalog.ThumbnailSize`のbitmapを作り、sourceが既に
+同寸法なら`needToResize=false`へ切り替えてunscaled copyする。それ以外はfit/cropをこの段階で一度だけ
+最終canvasへ解決する。class `ThumbViewerItem.LoadAsync`が完成bitmapを所有し、class `ThumbViewer.DrawItem`は
+`drawImageUnscaled` / `Graphics.DrawImageUnscaled`でitem canvasへ転送し、item repaintごとのfilterを行わない。
+partial repaintでも`DrawItem_slicedCanvas`へunscaled copyする。legacy ADS/JPEG-XR container、WPF bitmap cache、
+GDI canvasはNivisViewerへ移植していない。
+
+### 32.2 変更前のNivisViewer実経路
+
+通常画像、folder preview、ZIP/CBZ cover、external archive coverは最終的に既存
+`BrowserThumbnailProvider._render_image`から`render_pil_thumbnail`へ入る。decoded original dimensionsは
+Pillow `Image.size`そのもので、folderは直下のnatural-first readable image、archiveは現在のrepresentative
+entryのdimensionである。EXIF transpose後、letterboxは全source、center/smart cropはnormalized cropから
+丸めたsource rectangleを使う。Smart Cropだけは表示pixelとは別に最大256x256のBILINEAR proxyを解析するが、
+proxy pixelをthumbnailへ流用しない。表示pixelはcrop/fit sourceからphysical cache specへPillow LANCZOSで
+1回縮小され、QImage/disk WebP-or-PNG artifactになる。disk encode/decodeはresamplingではない。
+
+`ThumbnailDiskCache.get_suitable`とprovider `_memory_candidate`は同familyで十分な候補の最小long edgeを選び、
+不足候補はprovisionalだけにするため、closer adequate sourceがあるのに大き過ぎる／小さ過ぎるartifactを選ぶ
+具体的な不具合は見つからなかった。このpolicyは変更していない。
+
+変更前のdelegateはcache missでもmemory/disk hitでも毎回
+`QPainter.SmoothPixmapTransform=True`として`drawImage(target, image, source)`を実行した。quality margin、bucket
+quantization、shared content insetのためcache physical pixelsとdestination physical pixelsは通常一致しない。
+default portrait frame、fit、auto qualityでの実測例は次の通りで、各`target`はDPR適用後のphysical pixelsである。
+
+| preset / logical frame | DPR | cache QImage | final target |
+|---|---:|---:|---:|
+| 極小 / 68x96 | 1.00 / 1.25 / 1.50 / 2.00 | 113x160 / 136x192 / 181x256 / 226x320 | 60x84 / 74x104 / 90x128 / 120x170 |
+| コンパクト / 91x128 | 1.00 / 1.25 / 1.50 / 2.00 | 136x192 / 181x256 / 226x320 / 272x384 | 83x118 / 103x146 / 125x176 / 166x234 |
+| 中 / 105x149 | 1.00 / 1.25 / 1.50 / 2.00 | 181x256 / 226x320 / 226x320 / 362x512 | 97x137 / 121x172 / 145x206 / 194x274 |
+| 標準 / 127x180 | 1.00 / 1.25 / 1.50 / 2.00 | 181x256 / 226x320 / 272x384 / 362x512 | 119x168 / 149x211 / 179x252 / 238x336 |
+
+従ってnormal cache missはPillow LANCZOS 1段 + repaintごとのQt smooth 1段、cache hitはrepaintごとの
+Qt smooth 1段だった。folder previewとarchive coverも同じである。previewless folder、broken/unreadable archiveは
+QImageを持たず、shared placeholder canvasとfallback iconを描くため、このnormal-raster resampling経路には入らない。
+
+### 32.3 採用したNivisViewer process
+
+既存disk/family cacheをsource authorityのまま維持し、`BrowserItemDelegate`に
+`BrowserDisplaySurfaceCache`を追加した。実際にpaintされたthumbnailだけについて既存
+`thumbnail_image_rects`のDPI-snapped target/sourceを使い、targetのphysical width/heightと同寸法の
+ARGB QImageへQt smoothで一度準備する。source rectangleが既にそのphysical surfaceと厳密に同寸法ならfilterせず
+copy/shareする。surfaceにはwindow DPRを設定し、最終paintは
+`QPainter.drawImage(target.topLeft(), surface.image)`のpoint overloadだけを使うためpixel scalingを行わない。
+
+cache keyはsource QImage `cacheKey`、source crop、target physical size、DPRであり、最大96件かつ32 MiBのLRUである。
+DPR変更時とthumbnail size/frame ratio/display mode変更時はsurfaceだけをclearする。disk cache、provider memory cache、
+request generation、family token、worker数、Smart Crop、representative archive pageは変更しない。display surfaceは
+delegate paintからしか作られないのでread-ahead itemやwhole folderを変換せず、visible paintが常に起点である。
+
+変更後のnormal cache missはPillow LANCZOS 1段 + 最初のvisible paint時のQt smooth display preparation 1段 +
+unscaled final paint、memory/disk hitは最初のvisible paint時のQt smooth preparation 1段 + unscaled final paintである。
+同一source/geometryのwarm repaintはcache hit + unscaled final paintだけでresampling 0段になる。これは初回の
+stage数を人工的に減らす変更ではなく、確認された「同じcache bitmapをrepaintごとに再filterする」冗長性を除く。
+
+fine line、small text、photographic detail、high-contrast edge、portrait illustration fixtureで旧single paintと
+新しいprepare+unscaled paintを同一targetで比較し、channel差最大1以内を確認した。medium 149、DPR 1.25、
+source 226x320、target 121x172のoffscreen 1,000 warm paintsでは旧25.340 ms、新8.439 ms（3.00x）だった。
+これはsynthetic timingであり画質向上の根拠ではない。根拠はfinal delegate paintのpixel scalingが0になったことと、
+同じphysical output geometryをfixtureで維持したことである。memory tradeoffはvisible/recent surface最大32 MiBである。
+
+### 32.4 Provenance
+
+materially referencedしたfile/class/method/processは`source/ZipPla/GPSizeThumbnail.cs` class
+`GPSizeThumbnail` constants `SIZE_MARGIN` / `COMMON_RATIO`、methods `TryGet` / `TrySet` /
+`GetResizedInfo`、`source/ZipPla/BitmapResizer.cs` `BitmapResizer.CreateNew`、
+`source/ZipPla/CatalogForm.cs` class `CatalogForm` methods `GetThumbnail` / `GetImageThumbnail` /
+`GetArchiveThumbnail` / `DoJustClipping`、class `ThumbViewerItem.LoadAsync`、class `ThumbViewer.DrawItem` /
+`drawImageUnscaled`である。materially derivedしたprocessは「十分なcache sourceを表示寸法へ一度準備し、完成pixelを
+final paintでunscaled転送する」構造である。NivisViewer側の対応は`app/browser_item_delegate.py`
+`prepare_display_thumbnail_surface` / `BrowserDisplaySurfaceCache` /
+`BrowserItemDelegate._paint_thumbnail_image`である。必要なlicense本文とcopyright noticeはsection 1記載の
+`licenses/ZipPlaFork/AGPL.txt` / `licenses/ZipPlaFork/About.txt`に保持している。
+
+## 33. Browser item page-count metadata（2026-08-24）
+
+### 33.1 固定revisionで確認したCatalog flow
+
+固定revisionの`source/ZipPla/CatalogForm.cs` class `CatalogForm`はCatalog行と同じindexの
+`int[] FileCountArray`を持つ（field付近`:7153`）。`MetaPageCount_NotLoaded = -1`、
+`MetaPageCount_NotBook = -2`でunknown bookと非bookを分離する。directory準備の
+`ShouldBeSkipForFile`はarchiveを`MetaPageCount_NotLoaded`として分類し（`:7686-7707`）、
+`getDirectoryItemsInfo`はその初期値をfile行へ入れ、folder行を`-1`で初期化する
+（`:7783-7950`）。従ってstatus-bar selection changeからarchive/folderを同期列挙しない。
+
+count取得authorityは`getFileCount`（`:4661-4688`）である。まず
+`GPSizeThumbnail.TryGet(thumbnailCache, path, getArchiveIndexWithAIAInfo(path), out data)`を試し、
+`dataToFileCount`でcacheの付加dataを読む。cache missかつ
+`ArchivesInArchiveMode.Ignore`の場合だけ`PackedImageLoader.GetPackedImageEntries().Count`を取得する。
+`GetThumbnail`（`:4863-5008`）のdirectory/archive分岐はfull loadなら
+`GetArchiveThumbnail`からcoverとcountを同じ処理で返し、header-only分岐なら`getFileCount`を使う。
+`GetArchiveThumbnail`のcache writeは`GPSizeThumbnail.TrySet`へ
+`fileCountToData(filecount, isZipPlaImageData)`を渡す（`:6154-6166`）。serializerはASCII
+`BOOK`、`Int32 fileCount`、`Boolean zipPlaImageData`、readerは先頭`BOOK`を検証してcountを読む
+（`:5100-5128`）。つまりpage countはthumbnail/cache metadataであってstatus-bar独自cacheではない。
+
+countが配列へpublishされる経路ではpath/indexの再確認後に`FileCountArray[index]`を更新する。
+legacy completion path `bmwMakePreview_EachRunWorkerCompleted`はwork-set GUID、index bounds、
+`ResultTuple.Item1 == ZipPathArray[index]`、maskを検査してから`ResultTuple.Item4`を代入し、選択中なら
+`ShowStatusBar()`を再実行する（`:9024-9155`）。現行snapshotの個別reload path
+`ReloadOneThumbnailForSubThread`も`startingGuid == loadingGuid`、path/indexを再検査し、
+`GetThumbnail`のout countを`FileCountArray[index]`へ代入後、選択中なら`ShowStatusBar()`を呼ぶ
+（`:18573-18777`）。`ShowStatusBar`はsingle selected directory/archiveについて
+`FileCountArray[selectedIndex]`を読むだけで、負値は`?`として表示する（`:18835-18885`）。
+
+固定snapshot固有の注意として、visible `ThumbViewerItem.LoadAsync`（`:30231-30303`）は
+`GetThumbnail`のcount out値を破棄し、画像だけをpublishする。そのため通常の初回visible-loadの全経路が
+常にcount配列を埋める、という実装ではない。一方、既知値の行保持、BOOK cache metadata、header/reloadの
+count publication、unknown表示、statusのpassive readという設計原則は上記のとおり確認できる。
+NivisViewerへはこの原則を移し、WinForms配列、ADS/cache binary、GDI thumbnail、static semaphoreは移植しない。
+
+### 33.2 NivisViewer対応
+
+canonical metadataは既存`BrowserItem` / `BrowserScanEntry`のnullable `page_count`である。
+`BrowserItemModel`は同じpath identity上で値をpublishし、refresh時はkind、size、mtime fingerprintが一致する
+場合だけ既知値を引き継ぐ。rating renameは既存immutable itemの`replace`なので同じfieldを自然に保持する。
+
+既存`BrowserThumbnailProvider`のfolder cover listingは`os.scandir`で直下だけを列挙し、production
+`FolderImageSource(recursive=False)`と同じsupported image extension / file semanticsで候補数を返す。
+ZIP/CBZ cover listingは`ZipFile.infolist()`の非directoryかつsupported image entryだけを数える。
+どちらもcover生成時に既に作るcandidate listの長さを`ThumbnailLoadResult.page_count`としてpublishするため、
+追加列挙はない。countだけが不足する場合も、新scanner/thread/storeを作らず、同じproviderのbounded worker、
+generation、cancellation、folder/ZIP listing helperを使い、`BROWSER_PREFETCH` priorityでheader/list metadataだけを
+取得する。画像entryのopen、展開、pixel decode、recursive traversalは行わない。
+
+memory reuseはthumbnail LRUの同じcache keyへcountを添え、eviction/clearもthumbnailと同時に行う。
+disk reuseは既存SQLite `entries`へnullable `page_count`列を後方互換`ALTER TABLE`で追加した。
+lookupはsource path/kind/size/mtime/formatを検証し、QImage fileを読まない。生成済みcountは同じvalid sourceの
+thumbnail variantsへattachする。独立した永続DBやunbounded path mapはない。
+
+section 33実装時のsingle selected folder/archive infoは`サイズ: …    ページ: …`を一つのlabelへ表示した。
+unknownは`—`で、label更新は既知item metadataのreadだけである。当初の150 ms metadata fallbackは30 msの
+visible-thumbnail planを先行させ、同じproviderの最低priorityへqueueした。通常thumbnailがcountを返した場合、
+未開始fallbackはcancelされた。このslot geometryとpriorityはsection 34で後続改善している。
+provider generationとcurrent selected pathの双方を検査するため、Aを選択後Bへ移った時にAの完了値がBのlabelを
+上書きしない。Aのmodel itemが同じgeneration内に残る場合はAへ安全に保存され、再選択時に即時再利用される。
+
+### 33.3 Provenance
+
+参照元repositoryは`himamon/ZipPlaFork`、固定revisionは
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`、licenseはAGPL-3.0-or-laterである。
+materially referencedしたfile/class/method/processは`source/ZipPla/CatalogForm.cs` class
+`CatalogForm` fields `FileCountArray` / `MetaPageCount_NotLoaded` / `MetaPageCount_NotBook`、methods
+`ShouldBeSkipForFile`、`getDirectoryItemsInfo`、`getFileCount`、`GetHeader`、`GetThumbnail`、
+`GetArchiveThumbnail`、`dataToFileCount`、`dataToBookData`、`fileCountToData`、
+`bmwMakePreview_EachRunWorkerCompleted`、`ReloadOneThumbnailForSubThread`、`ShowStatusBar`、class
+`ThumbViewerItem.LoadAsync`である。materially derivedしたprocessは「per-item unknown/known countをthumbnail/header
+metadataと同じlifecycleでpublish/cacheし、statusはその値をpassively読む」構造である。NivisViewer側の対応は
+`app/browser_model.py`、`app/browser_scanner.py`、`app/thumbnail_provider.py`、
+`app/thumbnail_disk_cache.py`、`app/browser_window.py`である。必要なlicense本文とcopyright noticeはsection 1記載の
+`licenses/ZipPlaFork/AGPL.txt` / `licenses/ZipPlaFork/About.txt`に保持している。
+
+## 34. Browser compact chrome / stable status metadata（2026-08-24）
+
+### 34.1 固定revisionのCatalog geometryとstatus slot
+
+固定revision `07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`の
+`source/ZipPla/CatalogForm.Designer.cs`では、Catalog `menuStrip`は24 logical px、
+Back / Forward buttonは各24x22、`cbLocation` / `cbSortBy` / `cbFilter`は各20 px高で、
+main Catalog contentは概ねy=50から始まる。`statusStrip`は22 px高で、permanent metadataは
+`itemsCountToolStripStatusLabel` 90 px、`fileSizeToolStripStatusLabel` 70 px、
+`selectedFileContainsCountToolStripStatusLabel` 90 pxの`AutoSize=false` slotである。後二者は
+right alignされ、値の桁数が変わっても隣接slotの開始位置を動かさない。
+
+`source/ZipPla/CatalogForm.cs` class `CatalogForm.ShowStatusBar`はsingle selectionについて、
+sizeを`fileSizeToolStripStatusLabel`へ、もう一つのmetadataを
+`selectedFileContainsCountToolStripStatusLabel`へ投影する。通常画像なら`ImageInfoArray`の
+width x height、directory/archiveなら`FileCountArray`のpage countで、両方を同時には表示しない。
+unknownは既知になるまで`?`であり、このmethod自身はarchive/folderの同期列挙やpixel decodeをしない。
+sort modeやthumbnail presetもこのright-side metadata slotへ常駐表示しない。
+
+### 34.2 NivisViewerのcompact chromeとstatus projection
+
+変更前の100% offscreen実測はmenu 22 px + navigation toolbar 33 px = upper chrome 55 px、
+Back / Forwardは32x31、toolbar iconは24x24、location/sort/search outer rowは31 px高だった。
+変更後はfontを維持したままtop-level `QMenuBar::item`だけを上下1 px paddingへし、popup `QMenu`へは
+styleを適用していない。navigation toolbarは28 px、outer marginはleft/right 1、top/bottom 0、
+buttonは26x26、iconは20x20、location/sort/search shellは24 px高である。100%ではmenu 22 + toolbar 28 =
+50 pxとなり、main contentの開始位置はy=50である。値はQt logical pxなので125/150/200%でも同じlogical
+geometryを保ち、physical hit areaだけがDPIに従って拡大する。
+
+bottom messageからsort/order（例`更新日時・降順`）とdisplay density（例`表示：中`）を除去した。
+左側はcurrent folder、item count、single/multiple selectionという閲覧中に有用な情報だけを保持する。
+右側は既存selection metadata projectionを二つのfixed-width `QLabel`へ分離した。size slotはcurrent
+font metricsの`サイズ: 999.9 GB`、secondary slotは`ページ: 999999`と`99999 × 99999`の大きい方に
+左右余白を加えて構築し、14 logical pxの明示的spacingを置く。両slotはright alignされる。imageはsecondaryに
+resolution、folder/archiveは同じsecondaryにpage countを表示し、irrelevantな値は併記しない。
+
+### 34.3 Page-count readinessとbounded priority
+
+変更前はvisible thumbnail requestを30 ms後に計画した後、selection fallbackを150 ms待ち、さらに既存workerへ
+`ThumbnailPriority.PREFETCH`として投入していた。このためcache missのselected metadataがvisibleだけでなく
+ordinary read-ahead/safety workの後ろに滞留し、正しい`—`表示が体感上長く残った。
+
+canonical authorityはsection 33の`BrowserItem.page_count`、provider thumbnail LRU metadata、既存SQLite
+`entries.page_count`のままである。folder previewの既存direct-child candidate listing、ZIP/CBZの既存central-directory
+image-entry listing、external archiveの既存header listingは、candidate countが確定した時点でworker signalをpublishする。
+このsignalは最初のcover pixelをopen/decode/renderする前に発生する。同じlistingをcountのために繰り返さず、完成thumbnail
+にも従来どおりcountを添えてmemory/SQLiteへ保存する。既存disk thumbnail metadata hitもworker上でcountをpublishする。
+
+selection fallbackはvisible planに先行機会を与える60 ms後に動き、同じprovider/coordinator laneの
+`ThumbnailPriority.SELECTED`を使う。priority orderingは`VISIBLE > SELECTED > READ_AHEAD > PREFETCH`なので、
+selected unknown metadataはspeculative workを追い越すが、queued visible thumbnailを追い越さない。visible listingが先に
+countを発見すれば同pathの未完fallbackをcancelする。folder fallbackは直下だけ、archive fallbackはheaderだけで、image
+payloadをopen/decodeしない。scanner、worker pool、recursive traversal、独立map/databaseは追加していない。
+
+workset boundも既存のままである。archive countのpiggybackは通常のvisible/selected thumbnail workに入ったitemだけ、
+folder countのpiggybackはfolder previewが実際に行ったlistingだけである。`READ_AHEAD`/`PREFETCH`のfolder/archive decode skip
+を維持するため、巨大directoryの全folder/archiveをcount目的で先回り列挙しない。unknown selected itemだけが既存metadata
+request authorityを使う。provider generationとselected path identityの双方を引き続き検査し、stale completionは新しい
+selection slotを更新しない。
+
+### 34.4 Provenance
+
+参照元repositoryは`himamon/ZipPlaFork`、固定revisionは
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`、licenseはAGPL-3.0-or-laterである。
+materially referencedしたfile/class/method/processは`source/ZipPla/CatalogForm.Designer.cs`の
+`menuStrip`、`btnGoToBack`、`btnGoToForward`、`cbLocation`、`cbSortBy`、`cbFilter`、`statusStrip`、
+`itemsCountToolStripStatusLabel`、`fileSizeToolStripStatusLabel`、
+`selectedFileContainsCountToolStripStatusLabel` geometry、`source/ZipPla/CatalogForm.cs` class
+`CatalogForm.ShowStatusBar`、field `FileCountArray` / `ImageInfoArray`、metadata completion/update process
+`bmwMakePreview_EachRunWorkerCompleted` / `ReloadOneThumbnailForSubThread`である。materially derivedしたbehaviorは
+compact two-row Catalog density、fixed right-aligned size/secondary slots、known per-item metadataのpassive status read、
+metadata completion時のselected status refreshである。NivisViewer側対応は`app/browser_window.py`、
+`app/thumbnail_provider.py`、既存`app/browser_model.py` / `app/thumbnail_disk_cache.py` authorityである。WinForms control、
+`FileCountArray`、cache binary serializerは移植していない。必要なlicense本文とcopyright noticeはsection 1記載の
+`licenses/ZipPlaFork/AGPL.txt` / `licenses/ZipPlaFork/About.txt`に保持している。
+
+## 35. Browser chrome distribution / immediate selected metadata（2026-08-25）
+
+### 35.1 Follow-up前後の実測geometry
+
+section 34後の100% offscreen geometryはupper chrome 50 logical pxだったが、内訳には偏りがあった。
+menu barは22 px、先頭menu action（`ファイル`）はy=0、高さ14 pxで、action bottomからmenu bar bottomまで
+8 pxの空きがあった。menu bar bottomとnavigation toolbar topの間隔自体は0 pxだった。navigation toolbarは
+28 px、layout marginsはleft/right 1、top/bottom 0で、location shellはy=2、高さ24、native edit fieldは
+y=2、高さ20だった。toolbar content layoutとbreadcrumb layoutのvertical contentsMarginsはいずれも0である。
+従って主因はinter-row spacerではなく、22 px menu rowを決めるrating controlと14 px menu actionの高さ不一致だった。
+
+follow-up後はfontを変えず、rating quick-filterのvertical size hintをfont height + 8（この環境で20 px）へし、
+top-level menu itemを上下4 px paddingにした。menu barとmenu actionはともに20 pxで、action bottom gapは0 pxである。
+popup `QMenu`にはstyleを適用していない。navigation toolbarは27 pxで、26x26 buttonはy=1から完全に収まり、
+location shellはy=1、高さ24、native edit fieldは引き続き20 pxである。location/breadcrumbのvertical layout marginは
+0のままなので、native combo frameの上下2 pxを無理に削らなかった。main content開始位置はy=47である。
+同じlogical geometryを100/125/150/200% DPIで検査し、font、button icon、edit field、rating starsのclippingがないことを
+確認する。
+
+### 35.2 Compact status text
+
+right-side statusは既存の二slot authorityを維持し、sizeから`サイズ:` prefixを除いた。ordinary imageは
+`4.8 MB` / `1920 × 1080`、folder/archiveは`123.4 MB` / `42 ページ`というprojectionである。unknown page countは
+`— ページ`を直ちに表示する。size slotはcurrent font metricsの`999.9 GB`、secondary slotは
+`999999 ページ`と`99999 × 99999`の大きい方に各6 px余裕を足し、14 logical pxのspacingを置く。
+100% offscreenのcurrent fontではsize 102 px、secondary 162 pxだった。両方をfixed width/right alignedにし、
+桁数やimage/folder/archive種別の変更でslot位置を動かさない。sort/orderとdisplay-density textは戻していない。
+
+### 35.3 Timer-free latest-wins metadata scheduling
+
+section 34時点のselected unknown pathには固定60 ms single-shot timerが残っていた。これを削除し、selection changeで
+unknown folder/archiveを認識した同じcall stackから、既存`BrowserThumbnailProvider.request_page_count`へ
+`ThumbnailPriority.SELECTED`で直ちにsubmit/upgradeする。known `BrowserItem.page_count`はworkerを起こさず同期表示する。
+
+providerは同path/current generationのnormal thumbnail workerが既に`VISIBLE`/`SELECTED`なら、そのworkerの既存
+folder/header listingをadoptする。まだqueuedの`READ_AHEAD`/`PREFETCH`なら同じworkerを`SELECTED`へpromotionし、別の
+metadata workerを追加しない。低priority workerが既に走っていてpromotion不能な場合だけlightweight count requestを
+使用する。逆に`VISIBLE` thumbnail requestが到着した場合はqueued selected-count workをcancelし、visible workerの
+listing-before-decode publicationへ譲る。priority orderingは引き続き
+`VISIBLE > SELECTED > READ_AHEAD > PREFETCH`で、新poolはない。
+
+selection A -> B -> Cでは同generationのselected-count requestをpath identityでreplaceする。queued old workerは
+`tryTake`して除去し、running old workerは既存cancel tokenをsetする。folder `os.scandir`とZIP central-directory iterationは
+entryごとにcancelを確認する。cancel済みselected workerのfinished signalは`page_count_ready`をemitしないため、raceで
+listingが完了してもstale metadataをpublishしない。normal visible metadataは従来どおりmodelへcacheできるが、status slotは
+current selected path identityを再検査する。
+
+count-only ZIP workはcentral-directory/headerのeligible image entryだけ、folder workはdirect-child eligible image fileだけを
+列挙し、recursive traversalとpixel decodeを行わない。folder/archiveのnormal visible thumbnail listingからのearly
+page-count callbackも維持する。scanner、bulk pre-count、独立map/database、worker poolは追加していない。
+
+### 35.4 ZipPlaFork provenance
+
+参照元repositoryは`himamon/ZipPlaFork`、固定revisionは
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`、licenseはAGPL-3.0-or-laterである。
+materially referencedしたauthorityは`source/ZipPla/CatalogForm.Designer.cs`の`menuStrip`、
+`btnGoToBack` / `btnGoToForward`、`cbLocation`、`statusStrip`、`fileSizeToolStripStatusLabel`、
+`selectedFileContainsCountToolStripStatusLabel` geometry、`source/ZipPla/CatalogForm.cs` class `CatalogForm`
+field `FileCountArray`、methods `ShowStatusBar`、`getFileCount`、`GetThumbnail`、`GetArchiveThumbnail`、
+`dataToFileCount`、`fileCountToData`、metadata completion/update processes
+`bmwMakePreview_EachRunWorkerCompleted` / `ReloadOneThumbnailForSubThread`である。materially derivedしたbehaviorは、
+fixed compact status slots、statusのknown-array passive read、BOOK cache metadata優先、header/listing fallback、metadata
+completion時のselected status refreshである。NivisViewer側対応は`app/browser_window.py`、
+`app/browser_rating_filter_widget.py`、`app/thumbnail_provider.py`と既存`BrowserItem` / thumbnail SQLite authorityである。
+WinForms control、`FileCountArray`、BOOK binary serializerは移植していない。必要なlicense本文とcopyright noticeはsection 1記載の
+`licenses/ZipPlaFork/AGPL.txt` / `licenses/ZipPlaFork/About.txt`に保持している。

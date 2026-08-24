@@ -14,6 +14,7 @@ _LOG = logging.getLogger(__name__)
 
 class ImageWorkPriority(IntEnum):
     BROWSER_PREFETCH = 100
+    BROWSER_READ_AHEAD = 150
     BROWSER_SELECTED = 200
     BROWSER_VISIBLE = 300
     VIEWER_PREVIOUS = 400

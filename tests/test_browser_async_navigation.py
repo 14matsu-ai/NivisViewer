@@ -80,6 +80,19 @@ class RecordingThumbnailProvider(BrowserThumbnailProvider):
         self.cancel_calls.append(set(paths))
         return 0
 
+    def cancel_requests_except(
+        self,
+        paths: set[str],
+        *,
+        size: int,
+        generation: int,
+    ) -> int:
+        return self.cancel_prefetch_except(
+            paths,
+            size=size,
+            generation=generation,
+        )
+
 
 def make_config(tmp_path: Path, folder: Path) -> ConfigManager:
     config = ConfigManager(tmp_path / "config.json")
@@ -851,7 +864,7 @@ def test_large_model_requests_only_visible_and_limited_prefetch(
     assert 0 < len(provider.requests) < 500
     priorities = {request[3] for request in provider.requests}
     assert ThumbnailPriority.VISIBLE in priorities
-    assert ThumbnailPriority.PREFETCH in priorities
+    assert ThumbnailPriority.READ_AHEAD in priorities
     window.close()
 
 
@@ -881,7 +894,10 @@ def test_fast_scroll_suppresses_prefetch_and_idle_resumes_it(
     provider.requests.clear()
     window._request_visible_thumbnails()
     assert all(
-        item[3] is not ThumbnailPriority.PREFETCH
+        item[3] not in {
+            ThumbnailPriority.PREFETCH,
+            ThumbnailPriority.READ_AHEAD,
+        }
         for item in provider.requests
     )
     assert provider.cancel_calls
@@ -890,9 +906,59 @@ def test_fast_scroll_suppresses_prefetch_and_idle_resumes_it(
     window._on_scroll_idle()
     window._request_visible_thumbnails()
     assert any(
-        item[3] is ThumbnailPriority.PREFETCH
+        item[3] is ThumbnailPriority.READ_AHEAD
         for item in provider.requests
     )
+    window.close()
+
+
+def test_scroll_direction_recenters_bounded_read_ahead_without_queue_growth(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    provider = RecordingThumbnailProvider()
+    window, scanner = make_committed_window(tmp_path, qapp, provider=provider)
+    target = tmp_path / "directional"
+    target.mkdir()
+    assert window.navigate_to(target)
+    request = scanner.requests[-1]
+    entries = tuple(entry(target / f"{index:04d}.jpg") for index in range(1000))
+    scanner.batch_ready.emit(
+        BrowserScanBatch(request.path, request.generation, entries)
+    )
+    scanner.scan_completed.emit(
+        BrowserScanCompleted(request.path, request.generation, len(entries))
+    )
+    window._flush_pending_scan_batch()
+    window._fast_scrolling = False
+    window._visible_row_range = lambda: (100, 119)  # type: ignore[method-assign]
+
+    provider.requests.clear()
+    window._thumbnail_scroll_direction = 1
+    window._request_visible_thumbnails()
+    down = provider.requests.copy()
+    assert sum(item[3] is ThumbnailPriority.VISIBLE for item in down) == 20
+    assert sum(item[3] is ThumbnailPriority.READ_AHEAD for item in down) == 20
+    assert sum(item[3] is ThumbnailPriority.PREFETCH for item in down) == 5
+    assert {
+        Path(item[0]).name for item in down if item[3] is ThumbnailPriority.READ_AHEAD
+    } == {f"{index:04d}.jpg" for index in range(120, 140)}
+
+    provider.requests.clear()
+    window._thumbnail_scroll_direction = -1
+    window._request_visible_thumbnails()
+    reverse = provider.requests.copy()
+    assert {
+        Path(item[0]).name
+        for item in reverse
+        if item[3] is ThumbnailPriority.READ_AHEAD
+    } == {f"{index:04d}.jpg" for index in range(80, 100)}
+    assert {Path(path).name for path in provider.cancel_calls[-1]} == {
+        f"{index:04d}.jpg" for index in range(80, 125)
+    }
+    assert not {
+        f"{index:04d}.jpg" for index in range(125, 140)
+    }.intersection(Path(path).name for path in provider.cancel_calls[-1])
     window.close()
 
 

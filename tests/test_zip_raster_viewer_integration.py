@@ -406,7 +406,7 @@ def test_input_kind_admission_is_immediate_except_rapid_bursts(
         qapp.processEvents()
 
 
-def test_rapid_wheel_keeps_started_zip_work_and_commits_only_final_target(
+def test_rapid_wheel_preempts_started_warmup_and_commits_only_final_target(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
@@ -458,13 +458,13 @@ def test_rapid_wheel_keeps_started_zip_work_and_commits_only_final_target(
         assert requested is not None and requested.unit.focused_index == 10
         assert displayed is not None and displayed.unit.focused_index == 0
         assert runtime._active_job is started_job
-        assert not started_job.cancelled.is_set()
-        assert runtime.metrics.cancel_requests == 0
-        assert runtime.metrics.running_job_adoptions == 9
+        assert started_job.cancelled.is_set()
+        assert runtime.metrics.cancel_requests == 1
+        assert runtime.metrics.running_job_adoptions == 0
 
         # Production's wheel boundary admits the exact final request. The
-        # completed old frame remains cache-only; only page 10 can atomically
-        # replace the displayed page 0 presentation.
+        # cancelled warmup never becomes a cache artifact; only page 10 can
+        # atomically replace the displayed page 0 presentation.
         window._finish_wheel_navigation()
         source.release_page_one.set()
         _wait_until(
@@ -473,12 +473,151 @@ def test_rapid_wheel_keeps_started_zip_work_and_commits_only_final_target(
             and window.presentation_state.displayed.unit.focused_index == 10,
             timeout_ms=5000,
         )
-        assert 1 in runtime.cached_page_indexes
-        assert runtime.metrics.cancel_requests == 0
+        assert 1 not in runtime.cached_page_indexes
+        assert runtime.metrics.cancel_requests == 1
         assert runtime.metrics.stale_results == 0
         assert runtime.metrics.warmup_planner_creations == 1
     finally:
         source.release_page_one.set()
+        window.close()
+        qapp.processEvents()
+
+
+@pytest.mark.parametrize(
+    (
+        "ready_pages",
+        "final_page",
+        "expected_intermediate_commits",
+        "expected_intermediate_paint",
+        "forbidden_transit_decodes",
+    ),
+    (
+        ({1, 2}, 3, [1, 2], 2, set()),
+        (set(), 3, [], None, {2}),
+        ({1, 3}, 4, [1, 3], 3, {2}),
+    ),
+    ids=("ready", "cold", "mixed"),
+)
+def test_rapid_wheel_presents_only_ready_intermediate_frames(
+    tmp_path: Path,
+    qapp: QApplication,
+    ready_pages: set[int],
+    final_page: int,
+    expected_intermediate_commits: list[int],
+    expected_intermediate_paint: int | None,
+    forbidden_transit_decodes: set[int],
+) -> None:
+    archive = _write_zip(tmp_path, pages=6)
+
+    class ObservedZipSource(ZipImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.decode_starts: list[int] = []
+            self.block_image_id: str | None = None
+            self.final_started = Event()
+            self.release_final = Event()
+
+        def open_image(self, image_id: str) -> Image.Image:
+            page_index = int(Path(image_id).stem)
+            self.decode_starts.append(page_index)
+            if image_id == self.block_image_id:
+                self.final_started.set()
+                self.release_final.wait(3.0)
+            return super().open_image(image_id)
+
+    source = ObservedZipSource(archive)
+    config = ConfigManager(tmp_path / "ready-transit-config.json")
+    config.load()
+    config.apply({"viewer_memory_mode": "4096"})
+    session = BookSession(
+        source_factory=lambda _path, **_kwargs: (source, None),
+    )
+    window = ViewerWindow(config_manager=config, book_session=session)
+    window.resize(640, 480)
+    try:
+        window.set_view_mode("single")
+        window.show()
+        qapp.processEvents()
+        opened = session.open_book(archive)
+        assert window._finish_opened_book(opened, modal_on_empty=False)
+        runtime = session.viewer_runtime
+        assert runtime is not None
+
+        # Populate legitimate display-ready frames through the production
+        # request/commit path, independent of background warmup capacity.
+        for page_index in range(6):
+            window._go_to_index_with_history(page_index)
+            _wait_until(
+                qapp,
+                lambda page_index=page_index: (
+                    window.presentation_state.displayed_page == page_index
+                ),
+            )
+        window._go_to_index_with_history(0)
+        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 0)
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+
+        cold_pages = set(range(1, final_page + 1)) - ready_pages
+        for frame in tuple(runtime._frame_store.values()):
+            if any(
+                page.page_index in cold_pages for page in frame.unit.pages
+            ):
+                runtime._frame_store.take(frame.key)
+        runtime._source_store.clear()
+        assert all(
+            (page_index in runtime.cached_page_indexes) == (
+                page_index in ready_pages
+            )
+            for page_index in range(1, final_page + 1)
+        )
+
+        source.decode_starts.clear()
+        source.block_image_id = f"{final_page:03d}.png"
+        commits: list[int] = []
+        paints: list[int] = []
+        window.presentationCommitted.connect(
+            lambda commit: commits.append(commit.frame.unit.focused_index)
+        )
+
+        def record_paint(_serial: int, image_ids: object) -> None:
+            if not isinstance(image_ids, tuple) or not image_ids:
+                return
+            paints.append(int(Path(str(image_ids[0])).stem))
+
+        window.viewer.framePainted.connect(record_paint)
+
+        for _page_index in range(1, final_page + 1):
+            window.next_page(input_kind=NavigationInputKind.WHEEL)
+        window._finish_wheel_navigation()
+        if expected_intermediate_paint is None:
+            assert all(page_index == 0 for page_index in paints)
+        else:
+            # The final cold job is admitted first. The latest legitimate
+            # ready transit frame is then painted synchronously so a queued
+            # run of native wheel messages cannot starve its update event.
+            assert paints and paints[-1] == expected_intermediate_paint
+        _wait_until(qapp, source.final_started.is_set)
+
+        assert commits == expected_intermediate_commits
+        assert window.presentation_state.requested_page == final_page
+        assert window.presentation_state.displayed_page == (
+            expected_intermediate_commits[-1]
+            if expected_intermediate_commits
+            else 0
+        )
+        assert forbidden_transit_decodes.isdisjoint(source.decode_starts)
+        assert final_page in source.decode_starts
+
+        source.release_final.set()
+        _wait_until(
+            qapp,
+            lambda: window.presentation_state.displayed_page == final_page,
+        )
+        _wait_until(qapp, lambda: paints and paints[-1] == final_page)
+        assert commits == [*expected_intermediate_commits, final_page]
+        assert runtime.metrics.stale_results == 0
+    finally:
+        source.release_final.set()
         window.close()
         qapp.processEvents()
 

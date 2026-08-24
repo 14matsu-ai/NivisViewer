@@ -674,6 +674,9 @@ class _CachedFrame:
     gui_ready_at: float
 
 
+# Lexicographic shared-cache value: layout scope, artifact class
+# (display frame before rehydratable source), current-relative locality,
+# source-variant penalty, direction penalty. Higher tuples are reclaimed first.
 _ArtifactRetentionRank = tuple[int, int, int, int, int]
 
 
@@ -925,11 +928,25 @@ class _ZipRasterSourceStore:
         render_spec: ZipRasterRenderSpec,
         *,
         excluded_keys: frozenset[_SourceKey] = frozenset(),
+        retention_boundary: _ArtifactRetentionRank | None = None,
+        include_navigation_sources: bool = False,
     ) -> tuple[tuple[_SourceKey, int, _ArtifactRetentionRank], ...]:
-        """Return worst-first sources strictly below a pending unit's rank."""
+        """Return worst-first sources below a pending artifact's value.
+
+        Ordinary callers preserve current/displayed/near source ownership.
+        Display-frame admission may include those rehydratable navigation
+        sources and compare them with the pending *frame* rank. This lets a
+        constrained cache form an immediately paintable runway instead of
+        retaining one decoded source beside every already-independent QPixmap.
+        The pending unit's own reusable source remains protected.
+        """
 
         candidate_ranks: list[_ArtifactRetentionRank] = []
-        protected = set(self._protected_keys())
+        protected = (
+            set()
+            if include_navigation_sources
+            else set(self._protected_keys())
+        )
         for page in unit.pages:
             plan = self._retention_plan
             active_rank = (
@@ -957,15 +974,32 @@ class _ZipRasterSourceStore:
                 protected.add(reusable.key)
         if not candidate_ranks:
             return ()
-        candidate_boundary = max(candidate_ranks)
-        self._ensure_eviction_order()
+        candidate_boundary = (
+            max(candidate_ranks)
+            if retention_boundary is None
+            else retention_boundary
+        )
+        if include_navigation_sources:
+            positions = {
+                key: index for index, key in enumerate(self._sources)
+            }
+            eviction_order = sorted(
+                self._sources,
+                key=lambda key: (
+                    self._retention_rank(self._sources[key]),
+                    -positions[key],
+                ),
+            )
+        else:
+            self._ensure_eviction_order()
+            eviction_order = self._eviction_order or ()
         return tuple(
             (
                 key,
                 self._sources[key].qimage.sizeInBytes(),
                 self._retention_rank(self._sources[key]),
             )
-            for key in reversed(self._eviction_order or ())
+            for key in reversed(eviction_order)
             if key not in protected
             and key not in excluded_keys
             and self._retention_rank(self._sources[key]) > candidate_boundary
@@ -1204,9 +1238,9 @@ class _ZipRasterSourceStore:
             locality = self._fallback_distance(page_index)
         return (
             scope,
+            1,
             locality,
             int(not source_is_preview),
-            0,
             self._direction_penalty(page_index),
         )
 
@@ -1236,9 +1270,9 @@ class _ZipRasterSourceStore:
             locality = self._fallback_distance(source.page_index)
         return (
             scope,
+            1,
             locality,
             int(not source.source_is_preview),
-            0,
             self._direction_penalty(source.page_index),
         )
 
@@ -1419,6 +1453,11 @@ class _ZipRasterFrameStore:
             if self._retention_rank(candidate) > candidate_rank
         )
 
+    def retention_rank(self, key: _UnitKey) -> _ArtifactRetentionRank:
+        """Return the shared source/frame value of a display artifact."""
+
+        return self._retention_rank(key)
+
     def remove_reclaim_candidates(
         self,
         keys: tuple[_UnitKey, ...],
@@ -1502,9 +1541,9 @@ class _ZipRasterFrameStore:
             else None
         )
         if active_rank is not None:
-            return (0, active_rank, 0, 1, 0)
+            return (0, 0, active_rank, 0, 0)
         if current is None:
-            return (2, 0, 0, 1, 0)
+            return (2, 0, 0, 0, 0)
         current_anchor = self._unit_anchor(current)
         candidate_anchor = self._unit_anchor(key)
         delta = candidate_anchor - current_anchor
@@ -1515,9 +1554,9 @@ class _ZipRasterFrameStore:
         )
         return (
             1 if same_layout else 2,
+            0,
             abs(delta),
             0,
-            1,
             direction_penalty,
         )
 
@@ -2720,20 +2759,23 @@ class RasterBookRuntime(QObject):
         active = self._active_job
         if active is not None:
             active_cancelled = active.cancelled.is_set()
+            current_is_ready_or_pending = (
+                current_key in self._frame_store
+                or self._has_pending_completion(current_key)
+            )
             if active.key == current_key and not active_cancelled:
                 active.adopt_request(request.request_id, as_current=True)
             elif (
                 not active_cancelled
                 and self._active_job_is_artifact_compatible(active, request)
+                and current_is_ready_or_pending
             ):
-                # ZipPlaFork never cancels the sole started page merely because
-                # navigation changed current; only the unstarted order moves.
-                # Keep that book-work ownership while retaining NivisViewer's
-                # requested/displayed split: the final target is accepted now,
-                # but this compatible result becomes cache data unless it is
-                # also the latest presentation key.  Cancelling here cannot
-                # start the replacement until the occupied worker exits, and
-                # would discard the one artifact produced during that wait.
+                # Preserve compatible book work when the new presentation is
+                # already ready (or its completed artifact is queued for GUI
+                # publication): it cannot add latency to that request.  A
+                # cold interactive target instead cancels unrelated warmup so
+                # its read/decode can take the sole archive lane as soon as
+                # the cooperative cancellation boundary is reached.
                 if self._take_unstarted_job(active):
                     self._bump("queued_job_replacements")
                 else:
@@ -3130,6 +3172,8 @@ class RasterBookRuntime(QObject):
         source_candidates = self._source_store.lower_rank_reclaim_candidates(
             unit,
             key.render_spec,
+            retention_boundary=self._frame_store.retention_rank(key),
+            include_navigation_sources=True,
         )
         frame_candidates = self._frame_store.lower_rank_reclaim_candidates(key)
         reclaimable_bytes = sum(
@@ -3192,6 +3236,8 @@ class RasterBookRuntime(QObject):
             unit,
             key.render_spec,
             excluded_keys=excluded_source_keys,
+            retention_boundary=self._frame_store.retention_rank(key),
+            include_navigation_sources=True,
         )
         # Source and frame residency share one byte authority.  Pick the
         # globally lowest-value artifacts regardless of which store owns them
@@ -3243,6 +3289,8 @@ class RasterBookRuntime(QObject):
                 self._source_store.lower_rank_reclaim_candidates(
                     unit,
                     key.render_spec,
+                    retention_boundary=self._frame_store.retention_rank(key),
+                    include_navigation_sources=True,
                 )
             )
         )

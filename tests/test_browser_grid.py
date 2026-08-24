@@ -56,6 +56,19 @@ class RecordingThumbnailProvider(BrowserThumbnailProvider):
         self.cancelled_prefetch += 1
         return 0
 
+    def cancel_requests_except(
+        self,
+        paths: set[str],
+        *,
+        size: int,
+        generation: int,
+    ) -> int:
+        return self.cancel_prefetch_except(
+            paths,
+            size=size,
+            generation=generation,
+        )
+
 
 class FixedShellIconProvider:
     def __init__(self, color: str = "#d03030") -> None:
@@ -693,6 +706,7 @@ def test_ten_thousand_items_request_only_visible_and_prefetch_ranges(
     }
 
     provider.requests.clear()
+    cancellations_before = provider.cancelled_prefetch
     window.config.apply({"browser_thumbnail_display_mode": "center_crop"})
     window._fast_scrolling = True
     window._request_visible_thumbnails()
@@ -705,7 +719,7 @@ def test_ten_thousand_items_request_only_visible_and_prefetch_ranges(
         priority is not ThumbnailPriority.PREFETCH
         for _, _, priority in provider.requests
     )
-    assert provider.cancelled_prefetch == 1
+    assert provider.cancelled_prefetch == cancellations_before + 1
     window.close()
     qapp.processEvents()
 
@@ -805,7 +819,7 @@ def test_scroll_requests_only_new_items_and_does_not_request_ready_items_again(
 
     visible_range[:] = [40, 49]
     second_paths = request_and_apply()
-    assert len(second_paths) == 30
+    assert len(second_paths) == 23
     assert first_paths.isdisjoint(second_paths)
 
     visible_range[:] = [0, 9]

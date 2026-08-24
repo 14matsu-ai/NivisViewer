@@ -169,7 +169,7 @@ BrowserWindow
 
 `browser_folders_first`が有効なら昇順・降順やキーにかかわらずフォルダを先頭グループへ固定し、各グループ内部へ現在の並び替え条件を適用します。ZIPとCBZはフォルダ扱いせず、同一の書庫カテゴリです。無効時はすべての項目を選択キーだけで並べます。
 
-表示密度はExtra Compact（96px級）、Compact、Standard、Comfortable、Largeの5段階で、`QListView`の`gridSize`、`spacing`、フォント、タイトル行数を変更します。`browser_item_spacing_mode=custom`ではセル間隔を0～32 logical px、セル内余白を0～12 logical pxで指定できます。spacing／paddingはサムネイル画像サイズと独立しているため、変更してもthumbnail generation、smart crop解析、Shell icon cacheを変更しません。`thumbnail_size`のcache tokenが変わる場合だけ新しい世代を開始します。
+表示密度はExtra Compact（96px級）、Compact、Medium、Standard、Comfortable、Largeの6段階で、`QListView`の`gridSize`、`spacing`、フォント、タイトル行数を変更します。Mediumの一覧プリセットは149px long edge（既定比率で105×149）を使い、Compactのtext／spacing profileを再利用します。`browser_item_spacing_mode=custom`ではセル間隔を0～32 logical px、セル内余白を0～12 logical pxで指定できます。spacing／paddingはサムネイル画像サイズと独立しているため、変更してもthumbnail generation、smart crop解析、Shell icon cacheを変更しません。`thumbnail_size`のcache tokenが変わる場合だけ新しい世代を開始します。
 
 並び替え、フォルダ優先、密度、サムネイルサイズの変更前には、主選択、複数選択、表示基準項目、縦横スクロール位置を絶対パスで記録します。モデル更新とQtのレイアウト完了後に存在するパスだけを復元します。この処理はViewerのopen経路もBrowserNavigationHistoryのvisit経路も通りません。非同期サムネイル結果も従来どおりパスで照合するため、行番号が変わっても別項目へ混入しません。
 
@@ -397,11 +397,13 @@ ViewerWidgetの描画矩形は`calculate_spread_layout()`で計算します。2�
 
 ジオメトリ、ウィンドウ状態、全画面、回転角度はウィンドウ固有です。複数ウィンドウの完全な復元はまだ行わず、最後にアクティブだったViewerWindowの値を次回作成時の標準状態として保存します。現在の本、ズーム、パン、スライドショーの実行状態は各ViewerWindow内で独立し、ウィンドウ群としての復元対象にはしていません。読書位置だけは本ごとの履歴としてMetadataStoreへ保存します。
 
-BrowserWindowは`last_browser_path`、`browser_sidebar_visible`、`browser_sidebar_width`、`browser_window_geometry`、並び替えキー・順序、フォルダ優先、表示密度を保存します。サムネイルサイズは共有の`thumbnail_size`を使用し、96～384ピクセルへ正規化します。Compact／Standard／Comfortable／Largeプリセットは、サムネイルサイズ、フォント、セル間隔、タイトル行数を一括で選択します。個別設定も保持でき、プリセットと一致しない組み合わせはカスタム状態として扱います。ページ間隔は0～100、ディスクキャッシュ容量は128～4096MBへ正規化します。設定とキャッシュをユーザーの画像フォルダへ書き込みません。
+BrowserWindowは`last_browser_path`、`browser_sidebar_visible`、`browser_sidebar_width`、`browser_window_geometry`、並び替えキー・順序、フォルダ優先、表示密度を保存します。サムネイルサイズは共有の`thumbnail_size`を使用し、96～384ピクセルへ正規化します。Extra Compact／Compact／Medium／Standard／Comfortable／Largeプリセットは、サムネイルサイズ、フォント、セル間隔、タイトル行数を一括で選択します。個別設定も保持でき、プリセットと一致しない組み合わせはカスタム状態として扱います。ページ間隔は0～100、ディスクキャッシュ容量は128～4096MBへ正規化します。設定とキャッシュをユーザーの画像フォルダへ書き込みません。
 
 ### Browser固定セルとサムネイル要求
 
 Browser一覧は`QListView`のIconModeと固定`gridSize`、`BrowserItemDelegate`を使用します。デリゲートの`sizeHint()`は項目内容に依存せず、サムネイル領域とタイトル領域の大きさを表示密度ごとに固定します。`thumbnail_size`は画像枠の長辺のlogical pixelであり、選択した`thumbnail_frame_ratio`から枠の幅と高さを決定します。後着したQImageは項目固有のroleだけを更新するためセル配置を変更しません。
+
+disk/provider cache QImageはquality marginとsize bucketを持つsource authorityです。delegateは実際にpaintされた項目だけをDPI-snapped destinationと同じphysical pixel寸法のdisplay surfaceへ一度準備し、以後はpoint指定のunscaled paintで再利用します。display surfaceはsource QImage/crop/physical target/DPRをkeyに最大96件・32 MiBのLRUへ限定し、DPRまたはthumbnail geometry変更時に破棄します。disk cache、generation、read-ahead rangeはこのsurface cacheから独立しており、offscreen itemやfolder全体のdisplay変換は行いません。
 
 サムネイル要求は可視範囲を最優先にし、その前後1画面だけを先読みします。スクロール量と時間から高速スクロールを検出した間はmiss時の生成を抑止し、停止から180ms後に再開します。フォルダを開いた時点で全項目を要求しません。モデルは正規化パスから行番号への索引を持ち、サムネイル後着時の項目検索を項目数に依存しない処理にします。
 

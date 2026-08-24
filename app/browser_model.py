@@ -51,6 +51,7 @@ class BrowserItem:
     preview_kind: str = ""
     preview_status: str = "pending"
     rating: int | None = None
+    page_count: int | None = None
 
     @property
     def can_open(self) -> bool:
@@ -127,6 +128,7 @@ def browser_item_from_scan_entry(entry: BrowserScanEntry) -> BrowserItem:
         can_generate_preview=entry.can_generate_preview,
         preview_kind=entry.preview_kind,
         rating=entry.rating,
+        page_count=entry.page_count,
     )
 
 
@@ -149,6 +151,7 @@ class BrowserItemModel(QAbstractListModel):
     RatingRole = PathRole + 15
     RatingPreviewRole = PathRole + 16
     ImageDimensionsRole = PathRole + 17
+    PageCountRole = PathRole + 18
 
     _KIND_LABELS = {
         BrowserItemKind.FOLDER: "フォルダ",
@@ -235,6 +238,8 @@ class BrowserItemModel(QAbstractListModel):
             return self._rating_previews.get(self._key(item.path))
         if role == self.ImageDimensionsRole:
             return self._image_dimensions.get(self._key(item.path))
+        if role == self.PageCountRole:
+            return item.page_count
         if role == self.PathRole:
             return str(item.path)
         if role == self.KindRole:
@@ -319,6 +324,37 @@ class BrowserItemModel(QAbstractListModel):
         self._scan_generation = None
         self._rebuild_row_index()
         self.endResetModel()
+
+    def reuse_known_page_counts(
+        self,
+        items: tuple[BrowserItem, ...] | list[BrowserItem],
+    ) -> tuple[BrowserItem, ...]:
+        """Carry valid per-item counts across a same-folder refresh.
+
+        Scanner results intentionally stay cheap and therefore start with an
+        unknown count.  A count learned by the thumbnail metadata path remains
+        valid only while the item's kind, size, and modification fingerprint
+        still match the refreshed directory entry.
+        """
+
+        known = {
+            self._key(item.path): item
+            for item in self._source_items
+            if item.page_count is not None
+        }
+        reused: list[BrowserItem] = []
+        for item in items:
+            previous = known.get(self._key(item.path))
+            if (
+                item.page_count is None
+                and previous is not None
+                and previous.kind is item.kind
+                and previous.file_size == item.file_size
+                and previous.modified_time_ns == item.modified_time_ns
+            ):
+                item = replace(item, page_count=previous.page_count)
+            reused.append(item)
+        return tuple(reused)
 
     def begin_final_directory_scan(
         self,
@@ -640,6 +676,43 @@ class BrowserItemModel(QAbstractListModel):
 
     def image_dimensions(self, path: str | Path) -> tuple[int, int] | None:
         return self._image_dimensions.get(self._key(Path(path)))
+
+    def set_page_count(self, path: str | Path, page_count: int) -> bool:
+        key = self._key(Path(path))
+        normalized = max(0, int(page_count))
+        changed = False
+        for position, item in enumerate(self._source_items):
+            if self._key(item.path) != key or item.page_count == normalized:
+                continue
+            self._source_items[position] = replace(
+                item,
+                page_count=normalized,
+            )
+            changed = True
+        row = self._row_by_key.get(key, -1)
+        if row >= 0 and self._items[row].page_count != normalized:
+            self._items[row] = replace(
+                self._items[row],
+                page_count=normalized,
+            )
+            changed = True
+            index = self.index(row, 0)
+            self.dataChanged.emit(
+                index,
+                index,
+                [self.PageCountRole, self.ItemRole],
+            )
+        return changed
+
+    def page_count(self, path: str | Path) -> int | None:
+        key = self._key(Path(path))
+        row = self._row_by_key.get(key, -1)
+        if row >= 0:
+            return self._items[row].page_count
+        for item in self._source_items:
+            if self._key(item.path) == key:
+                return item.page_count
+        return None
 
     def apply_rating_renames(
         self,

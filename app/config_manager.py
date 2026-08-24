@@ -8,6 +8,10 @@ from typing import Any
 
 from PySide6.QtCore import QObject, Signal
 
+from .browser_wheel_scroll import (
+    normalize_browser_wheel_custom_rows,
+    normalize_browser_wheel_scroll_mode,
+)
 from .viewer_commands import normalize_viewer_command
 from .viewer_memory_policy import (
     normalize_viewer_memory_mode,
@@ -98,6 +102,8 @@ class ConfigManager(QObject):
         "thumbnail_crop_mode": "smart_crop",
         "browser_thumbnail_display_mode": "fit",
         "browser_folder_fallback_background": "auto",
+        "browser_wheel_scroll_mode": "system",
+        "browser_wheel_scroll_custom_rows": 3,
         "thumbnail_quality_mode": "auto",
         "thumbnail_cache_max_edge": 1024,
         "text_preview_enabled": True,
@@ -396,6 +402,16 @@ class ConfigManager(QObject):
             minimum=96,
             maximum=384,
         )
+        normalized["browser_wheel_scroll_mode"] = (
+            normalize_browser_wheel_scroll_mode(
+                normalized.get("browser_wheel_scroll_mode")
+            )
+        )
+        normalized["browser_wheel_scroll_custom_rows"] = (
+            normalize_browser_wheel_custom_rows(
+                normalized.get("browser_wheel_scroll_custom_rows")
+            )
+        )
         if normalized.get("browser_filename_display") not in {
             "hidden",
             "one_line",
@@ -509,6 +525,7 @@ class ConfigManager(QObject):
         if normalized.get("browser_display_density") not in {
             "extra_compact",
             "compact",
+            "medium",
             "standard",
             "comfortable",
             "large",

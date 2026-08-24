@@ -681,11 +681,16 @@ def test_budget_shrink_cancels_running_background_snapshot(
         # budget, while the already painted current artifact stays atomic.
         assert artifacts == [0]
         assert len(frames) == 1
-        assert runtime.metrics.jobs_submitted == 2
+        # The cancelled job plus bounded header-only capacity probes may
+        # drain after the shrink, but no additional display artifact is
+        # decoded/uploaded under the obsolete admission snapshot.
+        assert runtime.metrics.jobs_submitted >= 2
+        assert runtime.metrics.qpixmap_creations == 1
         assert runtime.cache_bytes <= reduced_budget
+        jobs_after_drain = runtime.metrics.jobs_submitted
         QTest.qWait(25)
         qapp.processEvents()
-        assert runtime.metrics.jobs_submitted == 2
+        assert runtime.metrics.jobs_submitted == jobs_after_drain
         assert not runtime.has_unfinished_tasks()
     finally:
         source.release_background.set()
@@ -746,7 +751,7 @@ def test_soft_target_recovery_keeps_unrelated_background_decode(
         source.close()
 
 
-def test_full_cache_navigation_reclaims_only_lower_rank_for_new_neighbor(
+def test_full_cache_navigation_reclaims_sources_before_ready_frames(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
@@ -794,14 +799,11 @@ def test_full_cache_navigation_reclaims_only_lower_rank_for_new_neighbor(
         # Fit the current plus its first two progressively larger neighbors,
         # but not a fourth page. The deprecated unit limit of one must not
         # truncate this byte-driven warm-up.
-        runtime.set_cache_limits(byte_budget=runtime.cache_bytes * 4)
+        runtime.set_cache_limits(byte_budget=runtime.cache_bytes * 3)
         assert runtime.release_startup_runway(request_id=1)
         assert runtime.release_prefetch(request_id=1)
-        _wait_until(
-            qapp,
-            lambda: runtime.cached_unit_count == 3
-            and not runtime.has_unfinished_tasks(),
-        )
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+        assert runtime.cached_unit_count == 3
         assert set(runtime.cached_page_indexes) == {0, 1, 2}
 
         # Freeze the combined store at its exact full size, then move the
@@ -868,6 +870,13 @@ def test_full_cache_navigation_reclaims_only_lower_rank_for_new_neighbor(
             units[2].pages[0],
             spec,
             unit=units[2],
+        ) is None
+        # The current-relative frame runway has higher navigation value than
+        # a rehydratable decoded source. Page 2 remains an immediate QPixmap
+        # hit even though a later magnifier/source request would hydrate it.
+        assert runtime._frame_store.get(
+            runtime._key_for(units[2], spec),
+            touch=False,
         ) is not None
         assert runtime.cache_bytes <= shifted_budget
         assert runtime.metrics.jobs_submitted == jobs_before + 2
@@ -956,7 +965,7 @@ def test_direction_reversal_retains_queued_compatible_artifact_and_reorders(
         source.close()
 
 
-def test_rapid_navigation_adopts_started_book_work_and_dispatches_final_target(
+def test_rapid_navigation_preempts_unrelated_started_warmup_for_cold_target(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
@@ -992,11 +1001,10 @@ def test_rapid_navigation_adopts_started_book_work_and_dispatches_final_target(
         assert started_job is not None
         assert started_job.started.is_set()
 
-        # Model the replaceable portion of a rapid wheel sequence. Every input
-        # updates the requested target and pending work order, but the sole
-        # already-started, compatible page remains book-owned. It is neither a
-        # presentation commit nor disposable work merely because its request
-        # serial changed.
+        # Model the replaceable portion of a rapid wheel sequence. The first
+        # cold target that differs from the speculative page cooperatively
+        # cancels that page; subsequent inputs keep replacing only the pending
+        # current target while the occupied worker unwinds.
         for request_id, page_index in enumerate(range(2, 11), start=2):
             final_request = _request(
                 request_id,
@@ -1006,18 +1014,18 @@ def test_rapid_navigation_adopts_started_book_work_and_dispatches_final_target(
             )
             assert runtime.stage(final_request)
             assert runtime._active_job is started_job
-            assert not started_job.cancelled.is_set()
+            assert started_job.cancelled.is_set()
 
         assert final_request is not None
-        assert runtime.metrics.cancel_requests == 0
-        assert runtime.metrics.running_job_adoptions == 9
+        assert runtime.metrics.cancel_requests == 1
+        assert runtime.metrics.running_job_adoptions == 0
         assert runtime.metrics.warmup_planner_creations == 1
         assert runtime.metrics.work_order_changes == 9
 
         source.release_page_one.set()
-        # Finish the native worker without draining its queued GUI result. The
-        # final request must release that finished scheduling slot immediately
-        # while the pending key ledger prevents a duplicate page-1 decode.
+        # Finish the cancelled native worker without draining its queued GUI
+        # result. The final request must release that finished scheduling slot
+        # immediately and start the final cold target.
         assert runtime.wait_for_done(3000)
         assert started_job.finished.is_set()
         assert 1 not in runtime.cached_page_indexes
@@ -1036,10 +1044,59 @@ def test_rapid_navigation_adopts_started_book_work_and_dispatches_final_target(
             lambda: frames[-1].request_id == final_request.request_id,
         )
         assert frames[-1].unit.identity == final_request.current.identity
-        assert 1 in runtime.cached_page_indexes
+        assert 1 not in runtime.cached_page_indexes
         assert source.decode_order[:3] == ["0.png", "1.png", "10.png"]
-        assert runtime.metrics.cancel_requests == 0
+        assert runtime.metrics.cancel_requests == 1
         assert runtime.metrics.stale_results == 0
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+    finally:
+        source.release_page_one.set()
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()
+
+
+def test_navigation_adopts_started_warmup_when_it_is_the_cold_target(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    archive = _write_zip(tmp_path, pages=4)
+
+    class BlockingSource(ZipImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.page_one_started = Event()
+            self.release_page_one = Event()
+
+        def open_image(self, image_id: str) -> Image.Image:
+            if image_id == "1.png":
+                self.page_one_started.set()
+                self.release_page_one.wait(2.0)
+            return super().open_image(image_id)
+
+    source = BlockingSource(archive)
+    runtime = ZipRasterBookRuntime(source, 1)
+    units = tuple(_unit(index) for index in range(4))
+    frames: list[ZipRasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    try:
+        assert runtime.request(_request(1, units[0], *units, direction=1))
+        _wait_until(qapp, lambda: bool(frames))
+        assert runtime.release_continuous_warmup(request_id=1)
+        assert source.page_one_started.wait(1.0)
+        started_job = runtime._active_job
+        assert started_job is not None and started_job.started.is_set()
+
+        page_one = _request(2, units[1], *units, direction=1)
+        assert runtime.stage(page_one)
+        assert runtime._active_job is started_job
+        assert not started_job.cancelled.is_set()
+        assert runtime.metrics.cancel_requests == 0
+
+        assert runtime.request(page_one)
+        source.release_page_one.set()
+        _wait_until(qapp, lambda: frames[-1].request_id == 2)
+        assert frames[-1].unit.start_index == 1
+        assert runtime.metrics.cancel_requests == 0
         _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
     finally:
         source.release_page_one.set()
@@ -1487,7 +1544,7 @@ def test_runtime_returns_terminal_error_frame_without_legacy_fallback(
         source.close()
 
 
-def test_memory_budget_stops_prefetch_before_decode_churn(
+def test_memory_budget_prioritizes_a_display_ready_runway_over_sources(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
@@ -1500,7 +1557,14 @@ def test_memory_budget_stops_prefetch_before_decode_churn(
             self.opens.append(image_id)
             return super().open_image(image_id)
 
-    source = CountingSource(_write_zip(tmp_path))
+    archive = tmp_path / "display-runway.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        for index in range(6):
+            path = tmp_path / f"{index}.png"
+            with Image.new("RGB", (120, 180), (40 + index * 20, 80, 120)) as image:
+                image.save(path)
+            output.write(path, path.name)
+    source = CountingSource(archive)
     runtime = ZipRasterBookRuntime(source, 1)
     frames: list[ZipRasterFrame] = []
     runtime.frameReady.connect(frames.append)
@@ -1508,35 +1572,44 @@ def test_memory_budget_stops_prefetch_before_decode_churn(
         units = tuple(
             ZipRasterDisplayUnit(
                 index,
-                (
-                    ZipRasterPage(
-                        index,
-                        f"{index}.png",
-                        (120 + index * 10, 180 + index * 10),
-                    ),
-                ),
+                (ZipRasterPage(index, f"{index}.png", (120, 180)),),
                 True,
             )
-            for index in range(3)
+            for index in range(6)
         )
-        request = _request(1, units[1], units[1], units[2], units[0])
+        spec = ZipRasterRenderSpec(
+            (100, 100),
+            decoder_maximum_size=(100, 100),
+        )
+        request = _request(
+            1,
+            units[2],
+            *units,
+            spec=spec,
+            direction=1,
+        )
         assert runtime.request(request)
         _wait_until(qapp, lambda: len(frames) == 1)
-        current_bytes = runtime.cache_bytes
-        assert runtime.decoded_source_bytes > 0
+        source_bytes = runtime.decoded_source_bytes
+        frame_bytes = runtime._frame_store.byte_size
+        assert source_bytes > frame_bytes * 2
         assert runtime.cached_unit_count == 1
-        runtime.set_cache_limits(byte_budget=current_bytes + 1)
+        # Several display frames plus two decoder-sized sources fit. Keeping
+        # a decoded source beside every QPixmap does not. The runtime should
+        # spend this constrained budget on a useful current-relative visual
+        # runway and let source hydration remain an on-demand fallback.
+        runtime.set_cache_limits(
+            byte_budget=source_bytes * 2 + frame_bytes * 4
+        )
         assert runtime.release_startup_runway(request_id=1)
         assert runtime.release_prefetch(request_id=1)
-        qapp.processEvents()
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
 
-        # The QPixmap-only store still has ample apparent room, but the
-        # protected decoded source consumes the combined budget.  Do not read
-        # and decode a neighbor only to evict it immediately.
-        assert runtime.metrics.jobs_submitted == 1
-        assert runtime.metrics.prefetch_admission_stops == 1
-        assert runtime.cached_page_indexes == (1,)
-        assert source.opens == ["1.png"]
+        assert {1, 2, 3, 4}.issubset(runtime.cached_page_indexes)
+        assert runtime.cached_unit_count >= 4
+        assert runtime.decoded_source_count <= 2
+        assert runtime.cache_bytes <= runtime.cache_byte_budget
+        assert source.opens[:4] == ["2.png", "3.png", "1.png", "4.png"]
     finally:
         assert runtime.shutdown(wait_msecs=3000)
         source.close()

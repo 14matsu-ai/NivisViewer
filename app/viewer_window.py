@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 from pathlib import Path
@@ -38,6 +39,10 @@ from PySide6.QtWidgets import (
 )
 
 from .archive_backend_registry import ArchiveBackendRegistry
+from .adjacent_book_search import (
+    AdjacentBookBrowserSnapshot,
+    path_key as adjacent_path_key,
+)
 from .app_icon import install_window_icon
 from .book_session import AsyncBookOpenFailed, BookOpened, BookSession
 from .config_manager import ConfigManager
@@ -218,6 +223,11 @@ class ViewerWindow(QMainWindow):
         self._drop_probe_workers: set[FolderDropProbe] = set()
         self._drop_active = False
         self._adjacent_book_handler = adjacent_book_handler
+        self._browser_navigation_snapshot: AdjacentBookBrowserSnapshot | None = None
+        self._browser_navigation_path = ""
+        self._pending_browser_navigation: (
+            tuple[str, AdjacentBookBrowserSnapshot | None] | None
+        ) = None
         self._shutdown_prepared = False
         self._reload_page_index: int | None = None
         self._pending_display_demand: (
@@ -561,6 +571,20 @@ class ViewerWindow(QMainWindow):
         if self.book_session.current_path is None:
             return ""
         return str(self.book_session.current_path)
+
+    @property
+    def browser_navigation_snapshot(self) -> AdjacentBookBrowserSnapshot | None:
+        pending = self._pending_browser_navigation
+        if pending is not None:
+            return pending[1]
+        return self._browser_navigation_snapshot
+
+    @property
+    def browser_navigation_path(self) -> str:
+        pending = self._pending_browser_navigation
+        if pending is not None:
+            return pending[0]
+        return self._browser_navigation_path or self._opened_path
 
     def show_initial(self) -> None:
         if self._start_fullscreen:
@@ -1688,6 +1712,7 @@ class ViewerWindow(QMainWindow):
         path: str | Path,
         *,
         folder_snapshot: FolderListingSnapshot | None = None,
+        browser_snapshot: AdjacentBookBrowserSnapshot | None = None,
         preserve_current_page: bool = False,
     ) -> bool:
         if not preserve_current_page:
@@ -1722,6 +1747,10 @@ class ViewerWindow(QMainWindow):
         )
         self._begin_interactive_open()
         suffix = Path(path).suffix.lower()
+        self._pending_browser_navigation = (
+            lexical_absolute(path),
+            browser_snapshot,
+        )
         self.book_session.open_book_async(
             path,
             recursive_folder=self.recursive_folder,
@@ -1746,6 +1775,7 @@ class ViewerWindow(QMainWindow):
         self._clear_status_override()
         self._pending_book_open_projection = None
         if self.model.total_pages == 0:
+            self._pending_browser_navigation = None
             self._cancel_interactive_open()
             if modal_on_empty:
                 QMessageBox.warning(self, "画像なし", "対応画像が見つかりませんでした。")
@@ -1761,6 +1791,21 @@ class ViewerWindow(QMainWindow):
             self._update_slider()
             self._update_status()
             return False
+
+        pending_browser_navigation = self._pending_browser_navigation
+        self._pending_browser_navigation = None
+        if (
+            pending_browser_navigation is not None
+            and adjacent_path_key(pending_browser_navigation[0])
+            == adjacent_path_key(opened.requested_path)
+        ):
+            (
+                self._browser_navigation_path,
+                self._browser_navigation_snapshot,
+            ) = pending_browser_navigation
+        else:
+            self._browser_navigation_path = lexical_absolute(opened.requested_path)
+            self._browser_navigation_snapshot = None
 
         self._metadata_book_path = str(opened.source_path)
         self._metadata_book_item_type = self._metadata_item_type_for_source(
@@ -1866,6 +1911,7 @@ class ViewerWindow(QMainWindow):
         self._finish_opened_book(opened, modal_on_empty=False)
 
     def _on_async_book_open_failed(self, failed: AsyncBookOpenFailed) -> None:
+        self._pending_browser_navigation = None
         self._reload_page_index = None
         self._cancel_interactive_open()
         self.presentation_state.fail_replacement_open(
@@ -2325,6 +2371,11 @@ class ViewerWindow(QMainWindow):
                     if preserve_order_snapshot
                     else None
                 ),
+                browser_snapshot=(
+                    self._browser_navigation_snapshot
+                    if preserve_order_snapshot
+                    else None
+                ),
                 preserve_current_page=True,
             )
 
@@ -2488,11 +2539,39 @@ class ViewerWindow(QMainWindow):
     def open_previous_book(self) -> None:
         self._open_adjacent_book(-1)
 
-    def _open_adjacent_book(self, direction: int) -> None:
+    def _open_adjacent_book(
+        self,
+        direction: int,
+        *,
+        require_browser_snapshot: bool = False,
+    ) -> None:
         if self._adjacent_book_handler is None:
             self._set_status_override("移動できる書庫がありません", 2500)
             return
-        result = self._adjacent_book_handler(self, direction)
+        try:
+            parameters = tuple(
+                inspect.signature(
+                    self._adjacent_book_handler
+                ).parameters.values()
+            )
+            accepts_snapshot_requirement = (
+                len(parameters) >= 3
+                or any(
+                    parameter.kind is inspect.Parameter.VAR_POSITIONAL
+                    for parameter in parameters
+                )
+            )
+        except (TypeError, ValueError):
+            accepts_snapshot_requirement = False
+        result = (
+            self._adjacent_book_handler(
+                self,
+                direction,
+                require_browser_snapshot,
+            )
+            if accepts_snapshot_requirement
+            else self._adjacent_book_handler(self, direction)
+        )
         if result == "boundary":
             message = "前の書庫はありません" if direction < 0 else "次の書庫はありません"
             self._set_status_override(message, 2500)
@@ -3263,8 +3342,36 @@ class ViewerWindow(QMainWindow):
             # request merely because this pending serial is obsolete.
             return
         if runtime.request(request):
+            self._paint_ready_transit_frame_after_cold_dispatch(request)
             return
         self._fail_raster_runtime_request(runtime)
+
+    def _paint_ready_transit_frame_after_cold_dispatch(
+        self,
+        request: RasterRequest,
+    ) -> bool:
+        """Let one legitimate ready transit frame reach the screen.
+
+        Decode priority is already settled by ``runtime.request`` before this
+        method runs.  PresentationState remains the semantic authority: only
+        its most recently committed frame may paint, and only while a distinct
+        cold request from the same book is pending.  No frame queue, timer or
+        placeholder path is introduced.
+        """
+
+        displayed = self.presentation_state.displayed
+        requested = self.presentation_state.requested
+        if (
+            displayed is None
+            or requested is None
+            or requested.token.request_serial != int(request.request_id)
+            or displayed.token.book != requested.token.book
+            or displayed.unit.identity == requested.unit.identity
+            or self.viewer.displayed_page_indexes
+            != displayed.unit.page_indexes
+        ):
+            return False
+        return self.viewer.paint_pending_committed_frame()
 
     def _finish_wheel_navigation(self) -> None:
         self._navigation_admission.finish_wheel()
@@ -5333,8 +5440,14 @@ class ViewerWindow(QMainWindow):
 
     def _on_extra_mouse_button(self, button: str) -> None:
         if button == "back":
+            if self.mouse_back_button_action == commands.PREVIOUS_BOOK:
+                self._open_adjacent_book(-1, require_browser_snapshot=True)
+                return
             self.dispatch_command(self.mouse_back_button_action)
         elif button == "forward":
+            if self.mouse_forward_button_action == commands.NEXT_BOOK:
+                self._open_adjacent_book(1, require_browser_snapshot=True)
+                return
             self.dispatch_command(self.mouse_forward_button_action)
 
     def _handle_escape(self) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 
 from PySide6.QtCore import QModelIndex, QRect, QRectF, QSize, Qt
@@ -31,6 +32,9 @@ class BrowserGridProfile:
 GRID_PROFILES = {
     BrowserDisplayDensity.EXTRA_COMPACT: BrowserGridProfile(4, 22, 0, 7, 1),
     BrowserDisplayDensity.COMPACT: BrowserGridProfile(20, 32, 2, 8, 1),
+    # The medium preset changes only the thumbnail content scale.  Reuse the
+    # compact text/spacing contract instead of inventing a parallel layout.
+    BrowserDisplayDensity.MEDIUM: BrowserGridProfile(20, 32, 2, 8, 1),
     BrowserDisplayDensity.STANDARD: BrowserGridProfile(44, 58, 6, 9, 2),
     BrowserDisplayDensity.COMFORTABLE: BrowserGridProfile(72, 88, 12, 10, 2),
     BrowserDisplayDensity.LARGE: BrowserGridProfile(104, 118, 16, 11, 2),
@@ -39,6 +43,7 @@ GRID_PROFILES = {
 GRID_PRESET_THUMBNAIL_SIZES = {
     BrowserDisplayDensity.EXTRA_COMPACT: 96,
     BrowserDisplayDensity.COMPACT: 128,
+    BrowserDisplayDensity.MEDIUM: 149,
     BrowserDisplayDensity.STANDARD: 180,
     BrowserDisplayDensity.COMFORTABLE: 240,
     BrowserDisplayDensity.LARGE: 320,
@@ -46,6 +51,153 @@ GRID_PRESET_THUMBNAIL_SIZES = {
 
 BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR = "#000000"
 BROWSER_PLACEHOLDER_ICON_MAX_RATIO = 0.50
+BROWSER_DISPLAY_SURFACE_CACHE_MAX_ITEMS = 96
+BROWSER_DISPLAY_SURFACE_CACHE_MAX_BYTES = 32 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class DisplayThumbnailSurface:
+    image: QImage
+    cache_hit: bool
+    prepared_with_resampling: bool
+
+
+def prepare_display_thumbnail_surface(
+    image: QImage,
+    source_rect: QRectF,
+    target_rect: QRectF,
+    device_pixel_ratio: float,
+) -> DisplayThumbnailSurface:
+    """Prepare physical display pixels once for a later unscaled paint."""
+
+    dpr = max(0.5, float(device_pixel_ratio))
+    physical_width = max(1, round(target_rect.width() * dpr))
+    physical_height = max(1, round(target_rect.height() * dpr))
+    source_is_integral = all(
+        abs(value - round(value)) < 0.000001
+        for value in (
+            source_rect.x(),
+            source_rect.y(),
+            source_rect.width(),
+            source_rect.height(),
+        )
+    )
+    source_matches_surface = (
+        source_is_integral
+        and round(source_rect.width()) == physical_width
+        and round(source_rect.height()) == physical_height
+    )
+    if source_matches_surface:
+        source = QRect(
+            round(source_rect.x()),
+            round(source_rect.y()),
+            physical_width,
+            physical_height,
+        )
+        if source == image.rect():
+            prepared = QImage(image)
+        else:
+            prepared = image.copy(source)
+        prepared.setDevicePixelRatio(dpr)
+        return DisplayThumbnailSurface(prepared, False, False)
+
+    prepared = QImage(
+        physical_width,
+        physical_height,
+        QImage.Format.Format_ARGB32_Premultiplied,
+    )
+    prepared.fill(Qt.GlobalColor.transparent)
+    surface_painter = QPainter(prepared)
+    try:
+        surface_painter.setRenderHint(
+            QPainter.RenderHint.SmoothPixmapTransform,
+            True,
+        )
+        surface_painter.drawImage(
+            QRectF(0, 0, physical_width, physical_height),
+            image,
+            source_rect,
+        )
+    finally:
+        surface_painter.end()
+    prepared.setDevicePixelRatio(dpr)
+    return DisplayThumbnailSurface(prepared, False, True)
+
+
+class BrowserDisplaySurfaceCache:
+    """Bounded, paint-driven cache of final physical Browser thumbnail pixels."""
+
+    def __init__(
+        self,
+        *,
+        max_items: int = BROWSER_DISPLAY_SURFACE_CACHE_MAX_ITEMS,
+        max_bytes: int = BROWSER_DISPLAY_SURFACE_CACHE_MAX_BYTES,
+    ) -> None:
+        self.max_items = max(1, int(max_items))
+        self.max_bytes = max(1, int(max_bytes))
+        self._items: OrderedDict[tuple[object, ...], QImage] = OrderedDict()
+        self._byte_cost = 0
+        self._device_pixel_ratio: float | None = None
+
+    @property
+    def item_count(self) -> int:
+        return len(self._items)
+
+    @property
+    def byte_cost(self) -> int:
+        return self._byte_cost
+
+    def clear(self) -> None:
+        self._items.clear()
+        self._byte_cost = 0
+
+    def prepare(
+        self,
+        image: QImage,
+        source_rect: QRectF,
+        target_rect: QRectF,
+        device_pixel_ratio: float,
+    ) -> DisplayThumbnailSurface:
+        dpr = max(0.5, float(device_pixel_ratio))
+        if (
+            self._device_pixel_ratio is not None
+            and abs(self._device_pixel_ratio - dpr) >= 0.001
+        ):
+            self.clear()
+        self._device_pixel_ratio = dpr
+        key = (
+            int(image.cacheKey()),
+            round(source_rect.x(), 6),
+            round(source_rect.y(), 6),
+            round(source_rect.width(), 6),
+            round(source_rect.height(), 6),
+            max(1, round(target_rect.width() * dpr)),
+            max(1, round(target_rect.height() * dpr)),
+            round(dpr, 6),
+        )
+        cached = self._items.get(key)
+        if cached is not None:
+            self._items.move_to_end(key)
+            return DisplayThumbnailSurface(cached, True, False)
+
+        surface = prepare_display_thumbnail_surface(
+            image,
+            source_rect,
+            target_rect,
+            dpr,
+        )
+        cost = max(1, int(surface.image.sizeInBytes()))
+        if cost <= self.max_bytes:
+            self._items[key] = surface.image
+            self._items.move_to_end(key)
+            self._byte_cost += cost
+            while (
+                len(self._items) > self.max_items
+                or self._byte_cost > self.max_bytes
+            ):
+                _old_key, old_image = self._items.popitem(last=False)
+                self._byte_cost -= max(1, int(old_image.sizeInBytes()))
+        return surface
 
 
 def browser_item_type_key(item: BrowserItem) -> str:
@@ -253,6 +405,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
         self.shell_icon_provider = (
             shell_icon_provider or ShellAssociatedIconProvider()
         )
+        self._display_surface_cache = BrowserDisplaySurfaceCache()
 
     @property
     def profile(self) -> BrowserGridProfile:
@@ -299,6 +452,11 @@ class BrowserItemDelegate(QStyledItemDelegate):
         item_spacing: int | None = None,
         folder_fallback_background: str | None = None,
     ) -> None:
+        previous_surface_geometry = (
+            self.thumbnail_size,
+            self.frame_ratio_id,
+            self.thumbnail_display_mode,
+        )
         self.thumbnail_size = int(thumbnail_size)
         self.density = density
         if frame_ratio_id is not None:
@@ -325,6 +483,12 @@ class BrowserItemDelegate(QStyledItemDelegate):
                     folder_fallback_background
                 )
             )
+        if previous_surface_geometry != (
+            self.thumbnail_size,
+            self.frame_ratio_id,
+            self.thumbnail_display_mode,
+        ):
+            self._display_surface_cache.clear()
 
     def sizeHint(
         self,
@@ -555,13 +719,17 @@ class BrowserItemDelegate(QStyledItemDelegate):
             display_mode or self.thumbnail_display_mode,
             device_pixel_ratio=dpr,
         )
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        surface = self._display_surface_cache.prepare(
+            image,
+            source,
+            target,
+            dpr,
+        )
         if not enabled:
             painter.setOpacity(0.55)
         painter.drawImage(
-            target,
-            image,
-            source,
+            target.topLeft(),
+            surface.image,
         )
         if not enabled:
             painter.setOpacity(1.0)
@@ -700,6 +868,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
         badge_sizes = {
             BrowserDisplayDensity.EXTRA_COMPACT: 14,
             BrowserDisplayDensity.COMPACT: 16,
+            BrowserDisplayDensity.MEDIUM: 16,
             BrowserDisplayDensity.STANDARD: 18,
             BrowserDisplayDensity.COMFORTABLE: 20,
             BrowserDisplayDensity.LARGE: 22,
