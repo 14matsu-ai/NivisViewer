@@ -804,6 +804,40 @@ def test_status_left_fields_follow_visible_filter_and_copy_full_selection_path(
         assert window.browser_item_count_label.text() == "3 個の項目"
         assert window.browser_selected_path_edit.text() == ""
         assert window.browser_selected_path_edit.isReadOnly()
+        assert not window.browser_selected_path_edit.hasFrame()
+        status_style = "".join(window.statusBar().styleSheet().split())
+        assert "QStatusBar::item{border:none;}" in status_style
+        path_style = "".join(
+            window.browser_selected_path_edit.styleSheet().split()
+        )
+        assert "border:none" in path_style
+        assert "background:transparent" in path_style
+        rendered_status = QImage(
+            window.statusBar().size(),
+            QImage.Format.Format_ARGB32_Premultiplied,
+        )
+        rendered_status.fill(Qt.GlobalColor.transparent)
+        window.statusBar().render(rendered_status)
+        path_left = window.browser_selected_path_edit.mapTo(
+            window.statusBar(),
+            QPoint(),
+        ).x()
+        path_right = path_left + window.browser_selected_path_edit.width() - 1
+        detail_left = window.selected_detail_widget.mapTo(
+            window.statusBar(),
+            QPoint(),
+        ).x()
+        vertical_pixels = range(3, rendered_status.height() - 3)
+        for edge, neighbor in (
+            (path_left, path_left - 1),
+            (path_right, path_right + 1),
+            (detail_left, detail_left - 1),
+        ):
+            assert sum(
+                rendered_status.pixelColor(edge, y)
+                != rendered_status.pixelColor(neighbor, y)
+                for y in vertical_pixels
+            ) <= 1
         assert (
             window.browser_status_summary_widget.layout().spacing()
             == BROWSER_STATUS_LEFT_SPACING

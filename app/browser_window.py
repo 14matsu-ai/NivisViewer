@@ -5105,6 +5105,9 @@ class BrowserWindow(QMainWindow):
             self.browser_search_edit,
         )
         browser_status_bar = self.statusBar()
+        browser_status_bar.setStyleSheet(
+            "QStatusBar::item { border: none; }"
+        )
         browser_status_bar.layout().setSpacing(BROWSER_STATUS_BAR_SPACING)
         self.browser_status_summary_widget = QWidget(self)
         self.browser_status_summary_widget.setObjectName(
