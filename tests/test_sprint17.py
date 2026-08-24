@@ -294,8 +294,10 @@ def test_two_hundred_item_plan_does_not_request_all_items() -> None:
         prefetch_screens=1,
     )
     assert len(plan.visible_rows) == 20
-    assert len(plan.prefetch_rows) == 40
-    assert len(plan.requested_rows) == 60
+    assert len(plan.directional_rows) == 20
+    assert len(plan.safety_rows) == 5
+    assert len(plan.prefetch_rows) == 25
+    assert len(plan.requested_rows) == 45
     assert 0 not in plan.requested_rows
     assert 199 not in plan.requested_rows
 

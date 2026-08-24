@@ -39,6 +39,7 @@ from .thumbnail_render import (
 
 _RETIRED_THUMBNAIL_PROVIDERS: set[BrowserThumbnailProvider] = set()
 _THUMBNAIL_LOG = logging.getLogger("nivisviewer.thumbnail")
+_PAGE_COUNT_REQUEST_TOKEN = -1
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class ThumbnailLoadResult:
     result_kind: PreviewResultKind | None = None
     preview_source: PreviewSource = PreviewSource.EXISTING
     persist_to_disk: bool = True
+    page_count: int | None = None
 
     @property
     def resolved_kind(self) -> PreviewResultKind:
@@ -80,6 +82,7 @@ class _PendingThumbnail:
 class _ThumbnailWorkerSignals(QObject):
     finished = Signal(str, int, object, object, object)
     provisional = Signal(str, int, object, object, object)
+    page_count_discovered = Signal(str, int, int)
 
 
 class _ThumbnailWorker(QRunnable):
@@ -98,6 +101,7 @@ class _ThumbnailWorker(QRunnable):
         self.loader = loader
         self.priority = ThumbnailPriority(priority)
         self.cancelled = Event()
+        self.page_count_reported = False
         self.signals = _ThumbnailWorkerSignals()
 
     @Slot()
@@ -115,6 +119,16 @@ class _ThumbnailWorker(QRunnable):
                 image,
             )
 
+        def report_page_count(page_count: int) -> None:
+            if self.cancelled.is_set():
+                return
+            self.page_count_reported = True
+            self.signals.page_count_discovered.emit(
+                str(self.item.path),
+                self.generation,
+                max(0, int(page_count)),
+            )
+
         try:
             result = _invoke_thumbnail_loader(
                 self.loader,
@@ -123,6 +137,7 @@ class _ThumbnailWorker(QRunnable):
                 self.cancelled,
                 self.priority,
                 report_provisional,
+                report_page_count,
             )
         except Exception:
             _THUMBNAIL_LOG.exception(
@@ -153,6 +168,7 @@ class BrowserThumbnailProvider(QObject):
     thumbnail_provisional = Signal(str, int, object)
     thumbnail_failed = Signal(str, int, str)
     preview_state_changed = Signal(str, int, str)
+    page_count_ready = Signal(str, int, int)
     cache_cleared = Signal()
     scheduling_resumed = Signal()
 
@@ -177,6 +193,9 @@ class BrowserThumbnailProvider(QObject):
         self._pool.setMaxThreadCount(1)
         self._cache_capacity = max(1, cache_capacity)
         self._cache: OrderedDict[tuple[str, int, float | None], QImage] = OrderedDict()
+        self._cache_page_counts: dict[
+            tuple[str, int, float | None], int
+        ] = {}
         self._cache_specs: dict[int, ThumbnailRenderSpec] = {}
         self._active_request_tokens: dict[str, set[int]] = {}
         self._pending: dict[tuple[str, int, int], _PendingThumbnail] = {}
@@ -186,16 +205,19 @@ class BrowserThumbnailProvider(QObject):
         self._stats: dict[str, int] = {
             "requested_visible": 0,
             "requested_selected": 0,
+            "requested_read_ahead": 0,
             "requested_prefetch": 0,
             "memory_hit": 0,
             "disk_hit": 0,
             "generated": 0,
             "generated_visible": 0,
             "generated_selected": 0,
+            "generated_read_ahead": 0,
             "generated_prefetch": 0,
             "disk_saved": 0,
             "disk_saved_visible": 0,
             "disk_saved_selected": 0,
+            "disk_saved_read_ahead": 0,
             "memory_only": 0,
             "prefetch_skipped": 0,
         }
@@ -280,6 +302,14 @@ class BrowserThumbnailProvider(QObject):
             cache_token = normalized_size
         path_key = self._path_key(item.path)
         normalized_priority = ThumbnailPriority(priority)
+        if normalized_priority is ThumbnailPriority.VISIBLE:
+            # Visible image work owns the lane.  Its existing folder/archive
+            # listing publishes the same metadata before decode, so obsolete
+            # selected-only count work should yield cooperatively.
+            self.cancel_page_count_requests_except(
+                None,
+                generation=requested_generation,
+            )
         if (
             self._fast_scroll_suppressed
             and normalized_priority is ThumbnailPriority.VISIBLE
@@ -289,6 +319,7 @@ class BrowserThumbnailProvider(QObject):
             {
                 ThumbnailPriority.VISIBLE: "requested_visible",
                 ThumbnailPriority.SELECTED: "requested_selected",
+                ThumbnailPriority.READ_AHEAD: "requested_read_ahead",
                 ThumbnailPriority.PREFETCH: "requested_prefetch",
             }[normalized_priority]
         )
@@ -299,12 +330,15 @@ class BrowserThumbnailProvider(QObject):
             self._increment_stat("memory_hit")
             self._cache.move_to_end(cache_key)
             image = QImage(cached)
+            page_count = self._cache_page_counts.get(cache_key)
             QTimer.singleShot(
                 0,
-                lambda path=str(item.path), current=requested_generation, result=image: (
-                    self.thumbnail_ready.emit(path, current, result)
-                    if not self._closed and current == self._generation
-                    else None
+                lambda path=str(item.path), current=requested_generation,
+                result=image, count=page_count: self._emit_memory_hit(
+                    path,
+                    current,
+                    result,
+                    count,
                 ),
             )
             return False
@@ -316,15 +350,17 @@ class BrowserThumbnailProvider(QObject):
                 normalized_size,
             )
             if candidate is not None:
-                candidate_image, candidate_spec = candidate
+                candidate_image, candidate_spec, page_count = candidate
                 image = QImage(candidate_image)
                 if candidate_spec.long_edge >= normalized_size.long_edge * 0.95:
                     QTimer.singleShot(
                         0,
-                        lambda path=str(item.path), current=requested_generation, result=image: (
-                            self.thumbnail_ready.emit(path, current, result)
-                            if not self._closed and current == self._generation
-                            else None
+                        lambda path=str(item.path), current=requested_generation,
+                        result=image, count=page_count: self._emit_memory_hit(
+                            path,
+                            current,
+                            result,
+                            count,
                         ),
                     )
                     return False
@@ -365,6 +401,144 @@ class BrowserThumbnailProvider(QObject):
             )
             worker.signals.finished.connect(self._on_finished)
             worker.signals.provisional.connect(self._on_provisional)
+            worker.signals.page_count_discovered.connect(
+                self._on_page_count_discovered
+            )
+            self._pending[pending_key] = _PendingThumbnail(
+                worker,
+                normalized_priority,
+            )
+        if self._start_worker(worker, normalized_priority):
+            return True
+        with self._pending_lock:
+            self._pending.pop(pending_key, None)
+        return False
+
+    def cancel_page_count_requests_except(
+        self,
+        keep_path: str | Path | None,
+        *,
+        generation: int | None = None,
+    ) -> int:
+        """Cancel obsolete selected metadata work on the existing lane."""
+
+        requested_generation = self._generation if generation is None else generation
+        keep_key = (
+            None
+            if keep_path is None
+            else self._path_key(Path(keep_path))
+        )
+        cancelled = 0
+        with self._pending_lock:
+            for key, pending in tuple(self._pending.items()):
+                if (
+                    key[1] != _PAGE_COUNT_REQUEST_TOKEN
+                    or key[2] != requested_generation
+                    or key[0] == keep_key
+                ):
+                    continue
+                pending.worker.cancelled.set()
+                cancelled += 1
+                if self._try_take(pending.worker):
+                    self._pending.pop(key, None)
+        return cancelled
+
+    def request_page_count(
+        self,
+        item: BrowserItem,
+        *,
+        generation: int | None = None,
+        priority: ThumbnailPriority = ThumbnailPriority.SELECTED,
+    ) -> bool:
+        """Queue lightweight count metadata on the thumbnail worker authority.
+
+        This deliberately uses the provider's existing bounded pool.  A
+        selected-item request stays below visible thumbnails but above
+        speculative read-ahead.  It lists direct folder entries or archive
+        headers only; it never opens an image payload.
+        """
+
+        if self._closed or self._paused:
+            return False
+        requested_generation = self._generation if generation is None else generation
+        if requested_generation != self._generation or item.kind not in {
+            BrowserItemKind.FOLDER,
+            BrowserItemKind.ARCHIVE,
+        }:
+            return False
+        if item.page_count is not None:
+            QTimer.singleShot(
+                0,
+                lambda path=str(item.path), current=requested_generation,
+                count=max(0, int(item.page_count)): (
+                    self.page_count_ready.emit(path, current, count)
+                    if not self._closed and current == self._generation
+                    else None
+                ),
+            )
+            return False
+
+        path_key = self._path_key(item.path)
+        normalized_priority = ThumbnailPriority(priority)
+        self.cancel_page_count_requests_except(
+            item.path,
+            generation=requested_generation,
+        )
+        pending_key = (
+            path_key,
+            _PAGE_COUNT_REQUEST_TOKEN,
+            requested_generation,
+        )
+        with self._pending_lock:
+            # A current-generation thumbnail worker for the same item already
+            # performs the required folder/header listing.  Adopt it when it
+            # is visible/selected, or promote it if it is still queued at a
+            # speculative priority, instead of adding duplicate count work.
+            for key, pending in tuple(self._pending.items()):
+                if (
+                    key[0] != path_key
+                    or key[1] == _PAGE_COUNT_REQUEST_TOKEN
+                    or key[2] != requested_generation
+                    or pending.worker.cancelled.is_set()
+                ):
+                    continue
+                if pending.priority >= normalized_priority:
+                    return False
+                if self._try_take(pending.worker):
+                    pending.worker.priority = normalized_priority
+                    self._pending[key] = _PendingThumbnail(
+                        pending.worker,
+                        normalized_priority,
+                    )
+                    self._start_worker(
+                        pending.worker,
+                        normalized_priority,
+                    )
+                    return False
+            existing = self._pending.get(pending_key)
+            if existing is not None:
+                if (
+                    normalized_priority > existing.priority
+                    and self._try_take(existing.worker)
+                ):
+                    existing.worker.priority = normalized_priority
+                    self._pending[pending_key] = _PendingThumbnail(
+                        existing.worker,
+                        normalized_priority,
+                    )
+                    self._start_worker(
+                        existing.worker,
+                        normalized_priority,
+                    )
+                return False
+            worker = _ThumbnailWorker(
+                item,
+                _PAGE_COUNT_REQUEST_TOKEN,
+                requested_generation,
+                self._load_page_count_pipeline,
+                normalized_priority,
+            )
+            worker.signals.finished.connect(self._on_page_count_finished)
             self._pending[pending_key] = _PendingThumbnail(
                 worker,
                 normalized_priority,
@@ -421,7 +595,11 @@ class BrowserThumbnailProvider(QObject):
         generation: int,
     ) -> int:
         keep = {self._path_key(Path(path)) for path in paths}
-        size_token = size.cache_token if isinstance(size, ThumbnailRenderSpec) else int(size)
+        size_token = (
+            size.cache_token
+            if isinstance(size, ThumbnailRenderSpec)
+            else int(size)
+        )
         cancelled = 0
         with self._pending_lock:
             candidates = tuple(self._pending.items())
@@ -434,8 +612,44 @@ class BrowserThumbnailProvider(QObject):
                     or path_key in keep
                 ):
                     continue
-                pending.worker.cancelled.set()
                 if self._try_take(pending.worker):
+                    pending.worker.cancelled.set()
+                    self._pending.pop(key, None)
+                    cancelled += 1
+        return cancelled
+
+    def cancel_requests_except(
+        self,
+        paths: set[str],
+        *,
+        size: int | ThumbnailRenderSpec,
+        generation: int,
+    ) -> int:
+        """Drop queued work that moved outside the current viewport plan.
+
+        A worker that has already started is allowed to finish; at most the
+        bounded worker count can therefore remain outside the new plan.
+        """
+
+        keep = {self._path_key(Path(path)) for path in paths}
+        size_token = (
+            size.cache_token
+            if isinstance(size, ThumbnailRenderSpec)
+            else int(size)
+        )
+        cancelled = 0
+        with self._pending_lock:
+            candidates = tuple(self._pending.items())
+            for key, pending in candidates:
+                path_key, pending_size, pending_generation = key
+                if (
+                    pending_generation != generation
+                    or pending_size != size_token
+                    or path_key in keep
+                ):
+                    continue
+                if self._try_take(pending.worker):
+                    pending.worker.cancelled.set()
                     self._pending.pop(key, None)
                     cancelled += 1
         return cancelled
@@ -560,6 +774,7 @@ class BrowserThumbnailProvider(QObject):
 
     def clear_memory_cache(self) -> None:
         self._cache.clear()
+        self._cache_page_counts.clear()
         self._cache_specs.clear()
         self._preview_registry.shell_service.clear_memory_cache()
         with self._failure_lock:
@@ -631,6 +846,7 @@ class BrowserThumbnailProvider(QObject):
         pdfium_service=None,
         pdf_render_priority: int = int(PdfRenderPriority.THUMBNAIL_VISIBLE),
         smart_crop_cache: SmartCropCache | None = None,
+        page_count_callback: Callable[[int], None] | None = None,
     ) -> ThumbnailLoadResult:
         spec = (
             size
@@ -651,6 +867,7 @@ class BrowserThumbnailProvider(QObject):
                     item.path,
                     spec,
                     smart_crop_cache,
+                    page_count_callback,
                 )
             if item.kind == BrowserItemKind.ARCHIVE:
                 if item.path.suffix.lower() in EXTERNAL_ARCHIVE_EXTENSIONS:
@@ -660,11 +877,13 @@ class BrowserThumbnailProvider(QObject):
                         archive_backend_registry,
                         cancel_token,
                         smart_crop_cache,
+                        page_count_callback,
                     )
                 return BrowserThumbnailProvider._load_archive_result(
                     item.path,
                     spec,
                     smart_crop_cache,
+                    page_count_callback,
                 )
             if item.kind == BrowserItemKind.PDF and pdfium_service is not None:
                 from .pdf_image_source import PdfImageSource
@@ -734,6 +953,7 @@ class BrowserThumbnailProvider(QObject):
         cancel_token=None,
         thumbnail_priority: ThumbnailPriority = ThumbnailPriority.VISIBLE,
         provisional_callback: Callable[[QImage], None] | None = None,
+        page_count_callback: Callable[[int], None] | None = None,
     ) -> ThumbnailLoadResult:
         cache_token = size.cache_token if isinstance(size, ThumbnailRenderSpec) else int(size)
         failure_key = (self._path_key(item.path), cache_token, item.modified_at)
@@ -743,6 +963,14 @@ class BrowserThumbnailProvider(QObject):
             if item.kind is BrowserItemKind.OTHER
             else None
         )
+
+        def publish_page_count(page_count: int) -> None:
+            normalized = max(0, int(page_count))
+            if self._disk_cache_enabled and disk_cache is not None:
+                disk_cache.update_page_count(item, normalized)
+            if page_count_callback is not None:
+                page_count_callback(normalized)
+
         provisional: QImage | None = None
         if self._disk_cache_enabled and disk_cache is not None:
             disk_cache.set_enabled(True)
@@ -764,8 +992,16 @@ class BrowserThumbnailProvider(QObject):
                     cached_result = disk_cache.get_suitable(item, size)
                 if cached_result is not None:
                     self._increment_stat("disk_hit")
+                    if (
+                        cached_result.page_count is not None
+                        and page_count_callback is not None
+                    ):
+                        page_count_callback(cached_result.page_count)
                     if not cached_result.low_resolution_placeholder:
-                        return ThumbnailLoadResult(cached_result.image)
+                        return ThumbnailLoadResult(
+                            cached_result.image,
+                            page_count=cached_result.page_count,
+                        )
                     provisional = cached_result.image
                     if provisional_callback is not None:
                         provisional_callback(provisional.copy())
@@ -783,13 +1019,17 @@ class BrowserThumbnailProvider(QObject):
                     self._increment_stat("disk_hit")
                     return ThumbnailLoadResult(cached)
 
+        normalized_priority = ThumbnailPriority(thumbnail_priority)
         if (
-            ThumbnailPriority(thumbnail_priority) is ThumbnailPriority.PREFETCH
+            normalized_priority is ThumbnailPriority.PREFETCH
             and item.kind in {
                 BrowserItemKind.FOLDER,
                 BrowserItemKind.IMAGE,
                 BrowserItemKind.ARCHIVE,
             }
+        ) or (
+            normalized_priority is ThumbnailPriority.READ_AHEAD
+            and item.kind is not BrowserItemKind.IMAGE
         ):
             self._increment_stat("prefetch_skipped")
             return ThumbnailLoadResult(
@@ -843,6 +1083,7 @@ class BrowserThumbnailProvider(QObject):
                     self._pdfium_service,
                     self._pdf_render_priority(thumbnail_priority),
                     self._smart_crop_cache,
+                    publish_page_count,
                 )
         else:
             loaded = _invoke_thumbnail_loader(
@@ -873,6 +1114,7 @@ class BrowserThumbnailProvider(QObject):
                 result_kind=result.resolved_kind,
                 preview_source=result.preview_source,
                 persist_to_disk=False,
+                page_count=result.page_count,
             )
 
         self._increment_stat("generated")
@@ -881,6 +1123,7 @@ class BrowserThumbnailProvider(QObject):
             {
                 ThumbnailPriority.VISIBLE: "generated_visible",
                 ThumbnailPriority.SELECTED: "generated_selected",
+                ThumbnailPriority.READ_AHEAD: "generated_read_ahead",
                 ThumbnailPriority.PREFETCH: "generated_prefetch",
             }[normalized_priority]
         )
@@ -915,15 +1158,18 @@ class BrowserThumbnailProvider(QObject):
                 result.image,
                 cover_path=result.cover_path,
                 entry_path=result.entry_path,
+                page_count=result.page_count,
                 protected_thumbnail_sizes=self._protected_thumbnail_sizes(item),
             )
             if saved:
                 self._increment_stat("disk_saved")
-                self._increment_stat(
-                    "disk_saved_visible"
-                    if normalized_priority is ThumbnailPriority.VISIBLE
-                    else "disk_saved_selected"
-                )
+                saved_key = {
+                    ThumbnailPriority.VISIBLE: "disk_saved_visible",
+                    ThumbnailPriority.SELECTED: "disk_saved_selected",
+                    ThumbnailPriority.READ_AHEAD: "disk_saved_read_ahead",
+                }.get(normalized_priority)
+                if saved_key is not None:
+                    self._increment_stat(saved_key)
         else:
             self._increment_stat("memory_only")
         return ThumbnailLoadResult(
@@ -934,6 +1180,7 @@ class BrowserThumbnailProvider(QObject):
             result_kind=result.resolved_kind,
             preview_source=result.preview_source,
             persist_to_disk=result.persist_to_disk,
+            page_count=result.page_count,
         )
 
     @Slot(str, int, object, object, object)
@@ -954,12 +1201,106 @@ class BrowserThumbnailProvider(QObject):
             return
         self.thumbnail_provisional.emit(path, generation, image)
 
+    @Slot(str, int, int)
+    def _on_page_count_discovered(
+        self,
+        path: str,
+        generation: int,
+        page_count: int,
+    ) -> None:
+        if self._closed or generation != self._generation:
+            return
+        path_key = self._path_key(Path(path))
+        self._cancel_page_count_request(path_key, generation)
+        self.page_count_ready.emit(
+            path,
+            generation,
+            max(0, int(page_count)),
+        )
+
     def _run_initial_maintenance(self, disk_cache: ThumbnailDiskCache) -> None:
         with self._pending_lock:
             if self._maintenance_started:
                 return
             self._maintenance_started = True
         disk_cache.cleanup_if_due()
+
+    def _load_page_count_pipeline(
+        self,
+        item: BrowserItem,
+        _size: int,
+        cancel_token=None,
+        _thumbnail_priority: ThumbnailPriority = ThumbnailPriority.PREFETCH,
+    ) -> ThumbnailLoadResult:
+        disk_cache = self._disk_cache
+        if self._disk_cache_enabled and disk_cache is not None:
+            disk_cache.set_enabled(True)
+            self._run_initial_maintenance(disk_cache)
+            cached = disk_cache.get_page_count(item)
+            if cached is not None:
+                return ThumbnailLoadResult(
+                    None,
+                    result_kind=PreviewResultKind.NOT_APPLICABLE,
+                    persist_to_disk=False,
+                    page_count=cached,
+                )
+        try:
+            if self._is_cancelled(cancel_token):
+                raise InterruptedError
+            if item.kind is BrowserItemKind.FOLDER:
+                page_count = len(
+                    self._folder_image_candidates(item.path, cancel_token)
+                )
+            elif item.path.suffix.lower() in EXTERNAL_ARCHIVE_EXTENSIONS:
+                if self._archive_backend_registry is None:
+                    return ThumbnailLoadResult(
+                        None,
+                        result_kind=PreviewResultKind.UNAVAILABLE,
+                        persist_to_disk=False,
+                    )
+                backend = self._archive_backend_registry.backend_for_path(
+                    item.path
+                )
+                if backend is None:
+                    return ThumbnailLoadResult(
+                        None,
+                        result_kind=PreviewResultKind.UNAVAILABLE,
+                        persist_to_disk=False,
+                    )
+                source = SevenZipImageSource(
+                    item.path,
+                    backend=backend,
+                    cancel_token=cancel_token,
+                )
+                try:
+                    page_count = len(source.list_images())
+                finally:
+                    source.close()
+            else:
+                with zipfile.ZipFile(item.path, "r") as source:
+                    page_count = len(
+                        self._zip_image_names(source, cancel_token)
+                    )
+            if disk_cache is not None and self._disk_cache_enabled:
+                disk_cache.update_page_count(item, page_count)
+            return ThumbnailLoadResult(
+                None,
+                result_kind=PreviewResultKind.NOT_APPLICABLE,
+                persist_to_disk=False,
+                page_count=page_count,
+            )
+        except InterruptedError:
+            return ThumbnailLoadResult(
+                None,
+                result_kind=PreviewResultKind.CANCELLED,
+                persist_to_disk=False,
+            )
+        except (OSError, zipfile.BadZipFile):
+            return ThumbnailLoadResult(
+                None,
+                result_kind=PreviewResultKind.FAILED,
+                persist_to_disk=False,
+            )
 
     def _protected_thumbnail_sizes(self, item: BrowserItem) -> set[int]:
         path_key = self._path_key(item.path)
@@ -977,6 +1318,7 @@ class BrowserThumbnailProvider(QObject):
         return {
             ThumbnailPriority.VISIBLE: int(PdfRenderPriority.THUMBNAIL_VISIBLE),
             ThumbnailPriority.SELECTED: int(PdfRenderPriority.THUMBNAIL_SELECTED),
+            ThumbnailPriority.READ_AHEAD: int(PdfRenderPriority.THUMBNAIL_PREFETCH),
             ThumbnailPriority.PREFETCH: int(PdfRenderPriority.THUMBNAIL_PREFETCH),
         }[ThumbnailPriority(priority)]
 
@@ -1007,13 +1349,26 @@ class BrowserThumbnailProvider(QObject):
         provisional = loaded.provisional_image
         if provisional is not None and not provisional.isNull():
             self.thumbnail_provisional.emit(path, generation, provisional)
+        if (
+            loaded.page_count is not None
+            and (
+                pending is None
+                or not pending.worker.page_count_reported
+            )
+        ):
+            self._cancel_page_count_request(path_key, generation)
+            self.page_count_ready.emit(
+                path,
+                generation,
+                max(0, int(loaded.page_count)),
+            )
         kind = loaded.resolved_kind
         self.preview_state_changed.emit(path, generation, kind.value)
         image = loaded.image
         if image is None or image.isNull():
             if (
                 pending is not None
-                and pending.priority is not ThumbnailPriority.PREFETCH
+                and pending.priority >= ThumbnailPriority.SELECTED
                 and kind is PreviewResultKind.FAILED
             ):
                 self.thumbnail_failed.emit(
@@ -1023,14 +1378,77 @@ class BrowserThumbnailProvider(QObject):
                 )
             return
         self._cache[cache_key] = QImage(image)
+        if loaded.page_count is not None:
+            self._cache_page_counts[cache_key] = max(
+                0,
+                int(loaded.page_count),
+            )
         if pending is not None and isinstance(
             pending.worker.size, ThumbnailRenderSpec
         ):
             self._cache_specs[int(size_token)] = pending.worker.size
         self._cache.move_to_end(cache_key)
         while len(self._cache) > self._cache_capacity:
-            self._cache.popitem(last=False)
+            evicted_key, _evicted_image = self._cache.popitem(last=False)
+            self._cache_page_counts.pop(evicted_key, None)
         self.thumbnail_ready.emit(path, generation, image)
+
+    @Slot(str, int, object, object, object)
+    def _on_page_count_finished(
+        self,
+        path: str,
+        generation: int,
+        _size_token: int,
+        _modified_at: float | None,
+        result: ThumbnailLoadResult | QImage | None,
+    ) -> None:
+        path_key = self._path_key(Path(path))
+        pending_key = (
+            path_key,
+            _PAGE_COUNT_REQUEST_TOKEN,
+            generation,
+        )
+        with self._pending_lock:
+            pending = self._pending.pop(pending_key, None)
+        if self._closed:
+            self._release_retired_if_idle()
+            return
+        if generation != self._generation:
+            return
+        if pending is None or pending.worker.cancelled.is_set():
+            return
+        loaded = (
+            result
+            if isinstance(result, ThumbnailLoadResult)
+            else ThumbnailLoadResult(result)
+        )
+        if loaded.page_count is not None:
+            self.page_count_ready.emit(
+                path,
+                generation,
+                max(0, int(loaded.page_count)),
+            )
+
+    def _cancel_page_count_request(
+        self,
+        path_key: str,
+        generation: int,
+    ) -> bool:
+        pending_key = (
+            path_key,
+            _PAGE_COUNT_REQUEST_TOKEN,
+            generation,
+        )
+        with self._pending_lock:
+            pending = self._pending.get(pending_key)
+            if pending is None:
+                return False
+            if self._try_take(pending.worker):
+                pending.worker.cancelled.set()
+                self._pending.pop(pending_key, None)
+                return True
+            pending.worker.cancelled.set()
+            return False
 
     def _increment_stat(self, key: str, amount: int = 1) -> None:
         with self._stats_lock:
@@ -1041,15 +1459,20 @@ class BrowserThumbnailProvider(QObject):
         path_key: str,
         modified_at: float | None,
         requested: ThumbnailRenderSpec,
-    ) -> tuple[QImage, ThumbnailRenderSpec] | None:
-        candidates: list[tuple[QImage, ThumbnailRenderSpec]] = []
-        for (cached_path, token, cached_modified), image in self._cache.items():
+    ) -> tuple[QImage, ThumbnailRenderSpec, int | None] | None:
+        candidates: list[
+            tuple[QImage, ThumbnailRenderSpec, int | None]
+        ] = []
+        for cache_key, image in self._cache.items():
+            cached_path, token, cached_modified = cache_key
             if cached_path != path_key or cached_modified != modified_at:
                 continue
             spec = self._cache_specs.get(token)
             if spec is None or spec.family_token != requested.family_token:
                 continue
-            candidates.append((image, spec))
+            candidates.append(
+                (image, spec, self._cache_page_counts.get(cache_key))
+            )
         if not candidates:
             return None
         adequate = [
@@ -1060,6 +1483,19 @@ class BrowserThumbnailProvider(QObject):
         if adequate:
             return min(adequate, key=lambda candidate: candidate[1].long_edge)
         return max(candidates, key=lambda candidate: candidate[1].long_edge)
+
+    def _emit_memory_hit(
+        self,
+        path: str,
+        generation: int,
+        image: QImage,
+        page_count: int | None,
+    ) -> None:
+        if self._closed or generation != self._generation:
+            return
+        if page_count is not None:
+            self.page_count_ready.emit(path, generation, page_count)
+        self.thumbnail_ready.emit(path, generation, image)
 
     @Slot(str, int, object, object, object)
     def _on_cache_clear_finished(
@@ -1109,19 +1545,54 @@ class BrowserThumbnailProvider(QObject):
         return BrowserThumbnailProvider._load_folder_result(folder, spec).image
 
     @staticmethod
+    def _folder_image_candidates(
+        folder: Path,
+        cancel_token=None,
+    ) -> list[Path]:
+        candidates: list[Path] = []
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if BrowserThumbnailProvider._is_cancelled(cancel_token):
+                    raise InterruptedError
+                if (
+                    Path(entry.name).suffix.lower()
+                    not in BROWSER_IMAGE_EXTENSIONS
+                ):
+                    continue
+                try:
+                    if entry.is_file(follow_symlinks=True):
+                        candidates.append(Path(entry.path))
+                except OSError:
+                    continue
+        return natsorted(candidates, key=lambda path: path.name)
+
+    @staticmethod
+    def _zip_image_names(
+        source: zipfile.ZipFile,
+        cancel_token=None,
+    ) -> list[str]:
+        names: list[str] = []
+        for info in source.infolist():
+            if BrowserThumbnailProvider._is_cancelled(cancel_token):
+                raise InterruptedError
+            if (
+                not info.is_dir()
+                and Path(info.filename).suffix.lower()
+                in BROWSER_IMAGE_EXTENSIONS
+            ):
+                names.append(info.filename)
+        return natsorted(names)
+
+    @staticmethod
     def _load_folder_result(
         folder: Path,
         spec: ThumbnailRenderSpec,
         smart_crop_cache: SmartCropCache | None = None,
+        page_count_callback: Callable[[int], None] | None = None,
     ) -> ThumbnailLoadResult:
         try:
-            candidates = natsorted(
-                (
-                    path
-                    for path in folder.iterdir()
-                    if path.is_file() and path.suffix.lower() in BROWSER_IMAGE_EXTENSIONS
-                ),
-                key=lambda path: path.name,
+            candidates = BrowserThumbnailProvider._folder_image_candidates(
+                folder
             )
         except OSError:
             return ThumbnailLoadResult(
@@ -1129,6 +1600,8 @@ class BrowserThumbnailProvider(QObject):
                 result_kind=PreviewResultKind.FAILED,
                 persist_to_disk=False,
             )
+        if page_count_callback is not None:
+            page_count_callback(len(candidates))
         for path in candidates:
             image = BrowserThumbnailProvider._load_image_path(
                 path,
@@ -1136,11 +1609,16 @@ class BrowserThumbnailProvider(QObject):
                 smart_crop_cache,
             )
             if image is not None:
-                return ThumbnailLoadResult(image, path)
+                return ThumbnailLoadResult(
+                    image,
+                    path,
+                    page_count=len(candidates),
+                )
         return ThumbnailLoadResult(
             None,
             result_kind=PreviewResultKind.NO_CONTENT,
             persist_to_disk=False,
+            page_count=len(candidates),
         )
 
     @staticmethod
@@ -1160,18 +1638,16 @@ class BrowserThumbnailProvider(QObject):
         archive: Path,
         spec: ThumbnailRenderSpec,
         smart_crop_cache: SmartCropCache | None = None,
+        page_count_callback: Callable[[int], None] | None = None,
     ) -> ThumbnailLoadResult:
         try:
             stat = archive.stat()
             with zipfile.ZipFile(archive, "r") as source:
-                names = natsorted(
-                    (
-                        info.filename
-                        for info in source.infolist()
-                        if not info.is_dir()
-                        and Path(info.filename).suffix.lower() in BROWSER_IMAGE_EXTENSIONS
-                    )
+                names = BrowserThumbnailProvider._zip_image_names(
+                    source
                 )
+                if page_count_callback is not None:
+                    page_count_callback(len(names))
                 for name in names:
                     try:
                         with source.open(name, "r") as file:
@@ -1190,7 +1666,11 @@ class BrowserThumbnailProvider(QObject):
                                 ),
                             )
                         if qimage is not None:
-                            return ThumbnailLoadResult(qimage, entry_path=name)
+                            return ThumbnailLoadResult(
+                                qimage,
+                                entry_path=name,
+                                page_count=len(names),
+                            )
                     except Exception:
                         continue
         except (OSError, zipfile.BadZipFile):
@@ -1203,6 +1683,7 @@ class BrowserThumbnailProvider(QObject):
             None,
             result_kind=PreviewResultKind.NO_CONTENT,
             persist_to_disk=False,
+            page_count=len(names),
         )
 
     @staticmethod
@@ -1228,6 +1709,7 @@ class BrowserThumbnailProvider(QObject):
         archive_backend_registry,
         cancel_token,
         smart_crop_cache: SmartCropCache | None = None,
+        page_count_callback: Callable[[int], None] | None = None,
     ) -> ThumbnailLoadResult:
         if archive_backend_registry is None:
             return ThumbnailLoadResult(
@@ -1249,7 +1731,10 @@ class BrowserThumbnailProvider(QObject):
                 backend=backend,
                 cancel_token=cancel_token,
             )
-            first = source.list_images()[0]
+            images = source.list_images()
+            if page_count_callback is not None:
+                page_count_callback(len(images))
+            first = images[0]
             with source.open_image(first) as image:
                 stat = archive.stat()
                 rendered, _crop = BrowserThumbnailProvider._render_image(
@@ -1264,12 +1749,17 @@ class BrowserThumbnailProvider(QObject):
                         ratio_id=spec.frame_ratio_id,
                     ),
                 )
-                return ThumbnailLoadResult(rendered, entry_path=first)
+                return ThumbnailLoadResult(
+                    rendered,
+                    entry_path=first,
+                    page_count=len(images),
+                )
         except IndexError:
             return ThumbnailLoadResult(
                 None,
                 result_kind=PreviewResultKind.NO_CONTENT,
                 persist_to_disk=False,
+                page_count=0,
             )
         except Exception:
             cancelled = bool(
@@ -1340,6 +1830,13 @@ class BrowserThumbnailProvider(QObject):
             os.path.abspath(os.path.normpath(os.fspath(path)))
         ).casefold()
 
+    @staticmethod
+    def _is_cancelled(cancel_token) -> bool:
+        return bool(
+            cancel_token is not None
+            and getattr(cancel_token, "is_set", lambda: False)()
+        )
+
     def _try_take(self, worker: _ThumbnailWorker) -> bool:
         if self._coordinator is not None:
             return self._coordinator.try_take_browser(worker)
@@ -1360,6 +1857,7 @@ class BrowserThumbnailProvider(QObject):
             mapped = {
                 ThumbnailPriority.VISIBLE: ImageWorkPriority.BROWSER_VISIBLE,
                 ThumbnailPriority.SELECTED: ImageWorkPriority.BROWSER_SELECTED,
+                ThumbnailPriority.READ_AHEAD: ImageWorkPriority.BROWSER_READ_AHEAD,
                 ThumbnailPriority.PREFETCH: ImageWorkPriority.BROWSER_PREFETCH,
             }[normalized]
             return self._coordinator.start_browser(worker, mapped)
@@ -1391,6 +1889,7 @@ def _invoke_thumbnail_loader(
     cancel_token,
     thumbnail_priority: ThumbnailPriority = ThumbnailPriority.VISIBLE,
     provisional_callback: Callable[[QImage], None] | None = None,
+    page_count_callback: Callable[[int], None] | None = None,
 ):
     try:
         signature = inspect.signature(loader)
@@ -1414,6 +1913,7 @@ def _invoke_thumbnail_loader(
             )
         )
         accepts_provisional = "provisional_callback" in signature.parameters
+        accepts_page_count = "page_count_callback" in signature.parameters
         accepts_cancel = (
             "cancel_token" in signature.parameters
             or positional_count >= 3
@@ -1426,6 +1926,16 @@ def _invoke_thumbnail_loader(
         accepts_cancel = False
         accepts_priority = False
         accepts_provisional = False
+        accepts_page_count = False
+    if accepts_provisional and accepts_page_count:
+        return loader(
+            item,
+            size,
+            cancel_token,
+            thumbnail_priority,
+            provisional_callback=provisional_callback,
+            page_count_callback=page_count_callback,
+        )
     if accepts_provisional:
         return loader(
             item,

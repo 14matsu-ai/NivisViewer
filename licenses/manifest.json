@@ -3,35 +3,35 @@
   "runtime": [
     {
       "name": "PySide6",
-      "version": "6.11.1",
+      "version": "6.11.2",
       "files": [
         "LicenseRef-Qt-Commercial.txt"
       ]
     },
     {
       "name": "PySide6_Addons",
-      "version": "6.11.1",
+      "version": "6.11.2",
       "files": [
         "LicenseRef-Qt-Commercial.txt"
       ]
     },
     {
       "name": "PySide6_Essentials",
-      "version": "6.11.1",
+      "version": "6.11.2",
       "files": [
         "LicenseRef-Qt-Commercial.txt"
       ]
     },
     {
       "name": "shiboken6",
-      "version": "6.11.1",
+      "version": "6.11.2",
       "files": [
         "LicenseRef-Qt-Commercial.txt"
       ]
     },
     {
       "name": "Pillow",
-      "version": "12.1.1",
+      "version": "12.3.0",
       "files": [
         "LICENSE"
       ]
@@ -45,7 +45,7 @@
     },
     {
       "name": "pypdfium2",
-      "version": "5.12.1",
+      "version": "5.13.0",
       "files": [
         "LICENSES__Apache-2.0.txt",
         "LICENSES__BSD-3-Clause.txt",
@@ -72,16 +72,16 @@
   "build_tools": [
     {
       "name": "PyInstaller",
-      "version": "6.20.0",
+      "version": "6.22.2",
       "files": [
         "COPYING.txt"
       ]
     }
   ],
   "warnings": [
-    "PySide6 6.11.1: only a commercial license reference was present; public-distribution terms require manual collection",
-    "PySide6_Addons 6.11.1: only a commercial license reference was present; public-distribution terms require manual collection",
-    "PySide6_Essentials 6.11.1: only a commercial license reference was present; public-distribution terms require manual collection",
-    "shiboken6 6.11.1: only a commercial license reference was present; public-distribution terms require manual collection"
+    "PySide6 6.11.2: only a commercial license reference was present; public-distribution terms require manual collection",
+    "PySide6_Addons 6.11.2: only a commercial license reference was present; public-distribution terms require manual collection",
+    "PySide6_Essentials 6.11.2: only a commercial license reference was present; public-distribution terms require manual collection",
+    "shiboken6 6.11.2: only a commercial license reference was present; public-distribution terms require manual collection"
   ]
 }

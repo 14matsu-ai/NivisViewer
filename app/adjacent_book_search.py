@@ -44,6 +44,7 @@ class AdjacentBookSnapshotEntry:
     natural_sort_identity: str
     modified_time_ns: int | None = None
     file_size: int | None = None
+    openable_by_nivisviewer: bool = True
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,43 @@ class AdjacentBookBrowserSnapshot:
     parent_folder: str
     scan_generation: int
     entries: tuple[AdjacentBookSnapshotEntry, ...]
+    sort_identity: str = "name:ascending"
+    filter_identity: str = "browser-visible-items"
+
+    @property
+    def viewer_paths(self) -> tuple[str, ...]:
+        """Return Viewer-openable files in the captured visible order."""
+
+        return tuple(
+            lexical_absolute(entry.absolute_path)
+            for entry in self.entries
+            if entry.openable_by_nivisviewer
+            and entry.item_kind
+            not in {BrowserItemKind.FOLDER.value, BrowserItemKind.OTHER.value}
+        )
+
+    def adjacent_viewer_path(
+        self,
+        current_path: str | Path,
+        direction: int,
+        *,
+        loop: bool = False,
+    ) -> tuple[AdjacentBookSearchStatus, str | None]:
+        """Select a neighbor without scanning or rebuilding Browser order."""
+
+        paths = self.viewer_paths
+        keys = tuple(path_key(path) for path in paths)
+        try:
+            current_index = keys.index(path_key(current_path))
+        except ValueError:
+            return AdjacentBookSearchStatus.UNAVAILABLE, None
+        next_index = current_index + (-1 if direction < 0 else 1)
+        if not 0 <= next_index < len(paths):
+            if loop and paths:
+                next_index %= len(paths)
+            else:
+                return AdjacentBookSearchStatus.BOUNDARY, None
+        return AdjacentBookSearchStatus.FOUND, paths[next_index]
 
 
 @dataclass(frozen=True)

@@ -100,7 +100,6 @@ from .browser_scanner import (
     BrowserScanStatus,
 )
 from .browser_sort import (
-    BROWSER_DISPLAY_DENSITY_LABELS,
     BROWSER_SORT_KEY_LABELS,
     BROWSER_SORT_ORDER_LABELS,
     BrowserDisplayDensity,
@@ -188,6 +187,15 @@ CloseAffectedViewersHandler = Callable[[tuple[object, ...]], bool | None]
 FolderNavigationHandler = Callable[[object, int], str]
 _THUMBNAIL_LOG = logging.getLogger("nivisviewer.thumbnail")
 _FILE_OPERATION_LOG = logging.getLogger("nivisviewer.file_operation")
+BROWSER_NAVIGATION_TOOLBAR_MIN_HEIGHT = 27
+BROWSER_NAVIGATION_TOOLBAR_MARGINS = (1, 0, 1, 0)
+BROWSER_NAVIGATION_BUTTON_SIZE = 26
+BROWSER_NAVIGATION_ICON_SIZE = 20
+BROWSER_CHROME_CONTROL_HEIGHT = 24
+BROWSER_CHROME_CONTROL_SPACING = 2
+BROWSER_STATUS_BAR_SPACING = 3
+BROWSER_STATUS_DETAIL_SPACING = 14
+BROWSER_STATUS_BAR_MIN_IDLE_HEIGHT = 22
 
 
 @dataclass(frozen=True)
@@ -465,6 +473,13 @@ class BrowserWindow(QMainWindow):
         )
         if preview_state_changed is not None:
             preview_state_changed.connect(self._on_preview_state_changed)
+        page_count_ready = getattr(
+            self.thumbnail_provider,
+            "page_count_ready",
+            None,
+        )
+        if page_count_ready is not None:
+            page_count_ready.connect(self._on_page_count_ready)
         resumed = getattr(self.thumbnail_provider, "scheduling_resumed", None)
         if resumed is not None:
             resumed.connect(self._schedule_thumbnail_requests)
@@ -497,6 +512,7 @@ class BrowserWindow(QMainWindow):
         self._pressed_extra_buttons: set[Qt.MouseButton] = set()
         self._shutdown_prepared = False
         self._fast_scrolling = False
+        self._thumbnail_scroll_direction = 1
         self._last_scroll_value = 0
         self._last_scroll_time = 0.0
         self._file_operation_request_id = 0
@@ -563,6 +579,12 @@ class BrowserWindow(QMainWindow):
         )
         self.browser_folder_fallback_background = str(
             self.settings.get("browser_folder_fallback_background", "auto")
+        )
+        self.browser_wheel_scroll_mode = str(
+            self.settings.get("browser_wheel_scroll_mode", "system")
+        )
+        self.browser_wheel_scroll_custom_rows = int(
+            self.settings.get("browser_wheel_scroll_custom_rows", 3)
         )
         self.thumbnail_quality_mode = str(
             self.settings.get("thumbnail_quality_mode", "auto")
@@ -683,6 +705,7 @@ class BrowserWindow(QMainWindow):
         self._rating_batch: _RatingRenameBatch | None = None
         self._detail_generation = 0
         self._detail_request_identity: tuple[int, str] | None = None
+        self._page_count_request_identity: tuple[int, str] | None = None
 
         self.rating_rename_service = RatingRenameService()
         self.image_detail_probe = BrowserImageDetailProbe(self)
@@ -720,7 +743,6 @@ class BrowserWindow(QMainWindow):
         self._scan_batch_timer.setSingleShot(True)
         self._scan_batch_timer.setInterval(120)
         self._scan_batch_timer.timeout.connect(self._flush_pending_scan_batch)
-
         self._build_ui()
         QTimer.singleShot(1000, self, self._run_idle_cache_cleanup)
         self.config.settings_changed.connect(self.apply_settings)
@@ -739,7 +761,6 @@ class BrowserWindow(QMainWindow):
         """Return committed model data without querying the filesystem."""
         if (
             self.current_path is None
-            or self._pending_scan is not None
             or adjacent_path_key(self.current_path)
             != adjacent_path_key(parent_path)
         ):
@@ -755,8 +776,22 @@ class BrowserWindow(QMainWindow):
                     natural_sort_identity=item.display_name.casefold(),
                     modified_time_ns=item.modified_time_ns,
                     file_size=item.file_size,
+                    openable_by_nivisviewer=item.openable_by_nivisviewer,
                 )
-                for item in self.items
+                for item in self._visible_order_snapshot_items()
+            ),
+            sort_identity=(
+                f"{self.browser_sort_key.value}:"
+                f"{self.browser_sort_order.value}:"
+                f"folders_first={int(self.browser_folders_first)}"
+            ),
+            filter_identity=(
+                f"hidden={int(self.browser_show_hidden_items)}:"
+                f"unsupported={int(self.browser_show_unsupported_files)}:"
+                f"system={int(self.browser_show_system_items)}:"
+                f"search={self.browser_filter_state.search_text.casefold()!r}:"
+                f"rating={self.browser_filter_state.rating_mode.value}:"
+                f"reference={self.browser_filter_state.rating_reference}"
             ),
         )
 
@@ -947,6 +982,7 @@ class BrowserWindow(QMainWindow):
         if pending.refresh:
             state = self._capture_list_view_state()
             pending.refresh_entries.clear()
+            items = self.item_model.reuse_known_page_counts(items)
             if tuple(items) != self.item_model.source_items:
                 self._generation = self.thumbnail_provider.begin_generation()
                 self.item_model.set_sorted_items(
@@ -1044,6 +1080,7 @@ class BrowserWindow(QMainWindow):
         self.current_path = pending.path
         self.config.set("last_browser_path", str(pending.path))
         self._generation = self.thumbnail_provider.begin_generation()
+        self._thumbnail_scroll_direction = 1
         self.list_view.clearSelection()
         self.list_view.setCurrentIndex(QModelIndex())
         if pending.record_history:
@@ -1599,6 +1636,11 @@ class BrowserWindow(QMainWindow):
                 str(item.path),
                 open_in_new_window,
                 self._folder_snapshot_for_item(item),
+                (
+                    self.adjacent_book_snapshot(self.current_path)
+                    if self.current_path is not None
+                    else None
+                ),
             )
 
     def _open_system_file(self, path: str | Path) -> bool:
@@ -1660,18 +1702,8 @@ class BrowserWindow(QMainWindow):
             or self.current_path is None
         ):
             return None
-        candidates = self.item_model.source_items
-        pending = self._pending_scan
-        if (
-            pending is not None
-            and pending.committed
-            and self._same_path(pending.path, self.current_path)
-            and pending.remaining_items
-        ):
-            candidates += pending.remaining_items[
-                pending.remaining_item_offset :
-            ]
-        candidates = self.item_model.visible_items(candidates)
+        candidates = self._visible_order_snapshot_items()
+
         image_ids = tuple(
             str(candidate.path)
             for candidate in candidates
@@ -1710,6 +1742,22 @@ class BrowserWindow(QMainWindow):
             ),
         )
 
+    def _visible_order_snapshot_items(self) -> tuple[BrowserItem, ...]:
+        """Freeze the existing source/filter/sort pipeline without rescanning."""
+
+        candidates = self.item_model.source_items
+        pending = self._pending_scan
+        if (
+            pending is not None
+            and pending.committed
+            and self._same_path(pending.path, self.current_path)
+            and pending.remaining_items
+        ):
+            candidates += pending.remaining_items[
+                pending.remaining_item_offset :
+            ]
+        return self.item_model.visible_items(candidates)
+
     def _folder_snapshot_for_path(
         self,
         path: str | Path,
@@ -1729,6 +1777,7 @@ class BrowserWindow(QMainWindow):
         path: str,
         open_in_new_window: bool,
         folder_snapshot: FolderListingSnapshot | None = None,
+        browser_snapshot: AdjacentBookBrowserSnapshot | None = None,
         *,
         use_browser_order: bool = True,
     ) -> object | None:
@@ -1742,16 +1791,38 @@ class BrowserWindow(QMainWindow):
             # dropped from outside explicitly opt out below and keep direct-
             # open semantics.
             folder_snapshot = self._folder_snapshot_for_path(path)
+        if (
+            browser_snapshot is None
+            and use_browser_order
+            and self.current_path is not None
+        ):
+            browser_snapshot = self.adjacent_book_snapshot(self.current_path)
         try:
             import inspect
 
             signature = inspect.signature(handler)
+            accepts_browser_snapshot = (
+                "browser_snapshot" in signature.parameters
+                or len(signature.parameters) >= 4
+                or any(
+                    parameter.kind is inspect.Parameter.VAR_POSITIONAL
+                    for parameter in signature.parameters.values()
+                )
+            )
             accepts_snapshot = len(signature.parameters) >= 3 or any(
                 parameter.kind is inspect.Parameter.VAR_POSITIONAL
                 for parameter in signature.parameters.values()
             )
         except (TypeError, ValueError):
+            accepts_browser_snapshot = False
             accepts_snapshot = False
+        if accepts_browser_snapshot:
+            return handler(
+                path,
+                open_in_new_window,
+                folder_snapshot,
+                browser_snapshot,
+            )
         if accepts_snapshot:
             return handler(path, open_in_new_window, folder_snapshot)
         return handler(path, open_in_new_window)
@@ -2247,7 +2318,7 @@ class BrowserWindow(QMainWindow):
             empty = favorite_menu.addAction("（お気に入りなし）")
             empty.setEnabled(False)
         for entry in favorite_entries:
-            action = favorite_menu.addAction(entry.display_name)
+            action = favorite_menu.addAction(entry.label)
             action.setToolTip(entry.path)
             action.triggered.connect(
                 lambda _checked=False, path=entry.path, kind=operation: (
@@ -2320,6 +2391,7 @@ class BrowserWindow(QMainWindow):
     def _on_file_operation_started(self, request: FileOperationRequest) -> None:
         if self._shutdown_prepared:
             return
+        self.statusBar().setMaximumHeight(16777215)
         self._active_file_operation_id = request.request_id
         self.cancel_operation_button.setVisible(
             self.file_operation_coordinator.queue is None
@@ -2370,6 +2442,11 @@ class BrowserWindow(QMainWindow):
         self._active_file_operation_id = None
         self.cancel_operation_button.setEnabled(False)
         self.cancel_operation_button.setVisible(False)
+        QTimer.singleShot(
+            3200 if self.file_operation_coordinator.queue is not None else 0,
+            self,
+            self._compact_status_bar_if_idle,
+        )
         self._update_file_action_states()
 
         if result.operation in {FileOperationKind.RENAME, FileOperationKind.MOVE}:
@@ -3002,6 +3079,29 @@ class BrowserWindow(QMainWindow):
             self.thumbnail_provider.cleanup_caches_async(force=False)
 
     def apply_settings(self, changed: dict[str, object]) -> None:
+        wheel_settings_changed = bool(
+            {
+                "browser_wheel_scroll_mode",
+                "browser_wheel_scroll_custom_rows",
+            }.intersection(changed)
+        )
+        if wheel_settings_changed:
+            self.browser_wheel_scroll_mode = str(
+                changed.get(
+                    "browser_wheel_scroll_mode",
+                    self.browser_wheel_scroll_mode,
+                )
+            )
+            self.browser_wheel_scroll_custom_rows = int(
+                changed.get(
+                    "browser_wheel_scroll_custom_rows",
+                    self.browser_wheel_scroll_custom_rows,
+                )
+            )
+            self.list_view.set_wheel_scroll_policy(
+                self.browser_wheel_scroll_mode,
+                self.browser_wheel_scroll_custom_rows,
+            )
         if "browser_folder_fallback_background" in changed:
             self.browser_folder_fallback_background = str(
                 changed["browser_folder_fallback_background"]
@@ -3922,6 +4022,24 @@ class BrowserWindow(QMainWindow):
             return f"{int(value)} B"
         return f"{value:.1f} {unit}"
 
+    def _set_selected_metadata(
+        self,
+        size_text: str = "",
+        secondary_text: str = "",
+    ) -> None:
+        self.file_size_label.setText(size_text)
+        self.file_detail_label.setText(secondary_text)
+
+    def _compact_status_bar_if_idle(self) -> None:
+        if self._shutdown_prepared or self._active_file_operation_id is not None:
+            return
+        status_bar = self.statusBar()
+        idle_height = max(
+            BROWSER_STATUS_BAR_MIN_IDLE_HEIGHT,
+            status_bar.fontMetrics().height() + 6,
+        )
+        status_bar.setMaximumHeight(idle_height)
+
     def _update_selected_detail(self) -> None:
         if not hasattr(self, "file_detail_label"):
             return
@@ -3930,30 +4048,128 @@ class BrowserWindow(QMainWindow):
         indexes = self.list_view.selectionModel().selectedIndexes()
         if len(indexes) != 1:
             self._detail_request_identity = None
-            self.file_detail_label.clear()
+            self._page_count_request_identity = None
+            self._cancel_obsolete_page_count_requests(None)
+            self._set_selected_metadata()
             return
         item = self.item_model.item_at(indexes[0])
-        if item is None or item.kind is BrowserItemKind.FOLDER:
+        if item is None:
             self._detail_request_identity = None
-            self.file_detail_label.clear()
+            self._page_count_request_identity = None
+            self._cancel_obsolete_page_count_requests(None)
+            self._set_selected_metadata()
             return
         size_text = self._format_file_size(item.file_size)
+        if item.kind in {
+            BrowserItemKind.FOLDER,
+            BrowserItemKind.ARCHIVE,
+        }:
+            self._detail_request_identity = None
+            count_text = (
+                "—" if item.page_count is None else str(item.page_count)
+            )
+            self._set_selected_metadata(
+                size_text,
+                f"{count_text} ページ",
+            )
+            if item.page_count is None:
+                self._page_count_request_identity = (
+                    generation,
+                    self._path_key(item.path),
+                )
+                self._cancel_obsolete_page_count_requests(item.path)
+                self._request_selected_page_count()
+            else:
+                self._page_count_request_identity = None
+                self._cancel_obsolete_page_count_requests(None)
+            return
+        self._page_count_request_identity = None
+        self._cancel_obsolete_page_count_requests(None)
         if item.kind is not BrowserItemKind.IMAGE:
             self._detail_request_identity = None
-            self.file_detail_label.setText(size_text)
+            self._set_selected_metadata(size_text)
             return
         path = str(item.path)
         dimensions = self.item_model.image_dimensions(path)
         if dimensions is not None:
             self._detail_request_identity = None
-            self.file_detail_label.setText(
-                f"{size_text}    {dimensions[0]} × {dimensions[1]}"
+            self._set_selected_metadata(
+                size_text,
+                f"{dimensions[0]} × {dimensions[1]}",
             )
             return
-        self.file_detail_label.setText(f"{size_text}    —")
+        self._set_selected_metadata(size_text, "—")
         identity = (generation, self._path_key(path))
         self._detail_request_identity = identity
         self.image_detail_probe.request(path, generation)
+
+    def _cancel_obsolete_page_count_requests(
+        self,
+        keep_path: str | Path | None,
+    ) -> None:
+        cancel = getattr(
+            self.thumbnail_provider,
+            "cancel_page_count_requests_except",
+            None,
+        )
+        if callable(cancel):
+            cancel(keep_path, generation=self._generation)
+
+    def _request_selected_page_count(self) -> None:
+        identity = self._page_count_request_identity
+        if identity is None or identity[0] != self._detail_generation:
+            return
+        indexes = self.list_view.selectionModel().selectedIndexes()
+        if len(indexes) != 1:
+            return
+        item = self.item_model.item_at(indexes[0])
+        if (
+            item is None
+            or self._path_key(item.path) != identity[1]
+            or item.page_count is not None
+        ):
+            return
+        request = getattr(
+            self.thumbnail_provider,
+            "request_page_count",
+            None,
+        )
+        if request is not None:
+            request(
+                item,
+                generation=self._generation,
+                priority=ThumbnailPriority.SELECTED,
+            )
+
+    def _on_page_count_ready(
+        self,
+        path: str,
+        generation: int,
+        page_count: int,
+    ) -> None:
+        if self._shutdown_prepared or generation != self._generation:
+            return
+        path_key = self._path_key(path)
+        self.item_model.set_page_count(path, page_count)
+        indexes = self.list_view.selectionModel().selectedIndexes()
+        if len(indexes) != 1:
+            return
+        item = self.item_model.item_at(indexes[0])
+        if (
+            item is None
+            or self._path_key(item.path) != path_key
+            or item.kind
+            not in {BrowserItemKind.FOLDER, BrowserItemKind.ARCHIVE}
+        ):
+            return
+        identity = self._page_count_request_identity
+        if identity is not None and identity[1] != path_key:
+            return
+        self._page_count_request_identity = None
+        self._set_selected_metadata(
+            self._format_file_size(item.file_size),
+            f"{max(0, int(page_count))} ページ",
+        )
 
     def _on_image_detail_completed(
         self,
@@ -3973,11 +4189,12 @@ class BrowserWindow(QMainWindow):
         self._detail_request_identity = None
         size_text = self._format_file_size(item.file_size)
         if result.dimensions is None:
-            self.file_detail_label.setText(f"{size_text}    —")
+            self._set_selected_metadata(size_text, "—")
             return
         self.item_model.set_image_dimensions(item.path, result.dimensions)
-        self.file_detail_label.setText(
-            f"{size_text}    {result.dimensions[0]} × {result.dimensions[1]}"
+        self._set_selected_metadata(
+            size_text,
+            f"{result.dimensions[0]} × {result.dimensions[1]}",
         )
 
     def _on_list_hovered(self, index: QModelIndex) -> None:
@@ -4202,6 +4419,12 @@ class BrowserWindow(QMainWindow):
         self._schedule_thumbnail_requests()
 
     def _build_ui(self) -> None:
+        # Keep only the top-level menu row compact. Popup QMenu geometry and
+        # application fonts remain owned by the active platform style.
+        self.menuBar().setStyleSheet(
+            "QMenuBar { padding: 0px; spacing: 0px; }"
+            "QMenuBar::item { padding: 4px 6px; margin: 0px; }"
+        )
         self.file_system_model = QFileSystemModel(self)
         self.file_system_model.setFilter(
             QDir.Filter.AllDirs | QDir.Filter.NoDotAndDotDot | QDir.Filter.Drives
@@ -4364,6 +4587,10 @@ class BrowserWindow(QMainWindow):
         self.list_view.setVerticalScrollMode(
             QListView.ScrollMode.ScrollPerPixel
         )
+        self.list_view.set_wheel_scroll_policy(
+            self.browser_wheel_scroll_mode,
+            self.browser_wheel_scroll_custom_rows,
+        )
         self.list_view.setSelectionMode(QListView.SelectionMode.ExtendedSelection)
         self.list_view.setUniformItemSizes(True)
         self.list_view.setMouseTracking(True)
@@ -4405,8 +4632,15 @@ class BrowserWindow(QMainWindow):
         self.navigation_toolbar = QToolBar("ナビゲーション", self)
         self.navigation_toolbar.setObjectName("browser_navigation_toolbar")
         self.navigation_toolbar.setMovable(False)
-        self.navigation_toolbar.setIconSize(QSize(24, 24))
-        self.navigation_toolbar.setMinimumHeight(36)
+        self.navigation_toolbar.setIconSize(
+            QSize(BROWSER_NAVIGATION_ICON_SIZE, BROWSER_NAVIGATION_ICON_SIZE)
+        )
+        self.navigation_toolbar.setFixedHeight(
+            BROWSER_NAVIGATION_TOOLBAR_MIN_HEIGHT
+        )
+        self.navigation_toolbar.layout().setContentsMargins(
+            *BROWSER_NAVIGATION_TOOLBAR_MARGINS
+        )
 
         self.back_action = QAction(
             style.standardIcon(QStyle.StandardPixmap.SP_ArrowBack),
@@ -4463,6 +4697,7 @@ class BrowserWindow(QMainWindow):
         self.up_action.setShortcut(QKeySequence("Alt+Up"))
         self.up_action.triggered.connect(self.go_up)
         self.navigation_toolbar.addAction(self.up_action)
+        self.up_button = self.navigation_toolbar.widgetForAction(self.up_action)
 
         self.refresh_action = QAction(
             style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload),
@@ -4473,7 +4708,25 @@ class BrowserWindow(QMainWindow):
         self.refresh_action.setShortcut(QKeySequence("F5"))
         self.refresh_action.triggered.connect(self.refresh_current_folder)
         self.navigation_toolbar.addAction(self.refresh_action)
+        self.refresh_button = self.navigation_toolbar.widgetForAction(
+            self.refresh_action
+        )
         self.navigation_toolbar.addSeparator()
+
+        for button in (
+            self.back_button,
+            self.forward_button,
+            self.up_button,
+            self.refresh_button,
+        ):
+            if button is not None:
+                button.setStyleSheet(
+                    "QToolButton { padding: 0px; margin: 0px; }"
+                )
+                button.setFixedSize(
+                    BROWSER_NAVIGATION_BUTTON_SIZE,
+                    BROWSER_NAVIGATION_BUTTON_SIZE,
+                )
 
         self.browser_toolbar_content = QWidget(self.navigation_toolbar)
         self.browser_toolbar_content.setObjectName("browser_toolbar_content")
@@ -4482,8 +4735,8 @@ class BrowserWindow(QMainWindow):
             QSizePolicy.Policy.Preferred,
         )
         browser_toolbar_layout = QHBoxLayout(self.browser_toolbar_content)
-        browser_toolbar_layout.setContentsMargins(0, 0, 2, 0)
-        browser_toolbar_layout.setSpacing(4)
+        browser_toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        browser_toolbar_layout.setSpacing(BROWSER_CHROME_CONTROL_SPACING)
 
         self.browser_location_control = _BrowserDropDownShell(
             self.browser_toolbar_content
@@ -4494,6 +4747,9 @@ class BrowserWindow(QMainWindow):
             QSizePolicy.Policy.Preferred,
         )
         self.browser_location_control.setMinimumWidth(60)
+        self.browser_location_control.setFixedHeight(
+            BROWSER_CHROME_CONTROL_HEIGHT
+        )
 
         self.location_stack = QStackedWidget(self.browser_location_control)
         self.location_stack.setObjectName("browser_location_stack")
@@ -4541,12 +4797,15 @@ class BrowserWindow(QMainWindow):
             QSizePolicy.Policy.Preferred,
         )
         browser_sort_layout = QHBoxLayout(self.browser_sort_row)
-        browser_sort_layout.setContentsMargins(2, 0, 2, 0)
-        browser_sort_layout.setSpacing(4)
+        browser_sort_layout.setContentsMargins(1, 0, 0, 0)
+        browser_sort_layout.setSpacing(BROWSER_CHROME_CONTROL_SPACING)
 
         self.browser_sort_key_combo = QComboBox(self.browser_sort_row)
         self.browser_sort_key_combo.setObjectName("browser_sort_key_combo")
         self.browser_sort_key_combo.setToolTip("一覧の並び替え基準")
+        self.browser_sort_key_combo.setFixedHeight(
+            BROWSER_CHROME_CONTROL_HEIGHT
+        )
         for value, label in BROWSER_SORT_KEY_LABELS.items():
             self.browser_sort_key_combo.addItem(label, value.value)
         browser_sort_layout.addWidget(self.browser_sort_key_combo)
@@ -4554,6 +4813,9 @@ class BrowserWindow(QMainWindow):
         self.browser_sort_order_combo = QComboBox(self.browser_sort_row)
         self.browser_sort_order_combo.setObjectName("browser_sort_order_combo")
         self.browser_sort_order_combo.setToolTip("一覧の並び順")
+        self.browser_sort_order_combo.setFixedHeight(
+            BROWSER_CHROME_CONTROL_HEIGHT
+        )
         for value, label in BROWSER_SORT_ORDER_LABELS.items():
             self.browser_sort_order_combo.addItem(label, value.value)
         browser_sort_layout.addWidget(self.browser_sort_order_combo)
@@ -4585,6 +4847,9 @@ class BrowserWindow(QMainWindow):
             self.browser_sort_row
         )
         self.browser_search_container.setObjectName("browser_search_container")
+        self.browser_search_container.setFixedHeight(
+            BROWSER_CHROME_CONTROL_HEIGHT
+        )
         self.browser_search_container.set_preferred_width(190)
         self.browser_search_container.setMinimumWidth(150)
         self.browser_search_container.setMaximumWidth(230)
@@ -4609,7 +4874,7 @@ class BrowserWindow(QMainWindow):
         )
         rating_layout = QHBoxLayout(self.rating_filter_container)
         rating_layout.setContentsMargins(4, 0, 6, 0)
-        rating_layout.setSpacing(4)
+        rating_layout.setSpacing(BROWSER_CHROME_CONTROL_SPACING)
         rating_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self.rating_filter_widget = BrowserRatingFilterWidget(
             self.rating_filter_container
@@ -4823,7 +5088,7 @@ class BrowserWindow(QMainWindow):
         )
         history_menu.addAction(clear_history_action)
 
-        self.settings_action = QAction("環境設定…", self)
+        self.settings_action = QAction("設定", self)
         self.settings_action.triggered.connect(self.open_settings_dialog)
         self.menuBar().addAction(self.settings_action)
         self.menuBar().setCornerWidget(
@@ -4838,28 +5103,64 @@ class BrowserWindow(QMainWindow):
             self.browser_sort_order_combo,
             self.browser_search_edit,
         )
-        self.statusBar().showMessage("フォルダを選択してください。")
-        self.file_detail_label = QLabel(self)
+        browser_status_bar = self.statusBar()
+        browser_status_bar.layout().setSpacing(BROWSER_STATUS_BAR_SPACING)
+        browser_status_bar.showMessage("フォルダを選択してください。")
+        self.selected_detail_widget = QWidget(self)
+        self.selected_detail_widget.setObjectName(
+            "browser_selected_detail_widget"
+        )
+        selected_detail_layout = QHBoxLayout(self.selected_detail_widget)
+        selected_detail_layout.setContentsMargins(0, 0, 0, 0)
+        selected_detail_layout.setSpacing(BROWSER_STATUS_DETAIL_SPACING)
+        self.file_size_label = QLabel(self.selected_detail_widget)
+        self.file_size_label.setObjectName("browser_file_size_label")
+        self.file_size_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.file_size_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        size_slot_width = (
+            self.file_size_label.fontMetrics().horizontalAdvance(
+                "999.9 GB"
+            )
+            + 6
+        )
+        self.file_size_label.setFixedWidth(size_slot_width)
+        selected_detail_layout.addWidget(self.file_size_label)
+
+        self.file_detail_label = QLabel(self.selected_detail_widget)
         self.file_detail_label.setObjectName("browser_file_detail_label")
         self.file_detail_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
-        self.file_detail_label.setMinimumWidth(150)
+        detail_metrics = self.file_detail_label.fontMetrics()
+        detail_slot_width = max(
+            detail_metrics.horizontalAdvance("999999 ページ"),
+            detail_metrics.horizontalAdvance("99999 × 99999"),
+        ) + 6
+        self.file_detail_label.setFixedWidth(detail_slot_width)
         self.file_detail_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        self.statusBar().addPermanentWidget(self.file_detail_label)
+        selected_detail_layout.addWidget(self.file_detail_label)
+        browser_status_bar.addPermanentWidget(self.selected_detail_widget)
         self.cancel_operation_button = QPushButton("キャンセル", self)
         self.cancel_operation_button.setObjectName(
             "cancel_file_operation_button"
         )
         self.cancel_operation_button.clicked.connect(self.cancel_file_operation)
         self.cancel_operation_button.setVisible(False)
-        self.statusBar().addPermanentWidget(self.cancel_operation_button)
+        browser_status_bar.addPermanentWidget(self.cancel_operation_button)
         self.file_operation_panel = FileOperationPanel(self)
         if self.file_operation_coordinator.queue is not None:
             self.file_operation_panel.bind(self.file_operation_coordinator.queue)
-            self.statusBar().addPermanentWidget(self.file_operation_panel, 1)
+            browser_status_bar.addPermanentWidget(self.file_operation_panel, 1)
+        # QStatusBar rebuilds its private layout as permanent widgets are
+        # inserted, so compact its idle chrome only after the final insertion.
+        browser_status_bar.layout().setSpacing(BROWSER_STATUS_BAR_SPACING)
+        self._compact_status_bar_if_idle()
         QApplication.clipboard().changed.connect(
             self._on_system_clipboard_changed
         )
@@ -5029,21 +5330,37 @@ class BrowserWindow(QMainWindow):
             last_visible=visible_range[1],
             selected_rows=selected_rows,
             prefetch_screens=1,
+            scroll_direction=self._thumbnail_scroll_direction,
             fast_scrolling=self._fast_scrolling,
         )
-        selected_set = set(selected_rows)
         request_token = self.thumbnail_render_spec.cache_token
-        set_fast_scroll = getattr(
+        keep_paths = {
+            str(item.path)
+            for row in plan.requested_rows
+            if (item := self.item_model.item_at(row)) is not None
+        }
+        cancel_outside_plan = getattr(
             self.thumbnail_provider,
-            "set_fast_scroll_suppressed",
+            "cancel_requests_except",
             None,
         )
-        if callable(set_fast_scroll):
-            set_fast_scroll(self._fast_scrolling)
+        if callable(cancel_outside_plan):
+            cancel_outside_plan(
+                keep_paths,
+                size=self.thumbnail_render_spec,
+                generation=self._generation,
+            )
+        elif self._fast_scrolling:
+            self.thumbnail_provider.cancel_prefetch_except(
+                keep_paths,
+                size=self.thumbnail_render_spec,
+                generation=self._generation,
+            )
         for rows, priority in (
             (plan.visible_rows, ThumbnailPriority.VISIBLE),
             (plan.selected_rows, ThumbnailPriority.SELECTED),
-            (plan.prefetch_rows, ThumbnailPriority.PREFETCH),
+            (plan.directional_rows, ThumbnailPriority.READ_AHEAD),
+            (plan.safety_rows, ThumbnailPriority.PREFETCH),
         ):
             for row in rows:
                 item = self.item_model.item_at(row)
@@ -5056,27 +5373,12 @@ class BrowserWindow(QMainWindow):
                     )
                 ):
                     continue
-                effective_priority = priority
-                if self._fast_scrolling and priority is ThumbnailPriority.VISIBLE:
-                    if row in selected_set:
-                        effective_priority = ThumbnailPriority.SELECTED
                 self.thumbnail_provider.request(
                     item,
                     self.thumbnail_render_spec,
                     generation=self._generation,
-                    priority=effective_priority,
+                    priority=priority,
                 )
-        if self._fast_scrolling:
-            keep_paths = {
-                str(item.path)
-                for row in plan.visible_rows + plan.selected_rows
-                if (item := self.item_model.item_at(row)) is not None
-            }
-            self.thumbnail_provider.cancel_prefetch_except(
-                keep_paths,
-                size=self.thumbnail_render_spec,
-                generation=self._generation,
-            )
 
     def _current_device_pixel_ratio(self) -> float:
         window = self.windowHandle()
@@ -5160,7 +5462,10 @@ class BrowserWindow(QMainWindow):
             self._last_scroll_value = int(value)
             self._last_scroll_time = now
             return
-        delta = abs(int(value) - self._last_scroll_value)
+        raw_delta = int(value) - self._last_scroll_value
+        if raw_delta:
+            self._thumbnail_scroll_direction = 1 if raw_delta > 0 else -1
+        delta = abs(raw_delta)
         elapsed = now - self._last_scroll_time
         threshold = max(
             self.list_view.gridSize().height(),
@@ -5291,18 +5596,12 @@ class BrowserWindow(QMainWindow):
         total_count = self.item_model.source_count
         selected = self.item_model.item_at(self.list_view.currentIndex())
         folder = str(self.current_path) if self.current_path is not None else ""
-        sort_label = BROWSER_SORT_KEY_LABELS[self.browser_sort_key]
-        order_label = BROWSER_SORT_ORDER_LABELS[self.browser_sort_order]
-        density_label = BROWSER_DISPLAY_DENSITY_LABELS[self.browser_display_density]
         count_text = (
             f"{count}/{total_count}件"
             if self.browser_filter_state.active
             else f"{count}件"
         )
-        message = (
-            f"{folder} — {count_text} — {sort_label}・{order_label}"
-            f" — 表示: {density_label}"
-        )
+        message = f"{folder} — {count_text}"
         if selected is not None:
             message += f" — 選択: {selected.display_name}"
             selected_count = len(self.list_view.selectionModel().selectedIndexes())

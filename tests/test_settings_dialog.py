@@ -398,21 +398,30 @@ def test_browser_grid_presets_apply_density_and_thumbnail_size(
 ) -> None:
     config = make_config(tmp_path)
     dialog = SettingsDialog(config)
-    large_index = dialog.browser_grid_preset_combo.findData("large")
+    medium_index = dialog.browser_grid_preset_combo.findData("medium")
 
-    assert dialog.browser_grid_preset_combo.count() == 5
-    assert dialog.browser_grid_preset_combo.findData("extra_compact") >= 0
-    assert large_index >= 0
-    dialog.browser_grid_preset_combo.setCurrentIndex(large_index)
-    dialog.browser_grid_preset_combo.activated.emit(large_index)
+    assert [
+        dialog.browser_grid_preset_combo.itemData(index)
+        for index in range(dialog.browser_grid_preset_combo.count())
+    ] == [
+        "extra_compact",
+        "compact",
+        "medium",
+        "standard",
+        "comfortable",
+        "large",
+    ]
+    assert dialog.browser_grid_preset_combo.itemText(medium_index) == "中 (149px)"
+    dialog.browser_grid_preset_combo.setCurrentIndex(medium_index)
+    dialog.browser_grid_preset_combo.activated.emit(medium_index)
     changed = dialog.apply_settings()
 
-    assert dialog.browser_display_density_combo.currentData() == "large"
-    assert dialog.thumbnail_size_spin.value() == 320
-    assert changed["browser_display_density"] == "large"
+    assert dialog.browser_display_density_combo.currentData() == "medium"
+    assert dialog.thumbnail_size_spin.value() == 149
+    assert changed["browser_display_density"] == "medium"
     restored = ConfigManager(config.path).load()
-    assert restored["browser_display_density"] == "large"
-    assert restored["thumbnail_size"] == 320
+    assert restored["browser_display_density"] == "medium"
+    assert restored["thumbnail_size"] == 149
     dialog.reject()
 
 

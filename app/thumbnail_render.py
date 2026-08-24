@@ -36,6 +36,10 @@ THUMBNAIL_QUALITY_MARGINS = {
 }
 THUMBNAIL_ENCODER_FORMAT = "webp-or-png"
 THUMBNAIL_ENCODER_QUALITY = 90
+# The 149px medium preset can quantize to the same physical bucket as the
+# existing 180px standard preset.  Keep its request lifecycle distinct while
+# family-token reuse still permits sharing a compatible cached artifact.
+DISTINCT_LOGICAL_THUMBNAIL_EDGES = frozenset({149})
 
 FRAME_RATIOS: dict[str, tuple[float, str]] = {
     "square_1_1": (1.0, "1:1"),
@@ -104,6 +108,7 @@ class ThumbnailRenderSpec:
     smart_crop_version: int = SMART_CROP_ALGORITHM_VERSION
     implementation_version: int = THUMBNAIL_IMPLEMENTATION_VERSION
     browser_display_mode: str = "fit"
+    logical_thumbnail_size: int = 0
 
     @classmethod
     def from_settings(
@@ -149,6 +154,7 @@ class ThumbnailRenderSpec:
             mode,
             quality_mode=normalized_quality,
             browser_display_mode=normalized_display_mode,
+            logical_thumbnail_size=max(1, int(thumbnail_size)),
         )
 
     @property
@@ -162,12 +168,17 @@ class ThumbnailRenderSpec:
             if self.browser_display_mode == "fit"
             else f"|browser-display:{self.browser_display_mode}"
         )
+        logical_variant = (
+            f"|logical-edge:{self.logical_thumbnail_size}"
+            if self.logical_thumbnail_size in DISTINCT_LOGICAL_THUMBNAIL_EDGES
+            else ""
+        )
         payload = (
             f"{self.frame_width}x{self.frame_height}|{self.frame_ratio_id}|"
             f"{self.crop_mode}|{self.quality_mode}|{self.encoder_format}|"
             f"{self.encoder_quality}|{self.render_policy_version}|"
             f"{self.smart_crop_version}|{self.implementation_version}"
-            f"{display_variant}"
+            f"{display_variant}{logical_variant}"
         ).encode("utf-8")
         return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & (
             (1 << 63) - 1
@@ -252,8 +263,8 @@ class ThumbnailRenderPolicy:
                 display_width / max(1, spec.frame_width),
                 display_height / max(1, spec.frame_height),
             ),
-            resize_count=1,
-            smooth_pixmap_transform=True,
+            resize_count=2,
+            smooth_pixmap_transform=False,
         )
 
 

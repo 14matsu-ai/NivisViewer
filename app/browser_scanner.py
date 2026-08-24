@@ -81,6 +81,7 @@ class BrowserScanEntry:
     can_generate_preview: bool = True
     preview_kind: str = ""
     rating: int | None = None
+    page_count: int | None = None
 
 
 @dataclass(frozen=True)

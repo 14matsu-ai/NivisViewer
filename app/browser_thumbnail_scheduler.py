@@ -7,19 +7,32 @@ from math import ceil
 
 class ThumbnailPriority(IntEnum):
     PREFETCH = 0
-    SELECTED = 1
-    VISIBLE = 2
+    READ_AHEAD = 1
+    SELECTED = 2
+    VISIBLE = 3
 
 
 @dataclass(frozen=True)
 class ThumbnailRequestPlan:
     visible_rows: tuple[int, ...]
     selected_rows: tuple[int, ...]
-    prefetch_rows: tuple[int, ...]
+    directional_rows: tuple[int, ...]
+    safety_rows: tuple[int, ...]
+
+    @property
+    def prefetch_rows(self) -> tuple[int, ...]:
+        """Compatibility view of all bounded speculative rows."""
+
+        return self.directional_rows + self.safety_rows
 
     @property
     def requested_rows(self) -> tuple[int, ...]:
-        return self.visible_rows + self.selected_rows + self.prefetch_rows
+        return (
+            self.visible_rows
+            + self.selected_rows
+            + self.directional_rows
+            + self.safety_rows
+        )
 
 
 def calculate_grid_visible_range(
@@ -51,11 +64,13 @@ def build_thumbnail_request_plan(
     last_visible: int,
     selected_rows: tuple[int, ...] = (),
     prefetch_screens: int = 1,
+    scroll_direction: int = 1,
+    opposite_safety_fraction: float = 0.25,
     fast_scrolling: bool = False,
 ) -> ThumbnailRequestPlan:
     count = max(0, int(row_count))
     if count == 0:
-        return ThumbnailRequestPlan((), (), ())
+        return ThumbnailRequestPlan((), (), (), ())
     first = max(0, min(int(first_visible), count - 1))
     last = max(first, min(int(last_visible), count - 1))
     visible = tuple(range(first, last + 1))
@@ -66,16 +81,42 @@ def build_thumbnail_request_plan(
         if 0 <= row < count and row not in visible_set
     )
     if fast_scrolling:
-        return ThumbnailRequestPlan(visible, selected, ())
+        return ThumbnailRequestPlan(visible, selected, (), ())
 
     visible_count = max(1, len(visible))
-    margin = visible_count * max(0, min(3, int(prefetch_screens)))
-    prefetch_first = max(0, first - margin)
-    prefetch_last = min(count - 1, last + margin)
-    excluded = visible_set | set(selected)
-    prefetch = tuple(
-        row
-        for row in range(prefetch_first, prefetch_last + 1)
-        if row not in excluded
+    directional_count = visible_count * max(0, min(3, int(prefetch_screens)))
+    safety_count = ceil(
+        visible_count * max(0.0, min(1.0, float(opposite_safety_fraction)))
     )
-    return ThumbnailRequestPlan(visible, selected, prefetch)
+    excluded = visible_set | set(selected)
+    direction = -1 if int(scroll_direction) < 0 else 1
+    if direction > 0:
+        directional_candidates = range(
+            last + 1,
+            min(count, last + 1 + directional_count),
+        )
+        safety_candidates = range(
+            first - 1,
+            max(-1, first - 1 - safety_count),
+            -1,
+        )
+    else:
+        directional_candidates = range(
+            first - 1,
+            max(-1, first - 1 - directional_count),
+            -1,
+        )
+        safety_candidates = range(
+            last + 1,
+            min(count, last + 1 + safety_count),
+        )
+    directional = tuple(
+        row for row in directional_candidates if row not in excluded
+    )
+    directional_set = set(directional)
+    safety = tuple(
+        row
+        for row in safety_candidates
+        if row not in excluded and row not in directional_set
+    )
+    return ThumbnailRequestPlan(visible, selected, directional, safety)

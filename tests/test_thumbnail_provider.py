@@ -138,8 +138,18 @@ def test_duplicate_requests_are_suppressed_and_old_generation_is_discarded(
     )
     first_generation = provider.begin_generation()
 
-    assert provider.request(item, 100, generation=first_generation)
-    assert not provider.request(item, 100, generation=first_generation)
+    assert provider.request(
+        item,
+        100,
+        generation=first_generation,
+        priority=ThumbnailPriority.READ_AHEAD,
+    )
+    assert not provider.request(
+        item,
+        100,
+        generation=first_generation,
+        priority=ThumbnailPriority.READ_AHEAD,
+    )
     provider.begin_generation()
     assert provider.wait_for_done(2000)
     qapp.processEvents()
@@ -391,6 +401,224 @@ def test_pending_prefetch_can_be_cancelled_while_visible_work_runs(
     assert provider.pending_count == 1
     release.set()
     assert provider.wait_for_done(2000)
+    provider.close()
+
+
+def test_directional_read_ahead_decodes_images_but_not_folders_or_archives(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    image_path = tmp_path / "image.jpg"
+    write_image(image_path)
+    folder_path = tmp_path / "folder"
+    folder_path.mkdir()
+    archive_path = tmp_path / "archive.cbz"
+    archive_path.write_bytes(b"archive")
+    calls: list[str] = []
+
+    def loader(item, _size, _cancel_token=None, _priority=None):
+        calls.append(str(item.path))
+        return QImage(8, 8, QImage.Format.Format_RGBA8888)
+
+    provider = BrowserThumbnailProvider(
+        loader=loader,
+        max_workers=1,
+        disk_cache_enabled=False,
+    )
+    generation = provider.begin_generation()
+    for path, kind in (
+        (image_path, BrowserItemKind.IMAGE),
+        (folder_path, BrowserItemKind.FOLDER),
+        (archive_path, BrowserItemKind.ARCHIVE),
+    ):
+        assert provider.request(
+            make_item(path, kind),
+            100,
+            generation=generation,
+            priority=ThumbnailPriority.READ_AHEAD,
+        )
+    assert provider.wait_for_done(2000)
+    qapp.processEvents()
+
+    assert calls == [str(image_path)]
+    stats = provider.cache_statistics()
+    assert stats["generated_read_ahead"] == 1
+    assert stats["prefetch_skipped"] == 2
+
+    for path, kind in (
+        (folder_path, BrowserItemKind.FOLDER),
+        (archive_path, BrowserItemKind.ARCHIVE),
+    ):
+        assert provider.request(
+            make_item(path, kind),
+            100,
+            generation=generation,
+            priority=ThumbnailPriority.VISIBLE,
+        )
+    assert provider.wait_for_done(2000)
+    qapp.processEvents()
+    assert calls == [str(image_path), str(folder_path), str(archive_path)]
+    provider.close()
+
+
+def test_read_ahead_memory_hit_does_not_decode_again(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    image_path = tmp_path / "cached.jpg"
+    write_image(image_path)
+    item = make_item(image_path, BrowserItemKind.IMAGE)
+    calls: list[str] = []
+
+    def loader(current, _size, _cancel_token=None, _priority=None):
+        calls.append(str(current.path))
+        return QImage(8, 8, QImage.Format.Format_RGBA8888)
+
+    provider = BrowserThumbnailProvider(
+        loader=loader,
+        max_workers=1,
+        disk_cache_enabled=False,
+    )
+    first = provider.begin_generation()
+    assert provider.request(
+        item,
+        100,
+        generation=first,
+        priority=ThumbnailPriority.VISIBLE,
+    )
+    assert provider.wait_for_done(2000)
+    qapp.processEvents()
+
+    second = provider.begin_generation()
+    assert not provider.request(
+        item,
+        100,
+        generation=second,
+        priority=ThumbnailPriority.READ_AHEAD,
+    )
+    qapp.processEvents()
+    assert calls == [str(image_path)]
+    assert provider.cache_statistics()["memory_hit"] == 1
+    provider.close()
+
+
+def test_read_ahead_persists_to_existing_disk_cache_for_next_visible_hit(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    image_path = tmp_path / "disk-read-ahead.jpg"
+    write_image(image_path)
+    item = make_item(image_path, BrowserItemKind.IMAGE)
+    cache_path = tmp_path / "cache"
+    calls: list[str] = []
+
+    def loader(current, _size, _cancel_token=None, _priority=None):
+        calls.append(str(current.path))
+        return QImage(8, 8, QImage.Format.Format_RGBA8888)
+
+    first_provider = BrowserThumbnailProvider(
+        loader=loader,
+        disk_cache=ThumbnailDiskCache(cache_path, enabled=False),
+        disk_cache_enabled=True,
+    )
+    first = first_provider.begin_generation()
+    assert first_provider.request(
+        item,
+        100,
+        generation=first,
+        priority=ThumbnailPriority.READ_AHEAD,
+    )
+    assert first_provider.wait_for_done(2000)
+    qapp.processEvents()
+    first_stats = first_provider.cache_statistics()
+    assert first_stats["disk_saved_read_ahead"] == 1
+    first_provider.close()
+
+    second_provider = BrowserThumbnailProvider(
+        loader=loader,
+        disk_cache=ThumbnailDiskCache(cache_path, enabled=False),
+        disk_cache_enabled=True,
+    )
+    second = second_provider.begin_generation()
+    assert second_provider.request(
+        item,
+        100,
+        generation=second,
+        priority=ThumbnailPriority.VISIBLE,
+    )
+    assert second_provider.wait_for_done(2000)
+    qapp.processEvents()
+
+    assert calls == [str(image_path)]
+    assert second_provider.cache_statistics()["disk_hit"] == 1
+    second_provider.close()
+
+
+def test_recenter_cancels_queued_old_visible_and_speculative_work(
+    tmp_path: Path,
+) -> None:
+    blocker_path = tmp_path / "blocker.jpg"
+    old_visible_path = tmp_path / "old-visible.jpg"
+    old_ahead_path = tmp_path / "old-ahead.jpg"
+    new_visible_path = tmp_path / "new-visible.jpg"
+    for path in (
+        blocker_path,
+        old_visible_path,
+        old_ahead_path,
+        new_visible_path,
+    ):
+        write_image(path)
+    started = Event()
+    release = Event()
+    calls: list[str] = []
+
+    def loader(item, _size, _cancel_token=None, _priority=None):
+        calls.append(str(item.path))
+        if item.path == blocker_path:
+            started.set()
+            release.wait(2)
+        return QImage(8, 8, QImage.Format.Format_RGBA8888)
+
+    provider = BrowserThumbnailProvider(
+        loader=loader,
+        max_workers=1,
+        disk_cache_enabled=False,
+    )
+    generation = provider.begin_generation()
+    assert provider.request(
+        make_item(blocker_path, BrowserItemKind.IMAGE),
+        100,
+        generation=generation,
+        priority=ThumbnailPriority.VISIBLE,
+    )
+    assert started.wait(1)
+    assert provider.request(
+        make_item(old_visible_path, BrowserItemKind.IMAGE),
+        100,
+        generation=generation,
+        priority=ThumbnailPriority.VISIBLE,
+    )
+    assert provider.request(
+        make_item(old_ahead_path, BrowserItemKind.IMAGE),
+        100,
+        generation=generation,
+        priority=ThumbnailPriority.READ_AHEAD,
+    )
+    assert provider.cancel_requests_except(
+        {str(blocker_path), str(new_visible_path)},
+        size=100,
+        generation=generation,
+    ) == 2
+    assert provider.request(
+        make_item(new_visible_path, BrowserItemKind.IMAGE),
+        100,
+        generation=generation,
+        priority=ThumbnailPriority.VISIBLE,
+    )
+    release.set()
+    assert provider.wait_for_done(2000)
+
+    assert calls == [str(blocker_path), str(new_visible_path)]
     provider.close()
 
 

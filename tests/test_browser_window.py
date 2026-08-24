@@ -860,7 +860,7 @@ def test_status_count_uses_model_row_count_without_materializing_items(
     ):
         window._update_status(force=True)
 
-    assert f" — {item_count}件 — " in window.statusBar().currentMessage()
+    assert f" — {item_count}件" in window.statusBar().currentMessage()
     if item_count > 1:
         assert "ほか1件" in window.statusBar().currentMessage()
     window.close()
@@ -976,7 +976,7 @@ def test_settings_action_is_direct_and_triggers_existing_dialog_path_once(
 
     actions = window.menuBar().actions()
     settings_actions = [
-        action for action in actions if action.text() == "環境設定…"
+        action for action in actions if action.text() == "設定"
     ]
     assert settings_actions == [window.settings_action]
     assert window.settings_action.menu() is None
@@ -1113,7 +1113,7 @@ def test_sort_controls_apply_without_opening_viewer_or_changing_history(
     assert len(window.navigation_history) == initial_history_length
     assert window.thumbnail_provider.generation == initial_generation
     assert opened == []
-    assert "更新日時・降順" in window.statusBar().currentMessage()
+    assert "更新日時・降順" not in window.statusBar().currentMessage()
     window.close()
     qapp.processEvents()
 

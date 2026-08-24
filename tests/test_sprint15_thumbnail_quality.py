@@ -129,8 +129,8 @@ def test_render_diagnostics_do_not_double_apply_dpr() -> None:
     assert metrics.cache_pixels == (362, 512)
     assert metrics.qimage_dpr == 1.0
     assert metrics.upscale_factor < 1.0
-    assert metrics.resize_count == 1
-    assert metrics.smooth_pixmap_transform
+    assert metrics.resize_count == 2
+    assert not metrics.smooth_pixmap_transform
 
 
 def _item(path: Path) -> BrowserItem:

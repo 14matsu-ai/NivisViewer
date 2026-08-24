@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -37,6 +38,10 @@ from .browser_sort import (
 )
 from .app_icon import install_window_icon
 from .browser_item_delegate import GRID_PRESET_THUMBNAIL_SIZES
+from .browser_wheel_scroll import (
+    BROWSER_WHEEL_SCROLL_CUSTOM_MAX_ROWS,
+    BROWSER_WHEEL_SCROLL_CUSTOM_MIN_ROWS,
+)
 from .config_manager import ConfigManager
 from .ffmpeg_thumbnail_backend import FFmpegLocator
 from .thumbnail_render import (
@@ -179,7 +184,7 @@ class SettingsDialog(QDialog):
         file_registration_service: WindowsFileRegistrationService | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("環境設定")
+        self.setWindowTitle("設定")
         install_window_icon(self)
         self.setModal(True)
         self.resize(620, 680)
@@ -265,6 +270,9 @@ class SettingsDialog(QDialog):
         scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        content_policy = content.sizePolicy()
+        content_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+        content.setSizePolicy(content_policy)
         scroll.setWidget(content)
         self._scroll_areas.append(scroll)
         return scroll
@@ -665,6 +673,62 @@ class SettingsDialog(QDialog):
         layout.addWidget(group)
         layout.addStretch(1)
         return tab
+
+    def _build_browser_wheel_scroll_group(self, parent: QWidget) -> QGroupBox:
+        self.browser_wheel_scroll_group = QGroupBox(
+            "Browser マウスホイール",
+            parent,
+        )
+        browser_wheel_form = QFormLayout(self.browser_wheel_scroll_group)
+        self.browser_wheel_scroll_mode_combo = QComboBox(
+            self.browser_wheel_scroll_group
+        )
+        for label, mode in (
+            ("System / Default", "system"),
+            ("Small", "small"),
+            ("Medium", "medium"),
+            ("Large", "large"),
+            ("Custom", "custom"),
+        ):
+            self.browser_wheel_scroll_mode_combo.addItem(label, mode)
+        self.browser_wheel_scroll_mode_combo.setToolTip(
+            "標準ホイール1目盛りあたりの移動量です。"
+            "System / DefaultではQtとWindowsの現在の動作をそのまま使用します。"
+        )
+        self.browser_wheel_scroll_mode_combo.currentIndexChanged.connect(
+            self._sync_browser_wheel_scroll_controls
+        )
+        browser_wheel_form.addRow(
+            "スクロール量:",
+            self.browser_wheel_scroll_mode_combo,
+        )
+        self.browser_wheel_scroll_custom_spin = QSpinBox(
+            self.browser_wheel_scroll_group
+        )
+        self.browser_wheel_scroll_custom_spin.setRange(
+            BROWSER_WHEEL_SCROLL_CUSTOM_MIN_ROWS,
+            BROWSER_WHEEL_SCROLL_CUSTOM_MAX_ROWS,
+        )
+        self.browser_wheel_scroll_custom_spin.setSuffix(" 行／1目盛り")
+        browser_wheel_form.addRow(
+            "Customの行数:",
+            self.browser_wheel_scroll_custom_spin,
+        )
+        self.browser_wheel_scroll_restore_button = QPushButton(
+            "既定に戻す",
+            self.browser_wheel_scroll_group,
+        )
+        self.browser_wheel_scroll_restore_button.clicked.connect(
+            self._restore_browser_wheel_scroll_default
+        )
+        browser_wheel_form.addRow(self.browser_wheel_scroll_restore_button)
+        browser_wheel_note = QLabel(
+            "Smallは1行、Mediumは2行、Largeは3行を移動します。",
+            self.browser_wheel_scroll_group,
+        )
+        browser_wheel_note.setWordWrap(True)
+        browser_wheel_form.addRow(browser_wheel_note)
+        return self.browser_wheel_scroll_group
 
     def _build_browser_tab(self) -> QWidget:
         tab = QWidget(self)
@@ -1077,6 +1141,8 @@ class SettingsDialog(QDialog):
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
 
+        layout.addWidget(self._build_browser_wheel_scroll_group(tab))
+
         gesture_group = QGroupBox("Viewer画像表示領域", tab)
         gesture_form = QFormLayout(gesture_group)
         self.mouse_gestures_checkbox = QCheckBox(
@@ -1316,6 +1382,14 @@ class SettingsDialog(QDialog):
         self.browser_show_system_checkbox.setChecked(
             bool(self.config.get("browser_show_system_items", False))
         )
+        self._select_data(
+            self.browser_wheel_scroll_mode_combo,
+            self.config.get("browser_wheel_scroll_mode", "system"),
+        )
+        self.browser_wheel_scroll_custom_spin.setValue(
+            int(self.config.get("browser_wheel_scroll_custom_rows", 3))
+        )
+        self._sync_browser_wheel_scroll_controls()
         self._sync_browser_grid_preset()
         self._select_data(
             self.browser_sort_key_combo,
@@ -1486,6 +1560,19 @@ class SettingsDialog(QDialog):
             "auto",
         )
         self._sync_folder_fallback_background_controls()
+
+    def _restore_browser_wheel_scroll_default(self) -> None:
+        self._select_data(self.browser_wheel_scroll_mode_combo, "system")
+        self.browser_wheel_scroll_custom_spin.setValue(3)
+        self._sync_browser_wheel_scroll_controls()
+
+    def _sync_browser_wheel_scroll_controls(
+        self,
+        *_args: object,
+    ) -> None:
+        self.browser_wheel_scroll_custom_spin.setEnabled(
+            self.browser_wheel_scroll_mode_combo.currentData() == "custom"
+        )
 
     def _sync_folder_fallback_background_controls(
         self,
@@ -1770,6 +1857,12 @@ class SettingsDialog(QDialog):
                 if self.browser_folder_fallback_background_combo.currentData()
                 == "custom"
                 else "auto"
+            ),
+            "browser_wheel_scroll_mode": str(
+                self.browser_wheel_scroll_mode_combo.currentData() or "system"
+            ),
+            "browser_wheel_scroll_custom_rows": (
+                self.browser_wheel_scroll_custom_spin.value()
             ),
             "thumbnail_quality_mode": str(
                 self.thumbnail_quality_mode_combo.currentData()

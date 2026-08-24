@@ -46,6 +46,7 @@ class CachedThumbnail:
     frame_width: int
     frame_height: int
     low_resolution_placeholder: bool = False
+    page_count: int | None = None
 
 
 class ThumbnailDiskCache:
@@ -226,7 +227,8 @@ class ThumbnailDiskCache:
                     f"""
                     SELECT cache_key, file_name, source_size, source_mtime_ns,
                            cover_path, cover_size, cover_mtime_ns,
-                           thumbnail_size, frame_width, frame_height
+                           thumbnail_size, frame_width, frame_height,
+                           page_count
                       FROM entries
                      WHERE source_path = ? AND item_kind = ?
                        AND family_token = ? AND format_version = ?
@@ -259,6 +261,7 @@ class ThumbnailDiskCache:
                     cache_token,
                     frame_width,
                     frame_height,
+                    page_count,
                 ) = row
                 if (source[0], source[1]) != (source_size, source_mtime_ns):
                     invalid.append((key, file_name))
@@ -287,6 +290,7 @@ class ThumbnailDiskCache:
                     int(frame_height),
                     int(cache_token) != spec.cache_token
                     and actual_edge < spec.long_edge * 0.95,
+                    None if page_count is None else max(0, int(page_count)),
                 )
             if invalid:
                 self._remove_entries(invalid)
@@ -300,6 +304,7 @@ class ThumbnailDiskCache:
         *,
         cover_path: str | Path | None = None,
         entry_path: str = "",
+        page_count: int | None = None,
         protected_thumbnail_sizes: set[int] | None = None,
     ) -> bool:
         with self._lock:
@@ -338,6 +343,12 @@ class ThumbnailDiskCache:
                     (key,),
                 ).fetchone()
                 if existing is not None and cache_file.is_file():
+                    if page_count is not None:
+                        self._connection.execute(
+                            "UPDATE entries SET page_count = ? WHERE cache_key = ?",
+                            (max(0, int(page_count)), key),
+                        )
+                        self._connection.commit()
                     return False
                 self.files_dir.mkdir(parents=True, exist_ok=True)
                 pil_image = self._qimage_to_pil(image)
@@ -364,8 +375,8 @@ class ThumbnailDiskCache:
                         source_mtime_ns, cover_path, cover_size,
                         cover_mtime_ns, entry_path, thumbnail_size, family_token,
                         frame_width, frame_height, format_version,
-                        file_name, byte_size, created_at, last_used
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        file_name, byte_size, created_at, last_used, page_count
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         key,
@@ -386,6 +397,11 @@ class ThumbnailDiskCache:
                         byte_size,
                         now,
                         now,
+                        (
+                            None
+                            if page_count is None
+                            else max(0, int(page_count))
+                        ),
                     ),
                 )
                 self._enforce_source_caps(
@@ -411,6 +427,70 @@ class ThumbnailDiskCache:
                     temporary.unlink(missing_ok=True)
                 except OSError:
                     pass
+
+    def get_page_count(self, item: BrowserItem) -> int | None:
+        """Return valid cached thumbnail metadata without reading image data."""
+
+        with self._lock:
+            if not self.enabled or self._connection is None:
+                return None
+            source = self._stat_path(item.path)
+            if source is None:
+                return None
+            try:
+                row = self._connection.execute(
+                    """
+                    SELECT page_count, source_size, source_mtime_ns
+                      FROM entries
+                     WHERE source_path = ? AND item_kind = ?
+                       AND format_version = ? AND page_count IS NOT NULL
+                     ORDER BY last_used DESC
+                     LIMIT 1
+                    """,
+                    (
+                        self._normalize_path(item.path),
+                        item.kind.value,
+                        self.format_version,
+                    ),
+                ).fetchone()
+            except sqlite3.DatabaseError as exc:
+                self.last_error = str(exc)
+                return None
+            if row is None or source != (row[1], row[2]):
+                return None
+            return max(0, int(row[0]))
+
+    def update_page_count(self, item: BrowserItem, page_count: int) -> int:
+        """Attach metadata to existing valid variants for this source."""
+
+        with self._lock:
+            if not self.enabled or self._connection is None:
+                return 0
+            source = self._stat_path(item.path)
+            if source is None:
+                return 0
+            try:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE entries SET page_count = ?
+                     WHERE source_path = ? AND item_kind = ?
+                       AND source_size = ? AND source_mtime_ns = ?
+                       AND format_version = ?
+                    """,
+                    (
+                        max(0, int(page_count)),
+                        self._normalize_path(item.path),
+                        item.kind.value,
+                        source[0],
+                        source[1],
+                        self.format_version,
+                    ),
+                )
+                self._connection.commit()
+                return max(0, int(cursor.rowcount))
+            except sqlite3.DatabaseError as exc:
+                self.last_error = str(exc)
+                return 0
 
     def usage_bytes(self) -> int:
         with self._lock:
@@ -727,10 +807,21 @@ class ThumbnailDiskCache:
                 file_name TEXT NOT NULL UNIQUE,
                 byte_size INTEGER NOT NULL,
                 created_at REAL NOT NULL,
-                last_used REAL NOT NULL
+                last_used REAL NOT NULL,
+                page_count INTEGER
             )
             """
         )
+        columns = {
+            str(row[1])
+            for row in self._connection.execute(
+                "PRAGMA table_info(entries)"
+            ).fetchall()
+        }
+        if "page_count" not in columns:
+            self._connection.execute(
+                "ALTER TABLE entries ADD COLUMN page_count INTEGER"
+            )
         self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS maintenance (

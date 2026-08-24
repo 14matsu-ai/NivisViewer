@@ -24,6 +24,7 @@ from PySide6.QtGui import (
     QPaintEvent,
     QPainter,
     QPen,
+    QWheelEvent,
 )
 from PySide6.QtWidgets import QApplication, QListView, QRubberBand, QTreeView
 
@@ -31,6 +32,7 @@ from .browser_pointer_controller import (
     BrowserPointerController,
     BrowserPointerState,
 )
+from .browser_wheel_scroll import BrowserWheelScrollAccumulator
 from .drag_drop import (
     FileDragController,
     is_internal_path_mime,
@@ -73,12 +75,49 @@ class ExplorerListView(QListView):
         self._folder_gesture_trail: list[QPoint] = []
         self._folder_gesture_right_button_down = False
         self._suppress_folder_gesture_context_menu = False
+        self._wheel_scroll = BrowserWheelScrollAccumulator()
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
         # All source drags are created by start_path_drag(). Qt's standard
         # startDrag and rubber-band paths stay disabled.
         self.setDragEnabled(False)
         self.setDragDropMode(QListView.DragDropMode.DropOnly)
+
+    def set_wheel_scroll_policy(
+        self,
+        mode: object,
+        custom_rows: object,
+    ) -> None:
+        self._wheel_scroll.configure(mode, custom_rows)
+
+    @property
+    def wheel_scroll_mode(self) -> str:
+        return self._wheel_scroll.mode
+
+    @property
+    def wheel_scroll_custom_rows(self) -> int:
+        return self._wheel_scroll.custom_rows
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
+        # Pixel deltas are already device/gesture-native. Keep Qt's smooth
+        # touchpad path intact and customize only vertical angle-wheel input.
+        if (
+            self._wheel_scroll.mode == "system"
+            or not event.pixelDelta().isNull()
+            or event.angleDelta().y() == 0
+            or bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        ):
+            super().wheelEvent(event)
+            return
+
+        movement = self._wheel_scroll.consume_angle_delta(
+            event.angleDelta().y(),
+            self.gridSize().height(),
+        )
+        if movement:
+            scrollbar = self.verticalScrollBar()
+            scrollbar.setValue(scrollbar.value() + movement)
+        event.accept()
 
     def ensure_viewport_drop_target(self) -> None:
         """Reapply drop routing after QListView replaces/configures its viewport."""

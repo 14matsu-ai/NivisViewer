@@ -34,7 +34,7 @@ class BrowserRatingFilterWidget(QWidget):
 
     def sizeHint(self) -> QSize:  # noqa: N802
         metrics = self.fontMetrics()
-        return QSize(metrics.horizontalAdvance("★★★★★") + 16, metrics.height() + 10)
+        return QSize(metrics.horizontalAdvance("★★★★★") + 16, metrics.height() + 8)
 
     def _stars_rect(self) -> QRect:
         return self.rect().adjusted(8, 2, -8, -2)

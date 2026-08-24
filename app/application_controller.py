@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from .adjacent_book_search import (
     SIBLING_FOLDERS,
+    AdjacentBookBrowserSnapshot,
     AdjacentBookSearchRequest,
     AdjacentBookSearchResult,
     AdjacentBookSearchService,
@@ -320,6 +321,7 @@ class ApplicationController(QObject):
         *,
         open_in_new_window: bool | None = None,
         folder_snapshot: FolderListingSnapshot | None = None,
+        browser_snapshot: AdjacentBookBrowserSnapshot | None = None,
     ) -> ViewerWindow:
         if self._shutdown:
             raise RuntimeError("application is shutting down")
@@ -332,6 +334,7 @@ class ApplicationController(QObject):
             window,
             path,
             folder_snapshot=folder_snapshot,
+            browser_snapshot=browser_snapshot,
         )
         return window
 
@@ -380,10 +383,38 @@ class ApplicationController(QObject):
             if self._exit_evaluation_suspended == 0:
                 QTimer.singleShot(0, self._evaluate_application_exit)
 
-    def open_adjacent_book(self, window: object, direction: int) -> str:
+    def open_adjacent_book(
+        self,
+        window: object,
+        direction: int,
+        require_browser_snapshot: bool = False,
+    ) -> str:
         if self._shutdown:
             return "unavailable"
         if not isinstance(window, ViewerWindow) or window not in self._viewer_windows:
+            return "unavailable"
+        browser_snapshot = window.browser_navigation_snapshot
+        snapshot_current = window.browser_navigation_path
+        if browser_snapshot is not None and snapshot_current:
+            status, candidate = browser_snapshot.adjacent_viewer_path(
+                snapshot_current,
+                direction,
+                loop=bool(self.settings.get("loop_book_navigation", False)),
+            )
+            if status is not AdjacentBookSearchStatus.FOUND or candidate is None:
+                return status.value
+            opened = self._open_path_in_viewer(
+                window,
+                candidate,
+                bring_to_front=False,
+                folder_snapshot=self._folder_snapshot_from_browser_navigation(
+                    browser_snapshot,
+                    candidate,
+                ),
+                browser_snapshot=browser_snapshot,
+            )
+            return "opened" if opened else "error"
+        if require_browser_snapshot:
             return "unavailable"
         current = self._book_navigation_path_lexical(window)
         if current is None:
@@ -393,19 +424,12 @@ class ApplicationController(QObject):
         self._adjacent_generation += 1
         request_id = self._adjacent_request_sequence
         generation = self._adjacent_generation
-        parent = lexical_absolute(os.path.dirname(current))
-        browser = self.get_browser_window()
-        snapshot = (
-            browser.adjacent_book_snapshot(parent)
-            if browser is not None
-            else None
-        )
         request = AdjacentBookSearchRequest(
             request_id=request_id,
             current_book_path=current,
             direction=-1 if direction < 0 else 1,
             loop=bool(self.settings.get("loop_book_navigation", False)),
-            browser_snapshot=snapshot,
+            browser_snapshot=None,
             generation=generation,
         )
         self._adjacent_request_by_window[id(window)] = request_id
@@ -635,6 +659,7 @@ class ApplicationController(QObject):
         *,
         bring_to_front: bool = True,
         folder_snapshot: FolderListingSnapshot | None = None,
+        browser_snapshot: AdjacentBookBrowserSnapshot | None = None,
     ) -> bool:
         self._cancel_adjacent_search(window, clear_status=True)
         self._active_viewer = window
@@ -649,7 +674,11 @@ class ApplicationController(QObject):
             f"path={path} browser_pending={pending}",
         )
         window.set_next_open_trace(trace_id)
-        opened = window.open_path(path, folder_snapshot=folder_snapshot)
+        opened = window.open_path(
+            path,
+            folder_snapshot=folder_snapshot,
+            browser_snapshot=browser_snapshot,
+        )
         if (
             opened
             and bring_to_front
@@ -676,24 +705,32 @@ class ApplicationController(QObject):
         path: str,
         open_in_new_window: bool,
         folder_snapshot: FolderListingSnapshot | None = None,
+        browser_snapshot: AdjacentBookBrowserSnapshot | None = None,
     ) -> ViewerWindow:
         try:
             accepts_snapshot = (
                 "folder_snapshot"
                 in inspect.signature(self.open_path).parameters
             )
+            accepts_browser_snapshot = (
+                "browser_snapshot"
+                in inspect.signature(self.open_path).parameters
+            )
         except (TypeError, ValueError):
             accepts_snapshot = False
+            accepts_browser_snapshot = False
         if not accepts_snapshot:
             return self.open_path(
                 path,
                 open_in_new_window=True if open_in_new_window else None,
             )
-        return self.open_path(
-            path,
-            open_in_new_window=True if open_in_new_window else None,
-            folder_snapshot=folder_snapshot,
-        )
+        kwargs = {
+            "open_in_new_window": True if open_in_new_window else None,
+            "folder_snapshot": folder_snapshot,
+        }
+        if accepts_browser_snapshot:
+            kwargs["browser_snapshot"] = browser_snapshot
+        return self.open_path(path, **kwargs)
 
     def _on_viewer_activated(self, window: object) -> None:
         if isinstance(window, ViewerWindow) and window in self._viewer_windows:
@@ -702,8 +739,24 @@ class ApplicationController(QObject):
                 self.select_path_in_browser(window.book_session.current_path)
 
     def _on_viewer_book_changed(self, window: object, path: str) -> None:
-        if window is self.get_active_viewer():
-            self.select_path_in_browser(path)
+        if window is not self.get_active_viewer():
+            return
+        snapshot = window.browser_navigation_snapshot
+        browser = self.get_browser_window()
+        if snapshot is not None:
+            # Snapshot navigation must not pull a Browser that has since moved
+            # elsewhere back into the old folder or add a history entry.  A
+            # Browser still showing the captured parent may safely update its
+            # selection through the existing same-folder path.
+            if (
+                browser is not None
+                and browser.current_path is not None
+                and adjacent_path_key(browser.current_path)
+                == adjacent_path_key(snapshot.parent_folder)
+            ):
+                browser.select_path(path)
+            return
+        self.select_path_in_browser(path)
 
     def _on_viewer_interactive_open_started(self, _window: object) -> None:
         self.image_work_coordinator.begin_viewer_interactive()
@@ -1167,6 +1220,44 @@ class ApplicationController(QObject):
         if os.path.splitext(current)[1].lower() in SUPPORTED_EXTENSIONS:
             return lexical_absolute(os.path.dirname(current))
         return current
+
+    @staticmethod
+    def _folder_snapshot_from_browser_navigation(
+        snapshot: AdjacentBookBrowserSnapshot,
+        selected_path: str,
+    ) -> FolderListingSnapshot | None:
+        selected_key = adjacent_path_key(selected_path)
+        image_entries = tuple(
+            entry
+            for entry in snapshot.entries
+            if entry.openable_by_nivisviewer and entry.item_kind == "image"
+        )
+        image_ids = tuple(
+            lexical_absolute(entry.absolute_path) for entry in image_entries
+        )
+        image_keys = tuple(adjacent_path_key(path) for path in image_ids)
+        try:
+            selected_index = image_keys.index(selected_key)
+        except ValueError:
+            return None
+        selected_image = image_ids[selected_index]
+        return FolderListingSnapshot(
+            Path(snapshot.parent_folder),
+            image_ids,
+            selected_image,
+            tuple(
+                (
+                    lexical_absolute(entry.absolute_path),
+                    entry.file_size,
+                    entry.modified_time_ns,
+                )
+                for entry in image_entries
+            ),
+            generation=snapshot.scan_generation,
+            sort_identity=snapshot.sort_identity,
+            selected_index=selected_index,
+            filter_identity=snapshot.filter_identity,
+        )
 
     def _cancel_adjacent_search(
         self,
