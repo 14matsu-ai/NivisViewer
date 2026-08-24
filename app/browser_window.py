@@ -194,6 +194,7 @@ BROWSER_NAVIGATION_ICON_SIZE = 20
 BROWSER_CHROME_CONTROL_HEIGHT = 24
 BROWSER_CHROME_CONTROL_SPACING = 2
 BROWSER_STATUS_BAR_SPACING = 3
+BROWSER_STATUS_LEFT_SPACING = 12
 BROWSER_STATUS_DETAIL_SPACING = 14
 BROWSER_STATUS_BAR_MIN_IDLE_HEIGHT = 22
 
@@ -5105,7 +5106,58 @@ class BrowserWindow(QMainWindow):
         )
         browser_status_bar = self.statusBar()
         browser_status_bar.layout().setSpacing(BROWSER_STATUS_BAR_SPACING)
-        browser_status_bar.showMessage("フォルダを選択してください。")
+        self.browser_status_summary_widget = QWidget(self)
+        self.browser_status_summary_widget.setObjectName(
+            "browser_status_summary_widget"
+        )
+        status_summary_layout = QHBoxLayout(
+            self.browser_status_summary_widget
+        )
+        status_summary_layout.setContentsMargins(0, 0, 0, 0)
+        status_summary_layout.setSpacing(BROWSER_STATUS_LEFT_SPACING)
+        self.browser_item_count_label = QLabel(
+            "0 個の項目",
+            self.browser_status_summary_widget,
+        )
+        self.browser_item_count_label.setObjectName(
+            "browser_item_count_label"
+        )
+        self.browser_item_count_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.browser_item_count_label.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Fixed,
+        )
+        status_summary_layout.addWidget(self.browser_item_count_label)
+
+        self.browser_selected_path_edit = QLineEdit(
+            self.browser_status_summary_widget
+        )
+        self.browser_selected_path_edit.setObjectName(
+            "browser_selected_path_edit"
+        )
+        self.browser_selected_path_edit.setAccessibleName(
+            "選択項目のパス"
+        )
+        self.browser_selected_path_edit.setReadOnly(True)
+        self.browser_selected_path_edit.setFrame(False)
+        self.browser_selected_path_edit.setTextMargins(0, 0, 0, 0)
+        self.browser_selected_path_edit.setStyleSheet(
+            "QLineEdit { border: none; padding: 0; background: transparent; }"
+        )
+        self.browser_selected_path_edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.browser_selected_path_edit.setMaximumHeight(
+            BROWSER_STATUS_BAR_MIN_IDLE_HEIGHT - 2
+        )
+        status_summary_layout.addWidget(self.browser_selected_path_edit, 1)
+        browser_status_bar.addWidget(
+            self.browser_status_summary_widget,
+            1,
+        )
         self.selected_detail_widget = QWidget(self)
         self.selected_detail_widget.setObjectName(
             "browser_selected_detail_widget"
@@ -5593,21 +5645,21 @@ class BrowserWindow(QMainWindow):
             )
             return
         count = self.item_model.rowCount()
-        total_count = self.item_model.source_count
-        selected = self.item_model.item_at(self.list_view.currentIndex())
-        folder = str(self.current_path) if self.current_path is not None else ""
-        count_text = (
-            f"{count}/{total_count}件"
-            if self.browser_filter_state.active
-            else f"{count}件"
-        )
-        message = f"{folder} — {count_text}"
-        if selected is not None:
-            message += f" — 選択: {selected.display_name}"
-            selected_count = len(self.list_view.selectionModel().selectedIndexes())
-            if selected_count > 1:
-                message += f" ほか{selected_count - 1}件"
-        self.statusBar().showMessage(message)
+        selected_indexes = self.list_view.selectionModel().selectedIndexes()
+        selected_text = ""
+        if len(selected_indexes) == 1:
+            selected = self.item_model.item_at(selected_indexes[0])
+            if selected is not None:
+                selected_text = str(selected.path)
+        elif len(selected_indexes) > 1:
+            selected_text = f"{len(selected_indexes)} 個を選択"
+
+        self.browser_item_count_label.setText(f"{count} 個の項目")
+        if self.browser_selected_path_edit.text() != selected_text:
+            self.browser_selected_path_edit.setText(selected_text)
+            self.browser_selected_path_edit.setCursorPosition(0)
+            self.browser_selected_path_edit.deselect()
+        self.statusBar().clearMessage()
 
     def _show_temporary_status(self, message: str, timeout_ms: int = 3000) -> None:
         self._status_message_token += 1

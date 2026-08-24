@@ -8,9 +8,10 @@ from unittest.mock import patch
 
 import pytest
 from PIL import Image
-from PySide6.QtCore import QItemSelectionModel
+from PySide6.QtCore import QItemSelectionModel, QPoint, Qt
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QApplication
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QSizePolicy
 
 from app.browser_model import BrowserItem, BrowserItemKind
 from app.browser_thumbnail_scheduler import ThumbnailPriority
@@ -21,6 +22,7 @@ from app.browser_window import (
     BROWSER_NAVIGATION_ICON_SIZE,
     BROWSER_NAVIGATION_TOOLBAR_MARGINS,
     BROWSER_NAVIGATION_TOOLBAR_MIN_HEIGHT,
+    BROWSER_STATUS_LEFT_SPACING,
     BROWSER_STATUS_DETAIL_SPACING,
     BROWSER_STATUS_BAR_MIN_IDLE_HEIGHT,
     BrowserWindow,
@@ -728,10 +730,13 @@ def test_status_omits_redundant_view_state_and_uses_stable_metadata_slots(
     try:
         window._update_status()
         message = window.statusBar().currentMessage()
+        assert message == ""
         assert "更新日時" not in message
         assert "降順" not in message
         assert "表示:" not in message
         assert "表示：" not in message
+        assert window.browser_item_count_label.text() == "2 個の項目"
+        assert window.browser_selected_path_edit.text() == ""
 
         size_geometry = window.file_size_label.geometry()
         detail_geometry = window.file_detail_label.geometry()
@@ -749,6 +754,7 @@ def test_status_omits_redundant_view_state_and_uses_stable_metadata_slots(
         )
 
         _select(window, folder, qapp)
+        assert window.browser_selected_path_edit.text() == str(folder)
         assert window.file_size_label.text() == "—"
         assert window.file_detail_label.text() == "120 ページ"
 
@@ -762,5 +768,104 @@ def test_status_omits_redundant_view_state_and_uses_stable_metadata_slots(
         assert window.file_size_label.text().endswith("B")
         assert "サイズ" not in window.file_size_label.text()
         assert window.file_detail_label.text() == "640 × 480"
+    finally:
+        _close(window, qapp)
+
+
+def test_status_left_fields_follow_visible_filter_and_copy_full_selection_path(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    long_parent = tmp_path / ("長いフォルダ" * 5)
+    long_parent.mkdir()
+    first = long_parent / (("選択した画像" * 5) + "-keep.jpg")
+    second = tmp_path / "second-keep.jpg"
+    hidden = tmp_path / "filtered-out.jpg"
+    for path in (first, second, hidden):
+        path.write_bytes(b"probe mocked")
+
+    window = BrowserWindow(
+        config_manager=_config(tmp_path),
+        restore_initial_location=False,
+    )
+    window.current_path = tmp_path
+    window.item_model.set_items(
+        [
+            _item(first, BrowserItemKind.IMAGE),
+            _item(second, BrowserItemKind.IMAGE),
+            _item(hidden, BrowserItemKind.IMAGE),
+        ]
+    )
+    window.resize(720, 620)
+    window.show()
+    qapp.processEvents()
+    try:
+        window._update_status()
+        assert window.browser_item_count_label.text() == "3 個の項目"
+        assert window.browser_selected_path_edit.text() == ""
+        assert window.browser_selected_path_edit.isReadOnly()
+        assert (
+            window.browser_status_summary_widget.layout().spacing()
+            == BROWSER_STATUS_LEFT_SPACING
+        )
+        assert (
+            window.browser_selected_path_edit.sizePolicy().horizontalPolicy()
+            == QSizePolicy.Policy.Expanding
+        )
+
+        window.browser_search_edit.setText("keep")
+        window._apply_pending_browser_search()
+        qapp.processEvents()
+        assert window.item_model.rowCount() == 2
+        assert window.browser_item_count_label.text() == "2 個の項目"
+
+        _select(window, first, qapp)
+        full_path = str(first)
+        assert window.browser_selected_path_edit.text() == full_path
+        assert "選択:" not in window.browser_selected_path_edit.text()
+        assert (
+            window.browser_selected_path_edit.fontMetrics().horizontalAdvance(
+                full_path
+            )
+            > window.browser_selected_path_edit.width()
+        )
+        window.browser_selected_path_edit.setFocus()
+        window.browser_selected_path_edit.selectAll()
+        QApplication.clipboard().clear()
+        QTest.keyClick(
+            window.browser_selected_path_edit,
+            Qt.Key.Key_C,
+            Qt.KeyboardModifier.ControlModifier,
+        )
+        assert QApplication.clipboard().text() == full_path
+
+        right_slot_positions = (
+            window.file_size_label.mapTo(window, QPoint()).x(),
+            window.file_detail_label.mapTo(window, QPoint()).x(),
+        )
+        selection = window.list_view.selectionModel()
+        second_index = window.item_model.index(
+            window.item_model.row_for_path(second),
+            0,
+        )
+        selection.select(
+            second_index,
+            QItemSelectionModel.SelectionFlag.Select,
+        )
+        qapp.processEvents()
+        assert window.browser_selected_path_edit.text() == "2 個を選択"
+        assert (
+            window.file_size_label.mapTo(window, QPoint()).x(),
+            window.file_detail_label.mapTo(window, QPoint()).x(),
+        ) == right_slot_positions
+
+        selection.clearSelection()
+        qapp.processEvents()
+        assert window.browser_selected_path_edit.text() == ""
+        assert window.statusBar().currentMessage() == ""
+        assert (
+            window.file_size_label.mapTo(window, QPoint()).x(),
+            window.file_detail_label.mapTo(window, QPoint()).x(),
+        ) == right_slot_positions
     finally:
         _close(window, qapp)

@@ -860,9 +860,10 @@ def test_status_count_uses_model_row_count_without_materializing_items(
     ):
         window._update_status(force=True)
 
-    assert f" — {item_count}件" in window.statusBar().currentMessage()
+    assert window.browser_item_count_label.text() == f"{item_count} 個の項目"
+    assert window.statusBar().currentMessage() == ""
     if item_count > 1:
-        assert "ほか1件" in window.statusBar().currentMessage()
+        assert window.browser_selected_path_edit.text() == "2 個を選択"
     window.close()
     qapp.processEvents()
 
