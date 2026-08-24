@@ -6269,3 +6269,45 @@ completion時のselected status refreshである。NivisViewer側対応は`app/b
 `app/browser_rating_filter_widget.py`、`app/thumbnail_provider.py`と既存`BrowserItem` / thumbnail SQLite authorityである。
 WinForms control、`FileCountArray`、BOOK binary serializerは移植していない。必要なlicense本文とcopyright noticeはsection 1記載の
 `licenses/ZipPlaFork/AGPL.txt` / `licenses/ZipPlaFork/About.txt`に保持している。
+
+## 36. Browser status left-side count / selected path（2026-08-25）
+
+### 36.1 ZipPlaForkのCatalog status behavior
+
+固定revision `07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`の
+`source/ZipPla/CatalogForm.cs` class `CatalogForm`は、`CatalogForm_Load`で
+`ToolStripSpringTextBox selectedFileNameToolStripTextBox`をread-onlyにし、status stripの
+`itemsCountToolStripStatusLabel`とright-side metadata slotの間へ挿入する。このtextboxは残り幅を受け持ち、
+single selectionでは`ShowStatusBar(IEnumerable<int>)`が`ZipPathArray[selectedIndex]`のフルパスを入れる。
+multiple selectionでは`Message._1ItemsAreSelected`にselection countを投影し、zero selectionでは空文字にする。
+
+`tvCatalog_ShowIndexToDataIndexChanged`は`tvCatalog.ShowIndexToDataIndex.Length`を
+`itemsCountToolStripStatusLabel`へ投影する。これはraw directory entry countではなく、Catalogが実際に
+表示するfilter/sort mappingの要素数である。`ShowStatusBar`は同時にright-side size/page/resolutionを更新するが、
+left-side textboxの長さでそれらのfixed slot幅を変えない。
+
+### 36.2 NivisViewerのprojection
+
+idle statusのplain messageを、left-aligned item-count `QLabel`とread-only/frameless `QLineEdit`の組み合わせへ
+置き換えた。countはcanonical visible modelの`BrowserItemModel.rowCount()`を`N 個の項目`として表示し、
+search/rating filterでvisible orderが変われば同じupdate pathで更新する。path fieldはsingle selectionで
+`BrowserItem.path`の全文字列、multiple selectionで`N 個を選択`、zero selectionで空文字を持つ。
+single pathは長くてもelideせずcontrol内に保持し、focus/select/Ctrl+Cでcopyできる。
+
+count/path間は12 logical pxの明示spacingで、path editだけがflexible middle widthを受け持つ。
+section 35のfixed-width/right-aligned sizeとpage-count/resolution slotはpermanent widgetのままで、pathの長さや
+selection countで位置を変えない。loading/error/file-operationは従来の`QStatusBar.showMessage`でnormal
+left widgetを一時的に隠すため、既存の運用status lifecycleは保持する。
+
+### 36.3 Provenance
+
+参照元repositoryは`himamon/ZipPlaFork`、固定revisionは
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`、licenseはAGPL-3.0-or-laterである。
+materially referencedしたfile/class/method/processは`source/ZipPla/CatalogForm.cs` class `CatalogForm`の
+field `itemsCountToolStripStatusLabel` / `selectedFileNameToolStripTextBox`、`CatalogForm_Load`、
+`ShowStatusBar()` / `ShowStatusBar(IEnumerable<int>)`、`tvCatalog_ShowIndexToDataIndexChanged`、
+`SelectedFileNameToolStripTextBox_TextChanged`、`statusStrip_SizeChanged`である。materially derivedしたbehaviorは
+visible mapping count、single full path、multiple-selection summary、zero-selection empty text、read-only selectable flexible field、
+fixed right-side metadataとの幅分離である。NivisViewer側対応は`app/browser_window.py`とfocused offscreen testsである。
+WinForms `ToolStripSpringTextBox`やZipPlaFork source codeの直接移植は行っていない。必要なlicense本文とcopyright noticeは
+section 1記載の`licenses/ZipPlaFork/AGPL.txt` / `licenses/ZipPlaFork/About.txt`に保持している。
