@@ -223,16 +223,86 @@ def test_delayed_dimensions_do_not_snap_sliding_anchor() -> None:
     assert _indexes(model) == [2, 3]
 
 
-def test_display_unit_navigation_leaves_sliding_mode() -> None:
+def test_display_unit_navigation_preserves_shifted_alignment_and_reverses() -> None:
     model = _model([(80, 120)] * 7)
     model.go_to_index(1)
     model.next_single()
     assert _indexes(model) == [2, 3]
 
     model.next()
-
     assert _indexes(model) == [4, 5]
-    assert not model.sliding_spread
+    assert model.sliding_spread
+
+    model.previous()
+    assert _indexes(model) == [2, 3]
+    assert model.sliding_spread
+
+
+def test_delayed_dimensions_do_not_snap_shifted_display_unit() -> None:
+    sizes = [(80, 120)] * 7
+    source = _MemorySource(sizes)
+    source.load_sizes_lazily = True
+    model = PageModel()
+    model.update_options(
+        view_mode="spread",
+        reading_direction="ltr",
+        single_first_page=True,
+        treat_wide_image_as_single=True,
+    )
+    model.set_prepared_source(source, source.list_images())
+    model.go_to_index(1)
+    model.next_single()
+    model.next()
+    assert _indexes(model) == [4, 5]
+
+    changed = model.set_image_size(6, (80, 120))
+
+    assert not changed
+    assert model.current_index == 4
+    assert _indexes(model) == [4, 5]
+
+
+def test_fullscreen_status_wheel_then_canvas_keeps_display_unit_alignment(
+    tmp_path: Path,
+    qapp,
+    monkeypatch,
+) -> None:
+    window, _pages = _viewer_with_pages(tmp_path, qapp, page_count=9)
+    controller = window.fullscreen_chrome
+    monkeypatch.setattr(
+        controller,
+        "_apply_native_fullscreen_frame",
+        lambda _fullscreen: None,
+    )
+    window.next_page()
+    _wait_for_applied_display(window, qapp)
+    assert _indexes(window.model) == [1, 2]
+    window.config.apply({"viewer_slider_wheel_single_page_enabled": True})
+    controller.set_fullscreen_state(True, hide_ui=True, hide_cursor=False)
+    controller.show_bottom()
+    qapp.processEvents()
+
+    bottom_event = _wheel(
+        controller.fullscreen_status_bar,
+        angle_y=-120,
+    )
+    assert bottom_event.isAccepted()
+    _wait_for_applied_display(window, qapp)
+    assert _indexes(window.model) == [2, 3]
+
+    canvas_forward = _wheel(window.viewer, angle_y=-120)
+    assert canvas_forward.isAccepted()
+    _wait_for_applied_display(window, qapp)
+    assert _indexes(window.model) == [4, 5]
+
+    canvas_reverse = _wheel(window.viewer, angle_y=120)
+    assert canvas_reverse.isAccepted()
+    _wait_for_applied_display(window, qapp)
+    assert _indexes(window.model) == [2, 3]
+
+    window.prepare_shutdown()
+    window.close()
+    qapp.processEvents()
 
 
 def test_page_navigation_controller_never_opens_books() -> None:
