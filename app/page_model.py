@@ -308,13 +308,40 @@ class PageModel:
             return spread.start_index
         return next_index
 
-    def previous_index_from(self, start_index: int) -> int:
+    def previous_index_from(
+        self,
+        start_index: int,
+        *,
+        preserve_alignment: bool = False,
+    ) -> int:
         if self.total_pages == 0:
             return 0
+        if preserve_alignment:
+            start_index = max(0, min(start_index, self.total_pages - 1))
+        if preserve_alignment and start_index > 0:
+            # A one-page command may deliberately shift a spread away from
+            # the fixed topology. Find the preceding unit whose normal
+            # forward edge reaches this exact anchor, rather than snapping
+            # through the fixed-boundary lookup below.
+            candidate = start_index - 1
+            while candidate >= 0:
+                candidate_next = self.next_index_from(candidate)
+                if candidate_next == start_index:
+                    return candidate
+                if candidate_next < start_index:
+                    break
+                candidate -= 1
         start_index = self.spread_start_for_index(start_index)
         if start_index <= 0:
             return 0
         return self.spread_start_for_index(start_index - 1)
+
+    def _uses_shifted_spread_anchor(self, index: int) -> bool:
+        return bool(
+            self.view_mode == "spread"
+            and self.total_pages > 0
+            and index != self.spread_start_for_index(index)
+        )
 
     def go_to_index(self, index: int) -> None:
         if not self.total_pages:
@@ -346,15 +373,35 @@ class PageModel:
 
     def next(self) -> None:
         if self.total_pages:
+            preserve_alignment = self._sliding_spread
             self.current_index = self.next_index_from(self.current_index)
             self._focused_page_identity = self.page_identity(self.current_index)
-            self._sliding_spread = False
+            if preserve_alignment:
+                self._sliding_spread = self._uses_shifted_spread_anchor(
+                    self.current_index
+                )
+            else:
+                self._sliding_spread = False
 
     def previous(self) -> None:
         if self.total_pages:
-            self.current_index = self.previous_index_from(self.current_index)
+            preserve_alignment = self._sliding_spread
+            if preserve_alignment:
+                self.current_index = self.previous_index_from(
+                    self.current_index,
+                    preserve_alignment=True,
+                )
+            else:
+                self.current_index = self.previous_index_from(
+                    self.current_index
+                )
             self._focused_page_identity = self.page_identity(self.current_index)
-            self._sliding_spread = False
+            if preserve_alignment:
+                self._sliding_spread = self._uses_shifted_spread_anchor(
+                    self.current_index
+                )
+            else:
+                self._sliding_spread = False
 
     def first(self) -> None:
         self.current_index = 0

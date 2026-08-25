@@ -505,6 +505,8 @@ PageModel
 
 矢印、Space、Backspace、Viewer canvas上の通常wheel、メニューの次／前は`next_display_unit`／`previous_display_unit`として従来の固定表示単位を進みます。canvasのraw key press/repeat/releaseとwheelのdevice timestampはpage移動の意味とは別のinput kindとしてWindowへ渡し、QShortcutへ縮退して初回とrepeatを混同しません。slider wheelと設定既定のcanvas左クリックだけが論理1ページ移動です。見開きでは`[2,3] → [3,4] → [4,5]`のsliding spreadを許可し、RTLは画面上の並びだけを反転します。表紙単独は`[0] → [1,2]`、anchorまたは次ページが横長なら該当規則に従って単独表示し、末尾では現在の本の範囲にclampします。画像寸法の後着はfocused identityとsliding anchorを維持します。
 
+single-page移動でずらしたanchorからdisplay-unit移動へ戻った場合も、ずらしalignmentは`PageModel`内で維持する。これにより`[2,3] → [4,5] → [2,3]`の順逆移動を対称にし、画像寸法の後着で移行後の`[4,5]`が固定boundaryの`[3,4]`へスナップしない。
+
 Viewer canvasのsingle clickはOSのdouble-click intervalまで保留します。drag threshold以上は、fit状態で実際にpanできない場合も`Panning`としてclickを破棄します。double clickはpending single clickを取消して全画面切替だけを実行します。modifier、overlay／edge trigger、popup／modal、drop、mouse gesture、focus out、Esc、Viewer終了、BookSession generationまたはfocused identity変更でもpending clickを破棄します。`viewer_canvas_left_click_action`は`next_single_page`、`next_display_unit`、`none`を選択でき、Applyは共有ConfigManager経由で既存Viewerへ即時反映されます。
 
 ### Sprint 17追補の入力状態とpage identity
