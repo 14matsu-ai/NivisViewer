@@ -533,15 +533,17 @@ def test_folder_one_axis_prefetch_budgets_complete_display_unit(
         expect_admitted=False,
     )
 
-    # Each tall page alone fit the same 2.401 MB snapshot used by the former
-    # page-local check.  Both missing native JPEG tiers plus their complete
-    # spread do not, so neither page may begin pixel decode.
+    # One tall page fits after including the safely reclaimable current source,
+    # but the complete two-page unit does not. Admission deliberately budgets
+    # free bytes plus lower-rank sources whose independent display-ready frame
+    # remains paintable; 1.501 MB free + the current ~1.2 MB preview is still
+    # below the complete spread's ~3.0 MB source-and-frame cost.
     exercise(
         tmp_path / "spread-total",
         sizes=((200, 6000), (200, 6000), (200, 6000)),
         viewport=(100, 100),
         decoder_maximum=(100, None),
-        free_bytes=2_401_000,
+        free_bytes=1_501_000,
         expect_admitted=False,
     )
 

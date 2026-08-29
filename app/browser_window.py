@@ -72,6 +72,10 @@ from .browser_model import (
     BrowserItemModel,
     browser_item_from_scan_entry,
 )
+from .browser_directory_watcher import (
+    BrowserDirectoryChange,
+    BrowserDirectoryWatcher,
+)
 from .app_icon import install_window_icon
 from .browser_main_drop import (
     BrowserMainDropController,
@@ -197,6 +201,7 @@ BROWSER_STATUS_BAR_SPACING = 3
 BROWSER_STATUS_LEFT_SPACING = 12
 BROWSER_STATUS_DETAIL_SPACING = 14
 BROWSER_STATUS_BAR_MIN_IDLE_HEIGHT = 22
+BROWSER_DIRECTORY_CHANGE_COALESCE_MS = 80
 
 
 @dataclass(frozen=True)
@@ -237,6 +242,8 @@ class _PendingDirectoryScan:
     remaining_item_offset: int = 0
     trace_id: int = 0
     navigation_source: str = "interactive"
+    atomic_restore: bool = False
+    directory_watch_dirty: bool = False
     first_batch_arrived: bool = False
     first_batch_applied: bool = False
 
@@ -346,6 +353,7 @@ class BrowserWindow(QMainWindow):
         open_path_handler: BrowserOpenHandler | None = None,
         discovery: BrowserItemDiscovery | None = None,
         scanner: BrowserDirectoryScanner | None = None,
+        directory_watcher: BrowserDirectoryWatcher | None = None,
         thumbnail_provider: BrowserThumbnailProvider | None = None,
         metadata_store: MetadataStore | None = None,
         file_operation_coordinator: FileOperationCoordinator | None = None,
@@ -410,6 +418,9 @@ class BrowserWindow(QMainWindow):
         self.file_operation_coordinator.operation_completed.connect(
             self._on_file_operation_completed
         )
+        self.file_operation_coordinator.operation_completed.connect(
+            self._release_deferred_directory_change
+        )
         self.file_operation_coordinator.conflicts_required.connect(
             self._on_file_operation_conflicts_required
         )
@@ -422,6 +433,13 @@ class BrowserWindow(QMainWindow):
         self.scanner.batch_ready.connect(self._on_scan_batch)
         self.scanner.scan_completed.connect(self._on_scan_completed)
         self.scanner.scan_failed.connect(self._on_scan_failed)
+        self._owns_directory_watcher = directory_watcher is None
+        self.directory_watcher = directory_watcher or BrowserDirectoryWatcher(
+            self
+        )
+        self.directory_watcher.directory_changed.connect(
+            self._on_directory_changed
+        )
         self.location_directory_loader = LocationDirectoryLoader(self)
         self.location_directory_loader.completed.connect(
             self._on_location_directory_loaded
@@ -497,6 +515,9 @@ class BrowserWindow(QMainWindow):
         self._generation = self.thumbnail_provider.generation
         self._scan_generation = 0
         self._pending_scan: _PendingDirectoryScan | None = None
+        self._directory_watch_generation = 0
+        self._directory_watch_path: Path | None = None
+        self._directory_change_pending = False
         self._pending_tree_navigation_path: Path | None = None
         self._deferred_tree_sync_generation: int | None = None
         self._first_paint_pending_generation: int | None = None
@@ -744,6 +765,14 @@ class BrowserWindow(QMainWindow):
         self._scan_batch_timer.setSingleShot(True)
         self._scan_batch_timer.setInterval(120)
         self._scan_batch_timer.timeout.connect(self._flush_pending_scan_batch)
+        self._directory_change_timer = QTimer(self)
+        self._directory_change_timer.setSingleShot(True)
+        self._directory_change_timer.setInterval(
+            BROWSER_DIRECTORY_CHANGE_COALESCE_MS
+        )
+        self._directory_change_timer.timeout.connect(
+            self._flush_directory_changes
+        )
         self._build_ui()
         QTimer.singleShot(1000, self, self._run_idle_cache_cleanup)
         self.config.settings_changed.connect(self.apply_settings)
@@ -828,22 +857,13 @@ class BrowserWindow(QMainWindow):
         failure_history_revert: str | int | None = None,
         navigation_source: str = "interactive",
         trace_id: int = 0,
+        atomic_restore: bool = False,
     ) -> bool:
         if trace_id:
             performance_trace.mark(trace_id, "navigation.navigate_to.called")
         if not self._starting_drop_focus_navigation:
             self._cancel_browser_drop_focus()
         target = self._absolute_browser_path(path)
-
-        same_path = self._same_path(self.current_path, target)
-        if same_path and not force_reload:
-            if restore_location is not None:
-                self._schedule_location_restore(restore_location)
-            if navigation_source != "favorite":
-                self._sync_tree_to_path(target)
-            self._sync_address_bar()
-            self._update_navigation_actions()
-            return True
 
         pending = self._pending_scan
         if (
@@ -854,11 +874,27 @@ class BrowserWindow(QMainWindow):
             pending.restore_location = (
                 restore_location or pending.restore_location
             )
+            pending.atomic_restore = pending.atomic_restore or atomic_restore
+            return True
+
+        same_path = self._same_path(self.current_path, target)
+        if same_path and not force_reload:
+            if pending is not None:
+                self._cancel_pending_scan(
+                    rollback_history=not atomic_restore,
+                )
+                self._restore_current_directory_watch()
+            if restore_location is not None:
+                self._schedule_location_restore(restore_location)
+            if navigation_source != "favorite":
+                self._sync_tree_to_path(target)
+            self._sync_address_bar()
+            self._update_navigation_actions()
             return True
 
         if capture_current:
             self._update_current_navigation_state()
-        self._cancel_pending_scan(rollback_history=True)
+        self._cancel_pending_scan(rollback_history=not atomic_restore)
         self._scan_generation += 1
         if trace_id:
             performance_trace.mark(
@@ -894,10 +930,14 @@ class BrowserWindow(QMainWindow):
             failure_history_revert=failure_history_revert,
             trace_id=trace_id,
             navigation_source=navigation_source,
+            atomic_restore=atomic_restore,
         )
+        if not self._same_path(self._directory_watch_path, target):
+            self._set_active_directory_watch(target)
         self.address_bar.setText(str(target))
         if not self.scanner.start(request):
             self._pending_scan = None
+            self._restore_current_directory_watch()
             self._show_temporary_status("フォルダへアクセスできません")
             self._sync_address_bar()
             return False
@@ -959,6 +999,7 @@ class BrowserWindow(QMainWindow):
             self._discard_pending_scan_buffers(pending)
             self._pending_scan = None
             self._pending_browser_focus = None
+            self._restore_current_directory_watch()
             self._update_status()
             return
 
@@ -991,7 +1032,10 @@ class BrowserWindow(QMainWindow):
                     preserve_thumbnails=True,
                 )
                 if self._pending_browser_focus is None:
-                    self._schedule_list_view_state_restore(state)
+                    self._schedule_list_view_state_restore(
+                        state,
+                        update_navigation_history=True,
+                    )
                 self._restore_location(
                     pending.restore_location,
                     update_status=False,
@@ -999,7 +1043,11 @@ class BrowserWindow(QMainWindow):
         else:
             pending.buffered_entries.clear()
             self._commit_pending_scan(pending)
-            initial_count = self._initial_scan_item_count(len(items))
+            initial_count = (
+                len(items)
+                if pending.atomic_restore
+                else self._initial_scan_item_count(len(items))
+            )
             initial_items = items[:initial_count]
             if initial_count < len(items):
                 pending.remaining_items = items
@@ -1008,6 +1056,12 @@ class BrowserWindow(QMainWindow):
                 initial_items,
                 generation=pending.generation,
             )
+            if pending.atomic_restore:
+                # Model reset invalidates the scroll range until the view lays
+                # out the new grid.  Resolve that geometry in this same event
+                # turn so a no-selection history entry can restore its saved
+                # scrollbar position before the first paint.
+                self.list_view.doItemsLayout()
             pending.first_batch_applied = True
             if pending.trace_id:
                 performance_trace.mark(
@@ -1032,10 +1086,11 @@ class BrowserWindow(QMainWindow):
         if self._pending_scan is not pending:
             return
         self._apply_pending_browser_focus(final=True)
+        reconcile_again = pending.directory_watch_dirty
         self._pending_scan = None
         self.directory_scan_committed.emit(str(pending.path))
         self._update_status()
-        if pending.refresh:
+        if pending.refresh and pending.navigation_source != "filesystem_watch":
             QTimer.singleShot(
                 0,
                 lambda: (
@@ -1047,11 +1102,23 @@ class BrowserWindow(QMainWindow):
         if self._operation_refresh_generation == pending.generation:
             self._operation_refresh_generation = None
             QTimer.singleShot(0, self._restore_file_operation_selection)
+        if reconcile_again:
+            self._schedule_directory_reconciliation()
 
     def _on_scan_failed(self, error: BrowserScanError) -> None:
         pending = self._matching_pending_scan(error.generation, error.path)
         if pending is None or self._shutdown_prepared:
             return
+        recover_missing_watched_directory = bool(
+            pending.refresh
+            and pending.navigation_source == "filesystem_watch"
+            and error.status
+            in {
+                BrowserScanStatus.NOT_FOUND,
+                BrowserScanStatus.NOT_DIRECTORY,
+            }
+            and self._same_path(self.current_path, pending.path)
+        )
         if pending.navigation_source == "recent_location":
             self.navigation_history.remove_recent(str(pending.path))
         if pending.committed:
@@ -1064,6 +1131,10 @@ class BrowserWindow(QMainWindow):
         self._pending_scan = None
         self._pending_browser_focus = None
         self._scan_batch_timer.stop()
+        if recover_missing_watched_directory:
+            self._clear_active_directory_watch()
+        else:
+            self._restore_current_directory_watch()
         self._sync_address_bar()
         self._update_navigation_actions()
         if error.status is BrowserScanStatus.NOT_FOUND:
@@ -1073,6 +1144,13 @@ class BrowserWindow(QMainWindow):
         else:
             message = "フォルダへアクセスできません"
         self._show_temporary_status(message)
+        if recover_missing_watched_directory:
+            parent = pending.path.parent
+            if not self._same_path(parent, pending.path):
+                self.navigate_to(
+                    parent,
+                    navigation_source="filesystem_watch_recovery",
+                )
 
     def _commit_pending_scan(self, pending: _PendingDirectoryScan) -> None:
         if pending.committed:
@@ -1095,6 +1173,7 @@ class BrowserWindow(QMainWindow):
         self._first_paint_pending_generation = pending.generation
         self._first_paint_trace_id = pending.trace_id
         self.list_view.notify_after_next_paint()
+        self._ensure_pending_directory_watch(pending)
         self._sync_address_bar()
         self._update_navigation_actions()
 
@@ -1152,6 +1231,7 @@ class BrowserWindow(QMainWindow):
             failure_history_revert=pending.failure_history_revert,
             navigation_source=pending.navigation_source,
             trace_id=pending.trace_id,
+            atomic_restore=pending.atomic_restore,
         )
 
     @staticmethod
@@ -1261,6 +1341,7 @@ class BrowserWindow(QMainWindow):
             restore_location=location,
             capture_current=False,
             failure_history_revert="forward",
+            atomic_restore=True,
         ):
             return True
         self.navigation_history.go_forward()
@@ -1279,6 +1360,7 @@ class BrowserWindow(QMainWindow):
             restore_location=location,
             capture_current=False,
             failure_history_revert="back",
+            atomic_restore=True,
         ):
             return True
         self.navigation_history.go_back()
@@ -1300,6 +1382,7 @@ class BrowserWindow(QMainWindow):
             restore_location=location,
             capture_current=False,
             failure_history_revert=previous_index,
+            atomic_restore=True,
         ):
             return True
         self.navigation_history.go_to(previous_index)
@@ -1322,6 +1405,9 @@ class BrowserWindow(QMainWindow):
         )
 
     def refresh_current_folder(self) -> bool:
+        return self._refresh_current_folder(navigation_source="manual_refresh")
+
+    def _refresh_current_folder(self, *, navigation_source: str) -> bool:
         if self.current_path is None:
             return False
         location = self._current_location()
@@ -1330,9 +1416,113 @@ class BrowserWindow(QMainWindow):
             record_history=False,
             restore_location=location,
             force_reload=True,
+            navigation_source=navigation_source,
         ):
             return False
         return True
+
+    def _set_active_directory_watch(self, path: str | Path) -> None:
+        if self._shutdown_prepared:
+            return
+        target = self._absolute_browser_path(path)
+        self._directory_watch_generation += 1
+        generation = self._directory_watch_generation
+        watched = self.directory_watcher.watch(str(target), generation)
+        self._directory_watch_path = target if watched else None
+
+    def _clear_active_directory_watch(self) -> None:
+        self._directory_watch_generation += 1
+        self._directory_watch_path = None
+        self._directory_change_pending = False
+        if hasattr(self, "_directory_change_timer"):
+            self._directory_change_timer.stop()
+        self.directory_watcher.clear()
+
+    def _restore_current_directory_watch(self) -> None:
+        if self._shutdown_prepared:
+            return
+        if self.current_path is None:
+            self._clear_active_directory_watch()
+            return
+        if self._same_path(self._directory_watch_path, self.current_path):
+            return
+        self._set_active_directory_watch(self.current_path)
+
+    def _ensure_pending_directory_watch(
+        self,
+        pending: _PendingDirectoryScan,
+    ) -> None:
+        if not self._same_path(self._directory_watch_path, pending.path):
+            self._set_active_directory_watch(pending.path)
+
+    def _on_directory_changed(self, change: BrowserDirectoryChange) -> None:
+        if self._shutdown_prepared:
+            return
+        if change.generation != self._directory_watch_generation:
+            return
+        changed_path = Path(change.path)
+        if not self._same_path(self._directory_watch_path, changed_path):
+            return
+        pending = self._pending_scan
+        if pending is not None:
+            if self._same_path(pending.path, changed_path):
+                pending.directory_watch_dirty = True
+            return
+        if not self._same_path(self.current_path, changed_path):
+            return
+        self._directory_change_pending = True
+        self._directory_change_timer.start()
+
+    def _schedule_directory_reconciliation(self) -> None:
+        if self._shutdown_prepared or self.current_path is None:
+            return
+        if not self._same_path(
+            self.current_path,
+            self._directory_watch_path,
+        ):
+            return
+        self._directory_change_pending = True
+        self._directory_change_timer.start()
+
+    def _flush_directory_changes(self) -> None:
+        self._directory_change_timer.stop()
+        if not self._directory_change_pending or self._shutdown_prepared:
+            return
+        if self.file_operation_coordinator.busy:
+            return
+        if self.current_path is None or not self._same_path(
+            self.current_path,
+            self._directory_watch_path,
+        ):
+            self._directory_change_pending = False
+            return
+        pending = self._pending_scan
+        if pending is not None:
+            if self._same_path(pending.path, self.current_path):
+                pending.directory_watch_dirty = True
+            self._directory_change_pending = False
+            return
+        self._directory_change_pending = False
+        self._refresh_current_folder(navigation_source="filesystem_watch")
+
+    def _release_deferred_directory_change(
+        self,
+        _result: FileOperationResult,
+    ) -> None:
+        if not self._directory_change_pending or self._shutdown_prepared:
+            return
+        pending = self._pending_scan
+        if (
+            pending is not None
+            and pending.refresh
+            and self._same_path(pending.path, self.current_path)
+        ):
+            # The production file-operation refresh is already a complete
+            # reconciliation of this directory, so it absorbs notifications
+            # accumulated while that operation was running.
+            self._directory_change_pending = False
+            return
+        self._directory_change_timer.start()
 
     def _on_browser_folder_gesture(self, pattern: str) -> None:
         if not self.browser_folder_gestures_enabled:
@@ -1857,6 +2047,16 @@ class BrowserWindow(QMainWindow):
         self._show_temporary_status(f"{len(paths)}項目をコピー候補にしました")
         return True
 
+    def copy_selected_names(self) -> bool:
+        paths = self.selected_file_operation_paths()
+        if not paths:
+            return False
+        mime = QMimeData()
+        mime.setText("\n".join(Path(path).name for path in paths))
+        QApplication.clipboard().setMimeData(mime)
+        self._show_temporary_status(f"{len(paths)}項目の名前をコピーしました")
+        return True
+
     def cut_selected_items(self) -> bool:
         paths = self.selected_file_operation_paths()
         if not paths:
@@ -1948,19 +2148,35 @@ class BrowserWindow(QMainWindow):
         paths = self.selected_file_operation_paths()
         if not paths:
             return False
-        if len(paths) == 1:
-            prompt = f"「{Path(paths[0]).name}」をごみ箱へ移動しますか？"
-        else:
-            prompt = f"{len(paths)}項目をごみ箱へ移動しますか？"
-        answer = QMessageBox.question(
-            self,
-            "削除",
-            prompt,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return False
+        if not bool(
+            self.config.get(
+                "file_operation_delete_skip_confirmation",
+                False,
+            )
+        ):
+            if len(paths) == 1:
+                prompt = f"「{Path(paths[0]).name}」をごみ箱へ移動しますか？"
+            else:
+                prompt = f"{len(paths)}項目をごみ箱へ移動しますか？"
+            default_button = (
+                QMessageBox.StandardButton.Yes
+                if bool(
+                    self.config.get(
+                        "file_operation_delete_confirm_focus_yes",
+                        False,
+                    )
+                )
+                else QMessageBox.StandardButton.No
+            )
+            answer = QMessageBox.question(
+                self,
+                "削除",
+                prompt,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                default_button,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
         return self._start_file_operation(
             FileOperationKind.RECYCLE,
             sources=paths,
@@ -3049,6 +3265,9 @@ class BrowserWindow(QMainWindow):
         self.browser_main_drop.close()
         self.image_detail_probe.close()
         self._pending_browser_focus = None
+        self._clear_active_directory_watch()
+        if self._owns_directory_watcher:
+            self.directory_watcher.close()
         self._cancel_pending_scan(rollback_history=False)
         self.scanner.close()
         self.location_directory_loader.close()
@@ -3062,6 +3281,7 @@ class BrowserWindow(QMainWindow):
         self._scroll_idle_timer.stop()
         self._scan_status_timer.stop()
         self._scan_batch_timer.stop()
+        self._directory_change_timer.stop()
         self._save_window_state()
         self.thumbnail_provider.close()
         if self._owns_archive_backend_registry:
@@ -3469,6 +3689,7 @@ class BrowserWindow(QMainWindow):
                     ),
                     navigation_source=pending_scan.navigation_source,
                     trace_id=pending_scan.trace_id,
+                    atomic_restore=pending_scan.atomic_restore,
                 )
             elif self.current_path is not None:
                 self.refresh_current_folder()
@@ -5765,6 +5986,7 @@ class BrowserWindow(QMainWindow):
         state: _ListViewState,
         *,
         request_thumbnails: bool = True,
+        update_navigation_history: bool = False,
     ) -> None:
         self._list_view_restore_token += 1
         token = self._list_view_restore_token
@@ -5774,6 +5996,8 @@ class BrowserWindow(QMainWindow):
             if token != self._list_view_restore_token:
                 return
             self._restore_list_view_state(state)
+            if update_navigation_history:
+                self._update_current_navigation_state()
             if request_thumbnails:
                 self._schedule_thumbnail_requests()
 
@@ -5878,6 +6102,12 @@ class BrowserWindow(QMainWindow):
 
     def _update_current_navigation_state(self) -> None:
         if self.current_path is None:
+            return
+        current_history = self.navigation_history.current()
+        if current_history is None or not self._same_path(
+            self.current_path,
+            Path(current_history.path),
+        ):
             return
         location = self._current_location()
         self.navigation_history.update_current_view_state(
@@ -6323,6 +6553,9 @@ class BrowserWindow(QMainWindow):
         menu.addSeparator()
         cut_action = menu.addAction("切り取り")
         copy_action = menu.addAction("コピー")
+        copy_name_action = (
+            menu.addAction("名前をコピー") if selection_count > 0 else None
+        )
         paste_action = menu.addAction("貼り付け")
         cut_action.setEnabled(selection_count > 0 and not busy)
         copy_action.setEnabled(selection_count > 0 and not busy)
@@ -6361,6 +6594,8 @@ class BrowserWindow(QMainWindow):
             self.cut_selected_items()
         elif selected == copy_action:
             self.copy_selected_items()
+        elif copy_name_action is not None and selected == copy_name_action:
+            self.copy_selected_names()
         elif selected == paste_action:
             self.paste_items()
         elif selected == recycle_action:

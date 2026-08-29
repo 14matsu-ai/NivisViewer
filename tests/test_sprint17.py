@@ -95,7 +95,7 @@ def test_settings_dialog_is_scrollable_and_round_trips_sprint17_values(
 ) -> None:
     config = make_config(tmp_path)
     dialog = SettingsDialog(config)
-    assert len(dialog.findChildren(QScrollArea)) == 5
+    assert len(dialog.findChildren(QScrollArea)) == 6
     assert dialog.button_box.parent() is dialog
     assert dialog.button_box.button(QDialogButtonBox.StandardButton.Ok) is not None
 

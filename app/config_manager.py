@@ -114,6 +114,8 @@ class ConfigManager(QObject):
         "ffmpeg_executable": "",
         "browser_external_drop_behavior": "focus_only",
         "file_operation_destinations": [],
+        "file_operation_delete_confirm_focus_yes": False,
+        "file_operation_delete_skip_confirmation": False,
         "browser_sort_key": "name",
         "browser_sort_order": "ascending",
         "browser_folders_first": True,
@@ -359,6 +361,8 @@ class ConfigManager(QObject):
             "text_preview_enabled",
             "video_thumbnail_enabled",
             "video_thumbnail_shell_placeholder",
+            "file_operation_delete_confirm_focus_yes",
+            "file_operation_delete_skip_confirmation",
         ):
             if not isinstance(normalized.get(key), bool):
                 normalized[key] = cls.DEFAULTS[key]

@@ -5,10 +5,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from PIL import Image
-from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QPointF, Qt
 from PySide6.QtGui import QContextMenuEvent, QMouseEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QToolButton
+from PySide6.QtWidgets import QApplication, QListView, QToolButton
 
 from app.browser_window import BrowserWindow
 from app.browser_filter import BrowserFilterState, RatingFilterMode
@@ -39,6 +39,50 @@ def make_window(
 def finish_scan(window: BrowserWindow, qapp: QApplication) -> None:
     assert window.wait_for_scan()
     qapp.processEvents()
+
+
+class _ViewportPaintRecorder(QObject):
+    def __init__(self, window: BrowserWindow) -> None:
+        super().__init__(window)
+        self.window = window
+        self.states: list[tuple[str, str | None, str | None, int, int]] = []
+        window.list_view.viewport().installEventFilter(self)
+
+    def stop(self) -> None:
+        self.window.list_view.viewport().removeEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
+        if (
+            watched is self.window.list_view.viewport()
+            and event.type() == QEvent.Type.Paint
+        ):
+            current = self.window.item_model.item_at(
+                self.window.list_view.currentIndex()
+            )
+            anchor_index = self.window._visible_anchor_index()
+            anchor = self.window.item_model.item_at(anchor_index)
+            anchor_rect = self.window.list_view.visualRect(anchor_index)
+            self.states.append(
+                (
+                    str(self.window.current_path or ""),
+                    str(current.path) if current is not None else None,
+                    str(anchor.path) if anchor is not None else None,
+                    anchor_rect.y() if anchor_rect.isValid() else 0,
+                    self.window.list_view.verticalScrollBar().value(),
+                )
+            )
+        return False
+
+
+def _open_child_folder(
+    window: BrowserWindow,
+    child: Path,
+    qapp: QApplication,
+) -> None:
+    row = window.item_model.row_for_path(child)
+    assert row >= 0
+    window.open_item(window.item_model.index(row, 0))
+    finish_scan(window, qapp)
 
 
 def send_extra_button(
@@ -159,6 +203,201 @@ def test_back_restores_selection_and_scroll_position(
     )
     window.close()
     qapp.processEvents()
+
+
+def test_large_back_never_paints_parent_before_saved_selection_is_restored(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    for number in range(180):
+        write_image(parent / f"{number:03}.jpg")
+    window = make_window(tmp_path, parent, qapp)
+    selected = parent / "150.jpg"
+    index = window.item_model.index(window.item_model.row_for_path(selected), 0)
+    window.list_view.setCurrentIndex(index)
+    window.list_view.scrollTo(index, QListView.ScrollHint.PositionAtCenter)
+    qapp.processEvents()
+    saved_scroll = window.list_view.verticalScrollBar().value()
+    _open_child_folder(window, child, qapp)
+    recorder = _ViewportPaintRecorder(window)
+
+    try:
+        assert window.go_back()
+        finish_scan(window, qapp)
+
+        parent_paints = [
+            state for state in recorder.states if state[0] == str(parent.absolute())
+        ]
+        assert parent_paints
+        assert all(state[1] == str(selected.absolute()) for state in parent_paints)
+        restored = window.item_model.item_at(window.list_view.currentIndex())
+        assert restored is not None and restored.path == selected.absolute()
+        assert abs(
+            window.list_view.verticalScrollBar().value() - saved_scroll
+        ) <= window.list_view.gridSize().height()
+    finally:
+        recorder.stop()
+        window.close()
+        qapp.processEvents()
+
+
+def test_large_back_without_selection_first_paints_saved_anchor_and_offset(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    for number in range(180):
+        write_image(parent / f"{number:03}.jpg")
+    window = make_window(tmp_path, parent, qapp)
+    anchor_target = parent / "140.jpg"
+    index = window.item_model.index(
+        window.item_model.row_for_path(anchor_target),
+        0,
+    )
+    window.list_view.scrollTo(index, QListView.ScrollHint.PositionAtTop)
+    window.list_view.clearSelection()
+    window.list_view.setCurrentIndex(QModelIndex())
+    qapp.processEvents()
+    anchor_index = window._visible_anchor_index()
+    anchor_item = window.item_model.item_at(anchor_index)
+    assert anchor_item is not None
+    saved_anchor = str(anchor_item.path)
+    saved_offset = window.list_view.visualRect(anchor_index).y()
+    _open_child_folder(window, child, qapp)
+    recorder = _ViewportPaintRecorder(window)
+
+    try:
+        assert window.go_back()
+        finish_scan(window, qapp)
+
+        parent_paints = [
+            state for state in recorder.states if state[0] == str(parent.absolute())
+        ]
+        assert parent_paints
+        assert all(state[1] is None for state in parent_paints)
+        assert all(state[2] == saved_anchor for state in parent_paints), (
+            saved_anchor,
+            saved_offset,
+            parent_paints,
+        )
+        assert all(state[3] == saved_offset for state in parent_paints), (
+            saved_anchor,
+            saved_offset,
+            parent_paints,
+        )
+        assert not window.list_view.currentIndex().isValid()
+    finally:
+        recorder.stop()
+        window.close()
+        qapp.processEvents()
+
+
+def test_small_back_keeps_existing_selection_restore_behavior(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    for number in range(6):
+        write_image(parent / f"{number:03}.jpg")
+    window = make_window(tmp_path, parent, qapp)
+    selected = parent / "004.jpg"
+    window.list_view.setCurrentIndex(
+        window.item_model.index(window.item_model.row_for_path(selected), 0)
+    )
+    _open_child_folder(window, child, qapp)
+    recorder = _ViewportPaintRecorder(window)
+
+    try:
+        assert window.go_back()
+        finish_scan(window, qapp)
+        parent_paints = [
+            state for state in recorder.states if state[0] == str(parent.absolute())
+        ]
+        assert parent_paints
+        assert all(state[1] == str(selected.absolute()) for state in parent_paints)
+    finally:
+        recorder.stop()
+        window.close()
+        qapp.processEvents()
+
+
+def test_forward_never_paints_large_folder_before_saved_state_is_restored(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    first = tmp_path / "first"
+    second = first / "second"
+    second.mkdir(parents=True)
+    for number in range(90):
+        write_image(first / f"first-{number:03}.jpg")
+        write_image(second / f"second-{number:03}.jpg")
+    window = make_window(tmp_path, first, qapp)
+    _open_child_folder(window, second, qapp)
+    selected = second / "second-075.jpg"
+    index = window.item_model.index(window.item_model.row_for_path(selected), 0)
+    window.list_view.setCurrentIndex(index)
+    window.list_view.scrollTo(index, QListView.ScrollHint.PositionAtCenter)
+    qapp.processEvents()
+    assert window.go_back()
+    finish_scan(window, qapp)
+    recorder = _ViewportPaintRecorder(window)
+
+    try:
+        assert window.go_forward()
+        finish_scan(window, qapp)
+        second_paints = [
+            state for state in recorder.states if state[0] == str(second.absolute())
+        ]
+        assert second_paints
+        assert all(state[1] == str(selected.absolute()) for state in second_paints)
+    finally:
+        recorder.stop()
+        window.close()
+        qapp.processEvents()
+
+
+def test_back_reuses_existing_sort_and_filter_state_during_atomic_restore(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    parent = tmp_path / "parent"
+    child = parent / "keep-child"
+    child.mkdir(parents=True)
+    for number in range(70):
+        write_image(parent / f"keep-{number:03}.jpg")
+        write_image(parent / f"drop-{number:03}.jpg")
+    window = make_window(tmp_path, parent, qapp)
+    window.config.apply({"browser_sort_order": "descending"})
+    window._set_browser_filter(
+        BrowserFilterState.normalized(search_text="keep")
+    )
+    qapp.processEvents()
+    visible_before = tuple(item.path for item in window.items)
+    selected = parent / "keep-010.jpg"
+    index = window.item_model.index(window.item_model.row_for_path(selected), 0)
+    window.list_view.setCurrentIndex(index)
+    window.list_view.scrollTo(index, QListView.ScrollHint.PositionAtCenter)
+    qapp.processEvents()
+    _open_child_folder(window, child, qapp)
+
+    try:
+        assert window.go_back()
+        finish_scan(window, qapp)
+        assert tuple(item.path for item in window.items) == visible_before
+        restored = window.item_model.item_at(window.list_view.currentIndex())
+        assert restored is not None and restored.path == selected.absolute()
+        assert window.browser_sort_order.value == "descending"
+        assert window.browser_filter_state.search_text == "keep"
+    finally:
+        window.close()
+        qapp.processEvents()
 
 
 def test_breadcrumb_separator_text_mode_and_filtered_viewer_snapshot(

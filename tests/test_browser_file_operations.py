@@ -21,6 +21,7 @@ from app.file_operation_service import (
 )
 from app.file_operation_worker import FileOperationExecutor
 from app.metadata_store import MetadataStore
+from app.settings_dialog import SettingsDialog
 from app.windows_recycle_bin import RecycleBinResult
 from app.zippla_filename_metadata import ZipPlaFilenameMetadata
 
@@ -669,6 +670,276 @@ def test_delete_confirmation_cancel_and_viewer_refusal_do_not_call_adapter(
     close_window(window, coordinator, qapp)
 
 
+def test_delete_default_dialog_focuses_no_and_escape_cancels(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "source.cbz"
+    write_file(source)
+    recycle = MovingRecycleBin(tmp_path / "trash")
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    select_paths(window, [source])
+    started = []
+    coordinator.operation_started.connect(started.append)
+    observed: dict[str, object] = {}
+
+    def inspect_and_escape() -> None:
+        box = QApplication.activeModalWidget()
+        assert isinstance(box, QMessageBox)
+        no_button = box.button(QMessageBox.StandardButton.No)
+        observed["default"] = box.defaultButton()
+        observed["focused"] = box.focusWidget()
+        observed["no_button"] = no_button
+        QTest.keyClick(box, Qt.Key.Key_Escape)
+
+    QTimer.singleShot(0, inspect_and_escape)
+    assert not window.move_selected_to_recycle_bin()
+
+    assert observed["default"] is observed["no_button"]
+    assert observed["focused"] is observed["no_button"]
+    assert started == []
+    assert recycle.paths == []
+    assert source.exists()
+    close_window(window, coordinator, qapp)
+
+
+def test_delete_focus_yes_requires_acceptance_before_recycle(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "source.cbz"
+    write_file(source)
+    recycle = MovingRecycleBin(tmp_path / "trash")
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    window.config.apply({"file_operation_delete_confirm_focus_yes": True})
+    select_paths(window, [source])
+    started = []
+    coordinator.operation_started.connect(started.append)
+    observed: dict[str, object] = {}
+
+    def inspect_and_accept() -> None:
+        box = QApplication.activeModalWidget()
+        assert isinstance(box, QMessageBox)
+        yes_button = box.button(QMessageBox.StandardButton.Yes)
+        observed["default"] = box.defaultButton()
+        observed["focused"] = box.focusWidget()
+        observed["yes_button"] = yes_button
+        observed["started_before_accept"] = list(started)
+        QTest.keyClick(box, Qt.Key.Key_Return)
+
+    QTimer.singleShot(0, inspect_and_accept)
+    assert window.move_selected_to_recycle_bin()
+    finish_operation(window, coordinator, qapp)
+
+    assert observed["default"] is observed["yes_button"]
+    assert observed["focused"] is observed["yes_button"]
+    assert observed["started_before_accept"] == []
+    assert len(started) == 1
+    assert started[0].operation is FileOperationKind.RECYCLE
+    assert started[0].source_paths == (str(source.absolute()),)
+    assert recycle.paths == [str(source.absolute())]
+    close_window(window, coordinator, qapp)
+
+
+def test_delete_focus_yes_escape_still_cancels(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "source.cbz"
+    write_file(source)
+    recycle = MovingRecycleBin(tmp_path / "trash")
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    window.config.apply({"file_operation_delete_confirm_focus_yes": True})
+    select_paths(window, [source])
+
+    def escape() -> None:
+        box = QApplication.activeModalWidget()
+        assert isinstance(box, QMessageBox)
+        assert box.focusWidget() is box.button(QMessageBox.StandardButton.Yes)
+        QTest.keyClick(box, Qt.Key.Key_Escape)
+
+    QTimer.singleShot(0, escape)
+    assert not window.move_selected_to_recycle_bin()
+
+    assert recycle.paths == []
+    assert source.exists()
+    close_window(window, coordinator, qapp)
+
+
+@pytest.mark.parametrize("focus_yes", [False, True])
+def test_delete_skip_confirmation_wins_without_duplicate_action(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+    focus_yes: bool,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "source.cbz"
+    write_file(source)
+    recycle = MovingRecycleBin(tmp_path / "trash")
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    window.config.apply(
+        {
+            "file_operation_delete_confirm_focus_yes": focus_yes,
+            "file_operation_delete_skip_confirmation": True,
+        }
+    )
+    select_paths(window, [source])
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: pytest.fail(
+            "skip-confirmation must not create a delete question"
+        ),
+    )
+    started = []
+    coordinator.operation_started.connect(started.append)
+
+    assert window.move_selected_to_recycle_bin()
+    finish_operation(window, coordinator, qapp)
+
+    assert len(started) == 1
+    assert started[0].operation is FileOperationKind.RECYCLE
+    assert recycle.paths == [str(source.absolute())]
+    close_window(window, coordinator, qapp)
+
+
+def test_delete_settings_apply_live_to_open_browser(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "source.cbz"
+    write_file(source)
+    recycle = MovingRecycleBin(tmp_path / "trash")
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    select_paths(window, [source])
+    dialog = SettingsDialog(window.config, window)
+    dialog.delete_skip_confirmation_checkbox.setChecked(True)
+    changed = dialog.apply_settings()
+    dialog.reject()
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: pytest.fail(
+            "the open Browser must use the newly applied setting"
+        ),
+    )
+
+    assert changed["file_operation_delete_skip_confirmation"] is True
+    assert window.move_selected_to_recycle_bin()
+    finish_operation(window, coordinator, qapp)
+
+    assert recycle.paths == [str(source.absolute())]
+    close_window(window, coordinator, qapp)
+
+
+def test_delete_skip_confirmation_multi_selection_is_one_coordinated_request(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    first = folder / "1.cbz"
+    second = folder / "2.cbz"
+    write_file(first)
+    write_file(second)
+    recycle = MovingRecycleBin(tmp_path / "trash")
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    window.config.apply({"file_operation_delete_skip_confirmation": True})
+    select_paths(window, [first, second])
+    expected = window.selected_file_operation_paths()
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: pytest.fail("confirmation should be skipped"),
+    )
+    started = []
+    coordinator.operation_started.connect(started.append)
+
+    assert window.move_selected_to_recycle_bin()
+    finish_operation(window, coordinator, qapp)
+
+    assert len(started) == 1
+    assert started[0].operation is FileOperationKind.RECYCLE
+    assert started[0].source_paths == expected
+    assert set(recycle.paths) == set(expected)
+    close_window(window, coordinator, qapp)
+
+
+def test_delete_skip_confirmation_failure_stays_visible_and_in_model(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "source.cbz"
+    write_file(source)
+    recycle = MovingRecycleBin(tmp_path / "trash", fail=True)
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    window.config.apply({"file_operation_delete_skip_confirmation": True})
+    select_paths(window, [source])
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: pytest.fail("confirmation should be skipped"),
+    )
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args, **kwargs: warnings.append((args, kwargs)),
+    )
+
+    assert window.move_selected_to_recycle_bin()
+    finish_operation(window, coordinator, qapp)
+
+    assert recycle.paths == [str(source.absolute())]
+    assert source.exists()
+    assert window.item_model.row_for_path(source) >= 0
+    assert len(warnings) == 1
+    close_window(window, coordinator, qapp)
+
+
 def test_delete_mixed_selection_passes_all_paths_to_recycle_adapter(
     tmp_path: Path,
     qapp: QApplication,
@@ -981,6 +1252,132 @@ def test_context_menu_has_exact_labels_and_separator_order(
         assert unwanted not in items
     assert not actions["削除"].enabled
     assert not actions["関連付けで開く..."].enabled
+    assert "名前をコピー" not in items
+    close_window(window, coordinator, qapp)
+
+
+def test_copy_selected_names_uses_canonical_basename_and_plain_text(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "folder"
+    archive = folder / "aaaaa.zip"
+    image = folder / "b.jpg"
+    dot_folder = folder / "Folder.Name"
+    write_file(archive)
+    write_file(image)
+    dot_folder.mkdir()
+    window, coordinator = make_window(tmp_path, qapp, folder)
+
+    select_paths(window, [archive])
+    assert window.copy_selected_names()
+    assert qapp.clipboard().text() == "aaaaa.zip"
+
+    select_paths(window, [dot_folder])
+    assert window.copy_selected_names()
+    assert qapp.clipboard().text() == "Folder.Name"
+
+    select_paths(window, [image, dot_folder, archive])
+    visible_paths = window.selected_file_operation_paths()
+    assert visible_paths == (
+        str(dot_folder.absolute()),
+        str(archive.absolute()),
+        str(image.absolute()),
+    )
+    assert window.copy_selected_names()
+    assert qapp.clipboard().text() == "Folder.Name\naaaaa.zip\nb.jpg"
+    mime = qapp.clipboard().mimeData()
+    assert mime is not None
+    assert mime.formats() == ["text/plain"]
+    assert mime.hasText()
+    assert not mime.hasUrls()
+    assert not mime.hasHtml()
+    assert not mime.hasImage()
+
+    # The existing file-operation Copy remains a URL/file clipboard action.
+    select_paths(window, [archive])
+    assert window.copy_selected_items()
+    assert window._clipboard_paths == (str(archive.absolute()),)
+    file_mime = qapp.clipboard().mimeData()
+    assert file_mime is not None and file_mime.hasUrls()
+    qapp.clipboard().clear()
+    qapp.processEvents()
+    close_window(window, coordinator, qapp)
+
+
+def test_context_menu_copy_name_is_selected_only_and_dispatches_separately(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "folder"
+    source = folder / "book.cbz"
+    write_file(source)
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [source])
+    menu_items: list[str | None] = []
+    actions: dict[str, object] = {}
+
+    class FakeAction:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+        def setEnabled(self, _enabled: bool) -> None:
+            pass
+
+    class FakeMenu:
+        def __init__(self, _parent=None) -> None:
+            pass
+
+        def addAction(self, text: str):
+            menu_items.append(text)
+            action = FakeAction(text)
+            actions[text] = action
+            return action
+
+        def addSeparator(self) -> None:
+            menu_items.append(None)
+
+        def addMenu(self, text: str):
+            menu_items.append(text)
+
+            class FakeSubMenu:
+                @staticmethod
+                def addAction(label: str):
+                    return FakeAction(label)
+
+            return FakeSubMenu()
+
+        def exec(self, _position):
+            return actions["名前をコピー"]
+
+    file_copy_calls = []
+    monkeypatch.setattr("app.browser_window.QMenu", FakeMenu)
+    monkeypatch.setattr(
+        window,
+        "copy_selected_items",
+        lambda: file_copy_calls.append(True),
+    )
+    row = window.item_model.row_for_path(source)
+    index = window.item_model.index(row, 0)
+
+    window._show_context_menu(window.list_view.visualRect(index).center())
+
+    basic_start = menu_items.index("切り取り")
+    assert menu_items[basic_start : basic_start + 4] == [
+        "切り取り",
+        "コピー",
+        "名前をコピー",
+        "貼り付け",
+    ]
+    assert qapp.clipboard().text() == "book.cbz"
+    assert file_copy_calls == []
+
+    window.list_view.selectionModel().clearSelection()
+    assert not window.copy_selected_names()
+    assert qapp.clipboard().text() == "book.cbz"
+    qapp.clipboard().clear()
+    qapp.processEvents()
     close_window(window, coordinator, qapp)
 
 

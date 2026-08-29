@@ -199,19 +199,24 @@ def test_settings_dialog_exposes_custom_rows_and_restores_system_default(
     )
     dialog = SettingsDialog(config)
     dialog._initial_probe_started = True
-    dialog.tabs.setCurrentIndex(3)
+    mouse_tab_index = next(
+        index
+        for index in range(dialog.tabs.count())
+        if dialog.tabs.tabText(index) == "Mouse"
+    )
+    dialog.tabs.setCurrentIndex(mouse_tab_index)
     dialog.show()
     qapp.processEvents()
 
     assert dialog.windowTitle() == "設定"
-    assert dialog.tabs.tabText(3) == "Mouse"
+    assert dialog.tabs.tabText(mouse_tab_index) == "Mouse"
     assert dialog.browser_wheel_scroll_group.title() == "Browser マウスホイール"
     assert [
         dialog.browser_wheel_scroll_mode_combo.itemText(index)
         for index in range(dialog.browser_wheel_scroll_mode_combo.count())
     ] == ["System / Default", "Small", "Medium", "Large", "Custom"]
     browser_page = dialog.tabs.widget(1).widget()
-    mouse_scroll = dialog.tabs.widget(3)
+    mouse_scroll = dialog.tabs.widget(mouse_tab_index)
     mouse_page = mouse_scroll.widget()
     assert mouse_page.isAncestorOf(dialog.browser_wheel_scroll_group)
     assert not browser_page.isAncestorOf(dialog.browser_wheel_scroll_group)
