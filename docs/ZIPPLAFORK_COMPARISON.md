@@ -6311,3 +6311,127 @@ visible mapping count、single full path、multiple-selection summary、zero-sel
 fixed right-side metadataとの幅分離である。NivisViewer側対応は`app/browser_window.py`とfocused offscreen testsである。
 WinForms `ToolStripSpringTextBox`やZipPlaFork source codeの直接移植は行っていない。必要なlicense本文とcopyright noticeは
 section 1記載の`licenses/ZipPlaFork/AGPL.txt` / `licenses/ZipPlaFork/About.txt`に保持している。
+
+## 37. Browser active-directory filesystem synchronization（2026-08-28）
+
+### 37.1 ZipPlaFork fixed-revision watcher system
+
+参照元repositoryは`himamon/ZipPlaFork`、固定revisionは
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`、licenseはAGPL-3.0-or-laterである。
+`source/ZipPla/CatalogForm.Designer.cs`の`fileSystemWatcher`は.NET `FileSystemWatcher`で、
+`NotifyFilter`を`FileName | DirectoryName | Size | LastWrite | LastAccess`とし、`SynchronizingObject`を
+Catalog formへ設定して`Changed` / `Created` / `Deleted` / `Renamed`をUI authorityへmarshalする。
+
+`source/ZipPla/CatalogForm.cs` class `CatalogForm`のlocation load processはreal directoryで
+`fileSystemWatcher.Path = preCurrentLocation`、`IncludeSubdirectories = true`、
+`EnableRaisingEvents = true`とし、archive等ではwatchを無効化する。`fileSystemWatcherStopper`はwatchが有効か、
+event parentがcurrent pathか、subfolder search/display modeとarchive-in-archive depth boundに合うかを再検査し、
+深いdescendant eventを必要に応じて直下childへ畳む。initial `CreatingZipPathArray`中のeventは
+`bmwMakePreview.RunWorkerStarting`まで保留し、その境界でもstopperを再検査する。
+
+event処理は次のとおりである。
+
+- `fileSystemWatcher_Created`はcurrent `loadingGuid`を捕捉し、
+  `addOrReloadItem(fullPath, thumbnailChanged: true, startingGuid)`を呼ぶ。
+- `fileSystemWatcher_Changed`はthumbnail cache folderを除外して`Created`と同じreload pathへ送る。
+- `fileSystemWatcher_Deleted`は`GPSizeThumbnail.TryMove(..., null)`でcache identityを除去して`removeItem`する。
+- `fileSystemWatcher_Renamed`はold/new path間でthumbnail cacheを移動し、editing suppressionを検査して
+  `renameItem(newPath, oldPath, startingGuid)`を呼ぶ。
+- `removeItem`はcanonical arraysのmask/path/itemを無効化する。focused item削除時には隣接visible itemへfocusを移す。
+- `renameItem`は同一typeかつ`ZipPlaInfo.ThumbnailInfo`が同じsuccessful itemならpath/name、bookmark/undo、
+  thumbnail/file-list表示をin-place更新する。再利用不能なら既存slotを`addOrReloadItem`でreloadする。
+- `addOrReloadItem`は既存pathならthumbnail reload、新規pathなら空きslotまたは拡張arrayへ追加する。
+- `enterQuickReload` / `exitQuickReload(Guid)`は複数quick updateを束ね、最後の完了かつ同じ`loadingGuid`でのみ
+  `GetSortArray(preSortArray: ...)`を再構築する。その前後で`tvCatalog.ScrollBarPercentage`を保存/復元し、
+  file listも`tryToKeepScroll: true`で同期する。
+
+ZipPlaFork自身の変更との競合は一律時間blacklistではない。`GPSizeThumbnail.EnterEditing` /
+`ExitedEditing` / `Editing`はCatalog/Viewer自身のmetadata writeをpath + last-access-timeで抑止する。
+`renameItem`のreload分岐はnew pathが既に`ZipPathArray`に存在する場合を「ZipPla自身が先に更新済み」として
+二重追加しない。new-folder/paste pathsは`addToUserAddFileList`で追跡し、watcherによる追加完了後にselectionを
+まとめて復元して`ScrollBarToIndexWithMinimalMove`する。大量virtual-directory pasteではitem-by-item taskを避け
+full `UpdatePreview`へ退避する。
+
+### 37.2 NivisViewer translation
+
+NivisViewerは既存依存のQt `QFileSystemWatcher`を`app/browser_directory_watcher.py`のisolated event sourceとして使う。
+watch対象はBrowserが読み込もうとしているactive directory一つだけで、recursive watch、polling thread、追加dependencyはない。
+navigationごとにfresh watcher objectとgenerationを割り当てるため、detach後にqueueへ残ったold-directory signalは
+`BrowserDirectoryChange(path, generation)`検査で捨てる。watch対象のdirectory自身が消失した場合は既存scannerの
+`NOT_FOUND` / `NOT_DIRECTORY`結果をauthorityとし、watchをdetachして既存`navigate_to`経由でparentへ回復する。
+
+Qt directory notificationはexact changed pathやrename old/new pairを保証しないため、ZipPlaForkのper-path deltaを
+不確かな推測で再現しない。raw eventを80 ms single-shot windowでcoalesceし、一burstにつき既存
+`BrowserDirectoryScanner`のsame-directory refreshを一回だけ行うreconciled designである。eventがinitial load、
+Back/Forward、manual/automatic refresh中に届いた場合は`_PendingDirectoryScan.directory_watch_dirty`一bitへ畳み、
+model commit後にもう一度だけreconcileする。Back/Forwardの`atomic_restore` full commit/layout/restore-before-paint契約は維持する。
+
+reconciliation resultは既存の
+`scanner -> BrowserItemModel.set_sorted_items(preserve_thumbnails=True) -> search AND rating filter -> stable sort -> Viewer snapshot`
+だけを通る。model tupleが同じならresetもthumbnail generation changeもない。変更がある場合も
+`_retain_compatible_thumbnails`がpath + source mtime fingerprintの一致するready thumbnailを保持し、変更itemだけを失効する。
+new visible itemのrequestは既存VISIBLE planning、近傍は既存bounded read-aheadを使う。worker数、whole-folder thumbnail generation、
+独立sorted list/cacheは追加していない。
+
+refreshは既存`_ListViewState`を使い、selectionが残ればpath selectionを復元してvisibleならscrollしない。
+selectionなしではfirst-visible stable path + pixel offsetを復元する。削除selectionは同rowの別itemへ置換しない。
+Qt eventからrename pairを得られないexternal renameはold remove + new addとして扱い、偽のidentity relocationを行わない。
+一方NivisViewer自身のrename/moveは従来どおり`FileOperationCoordinator`と
+`BrowserNavigationHistory.relocate_tree`が唯一のrelocation authorityである。operation中のwatch burstはdeferし、
+operation completionが既存refreshを開始した場合はそのreconciliationへ吸収する。後着eventは無視せずidempotentな次burstとして扱う。
+
+idle時はOS watcher以外のtimer、stat、scan、recursive enumerationを実行しない。event burstはdirectory listing一回を必要とするが、
+per-event relayoutは行わない。これはZipPlaForkのevent-driven quick reload原則をQt/async generation architectureへ翻訳したもので、
+WinForms `FileSystemWatcher` handler、array mutation、`QuickReloadProcessingCount`、C# source codeは移植していない。
+
+### 37.3 Provenance mapping
+
+materially referencedしたfile/class/method/processは、
+`source/ZipPla/CatalogForm.Designer.cs`の`fileSystemWatcher` configuration、
+`source/ZipPla/CatalogForm.cs` class `CatalogForm`のwatch setup、`fileSystemWatcherStopper`、
+`fileSystemWatcher_Created` / `Changed` / `Deleted` / `Renamed`、`addOrReloadItem`、`addOrReloadItem_Add`、
+`removeItem`、`renameItem`、`enterQuickReload` / `exitQuickReload`、`addToUserAddFileList`、fields
+`CreatingZipPathArray` / `loadingGuid` / `QuickReloadProcessingCount`、および
+`source/ZipPla/GPSizeThumbnail.cs`の`EnterEditing` / `ExitedEditing` / `Editing`である。
+materially derivedしたbehaviorはactive-location event watch、load-generation rejection、load中eventのcommit-boundary defer、
+burst後の一回sort/filter再投影、viewport preservation、own-operation deduplicationである。NivisViewer側対応は
+`app/browser_directory_watcher.py`、`app/browser_window.py`、既存`app/browser_scanner.py` /
+`app/browser_model.py` / `app/thumbnail_provider.py` authorityとfocused offscreen testsである。
+必要なAGPL-3.0-or-later license本文とcopyright noticeはsection 1記載の
+`licenses/ZipPlaFork/AGPL.txt` / `licenses/ZipPlaFork/About.txt`に保持している。
+
+## 38. Browser context-menu filename copy（2026-08-29）
+
+### 38.1 ZipPlaFork fixed-revision behavior
+
+固定revision `07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`の
+`source/ZipPla/CatalogForm.cs` class `CatalogForm`は、`CatalogForm_Load`でread-only
+`ToolStripTextBox rightClickFileNameToolStripTextBox`を`cmsRightClick`の先頭へ挿入する。
+`cmsRightClickPrepareAndShow_`はcanonical `ZipNameArray` / `ZipPathArray`とCatalog selectionから
+`selectedNameArray`を作り、single renamable itemでは`getBaseName(singleName)`、それ以外では
+`TextAnalyzer.TextToWildcard(selectedNameArray)`をtextboxへ表示してimportant rangeを選択する。
+したがってCatalogのright-click UIから選択項目名を直接選択・copyできる。`readme_original.txt`も
+right-click menu内textboxの活用、filename auto-selection、text selection customizationを記録している。
+
+### 38.2 NivisViewer behavior
+
+NivisViewerはeditable WinForms textbox、rename、wildcard selection processを移植せず、既存Browser item
+context menuのfile-operation `コピー`の隣に明示的な`名前をコピー` actionを追加した。値はdelegateの
+rendered/elided textではなく、`BrowserItemModel`のvisible selectionをrow順に読む既存
+`selected_file_operation_paths()`のcanonical absolute pathからbasenameだけを取得する。single fileは拡張子込み、
+folderは末尾component全体を保持するため`Folder.Name`のdotをextensionとして分離しない。multiple selectionは
+current Browser-visible orderのbasenameをLF改行で連結し、clipboardには`text/plain`だけを設定する。zero selectionの
+background menuにはaction自体を追加せず、既存file URL clipboard `コピー`の実装とdispatchは変更していない。
+
+### 38.3 Provenance
+
+参照元repositoryは`himamon/ZipPlaFork`、固定revisionは
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`、licenseはAGPL-3.0-or-laterである。
+materially referencedしたfile/class/method/processは`source/ZipPla/CatalogForm.cs` class `CatalogForm`の
+field `rightClickFileNameToolStripTextBox`、`CatalogForm_Load`、`rightClickContextMenuPrepareAndShow`、
+`contextMenuPrepareAndShow`、`cmsRightClickPrepareAndShow_`、`getBaseName`、canonical arrays
+`ZipNameArray` / `ZipPathArray` / `tvCatalog.SelectedIndices`、および`readme_original.txt`のright-click menu
+textbox／filename auto-selection記録である。materially derivedしたbehaviorはright-click UIからcanonical selected
+item nameをcopyしやすくすることだけで、C# control、rename、wildcard、selection algorithmのcodeは移植していない。
+NivisViewer側対応は`app/browser_window.py`とfocused offscreen testsである。必要なlicense本文とcopyright noticeは
+section 1記載の`licenses/ZipPlaFork/AGPL.txt` / `licenses/ZipPlaFork/About.txt`に保持している。

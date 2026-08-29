@@ -19,6 +19,45 @@ from .file_operation_service import (
 )
 
 
+QT_PROGRESS_MAXIMUM = 2_147_483_647
+
+
+def _project_qt_progress(
+    completed: int,
+    total: int,
+    *,
+    maximum: int = QT_PROGRESS_MAXIMUM,
+    always_scale: bool = False,
+) -> tuple[int, int]:
+    """Project exact Python counters into QProgressBar's 32-bit range."""
+
+    exact_total = max(0, int(total))
+    exact_completed = max(0, int(completed))
+    qt_limit = max(1, min(int(maximum), QT_PROGRESS_MAXIMUM))
+    if exact_total <= 0:
+        return 0, 0
+
+    exact_completed = min(exact_completed, exact_total)
+    qt_maximum = (
+        qt_limit
+        if always_scale or exact_total > qt_limit
+        else exact_total
+    )
+    if qt_maximum == exact_total:
+        return qt_maximum, exact_completed
+    if exact_completed <= 0:
+        return qt_maximum, 0
+    if exact_completed >= exact_total:
+        return qt_maximum, qt_maximum
+
+    projected = (
+        exact_completed * qt_maximum + exact_total // 2
+    ) // exact_total
+    if qt_maximum > 1:
+        projected = min(qt_maximum - 1, max(1, projected))
+    return qt_maximum, projected
+
+
 class FileOperationPanel(QWidget):
     cancel_requested = Signal()
 
@@ -175,29 +214,36 @@ class FileOperationPanel(QWidget):
         if progress.eta_seconds is not None:
             details += f"  残り約{max(0, round(progress.eta_seconds))}秒"
         self.detail_label.setText(details)
-        self.item_progress.setRange(0, max(1, progress.total))
-        self.item_progress.setValue(progress.completed)
+        item_maximum, item_value = _project_qt_progress(
+            progress.completed,
+            max(1, progress.total),
+        )
+        self.item_progress.setRange(0, item_maximum)
+        self.item_progress.setValue(item_value)
         if progress.bytes_total > 0:
-            self.byte_progress.setRange(0, 1000)
-            self.byte_progress.setValue(
-                min(1000, int(progress.bytes_completed * 1000 / progress.bytes_total))
+            byte_maximum, byte_value = _project_qt_progress(
+                progress.bytes_completed,
+                progress.bytes_total,
+                maximum=1000,
+                always_scale=True,
             )
+            self.byte_progress.setRange(0, byte_maximum)
+            self.byte_progress.setValue(byte_value)
             self.byte_progress.setFormat(
                 f"{progress.bytes_completed} / {progress.bytes_total} bytes"
             )
         else:
             self.byte_progress.setRange(0, 0)
-        if progress.current_file_bytes_total:
-            self.current_file_progress.setRange(
-                0,
-                max(1, progress.current_file_bytes_total),
+        if (
+            progress.current_file_bytes_total is not None
+            and progress.current_file_bytes_total > 0
+        ):
+            current_maximum, current_value = _project_qt_progress(
+                progress.current_file_bytes_completed,
+                progress.current_file_bytes_total,
             )
-            self.current_file_progress.setValue(
-                min(
-                    progress.current_file_bytes_completed,
-                    progress.current_file_bytes_total,
-                )
-            )
+            self.current_file_progress.setRange(0, current_maximum)
+            self.current_file_progress.setValue(current_value)
             self.current_file_progress.setFormat(
                 f"{progress.current_file_bytes_completed} / "
                 f"{progress.current_file_bytes_total}"

@@ -328,6 +328,55 @@ def test_new_navigation_cancels_and_discards_old_generation(
     window.close()
 
 
+def test_rapid_back_forward_cancels_stale_restore_and_keeps_latest_history(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    window, scanner = make_committed_window(tmp_path, qapp)
+    first = window.current_path
+    second = tmp_path / "second"
+    third = tmp_path / "third"
+    second.mkdir()
+    third.mkdir()
+    assert first is not None
+
+    assert window.navigate_to(second)
+    complete_empty(scanner, scanner.requests[-1])
+    assert window.navigate_to(third)
+    complete_empty(scanner, scanner.requests[-1])
+    assert window.current_path == third.absolute()
+
+    assert window.go_back()
+    stale_back = scanner.requests[-1]
+    assert stale_back.path == str(second.absolute())
+    assert window.go_forward()
+
+    assert stale_back.generation in scanner.cancelled
+    assert window._pending_scan is None
+    assert window.current_path == third.absolute()
+    assert window.navigation_history.current() is not None
+    assert window.navigation_history.current().path == str(third.absolute())
+
+    scanner.scan_completed.emit(
+        BrowserScanCompleted(
+            stale_back.path,
+            stale_back.generation,
+            1,
+            prepared_items=(
+                browser_item_from_scan_entry(entry(second / "stale.jpg")),
+            ),
+            sort_policy=stale_back.sort_policy,
+        )
+    )
+    qapp.processEvents()
+
+    assert window.current_path == third.absolute()
+    assert window.items == ()
+    assert window.navigation_history.current() is not None
+    assert window.navigation_history.current().path == str(third.absolute())
+    window.close()
+
+
 def test_scan_finish_uses_latest_sort_settings(
     tmp_path: Path,
     qapp: QApplication,

@@ -179,6 +179,56 @@ def test_folder_fallback_background_restore_default_uses_auto(
     dialog.reject()
 
 
+def test_delete_confirmation_settings_are_in_file_operations_and_persist_live(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    del qapp
+    config = make_config(tmp_path)
+    published: list[dict[str, object]] = []
+    config.settings_changed.connect(published.append)
+    dialog = SettingsDialog(config)
+
+    assert config.get("file_operation_delete_confirm_focus_yes") is False
+    assert config.get("file_operation_delete_skip_confirmation") is False
+    assert any(
+        dialog.tabs.tabText(index) == "ファイル"
+        for index in range(dialog.tabs.count())
+    )
+    assert dialog.file_operation_group.title() == "ファイル操作"
+    assert dialog.delete_confirm_focus_yes_checkbox.text() == (
+        "削除確認で「はい」を初期選択"
+    )
+    assert dialog.delete_skip_confirmation_checkbox.text() == (
+        "削除確認を表示せずゴミ箱へ移動"
+    )
+    assert dialog.delete_confirm_focus_yes_checkbox.isEnabled()
+
+    dialog.delete_confirm_focus_yes_checkbox.setChecked(True)
+    dialog.delete_skip_confirmation_checkbox.setChecked(True)
+    assert not dialog.delete_confirm_focus_yes_checkbox.isEnabled()
+    assert dialog.delete_confirm_focus_yes_checkbox.isChecked()
+
+    changed = dialog.apply_settings()
+    assert changed["file_operation_delete_confirm_focus_yes"] is True
+    assert changed["file_operation_delete_skip_confirmation"] is True
+    assert published[-1] == changed
+    assert config.get("file_operation_delete_confirm_focus_yes") is True
+    assert config.get("file_operation_delete_skip_confirmation") is True
+    dialog.reject()
+
+    reopened_config = ConfigManager(config.path)
+    reopened_config.load()
+    reopened = SettingsDialog(reopened_config)
+    assert reopened.delete_skip_confirmation_checkbox.isChecked()
+    assert reopened.delete_confirm_focus_yes_checkbox.isChecked()
+    assert not reopened.delete_confirm_focus_yes_checkbox.isEnabled()
+    reopened.delete_skip_confirmation_checkbox.setChecked(False)
+    assert reopened.delete_confirm_focus_yes_checkbox.isEnabled()
+    assert reopened.delete_confirm_focus_yes_checkbox.isChecked()
+    reopened.reject()
+
+
 def test_resampling_controls_expose_backend_authority_and_apply(
     tmp_path: Path,
     qapp: QApplication,

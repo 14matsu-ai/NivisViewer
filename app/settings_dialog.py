@@ -240,6 +240,7 @@ class SettingsDialog(QDialog):
         self._scroll_areas: list[QScrollArea] = []
         self.tabs.addTab(self._scrollable_tab(self._build_viewer_tab()), "Viewer")
         self.tabs.addTab(self._scrollable_tab(self._build_browser_tab()), "Browser")
+        self.tabs.addTab(self._scrollable_tab(self._build_file_tab()), "ファイル")
         self.tabs.addTab(self._scrollable_tab(self._build_archive_tab()), "書庫")
         self.tabs.addTab(self._scrollable_tab(self._build_mouse_tab()), "Mouse")
         self.tabs.addTab(
@@ -730,6 +731,35 @@ class SettingsDialog(QDialog):
         browser_wheel_form.addRow(browser_wheel_note)
         return self.browser_wheel_scroll_group
 
+    def _build_file_tab(self) -> QWidget:
+        tab = QWidget(self)
+        layout = QVBoxLayout(tab)
+
+        self.file_operation_group = QGroupBox("ファイル操作", tab)
+        file_operation_layout = QVBoxLayout(self.file_operation_group)
+        self.delete_skip_confirmation_checkbox = QCheckBox(
+            "削除確認を表示せずゴミ箱へ移動",
+            self.file_operation_group,
+        )
+        self.delete_confirm_focus_yes_checkbox = QCheckBox(
+            "削除確認で「はい」を初期選択",
+            self.file_operation_group,
+        )
+        self.delete_skip_confirmation_checkbox.toggled.connect(
+            self._sync_delete_confirmation_controls
+        )
+        file_operation_layout.addWidget(self.delete_skip_confirmation_checkbox)
+        file_operation_layout.addWidget(self.delete_confirm_focus_yes_checkbox)
+        recycle_note = QLabel(
+            "どちらの設定でも削除先はWindowsのゴミ箱です。",
+            self.file_operation_group,
+        )
+        recycle_note.setWordWrap(True)
+        file_operation_layout.addWidget(recycle_note)
+        layout.addWidget(self.file_operation_group)
+        layout.addStretch(1)
+        return tab
+
     def _build_browser_tab(self) -> QWidget:
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
@@ -1203,6 +1233,23 @@ class SettingsDialog(QDialog):
         self.bring_to_front_checkbox.setChecked(
             bool(self.config.get("bring_viewer_to_front_on_open", True))
         )
+        self.delete_confirm_focus_yes_checkbox.setChecked(
+            bool(
+                self.config.get(
+                    "file_operation_delete_confirm_focus_yes",
+                    False,
+                )
+            )
+        )
+        self.delete_skip_confirmation_checkbox.setChecked(
+            bool(
+                self.config.get(
+                    "file_operation_delete_skip_confirmation",
+                    False,
+                )
+            )
+        )
+        self._sync_delete_confirmation_controls()
         self.loop_navigation_checkbox.setChecked(
             bool(self.config.get("loop_book_navigation", False))
         )
@@ -1574,6 +1621,14 @@ class SettingsDialog(QDialog):
             self.browser_wheel_scroll_mode_combo.currentData() == "custom"
         )
 
+    def _sync_delete_confirmation_controls(
+        self,
+        *_args: object,
+    ) -> None:
+        self.delete_confirm_focus_yes_checkbox.setEnabled(
+            not self.delete_skip_confirmation_checkbox.isChecked()
+        )
+
     def _sync_folder_fallback_background_controls(
         self,
         *_args: object,
@@ -1775,6 +1830,12 @@ class SettingsDialog(QDialog):
         return {
             "open_viewer_behavior": self.open_behavior_combo.currentData(),
             "bring_viewer_to_front_on_open": self.bring_to_front_checkbox.isChecked(),
+            "file_operation_delete_confirm_focus_yes": (
+                self.delete_confirm_focus_yes_checkbox.isChecked()
+            ),
+            "file_operation_delete_skip_confirmation": (
+                self.delete_skip_confirmation_checkbox.isChecked()
+            ),
             "loop_book_navigation": self.loop_navigation_checkbox.isChecked(),
             "join_spread_pages": self.join_spread_checkbox.isChecked(),
             "gap": self.gap_spin.value(),
