@@ -9,6 +9,7 @@ REQUIRED = (
     "NivisViewer.exe",
     "portable.flag",
     "LICENSE",
+    "PROJECT_LICENSE.md",
     "THIRD_PARTY_NOTICES.md",
     "README.md",
     "licenses",
@@ -26,6 +27,8 @@ FORBIDDEN_EXECUTABLES = {
     "rar.exe",
     "7z.exe",
     "7zz.exe",
+    "ffmpeg.exe",
+    "ffprobe.exe",
 }
 
 
@@ -40,7 +43,7 @@ def verify(bundle: Path, smoke_result: Path | None = None) -> list[str]:
             errors.append(f"unexpected user/development data: {name}")
     for name in FORBIDDEN_EXECUTABLES:
         if name in lower_names:
-            errors.append(f"external archive executable must not be bundled: {name}")
+            errors.append(f"external executable must not be bundled: {name}")
     if not any(path.name.casefold() == "qwindows.dll" for path in paths):
         errors.append("Qt Windows platform plugin not found")
     if not any(

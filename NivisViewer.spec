@@ -24,6 +24,7 @@ a = Analysis(
     datas=pypdfium_data
     + [
         (str(root / "LICENSE"), "."),
+        (str(root / "PROJECT_LICENSE.md"), "."),
         (str(root / "THIRD_PARTY_NOTICES.md"), "."),
         (str(root / "README.md"), "."),
         (str(root / "portable.flag"), "."),

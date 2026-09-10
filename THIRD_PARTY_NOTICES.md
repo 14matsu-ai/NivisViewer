@@ -1,5 +1,22 @@
 # Third-Party Notices
 
+NivisViewer's current project license is **AGPL-3.0-or-later**, not MIT.
+See `PROJECT_LICENSE.md` and the full GNU text in `LICENSE`. Dependency license
+choices and original copyright notices are retained, not relicensed en masse.
+The 2026-09-10 installed-versus-pinned and existing-portable inventory review,
+official source links, and remaining public-release blockers are recorded in
+`docs/RELEASE_LICENSE_AUDIT.md`. This supplements the provenance below; it does
+not certify a distributable release.
+
+The installed PySide6/shiboken6 6.11.2 metadata declares open-source alternatives
+`LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only` even though its wheel contains only
+`LicenseRef-Qt-Commercial.txt`. That missing-file situation is not evidence that
+a commercial license is required. Official version-matched GPL/LGPL texts are
+retained in `licenses/Qt/6.11.2/` with source URLs and hashes. These texts alone
+do not fulfill the source, module-specific, or third-party attribution duties.
+In particular, the inspected portable folder also contains GPLv3-only Qt Virtual
+Keyboard and Qt PDF's separate native dependency tree; it is not all LGPL Qt.
+
 ## ZipPlaFork-derived Viewer scheduling and raster-loading structure
 
 This notice supersedes any earlier description that treated ZipPlaFork only as
