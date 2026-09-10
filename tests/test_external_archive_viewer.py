@@ -59,7 +59,7 @@ class ViewerBackend:
         return ArchiveListing(
             archive_path,
             tuple(
-                ArchiveEntry(f"{index + 1}.png", 100, 50, False, False)
+                ArchiveEntry(f"{index + 1}.png", len(image_bytes()), 50, False, False)
                 for index in range(self.pages)
             ),
             "7z",
@@ -223,6 +223,10 @@ def test_external_archive_page_navigation_does_not_reopen_or_restore_position(
     qapp.processEvents()
     assert backend.list_calls == 1
     assert restore_reads == 1
+    # External raster books now share ZIP/folder's first-frame commit gate;
+    # opening metadata is persisted only once an accepted frame has painted.
+    from tests.test_zip_raster_viewer_integration import _wait_until
+    _wait_until(qapp, lambda: history_records == 1)
     assert history_records == 1
 
     opens = 0

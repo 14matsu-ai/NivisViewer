@@ -26,12 +26,16 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction,
+    QBrush,
     QCloseEvent,
     QClipboard,
+    QContextMenuEvent,
     QDesktopServices,
     QKeyEvent,
     QKeySequence,
     QMouseEvent,
+    QPainter,
+    QPalette,
     QResizeEvent,
     QShortcut,
 )
@@ -55,12 +59,15 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QStyle,
+    QStyledItemDelegate,
     QStyleOptionComboBox,
+    QStyleOptionViewItem,
     QTabWidget,
     QToolBar,
     QToolButton,
     QTreeView,
     QWidget,
+    QWidgetAction,
 )
 
 from .browser_model import (
@@ -104,8 +111,10 @@ from .browser_scanner import (
     BrowserScanStatus,
 )
 from .browser_sort import (
-    BROWSER_SORT_KEY_LABELS,
-    BROWSER_SORT_ORDER_LABELS,
+    BROWSER_SORT_CHOICES,
+    browser_sort_choice_index,
+    new_browser_random_seed,
+    normalize_browser_random_seed,
     BrowserDisplayDensity,
     BrowserSortKey,
     BrowserSortOrder,
@@ -177,7 +186,7 @@ from .settings_dialog import SettingsDialog
 from .sidebar_layout import SidebarLayoutController
 from .thumbnail_provider import BrowserThumbnailProvider
 from .thumbnail_disk_cache import ThumbnailDiskCache
-from .thumbnail_render import ThumbnailRenderPolicy, ThumbnailRenderSpec
+from .thumbnail_render import ThumbnailRenderPolicy, ThumbnailRenderSpec, normalize_thumbnail_webp_quality
 from .system_file_opener import SystemFileOpener
 from .windows_filename import (
     generate_numbered_name,
@@ -248,6 +257,79 @@ class _PendingDirectoryScan:
     first_batch_applied: bool = False
 
 
+class _BrowserContextFilenameEdit(QLineEdit):
+    """Read-only menu text selection; never a filename mutation surface."""
+
+    def __init__(self, name: str, menu: QMenu) -> None:
+        super().__init__(menu)
+        self._menu = menu
+        self.setObjectName("browser_context_filename")
+        self.setReadOnly(True)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
+        self.setAccessibleName("ファイル名（読み取り専用）")
+        self.setText(name)
+        self.setCursorPosition(0)
+        self.setTextMargins(6, 2, 6, 2)
+        screen = menu.screen()
+        maximum = (
+            min(480, max(80, screen.availableGeometry().width() - 80))
+            if screen else 480
+        )
+        text_width = self.fontMetrics().horizontalAdvance(name) + 24
+        self.setFixedWidth(min(maximum, max(240, text_width)))
+
+    def copy_selected_text(self) -> bool:
+        text = self.selectedText()
+        if not text:
+            return False
+        mime = QMimeData()
+        mime.setText(text)
+        QApplication.clipboard().setMimeData(mime)
+        return True
+
+    def event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.ShortcutOverride:
+            # Keep all Browser/file shortcuts out while this editor owns focus.
+            event.accept()
+            return True
+        if event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
+            self.keyPressEvent(event)
+            return True
+        return super().event(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.matches(QKeySequence.StandardKey.Copy):
+            self.copy_selected_text()
+        elif event.matches(QKeySequence.StandardKey.SelectAll):
+            self.selectAll()
+        elif event.key() == Qt.Key.Key_Escape:
+            self._menu.close()
+        elif event.key() in {Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_Tab, Qt.Key.Key_Backtab}:
+            actions = [
+                action for action in self._menu.actions()
+                if action.isEnabled() and not action.isSeparator()
+                and not isinstance(action, QWidgetAction)
+            ]
+            self._menu.setFocus(Qt.FocusReason.OtherFocusReason)
+            if actions:
+                backwards = event.key() in {Qt.Key.Key_Up, Qt.Key.Key_Backtab}
+                self._menu.setActiveAction(actions[-1] if backwards else actions[0])
+        elif (
+            event.key() in {Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Home, Qt.Key.Key_End}
+            and not event.modifiers() & Qt.KeyboardModifier.AltModifier
+        ):
+            super().keyPressEvent(event)  # Includes Shift/Ctrl selection navigation.
+        # Typing, Enter, Delete, F2, cut/paste and other shortcuts are inert.
+        event.accept()
+
+    def focusOutEvent(self, event) -> None:
+        start, text = self.selectionStart(), self.selectedText()
+        super().focusOutEvent(event)
+        if start >= 0 and text:
+            # QLineEdit positions count UTF-16 units, including surrogate pairs.
+            self.setSelection(start, len(text.encode("utf-16-le", errors="surrogatepass")) // 2)
+
+
 class _BrowserSearchEdit(QLineEdit):
     """Compact search editor hosted by the integrated history control."""
 
@@ -258,6 +340,52 @@ class _BrowserSearchEdit(QLineEdit):
     def minimumSizeHint(self) -> QSize:  # noqa: N802
         hint = super().minimumSizeHint()
         return QSize(100, hint.height())
+
+
+class _BrowserSortItemDelegate(QStyledItemDelegate):
+    """Font-aware compact rows, independent of native combo menu padding."""
+
+    def sizeHint(  # noqa: N802
+        self, option: QStyleOptionViewItem, index: QModelIndex
+    ) -> QSize:
+        hint = super().sizeHint(option, index)
+        item_option = QStyleOptionViewItem(option)
+        self.initStyleOption(item_option, index)
+        # Use the actual font height with no added vertical row padding.
+        hint.setHeight(item_option.fontMetrics.height())
+        return hint
+
+    def paint(
+        self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex
+    ) -> None:
+        prepared = QStyleOptionViewItem(option)
+        self.initStyleOption(prepared, index)
+        highlighted = QStyle.StateFlag.State_Selected | QStyle.StateFlag.State_MouseOver
+        if not prepared.state & highlighted:
+            super().paint(painter, option, index)
+            return
+        group = QPalette.ColorGroup.Active
+        if not prepared.state & QStyle.StateFlag.State_Enabled:
+            group = QPalette.ColorGroup.Disabled
+        elif not prepared.state & QStyle.StateFlag.State_Active:
+            group = QPalette.ColorGroup.Inactive
+        painter.save()
+        try:
+            painter.setClipRect(prepared.rect, Qt.ClipOperation.IntersectClip)
+            painter.fillRect(prepared.rect, prepared.palette.brush(group, QPalette.ColorRole.Highlight))
+            # Own only the full-row highlight. Native Windows 11 item painting
+            # otherwise insets/rounds it even when adjacent visualRects touch.
+            # Keep native text layout, but don't paint that second highlight.
+            prepared.state &= ~(highlighted | QStyle.StateFlag.State_HasFocus)
+            prepared.backgroundBrush = QBrush(Qt.BrushStyle.NoBrush)
+            prepared.features &= ~QStyleOptionViewItem.ViewItemFeature.Alternate
+            prepared.palette.setCurrentColorGroup(group)
+            prepared.palette.setColor(group, QPalette.ColorRole.Text,
+                                      prepared.palette.color(group, QPalette.ColorRole.HighlightedText))
+            style = prepared.widget.style() if prepared.widget else QApplication.style()
+            style.drawControl(QStyle.ControlElement.CE_ItemViewItem, prepared, painter, prepared.widget)
+        finally:
+            painter.restore()
 
 
 class _BrowserDropDownShell(QComboBox):
@@ -345,6 +473,8 @@ class BrowserWindow(QMainWindow):
     activated = Signal(object)
     closing = Signal(object)
     directory_scan_committed = Signal(str)
+    location_changed = Signal(object, str)
+    search_query_edited = Signal(object, str)
 
     def __init__(
         self,
@@ -602,6 +732,9 @@ class BrowserWindow(QMainWindow):
         self.browser_folder_fallback_background = str(
             self.settings.get("browser_folder_fallback_background", "auto")
         )
+        self.browser_file_fallback_background = str(
+            self.settings.get("browser_file_fallback_background", "auto")
+        )
         self.browser_wheel_scroll_mode = str(
             self.settings.get("browser_wheel_scroll_mode", "system")
         )
@@ -615,8 +748,13 @@ class BrowserWindow(QMainWindow):
             256,
             min(2048, int(self.settings.get("thumbnail_cache_max_edge", 1024))),
         )
+        self.thumbnail_webp_quality = normalize_thumbnail_webp_quality(
+            self.settings.get("thumbnail_webp_quality")
+        )
+        self.thumbnail_preserve_alpha = self.settings.get("thumbnail_preserve_alpha", False) is True
         self._thumbnail_dpr = self._current_device_pixel_ratio()
         self.thumbnail_render_spec = self._build_thumbnail_render_spec()
+        self.thumbnail_provider.set_disk_cache_encoding_policy(self.thumbnail_render_spec.encoding_policy)
         self.thumbnail_bucket_size = self.thumbnail_render_spec.long_edge
         self.browser_sort_key = normalize_browser_sort_key(
             self.settings.get("browser_sort_key", BrowserSortKey.NAME.value)
@@ -627,6 +765,7 @@ class BrowserWindow(QMainWindow):
                 BrowserSortOrder.ASCENDING.value,
             )
         )
+        self.browser_random_seed = normalize_browser_random_seed(self.settings.get("browser_random_seed"))
         self.browser_folders_first = bool(
             self.settings.get("browser_folders_first", True)
         )
@@ -774,6 +913,7 @@ class BrowserWindow(QMainWindow):
             self._flush_directory_changes
         )
         self._build_ui()
+        self._refresh_thumbnail_encoding_policy()
         QTimer.singleShot(1000, self, self._run_idle_cache_cleanup)
         self.config.settings_changed.connect(self.apply_settings)
         self._restore_window_state()
@@ -787,6 +927,8 @@ class BrowserWindow(QMainWindow):
     def adjacent_book_snapshot(
         self,
         parent_path: str | Path,
+        *,
+        snapshot_items: tuple[BrowserItem, ...] | None = None,
     ) -> AdjacentBookBrowserSnapshot | None:
         """Return committed model data without querying the filesystem."""
         if (
@@ -807,13 +949,19 @@ class BrowserWindow(QMainWindow):
                     modified_time_ns=item.modified_time_ns,
                     file_size=item.file_size,
                     openable_by_nivisviewer=item.openable_by_nivisviewer,
+                    created_time_ns=item.created_time_ns,
+                    accessed_time_ns=item.accessed_time_ns,
                 )
-                for item in self._visible_order_snapshot_items()
+                for item in (
+                    self._visible_order_snapshot_items()
+                    if snapshot_items is None else snapshot_items
+                )
             ),
             sort_identity=(
                 f"{self.browser_sort_key.value}:"
                 f"{self.browser_sort_order.value}:"
                 f"folders_first={int(self.browser_folders_first)}"
+                + (f":seed={self.browser_random_seed}" if self.browser_sort_key is BrowserSortKey.RANDOM else "")
             ),
             filter_identity=(
                 f"hidden={int(self.browser_show_hidden_items)}:"
@@ -1155,6 +1303,17 @@ class BrowserWindow(QMainWindow):
     def _commit_pending_scan(self, pending: _PendingDirectoryScan) -> None:
         if pending.committed:
             return
+        previous_path = self.current_path
+        location_changed = bool(
+            previous_path is not None
+            and not self._same_path(previous_path, pending.path)
+        )
+        if location_changed:
+            self._replace_active_search_query(
+                "",
+                preserve_view_state=False,
+                request_thumbnails=False,
+            )
         pending.committed = True
         self.current_path = pending.path
         self.config.set("last_browser_path", str(pending.path))
@@ -1176,6 +1335,8 @@ class BrowserWindow(QMainWindow):
         self._ensure_pending_directory_watch(pending)
         self._sync_address_bar()
         self._update_navigation_actions()
+        if location_changed:
+            self.location_changed.emit(self, str(pending.path))
 
     def _initial_scan_item_count(self, total_count: int) -> int:
         count = max(0, int(total_count))
@@ -1280,6 +1441,7 @@ class BrowserWindow(QMainWindow):
             self.browser_sort_key,
             self.browser_sort_order,
             self.browser_folders_first,
+            self.browser_random_seed,
         )
 
     def _restore_pending_scan_location(
@@ -1328,6 +1490,64 @@ class BrowserWindow(QMainWindow):
         if not self.navigate_to(folder, restore_location=location):
             return
         self._restore_location(location)
+
+    def synchronize_viewer_item(
+        self,
+        path: str | Path,
+        *,
+        expected_parent: str | Path,
+    ) -> bool:
+        """Select one visible Viewer item without changing Browser location."""
+
+        if self.current_path is None or not self._same_path(
+            self.current_path,
+            Path(expected_parent),
+        ):
+            return False
+        target = self._absolute_browser_path(path)
+        row = self.item_model.row_for_path(target)
+        selection_model = self.list_view.selectionModel()
+        if selection_model is None:
+            return False
+        if row < 0:
+            selection_model.clearSelection()
+            selection_model.setCurrentIndex(
+                QModelIndex(),
+                QItemSelectionModel.SelectionFlag.NoUpdate,
+            )
+            self._update_status()
+            return False
+
+        index = self.item_model.index(row, 0)
+        current_item = self.item_model.item_at(self.list_view.currentIndex())
+        selected_items = tuple(
+            self.item_model.item_at(selected)
+            for selected in selection_model.selectedIndexes()
+        )
+        if (
+            current_item is not None
+            and self._same_path(current_item.path, target)
+            and len(selected_items) == 1
+            and selected_items[0] is not None
+            and self._same_path(selected_items[0].path, target)
+        ):
+            self._update_status()
+            return True
+
+        state = self._capture_list_view_state()
+        self._restore_list_view_state(
+            _ListViewState(
+                selected_paths=(str(target),),
+                current_path=str(target),
+                anchor_path=state.anchor_path,
+                anchor_row=state.anchor_row,
+                anchor_x=state.anchor_x,
+                anchor_y=state.anchor_y,
+                vertical_scroll=state.vertical_scroll,
+                horizontal_scroll=state.horizontal_scroll,
+            )
+        )
+        return self.list_view.currentIndex() == index
 
     def go_back(self) -> bool:
         self._update_current_navigation_state()
@@ -1826,12 +2046,7 @@ class BrowserWindow(QMainWindow):
             self._invoke_open_path_handler(
                 str(item.path),
                 open_in_new_window,
-                self._folder_snapshot_for_item(item),
-                (
-                    self.adjacent_book_snapshot(self.current_path)
-                    if self.current_path is not None
-                    else None
-                ),
+                snapshot_item=item,
             )
 
     def _open_system_file(self, path: str | Path) -> bool:
@@ -1887,13 +2102,21 @@ class BrowserWindow(QMainWindow):
     def _folder_snapshot_for_item(
         self,
         item: BrowserItem,
+        *,
+        snapshot_items: tuple[BrowserItem, ...] | None = None,
     ) -> FolderListingSnapshot | None:
         if (
             item.kind is not BrowserItemKind.IMAGE
             or self.current_path is None
         ):
             return None
-        candidates = self._visible_order_snapshot_items()
+        candidates = (
+            self._visible_order_snapshot_items()
+            if snapshot_items is None else snapshot_items
+        )
+        # Keep initial-open IMAGE membership and exact path selection intact.
+        # The mixed snapshot projection intentionally has a narrower openable
+        # filter and normalized first-match identity; they are not interchangeable.
 
         image_ids = tuple(
             str(candidate.path)
@@ -1921,6 +2144,7 @@ class BrowserWindow(QMainWindow):
                 f"{self.browser_sort_key.value}:"
                 f"{self.browser_sort_order.value}:"
                 f"folders_first={int(self.browser_folders_first)}"
+                + (f":seed={self.browser_random_seed}" if self.browser_sort_key is BrowserSortKey.RANDOM else "")
             ),
             selected_index=selected_index,
             filter_identity=(
@@ -1952,6 +2176,8 @@ class BrowserWindow(QMainWindow):
     def _folder_snapshot_for_path(
         self,
         path: str | Path,
+        *,
+        snapshot_items: tuple[BrowserItem, ...] | None = None,
     ) -> FolderListingSnapshot | None:
         """Snapshot the current visible Browser order for one image path."""
 
@@ -1961,7 +2187,7 @@ class BrowserWindow(QMainWindow):
         item = self.item_model.item_at(self.item_model.index(row, 0))
         if item is None:
             return None
-        return self._folder_snapshot_for_item(item)
+        return self._folder_snapshot_for_item(item, snapshot_items=snapshot_items)
 
     def _invoke_open_path_handler(
         self,
@@ -1971,23 +2197,39 @@ class BrowserWindow(QMainWindow):
         browser_snapshot: AdjacentBookBrowserSnapshot | None = None,
         *,
         use_browser_order: bool = True,
+        snapshot_item: BrowserItem | None = None,
     ) -> object | None:
         handler = self._open_path_handler
         if handler is None:
             return None
+        # One action-local capture, including pending progressive scan items.
+        # Supplied snapshots remain untouched; external drops explicitly opt out.
+        snapshot_items = None
+        if (
+            use_browser_order
+            and self.current_path is not None
+            and (folder_snapshot is None or browser_snapshot is None)
+        ):
+            snapshot_items = self._visible_order_snapshot_items()
         if folder_snapshot is None and use_browser_order:
             # Every open originating from the current Browser model must use
             # the model's visible image order, including bookmark/history
             # entry points that happen to target the displayed folder.  Paths
             # dropped from outside explicitly opt out below and keep direct-
             # open semantics.
-            folder_snapshot = self._folder_snapshot_for_path(path)
+            folder_snapshot = (
+                self._folder_snapshot_for_item(snapshot_item, snapshot_items=snapshot_items)
+                if snapshot_item is not None
+                else self._folder_snapshot_for_path(path, snapshot_items=snapshot_items)
+            )
         if (
             browser_snapshot is None
             and use_browser_order
             and self.current_path is not None
         ):
-            browser_snapshot = self.adjacent_book_snapshot(self.current_path)
+            browser_snapshot = self.adjacent_book_snapshot(
+                self.current_path, snapshot_items=snapshot_items,
+            )
         try:
             import inspect
 
@@ -3299,6 +3541,30 @@ class BrowserWindow(QMainWindow):
         if not self._shutdown_prepared:
             self.thumbnail_provider.cleanup_caches_async(force=False)
 
+    def _fallback_background_delegate_options(self) -> dict[str, str]:
+        """Project window-owned values for initial, layout and live updates."""
+        return {
+            "folder_fallback_background": self.browser_folder_fallback_background,
+            "file_fallback_background": self.browser_file_fallback_background,
+        }
+
+    def _apply_fallback_background_settings(self, changed: dict[str, object]) -> None:
+        """Color-only effect boundary: configure once and repaint; no layout/I/O."""
+        folder_key = "browser_folder_fallback_background"
+        file_key = "browser_file_fallback_background"
+        if folder_key not in changed and file_key not in changed:
+            return
+        if folder_key in changed:
+            self.browser_folder_fallback_background = str(changed[folder_key])
+        if file_key in changed:
+            self.browser_file_fallback_background = str(changed[file_key])
+        self.item_delegate.configure(
+            thumbnail_size=self.thumbnail_size,
+            density=self.browser_display_density,
+            **self._fallback_background_delegate_options(),
+        )
+        self.list_view.viewport().update()
+
     def apply_settings(self, changed: dict[str, object]) -> None:
         wheel_settings_changed = bool(
             {
@@ -3323,18 +3589,7 @@ class BrowserWindow(QMainWindow):
                 self.browser_wheel_scroll_mode,
                 self.browser_wheel_scroll_custom_rows,
             )
-        if "browser_folder_fallback_background" in changed:
-            self.browser_folder_fallback_background = str(
-                changed["browser_folder_fallback_background"]
-            )
-            self.item_delegate.configure(
-                thumbnail_size=self.thumbnail_size,
-                density=self.browser_display_density,
-                folder_fallback_background=(
-                    self.browser_folder_fallback_background
-                ),
-            )
-            self.list_view.viewport().update()
+        self._apply_fallback_background_settings(changed)
         if "browser_location_history_limit" in changed:
             self.navigation_history.set_recent_limit(
                 int(changed["browser_location_history_limit"])
@@ -3396,7 +3651,11 @@ class BrowserWindow(QMainWindow):
             "browser_filename_padding_y",
         }
         list_changed = bool(list_keys.intersection(changed))
+        list_changed = list_changed or "browser_random_seed" in changed
         view_state = self._capture_list_view_state() if list_changed else None
+
+        if "browser_random_seed" in changed:
+            self.browser_random_seed = normalize_browser_random_seed(changed["browser_random_seed"])
 
         if "browser_sort_key" in changed:
             self.browser_sort_key = normalize_browser_sort_key(
@@ -3436,6 +3695,7 @@ class BrowserWindow(QMainWindow):
             )
         sort_changed = bool(
             {
+                "browser_random_seed",
                 "browser_sort_key",
                 "browser_sort_order",
                 "browser_folders_first",
@@ -3456,6 +3716,7 @@ class BrowserWindow(QMainWindow):
                 self.browser_sort_key,
                 self.browser_sort_order,
                 self.browser_folders_first,
+                self.browser_random_seed,
             )
 
         thumbnail_changed = bool(
@@ -3693,6 +3954,12 @@ class BrowserWindow(QMainWindow):
                 )
             elif self.current_path is not None:
                 self.refresh_current_folder()
+        if "thumbnail_webp_quality" in changed or "thumbnail_preserve_alpha" in changed:
+            self.thumbnail_webp_quality = normalize_thumbnail_webp_quality(
+                changed.get("thumbnail_webp_quality", self.thumbnail_webp_quality)
+            )
+            self.thumbnail_preserve_alpha = changed.get("thumbnail_preserve_alpha", self.thumbnail_preserve_alpha) is True
+            self._refresh_thumbnail_encoding_policy()
         if "thumbnail_disk_cache_enabled" in changed:
             self.thumbnail_provider.set_disk_cache_enabled(
                 bool(changed["thumbnail_disk_cache_enabled"])
@@ -3745,40 +4012,70 @@ class BrowserWindow(QMainWindow):
             self._schedule_thumbnail_requests()
 
     def _apply_browser_controls(self, *_args: object) -> None:
-        self.config.apply(
-            {
-                "browser_sort_key": str(
-                    self.browser_sort_key_combo.currentData()
-                ),
-                "browser_sort_order": str(
-                    self.browser_sort_order_combo.currentData()
-                ),
-            },
-            save=True,
-        )
+        _, key, order = BROWSER_SORT_CHOICES[self.browser_sort_key_combo.currentIndex()]
+        values = {"browser_sort_key": key, "browser_sort_order": order}
+        if key == BrowserSortKey.RANDOM.value:
+            values["browser_random_seed"] = new_browser_random_seed(self.browser_random_seed)
+        self.config.apply(values, save=True)
 
     def _sync_browser_controls(self) -> None:
         controls = (
             self.browser_sort_key_combo,
-            self.browser_sort_order_combo,
         )
         for control in controls:
             control.blockSignals(True)
         try:
-            self._select_combo_data(
-                self.browser_sort_key_combo,
-                self.browser_sort_key.value,
-            )
-            self._select_combo_data(
-                self.browser_sort_order_combo,
-                self.browser_sort_order.value,
-            )
+            self.browser_sort_key_combo.setCurrentIndex(browser_sort_choice_index(
+                self.browser_sort_key, self.browser_sort_order,
+            ))
         finally:
             for control in controls:
                 control.blockSignals(False)
 
     def _on_browser_search_text_changed(self, _text: str) -> None:
+        self.search_query_edited.emit(self, str(_text))
         self._browser_search_timer.start()
+
+    @property
+    def active_search_query(self) -> str:
+        return self.browser_filter_state.search_text
+
+    def clear_active_browser_search(self) -> bool:
+        """Clear only the active query while retaining rating and query MRU."""
+
+        return self._replace_active_search_query("")
+
+    def restore_viewer_roundtrip_search(self, query: str) -> bool:
+        """Restore one controller-authorized transient Viewer return query."""
+
+        return self._replace_active_search_query(query)
+
+    def _replace_active_search_query(
+        self,
+        query: str,
+        *,
+        preserve_view_state: bool = True,
+        request_thumbnails: bool = True,
+    ) -> bool:
+        self._browser_search_timer.stop()
+        state = BrowserFilterState.normalized(
+            search_text=query,
+            rating_mode=self.browser_filter_state.rating_mode,
+            rating_reference=self.browser_filter_state.rating_reference,
+        )
+        if preserve_view_state:
+            return self._set_browser_filter(state)
+        if state == self.browser_filter_state:
+            self._sync_browser_filter_controls()
+            return False
+        self._list_view_restore_token += 1
+        self.browser_filter_state = state
+        changed = self.item_model.configure_filter(state)
+        self._sync_browser_filter_controls()
+        self._update_status(force=True)
+        if changed and request_thumbnails:
+            self._schedule_thumbnail_requests()
+        return changed
 
     def _commit_browser_search_history(self) -> bool:
         if self._shutdown_prepared:
@@ -3973,7 +4270,7 @@ class BrowserWindow(QMainWindow):
                 if self.browser_item_spacing_mode == "preset"
                 else self.browser_item_spacing
             ),
-            folder_fallback_background=self.browser_folder_fallback_background,
+            **self._fallback_background_delegate_options(),
         )
         self.list_view.setIconSize(QSize(self.thumbnail_size, self.thumbnail_size))
         self.list_view.setGridSize(self.item_delegate.grid_metrics.grid_size)
@@ -4488,6 +4785,20 @@ class BrowserWindow(QMainWindow):
         return handled
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
+        if (
+            watched in (self.list_view, self.list_view.viewport())
+            and isinstance(event, QContextMenuEvent)
+            and event.reason() == QContextMenuEvent.Reason.Keyboard
+        ):
+            index = self.list_view.currentIndex()
+            position = (
+                self.list_view.visualRect(index).center()
+                if index.isValid() else QPoint(-1, -1)
+            )
+            self._show_context_menu(position, keyboard=True)
+            return True
+        if watched is self.list_view and event.type() == QEvent.Type.PaletteChange:
+            self._refresh_thumbnail_encoding_policy()
         if watched is self.list_view.viewport():
             event_type = event.type()
             if event_type == QEvent.Type.MouseMove and isinstance(event, QMouseEvent):
@@ -4764,6 +5075,7 @@ class BrowserWindow(QMainWindow):
             self.browser_sort_key,
             self.browser_sort_order,
             self.browser_folders_first,
+            self.browser_random_seed,
         )
         style = self.style()
         self.item_model.set_fallback_icons(
@@ -4800,7 +5112,7 @@ class BrowserWindow(QMainWindow):
             filename_gap=self.browser_filename_gap,
             filename_padding_y=self.browser_filename_padding_y,
             item_spacing=0,
-            folder_fallback_background=self.browser_folder_fallback_background,
+            **self._fallback_background_delegate_options(),
         )
         self.list_view.setItemDelegate(self.item_delegate)
         self.list_view.setViewMode(QListView.ViewMode.IconMode)
@@ -5024,29 +5336,24 @@ class BrowserWindow(QMainWindow):
 
         self.browser_sort_key_combo = QComboBox(self.browser_sort_row)
         self.browser_sort_key_combo.setObjectName("browser_sort_key_combo")
-        self.browser_sort_key_combo.setToolTip("一覧の並び替え基準")
+        self.browser_sort_key_combo.setToolTip("一覧の並び替え（ランダムを選び直すと並び直します）")
         self.browser_sort_key_combo.setFixedHeight(
             BROWSER_CHROME_CONTROL_HEIGHT
         )
-        for value, label in BROWSER_SORT_KEY_LABELS.items():
-            self.browser_sort_key_combo.addItem(label, value.value)
+        self.browser_sort_key_combo.setItemDelegate(
+            _BrowserSortItemDelegate(self.browser_sort_key_combo)
+        )
+        for label, key, order in BROWSER_SORT_CHOICES:
+            self.browser_sort_key_combo.addItem(label, f"{key}:{order}")
+        # Show the full catalog, not Qt's default ten-row subset. Qt still
+        # bounds the popup to the screen and enables scrolling when necessary.
+        self.browser_sort_key_combo.setMaxVisibleItems(
+            self.browser_sort_key_combo.count()
+        )
         browser_sort_layout.addWidget(self.browser_sort_key_combo)
 
-        self.browser_sort_order_combo = QComboBox(self.browser_sort_row)
-        self.browser_sort_order_combo.setObjectName("browser_sort_order_combo")
-        self.browser_sort_order_combo.setToolTip("一覧の並び順")
-        self.browser_sort_order_combo.setFixedHeight(
-            BROWSER_CHROME_CONTROL_HEIGHT
-        )
-        for value, label in BROWSER_SORT_ORDER_LABELS.items():
-            self.browser_sort_order_combo.addItem(label, value.value)
-        browser_sort_layout.addWidget(self.browser_sort_order_combo)
-
         self._sync_browser_controls()
-        self.browser_sort_key_combo.currentIndexChanged.connect(
-            self._apply_browser_controls
-        )
-        self.browser_sort_order_combo.currentIndexChanged.connect(
+        self.browser_sort_key_combo.activated.connect(
             self._apply_browser_controls
         )
         self.browser_search_edit = _BrowserSearchEdit(self.browser_sort_row)
@@ -5319,10 +5626,6 @@ class BrowserWindow(QMainWindow):
         )
         QWidget.setTabOrder(
             self.browser_sort_key_combo,
-            self.browser_sort_order_combo,
-        )
-        QWidget.setTabOrder(
-            self.browser_sort_order_combo,
             self.browser_search_edit,
         )
         browser_status_bar = self.statusBar()
@@ -5670,6 +5973,13 @@ class BrowserWindow(QMainWindow):
             quality_mode=self.thumbnail_quality_mode,
             max_edge=self.thumbnail_cache_max_edge,
             browser_display_mode=self.browser_thumbnail_display_mode,
+            encoder_quality=self.thumbnail_webp_quality,
+            preserve_alpha=self.thumbnail_preserve_alpha,
+            # The delegate fills real thumbnail frames with option.palette.base().
+            # Fallback-only colors and the Viewer background are unrelated.
+            matte_color=(self.list_view.palette() if hasattr(self, "list_view") else self.palette()).color(
+                QPalette.ColorGroup.Active, QPalette.ColorRole.Base
+            ).name(),
         )
         spec = policy.render_spec()
         if _THUMBNAIL_LOG.isEnabledFor(logging.DEBUG):
@@ -5687,6 +5997,18 @@ class BrowserWindow(QMainWindow):
                 metrics.smooth_pixmap_transform,
             )
         return spec
+
+    def _refresh_thumbnail_encoding_policy(self) -> None:
+        if self._shutdown_prepared:
+            return
+        new_spec = self._build_thumbnail_render_spec()
+        self.thumbnail_provider.set_disk_cache_encoding_policy(new_spec.encoding_policy)
+        if new_spec.cache_token == self.thumbnail_render_spec.cache_token:
+            return
+        self.thumbnail_render_spec = new_spec
+        self._generation = self.thumbnail_provider.begin_generation()
+        # Keep painted thumbnails/viewport while normal requested work updates.
+        self._schedule_thumbnail_requests(0)
 
     def _install_screen_tracking(self) -> None:
         if self._shutdown_prepared:
@@ -6509,17 +6831,21 @@ class BrowserWindow(QMainWindow):
         if added:
             self._show_temporary_status(f"{added}件をお気に入りへ追加しました")
 
-    def _show_context_menu(self, position: QPoint) -> None:
+    def _show_context_menu(self, position: QPoint, *, keyboard: bool = False) -> None:
         if self.list_view.consume_folder_gesture_context_menu_suppression():
             return
-        index = self.list_view.indexAt(position)
+        index = self.list_view.currentIndex() if keyboard else self.list_view.indexAt(position)
         item = self.item_model.item_at(index)
         if item is not None and not self.list_view.selectionModel().isSelected(index):
             self.list_view.selectionModel().select(
                 index,
                 QItemSelectionModel.SelectionFlag.ClearAndSelect,
             )
-            self.list_view.setCurrentIndex(index)
+            # Selection is already explicit. QListView.setCurrentIndex can
+            # toggle it again when Ctrl is held while opening this menu.
+            self.list_view.selectionModel().setCurrentIndex(
+                index, QItemSelectionModel.SelectionFlag.NoUpdate,
+            )
         selected_paths = self.selected_file_operation_paths()
         selection_count = len(selected_paths)
         rating_paths = tuple(
@@ -6535,6 +6861,22 @@ class BrowserWindow(QMainWindow):
             and self.file_operation_coordinator.queue is None
         )
         menu = QMenu(self)
+        filename_edit = None
+        selected_text_copy = selected_text_search = None
+        if selection_count == 1 and item is not None:
+            filename_edit = _BrowserContextFilenameEdit(Path(selected_paths[0]).name, menu)
+            filename_action = QWidgetAction(menu)
+            filename_action.setDefaultWidget(filename_edit)
+            menu.addAction(filename_action)
+            selected_text_copy = menu.addAction("選択文字をコピー")
+            selected_text_search = menu.addAction("選択文字で検索")
+            def update_text_actions() -> None:
+                enabled = bool(filename_edit.selectedText())
+                selected_text_copy.setEnabled(enabled)
+                selected_text_search.setEnabled(enabled)
+            filename_edit.selectionChanged.connect(update_text_actions)
+            update_text_actions()
+            menu.addSeparator()
         open_action = menu.addAction("開く")
         open_with_action = menu.addAction("関連付けで開く...")
         location_action = menu.addAction("エクスプローラーで開く")
@@ -6583,8 +6925,20 @@ class BrowserWindow(QMainWindow):
         menu.addSeparator()
         properties_action = menu.addAction("プロパティ")
         properties_action.setEnabled(selection_count == 1 and not busy)
-        selected = menu.exec(self.list_view.viewport().mapToGlobal(position))
-        if selected == open_action and item is not None:
+        anchor = position
+        if keyboard and not self.list_view.viewport().rect().contains(anchor):
+            anchor = self.list_view.viewport().rect().center()
+        selected = menu.exec(self.list_view.viewport().mapToGlobal(anchor))
+        if filename_edit is not None and selected == selected_text_copy:
+            filename_edit.copy_selected_text()
+        elif filename_edit is not None and selected == selected_text_search:
+            text = filename_edit.selectedText()
+            if text:
+                # BrowserSearchPredicate is literal, case-folded substring
+                # matching. Quoting/escaping would add unwanted literal text.
+                self.browser_search_edit.setText(text)
+                self._commit_browser_search_history()
+        elif selected == open_action and item is not None:
             self.open_item(index)
         elif selected == open_with_action and item is not None:
             self._open_with_application_picker(item)

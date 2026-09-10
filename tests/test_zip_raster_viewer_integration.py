@@ -69,6 +69,49 @@ def _window(
     return window, session, source, archive
 
 
+def test_viewer_releases_final_frame_completed_while_staged(tmp_path, qapp):
+    archive = _write_zip(tmp_path, pages=2)
+
+    class BlockedSource(ZipImageSource):
+        started = Event()
+        release = Event()
+
+        def open_image(self, image_id):
+            if image_id == "001.png":
+                self.started.set()
+                assert self.release.wait(3)
+            return super().open_image(image_id)
+
+    source = BlockedSource(archive)
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    session = BookSession(source_factory=lambda *_args, **_kwargs: (source, None))
+    window = ViewerWindow(config_manager=config, book_session=session)
+    try:
+        window.resize(640, 480)
+        window.set_view_mode("single")
+        window.show()
+        qapp.processEvents()
+        assert window._finish_opened_book(session.open_book(archive), modal_on_empty=False)
+        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 0)
+        assert source.started.wait(1)
+        runtime = session.viewer_runtime
+        window.slider.setSliderDown(True)
+        window._go_to_index_with_history(1, input_kind=NavigationInputKind.SLIDER_SCRUB)
+        assert window._pending_zip_runtime_request is not None
+        source.release.set()
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+        assert window.presentation_state.displayed_page == 0
+        assert window.presentation_state.requested_page == 1
+        window.slider.setSliderDown(False)
+        assert window.presentation_state.displayed_page == 1
+        assert window._pending_zip_runtime_request is None
+    finally:
+        source.release.set()
+        window.close()
+        qapp.processEvents()
+
+
 def test_zip_first_paint_populates_book_wide_display_ready_cache(
     tmp_path: Path,
     qapp: QApplication,
@@ -306,6 +349,7 @@ def test_input_kind_admission_is_immediate_except_rapid_bursts(
         cached = [False]
         requested: list[ZipRasterRequest] = []
         staged: list[ZipRasterRequest] = []
+        released: list[ZipRasterRequest] = []
         monkeypatch.setattr(runtime, "has_unfinished_tasks", lambda: busy[0])
         monkeypatch.setattr(
             runtime,
@@ -320,7 +364,12 @@ def test_input_kind_admission_is_immediate_except_rapid_bursts(
         monkeypatch.setattr(
             runtime,
             "stage",
-            lambda request: staged.append(request) or True,
+            lambda request, **_kwargs: staged.append(request) or True,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "release_staged",
+            lambda request: released.append(request) or True,
         )
 
         assert window._finish_opened_book(opened, modal_on_empty=False)
@@ -356,17 +405,23 @@ def test_input_kind_admission_is_immediate_except_rapid_bursts(
         wheel_end = _wheel_end_event()
         window.viewer.wheelEvent(wheel_end)
         assert wheel_end.isAccepted()
-        assert requested[-1] is staged[-1]
+        assert released[-1] is staged[-1]
         assert window._pending_zip_runtime_request is None
 
-        # Even inside the same wheel cadence a ready frame bypasses stage,
-        # worker creation, and the timer completely.
+        # A ready frame can publish during the same wheel cadence, but it now
+        # remains staged so recentered warmup cannot start a cold transit page
+        # before the final wheel target is known.
         busy[0] = True
         cached[0] = True
         staged_count = len(staged)
+        requested_count = len(requested)
         window.next_page(input_kind=NavigationInputKind.WHEEL)
-        assert requested[-1].current.pages[0].page_index == 5
-        assert len(staged) == staged_count
+        assert len(requested) == requested_count
+        assert len(staged) == staged_count + 1
+        assert staged[-1].current.pages[0].page_index == 5
+        assert window._pending_zip_runtime_request is staged[-1]
+        window._finish_wheel_navigation()
+        assert released[-1] is staged[-1]
 
         # Raw key identity keeps the leading press immediate, coalesces only
         # auto-repeat, and flushes the exact final target on release.
@@ -400,7 +455,7 @@ def test_input_kind_admission_is_immediate_except_rapid_bursts(
             window.viewer,
             _key_event(QEvent.Type.KeyRelease, Qt.Key.Key_Right),
         )
-        assert requested[-1] is staged[-1]
+        assert released[-1] is staged[-1]
     finally:
         window.close()
         qapp.processEvents()
@@ -588,6 +643,8 @@ def test_rapid_wheel_presents_only_ready_intermediate_frames(
 
         for _page_index in range(1, final_page + 1):
             window.next_page(input_kind=NavigationInputKind.WHEEL)
+            assert window.slider.value() == _page_index
+            assert f"{_page_index + 1} / 6" in window.status.currentMessage()
         window._finish_wheel_navigation()
         if expected_intermediate_paint is None:
             assert all(page_index == 0 for page_index in paints)
@@ -599,6 +656,8 @@ def test_rapid_wheel_presents_only_ready_intermediate_frames(
         _wait_until(qapp, source.final_started.is_set)
 
         assert commits == expected_intermediate_commits
+        assert window.slider.value() == final_page
+        assert f"{final_page + 1} / 6" in window.status.currentMessage()
         assert window.presentation_state.requested_page == final_page
         assert window.presentation_state.displayed_page == (
             expected_intermediate_commits[-1]

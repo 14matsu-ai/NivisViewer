@@ -653,7 +653,6 @@ def test_browser_chrome_uses_compact_layout_authorities(
         for control in (
             window.browser_location_control,
             window.browser_sort_key_combo,
-            window.browser_sort_order_combo,
             window.browser_search_container,
         ):
             assert control.height() == BROWSER_CHROME_CONTROL_HEIGHT
@@ -685,7 +684,6 @@ def test_browser_chrome_controls_are_unclipped_at_process_dpi(
         for control in (
             window.browser_location_control,
             window.browser_sort_key_combo,
-            window.browser_sort_order_combo,
             window.browser_search_container,
         ):
             assert control.height() >= control.minimumSizeHint().height()

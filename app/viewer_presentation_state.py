@@ -171,6 +171,14 @@ class PresentationValues:
 
 
 @dataclass(frozen=True)
+class PresentationNavigationFeedback:
+    """Page-only controls, deliberately separate from committed image details."""
+
+    total_pages: int
+    page_index: int
+
+
+@dataclass(frozen=True)
 class PresentationFrameToken:
     book: PresentationBook
     request_serial: int
@@ -392,6 +400,26 @@ class ViewerPresentationState:
     @property
     def status_values(self) -> PresentationValues | None:
         return self._committed.status_values
+
+    @property
+    def navigation_feedback(self) -> PresentationNavigationFeedback | None:
+        """Latest accepted same-book destination, without advancing read state.
+
+        Request creation precedes runtime admission/staging. Abandonment fences
+        clear requested, so the retained presentation becomes the fallback.
+        During replacement keep the old displayed book's controls until its
+        replacement commits; on initial open there is no old book to retain.
+        """
+        requested = self._requested
+        displayed = self._committed.displayed
+        values = self._committed.status_values
+        if requested is not None and (
+            displayed is None or requested.token.book == displayed.token.book
+        ):
+            values = requested.values
+        if values is None:
+            return None
+        return PresentationNavigationFeedback(values.total_pages, values.page_index)
 
     @property
     def progress_values(self) -> PresentationValues | None:
@@ -650,8 +678,8 @@ class ViewerPresentationState:
             if failed
             else None
         )
-        # The complete semantic/UI state changes through one immutable snapshot
-        # assignment. No requested-only page can leak into progress or status.
+        # Committed image details/history/progress change through one immutable
+        # assignment. Page-only navigation feedback is a separate derived view.
         committed = _CommittedSnapshot(
             displayed=frame,
             slider_page_index=frame.values.page_index,

@@ -1,0 +1,81 @@
+About ZipPla
+
+
+Copyright ©  2016 Rio's Toolbox
+
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program. If not, see <http://www.gnu.org/licenses/>.
+
+
+
+This software includes source codes of following programs.
+
+SharpCompress 0.14.0
+Copyright (C) Adam Hathcock
+https://sharpcompress.codeplex.com/license
+
+iTextSharp 5.5.10
+Copyright (C) 1999-2016 by iText Group NV
+https://github.com/itext/itextsharp/blob/develop/LICENSE.md
+
+HtmlRenderer 1.5.0.6
+Copyright (c) 2009, José Manuel Menéndez Poo
+http://htmlrenderer.codeplex.com/license
+
+TagLib# 2.1.0.0
+Copyright (c) 2006-2007 Brian Nickel.  Copyright (c) 2009-2010 Other contributors
+https://github.com/mono/taglib-sharp/blob/master/COPYING
+
+System.Drawing.PSD 1.0.0.0
+Copyright © Darren Horrocks 2013
+https://github.com/bizzehdee/System.Drawing.PSD
+
+CSharpImageLibrary 3.2.1.0
+Copyright ©  KFreon 2015
+https://github.com/KFreon/CSharpImageLibrary
+
+UsefulThings 1.6.1.0
+Copyright © KFreon 2015
+https://github.com/KFreon/Useful-C-Sharp-Collection
+
+SevenZipExtractor 1.0.4
+Copyright ©  2016 (Alexander Selishchev)
+https://github.com/adoconnection/SevenZipExtractor
+
+Explorer Shell Context Menu (Jpmon1)
+https://www.codeproject.com/info/cpol10.aspx
+https://www.codeproject.com/Articles/22012/Explorer-Shell-Context-Menu
+
+WinTouch.NET 0.1.0.0
+Copyright © Rob Prouse 2014
+https://github.com/rprouse/WinTouch.NET
+
+LibAPNG 0.2.*
+Copyright © Amemiya 2012
+https://github.com/xupefei/APNG.NET/blob/master/LICENSE
+
+
+This software links to the following library. 
+
+Microsoft Deployment Compression Cab 1.0.0
+Copyright (c) Outercurve Foundation. All rights reserved.
+https://www.nuget.org/packages/MSFTCompressionCab/
+
+
+
+You can download full source code of this program from here.
+
+Rio's Toolbox
+https://sites.google.com/site/riostoolbox/
+
+(To download the source code, open "ZipPla > 各種ダウンロード" page and click "ソースコード.")

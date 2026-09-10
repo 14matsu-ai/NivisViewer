@@ -164,34 +164,34 @@ def test_top_rating_sort_controls_live_resort_without_thumbnail_decode(
     scan_generation = window._scan_generation
 
     try:
-        rating_index = window.browser_sort_key_combo.findData("rating")
+        rating_index = window.browser_sort_key_combo.findData("rating:ascending")
         assert rating_index >= 0
         window.browser_sort_key_combo.setCurrentIndex(rating_index)
-        window.browser_sort_order_combo.setCurrentIndex(
-            window.browser_sort_order_combo.findData("ascending")
-        )
+        window.browser_sort_key_combo.activated.emit(rating_index)
         qapp.processEvents()
-        assert window.browser_sort_key_combo.currentData() == "rating"
+        assert window.browser_sort_key_combo.currentData() == "rating:ascending"
         assert [item.display_name for item in window.items] == [
             "one.jpg",
             "three.jpg",
             "none.jpg",
         ]
 
-        window.browser_sort_order_combo.setCurrentIndex(
-            window.browser_sort_order_combo.findData("descending")
+        window.browser_sort_key_combo.setCurrentIndex(
+            window.browser_sort_key_combo.findData("rating:descending")
         )
+        window.browser_sort_key_combo.activated.emit(window.browser_sort_key_combo.currentIndex())
         qapp.processEvents()
-        assert window.browser_sort_order_combo.currentData() == "descending"
+        assert window.browser_sort_key_combo.currentData() == "rating:descending"
         assert [item.display_name for item in window.items] == [
             "three.jpg",
             "one.jpg",
             "none.jpg",
         ]
 
-        window.browser_sort_order_combo.setCurrentIndex(
-            window.browser_sort_order_combo.findData("ascending")
+        window.browser_sort_key_combo.setCurrentIndex(
+            window.browser_sort_key_combo.findData("rating:ascending")
         )
+        window.browser_sort_key_combo.activated.emit(window.browser_sort_key_combo.currentIndex())
         qapp.processEvents()
         selection = window.list_view.selectionModel()
         one_index = window.item_model.index(window.item_model.row_for_path(one), 0)
@@ -303,7 +303,7 @@ def test_search_and_rating_quick_filter_compose_without_changing_sort(
         assert window.browser_sort_row.layout().indexOf(
             window.browser_search_container
         ) > window.browser_sort_row.layout().indexOf(
-            window.browser_sort_order_combo
+            window.browser_sort_key_combo
         )
         assert not hasattr(window, "browser_folders_first_checkbox")
         assert not hasattr(window, "browser_display_density_combo")
@@ -386,7 +386,7 @@ def test_search_and_rating_quick_filter_compose_without_changing_sort(
         assert measured_widths[1920][2] >= 130
         assert measured_widths[3840][0] == measured_widths[1920][0]
         assert measured_widths[3840][3] > measured_widths[1920][3]
-        assert window.browser_sort_key_combo.currentData() == "modified_time"
+        assert window.browser_sort_key_combo.currentData() == "modified_time:descending"
         stars_rect = window.rating_filter_widget._stars_rect()
 
         def star_point(reference: int) -> QPoint:
@@ -505,7 +505,7 @@ def test_search_and_rating_quick_filter_compose_without_changing_sort(
             rating_mode=RatingFilterMode.AT_LEAST,
             rating_reference=3,
         )
-        assert window.browser_sort_key_combo.currentData() == "modified_time"
+        assert window.browser_sort_key_combo.currentData() == "modified_time:descending"
         assert [item.display_name for item in window.items] == [
             "日本語 high.jpg"
         ]
@@ -525,7 +525,7 @@ def test_search_and_rating_quick_filter_compose_without_changing_sort(
         assert [item.display_name for item in window.items] == [
             "日本語 none.jpg"
         ]
-        assert window.browser_sort_key_combo.currentData() == "modified_time"
+        assert window.browser_sort_key_combo.currentData() == "modified_time:descending"
 
         window.rating_filter_widget.clear_filter()
         window.browser_search_edit.setText("ALPHA")
@@ -1098,11 +1098,9 @@ def test_sort_controls_apply_without_opening_viewer_or_changing_history(
     initial_generation = window.thumbnail_provider.generation
 
     window.browser_sort_key_combo.setCurrentIndex(
-        window.browser_sort_key_combo.findData("modified_time")
+        window.browser_sort_key_combo.findData("modified_time:descending")
     )
-    window.browser_sort_order_combo.setCurrentIndex(
-        window.browser_sort_order_combo.findData("descending")
-    )
+    window.browser_sort_key_combo.activated.emit(window.browser_sort_key_combo.currentIndex())
     qapp.processEvents()
 
     assert [entry.display_name for entry in window.items] == [

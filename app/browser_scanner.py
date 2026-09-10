@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Callable
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 
 from .archive_backend import EXTERNAL_ARCHIVE_EXTENSIONS, is_supported_archive_candidate
-from .browser_sort import BrowserSortPolicy
+from .browser_sort import BrowserSortPolicy, creation_time_ns
 from .browser_visibility import (
     LEGACY_SUPPORTED_ITEMS_POLICY,
     BrowserVisibilityPolicy,
@@ -82,6 +82,8 @@ class BrowserScanEntry:
     preview_kind: str = ""
     rating: int | None = None
     page_count: int | None = None
+    created_time_ns: int | None = None
+    accessed_time_ns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -234,6 +236,8 @@ def scan_entry_from_dir_entry(
         can_generate_preview=True,
         preview_kind=preview_kind,
         rating=filename_metadata.rating,
+        created_time_ns=creation_time_ns(entry_stat),
+        accessed_time_ns=getattr(entry_stat, "st_atime_ns", None),
     )
 
 

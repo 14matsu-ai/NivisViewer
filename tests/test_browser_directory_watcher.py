@@ -162,6 +162,31 @@ def test_external_create_and_delete_reconcile_automatically(
         qapp.processEvents()
 
 
+def test_same_directory_watcher_reconcile_preserves_active_search(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "folder"
+    existing = folder / "keep.jpg"
+    created = folder / "keep-new.jpg"
+    write_item(existing)
+    window, watcher = make_window(tmp_path, folder, qapp)
+    window.browser_search_edit.setText("keep")
+    window._browser_search_timer.stop()
+    window._apply_pending_browser_search()
+
+    try:
+        write_item(created)
+        reconcile(window, watcher, qapp)
+
+        assert window.browser_filter_state.search_text == "keep"
+        assert window.browser_search_edit.text() == "keep"
+        assert window.item_model.row_for_path(created) >= 0
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
 def test_real_qt_directory_watcher_detects_external_create(
     tmp_path: Path,
     qapp: QApplication,

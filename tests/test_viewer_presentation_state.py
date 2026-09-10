@@ -101,6 +101,42 @@ def test_rapid_requests_reject_stale_frame_and_history_uses_last_displayed() -> 
     assert all(entry.values.page_index != 1 for entry in state.back_history)
 
 
+def test_navigation_feedback_is_a_derived_view_not_committed_progress():
+    state = ViewerPresentationState()
+    assert state.navigation_feedback is None
+    first = _request(state, 0)
+    assert state.navigation_feedback.page_index == 0
+    assert state.status_values is None and state.progress_values is None
+    _commit(state, first, 1)
+    old = state.displayed
+    for page in (1, 3, 2):
+        pending = _request(state, page)
+        assert state.navigation_feedback.page_index == page
+        assert state.slider_page_index == state.progress_page == state.history_page == 0
+        assert state.displayed is old
+    state.fail_pending("latest abandoned")
+    assert state.navigation_feedback.page_index == 0
+    assert _commit(state, pending, 2) is None
+    _request(state, 4)
+    state.supersede_pending()
+    assert state.navigation_feedback.page_index == 0
+
+    _request(state, 5)
+    state.begin_replacement_open()
+    assert state.navigation_feedback.page_index == 0
+    state.fail_replacement_open("unavailable book")
+    assert state.navigation_feedback.page_index == 0
+    replacement = state.request_frame(_book(2), _unit(3), _values(3, 240), (), 1.0)
+    assert state.navigation_feedback.total_pages == 10  # Retained old canvas.
+    _commit(state, replacement, 3)
+    assert state.navigation_feedback.total_pages == 240
+    assert state.navigation_feedback.page_index == 3
+    state.clear_book()
+    assert state.navigation_feedback is None
+    state.close()
+    assert state.navigation_feedback is None
+
+
 def test_surface_owner_keeps_loading_and_retained_replacement_explicit() -> None:
     state = ViewerPresentationState()
     assert state.surface.mode is PresentationSurfaceMode.EMPTY

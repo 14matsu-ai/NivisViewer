@@ -1,0 +1,23 @@
+{
+  "success": true,
+  "version": "0.1.0-dev",
+  "frozen": true,
+  "checks": {
+    "qt": true,
+    "browser": true,
+    "viewer": true,
+    "jpeg": true,
+    "png": true,
+    "webp": true,
+    "gif": true,
+    "tiff": true,
+    "ico": true,
+    "zip": true,
+    "pdf": true,
+    "metadata": true,
+    "thumbnail_cache": true,
+    "file_operations": true,
+    "shutdown": true
+  },
+  "errors": []
+}

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 import inspect
 import logging
@@ -30,6 +30,7 @@ from .preview_provider_registry import PreviewProviderRegistry
 from .thumbnail_disk_cache import ThumbnailDiskCache
 from .thumbnail_render import (
     SmartCropCache,
+    ThumbnailEncodingPolicy,
     ThumbnailRenderSpec,
     pil_to_qimage,
     render_pil_thumbnail,
@@ -738,6 +739,14 @@ class BrowserThumbnailProvider(QObject):
         )
         self._start_worker(worker, ThumbnailPriority.PREFETCH)
 
+    def set_disk_cache_encoder_quality(self, quality: int) -> None:
+        if self._disk_cache is not None:
+            self._disk_cache.set_encoder_quality(quality)
+
+    def set_disk_cache_encoding_policy(self, policy: ThumbnailEncodingPolicy) -> None:
+        if self._disk_cache is not None:
+            self._disk_cache.set_encoding_policy(policy)
+
     def set_disk_cache_max_unused_days(self, days: int) -> None:
         if self._disk_cache is not None:
             self._disk_cache.set_max_unused_days(days)
@@ -1152,6 +1161,13 @@ class BrowserThumbnailProvider(QObject):
             and self._disk_cache_enabled
             and disk_cache is not None
         ):
+            # Publish the same matte-composited pixels that we save. Otherwise
+            # a fresh transparent preview and its later opaque disk hit differ.
+            policy = size.encoding_policy if isinstance(size, ThumbnailRenderSpec) else getattr(disk_cache, "encoding_policy", ThumbnailEncodingPolicy())
+            if not policy.preserve_alpha and result.image.hasAlphaChannel():
+                result = replace(result, image=pil_to_qimage(
+                    policy.prepare_pixels(ThumbnailDiskCache._qimage_to_pil(result.image))
+                ))
             saved = disk_cache.put(
                 item,
                 size if isinstance(size, ThumbnailRenderSpec) else cache_token,
@@ -1160,6 +1176,7 @@ class BrowserThumbnailProvider(QObject):
                 entry_path=result.entry_path,
                 page_count=result.page_count,
                 protected_thumbnail_sizes=self._protected_thumbnail_sizes(item),
+                encoding_policy=policy,
             )
             if saved:
                 self._increment_stat("disk_saved")
@@ -1235,8 +1252,10 @@ class BrowserThumbnailProvider(QObject):
         disk_cache = self._disk_cache
         if self._disk_cache_enabled and disk_cache is not None:
             disk_cache.set_enabled(True)
-            self._run_initial_maintenance(disk_cache)
             cached = disk_cache.get_page_count(item)
+            # Read source metadata before maintenance can retire an old codec's
+            # payload. A quality change alone must not force this enumeration.
+            self._run_initial_maintenance(disk_cache)
             if cached is not None:
                 return ThumbnailLoadResult(
                     None,

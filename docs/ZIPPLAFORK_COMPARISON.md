@@ -6435,3 +6435,1536 @@ textbox／filename auto-selection記録である。materially derivedしたbehav
 item nameをcopyしやすくすることだけで、C# control、rename、wildcard、selection algorithmのcodeは移植していない。
 NivisViewer側対応は`app/browser_window.py`とfocused offscreen testsである。必要なlicense本文とcopyright noticeは
 section 1記載の`licenses/ZipPlaFork/AGPL.txt` / `licenses/ZipPlaFork/About.txt`に保持している。
+
+## 39. Viewer true-fullscreen transition and rapid-wheel dispatch gate（2026-09-03）
+
+### 39.1 ZipPlaFork fixed-revision fullscreen behavior
+
+固定revision `07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`の
+`source/ZipPla/ViewerForm.cs` class `ViewerForm`、property `FullScreen`
+（fixed-revision source lines 2005–2117）は、true fullscreenを
+`FormBorderStyle == None && WindowState == Maximized`として定義する。enter時は以前の
+`FormWindowState` / `FormBorderStyle`を保存する。すでにmaximizedで通常のViewer processなら、
+visible windowを一時的に隠して`WindowState = Normal`へ戻す。このlineには
+「タスクバーが残る問題の回避」と明記されている。その後`FormBorderStyle = None`、
+`WindowState = Maximized`の順でborderless full-monitor surfaceを作り、必要な設定の場合だけ
+`TopMostInFullscreen`を`TopMost`へ投影する。exit時は以前のborder style/state/sizeを戻し、
+`TopMost = false`とする。monitor移動の可能性があるnormalization pathでは
+`Screen.FromControl(this).WorkingArea`を比較し、normal boundsを対応displayへ移すが、fullscreen
+surface自体はborderless maximized stateが所有する。
+
+### 39.2 NivisViewer translation
+
+変更前のNivisViewerは`ViewerWindow.show_initial` / `toggle_fullscreen` / `exit_fullscreen`から
+Qt `showFullScreen()` / `showNormal()`を直接呼び、pre-fullscreen maximized state、normal geometry、
+target screen、window flagsをtransition authorityとして保持していなかった。特にmaximized HWNDから
+直接`WindowFullScreen`へ変えるため、Windows shellとのworking-area/taskbar関係がnative surfaceに残る
+遷移を避ける構造がなかった。
+
+既存`FullscreenChromeController`を唯一のfullscreen reconcilerのまま拡張し、enter時にwindow flags、
+normal geometry、target `QScreen`、maximized stateを一snapshotとして保存する。visible maximized windowは
+neutral stateを表示しないよう先にhideし、`WindowNoState`、`FramelessWindowHint`、target screenの
+`QScreen.geometry()`（`availableGeometry()`ではない）、Qt `showFullScreen()`の順で遷移する。
+Windows native platformではQtのlogical rectangleをWin32へ渡さない。2026-09-05 review修正で、
+neutral-state遷移前のViewer HWNDからtyped `MonitorFromWindow`でtarget HMONITORを捕捉し、
+遷移後にtyped `GetMonitorInfoW`のnative `rcMonitor`（`rcWork`ではない）を取得して
+`SetWindowPos(HWND_TOP, ..., SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW)`へ渡す。
+`app/windows_fullscreen.py`の`WindowsFullscreenAdapter`がこのnative boundaryだけを所有する。
+Qt logical QRect全体へのDPR乗算や`QScreen.name()`とのnative device-name照合は行わない。
+pointer-sized HWND/HMONITOR、signed rectangle、BOOL returnとAPI failureを明示的に扱い、
+monitorが消失した場合／API failureではQt boundsを保持する。
+根拠は[Qt High DPI](https://doc.qt.io/qt-6/highdpi.html)、
+[MonitorFromWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-monitorfromwindow)、
+[GetMonitorInfoW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getmonitorinfow)、
+[SetWindowPos](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowpos)である。
+`HWND_TOPMOST`、`WindowStaysOnTopHint`、taskbar API、shell auto-hide settingは使用しないため、
+Alt+Tabやdialog ownershipをblanket topmost workaroundで変更しない。exitは一度neutral/hidden stateにし、
+保存したflags、screen、normal geometryを戻してから、以前がmaximizedなら`showMaximized()`、それ以外は
+`showNormal()`へ復帰する。fullscreen中のapplication shutdown snapshotも保存済みpre-fullscreen
+`saveGeometry()`を使うため、次回fullscreen exitでfull-monitor boundsがnormal geometryへ混入しない。
+windowed/maximized modeの通常bounds authorityは変更していない。
+
+### 39.3 Rapid-wheel dispatch invariant
+
+mixed ready/cold wheel burstでは、ready transit frameを通常の`RasterBookRuntime.request()`で表示すると、
+同じcall末尾のcontinuous warmup `_drive()`が次のcold transit unitをsole workerへ投入できた。その直後の
+wheel inputはそのjobを新currentとしてadoptするため、final cold target admissionより先にtransit decodeが
+開始されていた。test expectationではなくproduction orderingの欠陥である。
+
+shared runtimeの既存`stage` gateを拡張し、cache-ready transitは`publish_cached=True`でatomic presentationを
+publishできる一方、decode/warmup dispatchはsuspendedのまま保持する。wheel boundaryはexact staged requestを
+`release_staged()`で開く。2026-09-05 review修正ではcacheとrequest publicationを分け、
+`_publish_frame`でpublication済みのrequest objectをsignal送信前に記録する。adoptしたworkerがstage中に
+完了した場合、release時にcached final frameを同期publishする。stageで既にpublishしたready transitの
+同じrequestは二重publishしない。未完了なら既存current-first driveに任せる。obsolete request、
+異なるsource epoch、duplicate releaseは既存exact-object gateで拒否する。これによりready
+intermediate presentation、display-ready retention、single-lane runtime、latest wheel coalescingを保持しつつ、
+mixed burstのcold transit decodeを開始しない。これはZipPlaFork sourceを移植した処理ではなく、
+NivisViewer固有async runtimeのcorrectness repairである。
+
+### 39.4 Provenance
+
+参照元repositoryは`himamon/ZipPlaFork`、固定revisionは
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`、licenseはAGPL-3.0-or-laterである。
+materially referenced／translatedしたfile/class/method/processは`source/ZipPla/ViewerForm.cs` class
+`ViewerForm`のproperty `FullScreen`、fields `FullScreen_pseudoFullScreen`、`prevFormWindowState`、
+`prevFormBorderStyle`、`prevSize`、`TopMostInFullscreen`、maximized enter時のhidden -> Normal ->
+borderless -> Maximized transition、exit restoration processである。NivisViewer側対応は
+`app/fullscreen_chrome.py`の`FullscreenChromeController.enter_true_fullscreen` /
+`leave_true_fullscreen` / `_apply_native_fullscreen_bounds`と`app/viewer_window.py`の既存fullscreen
+entry pointsである。必要なlicense本文とcopyright noticeはsection 1記載の
+`licenses/ZipPlaFork/AGPL.txt` / `licenses/ZipPlaFork/About.txt`に保持している。
+
+2026-09-05のpublication修正とWin32 coordinate adapterはNivisViewerの不具合修正であり、
+追加のZipPlaFork code移植やdependency追加はない。固定revisionとAGPL-3.0-or-later provenanceは上記のまま保持する。
+offscreen/fake testsは100/125/150/200%、負のorigin、mixed-DPI target monitor、geometry復元、
+ZIP/Folder completion-before/after-releaseを検証する。実Windows taskbar、Alt+Tab、native visible windowの
+動作はこの検証では実行しておらず、以前記載したtaskbar persistence原因は実機で確定した結論ではない。
+
+### 39.5 Current-tree verification (2026-09-05)
+
+The follow-up inspected the authoritative uncommitted implementation above;
+it did not reapply or replace those repairs. Four alternatives remain distinct:
+ZipPlaFork's borderless/maximized transition provides the Windows transition
+reference; the former NivisViewer direct Qt transition lacked explicit restore
+ownership; the implemented hybrid retains Qt fullscreen/chrome ownership and
+adapts the neutral transition plus a narrowly scoped native monitor correction;
+a new shell/taskbar manager or blanket topmost policy is unnecessary and was
+not introduced. Native taskbar suppression is still an unverified hypothesis,
+not a result demonstrated by the fake adapter tests.
+
+Fresh offscreen verification: ZIP runtime/integration suites **40 passed**;
+fullscreen state/controller/navigation suites **81 passed**. The exact
+`test_rapid_wheel_presents_only_ready_intermediate_frames[mixed]` case passed
+in **5/5 separate processes**; ready/cold/mixed variants also passed together
+(3 tests). No assertion was weakened and no timing sleep was added.
+
+The existing production `scripts/benchmark_viewer_navigation.py` ran with
+13 synthetic 4096 × 6500 JPEG pages, a 1920 × 1080 viewport, and a 512 MiB
+cache under offscreen Qt (Python 3.12.14 / PySide6 6.11.2). Request-to-paint:
+immediate cold final target 46.772 ms; sequential 3.011 ms; reverse 1.876 ms;
+direction reversal 1.870 ms; ping-pong median 1.464 ms; rapid final 2.376 ms.
+The immediate burst committed only its final page (5). One cancelled old
+result was rejected; terminal errors were zero. These are synthetic single-run
+measurements, not a before/after speedup or a real-machine responsiveness claim.
+The solid/compressible fixture archive was only 13,525 bytes despite the large
+decoded dimensions, so it does not measure real large-archive storage latency.
+No real application, taskbar interaction, native input, commit, or push ran.
+
+### 39.6 Attachment re-verification against the current tree (2026-09-06)
+
+The repeated fullscreen/mixed-wheel request was checked against the actual
+uncommitted files. Both production repairs and their focused tests already
+existed; they were preserved, not reapplied. The fixed-revision
+`ViewerForm.FullScreen` source was read again and confirms section 39.1.
+No production or test expectations changed in this verification pass.
+
+Fresh processes: the exact mixed case passed **5/5**; the ZIP runtime and
+integration suites passed **40 tests**; fullscreen state, controller and
+navigation suites passed **81 tests**. Syntax parsing passed for the seven
+relevant production/test files, and `git diff --check` passed.
+
+An additional production-runtime offscreen smoke used nine seeded high-detail
+2400 x 3600 JPEG pages (41,472,435-byte ZIP), a 1280 x 800 viewport and 256 MiB
+cache on Python 3.12.14 / Qt 6.11.2. Request-to-paint measurements were:
+immediate cold final target 84.183 ms, sequential 1.111 ms, reverse 1.382 ms,
+direction reversal 1.415 ms, ping-pong median 1.201 ms, rapid final 2.452 ms.
+The immediate burst committed only its final page (5); one cancelled old
+result was rejected and terminal errors were zero. These are a single
+synthetic smoke run, not a before/after speedup or Windows compositor timing.
+
+Native taskbar suppression (ordinary and auto-hide), Alt+Tab and real dialog
+ordering remain unverified. Fake native bounds/state tests do not establish
+that the shell symptom is resolved on the user's machine. No real application,
+native input, shell-setting change, commit or push was performed.
+
+### 39.7 Current attachment verification (2026-09-09)
+
+The current attachment requests the mixed-wheel/fullscreen repairs already
+present in the authoritative working tree. They were inspected and preserved;
+no production code or test expectation was changed in this verification pass.
+The fixed-reference `ViewerForm.FullScreen` source was reread; the methods,
+transition comparison and AGPL-3.0-or-later provenance in 39.1–39.4 still apply.
+
+On Python 3.11.9 / PySide6 and Qt 6.11.2, offscreen verification passed the
+exact mixed-wheel case in **5/5 fresh processes**. The runtime, ZIP integration,
+fullscreen-state and navigation-policy suites passed **59 tests**. A combined
+controller/navigation run aborted during garbage collection while the first
+Viewer fullscreen-wheel case imported PDF support with a raster worker active;
+that run is not counted as passing, and its root cause was not established.
+The same fullscreen-wheel case and four bottom-edge reveal/hover cases passed
+in a fresh focused process (**5 tests**). This does not establish that the
+broader test-process lifetime problem is resolved. The standalone controller
+suite also passed **7 tests**. Syntax parsing passed for seven relevant files,
+and `git diff --check` passed.
+
+The existing large-image offscreen smoke used nine seeded high-detail
+2400 × 3600 JPEGs (41,472,435-byte ZIP), 1280 × 800 viewport and 256 MiB cache.
+Request-to-paint: cold burst final 66.212 ms, sequential 0.905 ms, reverse
+0.901 ms, direction reversal 1.197 ms, ping-pong median 0.904 ms and rapid
+final 1.597 ms. Only final page 5 committed in the cold burst; one cancelled
+result was rejected and terminal errors were zero. These are single-run
+synthetic measurements, not native compositor timing or a before/after claim.
+
+Actual ordinary/auto-hide taskbar suppression, Alt+Tab, dialogs and native
+multi-monitor transitions remain unverified. No real application, native
+input, external GUI, shell configuration change, commit or push was performed.
+
+## 40. Browser snapshot-owned navigation index (2026-09-05)
+
+### 40.1 Fixed source and design choice
+
+Inspected the commit object in the local reference repository, not its working
+tree: `https://github.com/himamon/ZipPlaFork`, revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, `source/ZipPla/CatalogForm.cs`,
+class `CatalogForm`. Both `getSelectedPathArray` overloads read `ZipPathArray`
+and order selected data indexes through `tvCatalog.DataIndexToShowIndex`;
+`tvCatalog_ShowIndexToDataIndexChanged` reads the retained
+`ShowIndexToDataIndex.Length` for the visible count. These are examples of
+reusing visible/data correspondence, not evidence that every ZipPla operation
+is constant-time (the selection path itself sorts selected indexes).
+
+- ZipPla: retained visible/data arrays correspond to canonical path arrays.
+- Previous NivisViewer: immutable captured visible order, but openable paths,
+  normalized keys, membership sets and image lists were rebuilt on each input.
+- Adopted hybrid: retain NivisViewer's immutable captured-order authority and
+  derive its lexical normalized indexes once, then reuse them.
+- New design: a global navigation index would duplicate ownership/invalidation;
+  it is unnecessary and was not introduced.
+
+This is structural reference, not a direct C# port. Source license is
+AGPL-3.0-or-later; the upstream license and copyright notices remain in
+`licenses/ZipPlaFork/AGPL.txt` and `licenses/ZipPlaFork/About.txt`. Corresponding
+NivisViewer code is `app/adjacent_book_search.py`,
+`AdjacentBookBrowserSnapshot.__post_init__`, `viewer_paths`,
+`adjacent_viewer_path`, `contains_viewer_path`, and its image-only projection;
+`app/application_controller.py`, `_synchronize_browser_to_viewer_item` and
+`_folder_snapshot_from_browser_navigation`. No dependency was added.
+
+### 40.2 Implementation and preserved contracts
+
+The frozen snapshot owns tuple paths and read-only `MappingProxyType` indexes.
+`setdefault` preserves the FIRST normalized duplicate exactly as the previous
+`tuple.index`. Membership reuses the same Viewer index, not a second set.
+The image-only index is a different filtered domain: the existing controller
+also reconstructed all image paths/fingerprints on every adjacent-book open,
+even for ZIP targets. It now reuses snapshot tuples while constructing the
+existing `FolderListingSnapshot` with only the selected index/image changed.
+This small local change removes the remaining per-action snapshot traversal;
+it does not alter folder loading or establish another listing authority.
+
+Constructor arguments, frozen behavior, equality, hash and repr are unchanged:
+all derived fields are `init=False, compare=False, hash=False, repr=False`.
+Actual consumers pass snapshots in memory; no snapshot serialization/deepcopy
+consumer was found. Path identity still uses `lexical_absolute` / `path_key`,
+without stat, resolve, scans or sorting. Negative direction means previous;
+zero and positive mean next. Empty/missing, boundary, loop, mixed eligibility,
+captured sort/filter and first-duplicate behavior are preserved. Browser sync
+checks Browser existence/location before membership and leaves unrelated
+Browser navigation untouched. Its no-snapshot fallback is unchanged.
+
+### 40.3 Same-runtime A/B and cost tradeoff
+
+`scripts/benchmark_browser_snapshot_index.py` contains an explicitly isolated
+benchmark-only copy of the former algorithms. Both implementations receive
+the same prebuilt synthetic entries (alternating archive/image, Japanese
+basenames) in one Python 3.12.14 / Windows process. Times below are medians of
+7 samples; indexed lookup samples batch 1,000 calls and report per-call time.
+Construction is timed separately; `tracemalloc` runs separately from timing
+and excludes the shared input entries. There is no timing-based pass threshold.
+
+| Entries | Neighbor before → after ms | Membership before → after ms | Image projection before → after ms |
+|---:|---:|---:|---:|
+| 1,000 | 1.016600 → 0.000979 | 1.025600 → 0.000789 | 0.702200 → 0.002079 |
+| 10,000 | 10.443700 → 0.000981 | 10.712600 → 0.000794 | 7.012900 → 0.002087 |
+| 50,000 | 54.987400 → 0.000996 | 58.234100 → 0.000804 | 42.698400 → 0.002532 |
+
+| Entries | Construction before → after ms | Derived retained / construction peak bytes (after) |
+|---:|---:|---:|
+| 1,000 | 0.000700 → 1.385300 | 311,336 / 328,456 |
+| 10,000 | 0.000600 → 14.259400 | 3,193,640 / 3,362,408 |
+| 50,000 | 0.000600 → 91.636500 | 17,525,920 / 18,408,256 |
+
+Before construction retained only 288–424 bytes beyond shared entries, paying
+for derivation each time instead. At 50,000 entries, neighbor/membership peak
+temporary allocations were 11,031,646 / 12,653,484 bytes before, 468 / 468
+after. Image projection peak was 10,061,136 before versus 1,000 bytes after.
+Snapshot creation is still O(n) and now pays the derivation upfront; each live
+snapshot retains its derived memory until released. Large snapshot capture can
+therefore still incur noticeable one-time UI cost. Lookup work is independent
+of entry count (but depends on target path length and ordinary dictionary
+lookup behavior). These are string-only results, not measured end-to-end
+Viewer/Browser latency or a demonstrated real-device speedup.
+
+Focused tests verify no entry iteration and exactly one target normalization
+per neighbor/membership/image-projection call at 1/1,000/50,000 entries, plus
+immutable derived maps and dataclass contracts. Existing integration coverage
+checks rapid pending XButtons, same Viewer reuse, moved-away Browser, image /
+folder / archive selection sync, hidden rating target neutrality, and transient
+search round trips. Runtime: bundled Python 3.12.14 / PySide6 6.11.2 with existing
+site-packages; Python 3.11 is unavailable and was not repaired. Tests use
+offscreen Qt/fakes/temp fixtures only; no real app, native input, commit or push.
+
+Fresh-process groups passed **41 tests**: 12 new snapshot-index cases, 9 Viewer
+XButton cases, 9 controller snapshot/sync/roundtrip cases, and 11 adjacent-search
+stability cases. The repository-required production navigation check also ran
+on the same 13-page 4096 × 6500 synthetic fixture described in section 39.5:
+sequential 1.593 ms, reverse 1.542 ms, direction reversal 1.793 ms, ping-pong
+median 1.700 ms, rapid final 2.981 ms (request-to-paint); zero terminal errors.
+It is a regression smoke check, not a performance result attributable to this
+snapshot change. The compressible-fixture and offscreen limitations still apply.
+
+## 41. Shared initial-open capture and detailed ZIP observation (2026-09-05)
+
+### 41.1 One Browser capture per initial open
+
+The accepted section 40 implementation is the baseline, not the pre-index
+implementation. Previously `BrowserWindow.open_item` called
+`_folder_snapshot_for_item` and `adjacent_book_snapshot` independently; both
+executed `_visible_order_snapshot_items` (source + remaining progressive items,
+filter, stable sort). The `_invoke_open_path_handler` fallback could do the same.
+
+`open_item` now delegates preparation to `_invoke_open_path_handler`, carrying
+the exact selected `BrowserItem`. That dispatch captures the visible-order
+tuple once when snapshots are missing and passes it to the existing snapshot
+builders through an optional `snapshot_items` argument. No global cache or
+additional order authority exists. Progressive `remaining_item_offset` and
+same-location/committed guards are unchanged. Supplied snapshots are preserved;
+external drops with `use_browser_order=False` do not capture; 2/3/4-argument
+handlers, reuse/new-window flags and bookmark/history fallbacks remain intact.
+
+The image-only builder deliberately retains its original semantics: every
+IMAGE entry and exact path/selected-item matching. Scanner-produced IMAGE
+entries are supported (`browser_scanner.scan_entry_from_dir_entry`) and are
+converted to absolute paths (`browser_model.browser_item_from_scan_entry`).
+Nevertheless the model can accept constructed items with disabled openability
+or normalized duplicate identities. The mixed snapshot's image index filters
+openability and selects the first normalized match, so substituting it blindly
+would change these contracts. Both snapshots derive from the same captured
+items, but keep their existing eligibility/path rules. The accepted mixed
+snapshot indexes are still constructed and reused for subsequent navigation.
+
+`scripts/benchmark_browser_open_capture.py` measures both snapshot constructors
+and dispatch, using production Browser/model methods with a fake handler.
+Before = the original separate builders with the accepted indexed mixed
+snapshot; after = shared preparation. Identical prebuilt reversed mixed
+image/archive items, rating-descending/folders-first, search `keep`, rating≥3;
+7-sample medians in one runtime. Input/model setup and real file opening are
+excluded. `tracemalloc` runs separately and excludes shared input storage.
+
+| Source / visible items | Pipeline calls before → after | Preparation before → after ms | Retained bytes before → after | Peak bytes before → after |
+|---:|---:|---:|---:|---:|
+| 1,000 / 514 | 2 → 1 | 8.2291 → 4.7565 | 318,476 → 285,372 | 326,556 → 297,708 |
+| 10,000 / 5,143 | 2 → 1 | 84.2286 → 48.7380 | 2,680,552 → 2,680,496 | 2,768,152 → 2,809,384 |
+| 50,000 / 25,714 | 2 → 1 | 582.7358 → 364.7863 | 13,651,720 → 13,651,664 | 14,086,040 → 14,291,840 |
+
+Large retained results are effectively unchanged; keeping the capture alive
+through both builders slightly increases temporary peak memory. Allocator/cache
+effects are included in the small case. Preparation still performs one full
+filter/sort and O(n) snapshot derivation; 365 ms is not an instantaneous large
+folder open. These string/model measurements do not establish real UI latency.
+
+### 41.2 Reproducible high-detail fixture
+
+The maintained `scripts/benchmark_viewer_navigation.py` keeps the default flat
+JPEG mode and adds `--fixture-mode high-detail`. Algorithm
+`seeded-tile-texture-pseudo-glyphs-v1`: Python Random seed `20260905 + page`,
+independent 256×256 luminance-texture tiles mapped to 168–231, 24-pixel ruled
+rows, 20×24 pseudo-glyph pitch with three variable-width dark bars per glyph,
+and 256-pixel panel lines. This distributes texture and structured/text-like
+edges across the page without relying on a system font or a pure-noise image.
+It is synthetic stress content, NOT a real scan. JPEG quality 88, subsampling 2.
+One RGB page plus a tile and compressed buffers is generated at a time; there
+is no all-pages pixel array. Generation and hashing precede navigation timing.
+All ZIPs/configs are temporary, no image-library access or new dependency.
+
+The JSON report records dimensions/pages, algorithm/seed/parameters, JPEG
+quality/subsampling, generation duration, JPEG payload bytes, total payload
+including optional ignored padding, physical ZIP bytes, content digest
+(entry names + JPEG payloads + optional padding), physical ZIP digest, and
+Python/Pillow/JPEG/libjpeg-turbo/Qt/PySide/zlib/OS versions. ZIP member timestamps
+are fixed for reproducible containers; default flat JPEG bytes remain unchanged.
+
+### 41.3 Paint-based residence and final-target observation
+
+Schema 5 extends existing input/commit/`framePainted` instrumentation; it does
+not change production scheduling. The immediate burst remains synchronous
+`next_page(WHEEL)` calls followed by the existing wheel-end release, with NO
+inter-input pumping. Previously the hidden Viewer was explicitly rendered only
+after the target was ready; now every post-burst event-pump poll renders the
+current surface. The existing 1 ms idle wait is unchanged. This observation
+policy is explicit in the report and identical for both fixture modes. It can
+observe ready intermediate frames, but does not manufacture them or simulate
+a human input cadence. Old schema-4 timings with target-only rendering are not
+a like-for-like comparison with this observer.
+
+All timestamps/deadlines use `perf_counter`. Residence starts with the already
+painted initial page at the first input, includes every distinct painted unit
+transition, and ends at the explicit final observation (first final-target
+paint observed by the pump, or timeout). Repaints and same-unit quality updates
+do NOT reset residence; `same_unit_paints` counts those separately, and paint
+records retain serials. Maximum residence and first final-target paint time
+are computed from full-precision timestamps, then rounded. Leading and trailing
+intervals are included. No transitions means the entire observation duration,
+not zero. A missing final paint yields null time and `incomplete`/`timeout`;
+an initially visible target reports `already_at_target`, time 0, but still
+accounts for the observation duration. An actual immediate-observer timeout
+returns a failed report and explicitly skips remaining scenarios; CLI exits 1.
+Preparation failures still raise explicitly rather than yielding success.
+
+The immediate report includes input count, final accepted target, full painted
+sequence, distinct transitions, observation duration and unchanged intervals.
+`request_to_paint_ms` now means the FIRST final `framePainted` timestamp, not
+the later return from a wait helper. Work counters are accurately named
+`work_through_final_observation`. Offscreen forced rendering is not Windows
+compositor presentation; real wheel delivery, display timing and subjective
+smoothness remain unverified.
+
+### 41.4 Matched workload observations and verification
+
+Fresh-process flat/high-detail runs used identical 9×2400×3600 pages,
+1280×800 viewport, 256 MiB cache, DEFLATED ZIP, no padding, 5 immediate inputs
+from page 0 to accepted page 5, and 30 s timeout. Both observed only the distinct
+transition `[0] → [5]`; no ready intermediate painted in this cold burst.
+
+| Metric | Flat | High-detail |
+|---|---:|---:|
+| JPEG payload bytes | 1,220,661 | 41,509,228 |
+| Physical ZIP bytes | 6,905 | 41,472,435 |
+| Fixture generation ms (not navigation) | 126.016 | 1,746.077 |
+| First final-target paint ms | 21.579 | 61.165 |
+| Maximum unchanged-page interval ms | 21.579 | 61.165 |
+| Trailing observation interval ms | 0.159 | 0.117 |
+| Total observation ms | 21.738 | 61.283 |
+| Warm sequential / reverse ms | 1.611 / 0.978 | 1.075 / 1.014 |
+| Direction reversal / ping-pong median ms | 1.282 / 0.993 | 1.265 / 1.049 |
+| Warm rapid-final ms | 1.870 | 1.675 |
+| Terminal errors | 0 | 0 |
+
+Content SHA256: flat
+`6342fe6ce3fede938dabcbc114e9bb72860b8c1032457ac9f89b8af74cd44f3b`,
+high-detail `eb1ade19ee3aa110f986e9a3bdee7d8a58681ab53d5fcdc071250376ad313582`.
+Physical ZIP SHA256: flat
+`c84b993c66f7367ebf2e71c11001efb4ea001eca17832bd87dfd5c19d114afe8`,
+high-detail `6e762622fca5c52b89219b007a148816e954794c932f11fdb8c51e50337b32be`.
+These are workload differences, not a production speedup. A prior matched run
+observed 21.413 / 65.871 ms; do not treat single-run values as stable latency
+thresholds. Both runs produced identical fixture digests.
+
+Runtime: bundled Python 3.12.14, PySide6/Qt 6.11.2, Pillow 12.3.0, JPEG 8.0,
+libjpeg-turbo 3.1.4.1, Windows 11 build 26200. Python 3.11 remains unavailable;
+no environment repair was performed. Focused groups passed 58 tests: 10 new
+Browser capture cases, 7 benchmark fixture/observation cases, 12 snapshot-index
+cases, 18 XButton/controller cases, 7 progressive-scan/drop cases and 4 existing
+snapshot cases. Tests cover repeatable/different JPEG fixtures, leading/trailing
+gaps, same-unit paints, no changes, already-at-target and failed timeout reports.
+No real app launch/native input/external GUI, commit or push occurred.
+
+### 41.5 Fixed-revision reference and four-way decision
+
+Reference: `https://github.com/himamon/ZipPlaFork`, revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, AGPL-3.0-or-later.
+`source/ZipPla/CatalogForm.cs`, class `CatalogForm`, `getSelectedPathArray`
+overloads, `ShowIndexToDataIndex` / `DataIndexToShowIndex` / `ZipPathArray`
+correspondence remain the structural reference for reusing captured order.
+`source/ZipPla/ViewerForm.cs`, class `ViewerForm`, property `NextPage`, methods
+`movePageNatural` and `moveToNextPage` were inspected at the fixed revision:
+unready size/frame paths can keep current position; natural movement restores
+old current when it cannot advance. Equal input counts therefore do not imply
+equal accepted distance versus NivisViewer's latest-target contract.
+
+ZipPla's retained correspondence is useful; previous NivisViewer duplicated
+initial-open capture; the adopted hybrid shares action-local capture while
+retaining NivisViewer order, eligibility and input contracts. A new global cache
+or benchmark scheduler would add another authority and was rejected. The
+fixture and paint metric are new benchmark-only evaluation code; no ZipPla
+scheduler/input suppression was ported. NivisViewer correspondence is
+`app/browser_window.py` snapshot/open helpers and
+`scripts/benchmark_viewer_navigation.py` fixture/immediate observer. No direct
+C# port is claimed. Existing `licenses/ZipPlaFork/AGPL.txt` and `About.txt`
+retain upstream license/copyright notices. Search UI and production runtime
+scheduling were not changed.
+
+## 42. Requested-page feedback without changing committed presentation (2026-09-05)
+
+The user requested only the existing slider position and existing page fraction
+to communicate the latest accepted destination while a cold frame is pending.
+No spinner, overlay, dimming, arrow/current-to-target label, loading caption,
+setting or search-field change was added.
+
+### Ownership and reconciliation
+
+Inspection confirmed that every accepted same-book page movement reaches
+`ViewerWindow._refresh_view` / `_begin_presentation_request` before the runtime
+admission decision, `stage`, cold decode or wheel-end release. Thus the existing
+`ViewerPresentationState.requested` already holds the validated/clamped focused
+page even when `_pending_zip_runtime_request` has not been dispatched (or is
+absent because the leading/reversal input was admitted immediately).
+
+`ViewerPresentationState.navigation_feedback` is a read-only derived
+`PresentationNavigationFeedback(total_pages, page_index)` view, not another
+mutable cursor. `_project_presentation_surface` projects it synchronously to
+the existing slider and page fraction. `status_values`, `slider_page_index`,
+`progress_values`, displayed frame identity, image path/size/resolution, history
+and persistence remain committed-only under their existing contracts. A first
+request with no committed image can show its page fraction without inventing
+image details. Existing temporary status overrides keep their priority.
+
+`ViewerPageSlider.set_page_state` already uses `QSignalBlocker`; projecting a
+target cannot generate navigation. `_on_slider_changed` now reconciles against
+that target rather than snapping a drag back to the committed page. It does
+not clear slider-down state. No decode admission, wheel accumulation, slider
+single-page behavior, renderer, worker, cache or warmup policy was changed.
+No forced rendering or visibility change was added; hidden/fullscreen chrome
+continues to be managed by its existing controller.
+
+`fail_pending` or a superseding fence clears the request, so feedback falls
+back to the retained committed page. A subsequent valid request can immediately
+establish a new target through the same authority. Existing token/book/layout
+guards reject obsolete completions/errors before projection. Ready intermediate
+frames do not provide a separate widget cursor that can override a newer
+request. A committed error frame keeps its pre-existing commit/progress
+semantics; it is distinct from terminal abandonment with an old frame retained.
+
+Replacement-open fencing discards the old uncommitted target. While the old
+canvas is retained, its own committed page/total remains the feedback fallback,
+including while a different-book request is pending. The new book's page/total
+becomes visible at its first commit. A failed replacement retains the old book;
+the existing recovery path may issue a fresh valid request for that book.
+`clear_book` and `close` yield no feedback and disable/reset the slider, so no
+previous book target/total survives into the empty state.
+
+### Verification and limits
+
+Before implementation the new blocked-worker reproduction failed for both ZIP
+and folder sources: accepted target 1, slider still 0. After implementation,
+controls reflect every accepted forward/reverse target before release while
+the old pixmap, displayed values, history and progress remain unchanged.
+
+Fresh-process groups passed **51 tests**: 13 focused offscreen feedback cases
+(ZIP/folder blocked decode, drag signal count, abandonment/stale error, LTR/RTL
+focused spread/bounds/hidden controls, real replacement/close flow, and a PDF
+source using a fake backend), 7 presentation-state cases, 15 runtime/Viewer
+integration cases and 16 slider/fullscreen wheel cases. Existing mixed
+ready/cold transit tests now also assert current target controls during the
+burst. The old control-only committed assertions in `test_viewer_window.py`
+were deliberately updated; its atomic image, page-list, history and progress
+assertions were retained and strengthened. Syntax/diff checks passed.
+
+The maintained high-detail fixture smoke used the same section 41 settings:
+9×2400×3600 pages, 1280×800 viewport, 256 MiB cache, five cold burst inputs to
+page 5. First final paint and maximum unchanged-page interval were 60.879 ms;
+the observed distinct image sequence was still `[0] → [5]`. Sequential/reverse/
+direction-reversal/ping-pong median/warm rapid-final request-to-paint were
+0.984 / 0.965 / 1.249 / 0.958 / 1.649 ms; terminal errors zero. The page controls
+now communicate intent during that retained-image interval; these results are
+not a claim of faster decoding or real Windows compositor responsiveness.
+No benchmark paint boundary was redefined to count control updates as paints.
+
+Runtime: bundled Python 3.12.14 / PySide6 6.11.2; Python 3.11 remains unavailable
+and was not repaired. Only offscreen Qt, fake input/backends and temporary
+fixtures were used. No real app/native input/external GUI, commit or push ran.
+
+### Reference disposition
+
+This is a NivisViewer-specific UX change, not a new ZipPlaFork port. The
+fixed reference remains `himamon/ZipPlaFork`, revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, AGPL-3.0-or-later; existing provenance
+and license/copyright notices remain unchanged. ZipPla's `ViewerForm.NextPage`
+/ `movePageNatural` readiness-gated input is not being adopted. The chosen
+NivisViewer approach derives feedback from its existing request authority;
+a hybrid suppression policy would change accepted movement, and a new widget
+cursor/overlay system would duplicate ownership. Neither was introduced.
+Correspondence: `app/viewer_presentation_state.py` navigation feedback view;
+`app/viewer_window.py` presentation/slider/status projection only.
+
+## 43. Unified Browser sorting and persistent Random (2026-09-06–07)
+
+### Fixed source findings and disposition
+
+Reference: [himamon/ZipPlaFork](https://github.com/himamon/ZipPlaFork), fixed
+revision `07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, AGPL-3.0-or-later.
+The fixed source was read before implementation, not the moving worktree.
+
+`source/ZipPla/CatalogForm.cs`, class `CatalogForm`, populates `cbSortBy`
+(lines 3876–3890) with Type, Name, Rating, Created, Accessed, Modified and Size,
+each ascending/descending, followed by Random. `GetSortArray` (14101 onward)
+uses captured creation/access/modification arrays, keeps unrated entries after
+rated entries in both directions, and calls `GetTypeNameArray` for type sorts.
+`GetTypeNameArray` (14638) caches localized Windows type descriptions per
+extension; it does not classify every image/archive as one coarse category.
+
+The Random branch (14566 onward) retains `GetSortArray_RandomSeed` and builds
+a per-path hash table. `GetRandomIndex` (14678) hashes a metadata-stripped base
+path plus seed with SHA-1. Its comment explicitly protects order across tag
+changes. `source/ZipPla/ZipPlaInfo.cs`, class `ZipPlaInfo`, method
+`GetBasePathRoughly`, strips a basename metadata block, not parent-directory
+components. NivisViewer uses its existing validated metadata parser instead
+of that rough substring parser and SHA-256 instead of SHA-1; permutations are
+not intended to be byte-for-byte compatible.
+
+`cbSortBy_SelectedValueChanged` (14745 onward) clears the seed for a Random
+action. Settings save/load paths (9921, 10130, 10281) persist/restore it; the
+save shown there emits the seed only when the active mode is Random.
+`cbSortBy_DropDownClosed` around 16540 is commented out, not evidence of an
+active same-item reselect gesture. NivisViewer's explicit Random reactivation
+is a requested UX adaptation. ZipPla's Random action clears selection and
+scrolls to the top; that side effect was deliberately not adopted.
+
+Four-way decision: a literal ZipPla port would bring WinForms controls,
+localized shell lookups and unwanted selection clearing; keeping NivisViewer
+unchanged would retain two selectors and omit the new criteria. The chosen
+hybrid adopts the combined catalog and stable seeded-path ordering while
+retaining the existing NivisViewer sort/filter, selection, viewport and frozen
+snapshot authorities. A new parallel sorting/history/cache system was rejected.
+
+### NivisViewer correspondence and ordering contract
+
+`app/browser_sort.py` owns `BROWSER_SORT_CHOICES`, normalizers and
+`BrowserSortPolicy`. Both `BrowserWindow` and the Browser section of
+`SettingsDialog` use the same 15 entries: 種類, 名前, レート, 作成日時,
+アクセス日時, 更新日時, サイズ (each 昇順/降順), then exactly one ランダム.
+The independent direction control is removed. The existing compact chrome,
+font sizes and search sizing rules are unchanged.
+
+`BrowserWindow._apply_browser_controls` uses QComboBox `activated`, not
+`currentIndexChanged`: one explicit activation applies key/direction (and,
+for Random, seed) in one `ConfigManager.apply` and one model reorder. Same-item
+Random activation is included. Programmatic selection/synchronization and
+popup open/close do not activate. Settings keeps changes as a local draft until
+Apply/OK; Cancel does not persist a seed. An unchanged dialog preserves even
+a legacy Random/descending stored pair without a redundant reset.
+
+ConfigManager retains separate `browser_sort_key`/`browser_sort_order` for
+compatibility and adds `browser_random_seed`, a JSON integer in 0..2^64-1.
+Missing/invalid seeds normalize deterministically to zero, the migration/default
+seed; there is no entropy generation during normalization or sort. Each explicit
+Random activation generates a different bounded seed. The seed remains stored
+even when switching to regular criteria (an intentional extension of upstream
+persistence), and survives refresh, batches, filters, metadata changes,
+Back/Forward and restart. A different seed need not produce a different
+permutation of a tiny list.
+
+Random sorts the normalized lexical path with valid basename ZipPla metadata
+removed via `ZipPlaFilenameMetadata.parse(...).display_name`; it never trusts
+delegate/rendered text, uses Python `hash()`, stats paths or shuffles per call.
+Folders-first is an independent leading partition. Hash ties use stripped
+identity, then case-folded/original full path. Distinct physical names collapsing
+to the same stripped identity therefore have deterministic order; a rename
+within that degenerate duplicate-identity group can change its final tie-break.
+Ordinary rating/tag metadata renames keep the same random position. New items
+join their seeded position and removing/filtering items retains the relative
+order of survivors. Random ignores the legacy direction value.
+
+Regular criteria retain NivisViewer natural-name secondary order, deterministic
+path ties and natural name sorting. Unrated stays last both ways. Missing dates
+and sizes retain the existing numeric `-1` sentinel (before ordinary nonnegative
+values ascending, after them descending); newly exposed timestamps follow the
+same rule. This is not ZipPla's size-ascending unknown-last normalization.
+Folders-first overrides all primary directions. No recursive folder size is
+computed. Type sorting deliberately uses case-insensitive extension groups,
+including unsupported extensions and a separate folder group. The inspected
+`ShellAssociatedIconProvider` supplies icons, not cached type descriptions;
+no shell calls or new description cache were added to comparators/painting.
+This is meaningful file-type grouping, not exact localized Explorer parity.
+
+`app/browser_scanner.py` appends optional `created_time_ns`/`accessed_time_ns`
+fields to `BrowserScanEntry`; `app/browser_model.py` carries them into appended
+`BrowserItem` fields. Existing positional constructors remain valid. The same
+`DirEntry.stat(follow_symlinks=False)` supplies all timestamps: birthtime_ns
+when present, ctime_ns only as a Windows fallback, and atime_ns for filesystem
+access (not reading-history time). This follows the
+[Python stat_result documentation](https://docs.python.org/3/library/os.html#os.stat_result).
+POSIX ctime is not treated as creation; no access-time settings or timestamps
+are written. Worker-prepared sort policy equality includes the seed. The
+existing Browser refresh tuple/dataclass equality detects timestamp-only
+changes, retaining compatible thumbnails; no second reconcile mechanism exists.
+
+`app/adjacent_book_search.py` and the existing sibling-folder request in
+`app/application_controller.py` carry the same seed and optional timestamps,
+including the adjacent-search cache variant. Sibling date sorts request captured
+stat metadata; rating sorting uses the existing filename parser.
+`BrowserWindow._sync_browser_controls`, `_current_browser_sort_policy`,
+`_capture_list_view_state`/restore and `_finalize_rating_batch` remain the
+production authorities. Browser-originated Viewer opens still capture the
+single filtered/sorted order once, and the immutable snapshot indexes remain
+unchanged. Existing Viewer reload/navigation retain their open-time snapshot;
+a fresh Browser open receives the current order.
+
+### Verification and measured limits
+
+Focused fresh-process offscreen runs completed during this task:
+
+- Sort/scanner/config/Settings/Browser window suites: **125 passed**.
+- New `test_browser_unified_sort.py` plus the new real Browser-to-Viewer
+  random snapshot integration case: **50 passed** (49 + 1).
+- Existing capture/index/XButton/controller snapshot, sibling, sync and
+  roundtrip selection: **40 passed**, 26 deselected.
+- Browser navigation/watcher/page-count/chrome suites: **69 passed**.
+- Unified selector plus chrome geometry at process scale 1/1.25/1.5/2:
+  **2 passed at each scale** (8 executions).
+- Existing Viewer navigation-target feedback: **13 passed**. Final syntax
+  parsing passed for 15 affected Python files; `git diff --check` passed.
+
+New coverage includes all persisted key/order pairs, malformed seeds, exact
+activation/reset counts, Settings draft/cancel and unchanged Apply, Japanese
+natural ties, extension grouping, unknown dates/sizes, unrated/folder partitions,
+hash collisions, subsets/incremental batches, metadata/rating changes,
+selection/minimal viewport preservation, scan metadata propagation and
+timestamp-only refresh equality, fake Windows 3.11/3.12 stat shapes,
+Back/Forward/refresh seed retention, and frozen Viewer order across reshuffle.
+
+`scripts/benchmark_browser_random_sort.py` measures three-run medians using
+prebuilt items and the production single-capture/two-snapshot open path:
+
+| Items | Random sort | Full single-open capture |
+| ---: | ---: | ---: |
+| 1,000 | 11.500 ms | 18.431 ms |
+| 10,000 | 133.564 ms | 190.440 ms |
+| 50,000 | 742.460 ms | 1124.159 ms |
+
+Each open uses one pipeline capture; no filesystem scan/decode occurs. Random
+has O(n) temporary keys and O(n log n) sorting, with no retained random list or
+additional cache authority. These are synthetic timings, not native latency or
+a speedup claim; 50k capture still has a noticeable cost.
+
+The required high-detail navigation smoke completed with nine 2400 x 3600 JPEG
+pages, 1280 x 800 viewport and 256 MiB cache: cold immediate final 70.039 ms,
+sequential 1.490 ms, reverse 1.638 ms, reversal 1.849 ms, ping-pong median
+1.338 ms, rapid final 2.283 ms; terminal errors zero. No Viewer decoding or
+presentation implementation changed in this task.
+
+Runtime: bundled Python 3.12.14 / Qt/PySide6 6.11.2. Python 3.11 was unavailable;
+its Windows stat shape was faked, not executed on a repaired runtime. Real
+native UI responsiveness remains unverified. No new dependencies, real app
+launch, native input, external GUI, commit, push or destructive git operation.
+
+### License/copyright provenance
+
+The combined directional catalog, persisted seed/path-hash process and
+metadata-rename stability principle above are adapted from the fixed
+`CatalogForm`/`ZipPlaInfo` files and methods explicitly listed in this section,
+AGPL-3.0-or-later. NivisViewer correspondence is the Browser sort/catalog,
+config/UI activation and metadata propagation code listed above, not a new
+Viewer runtime port. Copyright notice **Copyright © 2016 Rio's Toolbox** and
+license text remain in `licenses/ZipPlaFork/About.txt` and
+`licenses/ZipPlaFork/AGPL.txt`; neither was changed or removed.
+
+### Review correction: deterministic filter/rename test boundaries (2026-09-07)
+
+The successful initial runs above did not establish stability of the new
+`test_random_selection_filter_rename_and_open_time_snapshot` test. Independent
+review observed **231 passed, 1 failed** across its initial groups and reproduced
+the selection assertion failure in an isolated process. Instrumentation found
+the selection was already empty before rating finalization, not lost by the
+rename's path remapping.
+
+The test had applied a filter, cleared it, reset the model and selected an item
+before processing the filter's queued post-layout restoration. Its selected
+random row could either survive or be excluded by the filter, making the later
+selection assertion depend on seed/temp-path order. This was a test sequencing
+defect; no settled production restoration defect was reproduced.
+
+The corrected test explicitly selects a retained identity (`本110.jpg`) or an
+excluded identity (`本80.jpg`) in two parameterized cases. A read-only observer
+around the existing `_restore_list_view_state` records both synchronous and
+queued calls: each filter operation processes Qt events and asserts the same
+state's post-layout restore has completed before proceeding. Model reset also
+settles before the next selection. The test asserts both filter-selection
+contracts and the intended selected/current path immediately before finalizing
+the rating rename. Post-rename selected identity, exact row and viewport-offset
+assertions remain intact. No production code, timeout, sleep, skip or xfail was
+added, and no post-rename assertion was weakened.
+
+Fresh offscreen verification after correction: both cases passed together in
+**10/10 separate repeated processes** (20 case executions), in addition to the
+initial corrected two-case run. Unified-sort/sort/scanner/config suites passed
+**119 tests** in another fresh process. Python 3.12.14 / PySide6 6.11.2 was used
+with `-B` and pytest `no:cacheprovider`. Syntax and diff checks passed. This
+follow-up changed only the focused test and this documentation; no real app,
+native input, external GUI, commit, push or destructive git operation occurred.
+
+## 44. Spread loupe, reading-direction slider and gesture stroke (2026-09-09)
+
+### Fixed-source inspection and design choice
+
+Reference: https://github.com/himamon/ZipPlaFork, fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, AGPL-3.0-or-later.
+Inspected the fixed `source/ZipPla/ViewerForm.cs`, class `ViewerForm`:
+`MagnifierCanvas`, `bwMagnifierMaker_DoWork`, magnifier branch of `pbView_Paint`,
+`GetMagnifierRectangle`, `MagnifierPhase2`, and `setSeekBarDirection`.
+The magnifier worker prepares separate page canvases and assigns offsets in
+one combined coordinate space. Binding direction determines horizontal
+placement; unequal heights are centered. Paint crops each canvas using its
+offset and fills uncovered regions with the Viewer background. Magnifier
+readiness is fenced by the current page and worker completion. Seek-bar
+`SameAsPage` projects right-to-left binding into `InversedSlider` without
+changing logical page indexes.
+
+Also inspected fixed `source/ZipPla/MouseGesture.cs`, class `MouseGesture`,
+`GetPen` / `GestureBegin` and orbit drawing: rounded caps, antialiasing and
+display-scaled stroke width. NivisViewer uses Qt logical coordinates, so it
+must not apply the WinForms physical-pixel DPI multiplication a second time.
+
+Four-way evaluation: **ZipPla** supplies the combined magnifier coordinate
+space and direction projection; the previous **NivisViewer** per-page crop
+and focused-page cancellation cannot represent a continuous spread. The
+chosen **Hybrid** preserves NivisViewer's actual painted rectangles, modern
+Qt DPR handling, source hydration, render workers, cache budget and generation
+fences, adapting ZipPla's page-offset composition. A **New** monolithic bitmap
+cache/worker or framebuffer-resize-per-pointer-move design was rejected: it
+would duplicate ownership and repeatedly resample already known pixels.
+
+### Repairs and retained contracts
+
+`ViewerWindow._refresh_view` formerly cancelled a loupe whose source page was
+not `model.focused_index`, even if that page remained in the displayed spread.
+Source hydration calls this path, explaining the left/non-focused-page failure.
+It now tests displayed-spread membership. `ViewerWidget` snapshots actual
+painted rectangles for both pages and maps the pointer crop across their union,
+including gutter/background, not just the originally hit image. Worker-built
+per-page magnifier artifacts are drawn at translated positions at their native
+DPR; pointer movement only updates the crop/translation. No navigation,
+filesystem access, decode or worker resize is introduced per pointer move.
+
+The existing `_magnifier_artifact_cache`, `ViewerRenderTask` and coordinator
+are reused. The spread dictionaries are current-session key/paint bindings,
+not another cache. Aggregate enlarged page pixels use the existing 32-Mpixel
+artifact ceiling (zoom is limited only when required by that ceiling); retained
+unique pixmaps, including active bindings, count against the existing 160-MiB
+cache ceiling. Queued obsolete keys are removed and old completions cannot
+activate a cancelled/new display. Preview or retained display pixmaps are
+resized on the worker as a coherent two-page fallback while existing source
+hydration runs; the normal spread/selection remains until both artifacts exist.
+Full-source replacements keep the same displayed placement. PDF target sizes
+are retained for both visible pages, with resume after prepared-frame commit.
+Single-page crop behavior is unchanged.
+
+`ViewerPageSlider.set_reading_direction` pins local layout direction to LTR
+and sets both `invertedAppearance` and `invertedControls` for RTL. Logical
+indices, wheel commands and requested-versus-committed state are unchanged.
+Viewer startup and live direction actions update this one slider, also used
+by fullscreen chrome. No overlay or spinner was added.
+
+The previous Browser/Viewer stroke consisted of separate translucent lines:
+overlapping round endpoints brighten the sampled joins, while antialiasing
+was not enabled and logical pen width was multiplied by DPR. Both now call
+`app/gesture_trail.py:draw_gesture_trail`, one antialiased path with round
+caps/joins and a 3-logical-pixel pen, retaining the previous color/alpha.
+Recognition, thresholds, commands and clearing remain with their owners.
+The existing `mouse_gesture_show_trail` setting is reused, default unchanged;
+its Mouse Settings label now says Viewer/Browser shared. It stays enabled
+when Viewer recognition is disabled. A visibility-only change clears/repaints
+the trail without cancelling active recognition on either surface. Existing
+ConfigManager signals provide immediate application and persistence.
+
+### Provenance and verification
+
+The page-offset composition and direction/rounded antialiased stroke principles
+above are adapted from the listed fixed source methods, not a line-for-line
+WinForms port. NivisViewer mappings are `app/viewer_widget.py` spread magnifier
+methods, `app/viewer_window.py` hydration membership/slider wiring,
+`app/viewer_page_slider.py:set_reading_direction` and
+`app/gesture_trail.py:draw_gesture_trail` with `ExplorerListView.paintEvent`.
+AGPL-3.0-or-later attribution applies. Existing license and notices are retained
+in `licenses/ZipPlaFork/AGPL.txt` and `licenses/ZipPlaFork/About.txt`, including
+`Copyright © 2016 Rio's Toolbox` and the bundled third-party notices. No new
+dependency or license was added.
+
+Python 3.11.9 x64 / PySide6 6.11.2, process-local clean PATH and
+`QT_QPA_PLATFORM=offscreen`: new focused tests plus existing magnifier tests
+**253 passed**; selected existing slider/navigation-feedback/gesture/settings
+tests **29 passed**. Coverage includes asymmetric page pixels, both entry sides,
+LTR/RTL, unequal pages, rotation 0/90/180/270, zoom/pan, full/preview/pixmap tiers,
+100/125/150/200% DPR, gutter pixels, no per-move work, stale rejection, real ZIP
+hydration, slider endpoints/intermediate/groove/drag/keys, pending feedback,
+shared fullscreen slider, sparse trail alpha continuity, active recognition
+with trail off, and real Settings persistence/live Browser/Viewer application.
+Seven changed Python files passed syntax parsing; diff whitespace was checked.
+
+One bounded high-detail offscreen smoke used nine 2400 x 3600 JPEG pages,
+1280 x 800 viewport and 256-MiB cache. Request-to-paint: sequential 0.995 ms,
+reverse 0.951 ms, reversal 1.239 ms, ping-pong median 0.931 ms, rapid final
+1.562 ms; terminal errors zero. These are synthetic single-run observations,
+not native responsiveness claims. No real interactive app, native input,
+external GUI, portable rebuild, commit or push ran. Real monitor/input-device
+visual behavior still requires user observation; offscreen DPR tests do not
+verify the native compositor.
+
+### 44.1 Review repair: live fallback policy and PDF zoom targets
+
+The independent review reproduced an early-return defect in the new spread
+fallback branch: any existing page key bypassed full policy/size validation.
+Two focused tests reproduced this before the repair: changing the explicit
+upscale algorithm queued **zero** replacement jobs, and increasing PDF loupe
+zoom left its promotion count at **two**, not four (one upgrade per page).
+
+Fallback identity now uses the retained painted QPixmap cache key, then builds
+the complete algorithm/size/DPR render key before consulting the existing
+artifact cache and pending jobs. `toImage()` is deferred until an actual miss;
+there is no additional retained source cache. Live bilinear changes build both
+required artifacts; cursor-only updates still perform no decode/resize work.
+Zoom changes rebuild both target sizes while retaining source identity.
+
+Promotion bookkeeping now retains the largest requested QSize per page within
+the existing loupe session. PDF requests upgrade only when a dimension grows;
+smaller/repeated targets, algorithm-only changes, source-ready callbacks and
+pointer moves do not re-request it. Raster promotion remains once per page
+because it hydrates the full source independently of magnifier target size.
+Cancellation clears this session bookkeeping as before. These are local
+correctness repairs, with no additional ZipPla port or license/dependency;
+section 44's fixed-revision provenance and architecture remain unchanged.
+
+Changed in this review pass: `app/viewer_widget.py`,
+`tests/test_spread_loupe_slider_trail.py`, and this document only. Source-tier
+tests assert both algorithm-bearing keys, replacement pixmaps and full RGBA
+pixel-byte agreement with the submitted source rendered under the requested
+policy, unchanged geometry, bounded jobs, raster hydration deduplication and
+PDF target upgrades. New/existing loupe suites: **255 passed**; the two new
+regressions also passed in **3/3 fresh processes**. Verified runtime was Python
+**3.11.9 x64**, PySide6 **6.11.2**, offscreen with process-local PATH. Syntax and
+diff checks passed. The bounded nine-page 2400 x 3600 high-detail navigation
+smoke completed with zero terminal errors: sequential 0.967 ms, reverse
+0.932 ms, reversal 1.249 ms, ping-pong median 0.954 ms, rapid final 1.605 ms.
+These are synthetic observations, not a native-performance claim. No real app,
+native input, external GUI, portable rebuild, commit or push was performed.
+
+
+## 45. Independent background for files without thumbnails (2026-09-09)
+
+Fixed source inspected: https://github.com/himamon/ZipPlaFork revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, AGPL-3.0-or-later;
+`source/ZipPla/CatalogForm.cs`, `CatalogForm.setColors`,
+`tvCatalog_ThumbnailPaint`, `drawFileImage`, `drawFileIconImage` and nested
+`ThumbViewer.DrawItem`. `setColors` sets the Catalog background to black.
+`DrawItem` fills the entire thumbnail canvas with `BackColorBrush` before
+drawing the image and raising the thumbnail-paint callback. FileNotFound,
+LoadError and NotYet enter the fallback branch. At this fixed revision
+`drawFileImage` immediately returns: its comment explains that an incomplete
+internal load state could otherwise cause an icon to overlap an actual image.
+The lower-left associated icon is handled separately in the completed branch.
+Thus the effective missing-file default is the shared black canvas, not a
+separate rounded card or an actively drawn large file icon.
+
+Four-way choice: ZipPla's shared black canvas is the reference; NivisViewer
+already has a correctly aligned placeholder helper and useful centered icons,
+but previously enabled its fill only for folders or errors. The chosen Hybrid
+extends that existing helper to every item without a valid QImage, retaining
+NivisViewer icons, framing and overlays. A new renderer, preview-state store
+or background cache was unnecessary and was not introduced.
+
+`BrowserItemDelegate._uses_placeholder_canvas` now tests actual image
+availability, not file kind/error alone. Unsupported/no-preview, pending,
+unrequested/cancelled, null-image and failed file previews use the same neutral
+fallback. Successful QImages take precedence, including when an error flag is
+stale; existing asynchronous generation guards are unchanged. Broken archives
+use the file color through this same path, not a competing archive renderer.
+Folder colors remain independent. The default for both is black `#000000`.
+The fill is exactly `thumbnail_content_rect`: the existing real-image maximum
+target, physically snapped at DPR, with no extra placeholder inset. The
+centered icon remains constrained to half each axis; associated icon alpha,
+rating/error/selection/hover overlays and the removed lower-left plate are
+unchanged. This change adds no image decode, association lookup, thumbnail
+request or filesystem scan to painting.
+
+Settings -> Browser -> サムネイル now places
+`ファイルの代替サムネイル背景` beside `フォルダーの代替サムネイル背景`.
+The independent `browser_file_fallback_background` stores `auto` or normalized
+`#rrggbb`; missing legacy keys and invalid values become `auto`. Shared
+normalization and color-picker/reset/button helpers preserve folder behavior.
+The explicit `デフォルトに戻す` button resets the staged value to `auto`;
+Apply/OK persists and repaints open Browser views immediately. Cancel discards
+unapplied changes, including an unapplied reset; repeated reset remains valid.
+Color-only configuration does not invalidate display surfaces, decoded caches,
+provider generation, scheduling or directory generations.
+
+Provenance mapping: the fixed Catalog canvas/default and not-yet/error process
+inform `app/browser_item_delegate.py:_uses_placeholder_canvas` /
+`_paint_placeholder_canvas`. This is an adaptation of the already documented
+section 24.3.1.1 authority, not a new WinForms code port. AGPL-3.0-or-later
+provenance and notices remain in `licenses/ZipPlaFork/AGPL.txt`,
+`licenses/ZipPlaFork/About.txt` (Copyright © 2016 Rio's Toolbox and bundled
+third-party notices) and `THIRD_PARTY_NOTICES.md`. No dependency was added.
+
+Verification: Python 3.11.9 x64 / PySide6 6.11.2, offscreen. New file-fallback
+suite **133 passed**; existing fallback/placeholder/badge/config/settings
+selection **27 passed**. Pixel checks cover four file kinds, unsupported,
+pending, cancelled and failed states, success transitions with stale error,
+centered icon visibility, bounded fill, fit/center-crop, compact/standard
+density and 100/125/150/200% DPR. Settings tests use the actual Browser tab,
+fake color picker and thumbnail provider, a visible model item, persisted
+custom/default/legacy/invalid values, Cancel, repeated reset, independent
+folder color and repaint with zero new requests/scans/generation changes.
+The broken-archive regression now selects the independent file color; its
+shared-geometry pixel assertions are retained. Six Python files passed syntax
+parsing; diff checks passed. One required bounded nine-page 2400 x 3600
+high-detail ZIP smoke completed with zero errors: sequential 1.065 ms, reverse
+0.961 ms, reversal 1.320 ms, ping-pong median 1.015 ms, rapid final 1.683 ms.
+These are synthetic observations, not native performance/visual verification.
+No real app, native input, external GUI, portable rebuild, commit or push ran.
+
+## 46. Automatic spatial clicks and RAR diagnosis (2026-09-09)
+
+### 46.1 Implemented option; no RAR optimization implemented
+
+Settings → Viewer → ページ表示 → 左右クリックのページ送り方向 now offers
+`綴じ方向に合わせる（自動）` (`viewer_canvas_click_direction="auto"`).
+The existing ConfigManager key, Settings draft/Apply/Cancel flow and
+ViewerWindow._move_from_canvas_side authority are reused. At the confirmed
+left-button spatial click, `ViewerWindow.reading_direction` resolves RTL to
+left=next/right=previous and LTR to right=next/left=previous. This is the same
+effective field used by spread rendering, model options and the page slider;
+set_reading_direction changes the next click immediately. There is currently
+no separate per-book reading-direction override in BookSession/MetadataStore
+to apply or migrate. UI locale is not consulted.
+
+`right_next` and `left_next` remain fixed physical-side choices. Missing or
+invalid values retain the existing `right_next` default; no preference is
+silently migrated. Existing single-page/display-unit actions still use
+PageNavigationController and the existing navigation policy. Pointer gesture,
+pan, loupe, overlay and context-token handling are unchanged; this option
+does not remap the right mouse button, wheel, keys or XButtons.
+
+### 46.2 Actual backend and pipeline inspection
+
+The readable repository config selects `auto` with empty WinRAR/7-Zip paths.
+Actual automatic registry discovery on a disposable RAR selected
+`WinRARBackend`, `C:\Program Files\WinRAR\UnRAR.exe`, **7.13 x64**.
+The installed Rar.exe console encoder and UnRAR.exe report file version
+7.13.0. No tool was installed. This identifies this environment's discovery,
+not an uninspected running portable profile or the user's archive format.
+ArchiveBackendRegistry._select_backend respects explicit preference/paths and
+7-Zip file association; auto supports one safe failover and remembers the
+successful backend per archive.
+
+`WinRARBackend.list_entries` executes `lb -scfr -- archive`; read_entry executes
+`p -inul -- archive entry`. WinRARProcessRunner inherits SevenZipProcessRunner:
+each run creates a **new console subprocess**, despite retaining the runner
+object. Stdout is fully collected before returning image bytes, with bounded
+output, timeout and cancellation. `_collect_output` polls process completion
+every 20 ms, so measured extraction includes startup, output copying and
+completion-observation delay, not just RAR decompression. Cancellation stops
+the owned process; it cannot retain its decompressor state for later reuse.
+The 7-Zip CLI alternative also launches a process per extraction; merely
+selecting it does not create a persistent archive session.
+
+`SevenZipImageSource` is the shared external-archive source even for WinRAR.
+Its constructor lists once, keeps entry identities/listing_snapshot, and
+fork_for_thumbnail reuses that snapshot. There is **no full relisting per
+page**. open_image calls read_entry, then Pillow Image.open/EXIF transpose/copy
+on the entire image. It does not implement the target-JPEG decode shortcut.
+ImageCache's worker then converts to QImage; ViewerWidget's preparation worker
+resizes/prepares the frame before GUI publication. There is no new GUI-thread
+decode path in this task.
+
+BookSession._replace_viewer_runtime selects ZipRasterBookRuntime for ZIP and
+FolderRasterBookRuntime for folders, but not for the external RAR source.
+RAR remains on ImageCache plus Viewer prepared frames, with decoded caching
+and bounded current-first read-ahead. It is not uncached and does not lack
+prefetch. Obsolete queued work is removed/cancelled through existing cache
+and source cancellation, with generation/request guards; wanted in-flight
+cache work can be reused, but cancelled extraction is not a retained session.
+The legacy ViewerWindow._queue_decode_demand still starts its **16 ms** timer
+after an existing frame, including a discrete cold navigation. ZIP uses its
+newer runtime admission policy instead; the mere existence of the timer in
+a ZIP window is not evidence that ZIP waits on it.
+
+For non-solid RAR there is no reason to infer whole-prefix decompression on
+every page, although archive/process reopening is certain. For solid RAR,
+separate extraction processes cannot share dictionary/reader progress and
+may repeat preceding data within the solid block. WinRAR's bare listing
+currently reports `solid=None`, even for the known solid fixture. We cannot
+classify the user's RAR as solid. Password-protected, missing-volume,
+multivolume, damaged and RAR4 cases were not benchmarked; all existing backend
+error/size/cancel limits must survive any future work.
+
+### 46.3 Real CLI/offscreen measurements, not mocks
+
+`scripts/diagnose_rar_navigation.py` creates six identical seeded high-detail
+2400 × 3600 JPEG payloads in ZIP, RAR5 non-solid (`-s-`) and RAR5 solid (`-s`)
+archives in a TemporaryDirectory. It uses installed console Rar/UnRAR,
+production sources and the actual offscreen Viewer, 1280 × 800 viewport and
+256 MiB setting. The synthetic archives are about 27.4–27.6 MB. A separate
+auto-discovery probe confirms the backend above; Viewer timings explicitly
+inject that same UnRAR backend for a controlled comparison.
+
+Windows, Python **3.11.9**, Pillow **12.3.0**, PySide6/Qt **6.11.2**;
+high-resolution perf_counter. Representative single run, milliseconds:
+
+| Observation | ZIP | Non-solid RAR5 | Solid RAR5 |
+| --- | ---: | ---: | ---: |
+| Open request → first paint | 60.703 | 193.503 | 214.227 |
+| Forward to page 1 / 2 | 52.453 / 51.017 | 149.442 / 148.695 | 169.621 / 167.904 |
+| Cold jump to page 5 | 61.920 | 164.313 | 209.061 |
+| Reverse to uncached page 4 | 52.035 | 167.458 | 192.618 |
+| Cached backtrack to page 1 | 0.638 | 0.738 | 0.786 |
+| Cached page 2 / 1 | 0.538 / 0.732 | 0.530 / 0.447 | 0.484 / 0.423 |
+
+Each RAR Viewer session listed once and completed five image extractions
+(pages 0,1,2,5,4); all three cached return legs completed **zero** extractions.
+Successful Viewer extraction durations were 63.766–84.987 ms non-solid and
+63.584–105.834 ms solid. Standalone component probes measured listing
+45.186/44.677 ms; non-solid extraction 64.330–66.173 ms, solid
+63.773–105.078 ms, and Pillow full decode/transpose/copy 43.268–44.817 ms.
+Solid timings are not strictly monotonic; this small JPEG fixture is not a
+claim about every solid dictionary, archive size or storage device.
+
+The component probes are separate from concurrent Viewer timings. Native
+process startup versus decompression, QImage conversion versus resize,
+publication versus Qt paint, cancelled extraction count and RAR rapid-burst
+latency were **not individually measured**. Do not subtract unrelated probes
+and label the remainder as resize time. All paint timings are offscreen,
+not Windows compositor latency. Files were just generated and component
+probes precede Viewer runs: "cold" means application-cache miss, **not a cold
+OS/storage cache**. No private archive or real interactive application was used.
+
+### 46.4 Fixed ZipPlaFork comparison and provenance
+
+Reference: https://github.com/himamon/ZipPlaFork at
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, **AGPL-3.0-or-later**.
+The fixed local source `source/ZipPla/PackedImageLoader.cs`, class
+PackedImageLoader, was inspected directly:
+
+- RAR5 dispatch uses getSevenZipArchiveEntry / getSevenZipArchiveEntry_Base
+  (around 879, 1454–1490). It retains the in-process ArchiveFile and Entry[]
+  rather than launching an extraction executable per page.
+- Ordinary RAR can use the SharpCompress archive route or configured SevenZip
+  route. OpenInnerImageStreamSharpCompress (1906 onward) uses entry streams
+  for non-solid; its solid fallback retains ExtractAllEntries()/iReader,
+  advances physical entries and caches decoded bitmaps for reuse/Clone.
+- GetInnerImageStreamSevenZip (2044 onward) extracts a retained Entry to
+  MemoryStream, optionally via SevenZipEntryExtractInTask. Its comment says
+  7z has its own cache. That is source intent, not measured proof of speed
+  for every solid archive. Dispose releases the retained archive/resources.
+
+This task adopts **no RAR source code or optimization**. The auto-click option
+is NivisViewer-owned logic, not a port. This section records analysis provenance;
+existing copyright/license notices remain in licenses/ZipPlaFork/About.txt
+(© 2016 Rio's Toolbox), AGPL.txt and THIRD_PARTY_NOTICES. No dependency added.
+
+| Alternative | Benefit and cost | Assessment |
+| --- | --- | --- |
+| ZipPla retained library/session | Removes per-page process startup; solid reader progress can be reused. Native/library lifetime, thread safety, crash isolation, format compatibility and licensing require review; bitmap retention must be bounded. | Useful structural reference, not a literal drop-in. |
+| Current Nivis CLI + decoded/prepared caches | Strong subprocess isolation and cancellation, bounded stdout and working cached turns. Repeated cold extraction/full decode and legacy admission remain. | Preserve safety/identity/commit authorities. |
+| Hybrid existing source/cache/UI with improved admission, target decode and bounded extraction/session reuse | Can keep existing UX, generation guards and backend fallback while addressing measured stages. Memory/disk budgets and source lifetime must be explicit. | Preferred incremental direction. |
+| New full-archive upfront extraction | Amortizes solid decompression and enables folder-like access, but startup, disk quota, privacy cleanup, cancellation and huge archives become expensive. | Do not make this the default or rewrite user archives. |
+
+### 46.5 Smallest proposed next steps (not implemented)
+
+1. First reuse the existing input-kind admission policy for external raster
+   discrete misses instead of the unconditional 16 ms wait; retain wheel
+   latest-wins coalescing and started-work cancellation. This removes a known
+   admission cost, not the measured extraction/decode cost. Instrument process
+   exit/completion separately before changing the 20 ms worker polling; an
+   event-driven completion wake must retain responsive cancellation/timeouts.
+2. For a material non-solid cold-page improvement, implement target-aware JPEG
+   decode from the already-extracted bytes through the existing ImageCache
+   source hook, preserving full-resolution zoom/loupe fallback, EXIF and
+   original dimensions. It reduces decode/copy/resize work and RAM, but does
+   not remove extraction startup. A bounded compressed-payload cache helps
+   re-decodes after frame eviction, not the first-ever page miss; merely
+   increasing decoded cache does not fix the cold timings above.
+3. For demonstrated large solid archives, prototype one sequential extraction
+   session or bounded temporary extraction reuse behind the existing source
+   authority. Only completed entries may publish; enforce byte/disk quotas,
+   cleanup and book-generation cancellation. This can amortize repeated solid
+   prefix work but trades startup/disk writes or memory and may conflict with
+   rapid far-jump latency. A retained native library is a larger alternative
+   requiring license/security/crash review, not an automatic recommendation.
+
+Acceptance: same JPEG payloads in ZIP/non-solid/solid, open/forward/reverse/
+backtrack/rapid final-target traces, multiple runs with median/p95, explicit
+application-cold versus OS-cold labels, listing/process/bytes/decode counters,
+and stage timing. Require immediate discrete admission without speculative
+work blocking it, zero extraction on retained cache hits, bounded memory/temp
+usage, stale-result rejection on direction/book changes, and unchanged output
+pixels/EXIF/spread/history/loupe. Include malformed, encrypted and missing-volume
+fixtures before changing the backend contract. Do not claim ZipPla speed parity
+without running a comparable permitted native benchmark.
+
+### 46.6 Focused verification
+
+The new auto-click suite passed **18 tests**: config roundtrip/default/invalid,
+real Settings Cancel/Apply and live Viewer binding, both fixed modes, RTL/LTR
+changes, both regions, single/spread, single-page/display-unit steps,
+fullscreen, bounds, blocked ZIP/folder pending history, modifier/drag/drop and
+fullscreen-edge guards. Existing loupe/right-drag gesture and XButton tests
+passed **10 tests**, including unchanged wheel routing. No per-book override
+test was invented because that authority does not currently exist. Syntax
+parsing passed for the three production files, auto-click test and diagnostic
+script; `git diff --check` passed.
+
+The required bounded navigation smoke already ran in this turn: nine synthetic
+2400 × 3600 JPEGs, 41,472,435-byte ZIP, 1280 × 800, 256 MiB. Cold burst final
+66.212 ms, forward 0.905 ms, reverse 0.901 ms, reversal 1.197 ms, ping-pong
+median 0.904 ms, rapid final 1.597 ms; final-only cold commit, zero terminal
+errors. This smoke was not rerun as an unrelated historical task. No real app,
+native input, external GUI, portable rebuild, commit or push was performed.
+
+## 47. Authorized external-raster admission, JPEG tiers and extraction reuse (2026-09-09)
+
+This implementation supersedes section 46's diagnosis-only boundary following
+explicit approval of all three improvements. Earlier work, including automatic
+spatial clicks, is preserved. This is not a replay of the ZIP/fullscreen task.
+
+### 47.1 Architecture and stage-specific changes
+
+**Stage 1 — use the existing raster authority.** BookSession now constructs the
+existing source-agnostic RasterBookRuntime for SevenZipImageSource (the shared
+WinRAR/7-Zip external source). ViewerWindow admits it through the same request,
+presentation, topology, memory and page-list paths as ZIP/folder. The previous
+ImageCache/prepared-frame route is suspended for these books, not run alongside
+the raster runtime. There is no additional extraction scheduler, thread pool
+implementation, navigation history or source authority.
+
+This makes discrete/initial-key misses immediate via NavigationAdmissionPolicy,
+retains cadence-derived wheel staging and key/slider release boundaries,
+adopts a wanted started job, cancels unrelated speculation and releases only
+the latest final target. Cached intermediate presentation stays separate from
+cold dispatch. The old 16 ms decode-demand timer still exists for legacy paths
+but is inactive for measured RAR navigation. The 20 ms backend process polling
+was **not changed**: its contribution is not confused with pure decompression.
+First display has no preceding whole-archive extraction; normal runtime
+preparation proceeds only after the current unit under its bounded memory
+policy. One current-first worker owns source decode/render. Existing history
+side effects now follow the shared accepted-frame/paint gate rather than
+external-source open completion.
+
+**Stage 2 — reuse native JPEG tiers.** SevenZipImageSource implements the existing
+open_compatible_jpeg_at_most/open_qimage_at_most, estimate and header-probe hooks.
+It uses the established Pillow/libjpeg draft helper (native 1/2, 1/4, 1/8 or
+full tier), EXIF transform and detached QImage conversion on the worker. The
+shared renderer performs final resize/rotation. Original oriented dimensions
+remain independent from preview dimensions; the existing source requirement
+and frame keys prevent preview/full aliasing. Manual zoom/loupe request full
+sources, while viewport/spread/DPR determine normal preview requirements.
+Non-JPEG uses the existing Pillow fallback; PDF does not enter this runtime.
+Malformed declared JPEGs fail without a second fallback extraction.
+
+**Stage 3 — bounded completed-payload reuse.** The external source retains
+successful compressed image bytes in its own LRU, keyed by existing entry
+identity. Header-to-decode, preview-to-full, different display tiers and
+decoded-frame eviction/revisit can reuse extraction output. This is an
+extraction-result cache, **not a persistent CLI/decompressor session**. Each
+first miss or evicted payload still starts the selected backend's process;
+new solid entries may still repeat earlier solid-block work. No undocumented
+batch stdout splitting, native DLL dependency or temporary extraction is used.
+
+BookSession reserves `min(64 MiB, configured hard cache budget / 8)` for these
+payloads and deducts it from raster hard/soft budgets. At 256 MiB, this is
+32 MiB payloads plus 224 MiB raster-cache allowance. Runtime memory-pressure
+sampling includes retained payload bytes. Smaller settings evict immediately;
+oversized entries are not retained. This bounds resident **cache** storage,
+not all process RSS: one active extraction/decode and existing protected-current
+oversize policy remain separately bounded by existing entry/runtime contracts.
+Standalone/thumbnail forks have zero payload allowance; no hidden per-fork
+retention or duplicate full-directory scan is introduced.
+
+Payload access uses short metadata locks, never a lock held across subprocess
+I/O or decoding. The shared runtime already serializes wanted book work and
+can adopt it. Unwanted backend requests retain cooperative cancellation and
+timeouts; completed-but-cancelled output cannot enter the LRU. Backend success,
+nonempty/bounded output and exact known entry size are checked before retention;
+invalid image data is removed when decoding/header validation fails. Original
+backend error codes propagate. Source close clears retained bytes and cancels
+active reads; no production disk artifacts exist, hence no crash-residue
+cleanup or path-traversal extraction surface is introduced.
+
+Archive identity uses device/inode/size/mtime/ctime checked around extraction,
+before navigation cache reuse and before frame publication. Replacement causes
+source invalidation, cancellation, artifact clearing and an explicit reopen
+message, not stale publication. Recognized `.partNN.rar` and legacy `.r00`
+multipart layouts disable payload retention: the first-volume stat cannot
+validate all volumes. Their selected backend/extraction behavior is retained.
+Solidity remains the listing authority's true/false/unknown value; no guessed
+classification or new metadata scan is added.
+
+### 47.2 Four-way comparison and provenance
+
+The fixed PackedImageLoader.cs source was reread: getSevenZipArchiveEntry_Base
+retains ArchiveFile/Entry[]; GetInnerImageStreamSevenZip extracts from retained
+entries; OpenInnerImageStreamSharpCompress keeps the solid ExtractAllEntries
+reader and bitmap reuse; Dispose ends their lifetimes. The useful principle
+is book-scoped reuse of completed expensive work, not literal WinForms or
+unbounded bitmap retention.
+
+| Choice | Decision |
+| --- | --- |
+| ZipPla retained DLL/archive/sequential reader | Strong reuse, but importing a library API changes crash containment, threading, formats and dependency/license obligations. Not needed for the measured completed-entry reuse benefit. |
+| Former Nivis CLI + legacy rendering | Keeps subprocess safety but lacks the shared admission/tier path. Keeping both schedulers would duplicate policy. Retired for external raster main display. |
+| Hybrid existing raster runtime + selected CLI + source-owned bounded payload reuse | Chosen. Preserves first-target priority, cancellation and format fallback, reuses proven tiers/cache/commit logic, avoids repeated extraction for retained entries. First new-entry process costs remain explicit. |
+| New sequential/temp whole-archive extraction | Could amortize solid prefix work across different entries, but adds disk quota/lifetime/crash cleanup and out-of-order jump contention. Not selected as the default; no first-image wait for it. |
+
+Reference repository https://github.com/himamon/ZipPlaFork, fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, **AGPL-3.0-or-later**.
+Source: `source/ZipPla/PackedImageLoader.cs`, class PackedImageLoader,
+getSevenZipArchiveEntry_Base (~1468), OpenInnerImageStreamSharpCompress (~1906),
+GetInnerImageStreamSevenZip (~2044), retained archive/reader/entry lifetimes and
+Dispose. Nivis correspondence: BookSession._replace_viewer_runtime /
+_source_runtime_limits, SevenZipImageSource._read_payload / close / JPEG hooks,
+ViewerWindow's existing raster request and publication path. The new LRU is
+Nivis code implementing the compared reuse principle, not a copied native
+archive session. Shared raster/decoder provenance remains documented in earlier
+sections. Copyright © 2016 Rio's Toolbox and license text remain in
+licenses/ZipPlaFork/About.txt and AGPL.txt. No dependency added or installed.
+
+### 47.3 Measurements and limits
+
+Same six seeded high-detail 2400 × 3600 JPEGs, 1280 × 800 viewport, 256 MiB,
+Windows / Python 3.11.9 / Pillow 12.3.0 / Qt and PySide6 6.11.2;
+UnRAR **7.13 x64** automatically discovered at the path recorded in section 46.
+RAR5 fixtures use explicit `-s-` and `-s`; production bare listings still report
+unknown solidity. Warm filesystem cache, initially empty application caches.
+
+Section 46's **single-run** before values versus medians of **three fresh-process**
+after runs, milliseconds (not a statistical parity/speedup guarantee):
+
+| Measurement | Non-solid before | Non-solid after | Solid before | Solid after |
+| --- | ---: | ---: | ---: | ---: |
+| First paint | 193.503 | 174.200 | 214.227 | 155.872 |
+| Forward page 1 | 149.442 | 106.690 | 169.621 | 126.562 |
+| Forward page 2 | 148.695 | 107.349 | 167.904 | 127.926 |
+| Cold far jump | 164.313 | 112.798 | 209.061 | 152.377 |
+| Cold reverse | 167.458 | 107.206 | 192.618 | 128.235 |
+
+Observed first-paint maxima were 194.221 ms non-solid and 172.838 ms solid;
+cold-jump maxima 114.344/154.552 ms. Three samples do not support a meaningful
+p95 claim. Cached returns remained approximately 0.5–1.2 ms with zero new
+extractions. Each measured session listed once and completed five entry reads
+for pages 0,1,2,5,4; cancelled speculative attempts are recorded separately.
+Payload retention at the snapshot was 23,062,520 bytes, under the 32 MiB reserve.
+
+The controlled Stage-3 probe decodes the same actual entry at preview/full/
+larger-preview tiers with retention disabled versus enabled. Median elapsed
+time fell **312.737 → 179.731 ms** (non-solid) and **316.310 → 181.296 ms**
+(solid). Extraction subprocesses fell **3 → 1**, retaining one 4,613,096-byte
+payload instead of extracting 13,839,288 bytes over the three calls. This
+isolates real extraction-result reuse; it does not claim that reading three
+different cold entries shares a decompressor.
+
+Observational wrappers around the real JPEG helper and render_qimage measured
+approximately 32.3–34.8 ms for native-tier decode/EXIF/QImage and 6.6–8.9 ms for
+RAR display resize/rotation. Backend read timing continues to include process
+startup, full stdout collection and 20 ms completion polling. These are directly
+timed phases, not unrelated measurements subtracted from total latency.
+Process startup/decompression and GUI upload/publication cost are not isolated.
+Publication order/count is measured from production commit signals; paint is
+offscreen Qt, not Windows compositor timing.
+
+Fresh-epoch rapid wheel bursts committed **only final page 5** for ZIP and both
+RAR fixtures. Median final paint was 54.813 ms ZIP, 113.947 ms non-solid,
+153.636 ms solid (observed maxima 55.220/130.340/153.699). Final entry 5 was
+admitted before post-commit warmup; entries shown as `started` after final
+paint are not transit commits. Fake event-gated tests separately prove wanted
+started-job adoption and cancellation with no cold page-2/3 transit extraction.
+RAR→ZIP book switches painted in 60.5–63.5 ms; first ZIP→RAR use in these
+sessions was 195.2–217.8 ms and also pays lazy backend discovery. These are
+different directions, not interchangeable book-switch comparisons.
+
+Real CLI safety fixtures: complete RAR5 multipart decoded correctly with payload
+retention disabled; missing volume and encrypted-header archives failed, and
+corrupt input did not open. Existing UnRAR mappings are coarse: missing volume
+and encrypted-header fixtures reported `corrupt_archive`, plain corrupt bytes
+reported `no_images`. These mappings were observed and **not silently fixed or
+claimed precise** by this performance change. Unit tests separately preserve
+structured password/corrupt/timeout/not-found propagation, empty listings and
+oversized/incomplete output rejection. No user archive was inspected.
+
+An additional attempt to isolate GUI completion timing was blocked by execution
+review, even after the current request's console-tool authorization was reread.
+No workaround was used and the unverified wrapper was removed. Further console
+runs require direct approval; earlier completed CLI results above remain valid.
+Native interactive performance, huge solid archives and arbitrary volume layouts
+remain unverified. No claim of ZipPla performance parity is made.
+
+### 47.4 Verification and changed files
+
+Focused fresh-process results: **29** new RAR pipeline tests; **7** existing
+external Viewer tests; **65** source/thumbnail/WinRAR/7-Zip/registry/error tests;
+**66** shared BookSession/ZIP/folder runtime tests; **224** auto-click and
+spread-loupe/slider/trail tests. The RAR tests include all eight EXIF orientations
+with quadrant pixel checks, preview/full extraction reuse, LRU/budget/oversize,
+close/cancel/replacement races, multipart retention policy, final-target-first
+adoption/cancellation, both spread directions, real offscreen loupe full-source
+upgrade, book switch, and 100/125/150/200% DPR plus rotation/manual zoom.
+
+The old external fixtures' made-up 100-byte metadata was replaced with actual
+fixture lengths to satisfy complete-entry validation. One history test now waits
+for the existing accepted-frame/paint gate before asserting exactly one record;
+its no-reopen/no-relist/no-position-restore assertions remain. No skip/xfail or
+timing sleep was added to hide failures.
+
+Required large-image ZIP smoke: nine seeded 2400 × 3600 JPEGs, 1280 × 800,
+256 MiB, zero terminal errors; forward 1.081 ms, reverse 1.021 ms, reversal
+1.262 ms, ping-pong median 0.934 ms, rapid final 1.640 ms. One cancelled old
+result was rejected. The same ZIP diagnostic's application-cold legs remained
+48.8–54.6 ms, near the section-46 baseline.
+
+Changed for this authorized task: app/book_session.py, app/image_source.py,
+app/viewer_window.py, scripts/diagnose_rar_navigation.py,
+tests/test_rar_raster_pipeline.py, tests/test_external_archive_image_source.py,
+tests/test_external_archive_viewer.py, tests/test_external_archive_thumbnail.py,
+and this comparison document. Syntax parsing passed for all eight Python files;
+`git diff --check` passed. Existing unrelated dirty/untracked work remains.
+No interactive real application, native input, external GUI, dependency install,
+portable rebuild, commit or push was performed. Console tools operated only on
+disposable fixtures. All production extraction remains in memory; no user image
+folder receives configuration, cache or extraction files.
+
+## 48. Thumbnail cache resolution versus display scaling (2026-09-10)
+
+### 48.1 Fixed-revision source and provenance
+
+Read directly from https://github.com/himamon/ZipPlaFork at revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`:
+
+- `source/ZipPla/GPSizeThumbnail.cs`: constants near 95; image `TryGet` near
+  390; image `TrySet` near 796, full-original sentinel near 1013;
+  `GetResizedInfo` near 1203.
+- `source/ZipPla/CatalogForm.cs`: `sizeProvider` near 5255,
+  `GetImageThumbnail` near 5343, `DoJustClipping` near 5534/5538,
+  `GetArchiveThumbnail` near 5762 (cache read near 5853, write near 6154,
+  normal display clipping near 6271).
+
+License: **AGPL-3.0-or-later**; copyright notice: Copyright (C) 2016 Rio's
+Toolbox. Existing license/third-party notices remain retained. This follow-up
+is source inspection and explanation, not a new code translation/port. The
+NivisViewer counterpart is the existing `ThumbnailRenderPolicy`/render spec,
+provider and disk cache. No resolution/upscaling policy was changed here.
+
+### 48.2 What the cache actually stores and selects
+
+ZipPla stores multiple JPEG XR thumbnail levels, usually smaller than the source
+but deliberately larger than their intended display. `SIZE_MARGIN` is sqrt(2),
+`COMMON_RATIO` is 2, and `AREA_UBOUND` is 160 x 120. `GetResizedInfo` chooses
+the fit/fill controlling dimension with that margin, caps at original dimensions,
+then builds successively halved levels. The area floor limits the smaller levels.
+For low-load sources when full-size caching is disabled, near-original requests
+can decline caching rather than save an almost-original copy. `TrySet` resizes
+largest to smallest and stores the entries in smallest-to-largest lookup order.
+JPEG XR quality 30 is not numerically equivalent to WebP quality 30 or 60.
+
+`TryGet` validates source/index metadata and multiplies requested dimensions by
+sqrt(2). It skips undersized levels and decodes the first acceptable one. For
+letterbox, width OR height satisfying the requirement is sufficient (aspect-fit
+controlling dimension); crop requires both. If no level qualifies, it reports a
+miss. Catalog's image/archive paths then load the source/cover and regenerate.
+It does not ordinarily take an insufficient reduced thumbnail from a large
+original and accept permanent enlargement as a sufficient cache hit.
+
+Important exception: when a saved level is the full original, `TrySet` writes
+`uint.MaxValue` width/height markers. This original-detail ceiling satisfies later
+requests even if the display grows; no higher source detail exists. It does not
+create a cache bitmap upscaled beyond the original's dimensions.
+
+### 48.3 Display can scale independently
+
+Catalog's normal display path calls `DoJustClipping(..., needToResize: true)`.
+`sizeProvider` and `Graphics.DrawImage` fit/crop the chosen bitmap into the display
+rectangle without a universal scale <= 1 restriction. Normally a margin-sized
+cached image is downscaled. A small full-original cache/source can be upscaled
+for display. Therefore “stores smaller images and enlarges them” needs this
+distinction: smaller than ORIGINAL is common; smaller than the required DISPLAY
+despite available higher-resolution source detail is not its normal cache policy.
+
+NivisViewer already has Auto's sqrt(2) margin with its own DPR/bucket policy.
+The current 149 logical px / portrait 1:sqrt(2) / Auto / max 512 comparison keeps
+that policy intact. Compression quality is separate and is now user-configurable
+(default 60); see `THUMBNAIL_COMPRESSION_SETTING.md` for measurements, request-owned
+identity, lazy maintenance and focused verification. No Viewer scheduler or
+thumbnail-resolution redesign was undertaken for this compression follow-up.
+
+## 49. Read-only Browser context filename selection (2026-09-10)
+
+### 49.1 Fixed-revision reference and provenance
+
+Reference: https://github.com/himamon/ZipPlaFork, fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, **AGPL-3.0-or-later**,
+Copyright (C) 2016 Rio's Toolbox. Existing `licenses/ZipPlaFork/AGPL.txt`
+and `licenses/ZipPlaFork/About.txt` remain retained; no dependency was added.
+
+Inspected `source/ZipPla/CatalogForm.cs`, class `CatalogForm`:
+
+- Constructor near 3183 inserts `rightClickFileNameToolStripTextBox` at the
+  beginning of the context menu and attaches text-selection/focus handlers.
+- `rightClickFileNameToolStripTextBox_GotFocus` / `LostFocus` and
+  `setRightClickMenuShortcutKeys` near 3220–3258 disable file Delete/Cut/Copy/
+  Paste shortcuts while the textbox owns focus, including read-only mode.
+- `cmsRightClickPrepareAndShow` near 12884–12922 chooses the name text,
+  measures its width, selects an important range and sets read-only according
+  to whether context renaming is permitted.
+- `RightClickFileNameToolStripTextBox_KeyDown` near 13791 handles Ctrl+A and
+  Up/Down menu focus. MouseMove/KeyUp and
+  `rightClickFileNameToolStripTextBox_SelectedTextChanged` near 13826 propagate
+  selected text into dynamic menu actions. MouseLeave/Enter near 13848–13855
+  switch focus between menu and textbox.
+- `StringToFilterForDynamicStringSelection` near 13866 sends selected text
+  through `SearchManager.TrimAndPutQuotationIfNeeded` and records filter history.
+
+This is a Qt adaptation of the filename-selection/shortcut-isolation interaction
+principle, not a port of the editable textbox, rename-on-close, important-range
+heuristic, multi-name wildcard synthesis, or WinForms control implementation.
+NivisViewer counterparts are `_BrowserContextFilenameEdit`,
+`BrowserWindow.eventFilter` and `BrowserWindow._show_context_menu` in
+`app/browser_window.py`.
+
+### 49.2 NivisViewer contract
+
+A single selected file/archive/folder gets a read-only `QLineEdit` at the top
+of its item menu. Its full basename comes from the existing canonical selected
+path authority, including extensions, dots and filename metadata—not delegate
+display text. Width is font-measured, normally 240–480 logical px, capped by
+available screen width minus 80 logical px. Long text scrolls horizontally;
+the full string is retained. No text is selected or copied implicitly.
+
+`選択文字をコピー` and `選択文字で検索` are enabled only for a nonempty selection.
+Copy and Ctrl+C publish only `text/plain`; Ctrl+A selects only this text.
+Selection survives menu focus changes, including UTF-16 surrogate pairs.
+Escape closes the menu; Up/Down and Tab/Backtab return to enabled menu actions;
+Left/Right/Home/End retain text navigation/selection. Typing, Enter, rename,
+cut/paste/delete and Browser navigation shortcuts cannot mutate a filename or
+invoke a file operation while this editor owns focus.
+
+Search sets the existing Browser search control and invokes its existing
+commit path: normal edit notification, immediate literal substring filtering,
+rating-filter composition, MRU and ConfigManager persistence. NivisViewer's
+`BrowserSearchPredicate` has no wildcard/operator grammar, so importing ZipPla's
+quotation helper would incorrectly add literal characters. Quotes, `+r=3`,
+wildcards and `OR` therefore pass through unchanged. Existing whitespace
+normalization remains authoritative.
+
+Background menus and multi-selection have no partial-name editor/actions.
+Existing `名前をコピー` still copies complete basenames in visible selection
+order; existing file-operation `コピー` remains unchanged. Mouse invocation
+retargets an unselected item; keyboard context invocation uses currentIndex,
+not the mouse position. Explicit retarget selection now sets currentIndex with
+`NoUpdate`, avoiding an unintended second Ctrl-toggle by QListView.
+
+### 49.3 Focused verification and limits
+
+`tests/test_browser_context_filename.py` uses an offscreen BrowserWindow,
+real QMenu/QWidgetAction/QLineEdit controls with fake menu invocation, synthetic
+QTest input, mocked image-header probes and temporary configuration. It covers
+canonical basenames, partial plain-text copy, literal search/MRU/edit lifecycle,
+read-only shortcut isolation, drag selection, disabled empty-selection actions,
+long Unicode horizontal scrolling, Ctrl-held retargeting, visible multi-name
+order, background menus and keyboard targeting. Existing file-operation menu
+test doubles now derive from QMenu so they can own real embedded widgets;
+their file-operation assertions remain in place.
+
+Two additional tests enter an unmodified QMenu event loop and use synthetic
+mouse clicks on the actual copy/search actions, checking selection survival
+through focus loss and menu closure. The test harness explicitly releases
+offscreen clipboard MIME ownership before Qt teardown. No production timing
+sleep or clipboard cleanup workaround was introduced.
+
+Final verification: **86 passed** across the filename-menu, Browser file
+operations, Browser search-history and Browser-window suites; **15 passed per
+scale** at 100/125/150/200% DPI in separate processes; **2 passed** for the
+existing Viewer-return search lifecycle/invalidation cases. Syntax parsing and
+`git diff --check` passed. These results describe this feature, not the older
+ZIP/fullscreen follow-up.
+
+No real application, native input, private image content, external GUI,
+portable rebuild, commit or push was used. Offscreen results do not establish
+native Windows menu/compositor or clipboard interoperability behavior.

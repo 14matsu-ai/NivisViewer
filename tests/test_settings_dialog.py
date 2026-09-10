@@ -56,6 +56,7 @@ def test_current_values_are_shown_and_join_disables_gap(
             "browser_folders_first": False,
             "browser_location_history_limit": 137,
             "browser_search_history_limit": 333,
+            "browser_preserve_search_for_viewer_roundtrip": False,
         }
     )
 
@@ -77,11 +78,18 @@ def test_current_values_are_shown_and_join_disables_gap(
     assert dialog.thumbnail_quality_mode_combo.currentData() == "high"
     assert dialog.thumbnail_cache_max_edge_spin.value() == 1536
     assert dialog.browser_display_density_combo.currentData() == "comfortable"
-    assert dialog.browser_sort_key_combo.currentData() == "modified_time"
-    assert dialog.browser_sort_order_combo.currentData() == "descending"
+    assert dialog.browser_sort_key_combo.currentData() == "modified_time:descending"
+    assert not hasattr(dialog, "browser_sort_order_combo")
     assert not dialog.browser_folders_first_checkbox.isChecked()
     assert dialog.browser_location_history_limit_spin.value() == 137
     assert dialog.browser_search_history_limit_spin.value() == 333
+    assert not (
+        dialog.browser_preserve_search_for_viewer_roundtrip_checkbox.isChecked()
+    )
+    assert (
+        dialog.browser_preserve_search_for_viewer_roundtrip_checkbox.text()
+        == "検索結果からViewerを開いたとき、戻るまで検索を維持"
+    )
     dialog.reject()
 
 
@@ -115,14 +123,12 @@ def test_apply_and_ok_persist_settings(tmp_path: Path, qapp: QApplication) -> No
         dialog.browser_display_density_combo.findData("compact")
     )
     dialog.browser_sort_key_combo.setCurrentIndex(
-        dialog.browser_sort_key_combo.findData("file_size")
-    )
-    dialog.browser_sort_order_combo.setCurrentIndex(
-        dialog.browser_sort_order_combo.findData("descending")
+        dialog.browser_sort_key_combo.findData("file_size:descending")
     )
     dialog.browser_folders_first_checkbox.setChecked(False)
     dialog.browser_location_history_limit_spin.setValue(217)
     dialog.browser_search_history_limit_spin.setValue(0)
+    dialog.browser_preserve_search_for_viewer_roundtrip_checkbox.setChecked(False)
 
     changed = dialog.apply_settings()
 
@@ -141,6 +147,7 @@ def test_apply_and_ok_persist_settings(tmp_path: Path, qapp: QApplication) -> No
     assert changed["browser_folders_first"] is False
     assert changed["browser_location_history_limit"] == 217
     assert changed["browser_search_history_limit"] == 0
+    assert changed["browser_preserve_search_for_viewer_roundtrip"] is False
 
     dialog.join_spread_checkbox.setChecked(True)
     dialog.accept()
@@ -149,6 +156,7 @@ def test_apply_and_ok_persist_settings(tmp_path: Path, qapp: QApplication) -> No
     assert restored["join_spread_pages"] is True
     assert restored["browser_thumbnail_display_mode"] == "center_crop"
     assert restored["browser_folder_fallback_background"] == "#31597d"
+    assert restored["browser_preserve_search_for_viewer_roundtrip"] is False
     reopened_config = ConfigManager(config.path)
     reopened_config.load()
     reopened = SettingsDialog(reopened_config)

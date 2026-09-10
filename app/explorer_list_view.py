@@ -40,6 +40,7 @@ from .drag_drop import (
 )
 from .folder_tree_pointer import FolderTreePointerController, FolderTreePointerState
 from .mouse_gesture import MouseGestureRecognizer
+from .gesture_trail import draw_gesture_trail
 
 
 class ExplorerListView(QListView):
@@ -552,16 +553,7 @@ class ExplorerListView(QListView):
             and len(self._folder_gesture_trail) >= 2
         ):
             painter = QPainter(self.viewport())
-            pen = QPen(QColor(120, 205, 255, 150))
-            pen.setWidthF(max(2.0, 3.0 * self.devicePixelRatioF()))
-            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-            painter.setPen(pen)
-            for start, end in zip(
-                self._folder_gesture_trail,
-                self._folder_gesture_trail[1:],
-            ):
-                painter.drawLine(start, end)
+            draw_gesture_trail(painter, self._folder_gesture_trail)
         if self._notify_after_next_paint:
             self._notify_after_next_paint = False
             self.paintCompleted.emit()
@@ -573,20 +565,24 @@ class ExplorerListView(QListView):
         show_trail: bool,
         min_distance: int,
     ) -> None:
-        self._cancel_folder_gesture()
+        policy = (bool(enabled), max(12, min(200, int(min_distance))))
+        changed = policy != (self.browser_folder_gestures_enabled, self.mouse_gesture_min_distance)
+        if changed:
+            self._cancel_folder_gesture()
         self.browser_folder_gestures_enabled = bool(enabled)
         self.mouse_gesture_show_trail = bool(show_trail)
         self.mouse_gesture_min_distance = max(
             12,
             min(200, int(min_distance)),
         )
-        self._folder_gesture_recognizer = MouseGestureRecognizer(
-            max(
-                self.mouse_gesture_min_distance,
-                QApplication.startDragDistance(),
-            ),
-            axis_dominance_ratio=1.2,
-        )
+        if changed:
+            self._folder_gesture_recognizer = MouseGestureRecognizer(
+                max(self.mouse_gesture_min_distance, QApplication.startDragDistance()),
+                axis_dominance_ratio=1.2,
+            )
+        if not self.mouse_gesture_show_trail:
+            self._folder_gesture_trail.clear()
+        self.viewport().update()
 
     @property
     def folder_gesture_in_progress(self) -> bool:

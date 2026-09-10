@@ -239,7 +239,10 @@ def test_folder_without_preview_uses_exact_black_thumbnail_rectangle(
     option.state = QStyle.StateFlag.State_Enabled
     thumbnail = delegate.grid_metrics.thumbnail_frame_rect(option.rect)
     content = thumbnail_content_rect(thumbnail).toRect()
-    probe = content.topLeft() + QPoint(1, 1)
+    # Probe unobscured edges: rating stars occupy the upper left, and the
+    # associated icon occupies the lower left of both preview states.
+    probe = content.topRight() + QPoint(-1, 1)
+    padding_probe = QPoint(content.left() - 1, content.center().y())
 
     def render(row: int, *, selected: bool = False) -> QImage:
         canvas = QImage(
@@ -259,32 +262,60 @@ def test_folder_without_preview_uses_exact_black_thumbnail_rectangle(
         painter.end()
         return canvas
 
-    pending = render(0)
-    assert pending.pixelColor(probe) == QColor(
-        BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR
-    )
-    assert pending.pixelColor(thumbnail.topLeft() - QPoint(1, 0)) == (
-        palette.window().color()
-    )
-    assert model.data(model.index(0, 0), model.ThumbnailImageRole) is None
-    assert delegate._uses_placeholder_canvas(folder, None)
-    assert not delegate._uses_placeholder_canvas(image_file, None)
+    def assert_placeholder(row: int, color: str) -> None:
+        pending = render(row)
+        # Both kinds fill the same square-cornered content rect, not a smaller
+        # card. The visible corners/left edge also constrain its full extent.
+        for point in (content.topRight(), content.bottomRight(),
+                      QPoint(content.left(), content.center().y()), probe):
+            assert pending.pixelColor(point) == QColor(color)
+        assert pending.pixelColor(padding_probe) == palette.base().color()
+        assert pending.pixelColor(thumbnail.topLeft() - QPoint(1, 0)) == palette.window().color()
+        assert model.data(model.index(row, 0), model.ThumbnailImageRole) is None
+        assert render(row, selected=True).pixelColor(probe) == QColor(color)
 
-    model.set_preview_status(folder.path, "loading")
-    loading = render(0, selected=True)
-    assert loading.pixelColor(probe) == QColor(
-        BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR
+    for row, item in enumerate((folder, image_file)):
+        assert_placeholder(row, BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR)
+        model.set_preview_status(item.path, "loading")
+        assert render(row, selected=True).pixelColor(probe) == QColor(
+            BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR
+        )
+
+    delegate.configure(
+        thumbnail_size=180,
+        density=BrowserDisplayDensity.STANDARD,
+        folder_fallback_background="#804020",
+        file_fallback_background="#31597d",
     )
+    assert_placeholder(0, "#804020")
+    assert_placeholder(1, "#31597d")
+    # Reset one field without overwriting the other kind's independent color.
+    delegate.configure(
+        thumbnail_size=180, density=BrowserDisplayDensity.STANDARD,
+        file_fallback_background="auto",
+    )
+    assert_placeholder(0, "#804020")
+    assert_placeholder(1, BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR)
+    delegate.configure(
+        thumbnail_size=180, density=BrowserDisplayDensity.STANDARD,
+        folder_fallback_background="auto",
+    )
+    assert_placeholder(0, BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR)
+    assert_placeholder(1, BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR)
 
     preview = QImage(
-        delegate.frame_size,
+        content.size() * 2,
         QImage.Format.Format_RGB32,
     )
     preview.fill(QColor("#20a050"))
-    assert not delegate._uses_placeholder_canvas(folder, preview)
-    model.set_thumbnail_image(folder.path, preview)
-    completed = render(0)
-    assert completed.pixelColor(thumbnail.center()) == QColor("#20a050")
+    for row, item in enumerate((folder, image_file)):
+        model.set_thumbnail_image(item.path, preview)
+        completed = render(row)
+        assert completed.pixelColor(thumbnail.center()) == QColor("#20a050")
+        assert completed.pixelColor(probe) == QColor("#20a050")
+        # Real pixels replace the fallback but cannot spill into frame padding.
+        assert completed.pixelColor(padding_probe) == palette.base().color()
+        assert render(row, selected=True).pixelColor(thumbnail.center()) == QColor("#20a050")
 
 
 @pytest.mark.parametrize("device_pixel_ratio", [1.0, 1.25, 1.5, 2.0])
@@ -356,7 +387,7 @@ def test_broken_archive_uses_shared_placeholder_canvas(
     delegate = BrowserItemDelegate(
         thumbnail_size=180,
         density=BrowserDisplayDensity.STANDARD,
-        folder_fallback_background=background,
+        file_fallback_background=background,
         shell_icon_provider=AlphaShellIconProvider(),
     )
     archive = make_item(tmp_path / "broken.cbz", BrowserItemKind.ARCHIVE)

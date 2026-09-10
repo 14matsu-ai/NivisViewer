@@ -4,6 +4,8 @@ from pathlib import Path
 from threading import Event, Lock
 from time import monotonic, sleep
 import zipfile
+import pytest
+from dataclasses import replace
 
 from PIL import Image
 from PySide6.QtGui import QImage, QPixmap
@@ -11,6 +13,8 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from app.image_source import ImageSourceError, StreamedJpegDecode, ZipImageSource
+from app.image_source import FolderImageSource
+from app.folder_raster_book_runtime import FolderRasterBookRuntime
 from app.image_work_coordinator import ImageWorkCoordinator
 from app.raster_warmup_planner import RasterBookTopology, RasterWarmupPlan
 from app.zip_raster_book_runtime import (
@@ -108,6 +112,73 @@ def _wait_until(
         qapp.processEvents()
         QTest.qWait(5)
     assert predicate()
+
+
+@pytest.mark.parametrize("folder", [False, True], ids=["zip", "folder"])
+@pytest.mark.parametrize("complete_before_release", [False, True])
+def test_staged_adopted_completion_publishes_once(
+    tmp_path, qapp, folder, complete_before_release,
+):
+    archive = _write_zip(tmp_path, pages=2)
+    base = FolderImageSource if folder else ZipImageSource
+
+    class BlockedSource(base):
+        started = Event()
+        release = Event()
+
+        def open_image(self, image_id):
+            if Path(image_id).name == "1.png":
+                self.started.set()
+                assert self.release.wait(3)
+            return super().open_image(image_id)
+
+    source = BlockedSource(tmp_path if folder else archive)
+    runtime = (FolderRasterBookRuntime if folder else ZipRasterBookRuntime)(source, 1)
+    frames = []
+    runtime.frameReady.connect(frames.append)
+    units = tuple(
+        ZipRasterDisplayUnit(i, (ZipRasterPage(i, name),), True)
+        for i, name in enumerate(source.list_images())
+    )
+    try:
+        assert runtime.request(_request(1, units[0], *units, direction=1))
+        _wait_until(qapp, lambda: len(frames) == 1)
+        runtime.release_continuous_warmup(request_id=1)
+        assert source.started.wait(1)
+        final = _request(2, units[1], *units, direction=1)
+        assert runtime.stage(final)
+        if complete_before_release:
+            source.release.set()
+            _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+            assert runtime.has_cached_current(final)
+            assert [frame.request_id for frame in frames] == [1]
+        assert not runtime.release_staged(replace(final, source_epoch=99))
+        assert not runtime.release_staged(replace(final, request_id=99))
+        assert runtime.release_staged(final)
+        source.release.set()
+        _wait_until(qapp, lambda: len(frames) == 2)
+        assert [frame.request_id for frame in frames] == [1, 2]
+        assert not runtime.release_staged(final)
+        assert len(frames) == 2
+
+        # A cached transit published during stage must not publish twice.
+        ready = _request(3, units[1], *units)
+        assert runtime.stage(ready, publish_cached=True)
+        assert [frame.request_id for frame in frames] == [1, 2, 3]
+        assert runtime.release_staged(ready)
+        assert not runtime.release_staged(ready)
+        assert [frame.request_id for frame in frames] == [1, 2, 3]
+        old = _request(4, units[0], *units)
+        newer = _request(5, units[1], *units)
+        assert runtime.stage(old)
+        assert runtime.stage(newer)
+        assert not runtime.release_staged(old)
+        assert runtime.release_staged(newer)
+        assert [frame.request_id for frame in frames] == [1, 2, 3, 5]
+    finally:
+        source.release.set()
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()
 
 
 def test_book_wide_artifact_store_ledgers_have_no_count_ceiling(

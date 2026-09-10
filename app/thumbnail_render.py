@@ -9,7 +9,7 @@ from threading import Lock
 
 from PIL import Image, ImageChops, ImageFilter, ImageOps, ImageStat
 from PySide6.QtCore import QRectF, QSize
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QColor, QImage
 
 
 THUMBNAIL_IMPLEMENTATION_VERSION = 3
@@ -35,7 +35,44 @@ THUMBNAIL_QUALITY_MARGINS = {
     "high": 2.0,
 }
 THUMBNAIL_ENCODER_FORMAT = "webp-or-png"
-THUMBNAIL_ENCODER_QUALITY = 90
+THUMBNAIL_ENCODER_QUALITY = 60
+# Historical whole-image-lossless benchmark reference, not the active encoder.
+# WebP lossless quality controls encoding effort, not pixel fidelity.
+THUMBNAIL_LOSSLESS_ENCODER_EFFORT = 90
+
+
+def normalize_thumbnail_webp_quality(value: object) -> int:
+    return value if type(value) is int and 1 <= value <= 100 else THUMBNAIL_ENCODER_QUALITY
+
+
+@dataclass(frozen=True)
+class ThumbnailEncodingPolicy:
+    """Request-owned saved-pixel policy; contains no GUI or cache state."""
+
+    quality: int = THUMBNAIL_ENCODER_QUALITY
+    preserve_alpha: bool = False
+    matte: str = "#ffffff"
+
+    @property
+    def alpha_token(self) -> str:
+        return "rgb-lossy-v1-alpha100" if self.preserve_alpha else f"rgb-lossy-v1-matte{self.matte.lstrip('#')}"
+
+    def prepare_pixels(self, image: Image.Image) -> Image.Image:
+        rgba = image.convert("RGBA")
+        if self.preserve_alpha:
+            return rgba
+        # QImage premultiplied input is converted to straight RGBA by the caller.
+        # Composite exactly once before discarding alpha, never just drop it.
+        if rgba.getchannel("A").getextrema()[0] < 255:
+            rgba = Image.alpha_composite(Image.new("RGBA", rgba.size, self.matte), rgba)
+        return rgba.convert("RGB")
+
+    def webp_options(self) -> dict[str, object]:
+        # alpha_quality=100 keeps the alpha plane exact; RGB remains lossy even
+        # at quality100. Hidden RGB is not promised bit-exact in either mode.
+        return dict(lossless=False, quality=self.quality, alpha_quality=100, method=4, exact=True)
+
+
 # The 149px medium preset can quantize to the same physical bucket as the
 # existing 180px standard preset.  Keep its request lifecycle distinct while
 # family-token reuse still permits sharing a compatible cached artifact.
@@ -109,6 +146,12 @@ class ThumbnailRenderSpec:
     implementation_version: int = THUMBNAIL_IMPLEMENTATION_VERSION
     browser_display_mode: str = "fit"
     logical_thumbnail_size: int = 0
+    preserve_alpha: bool = False
+    matte_color: str = "#ffffff"
+
+    @property
+    def encoding_policy(self) -> ThumbnailEncodingPolicy:
+        return ThumbnailEncodingPolicy(self.encoder_quality, self.preserve_alpha, self.matte_color)
 
     @classmethod
     def from_settings(
@@ -121,6 +164,9 @@ class ThumbnailRenderSpec:
         quality_mode: str = "economy",
         max_edge: int = 1024,
         browser_display_mode: str = "fit",
+        encoder_quality: int = THUMBNAIL_ENCODER_QUALITY,
+        preserve_alpha: bool = False,
+        matte_color: str = "#ffffff",
     ) -> ThumbnailRenderSpec:
         ratio_id = (
             frame_ratio_id
@@ -155,6 +201,9 @@ class ThumbnailRenderSpec:
             quality_mode=normalized_quality,
             browser_display_mode=normalized_display_mode,
             logical_thumbnail_size=max(1, int(thumbnail_size)),
+            encoder_quality=normalize_thumbnail_webp_quality(encoder_quality),
+            preserve_alpha=preserve_alpha is True,
+            matte_color=QColor(matte_color).name() if QColor(matte_color).isValid() else "#ffffff",
         )
 
     @property
@@ -178,7 +227,7 @@ class ThumbnailRenderSpec:
             f"{self.crop_mode}|{self.quality_mode}|{self.encoder_format}|"
             f"{self.encoder_quality}|{self.render_policy_version}|"
             f"{self.smart_crop_version}|{self.implementation_version}"
-            f"{display_variant}{logical_variant}"
+            f"{display_variant}{logical_variant}|{self.encoding_policy.alpha_token}"
         ).encode("utf-8")
         return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & (
             (1 << 63) - 1
@@ -196,7 +245,7 @@ class ThumbnailRenderSpec:
             f"{self.frame_ratio_id}|{self.crop_mode}|{self.quality_mode}|"
             f"{self.encoder_format}|{self.encoder_quality}|"
             f"{self.render_policy_version}|{self.smart_crop_version}|"
-            f"{self.implementation_version}{display_variant}"
+            f"{self.implementation_version}{display_variant}|{self.encoding_policy.alpha_token}"
         ).encode("utf-8")
         return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & (
             (1 << 63) - 1
@@ -214,6 +263,9 @@ class ThumbnailRenderPolicy:
     quality_mode: str = "auto"
     max_edge: int = 1024
     browser_display_mode: str = "fit"
+    encoder_quality: int = THUMBNAIL_ENCODER_QUALITY
+    preserve_alpha: bool = False
+    matte_color: str = "#ffffff"
 
     @property
     def logical_frame_size(self) -> QSize:
@@ -243,6 +295,9 @@ class ThumbnailRenderPolicy:
             quality_mode=self.quality_mode,
             max_edge=self.max_edge,
             browser_display_mode=self.browser_display_mode,
+            encoder_quality=self.encoder_quality,
+            preserve_alpha=self.preserve_alpha,
+            matte_color=self.matte_color,
         )
 
     def diagnostics(self) -> ThumbnailRenderDiagnostics:

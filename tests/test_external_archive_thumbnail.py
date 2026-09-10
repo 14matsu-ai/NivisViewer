@@ -36,8 +36,8 @@ class ThumbnailBackend:
         return ArchiveListing(
             archive_path,
             (
-                ArchiveEntry("10.png", 100, 50, False, False),
-                ArchiveEntry("2.png", 100, 50, False, False),
+                ArchiveEntry("10.png", len(png_bytes("red")), 50, False, False),
+                ArchiveEntry("2.png", len(png_bytes("red")), 50, False, False),
             ),
             "7z",
             False,

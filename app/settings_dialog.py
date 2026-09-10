@@ -30,14 +30,15 @@ from PySide6.QtWidgets import (
 
 from .browser_sort import (
     BROWSER_DISPLAY_DENSITY_LABELS,
-    BROWSER_SORT_KEY_LABELS,
-    BROWSER_SORT_ORDER_LABELS,
+    BROWSER_SORT_CHOICES,
+    browser_sort_choice_index,
+    new_browser_random_seed,
     BrowserDisplayDensity,
     BrowserSortKey,
-    BrowserSortOrder,
 )
 from .app_icon import install_window_icon
-from .browser_item_delegate import GRID_PRESET_THUMBNAIL_SIZES
+from .browser_item_delegate import BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR, GRID_PRESET_THUMBNAIL_SIZES
+from .fallback_background_editor import FallbackBackgroundEditor
 from .browser_wheel_scroll import (
     BROWSER_WHEEL_SCROLL_CUSTOM_MAX_ROWS,
     BROWSER_WHEEL_SCROLL_CUSTOM_MIN_ROWS,
@@ -226,7 +227,6 @@ class SettingsDialog(QDialog):
             ),
         }
         self._displayed_prefetch_preset: str | None = None
-        self._folder_fallback_custom_color = "#000000"
         raw_bindings = self.config.get("mouse_gesture_bindings", {})
         self._gesture_bindings_base = (
             dict(raw_bindings) if isinstance(raw_bindings, dict) else {}
@@ -390,6 +390,10 @@ class SettingsDialog(QDialog):
         self.viewer_canvas_click_direction_combo.addItem(
             "左側で次へ／右側で前へ",
             "left_next",
+        )
+        self.viewer_canvas_click_direction_combo.addItem(
+            "綴じ方向に合わせる（自動）",
+            "auto",
         )
         spread_form.addRow(
             "左右クリックのページ送り方向:",
@@ -784,14 +788,10 @@ class SettingsDialog(QDialog):
         list_form.addRow("表示密度:", self.browser_display_density_combo)
 
         self.browser_sort_key_combo = QComboBox(list_group)
-        for value, label in BROWSER_SORT_KEY_LABELS.items():
-            self.browser_sort_key_combo.addItem(label, value.value)
+        for label, key, order in BROWSER_SORT_CHOICES:
+            self.browser_sort_key_combo.addItem(label, f"{key}:{order}")
+        self.browser_sort_key_combo.activated.connect(self._activate_browser_sort)
         list_form.addRow("並び替え:", self.browser_sort_key_combo)
-
-        self.browser_sort_order_combo = QComboBox(list_group)
-        for value, label in BROWSER_SORT_ORDER_LABELS.items():
-            self.browser_sort_order_combo.addItem(label, value.value)
-        list_form.addRow("順序:", self.browser_sort_order_combo)
 
         self.browser_folders_first_checkbox = QCheckBox(
             "フォルダを常に先頭へ表示",
@@ -812,6 +812,13 @@ class SettingsDialog(QDialog):
         list_form.addRow(
             "検索履歴の保持件数:",
             self.browser_search_history_limit_spin,
+        )
+        self.browser_preserve_search_for_viewer_roundtrip_checkbox = QCheckBox(
+            "検索結果からViewerを開いたとき、戻るまで検索を維持",
+            list_group,
+        )
+        list_form.addRow(
+            self.browser_preserve_search_for_viewer_roundtrip_checkbox
         )
         self.browser_spacing_preset_checkbox = QCheckBox(
             "密度プリセットに従う",
@@ -893,43 +900,28 @@ class SettingsDialog(QDialog):
             self.browser_thumbnail_display_mode_combo,
         )
 
-        self.browser_folder_fallback_background_combo = QComboBox(cache_group)
-        self.browser_folder_fallback_background_combo.addItem(
-            "自動（ZipPla互換の黒）",
-            "auto",
+        folder_editor = FallbackBackgroundEditor(
+            cache_group, default_color=BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR,
+            auto_label="自動（ZipPla互換の黒）", restore_label="既定に戻す",
         )
-        self.browser_folder_fallback_background_combo.addItem(
-            "カスタム色",
-            "custom",
+        file_editor = FallbackBackgroundEditor(
+            cache_group, default_color=BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR,
+            auto_label="自動（既定の黒）", restore_label="デフォルトに戻す",
         )
-        self.browser_folder_fallback_background_combo.currentIndexChanged.connect(
-            self._sync_folder_fallback_background_controls
-        )
-        self.browser_folder_fallback_color_button = QPushButton(
-            "色を選択…",
-            cache_group,
-        )
-        self.browser_folder_fallback_color_button.clicked.connect(
-            self._choose_folder_fallback_background_color
-        )
-        self.browser_folder_fallback_restore_button = QPushButton(
-            "既定に戻す",
-            cache_group,
-        )
-        self.browser_folder_fallback_restore_button.clicked.connect(
-            self._restore_folder_fallback_background
-        )
-        folder_fallback_controls = QWidget(cache_group)
-        folder_fallback_layout = QHBoxLayout(folder_fallback_controls)
-        folder_fallback_layout.setContentsMargins(0, 0, 0, 0)
-        folder_fallback_layout.addWidget(
-            self.browser_folder_fallback_background_combo
-        )
-        folder_fallback_layout.addWidget(self.browser_folder_fallback_color_button)
-        folder_fallback_layout.addWidget(
-            self.browser_folder_fallback_restore_button
-        )
-        form.addRow("代替サムネイル背景:", folder_fallback_controls)
+        # One explicit catalog drives both loading and serialization.
+        self._fallback_background_editors = {
+            "browser_folder_fallback_background": folder_editor,
+            "browser_file_fallback_background": file_editor,
+        }
+        form.addRow("フォルダーの代替サムネイル背景:", folder_editor)
+        form.addRow("ファイルの代替サムネイル背景:", file_editor)
+        # Keep existing control accessors; these are aliases, not state.
+        self.browser_folder_fallback_background_combo = folder_editor.combo
+        self.browser_folder_fallback_color_button = folder_editor.color_button
+        self.browser_folder_fallback_restore_button = folder_editor.restore_button
+        self.browser_file_fallback_background_combo = file_editor.combo
+        self.browser_file_fallback_color_button = file_editor.color_button
+        self.browser_file_fallback_restore_button = file_editor.restore_button
 
         self.thumbnail_crop_mode_combo = QComboBox(cache_group)
         for mode, label in CROP_MODES.items():
@@ -951,6 +943,30 @@ class SettingsDialog(QDialog):
         self.thumbnail_cache_max_edge_spin.setSingleStep(256)
         self.thumbnail_cache_max_edge_spin.setSuffix(" px")
         form.addRow("生成最大辺:", self.thumbnail_cache_max_edge_spin)
+
+        self.thumbnail_webp_quality_spin = QSpinBox(cache_group)
+        self.thumbnail_webp_quality_spin.setObjectName("thumbnail_webp_quality_spin")
+        self.thumbnail_webp_quality_spin.setRange(1, 100)
+        form.addRow("保存サムネイルの圧縮品質:", self.thumbnail_webp_quality_spin)
+        compression_note = QLabel(
+            "高いほど高画質・容量大。WebP非対応時はPNG（可逆圧縮）で保存します。\n"
+            "新しく生成するサムネイルに適用され、既存キャッシュは順次更新されます。",
+            cache_group,
+        )
+        compression_note.setWordWrap(True)
+        self.thumbnail_webp_quality_spin.setToolTip(compression_note.text())
+        form.addRow(compression_note)
+        self.thumbnail_preserve_alpha_checkbox = QCheckBox("保存サムネイルの透明度を保持", cache_group)
+        self.thumbnail_preserve_alpha_checkbox.setObjectName("thumbnail_preserve_alpha_checkbox")
+        form.addRow(self.thumbnail_preserve_alpha_checkbox)
+        alpha_note = QLabel(
+            "通常はBrowserの背景色で透明部分を埋めて保存します。\n"
+            "オン: 透明度はそのまま保持し、色は指定品質で非可逆圧縮します。",
+            cache_group,
+        )
+        alpha_note.setWordWrap(True)
+        self.thumbnail_preserve_alpha_checkbox.setToolTip(alpha_note.text())
+        form.addRow(alpha_note)
 
         bucket_note = QLabel(
             "論理表示サイズと画面DPIから物理解像度を選び、複数のbucketを"
@@ -1182,7 +1198,7 @@ class SettingsDialog(QDialog):
         self.mouse_gestures_checkbox.toggled.connect(self._sync_gesture_controls)
         gesture_form.addRow(self.mouse_gestures_checkbox)
         self.mouse_gesture_trail_checkbox = QCheckBox(
-            "操作中に軌跡を表示する",
+            "操作中に軌跡を表示する（Viewer・Browser共通）",
             gesture_group,
         )
         gesture_form.addRow(self.mouse_gesture_trail_checkbox)
@@ -1377,29 +1393,16 @@ class SettingsDialog(QDialog):
             self.browser_thumbnail_display_mode_combo,
             self.config.get("browser_thumbnail_display_mode", "fit"),
         )
-        fallback_background = str(
-            self.config.get("browser_folder_fallback_background", "auto")
-        )
-        if fallback_background == "auto":
-            self._folder_fallback_custom_color = "#000000"
-            self._select_data(
-                self.browser_folder_fallback_background_combo,
-                "auto",
-            )
-        else:
-            color = QColor(fallback_background)
-            self._folder_fallback_custom_color = (
-                color.name() if color.isValid() else "#000000"
-            )
-            self._select_data(
-                self.browser_folder_fallback_background_combo,
-                "custom",
-            )
-        self._sync_folder_fallback_background_controls()
+        for key, editor in self._fallback_background_editors.items():
+            editor.load_value(str(self.config.get(key, "auto")))
         self._select_data(
             self.thumbnail_quality_mode_combo,
             self.config.get("thumbnail_quality_mode", "auto"),
         )
+        self.thumbnail_webp_quality_spin.setValue(
+            int(self.config.get("thumbnail_webp_quality", 60))
+        )
+        self.thumbnail_preserve_alpha_checkbox.setChecked(self.config.get("thumbnail_preserve_alpha", False) is True)
         self.thumbnail_cache_max_edge_spin.setValue(
             int(self.config.get("thumbnail_cache_max_edge", 1024))
         )
@@ -1438,17 +1441,13 @@ class SettingsDialog(QDialog):
         )
         self._sync_browser_wheel_scroll_controls()
         self._sync_browser_grid_preset()
-        self._select_data(
-            self.browser_sort_key_combo,
-            self.config.get("browser_sort_key", BrowserSortKey.NAME.value),
-        )
-        self._select_data(
-            self.browser_sort_order_combo,
-            self.config.get(
-                "browser_sort_order",
-                BrowserSortOrder.ASCENDING.value,
-            ),
-        )
+        self._browser_random_seed = self.config.get("browser_random_seed", 0)
+        # Random ignores direction, but an unchanged dialog must not rewrite
+        # a legacy persisted descending value and trigger a redundant reset.
+        self._browser_random_sort_order = self.config.get("browser_sort_order", "ascending")
+        self.browser_sort_key_combo.setCurrentIndex(browser_sort_choice_index(
+            self.config.get("browser_sort_key"), self.config.get("browser_sort_order"),
+        ))
         self.browser_folders_first_checkbox.setChecked(
             bool(self.config.get("browser_folders_first", True))
         )
@@ -1457,6 +1456,14 @@ class SettingsDialog(QDialog):
         )
         self.browser_search_history_limit_spin.setValue(
             int(self.config.get("browser_search_history_limit", 50))
+        )
+        self.browser_preserve_search_for_viewer_roundtrip_checkbox.setChecked(
+            bool(
+                self.config.get(
+                    "browser_preserve_search_for_viewer_roundtrip",
+                    True,
+                )
+            )
         )
         self.browser_spacing_preset_checkbox.setChecked(
             self.config.get("browser_item_spacing_mode", "preset") == "preset"
@@ -1585,33 +1592,37 @@ class SettingsDialog(QDialog):
         self.refresh_cache_usage()
         self.refresh_registration_status()
 
+    @property
+    def _folder_fallback_custom_color(self) -> str:
+        return self._fallback_background_editors["browser_folder_fallback_background"].custom_color
+
+    @_folder_fallback_custom_color.setter
+    def _folder_fallback_custom_color(self, value: str) -> None:
+        self._fallback_background_editors["browser_folder_fallback_background"].custom_color = value
+
+    @property
+    def _file_fallback_custom_color(self) -> str:
+        return self._fallback_background_editors["browser_file_fallback_background"].custom_color
+
+    @_file_fallback_custom_color.setter
+    def _file_fallback_custom_color(self, value: str) -> None:
+        self._fallback_background_editors["browser_file_fallback_background"].custom_color = value
+
     def _choose_folder_fallback_background_color(self) -> None:
-        color = QColorDialog.getColor(
-            QColor(self._folder_fallback_custom_color),
-            self,
-            "代替サムネイル背景色",
-        )
-        if not color.isValid():
-            return
-        self._folder_fallback_custom_color = color.name()
-        self._select_data(
-            self.browser_folder_fallback_background_combo,
-            "custom",
-        )
-        self._sync_folder_fallback_background_controls()
+        self._fallback_background_editors["browser_folder_fallback_background"].choose_color()
 
     def _restore_folder_fallback_background(self) -> None:
-        self._folder_fallback_custom_color = "#000000"
-        self._select_data(
-            self.browser_folder_fallback_background_combo,
-            "auto",
-        )
-        self._sync_folder_fallback_background_controls()
+        self._fallback_background_editors["browser_folder_fallback_background"].restore_default()
 
     def _restore_browser_wheel_scroll_default(self) -> None:
         self._select_data(self.browser_wheel_scroll_mode_combo, "system")
         self.browser_wheel_scroll_custom_spin.setValue(3)
         self._sync_browser_wheel_scroll_controls()
+
+    def _activate_browser_sort(self, index: int) -> None:
+        if BROWSER_SORT_CHOICES[index][1] == BrowserSortKey.RANDOM.value:
+            self._browser_random_seed = new_browser_random_seed(self._browser_random_seed)
+            self._browser_random_sort_order = "ascending"
 
     def _sync_browser_wheel_scroll_controls(
         self,
@@ -1629,23 +1640,8 @@ class SettingsDialog(QDialog):
             not self.delete_skip_confirmation_checkbox.isChecked()
         )
 
-    def _sync_folder_fallback_background_controls(
-        self,
-        *_args: object,
-    ) -> None:
-        custom = (
-            self.browser_folder_fallback_background_combo.currentData()
-            == "custom"
-        )
-        self.browser_folder_fallback_color_button.setEnabled(custom)
-        color = QColor(self._folder_fallback_custom_color)
-        text_color = "#000000" if color.lightness() >= 128 else "#ffffff"
-        self.browser_folder_fallback_color_button.setText(color.name().upper())
-        self.browser_folder_fallback_color_button.setStyleSheet(
-            "QPushButton {"
-            f"background-color: {color.name()}; color: {text_color};"
-            "}"
-        )
+    def _sync_folder_fallback_background_controls(self, *_args: object) -> None:
+        self._fallback_background_editors["browser_folder_fallback_background"].sync_controls()
 
     def _apply_browser_grid_preset(self, index: int) -> None:
         density_value = str(self.browser_grid_preset_combo.itemData(index))
@@ -1913,12 +1909,7 @@ class SettingsDialog(QDialog):
             "browser_thumbnail_display_mode": str(
                 self.browser_thumbnail_display_mode_combo.currentData()
             ),
-            "browser_folder_fallback_background": (
-                self._folder_fallback_custom_color
-                if self.browser_folder_fallback_background_combo.currentData()
-                == "custom"
-                else "auto"
-            ),
+            **{key: editor.value() for key, editor in self._fallback_background_editors.items()},
             "browser_wheel_scroll_mode": str(
                 self.browser_wheel_scroll_mode_combo.currentData() or "system"
             ),
@@ -1929,13 +1920,18 @@ class SettingsDialog(QDialog):
                 self.thumbnail_quality_mode_combo.currentData()
             ),
             "thumbnail_cache_max_edge": self.thumbnail_cache_max_edge_spin.value(),
+            "thumbnail_webp_quality": self.thumbnail_webp_quality_spin.value(),
+            "thumbnail_preserve_alpha": self.thumbnail_preserve_alpha_checkbox.isChecked(),
             "browser_display_density": str(
                 self.browser_display_density_combo.currentData()
             ),
-            "browser_sort_key": str(self.browser_sort_key_combo.currentData()),
-            "browser_sort_order": str(
-                self.browser_sort_order_combo.currentData()
+            "browser_sort_key": BROWSER_SORT_CHOICES[self.browser_sort_key_combo.currentIndex()][1],
+            "browser_sort_order": (
+                self._browser_random_sort_order
+                if BROWSER_SORT_CHOICES[self.browser_sort_key_combo.currentIndex()][1] == "random"
+                else BROWSER_SORT_CHOICES[self.browser_sort_key_combo.currentIndex()][2]
             ),
+            "browser_random_seed": self._browser_random_seed,
             "browser_folders_first": (
                 self.browser_folders_first_checkbox.isChecked()
             ),
@@ -1944,6 +1940,9 @@ class SettingsDialog(QDialog):
             ),
             "browser_search_history_limit": int(
                 self.browser_search_history_limit_spin.value()
+            ),
+            "browser_preserve_search_for_viewer_roundtrip": (
+                self.browser_preserve_search_for_viewer_roundtrip_checkbox.isChecked()
             ),
             "browser_item_spacing_mode": (
                 "preset"
@@ -2501,8 +2500,10 @@ class SettingsDialog(QDialog):
         self.gap_note.setVisible(joined)
 
     def _sync_gesture_controls(self, enabled: bool) -> None:
+        # Trail visibility is shared with Browser gestures, independently of
+        # whether Viewer recognition is enabled.
+        self.mouse_gesture_trail_checkbox.setEnabled(True)
         for widget in (
-            self.mouse_gesture_trail_checkbox,
             self.mouse_gesture_distance_spin,
             self.gesture_down_combo,
             self.gesture_up_combo,

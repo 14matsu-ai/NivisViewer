@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 
+import pytest
 from PIL import Image
 from PySide6.QtGui import QColor, QImage
 
 from app.browser_model import BrowserItem, BrowserItemKind
 from app.thumbnail_disk_cache import ThumbnailDiskCache
-from app.thumbnail_render import ThumbnailRenderSpec
+from app.thumbnail_render import (
+    THUMBNAIL_ENCODER_QUALITY, THUMBNAIL_LOSSLESS_ENCODER_EFFORT,
+    ThumbnailRenderSpec,
+)
 
 
 def write_image(path: Path, *, color: str = "white") -> None:
@@ -186,3 +192,147 @@ def test_unwritable_location_and_corrupt_database_do_not_raise(tmp_path: Path) -
     assert rebuilt.enabled
     assert rebuilt.usage_bytes() == 0
     rebuilt.close()
+
+
+@pytest.mark.parametrize("alpha", [255, 127, 0])
+def test_webp_encoding_matches_identity_and_flattens_alpha_by_default(tmp_path, alpha):
+    source = tmp_path / "source.png"
+    write_image(source)
+    cache = ThumbnailDiskCache(tmp_path / "cache")
+    try:
+        if cache.statistics()["encoder"] != "WEBP":
+            pytest.skip("WebP encoder unavailable")
+        assert THUMBNAIL_ENCODER_QUALITY == 60
+        assert THUMBNAIL_LOSSLESS_ENCODER_EFFORT == 90
+        assert cache.format_version == "3-webp-q60-rgb-lossy-v1-matteffffff"
+        image = thumbnail()
+        image.fill(QColor(23, 89, 177, alpha))
+        assert cache.put(make_item(source), 149, image)
+        encoded = next(cache.files_dir.glob("*.webp")).read_bytes()
+        expected = BytesIO()
+        pixels = cache.encoding_policy.prepare_pixels(cache._qimage_to_pil(image))
+        pixels.save(expected, format="WEBP", **cache.encoding_policy.webp_options())
+        assert encoded == expected.getvalue()
+        loaded = cache.get(make_item(source), 149)
+        assert loaded is not None
+        assert loaded.pixelColor(0, 0).alpha() == 255
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("dpr,edge", [(1, 256), (1.25, 320), (1.5, 320), (2, 512)])
+@pytest.mark.parametrize("old_quality", [70, 90])
+def test_q60_identity_preserves_user_resolution_policy(tmp_path, dpr, edge, old_quality):
+    spec = ThumbnailRenderSpec.from_settings(
+        149, "portrait_1_sqrt2", "letterbox", device_pixel_ratio=dpr,
+        quality_mode="auto", max_edge=512,
+    )
+    old = replace(spec, encoder_quality=old_quality)
+    assert spec.encoder_quality == 60
+    assert spec.long_edge == old.long_edge == edge
+    assert spec.frame_width == old.frame_width
+    assert spec.frame_height == old.frame_height
+    assert spec.cache_token != old.cache_token
+    assert spec.family_token != old.family_token
+    source = tmp_path / "image.png"
+    write_image(source)
+    cache = ThumbnailDiskCache(tmp_path / "cache")
+    try:
+        assert cache.put(make_item(source), old, thumbnail())
+        assert cache.get_suitable(make_item(source), spec) is None
+        assert cache.put(make_item(source), spec, thumbnail())
+        assert cache.get_suitable(make_item(source), spec) is not None
+        assert cache.get_suitable(make_item(source), old) is not None
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("old_quality", [70, 90])
+def test_old_quality_transition_is_lazy_bounded_and_reuses_source_metadata(tmp_path, monkeypatch, old_quality):
+    import app.thumbnail_disk_cache as module
+
+    spec = ThumbnailRenderSpec.from_settings(149, "portrait_1_sqrt2", "letterbox")
+    old_spec = replace(spec, encoder_quality=old_quality)
+    items = []
+    for number in range(5):
+        path = tmp_path / f"book{number}.zip"
+        path.write_bytes(b"not an archive: metadata must not enumerate this")
+        items.append(make_item(path, BrowserItemKind.ARCHIVE))
+    with monkeypatch.context() as legacy:
+        old = ThumbnailDiskCache(tmp_path / "cache", cleanup_interval=1000, encoder_quality=old_quality)
+        if old_quality == 90:
+            legacy.setattr(old, "_format_version_for_policy",
+                           lambda _q: f"3-{old._encoder.lower()}-q90-alpha-lossless")
+        for item in items:
+            assert old.put(item, old_spec, thumbnail(), page_count=42)
+        old.close()
+    old_files = set((tmp_path / "cache" / "files").iterdir())
+    cache = ThumbnailDiskCache(tmp_path / "cache", cleanup_interval=1000)
+    try:
+        assert set(cache.files_dir.iterdir()) == old_files  # No startup wipe.
+        assert cache.get(items[0], old_spec.cache_token) is None
+        assert cache.get_suitable(items[0], spec) is None
+        with monkeypatch.context() as metadata_only:
+            metadata_only.setattr(Image, "open", lambda *_a, **_k: pytest.fail("metadata decoded pixels"))
+            assert cache.get_page_count(items[0]) == 42
+            assert cache.update_page_count(items[0], 43) == 1
+        assert cache.put(items[0], spec, thumbnail())  # Carries count forward.
+        assert cache.get_suitable(items[0], spec).page_count == 43
+        # A changed source cannot reuse the previous format's metadata.
+        items[1].path.write_bytes(b"changed source bytes")
+        assert cache.get_page_count(items[1]) is None
+        assert cache.update_page_count(items[1], 99) == 0
+        assert module.OBSOLETE_FORMAT_PRUNE_BATCH == 128
+        monkeypatch.setattr(module, "OBSOLETE_FORMAT_PRUNE_BATCH", 2)
+        with monkeypatch.context() as maintenance:
+            maintenance.setattr(cache, "_stat_path", lambda *_: pytest.fail("maintenance touched source"))
+            maintenance.setattr(Image, "open", lambda *_a, **_k: pytest.fail("maintenance decoded pixels"))
+            assert cache.cleanup_if_due(force=True) == 2
+            assert len(set(cache.files_dir.iterdir()) & old_files) == 3
+            assert cache.cleanup_if_due() == 0  # Existing daily cadence.
+            assert cache.prune() == 2
+            assert cache.prune() == 1
+        assert not (set(cache.files_dir.iterdir()) & old_files)
+        assert cache.get_page_count(items[0]) == 43
+        assert cache.get_suitable(items[0], spec) is not None
+    finally:
+        cache.close()
+
+
+def test_png_fallback_remains_lossless(tmp_path, monkeypatch):
+    monkeypatch.setattr(ThumbnailDiskCache, "_select_encoder", staticmethod(lambda: ("PNG", "png")))
+    source = tmp_path / "image.png"
+    write_image(source)
+    cache = ThumbnailDiskCache(tmp_path / "cache")
+    try:
+        assert "-png-q60-" in cache.format_version
+        assert cache.put(make_item(source), 149, thumbnail("blue"))
+        assert cache.get(make_item(source), 149).pixelColor(0, 0) == QColor("blue")
+    finally:
+        cache.close()
+
+
+def test_first_selected_count_reuses_q90_metadata_before_retirement(tmp_path, monkeypatch, qapp):
+    import app.thumbnail_disk_cache as module
+    from app.thumbnail_provider import BrowserThumbnailProvider
+
+    source = tmp_path / "book.zip"
+    source.write_bytes(b"deliberately not a readable archive")
+    item = make_item(source, BrowserItemKind.ARCHIVE)
+    with monkeypatch.context() as legacy:
+        old = ThumbnailDiskCache(tmp_path / "cache", encoder_quality=90)
+        legacy.setattr(old, "_format_version_for_policy",
+                       lambda _q: f"3-{old._encoder.lower()}-q90-alpha-lossless")
+        assert old.put(item, 149, thumbnail(), page_count=42)
+        old.close()
+    cache = ThumbnailDiskCache(tmp_path / "cache")
+    provider = BrowserThumbnailProvider(disk_cache=cache)
+    try:
+        with monkeypatch.context() as no_source_read:
+            no_source_read.setattr("zipfile.ZipFile", lambda *_a, **_k: pytest.fail("re-enumerated source"))
+            result = provider._load_page_count_pipeline(item, 149)
+        assert result.page_count == 42
+        assert cache.statistics()["entry_count"] == 0  # Maintenance still ran.
+    finally:
+        provider.close()
+        qapp.processEvents()

@@ -383,6 +383,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
         filename_padding_y: int = 0,
         item_spacing: int = 0,
         folder_fallback_background: str = "auto",
+        file_fallback_background: str = "auto",
         shell_icon_provider: ShellAssociatedIconProvider | None = None,
     ) -> None:
         super().__init__(parent)
@@ -401,6 +402,9 @@ class BrowserItemDelegate(QStyledItemDelegate):
         self.item_spacing = max(0, min(32, int(item_spacing)))
         self.folder_fallback_background = self._normalize_folder_fallback_background(
             folder_fallback_background
+        )
+        self.file_fallback_background = self._normalize_folder_fallback_background(
+            file_fallback_background
         )
         self.shell_icon_provider = (
             shell_icon_provider or ShellAssociatedIconProvider()
@@ -451,6 +455,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
         filename_padding_y: int | None = None,
         item_spacing: int | None = None,
         folder_fallback_background: str | None = None,
+        file_fallback_background: str | None = None,
     ) -> None:
         previous_surface_geometry = (
             self.thumbnail_size,
@@ -477,6 +482,10 @@ class BrowserItemDelegate(QStyledItemDelegate):
             self.filename_padding_y = max(0, min(16, int(filename_padding_y)))
         if item_spacing is not None:
             self.item_spacing = max(0, min(32, int(item_spacing)))
+        if file_fallback_background is not None:
+            self.file_fallback_background = self._normalize_folder_fallback_background(
+                file_fallback_background
+            )
         if folder_fallback_background is not None:
             self.folder_fallback_background = (
                 self._normalize_folder_fallback_background(
@@ -543,6 +552,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
                 self._paint_placeholder_canvas(
                     painter,
                     content_rect,
+                    item=item,
                 )
             painter.setPen(QPen(option.palette.mid().color(), 1))
             painter.drawRect(snapped_frame.adjusted(0, 0, -1 / dpr, -1 / dpr))
@@ -605,18 +615,31 @@ class BrowserItemDelegate(QStyledItemDelegate):
             isinstance(thumbnail_image, QImage)
             and not thumbnail_image.isNull()
         )
-        return bool(
-            not has_thumbnail
-            and (item.kind is BrowserItemKind.FOLDER or thumbnail_error)
-        )
+        # Pending/unrequested/cancelled and failed previews share the neutral
+        # fallback. A valid image always wins, even with a stale error flag.
+        return not has_thumbnail
 
     def _paint_placeholder_canvas(
         self,
         painter: QPainter,
         content_rect: QRectF,
+        *,
+        item: BrowserItem | None = None,
     ) -> None:
         """Fill the same physical-pixel-snapped content rect as real images."""
-        painter.fillRect(content_rect, self.folder_fallback_background_color())
+        color = (
+            self.file_fallback_background_color()
+            if item is not None and item.kind is not BrowserItemKind.FOLDER
+            else self.folder_fallback_background_color()
+        )
+        painter.fillRect(content_rect, color)
+
+    def file_fallback_background_color(self) -> QColor:
+        return QColor(
+            BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR
+            if self.file_fallback_background == "auto"
+            else self.file_fallback_background
+        )
 
     def folder_fallback_background_color(self) -> QColor:
         value = (

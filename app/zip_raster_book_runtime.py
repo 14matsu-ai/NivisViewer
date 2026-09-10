@@ -2291,6 +2291,7 @@ class RasterBookRuntime(QObject):
         self._planner_render_spec: ZipRasterRenderSpec | None = None
         self._prefetch_admission_stopped_request_id: int | None = None
         self._dispatch_suspended = False
+        self._published_request: ZipRasterRequest | None = None
         self._painted_key: _UnitKey | None = None
         self._source_hydration_key: _UnitKey | None = None
         self._source_hydration_frame: _CachedFrame | None = None
@@ -2639,14 +2640,20 @@ class RasterBookRuntime(QObject):
                 return self._source_hydration_frame is not None
         return False
 
-    def stage(self, request: ZipRasterRequest) -> bool:
+    def stage(
+        self,
+        request: ZipRasterRequest,
+        *,
+        publish_cached: bool = False,
+    ) -> bool:
         """Adopt a navigation intent without starting its cold current job.
 
         The Viewer uses this before its replaceable cold-demand timer.  Work
         order, retention and cancellation therefore follow every input
         immediately, while a paced wheel/key burst can still replace the
-        eventual decode target.  A completed staged artifact is retained but
-        never published until :meth:`request` admits that exact serial.
+        eventual decode target.  By default a completed staged artifact is
+        retained but not published. ``publish_cached`` lets a ready transit
+        frame publish without opening the decode/warmup dispatch gate.
         """
 
         if (
@@ -2655,6 +2662,44 @@ class RasterBookRuntime(QObject):
         ):
             return False
         self._adopt_request(request, suspend_dispatch=True)
+        if publish_cached:
+            current_key = self._current_key
+            frame = (
+                self._frame_store.get(current_key, touch=True)
+                if current_key is not None
+                else None
+            )
+            if frame is None:
+                return False
+            self._bump("cache_hits")
+            self._publish_frame(request, frame, True)
+        return True
+
+    def release_staged(self, request: ZipRasterRequest) -> bool:
+        """Open the worker gate for the exact latest staged navigation.
+
+        An adopted job can finish while this gate is closed: publish its ready
+        final frame on release. A transit frame already published during stage
+        has the same cache presence but must not publish a second time.
+        """
+
+        if (
+            not self._accepting_requests
+            or request.source_epoch != self.source_epoch
+            or self._current_request is not request
+            or not self._dispatch_suspended
+        ):
+            return False
+        self._dispatch_suspended = False
+        current_key = self._current_key
+        frame = (
+            self._frame_store.get(current_key, touch=True)
+            if current_key is not None else None
+        )
+        if frame is not None and self._published_request is not request:
+            self._bump("cache_hits")
+            self._publish_frame(request, frame, True)
+        self._drive()
         return True
 
     def request(self, request: ZipRasterRequest) -> bool:
@@ -2677,7 +2722,7 @@ class RasterBookRuntime(QObject):
         frame = self._frame_store.get(current_key, touch=True)
         if frame is not None:
             self._bump("cache_hits")
-            self.frameReady.emit(self._public_frame(request, frame, True))
+            self._publish_frame(request, frame, True)
         else:
             self._bump("cache_misses")
         self._drive()
@@ -3573,9 +3618,7 @@ class RasterBookRuntime(QObject):
                 and self._current_request is request
                 and self._current_key == key
             ):
-                self.frameReady.emit(
-                    self._public_frame(request, hydration_frame, True)
-                )
+                self._publish_frame(request, hydration_frame, True)
             return
         pages = tuple(
             ZipRasterFramePage(
@@ -3608,7 +3651,7 @@ class RasterBookRuntime(QObject):
             and self._current_request is request
             and self._current_key == key
         ):
-            self.frameReady.emit(self._public_frame(request, cached, False))
+            self._publish_frame(request, cached, False)
 
     def _cancel_active_job(self) -> None:
         job = self._active_job
@@ -3830,9 +3873,7 @@ class RasterBookRuntime(QObject):
                     and not self._dispatch_suspended
                     and result.key == self._current_key
                 ):
-                    self.frameReady.emit(
-                        self._public_frame(request, hydration_frame, True)
-                    )
+                    self._publish_frame(request, hydration_frame, True)
                 self._drive()
                 self._emit_idle_if_needed()
                 return
@@ -3887,9 +3928,17 @@ class RasterBookRuntime(QObject):
                 and result.request_id != request.request_id
             )
         ):
-            self.frameReady.emit(self._public_frame(request, cached, False))
+            self._publish_frame(request, cached, False)
         self._drive()
         self._emit_idle_if_needed()
+
+    def _publish_frame(
+        self, request: ZipRasterRequest, cached: _CachedFrame, cache_hit: bool,
+    ) -> None:
+        # Record before emitting: GUI slots can synchronously navigate/release.
+        # Cache ownership alone does not imply this request was presented.
+        self._published_request = request
+        self.frameReady.emit(self._public_frame(request, cached, cache_hit))
 
     def _result_is_artifact_compatible(self, result: _JobResult) -> bool:
         request = self._current_request
