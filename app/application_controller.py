@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import os
 import weakref
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from time import monotonic
@@ -58,6 +59,14 @@ from .viewer_window import ViewerWindow
 WindowFactory = Callable[..., ViewerWindow]
 BrowserWindowFactory = Callable[..., BrowserWindow]
 VALID_OPEN_BEHAVIORS = {"reuse_active", "always_new", "reuse_or_create"}
+
+
+@dataclass(frozen=True)
+class _ViewerSearchReturnContext:
+    browser_ref: weakref.ReferenceType[BrowserWindow]
+    viewer_ref: weakref.ReferenceType[ViewerWindow]
+    location_key: str
+    query: str
 
 
 class FileOperationCloseChoice(StrEnum):
@@ -129,6 +138,9 @@ class ApplicationController(QObject):
         self._viewer_windows: list[ViewerWindow] = []
         self._active_viewer: ViewerWindow | None = None
         self._browser_window: BrowserWindow | None = None
+        self._viewer_search_return_context: (
+            _ViewerSearchReturnContext | None
+        ) = None
         self._shutdown = False
         self._shutdown_complete = False
         self.shutdown_coordinator = ApplicationShutdownCoordinator(self)
@@ -249,6 +261,11 @@ class ApplicationController(QObject):
         window._settings_dialog_open_guard = lambda: not self._shutdown
         self._quit_requested = False
         window.closing.connect(self._on_browser_closing)
+        window.activated.connect(self._on_browser_activated)
+        window.location_changed.connect(self._on_browser_location_changed)
+        window.search_query_edited.connect(
+            self._on_browser_search_query_edited
+        )
         window.directory_scan_committed.connect(
             self.adjacent_book_search.invalidate
         )
@@ -325,6 +342,7 @@ class ApplicationController(QObject):
     ) -> ViewerWindow:
         if self._shutdown:
             raise RuntimeError("application is shutting down")
+        self._invalidate_viewer_search_return_context()
         if not self._applying_startup_restore:
             self.startup_restore.cancel()
         window = self._select_viewer_for_open(open_in_new_window)
@@ -481,6 +499,7 @@ class ApplicationController(QObject):
             sort_key=window.browser_sort_key.value,
             sort_order=window.browser_sort_order.value,
             folders_first=window.browser_folders_first,
+            random_seed=window.browser_random_seed,
         )
         self._adjacent_request_by_window[id(window)] = request_id
         self._adjacent_context[request_id] = (
@@ -693,6 +712,7 @@ class ApplicationController(QObject):
         open_in_new_window: bool | None,
         source_window: object,
     ) -> ViewerWindow:
+        self._invalidate_viewer_search_return_context()
         if open_in_new_window is True:
             return self.open_path(path, open_in_new_window=True)
         if isinstance(source_window, ViewerWindow) and source_window in self._viewer_windows:
@@ -720,43 +740,124 @@ class ApplicationController(QObject):
             accepts_snapshot = False
             accepts_browser_snapshot = False
         if not accepts_snapshot:
-            return self.open_path(
+            viewer = self.open_path(
                 path,
                 open_in_new_window=True if open_in_new_window else None,
             )
-        kwargs = {
-            "open_in_new_window": True if open_in_new_window else None,
-            "folder_snapshot": folder_snapshot,
-        }
-        if accepts_browser_snapshot:
-            kwargs["browser_snapshot"] = browser_snapshot
-        return self.open_path(path, **kwargs)
+        else:
+            kwargs = {
+                "open_in_new_window": True if open_in_new_window else None,
+                "folder_snapshot": folder_snapshot,
+            }
+            if accepts_browser_snapshot:
+                kwargs["browser_snapshot"] = browser_snapshot
+            viewer = self.open_path(path, **kwargs)
+        self._capture_viewer_search_return_context(viewer)
+        return viewer
+
+    def _capture_viewer_search_return_context(
+        self,
+        viewer: ViewerWindow,
+    ) -> None:
+        self._viewer_search_return_context = None
+        browser = self.get_browser_window()
+        if browser is None or browser.current_path is None:
+            return
+        query = browser.active_search_query
+        if not bool(
+            self.settings.get(
+                "browser_preserve_search_for_viewer_roundtrip",
+                True,
+            )
+        ):
+            browser.clear_active_browser_search()
+            return
+        if not query:
+            return
+        self._viewer_search_return_context = _ViewerSearchReturnContext(
+            weakref.ref(browser),
+            weakref.ref(viewer),
+            adjacent_path_key(browser.current_path),
+            query,
+        )
+
+    def _invalidate_viewer_search_return_context(self) -> None:
+        self._viewer_search_return_context = None
+
+    def _on_browser_location_changed(
+        self,
+        browser: object,
+        _path: str,
+    ) -> None:
+        context = self._viewer_search_return_context
+        if context is not None and context.browser_ref() is browser:
+            self._invalidate_viewer_search_return_context()
+
+    def _on_browser_search_query_edited(
+        self,
+        browser: object,
+        _query: str,
+    ) -> None:
+        context = self._viewer_search_return_context
+        if context is not None and context.browser_ref() is browser:
+            self._invalidate_viewer_search_return_context()
+
+    def _on_browser_activated(self, browser: object) -> None:
+        context = self._viewer_search_return_context
+        if context is None or context.browser_ref() is not browser:
+            return
+        self._viewer_search_return_context = None
+        viewer = context.viewer_ref()
+        if (
+            not isinstance(browser, BrowserWindow)
+            or not isinstance(viewer, ViewerWindow)
+            or viewer not in self._viewer_windows
+            or browser.current_path is None
+            or adjacent_path_key(browser.current_path) != context.location_key
+        ):
+            return
+        browser.restore_viewer_roundtrip_search(context.query)
+
+    def _synchronize_browser_to_viewer_item(
+        self,
+        window: ViewerWindow,
+        path: str | Path,
+    ) -> None:
+        snapshot = window.browser_navigation_snapshot
+        if snapshot is None:
+            self.select_path_in_browser(path)
+            return
+        browser = self.get_browser_window()
+        if (
+            browser is None
+            or browser.current_path is None
+            or adjacent_path_key(browser.current_path)
+            != adjacent_path_key(snapshot.parent_folder)
+        ):
+            return
+        if not snapshot.contains_viewer_path(path):
+            return
+        browser.synchronize_viewer_item(
+            path,
+            expected_parent=snapshot.parent_folder,
+        )
 
     def _on_viewer_activated(self, window: object) -> None:
         if isinstance(window, ViewerWindow) and window in self._viewer_windows:
             self._active_viewer = window
             if window.book_session.current_path is not None:
-                self.select_path_in_browser(window.book_session.current_path)
+                self._synchronize_browser_to_viewer_item(
+                    window,
+                    window.browser_navigation_path,
+                )
 
     def _on_viewer_book_changed(self, window: object, path: str) -> None:
         if window is not self.get_active_viewer():
             return
-        snapshot = window.browser_navigation_snapshot
-        browser = self.get_browser_window()
-        if snapshot is not None:
-            # Snapshot navigation must not pull a Browser that has since moved
-            # elsewhere back into the old folder or add a history entry.  A
-            # Browser still showing the captured parent may safely update its
-            # selection through the existing same-folder path.
-            if (
-                browser is not None
-                and browser.current_path is not None
-                and adjacent_path_key(browser.current_path)
-                == adjacent_path_key(snapshot.parent_folder)
-            ):
-                browser.select_path(path)
-            return
-        self.select_path_in_browser(path)
+        self._synchronize_browser_to_viewer_item(
+            window,
+            window.browser_navigation_path or path,
+        )
 
     def _on_viewer_interactive_open_started(self, _window: object) -> None:
         self.image_work_coordinator.begin_viewer_interactive()
@@ -769,6 +870,9 @@ class ApplicationController(QObject):
 
     def _on_viewer_closing(self, window: object) -> None:
         if isinstance(window, ViewerWindow):
+            context = self._viewer_search_return_context
+            if context is not None and context.viewer_ref() is window:
+                self._invalidate_viewer_search_return_context()
             self._cancel_adjacent_search(window)
             self._unregister_viewer(window, save_window_state=window is self._active_viewer)
 
@@ -780,6 +884,7 @@ class ApplicationController(QObject):
 
     def _on_browser_closing(self, window: object) -> None:
         if isinstance(window, BrowserWindow) and window is self._browser_window:
+            self._invalidate_viewer_search_return_context()
             self._cancel_adjacent_search(window)
             self._unregister_browser(window)
             if (
@@ -1226,33 +1331,16 @@ class ApplicationController(QObject):
         snapshot: AdjacentBookBrowserSnapshot,
         selected_path: str,
     ) -> FolderListingSnapshot | None:
-        selected_key = adjacent_path_key(selected_path)
-        image_entries = tuple(
-            entry
-            for entry in snapshot.entries
-            if entry.openable_by_nivisviewer and entry.item_kind == "image"
-        )
-        image_ids = tuple(
-            lexical_absolute(entry.absolute_path) for entry in image_entries
-        )
-        image_keys = tuple(adjacent_path_key(path) for path in image_ids)
-        try:
-            selected_index = image_keys.index(selected_key)
-        except ValueError:
+        selected_index = snapshot.image_index_for_path(selected_path)
+        if selected_index is None:
             return None
+        image_ids = snapshot.image_paths
         selected_image = image_ids[selected_index]
         return FolderListingSnapshot(
             Path(snapshot.parent_folder),
             image_ids,
             selected_image,
-            tuple(
-                (
-                    lexical_absolute(entry.absolute_path),
-                    entry.file_size,
-                    entry.modified_time_ns,
-                )
-                for entry in image_entries
-            ),
+            snapshot.image_fingerprints,
             generation=snapshot.scan_generation,
             sort_identity=snapshot.sort_identity,
             selected_index=selected_index,
@@ -1348,6 +1436,15 @@ class ApplicationController(QObject):
             return False
 
     def _on_controller_settings_changed(self, changed: dict[str, object]) -> None:
+        if (
+            "browser_preserve_search_for_viewer_roundtrip" in changed
+            and not bool(changed["browser_preserve_search_for_viewer_roundtrip"])
+        ):
+            context = self._viewer_search_return_context
+            browser = context.browser_ref() if context is not None else None
+            self._invalidate_viewer_search_return_context()
+            if browser is not None:
+                browser.clear_active_browser_search()
         if {
             "archive_backend_preference",
             "winrar_executable",

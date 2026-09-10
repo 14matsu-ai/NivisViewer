@@ -107,7 +107,7 @@ def test_time_and_size_sort_are_stable_by_natural_name(
     ) == expected
 
 
-def test_item_type_groups_zip_and_cbz_in_archive_category(tmp_path: Path) -> None:
+def test_item_type_groups_by_extension_not_coarse_archive_category(tmp_path: Path) -> None:
     values = [
         item(tmp_path, "画像.jpg"),
         item(tmp_path, "本2.cbz", kind=BrowserItemKind.ARCHIVE),
@@ -122,7 +122,7 @@ def test_item_type_groups_zip_and_cbz_in_archive_category(tmp_path: Path) -> Non
             folders_first=False,
         ),
         values,
-    ) == ["フォルダ", "本1.zip", "本2.cbz", "画像.jpg"]
+    ) == ["フォルダ", "本2.cbz", "画像.jpg", "本1.zip"]
 
 
 def test_folders_first_remains_first_even_in_descending_size_sort(
@@ -219,7 +219,7 @@ def test_sort_generates_one_natural_key_per_item(
         folders_first=True,
     ).sorted_items(values)
 
-    assert len(calls) == len(values)
+    assert len(calls) == (0 if sort_key is BrowserSortKey.RANDOM else len(values))
 
 
 @pytest.mark.parametrize("order", list(BrowserSortOrder))

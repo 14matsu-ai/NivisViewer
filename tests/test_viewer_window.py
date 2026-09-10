@@ -851,8 +851,12 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
         assert not any(image.loading for image in window.viewer._images)
         assert window.presentation_state.requested_page == 1
         assert window.presentation_state.displayed_page == 0
-        assert window.slider.value() == 0
-        assert "1 / 7" in window.status.currentMessage()
+        # Only navigation controls lead the pending frame; image/page list,
+        # committed status values, history and progress retain their contract.
+        assert window.slider.value() == 1
+        assert "2 / 7" in window.status.currentMessage()
+        assert window.presentation_state.status_values.page_index == 0
+        assert window.presentation_state.progress_page == 0
         assert current_page_list_page(window) == 0
 
         first_release.set()
@@ -887,8 +891,10 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
         assert window.model.focused_index == 5
         assert window.presentation_state.requested_page == 5
         assert window.presentation_state.displayed_page == 1
-        assert window.slider.value() == 1
-        assert "2 / 7" in window.status.currentMessage()
+        assert window.slider.value() == 5
+        assert "6 / 7" in window.status.currentMessage()
+        assert window.presentation_state.status_values.page_index == 1
+        assert window.presentation_state.progress_page == 1
         assert applied in ([], [("page-5.jpg",)])
         intermediate_ids = tuple(
             image.image_id for image in window.viewer._images

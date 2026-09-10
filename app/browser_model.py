@@ -52,6 +52,8 @@ class BrowserItem:
     preview_status: str = "pending"
     rating: int | None = None
     page_count: int | None = None
+    created_time_ns: int | None = None
+    accessed_time_ns: int | None = None
 
     @property
     def can_open(self) -> bool:
@@ -129,6 +131,8 @@ def browser_item_from_scan_entry(entry: BrowserScanEntry) -> BrowserItem:
         preview_kind=entry.preview_kind,
         rating=entry.rating,
         page_count=entry.page_count,
+        created_time_ns=entry.created_time_ns,
+        accessed_time_ns=entry.accessed_time_ns,
     )
 
 
@@ -478,11 +482,13 @@ class BrowserItemModel(QAbstractListModel):
         sort_key: BrowserSortKey | str,
         sort_order: BrowserSortOrder | str,
         folders_first: bool,
+        random_seed: int = 0,
     ) -> bool:
         policy = BrowserSortPolicy(
             sort_key=normalize_browser_sort_key(sort_key),
             sort_order=normalize_browser_sort_order(sort_order),
             folders_first=bool(folders_first),
+            random_seed=random_seed,
         )
         if policy == self._sort_policy:
             return False

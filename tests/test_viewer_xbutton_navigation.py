@@ -112,7 +112,7 @@ def _open_snapshot_viewer(
     return controller, viewer, paths, snapshot
 
 
-def test_snapshot_neighbor_skips_browser_only_and_unsupported_items(
+def test_snapshot_neighbor_includes_folder_books_but_skips_unsupported_items(
     tmp_path: Path,
 ) -> None:
     first = tmp_path / "first.zip"
@@ -136,6 +136,9 @@ def test_snapshot_neighbor_skips_browser_only_and_unsupported_items(
 
     status, candidate = snapshot.adjacent_viewer_path(first, 1)
 
+    assert status is AdjacentBookSearchStatus.FOUND
+    assert Path(candidate or "") == tmp_path / "folder"
+    status, candidate = snapshot.adjacent_viewer_path(candidate or "", 1)
     assert status is AdjacentBookSearchStatus.FOUND
     assert Path(candidate or "") == second
 

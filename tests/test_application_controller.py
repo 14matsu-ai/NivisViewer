@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+from io import BytesIO
 from pathlib import Path
 from time import monotonic
+from zipfile import ZipFile
 from PIL import Image
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
@@ -18,6 +20,15 @@ def write_image(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with Image.new("RGB", (8, 12), "white") as image:
         image.save(path)
+
+
+def write_archive(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = BytesIO()
+    with Image.new("RGB", (8, 12), "white") as image:
+        image.save(payload, format="PNG")
+    with ZipFile(path, "w") as archive:
+        archive.writestr("001.png", payload.getvalue())
 
 
 def make_controller(tmp_path: Path, qapp: QApplication) -> ApplicationController:
@@ -59,6 +70,15 @@ def finish_viewer_open(qapp: QApplication, viewer) -> None:
         QTest.qWait(5)
     qapp.processEvents()
     assert viewer._pending_book_open_projection is None
+
+
+def activate_browser_search(browser, query: str, *, persist: bool = False) -> None:
+    browser.browser_search_edit.setText(query)
+    browser._browser_search_timer.stop()
+    browser._apply_pending_browser_search()
+    if persist:
+        browser.search_history.record(query)
+        browser._persist_browser_search_history()
 
 
 def test_start_creates_browser_and_shares_config(
@@ -744,6 +764,324 @@ def test_browser_order_snapshot_survives_reload_and_filter_until_reopen(
         finish_viewer_open(qapp, viewer)
         assert viewer.book_session.folder_listing_snapshot is None
         assert set(viewer.model.image_ids) == {str(path) for path in paths}
+    finally:
+        close_controller(controller, qapp)
+
+
+def test_random_reshuffle_preserves_viewer_open_time_snapshot(tmp_path, qapp):
+    folder = tmp_path / "random-snapshot"
+    for number in range(25):
+        write_image(folder / f"本{number}.jpg")
+    controller = make_controller(tmp_path, qapp)
+    controller._restore_on_start = False
+    controller.config.apply({"view_mode": "single", "browser_sort_key": "random",
+                             "browser_random_seed": 54321})
+    browser = controller.create_browser_window()
+    try:
+        assert browser.set_current_folder(folder)
+        assert browser.wait_for_scan()
+        qapp.processEvents()
+        before = tuple(str(i.path) for i in browser.items)
+        browser.open_item(browser.item_model.index(10, 0))
+        viewer = controller.get_active_viewer()
+        finish_viewer_open(qapp, viewer)
+        assert tuple(viewer.model.image_ids) == before
+        browser.browser_sort_key_combo.activated.emit(14)
+        qapp.processEvents()
+        assert browser.browser_random_seed != 54321
+        after = tuple(str(i.path) for i in browser.items)
+        assert tuple(viewer.model.image_ids) == before
+        viewer.reload_current_book()
+        finish_viewer_open(qapp, viewer)
+        assert tuple(viewer.model.image_ids) == before
+        browser.open_item(browser.item_model.index(10, 0))
+        finish_viewer_open(qapp, viewer)
+        assert tuple(viewer.model.image_ids) == after
+        assert viewer.book_session.page_list_runtime.image_ids == after
+    finally:
+        close_controller(controller, qapp)
+
+
+def test_viewer_roundtrip_search_is_one_shot_and_never_history_state(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder_a = tmp_path / "A"
+    folder_b = tmp_path / "B"
+    image = folder_a / "cat.jpg"
+    write_image(image)
+    folder_b.mkdir()
+    controller = make_controller(tmp_path, qapp)
+    controller._restore_on_start = False
+    browser = controller.create_browser_window()
+
+    try:
+        assert browser.set_current_folder(folder_a)
+        assert browser.wait_for_scan()
+        activate_browser_search(browser, "cat", persist=True)
+        row = browser.item_model.row_for_path(image)
+        browser.open_item(browser.item_model.index(row, 0))
+        viewer = controller.get_active_viewer()
+        assert viewer is not None
+        finish_viewer_open(qapp, viewer)
+
+        assert browser.active_search_query == "cat"
+        controller._on_browser_activated(browser)
+        assert browser.active_search_query == "cat"
+        assert controller._viewer_search_return_context is None
+
+        assert browser.navigate_to(folder_b)
+        assert browser.wait_for_scan()
+        assert browser.active_search_query == ""
+        assert browser.browser_search_edit.text() == ""
+        assert browser.go_back()
+        assert browser.wait_for_scan()
+        assert browser.current_path == folder_a.absolute()
+        assert browser.active_search_query == ""
+        restored = ConfigManager(controller.config.path).load()
+        assert "cat" in restored["browser_search_history"]
+    finally:
+        close_controller(controller, qapp)
+
+
+def test_viewer_roundtrip_context_is_invalidated_by_edit_clear_and_setting_off(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "folder"
+    cat = folder / "cat.jpg"
+    dog = folder / "dog.jpg"
+    write_image(cat)
+    write_image(dog)
+    controller = make_controller(tmp_path, qapp)
+    controller._restore_on_start = False
+    browser = controller.create_browser_window()
+
+    try:
+        assert browser.set_current_folder(folder)
+        assert browser.wait_for_scan()
+        activate_browser_search(browser, "cat", persist=True)
+        row = browser.item_model.row_for_path(cat)
+        browser.open_item(browser.item_model.index(row, 0))
+        viewer = controller.get_active_viewer()
+        assert viewer is not None
+        finish_viewer_open(qapp, viewer)
+        assert controller._viewer_search_return_context is not None
+
+        browser.browser_search_edit.setText("dog")
+        browser._browser_search_timer.stop()
+        browser._apply_pending_browser_search()
+        assert controller._viewer_search_return_context is None
+        controller._on_browser_activated(browser)
+        assert browser.active_search_query == "dog"
+
+        activate_browser_search(browser, "cat")
+        row = browser.item_model.row_for_path(cat)
+        browser.open_item(browser.item_model.index(row, 0))
+        finish_viewer_open(qapp, viewer)
+        assert controller._viewer_search_return_context is not None
+        browser.browser_search_edit.clear()
+        browser._browser_search_timer.stop()
+        browser._apply_pending_browser_search()
+        assert controller._viewer_search_return_context is None
+        assert browser.active_search_query == ""
+
+        activate_browser_search(browser, "cat")
+        row = browser.item_model.row_for_path(cat)
+        browser.open_item(browser.item_model.index(row, 0))
+        finish_viewer_open(qapp, viewer)
+        assert controller._viewer_search_return_context is not None
+        controller.config.apply(
+            {"browser_preserve_search_for_viewer_roundtrip": False}
+        )
+        assert controller._viewer_search_return_context is None
+        assert browser.active_search_query == ""
+
+        activate_browser_search(browser, "cat")
+        row = browser.item_model.row_for_path(cat)
+        browser.open_item(browser.item_model.index(row, 0))
+        finish_viewer_open(qapp, viewer)
+        assert controller._viewer_search_return_context is None
+        assert browser.active_search_query == ""
+        assert "cat" in browser.search_history.entries
+    finally:
+        close_controller(controller, qapp)
+
+
+def test_viewer_image_sync_uses_snapshot_identity_and_minimal_scroll(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "images"
+    paths = tuple(folder / f"{number:03}.jpg" for number in range(80))
+    for path in paths:
+        write_image(path)
+    controller = make_controller(tmp_path, qapp)
+    controller._restore_on_start = False
+    browser = controller.create_browser_window()
+    browser.resize(500, 360)
+    browser.show()
+
+    try:
+        assert browser.set_current_folder(folder)
+        assert browser.wait_for_scan()
+        qapp.processEvents()
+        snapshot = browser.adjacent_book_snapshot(folder)
+        assert snapshot is not None
+
+        visible_index = browser._visible_anchor_index()
+        visible_item = browser.item_model.item_at(visible_index)
+        assert visible_item is not None
+        visible_target = visible_item.path
+        before_scroll = browser.list_view.verticalScrollBar().value()
+        assert browser.synchronize_viewer_item(
+            visible_target,
+            expected_parent=folder,
+        )
+        assert browser.list_view.verticalScrollBar().value() == before_scroll
+
+        offscreen_target = paths[-1]
+        assert browser.synchronize_viewer_item(
+            offscreen_target,
+            expected_parent=folder,
+        )
+        assert browser.list_view.verticalScrollBar().value() > before_scroll
+        selected = browser.item_model.item_at(browser.list_view.currentIndex())
+        assert selected is not None and selected.path == offscreen_target.absolute()
+
+        first = paths[20]
+        folder_snapshot = controller._folder_snapshot_from_browser_navigation(
+            snapshot,
+            str(first),
+        )
+        viewer = controller.open_path(
+            first,
+            folder_snapshot=folder_snapshot,
+            browser_snapshot=snapshot,
+        )
+        finish_viewer_open(qapp, viewer)
+        selected = browser.item_model.item_at(browser.list_view.currentIndex())
+        assert selected is not None and selected.path == first.absolute()
+
+        assert controller.open_adjacent_book(viewer, 1) == "opened"
+        finish_viewer_open(qapp, viewer)
+        selected = browser.item_model.item_at(browser.list_view.currentIndex())
+        assert selected is not None and selected.path == paths[21].absolute()
+
+        for target in paths[22:25]:
+            controller._synchronize_browser_to_viewer_item(viewer, target)
+        selected = browser.item_model.item_at(browser.list_view.currentIndex())
+        assert selected is not None and selected.path == paths[24].absolute()
+    finally:
+        close_controller(controller, qapp)
+
+
+def test_viewer_folder_book_sync_selects_parent_item_and_adjacent_folder(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    parent = tmp_path / "books"
+    first = parent / "01.Folder"
+    second = parent / "02.Folder"
+    write_image(first / "1.jpg")
+    write_image(second / "1.jpg")
+    controller = make_controller(tmp_path, qapp)
+    controller._restore_on_start = False
+    browser = controller.create_browser_window()
+
+    try:
+        assert browser.set_current_folder(parent)
+        assert browser.wait_for_scan()
+        snapshot = browser.adjacent_book_snapshot(parent)
+        assert snapshot is not None
+        viewer = controller.open_path(first, browser_snapshot=snapshot)
+        finish_viewer_open(qapp, viewer)
+
+        assert browser.current_path == parent.absolute()
+        selected = browser.item_model.item_at(browser.list_view.currentIndex())
+        assert selected is not None and selected.path == first.absolute()
+
+        assert controller.open_adjacent_book(viewer, 1) == "opened"
+        finish_viewer_open(qapp, viewer)
+        assert browser.current_path == parent.absolute()
+        selected = browser.item_model.item_at(browser.list_view.currentIndex())
+        assert selected is not None and selected.path == second.absolute()
+    finally:
+        close_controller(controller, qapp)
+
+
+def test_existing_archive_sync_uses_the_same_snapshot_selection_path(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    parent = tmp_path / "archives"
+    first = parent / "01.zip"
+    second = parent / "02.zip"
+    write_archive(first)
+    write_archive(second)
+    controller = make_controller(tmp_path, qapp)
+    controller._restore_on_start = False
+    browser = controller.create_browser_window()
+
+    try:
+        assert browser.set_current_folder(parent)
+        assert browser.wait_for_scan()
+        snapshot = browser.adjacent_book_snapshot(parent)
+        assert snapshot is not None
+        viewer = controller.open_path(first, browser_snapshot=snapshot)
+        finish_viewer_open(qapp, viewer)
+        selected = browser.item_model.item_at(browser.list_view.currentIndex())
+        assert selected is not None and selected.path == first.absolute()
+
+        assert controller.open_adjacent_book(viewer, 1) == "opened"
+        finish_viewer_open(qapp, viewer)
+        selected = browser.item_model.item_at(browser.list_view.currentIndex())
+        assert selected is not None and selected.path == second.absolute()
+    finally:
+        close_controller(controller, qapp)
+
+
+def test_viewer_sync_leaves_selection_neutral_when_rating_hides_exact_item(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "rated"
+    visible = folder / "visible {zpi$r=5}.jpg"
+    hidden = folder / "hidden {zpi$r=1}.jpg"
+    write_image(visible)
+    write_image(hidden)
+    controller = make_controller(tmp_path, qapp)
+    controller._restore_on_start = False
+    browser = controller.create_browser_window()
+
+    try:
+        assert browser.set_current_folder(folder)
+        assert browser.wait_for_scan()
+        snapshot = browser.adjacent_book_snapshot(folder)
+        assert snapshot is not None
+        viewer = controller.open_path(
+            hidden,
+            folder_snapshot=controller._folder_snapshot_from_browser_navigation(
+                snapshot,
+                str(hidden),
+            ),
+            browser_snapshot=snapshot,
+        )
+        finish_viewer_open(qapp, viewer)
+        browser._set_browser_filter(
+            BrowserFilterState.normalized(
+                rating_mode=RatingFilterMode.AT_LEAST,
+                rating_reference=4,
+            )
+        )
+        qapp.processEvents()
+
+        controller._on_viewer_book_changed(viewer, str(hidden))
+
+        assert browser.item_model.row_for_path(hidden) < 0
+        assert not browser.list_view.currentIndex().isValid()
+        assert browser.list_view.selectionModel().selectedIndexes() == []
+        assert browser.browser_filter_state.rating_reference == 4
     finally:
         close_controller(controller, qapp)
 

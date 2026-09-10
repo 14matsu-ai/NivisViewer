@@ -7,17 +7,23 @@ import sqlite3
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PIL import Image, features
 from PySide6.QtGui import QImage
 
 from .browser_model import BrowserItem, BrowserItemKind
-from .thumbnail_render import ThumbnailRenderSpec
+from .thumbnail_render import (
+    THUMBNAIL_ENCODER_QUALITY,
+    ThumbnailEncodingPolicy,
+    ThumbnailRenderSpec,
+    normalize_thumbnail_webp_quality,
+)
 
 
 CACHE_SCHEMA_VERSION = 3
+OBSOLETE_FORMAT_PRUNE_BATCH = 128
 
 
 @dataclass(frozen=True)
@@ -61,6 +67,9 @@ class ThumbnailDiskCache:
         limit_bytes: int | None = None,
         cleanup_interval: int = 32,
         max_unused_days: int = 0,
+        encoder_quality: int = THUMBNAIL_ENCODER_QUALITY,
+        preserve_alpha: bool = False,
+        matte_color: str = "#ffffff",
     ) -> None:
         self.cache_dir = Path(cache_dir)
         self.files_dir = self.cache_dir / "files"
@@ -80,13 +89,41 @@ class ThumbnailDiskCache:
         self._cached_entry_count = 0
         self._cached_last_cleanup = 0.0
         self._encoder, self._extension = self._select_encoder()
-        self.format_version = (
-            f"{CACHE_SCHEMA_VERSION}-{self._encoder.lower()}-q90-alpha-lossless"
-        )
+        self._encoding_policy = ThumbnailRenderSpec.from_settings(
+            149, "portrait_1_sqrt2", "letterbox", encoder_quality=encoder_quality,
+            preserve_alpha=preserve_alpha, matte_color=matte_color,
+        ).encoding_policy
         self.enabled = False
         self.last_error: str | None = None
         if enabled:
             self.set_enabled(True)
+
+    @property
+    def encoder_quality(self) -> int:
+        return self._encoding_policy.quality
+
+    @property
+    def encoding_policy(self) -> ThumbnailEncodingPolicy:
+        return self._encoding_policy
+
+    @property
+    def format_version(self) -> str:
+        return self._format_version_for_policy(self._encoding_policy)
+
+    def set_encoder_quality(self, quality: int) -> None:
+        # Atomic policy scalar only: never wait for encoding/SQLite on the GUI
+        # thread. Workers own their immutable spec and snapshot their quality.
+        self._encoding_policy = replace(self._encoding_policy, quality=normalize_thumbnail_webp_quality(quality))
+
+    def set_encoding_policy(self, policy: ThumbnailEncodingPolicy) -> None:
+        # One immutable assignment, without waiting for a worker's cache lock.
+        self._encoding_policy = policy
+
+    def _format_version_for_policy(self, policy: ThumbnailEncodingPolicy) -> str:
+        return (
+            f"{CACHE_SCHEMA_VERSION}-{self._encoder.lower()}-q{policy.quality}"
+            f"-{policy.alpha_token}"
+        )
 
     def set_enabled(self, enabled: bool) -> None:
         with self._lock:
@@ -212,7 +249,7 @@ class ThumbnailDiskCache:
                     self._normalize_path(item.path),
                     item.kind.value,
                     spec.family_token,
-                    self.format_version,
+                    self._format_version_for_policy(spec.encoding_policy),
                 ]
                 if entry_path is not None:
                     parameters.append(str(entry_path))
@@ -306,6 +343,7 @@ class ThumbnailDiskCache:
         entry_path: str = "",
         page_count: int | None = None,
         protected_thumbnail_sizes: set[int] | None = None,
+        encoding_policy: ThumbnailEncodingPolicy | None = None,
     ) -> bool:
         with self._lock:
             if (
@@ -316,11 +354,16 @@ class ThumbnailDiskCache:
             ):
                 return False
             if isinstance(thumbnail_size, ThumbnailRenderSpec):
+                policy = thumbnail_size.encoding_policy
+                quality = thumbnail_size.encoder_quality
+                if type(quality) is not int or not 1 <= quality <= 100:
+                    return False
                 cache_token = thumbnail_size.cache_token
                 family_token = thumbnail_size.family_token
                 frame_width = max(1, image.width())
                 frame_height = max(1, image.height())
             else:
+                policy = encoding_policy if encoding_policy is not None else self._encoding_policy
                 cache_token = int(thumbnail_size)
                 family_token = cache_token
                 frame_width = max(1, image.width())
@@ -330,9 +373,13 @@ class ThumbnailDiskCache:
                 cache_token,
                 Path(cover_path) if cover_path else None,
                 entry_path,
+                format_version=self._format_version_for_policy(policy),
             )
             if fingerprint is None:
                 return False
+            if page_count is None:
+                # Encoding quality does not invalidate source listing metadata.
+                page_count = self.get_page_count(item)
             key = fingerprint.key
             file_name = f"{key}.{self._extension}"
             cache_file = self.files_dir / file_name
@@ -351,18 +398,9 @@ class ThumbnailDiskCache:
                         self._connection.commit()
                     return False
                 self.files_dir.mkdir(parents=True, exist_ok=True)
-                pil_image = self._qimage_to_pil(image)
+                pil_image = policy.prepare_pixels(self._qimage_to_pil(image))
                 if self._encoder == "WEBP":
-                    alpha_extrema = pil_image.getchannel("A").getextrema()
-                    save_options = {
-                        "format": "WEBP",
-                        "quality": 90,
-                        "method": 4,
-                        "exact": True,
-                    }
-                    if alpha_extrema[0] < 255:
-                        save_options["lossless"] = True
-                    pil_image.save(temporary, **save_options)
+                    pil_image.save(temporary, format="WEBP", **policy.webp_options())
                 else:
                     pil_image.save(temporary, format="PNG", optimize=False)
                 os.replace(temporary, cache_file)
@@ -409,6 +447,7 @@ class ThumbnailDiskCache:
                     fingerprint.item_kind,
                     fingerprint.entry_path,
                     family_token,
+                    format_version=fingerprint.format_version,
                     current_key=key,
                     protected_thumbnail_sizes=protected_thumbnail_sizes or set(),
                 )
@@ -443,14 +482,16 @@ class ThumbnailDiskCache:
                     SELECT page_count, source_size, source_mtime_ns
                       FROM entries
                      WHERE source_path = ? AND item_kind = ?
-                       AND format_version = ? AND page_count IS NOT NULL
+                       AND source_size = ? AND source_mtime_ns = ?
+                       AND page_count IS NOT NULL
                      ORDER BY last_used DESC
                      LIMIT 1
                     """,
                     (
                         self._normalize_path(item.path),
                         item.kind.value,
-                        self.format_version,
+                        source[0],
+                        source[1],
                     ),
                 ).fetchone()
             except sqlite3.DatabaseError as exc:
@@ -475,7 +516,6 @@ class ThumbnailDiskCache:
                     UPDATE entries SET page_count = ?
                      WHERE source_path = ? AND item_kind = ?
                        AND source_size = ? AND source_mtime_ns = ?
-                       AND format_version = ?
                     """,
                     (
                         max(0, int(page_count)),
@@ -483,7 +523,6 @@ class ThumbnailDiskCache:
                         item.kind.value,
                         source[0],
                         source[1],
-                        self.format_version,
                     ),
                 )
                 self._connection.commit()
@@ -568,6 +607,15 @@ class ThumbnailDiskCache:
             self.flush_accesses()
             try:
                 removed = 0
+                # Retire obsolete payloads incrementally, even below the LRU
+                # byte cap. Never visit or regenerate their source folders.
+                obsolete = self._connection.execute(
+                    "SELECT cache_key, file_name FROM entries "
+                    "WHERE format_version != ? ORDER BY last_used ASC LIMIT ?",
+                    (self.format_version, OBSOLETE_FORMAT_PRUNE_BATCH),
+                ).fetchall()
+                self._remove_entries_without_commit(obsolete)
+                removed += len(obsolete)
                 days = (
                     self.max_unused_days
                     if max_unused_days is None
@@ -847,6 +895,8 @@ class ThumbnailDiskCache:
         thumbnail_size: int,
         cover_path: Path | None,
         entry_path: str,
+        *,
+        format_version: str | None = None,
     ) -> _Fingerprint | None:
         source = self._stat_path(item.path)
         if source is None:
@@ -871,7 +921,7 @@ class ThumbnailDiskCache:
             cover_mtime_ns=cover[1],
             entry_path=str(entry_path),
             thumbnail_size=thumbnail_size,
-            format_version=self.format_version,
+            format_version=self.format_version if format_version is None else format_version,
         )
 
     def _remove_entries(self, entries: list[tuple[str, str]]) -> None:
@@ -926,6 +976,7 @@ class ThumbnailDiskCache:
         entry_path: str,
         family_token: int,
         *,
+        format_version: str,
         current_key: str,
         protected_thumbnail_sizes: set[int],
     ) -> None:
@@ -944,7 +995,7 @@ class ThumbnailDiskCache:
                 item_kind,
                 entry_path,
                 family_token,
-                self.format_version,
+                format_version,
             ),
         ).fetchall()
         self._trim_rows(
@@ -967,7 +1018,7 @@ class ThumbnailDiskCache:
                 source_path,
                 item_kind,
                 entry_path,
-                self.format_version,
+                format_version,
                 family_token,
             ),
         ).fetchall()

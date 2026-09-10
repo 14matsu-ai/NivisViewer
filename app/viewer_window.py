@@ -58,6 +58,7 @@ from .image_source import (
     FolderImageSource,
     FolderListingSnapshot,
     ImageSource,
+    ImageSourceError,
     SevenZipImageSource,
     ZipImageSource,
     create_image_source,
@@ -588,7 +589,7 @@ class ViewerWindow(QMainWindow):
 
     def show_initial(self) -> None:
         if self._start_fullscreen:
-            self.showFullScreen()
+            self.fullscreen_chrome.enter_true_fullscreen()
         else:
             self.show()
         self._apply_chrome_visibility()
@@ -606,8 +607,9 @@ class ViewerWindow(QMainWindow):
         self.config.apply(values)
 
     def window_state_snapshot(self) -> dict[str, object]:
+        geometry = self.fullscreen_chrome.standard_window_geometry()
         return {
-            "window_geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
+            "window_geometry": bytes(geometry.toBase64()).decode("ascii"),
             "window_state": bytes(self.saveState().toBase64()).decode("ascii"),
             "fullscreen": self.isFullScreen(),
             "rotation_angle": self.rotation_angle,
@@ -651,6 +653,7 @@ class ViewerWindow(QMainWindow):
             self.presentation_state.surface
         )
         self.slider = ViewerPageSlider(self)
+        self.slider.set_reading_direction(self.reading_direction)
         self.slider.set_page_state(0, 0)
 
         central = QWidget(self)
@@ -1374,7 +1377,7 @@ class ViewerWindow(QMainWindow):
             direction = str(changed["viewer_canvas_click_direction"])
             self.viewer_canvas_click_direction = (
                 direction
-                if direction in {"right_next", "left_next"}
+                if direction in {"right_next", "left_next", "auto"}
                 else "right_next"
             )
         if "viewer_slider_wheel_single_page_enabled" in changed:
@@ -1568,6 +1571,8 @@ class ViewerWindow(QMainWindow):
                 else 0
             )
         )
+        if isinstance(self.book_session.source, SevenZipImageSource):
+            current_cache_bytes += self.book_session.source.payload_cache_bytes
         policy.observe_memory_pressure(
             snapshot,
             current_cache_bytes=current_cache_bytes,
@@ -1864,7 +1869,7 @@ class ViewerWindow(QMainWindow):
         )
         raster_fast_path = isinstance(
             self.book_session.source,
-            (ZipImageSource, FolderImageSource),
+            (ZipImageSource, FolderImageSource, SevenZipImageSource),
         ) and self.book_session.viewer_runtime is not None
         if raster_fast_path:
             self._pending_book_open_projection = (
@@ -3079,7 +3084,7 @@ class ViewerWindow(QMainWindow):
 
     def _raster_book_topology(
         self,
-        source: ZipImageSource | FolderImageSource,
+        source: ZipImageSource | FolderImageSource | SevenZipImageSource,
     ) -> RasterBookTopology[
         RasterDisplayUnit,
         tuple[tuple[int, str], ...],
@@ -3141,7 +3146,7 @@ class ViewerWindow(QMainWindow):
         source = self.book_session.source
         runtime = self._zip_runtime
         if (
-            not isinstance(source, (ZipImageSource, FolderImageSource))
+            not isinstance(source, (ZipImageSource, FolderImageSource, SevenZipImageSource))
             or runtime is None
             or runtime is not self.book_session.viewer_runtime
             or runtime.source is not source
@@ -3296,6 +3301,7 @@ class ViewerWindow(QMainWindow):
         *,
         input_kind: NavigationInputKind,
         repeat_key: int | None,
+        publish_cached: bool = False,
     ) -> bool:
         self._zip_runtime_request_timer.stop()
         # Set ownership before Runtime.stage(): cancelling a not-yet-started
@@ -3303,7 +3309,12 @@ class ViewerWindow(QMainWindow):
         self._pending_zip_runtime_request = request
         self._pending_raster_input_kind = input_kind
         self._pending_raster_repeat_key = repeat_key
-        if not runtime.stage(request):
+        staged = (
+            runtime.stage(request, publish_cached=True)
+            if publish_cached
+            else runtime.stage(request)
+        )
+        if not staged:
             self._fail_raster_runtime_request(runtime)
             return False
         if input_kind is NavigationInputKind.WHEEL:
@@ -3341,7 +3352,7 @@ class ViewerWindow(QMainWindow):
             # ready hit or book transition.  Never cancel a newer Runtime
             # request merely because this pending serial is obsolete.
             return
-        if runtime.request(request):
+        if runtime.release_staged(request):
             self._paint_ready_transit_frame_after_cold_dispatch(request)
             return
         self._fail_raster_runtime_request(runtime)
@@ -3447,6 +3458,8 @@ class ViewerWindow(QMainWindow):
             or frame.source_identity != id(self.book_session.source)
             or frame.unit.identity != current_identity
         ):
+            return
+        if not self._validate_external_raster_source():
             return
         by_logical_page: dict[int, list[object]] = {}
         for page in frame.pages:
@@ -3741,11 +3754,14 @@ class ViewerWindow(QMainWindow):
         self._apply_presentation_commit(commit)
 
     def _project_presentation_surface(self) -> bool:
-        """Apply the single presentation-owned canvas state to the Widget."""
+        """Project canvas state and the separate page-only navigation feedback."""
 
-        return self.viewer.apply_presentation_surface(
+        applied = self.viewer.apply_presentation_surface(
             self.presentation_state.surface
         )
+        self._update_slider()
+        self._update_status()
+        return applied
 
     def _apply_presentation_commit(
         self,
@@ -3758,8 +3774,6 @@ class ViewerWindow(QMainWindow):
             self._commit_staged_page_list_runtime(
                 commit.frame.token.book.epoch
             )
-        self._update_slider()
-        self._update_status()
         if not self._zip_runtime_active:
             # Legacy/PDF callers keep their historical synchronous projection
             # contract. Raster runtimes defer these page-invariant widgets
@@ -3788,6 +3802,20 @@ class ViewerWindow(QMainWindow):
             self._pending_progress_seed = None
         self.presentationCommitted.emit(commit)
 
+    def _validate_external_raster_source(self) -> bool:
+        source = self.book_session.source
+        if isinstance(source, SevenZipImageSource):
+            try:
+                source.validate_archive()
+            except ImageSourceError as exc:
+                runtime = self.book_session.viewer_runtime
+                if runtime is not None:
+                    runtime.cancel(clear_artifacts=True)
+                self.presentation_state.fail_pending(str(exc))
+                self._set_status_override(str(exc))
+                return False
+        return True
+
     def _refresh_view(
         self,
         *,
@@ -3796,6 +3824,8 @@ class ViewerWindow(QMainWindow):
         repeat_key: int | None = None,
         input_timestamp_ns: int | None = None,
     ) -> None:
+        if not self._validate_external_raster_source():
+            return
         # A caller that cancelled the magnifier in order to navigate or change
         # layout owns this refresh.  Suppress the cancel signal's zero-timer
         # fallback so the same display unit is not requested twice.
@@ -3823,7 +3853,9 @@ class ViewerWindow(QMainWindow):
             slot.page_index for slot in spread.slots
         ) != self.viewer.displayed_page_indexes or (
             self.viewer.magnifier_source_page is not None
-            and self.viewer.magnifier_source_page != self.model.focused_index
+            and self.viewer.magnifier_source_page not in tuple(
+                slot.page_index for slot in spread.slots
+            )
         ):
             self.viewer.cancel_magnifier()
             self._raster_magnifier_cancel_timer.stop()
@@ -3863,9 +3895,22 @@ class ViewerWindow(QMainWindow):
                     return
                 self._fail_raster_runtime_request(runtime)
                 return
-            # Ready artifacts ignore a STAGE decision.  They never enter a
-            # timer/worker/upload path, but observing the input above lets a
-            # later cold page in the same wheel/repeat sequence coalesce.
+            # A ready transit frame may publish immediately, but a coalesced
+            # wheel/repeat sequence must keep background decode suspended.
+            # Otherwise its newly recentered warmup can start the next cold
+            # transit page before the final target has been admitted.
+            if (
+                input_kind is NavigationInputKind.WHEEL
+                or admission is NavigationAdmissionDecision.STAGE
+            ):
+                self._stage_raster_runtime_request(
+                    runtime,
+                    zip_request,
+                    input_kind=input_kind,
+                    repeat_key=repeat_key,
+                    publish_cached=True,
+                )
+                return
             self._clear_pending_raster_navigation(reset_policy=False)
             if runtime.request(zip_request):
                 return
@@ -3873,7 +3918,7 @@ class ViewerWindow(QMainWindow):
             return
         if isinstance(
             self.book_session.source,
-            (ZipImageSource, FolderImageSource),
+            (ZipImageSource, FolderImageSource, SevenZipImageSource),
         ):
             # Raster-runtime books never fall back per feature or decoder
             # failure. A missing runtime is a book-lifetime error, not an
@@ -5028,6 +5073,8 @@ class ViewerWindow(QMainWindow):
     ) -> None:
         if self._zip_runtime_active:
             return
+        if self.viewer.magnifier_active or self.viewer.magnifier_selecting:
+            self.viewer.resume_magnifier_after_source_render()
         # Native QMenu reconstruction is deferred until the user opens it;
         # this slot is delivered synchronously during ready-page navigation.
         self._arm_prepared_display_prefetch()
@@ -5322,11 +5369,12 @@ class ViewerWindow(QMainWindow):
         action = self.viewer_canvas_left_click_action
         if action == "none":
             return
-        next_side = (
-            "right"
-            if self.viewer_canvas_click_direction == "right_next"
-            else "left"
-        )
+        direction = self.viewer_canvas_click_direction
+        if direction == "auto":
+            # Resolve at the confirmed click, from the same effective Viewer
+            # direction used by the spread and slider; never from UI locale.
+            direction = "left_next" if self.reading_direction == "rtl" else "right_next"
+        next_side = "right" if direction == "right_next" else "left"
         forward = side == next_side
         if action == commands.NEXT_SINGLE_PAGE:
             if forward:
@@ -5720,10 +5768,10 @@ class ViewerWindow(QMainWindow):
             )
 
     def _update_slider(self) -> None:
-        values = self.presentation_state.status_values
+        feedback = self.presentation_state.navigation_feedback
         self.slider.set_page_state(
-            values.total_pages if values is not None else 0,
-            self.presentation_state.slider_page_index or 0,
+            feedback.total_pages if feedback is not None else 0,
+            feedback.page_index if feedback is not None else 0,
         )
 
     def _update_status(self) -> None:
@@ -5731,12 +5779,16 @@ class ViewerWindow(QMainWindow):
             self.status.showMessage(self._status_override_message)
             return
         values = self.presentation_state.status_values
-        if values is None:
+        feedback = self.presentation_state.navigation_feedback
+        if feedback is None:
             self.status.showMessage("画像が読み込まれていません")
             return
 
+        page_text = f"{feedback.page_index + 1} / {feedback.total_pages}"
+        if values is None:
+            self.status.showMessage(page_text)
+            return
         path = values.path
-        page_text = f"{values.page_index + 1} / {values.total_pages}"
         resolution = self.viewer.current_resolution_text()
         zoom = (
             f"{round(self.viewer.manual_zoom * 100)}%"
@@ -5808,8 +5860,8 @@ class ViewerWindow(QMainWindow):
             value,
             input_kind=input_kind,
         )
-        # A dragged QSlider moves before valueChanged. Restore the committed
-        # page until the requested frame reaches the atomic commit boundary.
+        # Reconcile clamping/no-op input through the same page-only authority;
+        # set_page_state blocks signals and keeps an accepted drag target.
         self._update_slider()
 
     def _on_zoom_changed(self, zoom: float) -> None:
@@ -6042,7 +6094,7 @@ class ViewerWindow(QMainWindow):
             and current.height() >= requested.height()
         ):
             return
-        self._pdf_magnifier_targets = {page_index: requested}
+        self._pdf_magnifier_targets[page_index] = requested
         self._rerender_pdf()
 
     def _request_raster_magnifier_resolution(
@@ -6122,6 +6174,7 @@ class ViewerWindow(QMainWindow):
         if direction != self.reading_direction:
             self.viewer.invalidate_prepared_displays()
         self.reading_direction = direction
+        self.slider.set_reading_direction(direction)
         self._update_shared_setting("reading_direction", direction)
         self.model.update_options(reading_direction=direction)
         self._sync_actions()
@@ -6398,15 +6451,21 @@ class ViewerWindow(QMainWindow):
         self.page_navigation.last_page(input_kind=input_kind)
 
     def toggle_fullscreen(self) -> None:
-        if self.isFullScreen():
-            self.showNormal()
+        if (
+            self.isFullScreen()
+            or self.fullscreen_chrome.owns_true_fullscreen_transition
+        ):
+            self.fullscreen_chrome.leave_true_fullscreen()
         else:
-            self.showFullScreen()
+            self.fullscreen_chrome.enter_true_fullscreen()
         self._apply_chrome_visibility()
 
     def exit_fullscreen(self) -> None:
-        if self.isFullScreen():
-            self.showNormal()
+        if (
+            self.isFullScreen()
+            or self.fullscreen_chrome.owns_true_fullscreen_transition
+        ):
+            self.fullscreen_chrome.leave_true_fullscreen()
         self._apply_chrome_visibility()
 
     def changeEvent(self, event) -> None:  # type: ignore[override]

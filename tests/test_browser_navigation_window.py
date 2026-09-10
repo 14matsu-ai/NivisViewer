@@ -13,6 +13,8 @@ from PySide6.QtWidgets import QApplication, QListView, QToolButton
 from app.browser_window import BrowserWindow
 from app.browser_filter import BrowserFilterState, RatingFilterMode
 from app.config_manager import ConfigManager
+from app.browser_location_bar import LocationPopupEntry
+from app.browser_navigation import BrowserLocation
 
 
 def write_image(path: Path) -> None:
@@ -363,7 +365,7 @@ def test_forward_never_paints_large_folder_before_saved_state_is_restored(
         qapp.processEvents()
 
 
-def test_back_reuses_existing_sort_and_filter_state_during_atomic_restore(
+def test_back_clears_search_but_preserves_sort_and_restores_saved_item(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
@@ -379,7 +381,7 @@ def test_back_reuses_existing_sort_and_filter_state_during_atomic_restore(
         BrowserFilterState.normalized(search_text="keep")
     )
     qapp.processEvents()
-    visible_before = tuple(item.path for item in window.items)
+    source_count = window.item_model.source_count
     selected = parent / "keep-010.jpg"
     index = window.item_model.index(window.item_model.row_for_path(selected), 0)
     window.list_view.setCurrentIndex(index)
@@ -390,11 +392,12 @@ def test_back_reuses_existing_sort_and_filter_state_during_atomic_restore(
     try:
         assert window.go_back()
         finish_scan(window, qapp)
-        assert tuple(item.path for item in window.items) == visible_before
+        assert window.item_model.rowCount() == source_count
         restored = window.item_model.item_at(window.list_view.currentIndex())
         assert restored is not None and restored.path == selected.absolute()
         assert window.browser_sort_order.value == "descending"
-        assert window.browser_filter_state.search_text == "keep"
+        assert window.browser_filter_state.search_text == ""
+        assert window.browser_search_edit.text() == ""
     finally:
         window.close()
         qapp.processEvents()
@@ -430,7 +433,13 @@ def test_breadcrumb_separator_text_mode_and_filtered_viewer_snapshot(
         window._navigate_from_breadcrumb(str(b))
         finish_scan(window, qapp)
         assert window.current_path == b.absolute()
-        assert window.browser_filter_state.search_text == "abc"
+        assert window.browser_filter_state.search_text == ""
+        assert window.browser_search_edit.text() == ""
+        assert (
+            window.browser_filter_state.rating_mode
+            is RatingFilterMode.AT_LEAST
+        )
+        assert window.browser_filter_state.rating_reference == 3
         assert window.browser_sort_order.value == "descending"
 
         current_index = len(window.location_breadcrumb.segments) - 1
@@ -473,11 +482,17 @@ def test_breadcrumb_separator_text_mode_and_filtered_viewer_snapshot(
         menu.list_widget.itemClicked.emit(child_item)
         finish_scan(window, qapp)
         assert window.current_path == c.absolute()
-        assert [item.display_name for item in window.items] == ["abc.jpg"]
+        assert [item.display_name for item in window.items] == [
+            "xyz.jpg",
+            "abc.jpg",
+        ]
 
         snapshot = window._folder_snapshot_for_path(c / "abc {zpi$r=3}.jpg")
         assert snapshot is not None
-        assert snapshot.image_ids == (str(c / "abc {zpi$r=3}.jpg"),)
+        assert snapshot.image_ids == (
+            str(c / "xyz {zpi$r=5}.jpg"),
+            str(c / "abc {zpi$r=3}.jpg"),
+        )
     finally:
         window.close()
         qapp.processEvents()
@@ -695,6 +710,106 @@ def test_up_gesture_selects_previous_child_and_can_go_back(
     assert window.current_path == child.absolute()
     window.close()
     qapp.processEvents()
+
+
+def test_all_directory_navigation_routes_clear_only_active_search(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    window = make_window(tmp_path, child, qapp)
+
+    def activate(query: str) -> None:
+        window.search_history.record(query)
+        window.browser_search_edit.setText(query)
+        window._browser_search_timer.stop()
+        window._apply_pending_browser_search()
+        assert window.browser_filter_state.search_text == query
+
+    try:
+        activate("up-query")
+        assert window.go_up()
+        finish_scan(window, qapp)
+        assert window.browser_search_edit.text() == ""
+
+        activate("child")
+        child_row = window.item_model.row_for_path(child)
+        window.open_item(window.item_model.index(child_row, 0))
+        finish_scan(window, qapp)
+        assert window.browser_filter_state.search_text == ""
+
+        activate("back-query")
+        assert window.go_back()
+        finish_scan(window, qapp)
+        assert window.browser_filter_state.search_text == ""
+
+        activate("forward-query")
+        assert window.go_forward()
+        finish_scan(window, qapp)
+        assert window.browser_filter_state.search_text == ""
+
+        activate("breadcrumb-query")
+        window._navigate_from_breadcrumb(str(parent))
+        finish_scan(window, qapp)
+        assert window.browser_filter_state.search_text == ""
+
+        activate("address-query")
+        window.address_bar.setText(str(child))
+        window._navigate_from_address_bar()
+        finish_scan(window, qapp)
+        assert window.browser_filter_state.search_text == ""
+
+        activate("mru-query")
+        location = BrowserLocation(str(parent))
+        window._activate_location_history_entry(
+            LocationPopupEntry("parent", location, str(parent))
+        )
+        finish_scan(window, qapp)
+        assert window.browser_filter_state.search_text == ""
+        assert window.search_history.entries == (
+            "mru-query",
+            "address-query",
+            "breadcrumb-query",
+            "forward-query",
+            "back-query",
+            "child",
+            "up-query",
+        )
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_same_location_sort_rating_and_thumbnail_changes_keep_search(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "folder"
+    write_image(folder / "keep {zpi$r=4}.jpg")
+    write_image(folder / "drop {zpi$r=2}.jpg")
+    window = make_window(tmp_path, folder, qapp)
+    window.browser_search_edit.setText("keep")
+    window._browser_search_timer.stop()
+    window._apply_pending_browser_search()
+
+    try:
+        window.config.apply({"browser_sort_order": "descending"})
+        window._on_rating_quick_filter_changed(
+            RatingFilterMode.AT_LEAST.value,
+            3,
+        )
+        window.config.apply({"thumbnail_size": 224})
+        qapp.processEvents()
+
+        assert window.browser_filter_state.search_text == "keep"
+        assert window.browser_search_edit.text() == "keep"
+        assert window.browser_filter_state.rating_reference == 3
+        assert window.thumbnail_size == 224
+    finally:
+        window.close()
+        qapp.processEvents()
 
 
 def test_refresh_preserves_history_selection_scroll_and_updates_items(

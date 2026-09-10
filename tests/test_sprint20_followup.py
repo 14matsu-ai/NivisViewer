@@ -554,9 +554,9 @@ def test_normal_and_favorite_large_folder_navigation_do_the_same_work(
                 metrics["remaining_append"] += 1
                 return original_append(items, generation=generation)
 
-            def counted_snapshot(item):
+            def counted_snapshot(item, **kwargs):
                 metrics["snapshot"] += 1
-                return original_snapshot(item)
+                return original_snapshot(item, **kwargs)
 
             def counted_history_visit(location):
                 metrics["history_visit"] += 1

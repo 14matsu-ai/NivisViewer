@@ -194,10 +194,10 @@ def test_publish_failure_keeps_source_and_cleans_staging(
     source = source_folder / "image.png"
     source.write_bytes(b"source")
 
-    def fail_replace(_old, _new):
+    def fail_publish(_old, _new):
         raise PermissionError("publish locked")
 
-    monkeypatch.setattr("app.file_operation_service.os.replace", fail_replace)
+    monkeypatch.setattr("app.file_operation_service.os.rename", fail_publish)
     result = FileOperationService().copy([source], destination_folder)
 
     assert not result.items[0].success
@@ -217,13 +217,13 @@ def test_cleanup_failure_is_structured_and_source_is_not_removed(
     source = source_folder / "image.png"
     source.write_bytes(b"source")
 
+    def fail_publish_after_cross_volume(old, _new):
+        if Path(old) == source:
+            raise OSError(errno.EXDEV, "cross volume")
+        raise PermissionError("publish locked")
+
     monkeypatch.setattr(
-        "app.file_operation_service.os.rename",
-        lambda *_args: (_ for _ in ()).throw(OSError(errno.EXDEV, "cross volume")),
-    )
-    monkeypatch.setattr(
-        "app.file_operation_service.os.replace",
-        lambda *_args: (_ for _ in ()).throw(PermissionError("publish locked")),
+        "app.file_operation_service.os.rename", fail_publish_after_cross_volume,
     )
 
     def cleanup_failed(path):
@@ -466,19 +466,16 @@ def test_cancel_after_publish_keeps_final_and_source_as_partial(
     source = source_folder / "image.png"
     source.write_bytes(b"source")
     cancelled = Event()
-    original_replace = os.replace
-
-    monkeypatch.setattr(
-        "app.file_operation_service.os.rename",
-        lambda *_args: (_ for _ in ()).throw(OSError(errno.EXDEV, "cross volume")),
-    )
+    original_rename = os.rename
 
     def publish_then_cancel(old, new):
-        result = original_replace(old, new)
+        if Path(old) == source:
+            raise OSError(errno.EXDEV, "cross volume")
+        result = original_rename(old, new)
         cancelled.set()
         return result
 
-    monkeypatch.setattr("app.file_operation_service.os.replace", publish_then_cancel)
+    monkeypatch.setattr("app.file_operation_service.os.rename", publish_then_cancel)
     result = FileOperationService().move(
         [source],
         destination_folder,

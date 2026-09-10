@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import threading
 import zipfile
+from collections import OrderedDict
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from math import ceil
@@ -1299,6 +1301,7 @@ class ZipImageSource(ImageSource):
 
 class SevenZipImageSource(ImageSource):
     load_sizes_lazily = True
+    compatible_jpeg_unknown_area_multiplier = 4
 
     def __init__(
         self,
@@ -1315,6 +1318,19 @@ class SevenZipImageSource(ImageSource):
         self._closed = threading.Event()
         self._active_lock = threading.RLock()
         self._active_requests: dict[str, set[threading.Event]] = {}
+        # No worker/process or disk store of its own. The book's existing
+        # runtime grants this completed-payload LRU a resident byte reserve.
+        self._payloads: OrderedDict[str, bytes] = OrderedDict()
+        self._payload_bytes = 0
+        self._payload_budget = 0
+        self._payload_hits = 0
+        self._archive_stamp = self._stat_archive()
+        # A first-volume stat cannot validate other volumes. Keep the existing
+        # backend behavior, without adding retained payloads for these books.
+        self._payload_retention_safe = not (
+            re.search(r"(?i)\.part\d+\.rar$", self.source_path.name)
+            or self.source_path.with_suffix(".r00").exists()
+        )
         try:
             if listing_snapshot is None:
                 listing = backend.list_entries(
@@ -1352,7 +1368,46 @@ class SevenZipImageSource(ImageSource):
     def list_images(self) -> list[str]:
         return [entry.path for entry in self._entries]
 
-    def open_image(self, image_id: str) -> Image.Image:
+    def _stat_archive(self) -> tuple[int, ...] | None:
+        try:
+            stat = self.source_path.stat()
+            return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        except OSError:
+            return None
+
+    def validate_archive(self) -> None:
+        if self._archive_stamp != self._stat_archive():
+            self.close()
+            raise ImageSourceError("書庫が変更されました。開き直してください。", code="source_changed")
+        if self._closed.is_set():
+            raise ImageSourceError("読み込みを中止しました。", code=ArchiveErrorCode.PROCESS_CANCELLED.value)
+
+    @property
+    def payload_cache_bytes(self) -> int:
+        with self._active_lock:
+            return self._payload_bytes
+
+    @property
+    def payload_cache_hits(self) -> int:
+        with self._active_lock:
+            return self._payload_hits
+
+    @property
+    def payload_cache_budget(self) -> int:
+        with self._active_lock:
+            return self._payload_budget
+
+    def set_payload_cache_budget(self, byte_budget: int) -> None:
+        with self._active_lock:
+            self._payload_budget = max(0, int(byte_budget)) if self._payload_retention_safe else 0
+            self._trim_payloads()
+
+    def _trim_payloads(self) -> None:
+        while self._payload_bytes > self._payload_budget and self._payloads:
+            _key, data = self._payloads.popitem(last=False)
+            self._payload_bytes -= len(data)
+
+    def _read_payload(self, image_id: str) -> bytes:
         entry = self._entry_by_id.get(image_id)
         if entry is None:
             raise ImageSourceError(
@@ -1365,9 +1420,15 @@ class SevenZipImageSource(ImageSource):
                 code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
             )
         cancelled = threading.Event()
+        self.validate_archive()
         with self._active_lock:
             if self._closed.is_set():
-                cancelled.set()
+                raise ImageSourceError("読み込みを中止しました。", code=ArchiveErrorCode.PROCESS_CANCELLED.value)
+            cached = self._payloads.get(image_id)
+            if cached is not None:
+                self._payloads.move_to_end(image_id)
+                self._payload_hits += 1
+                return cached
             self._active_requests.setdefault(image_id, set()).add(cancelled)
         try:
             data = self.backend.read_entry(
@@ -1380,9 +1441,22 @@ class SevenZipImageSource(ImageSource):
                     else MAX_IMAGE_ENTRY_BYTES
                 ),
             )
-            with Image.open(io.BytesIO(data)) as image:
-                image.seek(0)
-                return ImageOps.exif_transpose(image).copy()
+            self.validate_archive()
+            if not data or len(data) > MAX_IMAGE_ENTRY_BYTES or (
+                entry.size is not None and len(data) != entry.size
+            ):
+                raise ImageSourceError("書庫内の画像データが不完全です。", code="invalid_entry_size")
+            with self._active_lock:
+                if cancelled.is_set() or self._closed.is_set():
+                    raise ImageSourceError("読み込みを中止しました。", code=ArchiveErrorCode.PROCESS_CANCELLED.value)
+                if len(data) <= self._payload_budget and self._archive_stamp is not None:
+                    previous = self._payloads.pop(image_id, None)
+                    if previous is not None:
+                        self._payload_bytes -= len(previous)
+                    self._payloads[image_id] = data
+                    self._payload_bytes += len(data)
+                    self._trim_payloads()
+            return data
         except ArchiveBackendError as exc:
             raise ImageSourceError(
                 exc.user_message,
@@ -1402,6 +1476,57 @@ class SevenZipImageSource(ImageSource):
                     requests.discard(cancelled)
                     if not requests:
                         self._active_requests.pop(image_id, None)
+
+    def open_image(self, image_id: str) -> Image.Image:
+        data = self._read_payload(image_id)
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                image.seek(0)
+                return ImageOps.exif_transpose(image).copy()
+        except Exception as exc:
+            self._discard_payload(image_id)
+            raise ImageSourceError(f"書庫内の画像を読み込めません: {image_id}", code="decode_failed") from exc
+
+    def _discard_payload(self, image_id: str) -> None:
+        with self._active_lock:
+            data = self._payloads.pop(image_id, None)
+            if data is not None:
+                self._payload_bytes -= len(data)
+
+    def open_compatible_jpeg_at_most(
+        self, image_id: str, maximum_size: JpegMaximumSize,
+    ) -> StreamedJpegDecode | None:
+        if Path(image_id).suffix.casefold() not in {".jpg", ".jpeg", ".jpe"}:
+            return None
+        data = self._read_payload(image_id)
+        decoded = _read_folder_compatible_jpeg_at_most(data, maximum_size)
+        if decoded is None:
+            self._discard_payload(image_id)
+            raise ImageSourceError(f"JPEGを読み込めません: {image_id}", code="decode_failed")
+        image, original_size = decoded
+        return StreamedJpegDecode(image, original_size, len(data), 1,
+                                  "external-payload-pillow-draft", 1)
+
+    def open_qimage_at_most(
+        self, image_id: str, maximum_size: JpegMaximumSize,
+    ) -> tuple[QImage, tuple[int, int]] | None:
+        decoded = self.open_compatible_jpeg_at_most(image_id, maximum_size)
+        return (decoded.qimage, decoded.original_size) if decoded is not None else None
+
+    def estimate_compatible_jpeg_size(self, logical_size, maximum_size):
+        return jpeg_native_reduction_size(logical_size, maximum_size)
+
+    def probe_image_size(self, image_id: str) -> tuple[int, int] | None:
+        data = self._read_payload(image_id)
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                width, height = image.size
+                if image.getexif().get(274, 1) in {5, 6, 7, 8}:
+                    width, height = height, width
+                return width, height
+        except Exception as exc:
+            self._discard_payload(image_id)
+            raise ImageSourceError(f"画像ヘッダーを読み込めません: {image_id}", code="decode_failed") from exc
 
     def cancel_image_request(self, image_id: str) -> None:
         with self._active_lock:
@@ -1426,6 +1551,8 @@ class SevenZipImageSource(ImageSource):
     def close(self) -> None:
         self._closed.set()
         with self._active_lock:
+            self._payloads.clear()
+            self._payload_bytes = 0
             for requests in tuple(self._active_requests.values()):
                 for cancelled in tuple(requests):
                     cancelled.set()

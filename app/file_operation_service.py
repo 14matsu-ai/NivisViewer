@@ -232,6 +232,10 @@ class _SourceDeleteFailed(Exception):
     pass
 
 
+class _PublicationCollision(FileExistsError):
+    """Only a non-replacing final rename may re-enter collision policy."""
+
+
 class _ArtifactOperationError(OSError):
     def __init__(
         self,
@@ -697,6 +701,23 @@ class FileOperationService:
         source: str,
         cancelled: Event,
     ) -> FileOperationItemResult:
+        while True:
+            if cancelled.is_set():
+                raise _OperationCancelled
+            try:
+                return self._transfer_item_attempt(request, source, cancelled)
+            except _PublicationCollision:
+                # Atomic publication lost a race. Staging has been cleaned;
+                # re-enter the same collision policy, including generated names
+                # and per-destination resolutions. A move still owns its source.
+                continue
+
+    def _transfer_item_attempt(
+        self,
+        request: FileOperationRequest,
+        source: str,
+        cancelled: Event,
+    ) -> FileOperationItemResult:
         destination_root = (
             self._absolute(request.destination_directory)
             if request.destination_directory
@@ -789,6 +810,8 @@ class FileOperationService:
             else:
                 self._move_safe(source, destination, cancelled)
         except _OperationCancelled:
+            raise
+        except _PublicationCollision:
             raise
         except _SourceDeleteFailed as exc:
             return self._source_removal_failure(
@@ -995,7 +1018,10 @@ class FileOperationService:
             operation_id=request.operation_id,
         )
 
-    def _copy_atomic(self, source: str, destination: str, cancelled: Event) -> bool:
+    def _copy_atomic(
+        self, source: str, destination: str, cancelled: Event,
+        *, replace_existing: bool = False,
+    ) -> bool:
         temporary = FileOperationArtifactPolicy.create_staging_path(
             destination,
             uuid.uuid4().hex,
@@ -1016,7 +1042,15 @@ class FileOperationService:
                 raise _OperationCancelled
             if not os.path.lexists(temporary):
                 raise OSError("stagingの完成を確認できません")
-            os.replace(temporary, destination)
+            if replace_existing:
+                os.replace(temporary, destination)
+            else:
+                # Windows rename is atomically non-replacing, for files and
+                # directories alike (as in ChunkedFileCopier.copy).
+                try:
+                    os.rename(temporary, destination)
+                except FileExistsError as exc:
+                    raise _PublicationCollision(*exc.args) from exc
             published = True
             if (
                 not os.path.lexists(destination)
@@ -1062,7 +1096,7 @@ class FileOperationService:
         cancelled: Event,
     ) -> None:
         if not os.path.isdir(source):
-            self._copy_atomic(source, destination, cancelled)
+            self._copy_atomic(source, destination, cancelled, replace_existing=True)
             return
         temporary = FileOperationArtifactPolicy.create_staging_path(
             destination,
@@ -1245,6 +1279,27 @@ class FileOperationService:
         return tuple(results)
 
     def _merge_child(
+        self,
+        request: FileOperationRequest,
+        child_source: str,
+        child_destination: str,
+        is_directory: bool,
+        cancelled: Event,
+        *,
+        move: bool,
+    ) -> FileOperationItemResult:
+        while True:
+            if cancelled.is_set():
+                raise _OperationCancelled
+            try:
+                return self._merge_child_attempt(
+                    request, child_source, child_destination, is_directory,
+                    cancelled, move=move,
+                )
+            except _PublicationCollision:
+                continue
+
+    def _merge_child_attempt(
         self,
         request: FileOperationRequest,
         child_source: str,
@@ -1503,6 +1558,8 @@ class FileOperationService:
                     os.path.lexists(destination),
                 )
             return
+        except FileExistsError as exc:
+            raise _PublicationCollision(*exc.args) from exc
         except OSError as exc:
             if exc.errno != errno.EXDEV:
                 raise

@@ -34,6 +34,7 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
     assert manager.data["browser_location_history_limit"] == 50
     assert manager.data["browser_search_history_limit"] == 50
     assert manager.data["browser_search_history"] == []
+    assert manager.data["browser_preserve_search_for_viewer_roundtrip"] is True
     assert manager.data["join_spread_pages"] is False
     assert manager.data["thumbnail_disk_cache_enabled"] is True
     assert manager.data["thumbnail_cache_limit_mb"] == 512

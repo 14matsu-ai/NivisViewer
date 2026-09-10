@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import sys
+from dataclasses import dataclass
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QTimer, Qt
-from PySide6.QtGui import QCursor, QMouseEvent, QPalette, QWheelEvent, QWindow
+from PySide6.QtCore import QByteArray, QEvent, QObject, QPoint, QRect, QTimer, Qt
+from PySide6.QtGui import (
+    QCursor,
+    QGuiApplication,
+    QMouseEvent,
+    QPalette,
+    QScreen,
+    QWheelEvent,
+    QWindow,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -17,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.viewer_page_slider import ViewerPageSlider
+from app.windows_fullscreen import WindowsFullscreenAdapter
 
 
 CURSOR_IDLE_HIDE_MS = 800
@@ -27,8 +38,24 @@ _DWMWA_BORDER_COLOR = 34
 _DWM_COLOR_DEFAULT = 0xFFFFFFFF
 
 
+def _is_native_windows_platform() -> bool:
+    return bool(
+        sys.platform == "win32"
+        and QGuiApplication.platformName().lower() == "windows"
+    )
+
+
+@dataclass(frozen=True)
+class _FullscreenRestoreState:
+    window_flags: Qt.WindowType
+    normal_geometry: QRect
+    saved_geometry: QByteArray
+    screen: QScreen | None
+    was_maximized: bool
+
+
 class FullscreenChromeController(QObject):
-    """Single reconciler for fullscreen chrome and window-local cursor state."""
+    """Single reconciler for true-fullscreen state, chrome and cursor state."""
 
     def __init__(
         self,
@@ -77,6 +104,7 @@ class FullscreenChromeController(QObject):
         self._cursor_timer_generation = 0
         self._scheduled_cursor_generation = 0
         self._last_bottom_overlay_height = 1
+        self._fullscreen_restore_state: _FullscreenRestoreState | None = None
 
         parent = window.centralWidget()
         if parent is None:
@@ -154,6 +182,133 @@ class FullscreenChromeController(QObject):
         )
         self.hide_overlays()
         self.bottom_reveal_strip.hide()
+
+    def enter_true_fullscreen(self) -> None:
+        """Enter a full-monitor borderless state through a neutral state.
+
+        On Windows, changing a maximized decorated HWND directly to fullscreen
+        can leave the shell's working-area maximization/taskbar relationship
+        attached to the window.  Capture restoration state, hide that
+        intermediate transition, remove maximization, then create the
+        frameless fullscreen surface on the same monitor.
+        """
+
+        if (
+            self.window.isFullScreen()
+            or self._fullscreen_restore_state is not None
+        ):
+            return
+        screen = self.window.screen()
+        normal_geometry = QRect(self.window.normalGeometry())
+        if not normal_geometry.isValid() or normal_geometry.isEmpty():
+            normal_geometry = QRect(self.window.geometry())
+        self._fullscreen_restore_state = _FullscreenRestoreState(
+            window_flags=self.window.windowFlags(),
+            normal_geometry=normal_geometry,
+            saved_geometry=QByteArray(self.window.saveGeometry()),
+            screen=screen,
+            was_maximized=self.window.isMaximized(),
+        )
+        target_geometry = (
+            QRect(screen.geometry())
+            if screen is not None
+            else QRect(self.window.geometry())
+        )
+        native_monitor = self._capture_native_fullscreen_monitor()
+
+        # setWindowFlags recreates the native surface and hides it.  Hide an
+        # already visible maximized window first so neither the neutral state
+        # nor the working-area bounds are presented to the user.
+        if self.window.isVisible() and self.window.isMaximized():
+            self.window.hide()
+        self.window.setWindowState(Qt.WindowState.WindowNoState)
+        self.window.setWindowFlags(
+            self._fullscreen_restore_state.window_flags
+            | Qt.WindowType.FramelessWindowHint
+        )
+        self._set_target_screen(screen)
+        self.window.setGeometry(target_geometry)
+        self.window.showFullScreen()
+        # Qt owns the fullscreen state; the explicit full-monitor projection
+        # prevents a stale availableGeometry/working-area rectangle from
+        # surviving the native transition.
+        self.window.setGeometry(target_geometry)
+        self._apply_native_fullscreen_bounds(native_monitor)
+
+    @property
+    def owns_true_fullscreen_transition(self) -> bool:
+        return self._fullscreen_restore_state is not None
+
+    def leave_true_fullscreen(self) -> None:
+        """Restore the exact pre-fullscreen flags, monitor and normal state."""
+
+        restore = self._fullscreen_restore_state
+        if restore is None:
+            if self.window.isFullScreen():
+                self.window.showNormal()
+            return
+
+        self.window.hide()
+        self.window.setWindowState(Qt.WindowState.WindowNoState)
+        self.window.setWindowFlags(restore.window_flags)
+        self._set_target_screen(restore.screen)
+        self.window.setGeometry(restore.normal_geometry)
+        if restore.was_maximized:
+            self.window.showMaximized()
+        else:
+            self.window.showNormal()
+            self.window.setGeometry(restore.normal_geometry)
+        self._fullscreen_restore_state = None
+
+    def standard_window_geometry(self) -> QByteArray:
+        """Return geometry for persistence without saving fullscreen bounds."""
+
+        restore = self._fullscreen_restore_state
+        if restore is not None:
+            return QByteArray(restore.saved_geometry)
+        return QByteArray(self.window.saveGeometry())
+
+    def _set_target_screen(self, screen: QScreen | None) -> None:
+        if screen is None:
+            return
+        window_handle = self.window.windowHandle()
+        if window_handle is not None and window_handle.screen() is not screen:
+            window_handle.setScreen(screen)
+
+    def _capture_native_fullscreen_monitor(self) -> int | None:
+        if not _is_native_windows_platform():
+            return None
+        try:
+            return WindowsFullscreenAdapter().monitor_for_window(self._native_window_id())
+        except (AttributeError, OSError):
+            return None
+
+    def _apply_native_fullscreen_bounds(self, monitor: int | None) -> None:
+        """Project full-monitor bounds to the Windows HWND without topmost.
+
+        This does not modify taskbar settings or z-order the Viewer above
+        other applications.  It only closes Qt/native transition gaps by
+        applying the monitor rectangle to the already frameless fullscreen
+        HWND.
+        """
+
+        if not _is_native_windows_platform() or not self.window.isVisible():
+            return
+        if monitor is None:
+            return
+        try:
+            applied = WindowsFullscreenAdapter().apply(
+                self._native_window_id(), monitor,
+            )
+        except (AttributeError, OSError):
+            applied = False
+        if not applied:
+            logging.getLogger(__name__).warning(
+                "Native fullscreen monitor correction unavailable; retaining Qt bounds"
+            )
+
+    def _native_window_id(self) -> int:
+        return int(self.window.winId())
 
     def configure(
         self,

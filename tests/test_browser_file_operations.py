@@ -8,7 +8,7 @@ from threading import Event
 import pytest
 from PySide6.QtCore import QItemSelectionModel, QPoint, QTimer, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLineEdit, QMessageBox
+from PySide6.QtWidgets import QApplication, QLineEdit, QMenu, QMessageBox
 
 from app.browser_window import BrowserWindow
 from app.browser_navigation import BrowserLocation
@@ -448,8 +448,9 @@ def test_folder_context_menu_rating_action_is_enabled(
         def setEnabled(self, enabled: bool) -> None:
             self.enabled = enabled
 
-    class FakeMenu:
+    class FakeMenu(QMenu):
         def __init__(self, _parent=None, *, rating_menu: bool = False) -> None:
+            super().__init__(_parent)
             self.rating_menu = rating_menu
 
         def addAction(self, text: str):
@@ -1199,9 +1200,9 @@ def test_context_menu_has_exact_labels_and_separator_order(
         def setEnabled(self, enabled: bool) -> None:
             self.enabled = enabled
 
-    class FakeMenu:
+    class FakeMenu(QMenu):
         def __init__(self, _parent=None) -> None:
-            pass
+            super().__init__(_parent)
 
         def addAction(self, text: str):
             items.append(text)
@@ -1325,9 +1326,9 @@ def test_context_menu_copy_name_is_selected_only_and_dispatches_separately(
         def setEnabled(self, _enabled: bool) -> None:
             pass
 
-    class FakeMenu:
+    class FakeMenu(QMenu):
         def __init__(self, _parent=None) -> None:
-            pass
+            super().__init__(_parent)
 
         def addAction(self, text: str):
             menu_items.append(text)
@@ -1400,9 +1401,9 @@ def test_context_menu_open_calls_existing_open_item_not_system_opener(
         def setEnabled(self, _enabled: bool) -> None:
             pass
 
-    class FakeMenu:
+    class FakeMenu(QMenu):
         def __init__(self, _parent=None) -> None:
-            pass
+            super().__init__(_parent)
 
         def addAction(self, text: str):
             action = FakeAction(text)
@@ -1462,9 +1463,9 @@ def test_context_menu_open_with_picker_calls_explicit_picker_for_file(
         def setEnabled(self, enabled: bool) -> None:
             self.enabled = enabled
 
-    class FakeMenu:
+    class FakeMenu(QMenu):
         def __init__(self, _parent=None) -> None:
-            pass
+            super().__init__(_parent)
 
         def addAction(self, text: str):
             action = FakeAction(text)
@@ -1521,8 +1522,9 @@ def test_context_menu_open_with_picker_enablement(
         def setEnabled(self, enabled: bool) -> None:
             self.enabled = enabled
 
-    class FakeMenu:
+    class FakeMenu(QMenu):
         def __init__(self, _parent=None) -> None:
+            super().__init__(_parent)
             self.actions: dict[str, FakeAction] = {}
             menus.append(self.actions)
 
@@ -1584,9 +1586,9 @@ def test_context_menu_explorer_uses_clicked_item_with_multiple_selection(
         def setEnabled(self, enabled: bool) -> None:
             self.enabled = enabled
 
-    class FakeMenu:
+    class FakeMenu(QMenu):
         def __init__(self, _parent=None) -> None:
-            pass
+            super().__init__(_parent)
 
         def addAction(self, text: str):
             action = FakeAction(text)

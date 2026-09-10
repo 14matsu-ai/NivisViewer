@@ -23,10 +23,18 @@ class ViewerPageSlider(QSlider):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(Qt.Orientation.Horizontal, parent)
+        self.set_reading_direction("ltr")
         self._single_page_wheel_enabled = False
         self._angle_remainder = 0
         self._pixel_remainder = 0
         self.valueChanged.connect(self.focusedPageRequested)
+
+    def set_reading_direction(self, direction: str) -> None:
+        # Own direction here: inherited RTL layout must not invert it twice.
+        self.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        rtl = direction == "rtl"
+        self.setInvertedAppearance(rtl)
+        self.setInvertedControls(rtl)
 
     def set_single_page_wheel_enabled(self, enabled: bool) -> None:
         self._single_page_wheel_enabled = bool(enabled)

@@ -17,6 +17,7 @@ from .image_source import (
     FolderListingSnapshot,
     ImageSource,
     ImageSourceError,
+    SevenZipImageSource,
     ZipImageSource,
     create_image_source,
 )
@@ -688,18 +689,20 @@ class BookSession(QObject):
             runtime_type = ZipRasterBookRuntime
         elif isinstance(source, FolderImageSource):
             runtime_type = FolderRasterBookRuntime
+        elif isinstance(source, SevenZipImageSource):
+            # Share ZIP/folder admission, source tiers and atomic commits.
+            runtime_type = RasterBookRuntime
         else:
             runtime_type = None
+        hard, soft = self._source_runtime_limits(source)
         new_runtime = (
             runtime_type(
                 source,
                 self.generation,
                 self,
                 image_work_coordinator=self._image_work_coordinator,
-                cache_byte_budget=self._viewer_runtime_hard_limit_bytes,
-                cache_soft_target_bytes=(
-                    self._viewer_runtime_soft_target_bytes
-                ),
+                cache_byte_budget=hard,
+                cache_soft_target_bytes=soft,
             )
             if runtime_type is not None and source is not None
             else None
@@ -818,10 +821,24 @@ class BookSession(QObject):
         self._viewer_runtime_soft_target_bytes = soft
         runtime = self.viewer_runtime
         if runtime is not None:
+            hard, soft = self._source_runtime_limits(runtime.source)
             runtime.set_memory_limits(
                 hard_limit_bytes=hard,
                 soft_target_bytes=soft,
             )
+
+    def _source_runtime_limits(self, source: ImageSource | None) -> tuple[int, int]:
+        hard = self._viewer_runtime_hard_limit_bytes
+        soft = self._viewer_runtime_soft_target_bytes
+        if isinstance(source, SevenZipImageSource):
+            # Payload retention is reserved WITHIN the configured Viewer
+            # cache budget, not an independently growing extra allowance.
+            reserve = min(64 * 1024 * 1024, hard // 8)
+            source.set_payload_cache_budget(reserve)
+            reserve = source.payload_cache_budget
+            hard = max(1, hard - reserve)
+            soft = max(1, min(hard, soft - reserve))
+        return hard, soft
 
     def _retire_page_list_runtime(
         self,

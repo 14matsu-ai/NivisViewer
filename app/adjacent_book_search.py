@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from threading import Event, Lock
+from types import MappingProxyType
+from typing import Mapping
 
 from natsort import natsorted
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
@@ -20,8 +22,10 @@ from .browser_sort import (
     BrowserSortPolicy,
     normalize_browser_sort_key,
     normalize_browser_sort_order,
+    creation_time_ns,
 )
 from .image_source import BOOK_FILE_EXTENSIONS, SUPPORTED_EXTENSIONS
+from .zippla_filename_metadata import ZipPlaFilenameMetadata
 
 
 ADJACENT_BOOKS = "books"
@@ -45,6 +49,8 @@ class AdjacentBookSnapshotEntry:
     modified_time_ns: int | None = None
     file_size: int | None = None
     openable_by_nivisviewer: bool = True
+    created_time_ns: int | None = None
+    accessed_time_ns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -55,17 +61,60 @@ class AdjacentBookBrowserSnapshot:
     sort_identity: str = "name:ascending"
     filter_identity: str = "browser-visible-items"
 
+    # Derived once from captured order, never from the current filesystem.
+    # Excluded from the public dataclass constructor/value/repr contracts.
+    _viewer_paths: tuple[str, ...] = field(init=False, repr=False, compare=False, hash=False)
+    _viewer_indexes: Mapping[str, int] = field(init=False, repr=False, compare=False, hash=False)
+    _image_paths: tuple[str, ...] = field(init=False, repr=False, compare=False, hash=False)
+    _image_indexes: Mapping[str, int] = field(init=False, repr=False, compare=False, hash=False)
+    _image_fingerprints: tuple[tuple[str, int | None, int | None], ...] = field(
+        init=False, repr=False, compare=False, hash=False,
+    )
+
+    def __post_init__(self) -> None:
+        paths: list[str] = []
+        indexes: dict[str, int] = {}
+        image_paths: list[str] = []
+        image_indexes: dict[str, int] = {}
+        fingerprints: list[tuple[str, int | None, int | None]] = []
+        for entry in self.entries:
+            if not entry.openable_by_nivisviewer or entry.item_kind == BrowserItemKind.OTHER.value:
+                continue
+            path = lexical_absolute(entry.absolute_path)
+            key = path_key(path)
+            # tuple.index previously selected the FIRST normalized duplicate.
+            indexes.setdefault(key, len(paths))
+            paths.append(path)
+            if entry.item_kind == BrowserItemKind.IMAGE.value:
+                image_indexes.setdefault(key, len(image_paths))
+                image_paths.append(path)
+                fingerprints.append((path, entry.file_size, entry.modified_time_ns))
+        object.__setattr__(self, "_viewer_paths", tuple(paths))
+        object.__setattr__(self, "_viewer_indexes", MappingProxyType(indexes))
+        object.__setattr__(self, "_image_paths", tuple(image_paths))
+        object.__setattr__(self, "_image_indexes", MappingProxyType(image_indexes))
+        object.__setattr__(self, "_image_fingerprints", tuple(fingerprints))
+
     @property
     def viewer_paths(self) -> tuple[str, ...]:
-        """Return Viewer-openable files in the captured visible order."""
+        """Return Viewer-openable items in the captured visible order."""
 
-        return tuple(
-            lexical_absolute(entry.absolute_path)
-            for entry in self.entries
-            if entry.openable_by_nivisviewer
-            and entry.item_kind
-            not in {BrowserItemKind.FOLDER.value, BrowserItemKind.OTHER.value}
-        )
+        return self._viewer_paths
+
+    def contains_viewer_path(self, path: str | Path) -> bool:
+        return path_key(path) in self._viewer_indexes
+
+    @property
+    def image_paths(self) -> tuple[str, ...]:
+        return self._image_paths
+
+    @property
+    def image_fingerprints(self) -> tuple[tuple[str, int | None, int | None], ...]:
+        return self._image_fingerprints
+
+    def image_index_for_path(self, path: str | Path) -> int | None:
+        """Index in the image-only projection (not the mixed Viewer order)."""
+        return self._image_indexes.get(path_key(path))
 
     def adjacent_viewer_path(
         self,
@@ -77,10 +126,8 @@ class AdjacentBookBrowserSnapshot:
         """Select a neighbor without scanning or rebuilding Browser order."""
 
         paths = self.viewer_paths
-        keys = tuple(path_key(path) for path in paths)
-        try:
-            current_index = keys.index(path_key(current_path))
-        except ValueError:
+        current_index = self._viewer_indexes.get(path_key(current_path))
+        if current_index is None:
             return AdjacentBookSearchStatus.UNAVAILABLE, None
         next_index = current_index + (-1 if direction < 0 else 1)
         if not 0 <= next_index < len(paths):
@@ -103,6 +150,7 @@ class AdjacentBookSearchRequest:
     sort_key: str = BrowserSortKey.NAME.value
     sort_order: str = BrowserSortOrder.ASCENDING.value
     folders_first: bool = True
+    random_seed: int = 0
 
 
 @dataclass(frozen=True)
@@ -123,10 +171,16 @@ class _FileSystemEntry:
     extension: str
     modified_time_ns: int | None = None
     file_size: int | None = None
+    created_time_ns: int | None = None
+    accessed_time_ns: int | None = None
 
     @property
     def display_name(self) -> str:
-        return self.name
+        return ZipPlaFilenameMetadata.parse(self.path).display_name
+
+    @property
+    def rating(self) -> int | None:
+        return ZipPlaFilenameMetadata.parse(self.path).rating
 
     @property
     def kind(self) -> BrowserItemKind:
@@ -147,7 +201,7 @@ class _CacheEntry:
 class _WorkerOutcome:
     result: AdjacentBookSearchResult
     parent_key: str
-    cache_variant: tuple[str, str, str, bool]
+    cache_variant: tuple[str, str, str, bool, int]
     fingerprint: int | None
     candidates: tuple[str, ...] | None
 
@@ -192,6 +246,8 @@ class AdjacentBookFileSystem:
                             if stat is not None and is_file
                             else None
                         ),
+                        created_time_ns=creation_time_ns(stat),
+                        accessed_time_ns=getattr(stat, "st_atime_ns", None),
                     )
                 )
         return tuple(result)
@@ -330,7 +386,7 @@ class _SearchWorker(QRunnable):
         include_metadata = (
             self.request.candidate_mode == SIBLING_FOLDERS
             and normalize_browser_sort_key(self.request.sort_key)
-            is BrowserSortKey.MODIFIED_TIME
+            in {BrowserSortKey.MODIFIED_TIME, BrowserSortKey.CREATED_TIME, BrowserSortKey.ACCESSED_TIME}
         )
         return self._collect_candidates(
             self.filesystem.scandir(
@@ -354,6 +410,8 @@ class _SearchWorker(QRunnable):
                 extension=entry.extension.lower(),
                 modified_time_ns=entry.modified_time_ns,
                 file_size=entry.file_size,
+                created_time_ns=entry.created_time_ns,
+                accessed_time_ns=entry.accessed_time_ns,
             )
             for entry in snapshot.entries
         )
@@ -370,6 +428,7 @@ class _SearchWorker(QRunnable):
                     self.request.sort_order
                 ),
                 folders_first=bool(self.request.folders_first),
+                random_seed=self.request.random_seed,
             )
             return tuple(
                 entry.path
@@ -430,6 +489,7 @@ class _SearchWorker(QRunnable):
                     str(self.request.sort_key),
                     str(self.request.sort_order),
                     bool(self.request.folders_first),
+                    self.request.random_seed,
                 ),
                 fingerprint,
                 candidates,
@@ -454,7 +514,7 @@ class AdjacentBookSearchService(QObject):
         self._lock = Lock()
         self._cancel_events: dict[int, Event] = {}
         self._cache: dict[
-            tuple[str, str, str, str, bool],
+            tuple[str, str, str, str, bool, int],
             _CacheEntry,
         ] = {}
         self._closed = False
@@ -467,6 +527,7 @@ class AdjacentBookSearchService(QObject):
             str(request.sort_key),
             str(request.sort_order),
             bool(request.folders_first),
+            request.random_seed,
         )
         with self._lock:
             if self._closed:

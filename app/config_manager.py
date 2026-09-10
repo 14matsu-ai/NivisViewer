@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QObject, Signal
+from .browser_sort import normalize_browser_random_seed, normalize_browser_sort_key
+from .thumbnail_render import THUMBNAIL_ENCODER_QUALITY, normalize_thumbnail_webp_quality
 
 from .browser_wheel_scroll import (
     normalize_browser_wheel_custom_rows,
@@ -102,9 +104,12 @@ class ConfigManager(QObject):
         "thumbnail_crop_mode": "smart_crop",
         "browser_thumbnail_display_mode": "fit",
         "browser_folder_fallback_background": "auto",
+        "browser_file_fallback_background": "auto",
         "browser_wheel_scroll_mode": "system",
         "browser_wheel_scroll_custom_rows": 3,
         "thumbnail_quality_mode": "auto",
+        "thumbnail_webp_quality": THUMBNAIL_ENCODER_QUALITY,
+        "thumbnail_preserve_alpha": False,
         "thumbnail_cache_max_edge": 1024,
         "text_preview_enabled": True,
         "video_thumbnail_enabled": True,
@@ -118,10 +123,12 @@ class ConfigManager(QObject):
         "file_operation_delete_skip_confirmation": False,
         "browser_sort_key": "name",
         "browser_sort_order": "ascending",
+        "browser_random_seed": 0,
         "browser_folders_first": True,
         "browser_location_history_limit": 50,
         "browser_search_history_limit": 50,
         "browser_search_history": [],
+        "browser_preserve_search_for_viewer_roundtrip": True,
         "browser_display_density": "standard",
         "browser_item_spacing_mode": "preset",
         "browser_item_spacing": 2,
@@ -352,6 +359,7 @@ class ConfigManager(QObject):
             "folder_tree_collapse_unrelated",
             "folder_tree_focus_rebase",
             "clear_browser_filter_on_navigation",
+            "browser_preserve_search_for_viewer_roundtrip",
             "fullscreen_auto_reveal_ui",
             "hide_ui_in_fullscreen",
             "hide_cursor_in_fullscreen",
@@ -473,20 +481,18 @@ class ConfigManager(QObject):
             normalized["thumbnail_quality_mode"] = cls.DEFAULTS[
                 "thumbnail_quality_mode"
             ]
+        normalized["thumbnail_webp_quality"] = normalize_thumbnail_webp_quality(
+            normalized.get("thumbnail_webp_quality")
+        )
+        normalized["thumbnail_preserve_alpha"] = normalized.get("thumbnail_preserve_alpha") is True
         normalized["thumbnail_cache_max_edge"] = cls._clamped_int(
             normalized.get("thumbnail_cache_max_edge"),
             default=int(cls.DEFAULTS["thumbnail_cache_max_edge"]),
             minimum=256,
             maximum=2048,
         )
-        if normalized.get("browser_sort_key") not in {
-            "name",
-            "modified_time",
-            "item_type",
-            "file_size",
-            "rating",
-        }:
-            normalized["browser_sort_key"] = cls.DEFAULTS["browser_sort_key"]
+        normalized["browser_sort_key"] = normalize_browser_sort_key(normalized.get("browser_sort_key")).value
+        normalized["browser_random_seed"] = normalize_browser_random_seed(normalized.get("browser_random_seed"))
         if normalized.get("browser_sort_order") not in {"ascending", "descending"}:
             normalized["browser_sort_order"] = cls.DEFAULTS["browser_sort_order"]
         if not isinstance(normalized.get("browser_folders_first"), bool):
@@ -639,6 +645,7 @@ class ConfigManager(QObject):
         if normalized.get("viewer_canvas_click_direction") not in {
             "right_next",
             "left_next",
+            "auto",
         }:
             normalized["viewer_canvas_click_direction"] = cls.DEFAULTS[
                 "viewer_canvas_click_direction"
@@ -767,15 +774,14 @@ class ConfigManager(QObject):
             minimum=72,
             maximum=300,
         )
-        fallback_background = str(
-            normalized.get("browser_folder_fallback_background", "auto")
-        ).strip().casefold()
-        normalized["browser_folder_fallback_background"] = (
-            fallback_background
-            if fallback_background == "auto"
-            or re.fullmatch(r"#[0-9a-f]{6}", fallback_background)
-            else cls.DEFAULTS["browser_folder_fallback_background"]
-        )
+        for key in ("browser_folder_fallback_background", "browser_file_fallback_background"):
+            fallback_background = str(normalized.get(key, "auto")).strip().casefold()
+            normalized[key] = (
+                fallback_background
+                if fallback_background == "auto"
+                or re.fullmatch(r"#[0-9a-f]{6}", fallback_background)
+                else cls.DEFAULTS[key]
+            )
         return normalized
 
     @classmethod

@@ -71,7 +71,7 @@ class FakeBackend:
         return self.data
 
 
-def archive_entry(path: str, size: int = 100) -> ArchiveEntry:
+def archive_entry(path: str, size: int = len(image_bytes())) -> ArchiveEntry:
     return ArchiveEntry(path, size, 50, False, False, original_path=path)
 
 
@@ -94,7 +94,7 @@ def test_source_lists_once_naturally_and_reads_selected_page(tmp_path: Path) -> 
 
     assert backend.list_calls == 1
     assert backend.read_calls[0][1] == "page2.png"
-    assert backend.read_calls[0][2] == 100
+    assert backend.read_calls[0][2] == len(image_bytes())
     assert source.solid is True
     source.close()
 

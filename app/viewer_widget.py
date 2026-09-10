@@ -35,6 +35,7 @@ from PySide6.QtWidgets import QWidget
 
 from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
 from .mouse_gesture import MouseGestureRecognizer
+from .gesture_trail import draw_gesture_trail
 from .page_model import DisplaySpread
 from .viewer_canvas_pointer import (
     ViewerCanvasPointerController,
@@ -417,6 +418,11 @@ class ViewerWidget(QWidget):
         ] = OrderedDict()
         self._magnifier_waiting_for_pdf = False
         self._magnifier_pdf_source_key = 0
+        self._magnifier_spread_layout: tuple[tuple[QRectF, str], ...] = ()
+        self._magnifier_spread_keys: dict[str, ViewerRenderKey] = {}
+        self._magnifier_spread_pixmaps: dict[str, QPixmap] = {}
+        self._magnifier_spread_promotions: dict[str, QSize] = {}
+        self._magnifier_spread_zoom = 1.0
         self.mouse_gestures_enabled = True
         self.mouse_gesture_show_trail = True
         self.mouse_gesture_min_distance = 36
@@ -683,6 +689,17 @@ class ViewerWidget(QWidget):
         if size is not None:
             self.magnifier_size = min(600, max(80, int(size)))
         if rerender:
+            if self._magnifier_spread_layout:
+                dpr = max(1.0, self.devicePixelRatioF())
+                area = sum(r.width() * r.height() for r, _ in self._magnifier_spread_layout)
+                self._magnifier_spread_zoom = min(
+                    self.magnifier_zoom,
+                    (_MAX_MAGNIFIER_ARTIFACT_PIXELS / max(1.0, area * dpr * dpr)) ** 0.5,
+                )
+                self._magnifier_spread_keys.clear()
+                self._magnifier_spread_pixmaps.clear()
+                self.magnifier_selecting = True
+                self.magnifier_active = False
             position = self._mouse_pos
             if position is None and self._magnifier_selection_rect is not None:
                 position = self._magnifier_selection_rect.center()
@@ -692,6 +709,10 @@ class ViewerWidget(QWidget):
         self.update()
 
     def cancel_magnifier(self) -> bool:
+        self._magnifier_spread_layout = ()
+        self._magnifier_spread_keys.clear()
+        self._magnifier_spread_pixmaps.clear()
+        self._magnifier_spread_promotions.clear()
         was_active = (
             self.magnifier_selecting
             or self.magnifier_active
@@ -750,17 +771,17 @@ class ViewerWidget(QWidget):
         show_trail: bool | None = None,
         min_distance: int | None = None,
     ) -> None:
+        previous_policy = (self.mouse_gestures_enabled, self.mouse_gesture_min_distance)
         if enabled is not None:
             self.mouse_gestures_enabled = bool(enabled)
         if show_trail is not None:
             self.mouse_gesture_show_trail = bool(show_trail)
         if min_distance is not None:
             self.mouse_gesture_min_distance = max(12, min(200, int(min_distance)))
-        if self._gesture_recognizer.active:
-            self.cancel_mouse_gesture()
-        self._gesture_recognizer = MouseGestureRecognizer(
-            self.mouse_gesture_min_distance
-        )
+        if previous_policy != (self.mouse_gestures_enabled, self.mouse_gesture_min_distance):
+            if self._gesture_recognizer.active:
+                self.cancel_mouse_gesture()
+            self._gesture_recognizer = MouseGestureRecognizer(self.mouse_gesture_min_distance)
         if not self.mouse_gesture_show_trail:
             self._gesture_trail.clear()
             self.update()
@@ -2513,7 +2534,8 @@ class ViewerWidget(QWidget):
         if result.image is None or result.error is not None:
             if (
                 result.key.purpose == "magnifier"
-                and result.key == self._magnifier_key
+                and (result.key == self._magnifier_key
+                     or result.key in self._magnifier_spread_keys.values())
             ):
                 self.cancel_magnifier()
                 return
@@ -2529,22 +2551,29 @@ class ViewerWidget(QWidget):
                 self.renderWorkFinished.emit(result.key, False)
             return
         if result.key.purpose == "magnifier":
-            if result.key != self._magnifier_key:
+            spread_accepts = result.key in self._magnifier_spread_keys.values()
+            if result.key != self._magnifier_key and not spread_accepts:
                 return
             pixmap = QPixmap.fromImage(result.image)
             pixmap.setDevicePixelRatio(
                 max(1.0, result.key.device_pixel_ratio_milli / 1000.0)
             )
             self._magnifier_pixmap = pixmap
+            if spread_accepts:
+                self._magnifier_spread_pixmaps[result.key.image_id] = pixmap
             self._magnifier_artifact_cache[result.key] = pixmap
             self._magnifier_artifact_cache.move_to_end(result.key)
-            while len(self._magnifier_artifact_cache) > 2 or sum(
-                cached.width() * cached.height() * 4
-                for cached in self._magnifier_artifact_cache.values()
-            ) > _MAX_MAGNIFIER_CACHE_BYTES:
+            while self._magnifier_artifact_cache and (
+                len(self._magnifier_artifact_cache) > 2
+                or self._magnifier_retained_bytes() > _MAX_MAGNIFIER_CACHE_BYTES
+            ):
                 self._magnifier_artifact_cache.popitem(last=False)
-            self.magnifier_selecting = False
-            self.magnifier_active = True
+            ready = not self._magnifier_spread_layout or all(
+                image_id in self._magnifier_spread_pixmaps
+                for _rect, image_id in self._magnifier_spread_layout
+            )
+            self.magnifier_selecting = not ready
+            self.magnifier_active = ready
             if (
                 not self._magnifier_waiting_for_pdf
                 or result.key.source_cache_key
@@ -2824,15 +2853,9 @@ class ViewerWidget(QWidget):
         hit = next(
             (
                 (rect, image)
-                for rect, image, _pixmap in reversed(self._last_image_layout)
+                for rect, image, painted_pixmap in reversed(self._last_image_layout)
                 if rect.contains(position)
-                and (
-                    image.qimage is not None
-                    or (
-                        image.pixmap is not None
-                        and not image.pixmap.isNull()
-                    )
-                )
+                and not painted_pixmap.isNull()
             ),
             None,
         )
@@ -2852,6 +2875,19 @@ class ViewerWidget(QWidget):
         self._magnifier_pixmap = None
         self._magnifier_key = None
         self._magnifier_waiting_for_pdf = False
+        if len(self._last_image_layout) > 1:
+            # Snapshot actual painted placement, including unequal sizes,
+            # rotation, pan and the gutter. Never reconstruct a page order.
+            self._magnifier_spread_layout = tuple(
+                (QRectF(page_rect), page.image_id)
+                for page_rect, page, _pixmap in self._last_image_layout
+            )
+            dpr = max(1.0, self.devicePixelRatioF())
+            area = sum(r.width() * r.height() for r, _ in self._magnifier_spread_layout)
+            self._magnifier_spread_zoom = min(
+                self.magnifier_zoom,
+                (_MAX_MAGNIFIER_ARTIFACT_PIXELS / max(1.0, area * dpr * dpr)) ** 0.5,
+            )
         self._update_magnifier_selection(position, hit=(rect, image))
         return True
 
@@ -2862,6 +2898,26 @@ class ViewerWidget(QWidget):
         hit: tuple[QRect, ViewerImage] | None = None,
     ) -> None:
         if not (self.magnifier_selecting or self.magnifier_active):
+            return
+        if self._magnifier_spread_layout:
+            bounds = QRectF()
+            for rect, _image_id in self._magnifier_spread_layout:
+                bounds = bounds.united(rect)
+            zoom = self._magnifier_spread_zoom
+            width, height = self.width() / zoom, self.height() / zoom
+
+            def origin(center: float, start: float, extent: float, crop: float) -> float:
+                if crop >= extent:
+                    return start + (extent - crop) / 2
+                return max(start, min(center - crop / 2, start + extent - crop))
+
+            self.magnifier_source_rect = QRectF(
+                origin(position.x(), bounds.left(), bounds.width(), width),
+                origin(position.y(), bounds.top(), bounds.height(), height),
+                width, height,
+            )
+            self._magnifier_selection_rect = self.magnifier_source_rect.toAlignedRect()
+            self.update()
             return
         if hit is None:
             hit = next(
@@ -2967,6 +3023,9 @@ class ViewerWidget(QWidget):
         )
 
     def _request_magnifier_render(self, *, allow_pdf_request: bool = True) -> None:
+        if self._magnifier_spread_layout:
+            self._request_spread_magnifier_render(allow_promotion=allow_pdf_request)
+            return
         image = self._magnifier_image()
         source_rect = self.magnifier_source_rect
         if image is None or source_rect is None:
@@ -3111,10 +3170,106 @@ class ViewerWidget(QWidget):
             priority=int(ImageWorkPriority.VIEWER_INTERACTIVE_RERENDER),
         )
 
+    def _magnifier_retained_bytes(self) -> int:
+        retained = list(self._magnifier_artifact_cache.values())
+        retained.extend(self._magnifier_spread_pixmaps.values())
+        if self._magnifier_pixmap is not None:
+            retained.append(self._magnifier_pixmap)
+        unique = {pixmap.cacheKey(): pixmap for pixmap in retained}
+        return sum(pixmap.width() * pixmap.height() * 4 for pixmap in unique.values())
+
+    def _request_spread_magnifier_render(self, *, allow_promotion: bool) -> None:
+        """Prepare page artifacts in one displayed-spread coordinate space.
+
+        ZipPlaFork ViewerForm.bwMagnifierMaker_DoWork uses per-page canvases
+        and offsets too; see docs/ZIPPLAFORK_COMPARISON.md for provenance.
+        The retained painted tier is a coherent fallback while source
+        hydration runs through the existing book/cache authority.
+        """
+        images = {image.image_id: image for image in self._images}
+        if any(image_id not in images for _, image_id in self._magnifier_spread_layout):
+            self.cancel_magnifier()
+            return
+        painted = {image.image_id: pixmap for _, image, pixmap in self._last_image_layout}
+        dpr = max(1.0, self.devicePixelRatioF())
+        promotions = []
+        for rect, image_id in self._magnifier_spread_layout:
+            image = images[image_id]
+            source = image.qimage
+            fallback = source is None
+            if fallback:
+                pixmap = painted.get(image_id)
+                if pixmap is None:
+                    continue
+                # Identify the retained painted tier without transferring it.
+                # Reuse requires the full policy/size key, not just a page ID.
+                source_key = int(pixmap.cacheKey())
+            else:
+                source_key = int(source.cacheKey())
+            width = max(1, round(rect.width() * self._magnifier_spread_zoom * dpr))
+            height = max(1, round(rect.height() * self._magnifier_spread_zoom * dpr))
+            key = ViewerRenderKey(
+                image_id=image_id, source_cache_key=source_key,
+                target_width=width, target_height=height,
+                mode=self.magnifier_resampling_mode,
+                rotation=0 if fallback or image.pre_rotated else self.rotation_angle,
+                device_pixel_ratio_milli=round(dpr * 1000),
+                crop=None, purpose="magnifier", request_generation=0,
+                split_range=None if fallback else image.split_range,
+                downscale_algorithm=self.magnifier_downscale_algorithm if self._use_explicit_resampling_policy else None,
+                upscale_algorithm=self.magnifier_upscale_algorithm if self._use_explicit_resampling_policy else None,
+            )
+            self._magnifier_spread_keys[image_id] = key
+            cached = self._magnifier_artifact_cache.get(key)
+            if cached is not None:
+                self._magnifier_spread_pixmaps[image_id] = cached
+            elif key not in self._render_pending:
+                if fallback:
+                    # Transfer only on an actual artifact miss. This is not
+                    # file decoding; resampling stays on the existing worker.
+                    source = pixmap.toImage()
+                self._queue_render(source, key, priority=int(ImageWorkPriority.VIEWER_INTERACTIVE_RERENDER))
+            if allow_promotion:
+                if fallback or image.source_is_preview or image.rendered_size is not None:
+                    previous = self._magnifier_spread_promotions.get(image_id)
+                    pdf = image.rendered_size is not None
+                    # Raster hydration already requests the full source once.
+                    # PDF resolution is target-sized, so a larger zoom needs
+                    # an upgrade; policy-only changes/repeated targets do not.
+                    if previous is None or (pdf and (
+                        width > previous.width() or height > previous.height()
+                    )):
+                        target = QSize(
+                            max(width, previous.width() if previous else 0),
+                            max(height, previous.height() if previous else 0),
+                        )
+                        self._magnifier_spread_promotions[image_id] = target
+                        promotions.append((image.page_index, target, pdf))
+        ready = all(image_id in self._magnifier_spread_pixmaps for _, image_id in self._magnifier_spread_layout)
+        for task in tuple(self._render_tasks):
+            if task.key.purpose == "magnifier" and task.key not in self._magnifier_spread_keys.values():
+                if self._try_take_render_task(task):
+                    self._discard_render_task(task)
+        self.magnifier_active = ready
+        self.magnifier_selecting = not ready
+        self.update()
+        # Signals can synchronously refresh the displayed unit. Install all
+        # keys first; membership and normal render-generation gates fence it.
+        for page, size, pdf in promotions:
+            if not self._magnifier_spread_layout:
+                break
+            if pdf:
+                self.magnifierPdfResolutionRequested.emit(page, size)
+            else:
+                self.magnifierSourceResolutionRequested.emit(page, size)
+
     def resume_magnifier_after_source_render(self) -> None:
         self._resume_magnifier_after_pdf_render()
 
     def _resume_magnifier_after_pdf_render(self) -> None:
+        if self._magnifier_spread_layout:
+            self._request_spread_magnifier_render(allow_promotion=False)
+            return
         image = self._magnifier_image()
         normalized = self._magnifier_source_normalized
         if (
@@ -3135,6 +3290,22 @@ class ViewerWidget(QWidget):
         self._request_magnifier_render(allow_pdf_request=False)
 
     def _draw_magnifier(self, painter: QPainter) -> None:
+        if self.magnifier_active and self._magnifier_spread_layout:
+            crop = self.magnifier_source_rect
+            if crop is None:
+                return
+            painter.fillRect(self.rect(), self.background_color)
+            zoom = self._magnifier_spread_zoom
+            for rect, image_id in self._magnifier_spread_layout:
+                pixmap = self._magnifier_spread_pixmaps.get(image_id)
+                if pixmap is not None:
+                    # Artifacts are already enlarged by the worker. Pointer
+                    # movement only translates them; no decode/resize request.
+                    painter.drawPixmap(QPointF(
+                        (rect.x() - crop.x()) * zoom,
+                        (rect.y() - crop.y()) * zoom,
+                    ), pixmap)
+            return
         if self.magnifier_active and self._magnifier_pixmap is not None:
             normalized = self._magnifier_source_normalized
             if normalized is None:
@@ -3173,10 +3344,4 @@ class ViewerWidget(QWidget):
             or len(self._gesture_trail) < 2
         ):
             return
-        pen = QPen(QColor(120, 205, 255, 150))
-        pen.setWidthF(max(2.0, 3.0 * self.devicePixelRatioF()))
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(pen)
-        for start, end in zip(self._gesture_trail, self._gesture_trail[1:]):
-            painter.drawLine(start, end)
+        draw_gesture_trail(painter, self._gesture_trail)

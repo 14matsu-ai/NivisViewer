@@ -16,12 +16,15 @@ import hashlib
 import io
 import json
 import os
+import platform
 from pathlib import Path
+import random
 import statistics
 import sys
 from tempfile import TemporaryDirectory
 from threading import Lock
 import time
+import zlib
 from typing import Callable
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
 
@@ -31,7 +34,10 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPOSITORY_ROOT))
 
-from PIL import Image
+from PIL import Image, ImageDraw, features
+import PIL
+import PySide6
+from PySide6.QtCore import qVersion
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QApplication
 
@@ -45,7 +51,12 @@ from app.viewer_memory_policy import viewer_memory_mode_from_legacy_mib
 from app.viewer_window import ViewerWindow
 
 
-def _jpeg_payload(size: tuple[int, int], page: int) -> bytes:
+DETAIL_SEED = 20260905
+
+
+def _jpeg_payload(size: tuple[int, int], page: int, *, fixture_mode: str = "flat") -> bytes:
+    if fixture_mode not in {"flat", "high-detail"}:
+        raise ValueError(f"unknown fixture mode: {fixture_mode}")
     output = io.BytesIO()
     color = (
         32 + page * 17 % 190,
@@ -53,6 +64,26 @@ def _jpeg_payload(size: tuple[int, int], page: int) -> bytes:
         64 + page * 41 % 160,
     )
     with Image.new("RGB", size, color) as image:
+        if fixture_mode == "high-detail":
+            # One RGB page plus one 256-square tile at a time. Seeded luminance
+            # texture, ruled panels and font-independent pseudo-glyph edges;
+            # synthetic stress content, not a claim to reproduce a real scan.
+            rng = random.Random(DETAIL_SEED + page)
+            levels = bytes(168 + i % 64 for i in range(256))
+            for y in range(0, size[1], 256):
+                for x in range(0, size[0], 256):
+                    with Image.frombytes("L", (256, 256), rng.randbytes(256 * 256).translate(levels)) as tile:
+                        image.paste(tile, (x, y))
+            draw = ImageDraw.Draw(image)
+            for y in range(8, size[1], 24):
+                draw.line((0, y, size[0], y), fill=(130, 145, 155), width=1)
+                for x in range(8, size[0], 20):
+                    bits = rng.getrandbits(8)
+                    for bar in range(3):
+                        width = 3 + ((bits >> (bar * 2)) & 7)
+                        draw.rectangle((x, y + 4 + bar * 4, x + width, y + 5 + bar * 4), fill=(35, 40, 45))
+            for x in range(0, size[0], 256):
+                draw.line((x, 0, x, size[1]), fill=(80, 90, 100), width=2)
         image.save(output, "JPEG", quality=88, subsampling=2)
     return output.getvalue()
 
@@ -64,15 +95,18 @@ def _build_zip(
     image_size: tuple[int, int],
     compression: int = ZIP_DEFLATED,
     padding_bytes: int = 0,
+    fixture_mode: str = "flat",
 ) -> tuple[Path, str, int]:
     archive = root / "日本語-navigation-benchmark.zip"
     digest = hashlib.sha256()
     total_bytes = 0
     with ZipFile(archive, "w", compression=compression) as output:
         for page in range(pages):
-            payload = _jpeg_payload(image_size, page)
+            payload = _jpeg_payload(image_size, page, fixture_mode=fixture_mode)
             name = f"ページ {page:03d}.jpg"
-            output.writestr(name, payload)
+            info = ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
+            info.compress_type = compression
+            output.writestr(info, payload)
             digest.update(name.encode("utf-8"))
             digest.update(payload)
             total_bytes += len(payload)
@@ -206,8 +240,8 @@ def _pump_until(
     *,
     timeout: float,
 ) -> None:
-    deadline = time.monotonic() + max(0.1, float(timeout))
-    while time.monotonic() < deadline:
+    deadline = time.perf_counter() + max(0.1, float(timeout))
+    while time.perf_counter() < deadline:
         application.processEvents()
         if predicate():
             return
@@ -219,6 +253,57 @@ def _render_once(window: ViewerWindow) -> None:
     target = QPixmap(window.viewer.size())
     target.fill()
     window.viewer.render(target)
+
+
+def _paint_progress_summary(
+    *, started_at: float, observed_until: float,
+    initial_unit: tuple[int, ...], final_unit: tuple[int, ...],
+    paints: list[tuple[float, tuple[int, ...]]], timed_out: bool = False,
+) -> dict[str, object]:
+    """Measure page/unit residence, not repaint frequency or frame readiness.
+
+    Include the initial page from the first input and the trailing interval to
+    explicit observation end. Same-unit quality upgrades/repaints do not reset
+    residence. Inputs and paint timestamps use the same perf_counter clock.
+    """
+    if observed_until < started_at:
+        raise ValueError("observation ends before input starts")
+    unit = initial_unit
+    changed_at = started_at
+    intervals = []
+    first_final = started_at if initial_unit == final_unit else None
+    transitions = []
+    same_unit_paints = 0
+    for timestamp, painted_unit in paints:
+        if not started_at <= timestamp <= observed_until or not painted_unit:
+            continue
+        if painted_unit == final_unit and first_final is None:
+            first_final = timestamp
+        if painted_unit == unit:
+            same_unit_paints += 1
+            continue
+        intervals.append(timestamp - changed_at)
+        changed_at, unit = timestamp, painted_unit
+        transitions.append({"pages": list(unit), "after_first_input_ms": (timestamp - started_at) * 1000})
+    intervals.append(observed_until - changed_at)
+    return {
+        "status": "timeout" if timed_out else (
+            "already_at_target" if initial_unit == final_unit else
+            "completed" if first_final is not None else "incomplete"
+        ),
+        "observation_duration_ms": round((observed_until - started_at) * 1000, 3),
+        "maximum_unchanged_page_interval_ms": round(max(intervals) * 1000, 3),
+        "unchanged_intervals_ms": [round(value * 1000, 3) for value in intervals],
+        "first_final_paint_ms": None if first_final is None else round((first_final - started_at) * 1000, 3),
+        "initial_pages": list(initial_unit),
+        "final_requested_pages": list(final_unit),
+        "last_observed_pages": list(unit),
+        "distinct_painted_transitions": [
+            {**event, "after_first_input_ms": round(event["after_first_input_ms"], 3)}
+            for event in transitions
+        ],
+        "same_unit_paints": same_unit_paints,
+    }
 
 
 def _wait_for_page(
@@ -318,17 +403,44 @@ def run_benchmark(
     compression: int = ZIP_DEFLATED,
     padding_bytes: int = 0,
     immediate_target: int = 5,
+    fixture_mode: str = "flat",
 ) -> dict[str, object]:
     application = QApplication.instance() or QApplication([])
     with TemporaryDirectory(prefix="nivis-current-zip-benchmark-") as temporary:
         root = Path(temporary)
+        fixture_started = time.perf_counter()
         archive, fixture_sha256, payload_bytes = _build_zip(
             root,
             pages=pages,
             image_size=image_size,
             compression=compression,
             padding_bytes=padding_bytes,
+            fixture_mode=fixture_mode,
         )
+        generation_ms = (time.perf_counter() - fixture_started) * 1000
+        with archive.open("rb") as stream:
+            archive_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+        fixture_report = {
+            "mode": fixture_mode,
+            "seed": DETAIL_SEED if fixture_mode == "high-detail" else None,
+            "algorithm": "seeded-tile-texture-pseudo-glyphs-v1" if fixture_mode == "high-detail" else "flat-page-color-v1",
+            "parameters": {"texture_tile": 256, "luminance": [168, 231], "glyph_pitch": [20, 24], "bars_per_glyph": 3} if fixture_mode == "high-detail" else {},
+            "jpeg_quality": 88, "jpeg_subsampling": 2,
+            "pages": pages, "image_size": list(image_size),
+            "viewport_size": list(viewport_size),
+            "payload_bytes": payload_bytes, "archive_bytes": archive.stat().st_size,
+            "jpeg_payload_bytes": payload_bytes - int(padding_bytes),
+            "compression": "stored" if compression == ZIP_STORED else "deflated",
+            "padding_bytes": int(padding_bytes), "sha256": fixture_sha256,
+            "archive_sha256": archive_sha256,
+            "generation_ms": round(generation_ms, 3),
+        }
+        versions = {
+            "python": platform.python_version(), "pillow": PIL.__version__,
+            "jpeg": features.version("jpg"), "libjpeg_turbo": features.version("libjpeg_turbo"),
+            "pyside6": PySide6.__version__, "qt": qVersion(), "os": platform.platform(),
+            "zlib": zlib.ZLIB_RUNTIME_VERSION,
+        }
         config = ConfigManager(root / "config.json")
         config.load()
         config.apply(
@@ -460,6 +572,7 @@ def run_benchmark(
             metrics_before = asdict(runtime.metrics)
             commit_events: list[dict[str, float | int]] = []
             paint_events: list[dict[str, object]] = []
+            raw_paints: list[tuple[float, tuple[int, ...]]] = []
             input_events: list[dict[str, float | int | bool]] = []
 
             def record_commit(commit) -> None:
@@ -480,6 +593,9 @@ def run_benchmark(
 
             def record_paint(_serial: int, image_ids: object) -> None:
                 ids = image_ids if isinstance(image_ids, tuple) else ()
+                timestamp = time.perf_counter()
+                painted_unit = tuple(image_indexes[image_id] for image_id in ids if image_id in image_indexes)
+                raw_paints.append((timestamp, painted_unit))
                 paint_events.append(
                     {
                         "pages": [
@@ -487,8 +603,9 @@ def run_benchmark(
                             for image_id in ids
                             if image_id in image_indexes
                         ],
+                        "serial": _serial,
                         "after_first_visible_ms": round(
-                            (time.perf_counter() - first_visible_at) * 1000,
+                            (timestamp - first_visible_at) * 1000,
                             3,
                         ),
                     }
@@ -496,6 +613,7 @@ def run_benchmark(
 
             window.presentationCommitted.connect(record_commit)
             window.viewer.framePainted.connect(record_paint)
+            initial_unit = tuple(window.viewer.displayed_page_indexes)
             request_started = time.perf_counter()
             for step in range(1, target + 1):
                 input_events.append(
@@ -513,10 +631,28 @@ def run_benchmark(
                 window.next_page(input_kind=NavigationInputKind.WHEEL)
             window._finish_wheel_navigation()
             request_finished = time.perf_counter()
-            _wait_for_page(application, window, target, timeout=timeout)
-            target_painted_at = time.perf_counter()
+            accepted_target = window.presentation_state.requested_page
+            timed_out = False
+
+            def observe_final_paint() -> bool:
+                # No pumping between burst inputs. Afterwards each existing
+                # event-pump iteration explicitly renders the current surface,
+                # so ready intermediates are observable even for a hidden window.
+                _render_once(window)
+                return any(unit == (target,) for _at, unit in raw_paints)
+
+            try:
+                _pump_until(application, observe_final_paint, timeout=timeout)
+            except TimeoutError:
+                timed_out = True
+            observed_until = time.perf_counter()
+            progress = _paint_progress_summary(
+                started_at=request_started, observed_until=observed_until,
+                initial_unit=initial_unit, final_unit=(target,),
+                paints=raw_paints, timed_out=timed_out,
+            )
             target_neighborhood = neighborhood_snapshot(
-                "immediate_target_painted",
+                "immediate_observation_timeout" if timed_out else "immediate_target_painted",
                 target,
             )
             committed_pages = list(commit_events)
@@ -534,10 +670,11 @@ def run_benchmark(
                     (request_finished - request_started) * 1000,
                     3,
                 ),
-                "request_to_paint_ms": round(
-                    (target_painted_at - request_started) * 1000,
-                    3,
-                ),
+                "request_to_paint_ms": progress["first_final_paint_ms"],
+                "paint_progress": progress,
+                "input_count": len(input_events),
+                "final_accepted_target": accepted_target,
+                "observation_policy": "Synchronous next_page(WHEEL) burst, no inter-input pumping; finish_wheel_navigation then processEvents + forced render each poll, existing 1 ms idle sleep. framePainted is offscreen rendering, not Windows compositor presentation.",
                 "target_cache_hit_before_request": cached_before,
                 "active_job_at_input": active_at_input,
                 "navigation_inputs": input_events,
@@ -547,12 +684,22 @@ def run_benchmark(
                     key: metrics_after[key] - metrics_before[key]
                     for key in metrics_after
                 },
-                "work_before_target_commit": source.interval_work(
+                "work_through_final_observation": source.interval_work(
                     first_visible_at,
-                    target_painted_at,
+                    observed_until,
                     target_image_id=target_image_id,
                 ),
             }
+
+            if timed_out:
+                runtime.artifactReady.disconnect(record_artifact)
+                return {
+                    "schema_version": 5, "status": "timeout", "qt_platform": "offscreen",
+                    "fixture": fixture_report, "versions": versions,
+                    "initial_open_to_paint_ms": initial_paint_ms,
+                    "immediate_after_first_visible": immediate,
+                    "remaining_scenarios": "not run: immediate target was not painted before timeout",
+                }
 
             _wait_for_runtime_quiet(
                 application,
@@ -658,7 +805,9 @@ def run_benchmark(
             )
             metrics = asdict(runtime.metrics)
             return {
-                "schema_version": 4,
+                "schema_version": 5,
+                "status": "completed",
+                "versions": versions,
                 "benchmark": "current RasterBookRuntime ZIP navigation",
                 "qt_platform": "offscreen",
                 "production_authority": {
@@ -666,18 +815,7 @@ def run_benchmark(
                     "viewer_active": bool(window._zip_runtime_active),
                     "legacy_paths": "retired; no benchmark-only Viewer path override",
                 },
-                "fixture": {
-                    "pages": pages,
-                    "image_size": list(image_size),
-                    "viewport_size": list(viewport_size),
-                    "payload_bytes": payload_bytes,
-                    "archive_bytes": archive.stat().st_size,
-                    "compression": (
-                        "stored" if compression == ZIP_STORED else "deflated"
-                    ),
-                    "padding_bytes": int(padding_bytes),
-                    "sha256": fixture_sha256,
-                },
+                "fixture": fixture_report,
                 "initial_open_to_paint_ms": initial_paint_ms,
                 "immediate_after_first_visible": immediate,
                 "warm_idle_control": warm_idle_control,
@@ -711,6 +849,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--viewport-width", type=int, default=3840)
     parser.add_argument("--viewport-height", type=int, default=2106)
     parser.add_argument("--cache-mib", type=int, default=512)
+    parser.add_argument("--fixture-mode", choices=("flat", "high-detail"), default="flat")
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument(
         "--zip-compression",
@@ -775,12 +914,13 @@ def main() -> int:
         ),
         padding_bytes=int(args.archive_padding_mib) * 1024 * 1024,
         immediate_target=int(args.immediate_target),
+        fixture_mode=args.fixture_mode,
     )
     encoded = json.dumps(report, ensure_ascii=False, indent=2)
     print(encoded)
     if args.output is not None:
         args.output.write_text(encoded + "\n", encoding="utf-8")
-    return 0
+    return 0 if report["status"] == "completed" else 1
 
 
 if __name__ == "__main__":
