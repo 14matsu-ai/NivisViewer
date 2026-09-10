@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import initialize_ui_language, tr
+
+
 import inspect
 import os
 import weakref
@@ -100,6 +103,7 @@ class ApplicationController(QObject):
         self.application = application
         self.config = config_manager or ConfigManager()
         self.settings = self.config.load()
+        initialize_ui_language(self.settings.get("ui_language", "ja"))
         self.metadata_store = metadata_store or MetadataStore(
             self.config.metadata_database_path,
             self,
@@ -956,11 +960,8 @@ class ApplicationController(QObject):
             return True
         answer = QMessageBox.question(
             window,
-            "ファイル操作を実行中",
-            "ファイル操作を実行中です。\n"
-            "［はい］: 操作を続けてウィンドウを閉じる\n"
-            "［いいえ］: 操作をキャンセルして閉じる\n"
-            "［キャンセル］: ウィンドウを閉じない",
+            tr('ファイル操作を実行中'),
+            tr('ファイル操作を実行中です。\n［はい］: 操作を続けてウィンドウを閉じる\n［いいえ］: 操作をキャンセルして閉じる\n［キャンセル］: ウィンドウを閉じない'),
             QMessageBox.StandardButton.Yes
             | QMessageBox.StandardButton.No
             | QMessageBox.StandardButton.Cancel,
@@ -974,7 +975,7 @@ class ApplicationController(QObject):
             window.setEnabled(False)
             status_bar = getattr(window, "statusBar", None)
             if callable(status_bar):
-                status_bar().showMessage("ファイル操作をキャンセルして終了しています…")
+                status_bar().showMessage(tr('ファイル操作をキャンセルして終了しています…'))
             self.file_operation_queue.begin_shutdown(cancel_active=True)
             return False
         self._continue_operations_without_main_window = True
@@ -1020,11 +1021,11 @@ class ApplicationController(QObject):
         if choice is FileOperationCloseChoice.CLOSE_AFTER_OPERATION:
             window._close_after_operation = True
             window.statusBar().showMessage(
-                "ファイル操作の完了後にウィンドウを閉じます…"
+                tr('ファイル操作の完了後にウィンドウを閉じます…')
             )
         else:
             window._close_after_cancel = True
-            window.statusBar().showMessage("ファイル操作を中止しています…")
+            window.statusBar().showMessage(tr('ファイル操作を中止しています…'))
             window.cancel_operation_button.setEnabled(False)
             if (
                 not window._cancel_requested
@@ -1045,19 +1046,19 @@ class ApplicationController(QObject):
     ]:
         dialog = QMessageBox(window)
         dialog.setIcon(QMessageBox.Icon.Question)
-        dialog.setWindowTitle("ファイル操作を実行中")
-        dialog.setText("ファイル操作が完了していません。どうしますか？")
+        dialog.setWindowTitle(tr('ファイル操作を実行中'))
+        dialog.setText(tr('ファイル操作が完了していません。どうしますか？'))
         buttons = {
             FileOperationCloseChoice.CLOSE_AFTER_OPERATION: dialog.addButton(
-                "完了後に閉じる",
+                tr('完了後に閉じる'),
                 QMessageBox.ButtonRole.AcceptRole,
             ),
             FileOperationCloseChoice.CANCEL_AND_CLOSE: dialog.addButton(
-                "操作を中止して閉じる",
+                tr('操作を中止して閉じる'),
                 QMessageBox.ButtonRole.DestructiveRole,
             ),
             FileOperationCloseChoice.KEEP_OPEN: dialog.addButton(
-                "閉じない",
+                tr('閉じない'),
                 QMessageBox.ButtonRole.RejectRole,
             ),
         }
@@ -1113,7 +1114,7 @@ class ApplicationController(QObject):
     def _show_operation_fallback(self) -> None:
         if self._operation_fallback_panel is None:
             panel = FileOperationPanel()
-            panel.setWindowTitle("NivisViewer - ファイル操作")
+            panel.setWindowTitle(tr('NivisViewer - ファイル操作'))
             panel.bind(self.file_operation_queue)
             panel_id = id(panel)
             panel.destroyed.connect(

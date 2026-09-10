@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import logging
 import os
 import re
@@ -110,7 +113,7 @@ class FileOperationArtifactPolicy:
             return ArtifactCleanupResult(
                 target,
                 False,
-                "内部一時ファイルではないため削除しません",
+                tr('内部一時ファイルではないため削除しません'),
             )
         try:
             if os.path.isdir(target) and not os.path.islink(target):
@@ -156,9 +159,7 @@ class FileOperationArtifactPolicy:
         if description is None or not _LOG.isEnabledFor(logging.DEBUG):
             return
         _LOG.debug(
-            "未完了のファイル操作一時データを検出しました "
-            "artifact=%s final=%s nested=%s size=%s mtime_ns=%s "
-            "final_exists=%s source_known=%s",
+            tr('未完了のファイル操作一時データを検出しました artifact=%s final=%s nested=%s size=%s mtime_ns=%s final_exists=%s source_known=%s'),
             description.path,
             description.final_destination,
             description.nested,

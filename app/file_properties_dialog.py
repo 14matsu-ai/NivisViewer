@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from datetime import datetime
 from pathlib import Path
 
@@ -22,7 +25,7 @@ class FilePropertiesDialog(QDialog):
     def __init__(self, path: str | Path, parent=None) -> None:
         super().__init__(parent)
         self._path = Path(path)
-        self.setWindowTitle("プロパティ")
+        self.setWindowTitle(tr('プロパティ'))
         install_window_icon(self)
         self.setModal(True)
         self.resize(520, 240)
@@ -50,11 +53,11 @@ class FilePropertiesDialog(QDialog):
         self.error_label.hide()
 
         form = QFormLayout()
-        form.addRow("名前:", self.name_edit)
-        form.addRow("種類:", self.type_label)
-        form.addRow("場所:", self.location_label)
-        form.addRow("サイズ:", self.size_label)
-        form.addRow("更新日時:", self.modified_label)
+        form.addRow(tr('名前:'), self.name_edit)
+        form.addRow(tr('種類:'), self.type_label)
+        form.addRow(tr('場所:'), self.location_label)
+        form.addRow(tr('サイズ:'), self.size_label)
+        form.addRow(tr('更新日時:'), self.modified_label)
 
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -104,7 +107,7 @@ class FilePropertiesDialog(QDialog):
         self.cancel_button.setEnabled(enabled)
 
     def show_error(self, message: str) -> None:
-        self.error_label.setText(message or "名前を変更できませんでした")
+        self.error_label.setText(message or tr('名前を変更できませんでした'))
         self.error_label.show()
         self.name_edit.setFocus()
         self.name_edit.selectAll()
@@ -121,7 +124,7 @@ class FilePropertiesDialog(QDialog):
 
     def _refresh_information(self) -> None:
         path = self._path
-        self.type_label.setText("フォルダー" if path.is_dir() else "ファイル")
+        self.type_label.setText(tr('フォルダー') if path.is_dir() else tr('ファイル'))
         self.location_label.setText(str(path.parent))
         try:
             stat_result = path.stat()
@@ -130,7 +133,7 @@ class FilePropertiesDialog(QDialog):
             self.modified_label.setText("-")
             return
         self.size_label.setText(
-            "-" if path.is_dir() else f"{stat_result.st_size:,} バイト"
+            "-" if path.is_dir() else tr('{p0:,} バイト', p0=stat_result.st_size)
         )
         self.modified_label.setText(
             datetime.fromtimestamp(stat_result.st_mtime).strftime(

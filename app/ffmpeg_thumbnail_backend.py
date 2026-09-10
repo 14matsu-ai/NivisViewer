@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from io import BytesIO
 import json
 import os
@@ -142,9 +145,9 @@ class FFmpegThumbnailBackend:
         try:
             rendered = self.policy.render(selected.image, spec, metadata)
         except Exception as exc:
-            return PreviewResult.failed(f"動画フレームを読み込めません: {exc}")
+            return PreviewResult.failed(tr('動画フレームを読み込めません: {p0}', p0=exc))
         if rendered is None or rendered.isNull():
-            return PreviewResult.failed("動画フレームを描画できません")
+            return PreviewResult.failed(tr('動画フレームを描画できません'))
         return PreviewResult.ready_image(
             rendered,
             source=PreviewSource.FFMPEG,
@@ -230,7 +233,7 @@ class FFmpegThumbnailBackend:
                 self._terminate_process(process)
 
         if len(output) > 32 * 1024 * 1024:
-            return PreviewResult.failed("動画サムネイルの出力が大きすぎます")
+            return PreviewResult.failed(tr('動画サムネイルの出力が大きすぎます'))
         error_output = error_output[: 1024 * 1024]
         if process.returncode != 0 or not output:
             return PreviewResult(PreviewResultKind.UNAVAILABLE)
@@ -238,7 +241,7 @@ class FFmpegThumbnailBackend:
             with Image.open(BytesIO(output)) as image:
                 return image.convert("RGBA")
         except Exception as exc:
-            return PreviewResult.failed(f"動画フレームを読み込めません: {exc}")
+            return PreviewResult.failed(tr('動画フレームを読み込めません: {p0}', p0=exc))
 
     def _probe_metadata(
         self,

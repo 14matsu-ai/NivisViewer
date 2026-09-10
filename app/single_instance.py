@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import getpass
 import hashlib
 import json
@@ -155,7 +158,7 @@ class SingleInstanceBroker(QObject):
         if self._forward(message):
             return False
         raise RuntimeError(
-            f"単一インスタンス用サーバーを開始できません: {self.server.errorString()}"
+            tr('単一インスタンス用サーバーを開始できません: {p0}', p0=self.server.errorString())
         )
 
     def close(self) -> None:

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from enum import StrEnum
 from pathlib import Path
 from typing import Callable
@@ -108,10 +111,10 @@ class StartupRestoreCoordinator(QObject):
             self._set_state(StartupRestoreState.FAILED)
             self.notification_requested.emit(
                 {
-                    PathAvailability.MISSING: "前回開いていた項目が見つかりません",
-                    PathAvailability.UNAVAILABLE: "前回開いていた項目へ現在アクセスできません",
-                    PathAvailability.ERROR: "前回開いていた項目を確認できません",
-                }.get(result.state, "前回開いていた項目を復元できません")
+                    PathAvailability.MISSING: tr('前回開いていた項目が見つかりません'),
+                    PathAvailability.UNAVAILABLE: tr('前回開いていた項目へ現在アクセスできません'),
+                    PathAvailability.ERROR: tr('前回開いていた項目を確認できません'),
+                }.get(result.state, tr('前回開いていた項目を復元できません'))
             )
         self.finished.emit(self._state.value)
 

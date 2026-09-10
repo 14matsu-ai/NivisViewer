@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -68,7 +71,7 @@ class SevenZipLocator:
             seen.add(key)
             try:
                 if not absolute.is_file():
-                    last_error = f"実行ファイルではありません: {absolute}"
+                    last_error = tr('実行ファイルではありません: {p0}', p0=absolute)
                     continue
             except OSError as exc:
                 last_error = str(exc)
@@ -90,7 +93,7 @@ class SevenZipLocator:
                 ),
                 available=False,
                 version_text=None,
-                error_message=last_error or "7-Zipが見つかりません",
+                error_message=last_error or tr('7-Zipが見つかりません'),
             ),
         )
 
@@ -112,7 +115,7 @@ class SevenZipLocator:
                 absolute,
                 False,
                 None,
-                "7-Zipの情報取得コマンドを確認できませんでした",
+                tr('7-Zipの情報取得コマンドを確認できませんでした'),
             )
         version_line = next(
             (line.strip() for line in text.splitlines() if "7-Zip" in line),

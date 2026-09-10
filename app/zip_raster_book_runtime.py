@@ -16,6 +16,9 @@ complete source/method/license map is in docs/ZIPPLAFORK_COMPARISON.md.
 
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from heapq import heapify, heappop, heappush
@@ -1786,7 +1789,7 @@ class _ZipRasterUnitJob(QRunnable):
                         original_size,
                         None,
                         page.qimage,
-                        page.error or "画像を表示できません。",
+                        page.error or tr('画像を表示できません。'),
                         split_range,
                         page.source_is_preview,
                         page.source_key,
@@ -1825,7 +1828,7 @@ class _ZipRasterUnitJob(QRunnable):
             )
             try:
                 display_qimage, _resized = render_qimage(page.qimage, render_key)
-                error = None if not display_qimage.isNull() else "画像を表示できません。"
+                error = None if not display_qimage.isNull() else tr('画像を表示できません。')
                 if error is not None:
                     display_qimage = None
             except Exception as exc:
@@ -1948,7 +1951,7 @@ class _ZipRasterUnitJob(QRunnable):
                     False,
                 )
             if qimage is None or qimage.isNull():
-                raise ImageSourceError("画像decoderが結果を返しませんでした。")
+                raise ImageSourceError(tr('画像decoderが結果を返しませんでした。'))
             logical = original_size or (qimage.width(), qimage.height())
             logical = (max(1, int(logical[0])), max(1, int(logical[1])))
             source_is_preview = (qimage.width(), qimage.height()) != logical
@@ -3591,7 +3594,7 @@ class RasterBookRuntime(QObject):
                 request,
                 key,
                 unit,
-                f"{self._runtime_display_name} Viewer workerを開始できませんでした。",
+                tr('{p0} Viewer workerを開始できませんでした。', p0=self._runtime_display_name),
             )
         else:
             self._failed_prefetch.add(key)
@@ -3824,7 +3827,7 @@ class RasterBookRuntime(QObject):
                 pixmap = QPixmap.fromImage(rendered.display_qimage)
                 if pixmap.isNull():
                     pixmap = None
-                    error = "QPixmapを作成できませんでした。"
+                    error = tr('QPixmapを作成できませんでした。')
                 else:
                     pixmap.setDevicePixelRatio(
                         result.key.render_spec.device_pixel_ratio

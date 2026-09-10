@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import os
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -93,7 +96,7 @@ class BrowserItemDiscovery:
             return BrowserDiscoveryResult(
                 folder=target,
                 items=(),
-                error=f"フォルダを読み込めません: {target} ({exc})",
+                error=tr('フォルダを読み込めません: {p0} ({p1})', p0=target, p1=exc),
             )
 
         ordered = BrowserSortPolicy().sorted_items(items)
@@ -209,7 +212,7 @@ class BrowserItemModel(QAbstractListModel):
             return None
         item = self._items[index.row()]
         if role == int(Qt.ItemDataRole.DisplayRole):
-            return f"{item.display_name}\n{self._KIND_LABELS[item.kind]}"
+            return f"{item.display_name}\n{tr(self._KIND_LABELS[item.kind])}"
         if role == int(Qt.ItemDataRole.DecorationRole):
             return self._icons.get(self._key(item.path), self._fallback_icons.get(item.kind))
         if role == self.ThumbnailImageRole:

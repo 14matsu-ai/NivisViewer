@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import os
 import shutil
 import uuid
@@ -36,7 +39,7 @@ class ChunkedFileCopier:
         if FileOperationArtifactPolicy.is_internal_operation_artifact(
             destination_path
         ):
-            raise ValueError("内部一時ファイルを最終destinationに指定できません")
+            raise ValueError(tr('内部一時ファイルを最終destinationに指定できません'))
         temporary = FileOperationArtifactPolicy.create_staging_path(
             destination_path,
             uuid.uuid4().hex,
@@ -59,7 +62,7 @@ class ChunkedFileCopier:
                 not os.path.lexists(destination_path)
                 or os.path.lexists(temporary)
             ):
-                raise OSError("コピー公開後の事後条件を満たしていません")
+                raise OSError(tr('コピー公開後の事後条件を満たしていません'))
             return copied
         except BaseException:
             FileOperationArtifactPolicy.cleanup_staging_path(temporary)
@@ -94,8 +97,7 @@ class ChunkedFileCopier:
             actual = os.path.getsize(staging_path)
             if actual != expected:
                 raise OSError(
-                    f"コピーサイズが一致しません: expected={expected}, "
-                    f"copied={actual}"
+                    tr('コピーサイズが一致しません: expected={p0}, copied={p1}', p0=expected, p1=actual)
                 )
             return copied
         with open(source_path, "rb", buffering=0) as input_file:
@@ -114,7 +116,7 @@ class ChunkedFileCopier:
                 os.fsync(output_file.fileno())
         if copied != expected or os.path.getsize(staging_path) != expected:
             raise OSError(
-                f"コピーサイズが一致しません: expected={expected}, copied={copied}"
+                tr('コピーサイズが一致しません: expected={p0}, copied={p1}', p0=expected, p1=copied)
             )
         shutil.copystat(source_path, staging_path, follow_symlinks=False)
         return copied

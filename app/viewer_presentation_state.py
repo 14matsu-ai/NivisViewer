@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from dataclasses import dataclass, replace
 from enum import Enum
 from math import isfinite
@@ -959,7 +962,7 @@ class ViewerPresentationState:
             index = int(page_index)
             if index in normalized:
                 raise ValueError("failed page indexes must be unique")
-            normalized[index] = str(message) or "画像を表示できません。"
+            normalized[index] = str(message) or tr('画像を表示できません。')
         return normalized
 
 

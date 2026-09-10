@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import os
 import shutil
 import stat
@@ -164,21 +167,19 @@ class FileOperationPlanner:
                 )
             if FileOperationArtifactPolicy.is_internal_operation_artifact(source):
                 errors.append(
-                    "INTERNAL_STAGING_ARTIFACT: "
-                    "NivisViewerの未完了一時ファイルは通常の"
-                    f"ファイル操作対象にできません: {source}"
+                    tr('INTERNAL_STAGING_ARTIFACT: NivisViewerの未完了一時ファイルは通常のファイル操作対象にできません: {p0}', p0=source)
                 )
                 continue
             try:
                 item = self._inspect_source(source, destination_root, cancel, warnings)
             except FileNotFoundError:
-                warnings.append(f"対象が見つかりません: {source}")
+                warnings.append(tr('対象が見つかりません: {p0}', p0=source))
                 continue
             except PermissionError:
-                warnings.append(f"アクセスできません: {source}")
+                warnings.append(tr('アクセスできません: {p0}', p0=source))
                 continue
             except OSError as exc:
-                warnings.append(f"確認できません: {source}: {exc}")
+                warnings.append(tr('確認できません: {p0}: {p1}', p0=source, p1=exc))
                 continue
             item = replace(
                 item,
@@ -246,11 +247,10 @@ class FileOperationPlanner:
                 available_bytes = int(shutil.disk_usage(destination_root).free)
                 if request.operation is FileOperationKind.COPY and total_bytes > available_bytes:
                     errors.append(
-                        "コピー先の空き容量が不足しています"
-                        f"（必要 {total_bytes} bytes / 空き {available_bytes} bytes）"
+                        tr('コピー先の空き容量が不足しています（必要 {p0} bytes / 空き {p1} bytes）', p0=total_bytes, p1=available_bytes)
                     )
             except OSError as exc:
-                warnings.append(f"コピー先の空き容量を確認できません: {exc}")
+                warnings.append(tr('コピー先の空き容量を確認できません: {p0}', p0=exc))
 
         if cancel.is_set():
             state = FileOperationState.CANCELLED
@@ -337,7 +337,7 @@ class FileOperationPlanner:
                 FileConflictKind.INVALID_DESTINATION_NAME,
                 item.source_path,
                 destination,
-                validation.error_message or "名前が無効です",
+                validation.error_message or tr('名前が無効です'),
                 (ConflictResolution.SKIP, ConflictResolution.CANCEL),
             )
             return planned
@@ -354,9 +354,9 @@ class FileOperationPlanner:
                 item.source_path,
                 destination,
                 (
-                    "名前が変更されていません"
+                    tr('名前が変更されていません')
                     if kind is FileConflictKind.SAME_PATH
-                    else "大文字／小文字だけが異なる名前です"
+                    else tr('大文字／小文字だけが異なる名前です')
                 ),
                 (
                     ConflictResolution.SKIP,
@@ -379,7 +379,7 @@ class FileOperationPlanner:
                 kind,
                 item.source_path,
                 destination,
-                "同名項目が存在します",
+                tr('同名項目が存在します'),
                 (
                     ConflictResolution.SKIP,
                     ConflictResolution.CANCEL,
@@ -398,7 +398,7 @@ class FileOperationPlanner:
         if cancelled.is_set():
             return 0, 0, 0
         if reparse:
-            warnings.append(f"再解析ポイントは再帰しません: {path}")
+            warnings.append(tr('再解析ポイントは再帰しません: {p0}', p0=path))
             return 0, 0 if is_directory else 1, 1 if is_directory else 0
         if not is_directory:
             return int(os.lstat(path).st_size), 1, 0
@@ -424,7 +424,7 @@ class FileOperationPlanner:
                     files += child_files
                     directories += child_directories
                 except (FileNotFoundError, PermissionError, OSError) as exc:
-                    warnings.append(f"項目を確認できません: {entry.path}: {exc}")
+                    warnings.append(tr('項目を確認できません: {p0}: {p1}', p0=entry.path, p1=exc))
         return total_bytes, files, directories
 
     def _validate_destination(
@@ -438,7 +438,7 @@ class FileOperationPlanner:
                 FileConflictKind.DESTINATION_PARENT_MISSING,
                 None,
                 destination,
-                "移動先フォルダが存在しません",
+                tr('移動先フォルダが存在しません'),
                 (ConflictResolution.CANCEL,),
             )
             return
@@ -448,7 +448,7 @@ class FileOperationPlanner:
                 FileConflictKind.DESTINATION_READ_ONLY,
                 None,
                 destination,
-                "移動先へ書き込めません",
+                tr('移動先へ書き込めません'),
                 (ConflictResolution.CANCEL,),
             )
 
@@ -469,7 +469,7 @@ class FileOperationPlanner:
                 FileConflictKind.INVALID_DESTINATION_NAME,
                 source,
                 destination,
-                validation.error_message or "移動先の名前が無効です",
+                validation.error_message or tr('移動先の名前が無効です'),
                 (ConflictResolution.SKIP, ConflictResolution.CANCEL),
             )
             return
@@ -484,7 +484,7 @@ class FileOperationPlanner:
                 kind,
                 source,
                 destination,
-                "コピー元と移動先が同じです",
+                tr('コピー元と移動先が同じです'),
                 (
                     (
                         ConflictResolution.SKIP,
@@ -505,7 +505,7 @@ class FileOperationPlanner:
                 FileConflictKind.SAME_PATH,
                 source,
                 destination,
-                "フォルダ自身の子階層へコピー／移動できません",
+                tr('フォルダ自身の子階層へコピー／移動できません'),
                 (ConflictResolution.SKIP, ConflictResolution.CANCEL),
             )
             return
@@ -547,7 +547,7 @@ class FileOperationPlanner:
             kind,
             source,
             destination,
-            "同名項目が移動先に存在します",
+            tr('同名項目が移動先に存在します'),
             allowed,
         )
 
@@ -575,7 +575,7 @@ class FileOperationPlanner:
                         entry_stat = entry.stat(follow_symlinks=False)
                         if self._is_reparse(entry_stat):
                             warnings.append(
-                                f"再解析ポイントは再帰しません: {entry.path}"
+                                tr('再解析ポイントは再帰しません: {p0}', p0=entry.path)
                             )
                             continue
                         destination_entry = destinations.get(entry.name.casefold())
@@ -632,7 +632,7 @@ class FileOperationPlanner:
                             kind,
                             entry.path,
                             destination_path,
-                            "統合先に同名の子項目があります",
+                            tr('統合先に同名の子項目があります'),
                             allowed,
                         )
                         if source_is_directory and destination_is_directory:
@@ -645,11 +645,11 @@ class FileOperationPlanner:
                             )
                     except (FileNotFoundError, PermissionError, OSError) as exc:
                         warnings.append(
-                            f"子項目の衝突を確認できません: {entry.path}: {exc}"
+                            tr('子項目の衝突を確認できません: {p0}: {p1}', p0=entry.path, p1=exc)
                         )
         except (FileNotFoundError, PermissionError, OSError) as exc:
             warnings.append(
-                f"フォルダ統合の衝突を確認できません: {source}: {exc}"
+                tr('フォルダ統合の衝突を確認できません: {p0}: {p1}', p0=source, p1=exc)
             )
 
     @staticmethod

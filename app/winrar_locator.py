@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -67,7 +70,7 @@ class WinRARLocator:
         ):
             console = self._console_candidate(candidate)
             if console is None:
-                last_error = f"WinRARの公式コンソールCLIが見つかりません: {candidate}"
+                last_error = tr('WinRARの公式コンソールCLIが見つかりません: {p0}', p0=candidate)
                 continue
             absolute = Path(os.path.abspath(os.path.normpath(os.fspath(console))))
             key = os.path.normcase(str(absolute)).casefold()
@@ -76,7 +79,7 @@ class WinRARLocator:
             seen.add(key)
             try:
                 if not absolute.is_file():
-                    last_error = f"実行ファイルではありません: {absolute}"
+                    last_error = tr('実行ファイルではありません: {p0}', p0=absolute)
                     continue
             except OSError as exc:
                 last_error = str(exc)
@@ -100,7 +103,7 @@ class WinRARLocator:
                 "",
                 False,
                 None,
-                last_error or "WinRARの公式コンソールCLIが見つかりません",
+                last_error or tr('WinRARの公式コンソールCLIが見つかりません'),
             ),
         )
 
@@ -122,7 +125,7 @@ class WinRARLocator:
                 absolute,
                 False,
                 None,
-                "WinRAR公式CLIのバージョンを確認できませんでした",
+                tr('WinRAR公式CLIのバージョンを確認できませんでした'),
             )
         return WinRARInfo(absolute, True, text.splitlines()[0], None)
 

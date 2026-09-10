@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -67,7 +70,7 @@ class TextPreviewProvider:
             with Path(path).open("rb") as source:
                 data = source.read(self.max_bytes + 1)
         except (OSError, ValueError) as exc:
-            return PreviewResult.failed(f"テキストを読み込めません: {exc}")
+            return PreviewResult.failed(tr('テキストを読み込めません: {p0}', p0=exc))
         if cancel_token is not None and cancel_token.is_set():
             return PreviewResult(PreviewResultKind.CANCELLED)
         if not data:
@@ -94,7 +97,7 @@ class TextPreviewProvider:
             return PreviewResult(PreviewResultKind.CANCELLED)
         image = self.render(content.text, spec)
         if image.isNull():
-            return PreviewResult.failed("テキストプレビューを描画できません")
+            return PreviewResult.failed(tr('テキストプレビューを描画できません'))
         return PreviewResult.ready_image(
             image,
             source=PreviewSource.TEXT,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .i18n import tr
+
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 import math
@@ -65,7 +67,7 @@ class PdfBackendError(RuntimeError):
         debug_message: str | None = None,
     ) -> None:
         self.code = PdfErrorCode(code)
-        self.user_message = user_message or _USER_MESSAGES[self.code]
+        self.user_message = user_message or tr(_USER_MESSAGES[self.code])
         self.debug_message = debug_message
         super().__init__(self.user_message)
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import ctypes
 import os
 from ctypes import wintypes
@@ -65,7 +68,7 @@ class WindowsRecycleBin:
             return RecycleBinResult(
                 False,
                 error_code="api_unavailable",
-                error_message="Windowsのごみ箱APIを利用できません",
+                error_message=tr('Windowsのごみ箱APIを利用できません'),
             )
         operation = _SHFILEOPSTRUCTW()
         source_list = ctypes.create_unicode_buffer(f"{target}\0")
@@ -94,18 +97,18 @@ class WindowsRecycleBin:
                 False,
                 cancelled=True,
                 error_code="cancelled",
-                error_message="ごみ箱への移動がキャンセルされました",
+                error_message=tr('ごみ箱への移動がキャンセルされました'),
             )
         if result_code != 0:
             return RecycleBinResult(
                 False,
                 error_code="shell_error",
-                error_message=f"ごみ箱APIエラー: {result_code}",
+                error_message=tr('ごみ箱APIエラー: {p0}', p0=result_code),
             )
         if os.path.lexists(target):
             return RecycleBinResult(
                 False,
                 error_code="source_remains",
-                error_message="ごみ箱への移動後も元の項目が残っています",
+                error_message=tr('ごみ箱への移動後も元の項目が残っています'),
             )
         return RecycleBinResult(True)

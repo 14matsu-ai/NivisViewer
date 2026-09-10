@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -465,7 +468,7 @@ class BrowserLocationBreadcrumb(QWidget):
             button = QToolButton(self)
             button.setObjectName("browser_location_ellipsis")
             button.setText("…")
-            button.setToolTip("省略した上位階層")
+            button.setToolTip(tr('省略した上位階層'))
             menu = QMenu(button)
             for segment in omitted:
                 action = menu.addAction(segment.label)
@@ -514,7 +517,7 @@ class BrowserLocationBreadcrumb(QWidget):
             separator = QToolButton(self)
             separator.setObjectName(f"browser_location_separator_{absolute_index}")
             separator.setText("›")
-            separator.setToolTip(f"{segment.label} 直下のフォルダ")
+            separator.setToolTip(tr('{p0} 直下のフォルダ', p0=segment.label))
             key = os.path.normcase(
                 os.path.abspath(os.path.normpath(segment.path))
             ).casefold()

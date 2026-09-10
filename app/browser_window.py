@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from .i18n import tr
+from .menu_icons import install_text_icon_menu_style, settings_icon
+
+
 import os
 import logging
 from dataclasses import dataclass, field
@@ -266,7 +270,7 @@ class _BrowserContextFilenameEdit(QLineEdit):
         self.setObjectName("browser_context_filename")
         self.setReadOnly(True)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
-        self.setAccessibleName("ファイル名（読み取り専用）")
+        self.setAccessibleName(tr('ファイル名（読み取り専用）'))
         self.setText(name)
         self.setCursorPosition(0)
         self.setTextMargins(6, 2, 6, 2)
@@ -501,7 +505,7 @@ class BrowserWindow(QMainWindow):
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setAcceptDrops(True)
-        self.setWindowTitle("NivisViewer - ブラウザ")
+        self.setWindowTitle(tr('NivisViewer - ブラウザ'))
         install_window_icon(self)
         self.resize(1100, 760)
 
@@ -1086,7 +1090,7 @@ class BrowserWindow(QMainWindow):
         if not self.scanner.start(request):
             self._pending_scan = None
             self._restore_current_directory_watch()
-            self._show_temporary_status("フォルダへアクセスできません")
+            self._show_temporary_status(tr('フォルダへアクセスできません'))
             self._sync_address_bar()
             return False
         self._update_status(force=True)
@@ -1242,7 +1246,7 @@ class BrowserWindow(QMainWindow):
             QTimer.singleShot(
                 0,
                 lambda: (
-                    self._show_temporary_status("フォルダを更新しました")
+                    self._show_temporary_status(tr('フォルダを更新しました'))
                     if not self._shutdown_prepared
                     else None
                 ),
@@ -1286,11 +1290,11 @@ class BrowserWindow(QMainWindow):
         self._sync_address_bar()
         self._update_navigation_actions()
         if error.status is BrowserScanStatus.NOT_FOUND:
-            message = "フォルダが見つかりません"
+            message = tr('フォルダが見つかりません')
         elif error.status is BrowserScanStatus.NOT_DIRECTORY:
-            message = "このファイル形式は表示できません"
+            message = tr('このファイル形式は表示できません')
         else:
-            message = "フォルダへアクセスできません"
+            message = tr('フォルダへアクセスできません')
         self._show_temporary_status(message)
         if recover_missing_watched_directory:
             parent = pending.path.parent
@@ -1804,7 +1808,7 @@ class BrowserWindow(QMainWindow):
         if current is not None:
             popup_entries.append(
                 LocationPopupEntry(
-                    f"現在: {self._location_menu_label(current.path)}",
+                    tr('現在: {p0}', p0=self._location_menu_label(current.path)),
                     None,
                     current.path,
                     enabled=False,
@@ -1943,7 +1947,7 @@ class BrowserWindow(QMainWindow):
         if result.error:
             popup_entries.append(
                 LocationPopupEntry(
-                    "フォルダを読み込めません",
+                    tr('フォルダを読み込めません'),
                     None,
                     result.error,
                     enabled=False,
@@ -1952,7 +1956,7 @@ class BrowserWindow(QMainWindow):
         elif not result.directories:
             popup_entries.append(
                 LocationPopupEntry(
-                    "子フォルダはありません",
+                    tr('子フォルダはありません'),
                     None,
                     enabled=False,
                 )
@@ -2056,15 +2060,15 @@ class BrowserWindow(QMainWindow):
         )
         if result.success:
             self._show_temporary_status(
-                "NivisViewerでは表示できません。既定のアプリで開きました"
+                tr('NivisViewerでは表示できません。既定のアプリで開きました')
             )
             return True
         self._show_temporary_status(
-            "NivisViewerでは表示できません。"
+            tr('NivisViewerでは表示できません。')
             + (
                 f" {result.error_message}"
                 if result.error_message
-                else " 関連付けアプリで開けませんでした"
+                else tr(' 関連付けアプリで開けませんでした')
             )
         )
         return False
@@ -2072,17 +2076,17 @@ class BrowserWindow(QMainWindow):
     def _open_with_application_picker(self, item: BrowserItem) -> bool:
         target = self._absolute_browser_path(item.path)
         if item.kind is BrowserItemKind.FOLDER or not target.is_file():
-            self._show_temporary_status("関連付けで開く対象が見つかりません")
+            self._show_temporary_status(tr('関連付けで開く対象が見つかりません'))
             return False
         result = self.system_file_opener.open_with_application_picker(
             target,
             parent_hwnd=int(self.winId()),
         )
         if result.success:
-            self._show_temporary_status("アプリ選択画面を開きました")
+            self._show_temporary_status(tr('アプリ選択画面を開きました'))
             return True
         self._show_temporary_status(
-            result.error_message or "アプリ選択画面を開けませんでした"
+            result.error_message or tr('アプリ選択画面を開けませんでした')
         )
         return False
 
@@ -2095,7 +2099,7 @@ class BrowserWindow(QMainWindow):
         if result.success:
             return True
         self._show_temporary_status(
-            result.error_message or "Explorerを開けませんでした"
+            result.error_message or tr('Explorerを開けませんでした')
         )
         return False
 
@@ -2286,7 +2290,7 @@ class BrowserWindow(QMainWindow):
         if not paths:
             return False
         self._set_file_clipboard(paths, cut=False)
-        self._show_temporary_status(f"{len(paths)}項目をコピー候補にしました")
+        self._show_temporary_status(tr('{p0}項目をコピー候補にしました', p0=len(paths)))
         return True
 
     def copy_selected_names(self) -> bool:
@@ -2296,7 +2300,7 @@ class BrowserWindow(QMainWindow):
         mime = QMimeData()
         mime.setText("\n".join(Path(path).name for path in paths))
         QApplication.clipboard().setMimeData(mime)
-        self._show_temporary_status(f"{len(paths)}項目の名前をコピーしました")
+        self._show_temporary_status(tr('{p0}項目の名前をコピーしました', p0=len(paths)))
         return True
 
     def cut_selected_items(self) -> bool:
@@ -2304,7 +2308,7 @@ class BrowserWindow(QMainWindow):
         if not paths:
             return False
         self._set_file_clipboard(paths, cut=True)
-        self._show_temporary_status(f"{len(paths)}項目を切り取り候補にしました")
+        self._show_temporary_status(tr('{p0}項目を切り取り候補にしました', p0=len(paths)))
         return True
 
     def clear_file_clipboard(self) -> None:
@@ -2319,7 +2323,7 @@ class BrowserWindow(QMainWindow):
             return False
         sources = self._clipboard_paths or self._clipboard_file_urls()
         if not sources:
-            self._show_temporary_status("貼り付けるファイルがありません")
+            self._show_temporary_status(tr('貼り付けるファイルがありません'))
             return False
         operation = (
             FileOperationKind.MOVE
@@ -2348,7 +2352,7 @@ class BrowserWindow(QMainWindow):
                 for path in sources
             )
         ):
-            self._show_temporary_status("同じフォルダへの移動は行いません")
+            self._show_temporary_status(tr('同じフォルダへの移動は行いません'))
             return False
         return self._start_file_operation(
             operation,
@@ -2362,8 +2366,8 @@ class BrowserWindow(QMainWindow):
             return False
         source = Path(paths[0])
         new_name = self._prompt_for_filename(
-            "名前の変更",
-            "新しい名前:",
+            tr('名前の変更'),
+            tr('新しい名前:'),
             source.name,
         )
         if new_name is None or new_name == source.name:
@@ -2373,8 +2377,8 @@ class BrowserWindow(QMainWindow):
         if old_suffix != new_suffix:
             answer = QMessageBox.question(
                 self,
-                "拡張子の変更",
-                "拡張子を変更すると項目を開けなくなる場合があります。続行しますか？",
+                tr('拡張子の変更'),
+                tr('拡張子を変更すると項目を開けなくなる場合があります。続行しますか？'),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -2397,9 +2401,9 @@ class BrowserWindow(QMainWindow):
             )
         ):
             if len(paths) == 1:
-                prompt = f"「{Path(paths[0]).name}」をごみ箱へ移動しますか？"
+                prompt = tr('「{p0}」をごみ箱へ移動しますか？', p0=Path(paths[0]).name)
             else:
-                prompt = f"{len(paths)}項目をごみ箱へ移動しますか？"
+                prompt = tr('{p0}項目をごみ箱へ移動しますか？', p0=len(paths))
             default_button = (
                 QMessageBox.StandardButton.Yes
                 if bool(
@@ -2412,7 +2416,7 @@ class BrowserWindow(QMainWindow):
             )
             answer = QMessageBox.question(
                 self,
-                "削除",
+                tr('削除'),
                 prompt,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 default_button,
@@ -2460,15 +2464,15 @@ class BrowserWindow(QMainWindow):
             return
         validation = validate_windows_filename(new_name)
         if not validation.valid:
-            dialog.show_error(validation.error_message or "名前が無効です")
+            dialog.show_error(validation.error_message or tr('名前が無効です'))
             return
         if source.is_file() and source.suffix.casefold() != Path(
             validation.normalized_name
         ).suffix.casefold():
             answer = QMessageBox.question(
                 dialog,
-                "拡張子の変更",
-                "拡張子を変更すると項目を開けなくなる場合があります。続行しますか？",
+                tr('拡張子の変更'),
+                tr('拡張子を変更すると項目を開けなくなる場合があります。続行しますか？'),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -2479,7 +2483,7 @@ class BrowserWindow(QMainWindow):
             sources=(str(source),),
             new_name=validation.normalized_name,
         ):
-            dialog.show_error("名前変更を開始できませんでした")
+            dialog.show_error(tr('名前変更を開始できませんでした'))
             return
         request_id = self._file_operation_request_id
         self._property_rename_requests[request_id] = (
@@ -2493,7 +2497,7 @@ class BrowserWindow(QMainWindow):
         paths = self.selected_file_operation_paths()
         if not paths:
             return False
-        target = self._choose_destination("コピー先を選択", destination)
+        target = self._choose_destination(tr('コピー先を選択'), destination)
         if target is None:
             return False
         return self._start_file_operation(
@@ -2506,7 +2510,7 @@ class BrowserWindow(QMainWindow):
         paths = self.selected_file_operation_paths()
         if not paths:
             return False
-        target = self._choose_destination("移動先を選択", destination)
+        target = self._choose_destination(tr('移動先を選択'), destination)
         if target is None:
             return False
         return self._start_file_operation(
@@ -2523,11 +2527,11 @@ class BrowserWindow(QMainWindow):
             (item.display_name for item in self.items),
         )
         if initial_name is None:
-            self._show_temporary_status("新しいフォルダ名を生成できません")
+            self._show_temporary_status(tr('新しいフォルダ名を生成できません'))
             return False
         name = self._prompt_for_filename(
-            "新しいフォルダ",
-            "フォルダ名:",
+            tr('新しいフォルダ'),
+            tr('フォルダ名:'),
             initial_name,
         )
         if name is None:
@@ -2541,7 +2545,7 @@ class BrowserWindow(QMainWindow):
     def cancel_file_operation(self) -> None:
         if self.file_operation_coordinator.busy:
             self.file_operation_coordinator.cancel()
-            self.statusBar().showMessage("安全な境界でキャンセルしています…")
+            self.statusBar().showMessage(tr('安全な境界でキャンセルしています…'))
 
     def _start_file_operation(
         self,
@@ -2560,7 +2564,7 @@ class BrowserWindow(QMainWindow):
         )
         if sources and not filtered_sources:
             self._show_temporary_status(
-                "NivisViewerの未完了一時ファイルは操作できません"
+                tr('NivisViewerの未完了一時ファイルは操作できません')
             )
             return False
         sources = filtered_sources
@@ -2568,7 +2572,7 @@ class BrowserWindow(QMainWindow):
             self.file_operation_coordinator.busy
             and self.file_operation_coordinator.queue is None
         ):
-            self._show_temporary_status("別のファイル操作を実行中です")
+            self._show_temporary_status(tr('別のファイル操作を実行中です'))
             return False
         if operation in {
             FileOperationKind.RENAME,
@@ -2613,7 +2617,7 @@ class BrowserWindow(QMainWindow):
         if not self.file_operation_coordinator.execute(request):
             self._file_operation_requests.pop(request.request_id, None)
             self._file_operation_selection_before.pop(request.request_id, None)
-            self._show_temporary_status("ファイル操作を開始できません")
+            self._show_temporary_status(tr('ファイル操作を開始できません'))
             return False
         return True
 
@@ -2687,9 +2691,8 @@ class BrowserWindow(QMainWindow):
             return True
         answer = QMessageBox.question(
             self,
-            "ViewerWindowで使用中",
-            "この項目はViewerWindowで開かれています。\n"
-            "対象Viewerを閉じて操作を続けますか？",
+            tr('ViewerWindowで使用中'),
+            tr('この項目はViewerWindowで開かれています。\n対象Viewerを閉じて操作を続けますか？'),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -2700,7 +2703,7 @@ class BrowserWindow(QMainWindow):
         closed = self._close_affected_viewers_handler(viewers)
         if closed is False:
             self._show_temporary_status(
-                "PDFの解放を待機中のためファイル操作を開始できません"
+                tr('PDFの解放を待機中のためファイル操作を開始できません')
             )
             return False
         return True
@@ -2730,8 +2733,8 @@ class BrowserWindow(QMainWindow):
         if not validation.valid:
             QMessageBox.warning(
                 self,
-                "名前を使用できません",
-                validation.error_message or "名前が無効です",
+                tr('名前を使用できません'),
+                validation.error_message or tr('名前が無効です'),
             )
             return None
         return validation.normalized_name
@@ -2756,10 +2759,10 @@ class BrowserWindow(QMainWindow):
         operation: FileOperationKind,
     ) -> None:
         menu.clear()
-        recent_menu = menu.addMenu("最近使った移動先")
+        recent_menu = menu.addMenu(tr('最近使った移動先'))
         recent = self.destination_history.entries()
         if not recent:
-            empty = recent_menu.addAction("（履歴なし）")
+            empty = recent_menu.addAction(tr('（履歴なし）'))
             empty.setEnabled(False)
         for entry in recent:
             action = recent_menu.addAction(entry.display_label)
@@ -2771,10 +2774,10 @@ class BrowserWindow(QMainWindow):
                     else self.move_selected_to(path)
                 )
             )
-        favorite_menu = menu.addMenu("お気に入り")
+        favorite_menu = menu.addMenu(tr('お気に入り'))
         favorite_entries = tuple(getattr(self.folder_bookmark_model, "entries", ()))
         if not favorite_entries:
-            empty = favorite_menu.addAction("（お気に入りなし）")
+            empty = favorite_menu.addAction(tr('（お気に入りなし）'))
             empty.setEnabled(False)
         for entry in favorite_entries:
             action = favorite_menu.addAction(entry.label)
@@ -2787,7 +2790,7 @@ class BrowserWindow(QMainWindow):
                 )
             )
         menu.addSeparator()
-        specified = menu.addAction("指定先...")
+        specified = menu.addAction(tr('指定先...'))
         specified.triggered.connect(
             lambda _checked=False, kind=operation: (
                 self.copy_selected_to()
@@ -2858,8 +2861,7 @@ class BrowserWindow(QMainWindow):
         self.cancel_operation_button.setEnabled(True)
         self._update_file_action_states()
         self.statusBar().showMessage(
-            f"{self._operation_label(request.operation)}中… 0 / "
-            f"{max(1, len(request.source_paths))}"
+            tr('{p0}中… 0 / {p1}', p0=self._operation_label(request.operation), p1=max(1, len(request.source_paths)))
         )
 
     def _on_file_operation_progress(
@@ -2872,11 +2874,10 @@ class BrowserWindow(QMainWindow):
         ):
             return
         if self._close_after_cancel:
-            self.statusBar().showMessage("ファイル操作を中止しています…")
+            self.statusBar().showMessage(tr('ファイル操作を中止しています…'))
             return
         self.statusBar().showMessage(
-            f"{self._operation_label(progress.operation)}中… "
-            f"{progress.completed} / {progress.total}"
+            tr('{p0}中… {p1} / {p2}', p0=self._operation_label(progress.operation), p1=progress.completed, p2=progress.total)
         )
 
     def _on_file_operation_completed(
@@ -2984,7 +2985,7 @@ class BrowserWindow(QMainWindow):
         failure_count += root_cleanup_failures
         if result.cancelled:
             completion_message = (
-                f"{self._operation_label(result.operation)}をキャンセルしました"
+                tr('{p0}をキャンセルしました', p0=self._operation_label(result.operation))
             )
         elif failure_count:
             skipped_count = sum(
@@ -3003,12 +3004,10 @@ class BrowserWindow(QMainWindow):
                 if not item.success
             )
             completion_message = (
-                f"{self._operation_label(result.operation)}完了: "
-                f"成功{success_count}件、スキップ{skipped_count}件、"
-                f"失敗{max(0, failure_count - skipped_count)}件"
+                tr('{p0}完了: 成功{p1}件、スキップ{p2}件、失敗{p3}件', p0=self._operation_label(result.operation), p1=success_count, p2=skipped_count, p3=max(0, failure_count - skipped_count))
             )
             if source_remaining_count:
-                completion_message += f"（元項目残留{source_remaining_count}件）"
+                completion_message += tr('（元項目残留{p0}件）', p0=source_remaining_count)
             codes = sorted(
                 {
                     item.error_code or "unknown"
@@ -3022,14 +3021,12 @@ class BrowserWindow(QMainWindow):
             ):
                 QMessageBox.warning(
                     self,
-                    "ファイル操作の一部を完了できませんでした",
-                    f"成功: {success_count}件\n失敗: {failure_count}件\n"
-                    f"エラー種別: {', '.join(codes)}\n"
-                    "同名項目は上書きせずスキップします。",
+                    tr('ファイル操作の一部を完了できませんでした'),
+                    tr('成功: {p0}件\n失敗: {p1}件\nエラー種別: {p2}\n同名項目は上書きせずスキップします。', p0=success_count, p1=failure_count, p2=', '.join(codes)),
                 )
         else:
             completion_message = (
-                f"{self._operation_label(result.operation)}が完了しました"
+                tr('{p0}が完了しました', p0=self._operation_label(result.operation))
             )
 
         if property_rename is not None:
@@ -3054,7 +3051,7 @@ class BrowserWindow(QMainWindow):
                         if failure is not None
                         else None
                     )
-                    or "名前を変更できませんでした"
+                    or tr('名前を変更できませんでした')
                 )
             else:
                 dialog.mark_renamed(renamed_item.destination_path)
@@ -3169,11 +3166,11 @@ class BrowserWindow(QMainWindow):
     @staticmethod
     def _operation_label(operation: FileOperationKind) -> str:
         return {
-            FileOperationKind.RENAME: "名前変更",
-            FileOperationKind.COPY: "コピー",
-            FileOperationKind.MOVE: "移動",
-            FileOperationKind.RECYCLE: "削除",
-            FileOperationKind.CREATE_DIRECTORY: "フォルダ作成",
+            FileOperationKind.RENAME: tr('名前変更'),
+            FileOperationKind.COPY: tr('コピー'),
+            FileOperationKind.MOVE: tr('移動'),
+            FileOperationKind.RECYCLE: tr('削除'),
+            FileOperationKind.CREATE_DIRECTORY: tr('フォルダ作成'),
         }[operation]
 
     def add_browser_bookmark(
@@ -3199,9 +3196,9 @@ class BrowserWindow(QMainWindow):
         if self.current_path is None or self.metadata_store is None:
             return
         if self.metadata_store.add_folder_bookmark(str(self.current_path)):
-            self._show_temporary_status("現在のフォルダをお気に入りへ追加しました")
+            self._show_temporary_status(tr('現在のフォルダをお気に入りへ追加しました'))
         else:
-            self._show_temporary_status("このフォルダは登録済みです")
+            self._show_temporary_status(tr('このフォルダは登録済みです'))
 
     def add_selected_folder_bookmark(self) -> bool:
         item = self.item_model.item_at(self.list_view.currentIndex())
@@ -3216,9 +3213,9 @@ class BrowserWindow(QMainWindow):
             label=item.display_name,
         )
         self._show_temporary_status(
-            "フォルダをお気に入りへ追加しました"
+            tr('フォルダをお気に入りへ追加しました')
             if added
-            else "このフォルダは登録済みです"
+            else tr('このフォルダは登録済みです')
         )
         return added
 
@@ -3230,7 +3227,7 @@ class BrowserWindow(QMainWindow):
             for entry in self.metadata_store.list_folder_bookmarks()
         ):
             self.metadata_store.remove_folder_bookmark(str(self.current_path))
-            self._show_temporary_status("現在のフォルダをお気に入りから削除しました")
+            self._show_temporary_status(tr('現在のフォルダをお気に入りから削除しました'))
         else:
             self.add_current_folder_bookmark()
 
@@ -3307,8 +3304,8 @@ class BrowserWindow(QMainWindow):
         if label is None:
             label, accepted = QInputDialog.getText(
                 self,
-                "お気に入りの表示名",
-                "表示名:",
+                tr('お気に入りの表示名'),
+                tr('表示名:'),
                 text=entry.label,
             )
             if not accepted:
@@ -3354,7 +3351,7 @@ class BrowserWindow(QMainWindow):
             self.bookmark_model.AvailabilityRole,
         )
         if availability == "missing":
-            self.statusBar().showMessage("ブックマーク先が見つかりません", 3000)
+            self.statusBar().showMessage(tr('ブックマーク先が見つかりません'), 3000)
             return
         if entry.item_type == "folder":
             self.navigate_to(entry.path)
@@ -3376,7 +3373,7 @@ class BrowserWindow(QMainWindow):
             self.history_model.AvailabilityRole,
         )
         if availability == "missing":
-            self.statusBar().showMessage("履歴の項目が見つかりません", 3000)
+            self.statusBar().showMessage(tr('履歴の項目が見つかりません'), 3000)
             return
         if self._open_path_handler is not None:
             self._invoke_open_path_handler(entry.path, open_in_new_window)
@@ -3392,8 +3389,8 @@ class BrowserWindow(QMainWindow):
         if confirm:
             answer = QMessageBox.question(
                 self,
-                "閲覧履歴を消去",
-                "閲覧履歴をすべて消去しますか？",
+                tr('閲覧履歴を消去'),
+                tr('閲覧履歴をすべて消去しますか？'),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -4102,7 +4099,7 @@ class BrowserWindow(QMainWindow):
         )
         count = len(self.search_history.entries)
         self.browser_search_container.setToolTip(
-            f"検索履歴を表示（{count}件）"
+            tr('検索履歴を表示（{p0}件）', p0=count)
         )
 
     def _show_search_history_popup(
@@ -4127,7 +4124,7 @@ class BrowserWindow(QMainWindow):
             (
                 LocationPopupEntry("────────", None, enabled=False),
                 LocationPopupEntry(
-                    "検索履歴を消去",
+                    tr('検索履歴を消去'),
                     _CLEAR_SEARCH_HISTORY,
                 ),
             )
@@ -4406,7 +4403,7 @@ class BrowserWindow(QMainWindow):
             )
             if not result.success:
                 batch.failures.append(
-                    f"{Path(path).name}: {result.error_message or '変更できません'}"
+                    f"{Path(path).name}: {result.error_message or tr('変更できません')}"
                 )
                 continue
             if not result.changed:
@@ -4439,7 +4436,7 @@ class BrowserWindow(QMainWindow):
                 batch.active_request_id = self._file_operation_request_id
                 return True
             batch.failures.append(
-                f"{Path(source_path).name}: 名前変更を開始できませんでした"
+                tr('{p0}: 名前変更を開始できませんでした', p0=Path(source_path).name)
             )
         self._finalize_rating_batch(batch)
         return False
@@ -4466,12 +4463,12 @@ class BrowserWindow(QMainWindow):
             source = (
                 item.source_path
                 if item is not None and item.source_path
-                else "フォルダ"
+                else tr('フォルダ')
             )
             message = (
                 item.error_message
                 if item is not None and item.error_message
-                else "変更できません"
+                else tr('変更できません')
             )
             batch.failures.append(f"{Path(source).name}: {message}")
         if not self._start_next_folder_rating_rename():
@@ -4515,15 +4512,14 @@ class BrowserWindow(QMainWindow):
         changed_count = len(replacements)
         if batch.failures:
             summary = (
-                f"レート変更: {changed_count}件成功、"
-                f"{len(batch.failures)}件失敗"
+                tr('レート変更: {p0}件成功、{p1}件失敗', p0=changed_count, p1=len(batch.failures))
             )
             self._show_temporary_status(summary, 5000)
             logging.getLogger("nivisviewer.rating").warning(
                 "%s: %s", summary, "; ".join(batch.failures)
             )
         elif changed_count:
-            self._show_temporary_status(f"{changed_count}件のレートを変更しました")
+            self._show_temporary_status(tr('{p0}件のレートを変更しました', p0=changed_count))
         return changed_count > 0 and not batch.failures
 
     @staticmethod
@@ -4589,7 +4585,7 @@ class BrowserWindow(QMainWindow):
             )
             self._set_selected_metadata(
                 size_text,
-                f"{count_text} ページ",
+                tr('{p0} ページ', p0=count_text),
             )
             if item.page_count is None:
                 self._page_count_request_identity = (
@@ -4687,7 +4683,7 @@ class BrowserWindow(QMainWindow):
         self._page_count_request_identity = None
         self._set_selected_metadata(
             self._format_file_size(item.file_size),
-            f"{max(0, int(page_count))} ページ",
+            tr('{p0} ページ', p0=max(0, int(page_count))),
         )
 
     def _on_image_detail_completed(
@@ -4909,7 +4905,7 @@ class BrowserWindow(QMainWindow):
             and bool(self._clipboard_paths)
         ):
             self.clear_file_clipboard()
-            self._show_temporary_status("切り取り／コピー候補を解除しました")
+            self._show_temporary_status(tr('切り取り／コピー候補を解除しました'))
             return True
         if (
             watched is not self.address_bar
@@ -4954,10 +4950,7 @@ class BrowserWindow(QMainWindow):
     def _build_ui(self) -> None:
         # Keep only the top-level menu row compact. Popup QMenu geometry and
         # application fonts remain owned by the active platform style.
-        self.menuBar().setStyleSheet(
-            "QMenuBar { padding: 0px; spacing: 0px; }"
-            "QMenuBar::item { padding: 4px 6px; margin: 0px; }"
-        )
+        install_text_icon_menu_style(self.menuBar(), compact=True)
         self.file_system_model = QFileSystemModel(self)
         self.file_system_model.setFilter(
             QDir.Filter.AllDirs | QDir.Filter.NoDotAndDotDot | QDir.Filter.Drives
@@ -5163,7 +5156,7 @@ class BrowserWindow(QMainWindow):
         self.setCentralWidget(self.splitter)
         self.splitter.setAcceptDrops(True)
 
-        self.navigation_toolbar = QToolBar("ナビゲーション", self)
+        self.navigation_toolbar = QToolBar(tr('ナビゲーション'), self)
         self.navigation_toolbar.setObjectName("browser_navigation_toolbar")
         self.navigation_toolbar.setMovable(False)
         self.navigation_toolbar.setIconSize(
@@ -5178,10 +5171,10 @@ class BrowserWindow(QMainWindow):
 
         self.back_action = QAction(
             style.standardIcon(QStyle.StandardPixmap.SP_ArrowBack),
-            "戻る",
+            tr('戻る'),
             self,
         )
-        self.back_action.setToolTip("前に表示していたフォルダへ戻る (Alt+Left)")
+        self.back_action.setToolTip(tr('前に表示していたフォルダへ戻る (Alt+Left)'))
         self.back_action.setShortcuts(
             [QKeySequence("Alt+Left")]
         )
@@ -5201,10 +5194,10 @@ class BrowserWindow(QMainWindow):
 
         self.forward_action = QAction(
             style.standardIcon(QStyle.StandardPixmap.SP_ArrowForward),
-            "進む",
+            tr('進む'),
             self,
         )
-        self.forward_action.setToolTip("戻る前のフォルダへ進む (Alt+Right)")
+        self.forward_action.setToolTip(tr('戻る前のフォルダへ進む (Alt+Right)'))
         self.forward_action.setShortcut(QKeySequence("Alt+Right"))
         self.forward_action.triggered.connect(self.go_forward)
         self.navigation_toolbar.addAction(self.forward_action)
@@ -5224,10 +5217,10 @@ class BrowserWindow(QMainWindow):
 
         self.up_action = QAction(
             style.standardIcon(QStyle.StandardPixmap.SP_ArrowUp),
-            "上へ",
+            tr('上へ'),
             self,
         )
-        self.up_action.setToolTip("ひとつ上の階層へ移動 (Alt+Up)")
+        self.up_action.setToolTip(tr('ひとつ上の階層へ移動 (Alt+Up)'))
         self.up_action.setShortcut(QKeySequence("Alt+Up"))
         self.up_action.triggered.connect(self.go_up)
         self.navigation_toolbar.addAction(self.up_action)
@@ -5235,10 +5228,10 @@ class BrowserWindow(QMainWindow):
 
         self.refresh_action = QAction(
             style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload),
-            "更新",
+            tr('更新'),
             self,
         )
-        self.refresh_action.setToolTip("現在のフォルダを更新 (F5)")
+        self.refresh_action.setToolTip(tr('現在のフォルダを更新 (F5)'))
         self.refresh_action.setShortcut(QKeySequence("F5"))
         self.refresh_action.triggered.connect(self.refresh_current_folder)
         self.navigation_toolbar.addAction(self.refresh_action)
@@ -5307,9 +5300,9 @@ class BrowserWindow(QMainWindow):
         self.address_bar.setObjectName("browser_address_bar")
         self.address_bar.setFrame(False)
         self.address_bar.setClearButtonEnabled(True)
-        self.address_bar.setPlaceholderText("フォルダ、画像、ZIP/CBZのパス")
+        self.address_bar.setPlaceholderText(tr('フォルダ、画像、ZIP/CBZのパス'))
         self.address_bar.setToolTip(
-            "パスを入力してEnterで移動。相対パスは現在のフォルダ基準です。"
+            tr('パスを入力してEnterで移動。相対パスは現在のフォルダ基準です。')
         )
         self.address_bar.returnPressed.connect(self._navigate_from_address_bar)
         self.address_bar.editingFinished.connect(self._finish_address_edit)
@@ -5318,7 +5311,7 @@ class BrowserWindow(QMainWindow):
         self.location_stack.addWidget(self.address_bar)
         self.location_stack.setCurrentWidget(self.location_breadcrumb)
         self.browser_location_control.set_content_widget(self.location_stack)
-        self.browser_location_control.setToolTip("最近表示したフォルダ")
+        self.browser_location_control.setToolTip(tr('最近表示したフォルダ'))
         self.browser_location_control.dropDownRequested.connect(
             self._show_location_history_popup
         )
@@ -5336,7 +5329,7 @@ class BrowserWindow(QMainWindow):
 
         self.browser_sort_key_combo = QComboBox(self.browser_sort_row)
         self.browser_sort_key_combo.setObjectName("browser_sort_key_combo")
-        self.browser_sort_key_combo.setToolTip("一覧の並び替え（ランダムを選び直すと並び直します）")
+        self.browser_sort_key_combo.setToolTip(tr('一覧の並び替え（ランダムを選び直すと並び直します）'))
         self.browser_sort_key_combo.setFixedHeight(
             BROWSER_CHROME_CONTROL_HEIGHT
         )
@@ -5344,7 +5337,7 @@ class BrowserWindow(QMainWindow):
             _BrowserSortItemDelegate(self.browser_sort_key_combo)
         )
         for label, key, order in BROWSER_SORT_CHOICES:
-            self.browser_sort_key_combo.addItem(label, f"{key}:{order}")
+            self.browser_sort_key_combo.addItem(tr(label), f"{key}:{order}")
         # Show the full catalog, not Qt's default ten-row subset. Qt still
         # bounds the popup to the screen and enables scrolling when necessary.
         self.browser_sort_key_combo.setMaxVisibleItems(
@@ -5358,7 +5351,7 @@ class BrowserWindow(QMainWindow):
         )
         self.browser_search_edit = _BrowserSearchEdit(self.browser_sort_row)
         self.browser_search_edit.setObjectName("browser_search_edit")
-        self.browser_search_edit.setPlaceholderText("ファイル名を検索")
+        self.browser_search_edit.setPlaceholderText(tr('ファイル名を検索'))
         self.browser_search_edit.setClearButtonEnabled(True)
         self.browser_search_edit.setSizePolicy(
             QSizePolicy.Policy.Preferred,
@@ -5485,24 +5478,24 @@ class BrowserWindow(QMainWindow):
         ):
             target.installEventFilter(self)
 
-        file_menu = self.menuBar().addMenu("ファイル")
-        self.copy_action = file_menu.addAction("コピー")
+        file_menu = self.menuBar().addMenu(tr('ファイル'))
+        self.copy_action = file_menu.addAction(tr('コピー'))
         self.copy_action.triggered.connect(self.copy_selected_items)
-        self.cut_action = file_menu.addAction("切り取り")
+        self.cut_action = file_menu.addAction(tr('切り取り'))
         self.cut_action.triggered.connect(self.cut_selected_items)
-        self.paste_action = file_menu.addAction("貼り付け")
+        self.paste_action = file_menu.addAction(tr('貼り付け'))
         self.paste_action.triggered.connect(self.paste_items)
         file_menu.addSeparator()
-        self.copy_to_action = file_menu.addAction("指定先へコピー...")
+        self.copy_to_action = file_menu.addAction(tr('指定先へコピー...'))
         self.copy_to_action.triggered.connect(
             lambda _checked=False: self.copy_selected_to()
         )
-        self.move_to_action = file_menu.addAction("指定先へ移動...")
+        self.move_to_action = file_menu.addAction(tr('指定先へ移動...'))
         self.move_to_action.triggered.connect(
             lambda _checked=False: self.move_selected_to()
         )
-        self.copy_destination_menu = file_menu.addMenu("コピー先")
-        self.move_destination_menu = file_menu.addMenu("移動先")
+        self.copy_destination_menu = file_menu.addMenu(tr('コピー先'))
+        self.move_destination_menu = file_menu.addMenu(tr('移動先'))
         self.copy_destination_menu.aboutToShow.connect(
             lambda: self._populate_destination_menu(
                 self.copy_destination_menu,
@@ -5516,23 +5509,23 @@ class BrowserWindow(QMainWindow):
             )
         )
         file_menu.addSeparator()
-        self.rename_action = file_menu.addAction("名前の変更")
+        self.rename_action = file_menu.addAction(tr('名前の変更'))
         self.rename_action.triggered.connect(self.rename_selected_item)
-        self.recycle_action = file_menu.addAction("削除")
+        self.recycle_action = file_menu.addAction(tr('削除'))
         self.recycle_action.triggered.connect(self.move_selected_to_recycle_bin)
         file_menu.addSeparator()
-        self.new_folder_action = file_menu.addAction("新しいフォルダ")
+        self.new_folder_action = file_menu.addAction(tr('新しいフォルダ'))
         self.new_folder_action.triggered.connect(self.create_new_folder)
 
-        view_menu = self.menuBar().addMenu("表示")
-        self.sidebar_action = QAction("サイドバーを表示", self)
+        view_menu = self.menuBar().addMenu(tr('表示'))
+        self.sidebar_action = QAction(tr('サイドバーを表示'), self)
         self.sidebar_action.setCheckable(True)
         self.sidebar_action.setChecked(
             bool(self.settings.get("browser_sidebar_visible", True))
         )
         self.sidebar_action.toggled.connect(self.set_sidebar_visible)
         view_menu.addAction(self.sidebar_action)
-        self.favorites_visible_action = QAction("お気に入りを表示", self)
+        self.favorites_visible_action = QAction(tr('お気に入りを表示'), self)
         self.favorites_visible_action.setCheckable(True)
         self.favorites_visible_action.toggled.connect(
             lambda checked: self.set_sidebar_component_visible(
@@ -5540,13 +5533,13 @@ class BrowserWindow(QMainWindow):
             )
         )
         view_menu.addAction(self.favorites_visible_action)
-        self.folder_tree_visible_action = QAction("フォルダツリーを表示", self)
+        self.folder_tree_visible_action = QAction(tr('フォルダツリーを表示'), self)
         self.folder_tree_visible_action.setCheckable(True)
         self.folder_tree_visible_action.toggled.connect(
             lambda checked: self.set_sidebar_component_visible("tree", checked)
         )
         view_menu.addAction(self.folder_tree_visible_action)
-        self.history_visible_action = QAction("履歴を表示", self)
+        self.history_visible_action = QAction(tr('履歴を表示'), self)
         self.history_visible_action.setCheckable(True)
         self.history_visible_action.toggled.connect(
             lambda checked: self.set_sidebar_component_visible(
@@ -5554,14 +5547,14 @@ class BrowserWindow(QMainWindow):
             )
         )
         view_menu.addAction(self.history_visible_action)
-        layout_menu = view_menu.addMenu("サイドバーレイアウト")
+        layout_menu = view_menu.addMenu(tr('サイドバーレイアウト'))
         self.sidebar_layout_actions: dict[str, QAction] = {}
         for name, label in (
-            ("favorites_top_tree_bottom", "お気に入り上／ツリー下"),
-            ("tree_top_favorites_bottom", "ツリー上／お気に入り下"),
-            ("tabs", "タブ"),
-            ("favorites_only", "お気に入りのみ"),
-            ("tree_only", "ツリーのみ"),
+            ("favorites_top_tree_bottom", tr('お気に入り上／ツリー下')),
+            ("tree_top_favorites_bottom", tr('ツリー上／お気に入り下')),
+            ("tabs", tr('タブ')),
+            ("favorites_only", tr('お気に入りのみ')),
+            ("tree_only", tr('ツリーのみ')),
         ):
             action = layout_menu.addAction(label)
             action.setCheckable(True)
@@ -5569,12 +5562,12 @@ class BrowserWindow(QMainWindow):
                 lambda _checked=False, value=name: self.set_sidebar_layout(value)
             )
             self.sidebar_layout_actions[name] = action
-        tree_sync_menu = view_menu.addMenu("フォルダツリー同期")
+        tree_sync_menu = view_menu.addMenu(tr('フォルダツリー同期'))
         self.folder_tree_sync_actions: dict[str, QAction] = {}
         for name, label in (
-            ("off", "同期しない"),
-            ("select_current", "現在フォルダを選択"),
-            ("focus_current", "現在フォルダへフォーカス"),
+            ("off", tr('同期しない')),
+            ("select_current", tr('現在フォルダを選択')),
+            ("focus_current", tr('現在フォルダへフォーカス')),
         ):
             action = tree_sync_menu.addAction(label)
             action.setCheckable(True)
@@ -5585,7 +5578,7 @@ class BrowserWindow(QMainWindow):
             )
             self.folder_tree_sync_actions[name] = action
         self.collapse_auto_tree_action = tree_sync_menu.addAction(
-            "無関係な自動展開を折りたたむ"
+            tr('無関係な自動展開を折りたたむ')
         )
         self.collapse_auto_tree_action.setCheckable(True)
         self.collapse_auto_tree_action.triggered.connect(
@@ -5593,8 +5586,8 @@ class BrowserWindow(QMainWindow):
         )
         self._sync_sidebar_actions()
 
-        bookmark_menu = self.menuBar().addMenu("ブックマーク")
-        self.add_folder_bookmark_action = QAction("現在のフォルダを追加", self)
+        bookmark_menu = self.menuBar().addMenu(tr('ブックマーク'))
+        self.add_folder_bookmark_action = QAction(tr('現在のフォルダを追加'), self)
         self.add_folder_bookmark_action.triggered.connect(
             self.add_current_folder_bookmark
         )
@@ -5610,14 +5603,16 @@ class BrowserWindow(QMainWindow):
             self.toggle_current_folder_bookmark
         )
 
-        history_menu = self.menuBar().addMenu("履歴")
-        clear_history_action = QAction("閲覧履歴をすべて消去...", self)
+        history_menu = self.menuBar().addMenu(tr('履歴'))
+        clear_history_action = QAction(tr('閲覧履歴をすべて消去...'), self)
         clear_history_action.triggered.connect(
             lambda _checked=False: self.clear_history()
         )
         history_menu.addAction(clear_history_action)
 
-        self.settings_action = QAction("設定", self)
+        self.settings_action = QAction(tr('設定'), self)
+        self.settings_action.setIcon(settings_icon())
+        self.settings_action.setIconVisibleInMenu(True)
         self.settings_action.triggered.connect(self.open_settings_dialog)
         self.menuBar().addAction(self.settings_action)
         self.menuBar().setCornerWidget(
@@ -5643,7 +5638,7 @@ class BrowserWindow(QMainWindow):
         status_summary_layout.setContentsMargins(0, 0, 0, 0)
         status_summary_layout.setSpacing(BROWSER_STATUS_LEFT_SPACING)
         self.browser_item_count_label = QLabel(
-            "0 個の項目",
+            tr('0 個の項目'),
             self.browser_status_summary_widget,
         )
         self.browser_item_count_label.setObjectName(
@@ -5665,7 +5660,7 @@ class BrowserWindow(QMainWindow):
             "browser_selected_path_edit"
         )
         self.browser_selected_path_edit.setAccessibleName(
-            "選択項目のパス"
+            tr('選択項目のパス')
         )
         self.browser_selected_path_edit.setReadOnly(True)
         self.browser_selected_path_edit.setFrame(False)
@@ -5716,7 +5711,7 @@ class BrowserWindow(QMainWindow):
         )
         detail_metrics = self.file_detail_label.fontMetrics()
         detail_slot_width = max(
-            detail_metrics.horizontalAdvance("999999 ページ"),
+            detail_metrics.horizontalAdvance(tr('999999 ページ')),
             detail_metrics.horizontalAdvance("99999 × 99999"),
         ) + 6
         self.file_detail_label.setFixedWidth(detail_slot_width)
@@ -5725,7 +5720,7 @@ class BrowserWindow(QMainWindow):
         )
         selected_detail_layout.addWidget(self.file_detail_label)
         browser_status_bar.addPermanentWidget(self.selected_detail_widget)
-        self.cancel_operation_button = QPushButton("キャンセル", self)
+        self.cancel_operation_button = QPushButton(tr('キャンセル'), self)
         self.cancel_operation_button.setObjectName(
             "cancel_file_operation_button"
         )
@@ -6187,7 +6182,7 @@ class BrowserWindow(QMainWindow):
                 )
             )
             self.statusBar().showMessage(
-                f"{pending.path} — 読み込み中… {count}項目"
+                tr('{p0} — 読み込み中… {p1}項目', p0=pending.path, p1=count)
             )
             return
         count = self.item_model.rowCount()
@@ -6198,9 +6193,9 @@ class BrowserWindow(QMainWindow):
             if selected is not None:
                 selected_text = str(selected.path)
         elif len(selected_indexes) > 1:
-            selected_text = f"{len(selected_indexes)} 個を選択"
+            selected_text = tr('{p0} 個を選択', p0=len(selected_indexes))
 
-        self.browser_item_count_label.setText(f"{count} 個の項目")
+        self.browser_item_count_label.setText(tr('{p0} 個の項目', p0=count))
         if self.browser_selected_path_edit.text() != selected_text:
             self.browser_selected_path_edit.setText(selected_text)
             self.browser_selected_path_edit.setCursorPosition(0)
@@ -6615,7 +6610,7 @@ class BrowserWindow(QMainWindow):
             return
         if request.ignored_count:
             self._show_temporary_status(
-                f"先頭のフォルダを使用します（ほか{request.ignored_count}件）"
+                tr('先頭のフォルダを使用します（ほか{p0}件）', p0=request.ignored_count)
             )
         if not request.paths:
             self._starting_drop_focus_navigation = True
@@ -6704,7 +6699,7 @@ class BrowserWindow(QMainWindow):
         self._pending_browser_focus = None
         if not found:
             self._show_temporary_status(
-                "ドロップした項目は現在の一覧に表示されません"
+                tr('ドロップした項目は現在の一覧に表示されません')
             )
             return
         if request.open_after:
@@ -6771,7 +6766,7 @@ class BrowserWindow(QMainWindow):
         if not paths or any(
             is_invalid_drop_target(path, destination) for path in paths
         ):
-            self._show_temporary_status("この場所にはドロップできません")
+            self._show_temporary_status(tr('この場所にはドロップできません'))
             return False
         operation_name = choose_drop_operation(paths, destination, modifiers)
         operation = (
@@ -6786,7 +6781,7 @@ class BrowserWindow(QMainWindow):
                 for path in paths
             )
         ):
-            self._show_temporary_status("同じフォルダへの移動は行いません")
+            self._show_temporary_status(tr('同じフォルダへの移動は行いません'))
             return False
         return self._start_file_operation(
             operation,
@@ -6829,7 +6824,7 @@ class BrowserWindow(QMainWindow):
             if self.metadata_store.add_folder_bookmark(folder):
                 added += 1
         if added:
-            self._show_temporary_status(f"{added}件をお気に入りへ追加しました")
+            self._show_temporary_status(tr('{p0}件をお気に入りへ追加しました', p0=added))
 
     def _show_context_menu(self, position: QPoint, *, keyboard: bool = False) -> None:
         if self.list_view.consume_folder_gesture_context_menu_suppression():
@@ -6868,8 +6863,8 @@ class BrowserWindow(QMainWindow):
             filename_action = QWidgetAction(menu)
             filename_action.setDefaultWidget(filename_edit)
             menu.addAction(filename_action)
-            selected_text_copy = menu.addAction("選択文字をコピー")
-            selected_text_search = menu.addAction("選択文字で検索")
+            selected_text_copy = menu.addAction(tr('選択文字をコピー'))
+            selected_text_search = menu.addAction(tr('選択文字で検索'))
             def update_text_actions() -> None:
                 enabled = bool(filename_edit.selectedText())
                 selected_text_copy.setEnabled(enabled)
@@ -6877,9 +6872,9 @@ class BrowserWindow(QMainWindow):
             filename_edit.selectionChanged.connect(update_text_actions)
             update_text_actions()
             menu.addSeparator()
-        open_action = menu.addAction("開く")
-        open_with_action = menu.addAction("関連付けで開く...")
-        location_action = menu.addAction("エクスプローラーで開く")
+        open_action = menu.addAction(tr('開く'))
+        open_with_action = menu.addAction(tr('関連付けで開く...'))
+        location_action = menu.addAction(tr('エクスプローラーで開く'))
         target_exists = bool(
             item is not None
             and self._absolute_browser_path(item.path).exists()
@@ -6893,12 +6888,12 @@ class BrowserWindow(QMainWindow):
         )
         location_action.setEnabled(item is not None and target_exists)
         menu.addSeparator()
-        cut_action = menu.addAction("切り取り")
-        copy_action = menu.addAction("コピー")
+        cut_action = menu.addAction(tr('切り取り'))
+        copy_action = menu.addAction(tr('コピー'))
         copy_name_action = (
-            menu.addAction("名前をコピー") if selection_count > 0 else None
+            menu.addAction(tr('名前をコピー')) if selection_count > 0 else None
         )
-        paste_action = menu.addAction("貼り付け")
+        paste_action = menu.addAction(tr('貼り付け'))
         cut_action.setEnabled(selection_count > 0 and not busy)
         copy_action.setEnabled(selection_count > 0 and not busy)
         paste_action.setEnabled(
@@ -6907,12 +6902,12 @@ class BrowserWindow(QMainWindow):
             and bool(self._clipboard_paths or self._clipboard_file_urls())
         )
         menu.addSeparator()
-        recycle_action = menu.addAction("削除")
+        recycle_action = menu.addAction(tr('削除'))
         recycle_action.setEnabled(selection_count > 0 and not busy)
-        rating_menu = menu.addMenu("レート")
+        rating_menu = menu.addMenu(tr('レート'))
         rating_actions: dict[QAction, int | None] = {}
         for label, value in (
-            ("なし", None),
+            (tr('なし'), None),
             ("★", 1),
             ("★★", 2),
             ("★★★", 3),
@@ -6923,7 +6918,7 @@ class BrowserWindow(QMainWindow):
             action.setEnabled(bool(rating_paths) and not busy)
             rating_actions[action] = value
         menu.addSeparator()
-        properties_action = menu.addAction("プロパティ")
+        properties_action = menu.addAction(tr('プロパティ'))
         properties_action.setEnabled(selection_count == 1 and not busy)
         anchor = position
         if keyboard and not self.list_view.viewport().rect().contains(anchor):
@@ -6965,12 +6960,12 @@ class BrowserWindow(QMainWindow):
         if entry is None:
             return
         menu = QMenu(self)
-        open_action = menu.addAction("開く")
-        new_action = menu.addAction("新しいViewerWindowで開く")
+        open_action = menu.addAction(tr('開く'))
+        new_action = menu.addAction(tr('新しいViewerWindowで開く'))
         if entry.item_type == "folder":
             new_action.setEnabled(False)
         menu.addSeparator()
-        remove_action = menu.addAction("ブックマークから削除")
+        remove_action = menu.addAction(tr('ブックマークから削除'))
         selected = menu.exec(self.bookmark_view.viewport().mapToGlobal(position))
         if selected == open_action:
             self.open_bookmark(index)
@@ -6985,16 +6980,16 @@ class BrowserWindow(QMainWindow):
         if entry is None:
             return
         menu = QMenu(self)
-        open_action = menu.addAction("移動")
-        location_action = menu.addAction("エクスプローラーで場所を開く")
+        open_action = menu.addAction(tr('移動'))
+        location_action = menu.addAction(tr('エクスプローラーで場所を開く'))
         menu.addSeparator()
-        rename_action = menu.addAction("表示名を変更")
-        move_up_action = menu.addAction("上へ移動")
-        move_down_action = menu.addAction("下へ移動")
-        remove_action = menu.addAction("お気に入りから削除")
+        rename_action = menu.addAction(tr('表示名を変更'))
+        move_up_action = menu.addAction(tr('上へ移動'))
+        move_down_action = menu.addAction(tr('下へ移動'))
+        remove_action = menu.addAction(tr('お気に入りから削除'))
         menu.addSeparator()
-        copy_here_action = menu.addAction("選択項目をここへコピー")
-        move_here_action = menu.addAction("選択項目をここへ移動")
+        copy_here_action = menu.addAction(tr('選択項目をここへコピー'))
+        move_here_action = menu.addAction(tr('選択項目をここへ移動'))
         has_selection = bool(self.selected_file_operation_paths())
         busy = (
             self.file_operation_coordinator.busy
@@ -7039,10 +7034,10 @@ class BrowserWindow(QMainWindow):
     def _show_folder_tree_context_menu(self, position: QPoint) -> None:
         index = self.folder_tree.indexAt(position)
         menu = QMenu(self)
-        full_tree_action = menu.addAction("ツリーのルートを戻す")
+        full_tree_action = menu.addAction(tr('ツリーのルートを戻す'))
         menu.addSeparator()
-        copy_here_action = menu.addAction("選択項目をここへコピー")
-        move_here_action = menu.addAction("選択項目をここへ移動")
+        copy_here_action = menu.addAction(tr('選択項目をここへコピー'))
+        move_here_action = menu.addAction(tr('選択項目をここへ移動'))
         has_selection = bool(self.selected_file_operation_paths())
         busy = (
             self.file_operation_coordinator.busy
@@ -7074,12 +7069,12 @@ class BrowserWindow(QMainWindow):
         if entry is None:
             return
         menu = QMenu(self)
-        open_action = menu.addAction("開く")
-        new_action = menu.addAction("新しいViewerWindowで開く")
-        location_action = menu.addAction("親フォルダを表示")
+        open_action = menu.addAction(tr('開く'))
+        new_action = menu.addAction(tr('新しいViewerWindowで開く'))
+        location_action = menu.addAction(tr('親フォルダを表示'))
         menu.addSeparator()
-        remove_action = menu.addAction("この履歴を削除")
-        clear_action = menu.addAction("閲覧履歴をすべて消去...")
+        remove_action = menu.addAction(tr('この履歴を削除'))
+        clear_action = menu.addAction(tr('閲覧履歴をすべて消去...'))
         selected = menu.exec(self.history_view.viewport().mapToGlobal(position))
         if selected == open_action:
             self.open_history(index)

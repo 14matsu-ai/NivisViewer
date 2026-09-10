@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import platform
 import os
 import sys
@@ -32,11 +35,15 @@ def diagnostic_text(
     profile_dir: str | Path,
     *,
     pdf_available: bool | None = None,
-    archive_status: str = "起動時検出を使用",
-    registration_status: str = "設定画面で確認",
+    archive_status: str | None = None,
+    registration_status: str | None = None,
     pdf_snapshot: PdfAvailabilitySnapshot | None = None,
 ) -> str:
     versions = dependency_versions()
+    if archive_status is None:
+        archive_status = tr("起動時検出を使用")
+    if registration_status is None:
+        registration_status = tr("設定画面で確認")
     lines = [
         f"NivisViewer {__version__}",
         "License: MIT",
@@ -61,15 +68,15 @@ def _pdf_status_text(
 ) -> str:
     if snapshot is None:
         if legacy_available is None:
-            return "未確認"
-        return "利用可能" if legacy_available else "利用不可"
+            return tr('未確認')
+        return tr('利用可能') if legacy_available else tr('利用不可')
     return {
-        PdfAvailabilityState.UNKNOWN: "未確認",
-        PdfAvailabilityState.CHECKING: "確認中",
-        PdfAvailabilityState.AVAILABLE: "利用可能",
-        PdfAvailabilityState.UNAVAILABLE: "利用不可",
-        PdfAvailabilityState.ERROR: "エラー",
-        PdfAvailabilityState.STOPPED: "停止済み",
+        PdfAvailabilityState.UNKNOWN: tr('未確認'),
+        PdfAvailabilityState.CHECKING: tr('確認中'),
+        PdfAvailabilityState.AVAILABLE: tr('利用可能'),
+        PdfAvailabilityState.UNAVAILABLE: tr('利用不可'),
+        PdfAvailabilityState.ERROR: tr('エラー'),
+        PdfAvailabilityState.STOPPED: tr('停止済み'),
     }[snapshot.state]
 
 
@@ -84,7 +91,7 @@ class DiagnosticsDialog(QDialog):
         pdfium_service: PdfiumService | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("NivisViewerについて／診断情報")
+        self.setWindowTitle(tr('NivisViewerについて／診断情報'))
         install_window_icon(self)
         self.resize(680, 480)
         self.profile_dir = Path(profile_dir)
@@ -103,9 +110,9 @@ class DiagnosticsDialog(QDialog):
         self.text_edit = QTextEdit(self)
         self.text_edit.setReadOnly(True)
         self.text_edit.setPlainText(self._current_text())
-        copy_button = QPushButton("診断情報をコピー", self)
-        logs_button = QPushButton("ログフォルダを開く", self)
-        licenses_button = QPushButton("ライセンス情報を開く", self)
+        copy_button = QPushButton(tr('診断情報をコピー'), self)
+        logs_button = QPushButton(tr('ログフォルダを開く'), self)
+        licenses_button = QPushButton(tr('ライセンス情報を開く'), self)
         copy_button.clicked.connect(self.copy_to_clipboard)
         logs_button.clicked.connect(
             lambda: self._open_path(self.profile_dir / "data" / "logs")

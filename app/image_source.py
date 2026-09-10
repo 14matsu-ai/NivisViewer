@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import io
 import os
 import re
@@ -135,7 +138,7 @@ def _read_image_file_bytes(path: str | Path) -> bytes:
         None,
     )
     if handle == wintypes.HANDLE(-1).value:
-        raise OSError(ctypes.get_last_error(), f"画像を開けません: {target}")
+        raise OSError(ctypes.get_last_error(), tr('画像を開けません: {p0}', p0=target))
     try:
         file_descriptor = msvcrt.open_osfhandle(
             int(handle),
@@ -604,7 +607,7 @@ class FolderImageSource(ImageSource):
             if file_size is not None
         }
         if not self.source_path.is_dir():
-            raise ImageSourceError(f"フォルダが見つかりません: {self.source_path}")
+            raise ImageSourceError(tr('フォルダが見つかりません: {p0}', p0=self.source_path))
 
     def list_images(self) -> list[str]:
         if self._listed_images is not None:
@@ -638,7 +641,7 @@ class FolderImageSource(ImageSource):
                         if is_file:
                             files.append(Path(entry.path))
         except OSError as exc:
-            raise ImageSourceError(f"フォルダを読み込めません: {self.source_path}") from exc
+            raise ImageSourceError(tr('フォルダを読み込めません: {p0}', p0=self.source_path)) from exc
 
         listed = tuple(
             str(path)
@@ -684,7 +687,7 @@ class FolderImageSource(ImageSource):
                 self._size_cache[image_id] = result.size
                 return result
         except Exception as exc:
-            raise ImageSourceError(f"画像を読み込めません: {image_id}") from exc
+            raise ImageSourceError(tr('画像を読み込めません: {p0}', p0=image_id)) from exc
 
     def open_qimage(self, image_id: str) -> QImage | None:
         if Path(image_id).suffix.casefold() != ".webp":
@@ -791,14 +794,14 @@ class ZipImageSource(ImageSource):
         super().__init__(archive_path)
         self.sort_descending = sort_descending
         if not self.source_path.is_file():
-            raise ImageSourceError(f"書庫が見つかりません: {self.source_path}")
+            raise ImageSourceError(tr('書庫が見つかりません: {p0}', p0=self.source_path))
 
         try:
             self._zip = zipfile.ZipFile(self.source_path, "r")
         except zipfile.BadZipFile as exc:
-            raise ImageSourceError(f"ZIP/CBZとして開けません: {self.source_path}") from exc
+            raise ImageSourceError(tr('ZIP/CBZとして開けません: {p0}', p0=self.source_path)) from exc
         except OSError as exc:
-            raise ImageSourceError(f"書庫を開けません: {self.source_path}") from exc
+            raise ImageSourceError(tr('書庫を開けません: {p0}', p0=self.source_path)) from exc
         self._lock = threading.RLock()
         self._active_lock = threading.RLock()
         self._closed = threading.Event()
@@ -842,7 +845,7 @@ class ZipImageSource(ImageSource):
         except ImageSourceError:
             raise
         except Exception as exc:
-            raise ImageSourceError(f"書庫内の画像を読み込めません: {image_id}") from exc
+            raise ImageSourceError(tr('書庫内の画像を読み込めません: {p0}', p0=image_id)) from exc
         finally:
             self._finish_request(image_id, cancelled)
 
@@ -903,12 +906,12 @@ class ZipImageSource(ImageSource):
                 info = self._zip.NameToInfo.get(image_id)
                 if info is None:
                     raise ImageSourceError(
-                        f"書庫内の画像が見つかりません: {image_id}",
+                        tr('書庫内の画像が見つかりません: {p0}', p0=image_id),
                         code=ArchiveErrorCode.ENTRY_NOT_FOUND.value,
                     )
                 if info.file_size > MAX_IMAGE_ENTRY_BYTES:
                     raise ImageSourceError(
-                        "書庫内の画像が大きすぎます。",
+                        tr('書庫内の画像が大きすぎます。'),
                         code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
                     )
                 self._raise_if_cancelled(cancelled)
@@ -935,7 +938,7 @@ class ZipImageSource(ImageSource):
                         self._raise_if_cancelled(cancelled)
                         if device.too_large:
                             raise ImageSourceError(
-                                "書庫内の画像が大きすぎます。",
+                                tr('書庫内の画像が大きすぎます。'),
                                 code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
                             )
                         if device.read_error is not None:
@@ -970,7 +973,7 @@ class ZipImageSource(ImageSource):
                         self._raise_if_cancelled(cancelled)
                         if device.too_large:
                             raise ImageSourceError(
-                                "書庫内の画像が大きすぎます。",
+                                tr('書庫内の画像が大きすぎます。'),
                                 code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
                             )
                         if device.read_error is not None or image.isNull():
@@ -1019,7 +1022,7 @@ class ZipImageSource(ImageSource):
                 # every fallback decoder.  Failing here also keeps first-use
                 # plugin initialization away from a malformed worker payload.
                 raise ImageSourceError(
-                    f"書庫内のJPEGが破損しています: {image_id}"
+                    tr('書庫内のJPEGが破損しています: {p0}', p0=image_id)
                 )
             decoded = _read_jpeg_qbytearray_at_most(
                 payload,
@@ -1066,12 +1069,12 @@ class ZipImageSource(ImageSource):
                 info = self._zip.NameToInfo.get(image_id)
                 if info is None:
                     raise ImageSourceError(
-                        f"書庫内の画像が見つかりません: {image_id}",
+                        tr('書庫内の画像が見つかりません: {p0}', p0=image_id),
                         code=ArchiveErrorCode.ENTRY_NOT_FOUND.value,
                     )
                 if info.file_size > MAX_IMAGE_ENTRY_BYTES:
                     raise ImageSourceError(
-                        "書庫内の画像が大きすぎます。",
+                        tr('書庫内の画像が大きすぎます。'),
                         code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
                     )
                 with self._zip.open(info, "r") as entry:
@@ -1091,7 +1094,7 @@ class ZipImageSource(ImageSource):
                         self._raise_if_cancelled(cancelled)
                         if device.too_large:
                             raise ImageSourceError(
-                                "書庫内の画像が大きすぎます。",
+                                tr('書庫内の画像が大きすぎます。'),
                                 code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
                             )
                         if device.read_error is not None:
@@ -1160,7 +1163,7 @@ class ZipImageSource(ImageSource):
     def _raise_if_cancelled(cancelled: threading.Event) -> None:
         if cancelled.is_set():
             raise ImageSourceError(
-                "ZIP画像の読み込みを中止しました。",
+                tr('ZIP画像の読み込みを中止しました。'),
                 code=ArchiveErrorCode.PROCESS_CANCELLED.value,
             )
 
@@ -1176,12 +1179,12 @@ class ZipImageSource(ImageSource):
                 info = self._zip.getinfo(image_id)
             except KeyError as exc:
                 raise ImageSourceError(
-                    f"書庫内の画像が見つかりません: {image_id}",
+                    tr('書庫内の画像が見つかりません: {p0}', p0=image_id),
                     code=ArchiveErrorCode.ENTRY_NOT_FOUND.value,
                 ) from exc
             if info.file_size > MAX_IMAGE_ENTRY_BYTES:
                 raise ImageSourceError(
-                    "書庫内の画像が大きすぎます。",
+                    tr('書庫内の画像が大きすぎます。'),
                     code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
                 )
             self._raise_if_cancelled(cancelled)
@@ -1201,7 +1204,7 @@ class ZipImageSource(ImageSource):
                     total += len(chunk)
                     if total > MAX_IMAGE_ENTRY_BYTES:
                         raise ImageSourceError(
-                            "書庫内の画像が大きすぎます。",
+                            tr('書庫内の画像が大きすぎます。'),
                             code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
                         )
                     buffer.write(chunk)
@@ -1222,12 +1225,12 @@ class ZipImageSource(ImageSource):
                 info = self._zip.getinfo(image_id)
             except KeyError as exc:
                 raise ImageSourceError(
-                    f"書庫内の画像が見つかりません: {image_id}",
+                    tr('書庫内の画像が見つかりません: {p0}', p0=image_id),
                     code=ArchiveErrorCode.ENTRY_NOT_FOUND.value,
                 ) from exc
             if info.file_size > MAX_IMAGE_ENTRY_BYTES:
                 raise ImageSourceError(
-                    "書庫内の画像が大きすぎます。",
+                    tr('書庫内の画像が大きすぎます。'),
                     code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
                 )
             payload.reserve(max(0, int(info.file_size)))
@@ -1244,7 +1247,7 @@ class ZipImageSource(ImageSource):
                     total += len(chunk)
                     if total > MAX_IMAGE_ENTRY_BYTES:
                         raise ImageSourceError(
-                            "書庫内の画像が大きすぎます。",
+                            tr('書庫内の画像が大きすぎます。'),
                             code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
                         )
                     payload.append(chunk)
@@ -1356,7 +1359,7 @@ class SevenZipImageSource(ImageSource):
             ) from exc
         if not entries:
             raise ImageSourceError(
-                "表示可能な画像がありません。",
+                tr('表示可能な画像がありません。'),
                 code="no_images",
             )
         self.listing = listing
@@ -1378,9 +1381,9 @@ class SevenZipImageSource(ImageSource):
     def validate_archive(self) -> None:
         if self._archive_stamp != self._stat_archive():
             self.close()
-            raise ImageSourceError("書庫が変更されました。開き直してください。", code="source_changed")
+            raise ImageSourceError(tr('書庫が変更されました。開き直してください。'), code="source_changed")
         if self._closed.is_set():
-            raise ImageSourceError("読み込みを中止しました。", code=ArchiveErrorCode.PROCESS_CANCELLED.value)
+            raise ImageSourceError(tr('読み込みを中止しました。'), code=ArchiveErrorCode.PROCESS_CANCELLED.value)
 
     @property
     def payload_cache_bytes(self) -> int:
@@ -1411,19 +1414,19 @@ class SevenZipImageSource(ImageSource):
         entry = self._entry_by_id.get(image_id)
         if entry is None:
             raise ImageSourceError(
-                "書庫内の画像が見つかりません。",
+                tr('書庫内の画像が見つかりません。'),
                 code=ArchiveErrorCode.ENTRY_NOT_FOUND.value,
             )
         if entry.size is not None and entry.size > MAX_IMAGE_ENTRY_BYTES:
             raise ImageSourceError(
-                "書庫内の画像が大きすぎます。",
+                tr('書庫内の画像が大きすぎます。'),
                 code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
             )
         cancelled = threading.Event()
         self.validate_archive()
         with self._active_lock:
             if self._closed.is_set():
-                raise ImageSourceError("読み込みを中止しました。", code=ArchiveErrorCode.PROCESS_CANCELLED.value)
+                raise ImageSourceError(tr('読み込みを中止しました。'), code=ArchiveErrorCode.PROCESS_CANCELLED.value)
             cached = self._payloads.get(image_id)
             if cached is not None:
                 self._payloads.move_to_end(image_id)
@@ -1445,10 +1448,10 @@ class SevenZipImageSource(ImageSource):
             if not data or len(data) > MAX_IMAGE_ENTRY_BYTES or (
                 entry.size is not None and len(data) != entry.size
             ):
-                raise ImageSourceError("書庫内の画像データが不完全です。", code="invalid_entry_size")
+                raise ImageSourceError(tr('書庫内の画像データが不完全です。'), code="invalid_entry_size")
             with self._active_lock:
                 if cancelled.is_set() or self._closed.is_set():
-                    raise ImageSourceError("読み込みを中止しました。", code=ArchiveErrorCode.PROCESS_CANCELLED.value)
+                    raise ImageSourceError(tr('読み込みを中止しました。'), code=ArchiveErrorCode.PROCESS_CANCELLED.value)
                 if len(data) <= self._payload_budget and self._archive_stamp is not None:
                     previous = self._payloads.pop(image_id, None)
                     if previous is not None:
@@ -1466,7 +1469,7 @@ class SevenZipImageSource(ImageSource):
             raise
         except Exception as exc:
             raise ImageSourceError(
-                f"書庫内の画像を読み込めません: {image_id}",
+                tr('書庫内の画像を読み込めません: {p0}', p0=image_id),
                 code="decode_failed",
             ) from exc
         finally:
@@ -1485,7 +1488,7 @@ class SevenZipImageSource(ImageSource):
                 return ImageOps.exif_transpose(image).copy()
         except Exception as exc:
             self._discard_payload(image_id)
-            raise ImageSourceError(f"書庫内の画像を読み込めません: {image_id}", code="decode_failed") from exc
+            raise ImageSourceError(tr('書庫内の画像を読み込めません: {p0}', p0=image_id), code="decode_failed") from exc
 
     def _discard_payload(self, image_id: str) -> None:
         with self._active_lock:
@@ -1502,7 +1505,7 @@ class SevenZipImageSource(ImageSource):
         decoded = _read_folder_compatible_jpeg_at_most(data, maximum_size)
         if decoded is None:
             self._discard_payload(image_id)
-            raise ImageSourceError(f"JPEGを読み込めません: {image_id}", code="decode_failed")
+            raise ImageSourceError(tr('JPEGを読み込めません: {p0}', p0=image_id), code="decode_failed")
         image, original_size = decoded
         return StreamedJpegDecode(image, original_size, len(data), 1,
                                   "external-payload-pillow-draft", 1)
@@ -1526,7 +1529,7 @@ class SevenZipImageSource(ImageSource):
                 return width, height
         except Exception as exc:
             self._discard_payload(image_id)
-            raise ImageSourceError(f"画像ヘッダーを読み込めません: {image_id}", code="decode_failed") from exc
+            raise ImageSourceError(tr('画像ヘッダーを読み込めません: {p0}', p0=image_id), code="decode_failed") from exc
 
     def cancel_image_request(self, image_id: str) -> None:
         with self._active_lock:
@@ -1580,7 +1583,7 @@ def create_image_source(
     if suffix in PDF_EXTENSIONS:
         if pdfium_service is None:
             raise ImageSourceError(
-                "PDFレンダリング機能を利用できません。",
+                tr('PDFレンダリング機能を利用できません。'),
                 code="backend_unavailable",
             )
         from .pdf_image_source import PdfImageSource
@@ -1605,8 +1608,7 @@ def create_image_source(
         )
         if backend is None:
             raise ImageSourceError(
-                "RAR／7zの閲覧には7-Zipが必要です。"
-                "設定から実行ファイルを指定してください。",
+                tr('RAR／7zの閲覧には7-Zipが必要です。設定から実行ファイルを指定してください。'),
                 code=ArchiveErrorCode.BACKEND_NOT_FOUND.value,
             )
         return (
@@ -1658,7 +1660,7 @@ def create_image_source(
         selected_image = selected_from_snapshot or str(target)
         return source, selected_image
 
-    raise ImageSourceError(f"対応していない形式です: {target}")
+    raise ImageSourceError(tr('対応していない形式です: {p0}', p0=target))
 
 
 def _path_identity_key(path: str | Path) -> str:

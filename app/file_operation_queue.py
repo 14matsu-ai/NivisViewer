@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import os
 from collections import deque
 from dataclasses import dataclass, replace
@@ -75,7 +78,7 @@ class _PreflightWorker(QRunnable):
                 operation=self.request.operation,
                 source_paths=self.request.source_paths,
                 destination_directory=self.request.destination_directory,
-                errors=(f"事前確認に失敗しました: {exc}",),
+                errors=(tr('事前確認に失敗しました: {p0}', p0=exc),),
                 state=FileOperationState.FAILED,
             )
         self.signals.completed.emit(self.request, plan)
@@ -475,7 +478,7 @@ class FileOperationQueue(QObject):
                         if entry.state is FileOperationState.CANCELLED
                         else FileOperationErrorCode.IO_ERROR.value
                     ),
-                    "; ".join(plan.errors) if plan.errors else "操作がキャンセルされました",
+                    "; ".join(plan.errors) if plan.errors else tr('操作がキャンセルされました'),
                 )
                 for source in (plan.source_paths or (None,))
             )
@@ -571,7 +574,7 @@ class FileOperationQueue(QObject):
             active = self._active
         operation_id = active.operation_id if active is not None else ""
         self.shutdown_failed.emit(
-            f"ファイル操作の終了を待機中です: {operation_id}"
+            tr('ファイル操作の終了を待機中です: {p0}', p0=operation_id)
         )
 
     def _contains_id_locked(self, operation_id: str) -> bool:

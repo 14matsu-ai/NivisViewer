@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -25,39 +28,39 @@ class FilenameValidationResult:
 def validate_windows_filename(name: str) -> FilenameValidationResult:
     candidate = str(name)
     if not candidate:
-        return _invalid(candidate, "empty", "名前を入力してください")
+        return _invalid(candidate, "empty", tr('名前を入力してください'))
     if candidate in {".", ".."}:
-        return _invalid(candidate, "dot_name", "「.」と「..」は使用できません")
+        return _invalid(candidate, "dot_name", tr('「.」と「..」は使用できません'))
     if candidate[-1:] in {" ", "."}:
         return _invalid(
             candidate,
             "trailing_space_or_dot",
-            "名前の末尾に空白またはピリオドは使用できません",
+            tr('名前の末尾に空白またはピリオドは使用できません'),
         )
     if any(character in _INVALID_CHARACTERS for character in candidate):
         return _invalid(
             candidate,
             "invalid_character",
-            '名前に < > : " / \\ | ? * は使用できません',
+            tr('名前に < > : " / \\ | ? * は使用できません'),
         )
     if any(ord(character) < 32 for character in candidate):
         return _invalid(
             candidate,
             "control_character",
-            "名前に制御文字は使用できません",
+            tr('名前に制御文字は使用できません'),
         )
     stem = candidate.split(".", 1)[0].upper()
     if stem in _RESERVED_STEMS:
         return _invalid(
             candidate,
             "reserved_name",
-            f"Windowsの予約名「{stem}」は使用できません",
+            tr('Windowsの予約名「{p0}」は使用できません', p0=stem),
         )
     if _utf16_units(candidate) > MAX_WINDOWS_FILENAME_UNITS:
         return _invalid(
             candidate,
             "too_long",
-            "名前が長すぎます",
+            tr('名前が長すぎます'),
         )
     return FilenameValidationResult(True, candidate)
 

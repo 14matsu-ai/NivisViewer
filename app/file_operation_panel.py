@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -79,9 +82,9 @@ class FileOperationPanel(QWidget):
         self.byte_progress.setTextVisible(True)
         self.current_file_progress = QProgressBar(self)
         self.current_file_progress.setTextVisible(True)
-        self.cancel_button = QPushButton("キャンセル", self)
+        self.cancel_button = QPushButton(tr('キャンセル'), self)
         self.cancel_button.clicked.connect(self._request_cancel)
-        self.details_button = QPushButton("詳細", self)
+        self.details_button = QPushButton(tr('詳細'), self)
         self.details_button.setVisible(False)
         self.details_view = QTextEdit(self)
         self.details_view.setReadOnly(True)
@@ -143,7 +146,7 @@ class FileOperationPanel(QWidget):
         self.show_state(request.operation.value, state)
 
     def _on_queue_changed(self) -> None:
-        self.queue_label.setText(f"待機 {len(self._queue.queued_requests)}")
+        self.queue_label.setText(tr('待機 {p0}', p0=len(self._queue.queued_requests)))
         self.close_if_idle()
 
     def _begin_operation(self, request: FileOperationRequest) -> None:
@@ -212,7 +215,7 @@ class FileOperationPanel(QWidget):
         if progress.bytes_per_second > 0:
             details += f"  {self._format_bytes(progress.bytes_per_second)}/s"
         if progress.eta_seconds is not None:
-            details += f"  残り約{max(0, round(progress.eta_seconds))}秒"
+            details += tr('  残り約{p0}秒', p0=max(0, round(progress.eta_seconds)))
         self.detail_label.setText(details)
         item_maximum, item_value = _project_qt_progress(
             progress.completed,
@@ -274,10 +277,10 @@ class FileOperationPanel(QWidget):
         )
         self.details_view.setPlainText(
             "\n".join(
-                f"{item.source_path or item.destination_path or '(不明)'}: "
-                f"{item.error_message or item.error_code or '失敗'}"
+                f"{item.source_path or item.destination_path or tr('(不明)')}: "
+                f"{item.error_message or item.error_code or tr('失敗')}"
                 + (
-                    f"\n  未回収artifact: {', '.join(item.artifact_paths)}"
+                    tr('\n  未回収artifact: {p0}', p0=', '.join(item.artifact_paths))
                     if item.artifact_paths
                     else ""
                 )
@@ -293,18 +296,17 @@ class FileOperationPanel(QWidget):
         self.details_button.setVisible(bool(failures))
         self.cancel_button.setEnabled(False)
         if result.cancelled:
-            self.summary_label.setText("キャンセルしました")
+            self.summary_label.setText(tr('キャンセルしました'))
             self._hide_timer.start(3000)
         elif failures:
             summary = (
-                f"完了: 成功 {sum(item.success for item in items)} / "
-                f"スキップ {skipped} / 失敗 {max(0, failures - skipped)}"
+                tr('完了: 成功 {p0} / スキップ {p1} / 失敗 {p2}', p0=sum(item.success for item in items), p1=skipped, p2=max(0, failures - skipped))
             )
             if source_remaining:
-                summary += f"（元項目残留 {source_remaining}）"
+                summary += tr('（元項目残留 {p0}）', p0=source_remaining)
             self.summary_label.setText(summary)
         else:
-            self.summary_label.setText("完了")
+            self.summary_label.setText(tr('完了'))
             self._hide_timer.start(2500)
         self.byte_progress.setRange(0, 1000)
         self.byte_progress.setValue(1000 if not result.cancelled else 0)

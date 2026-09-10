@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -53,8 +56,8 @@ class ConflictPresentationModel:
         source_path = conflict.source_path or ""
         destination_path = conflict.destination_path or ""
         return cls(
-            source_name=os.path.basename(source_path) or "(不明)",
-            source_path=source_path or "(不明)",
+            source_name=os.path.basename(source_path) or tr('(不明)'),
+            source_path=source_path or tr('(不明)'),
             source_size=cls._size_text(
                 conflict.source_size,
                 conflict.source_kind,
@@ -62,9 +65,9 @@ class ConflictPresentationModel:
             source_modified_time=FileConflictTableModel._format_mtime(
                 conflict.source_mtime_ns
             )
-            or "(不明)",
-            destination_name=os.path.basename(destination_path) or "(不明)",
-            destination_path=destination_path or "(不明)",
+            or tr('(不明)'),
+            destination_name=os.path.basename(destination_path) or tr('(不明)'),
+            destination_path=destination_path or tr('(不明)'),
             destination_size=cls._size_text(
                 conflict.destination_size,
                 conflict.destination_kind,
@@ -72,11 +75,11 @@ class ConflictPresentationModel:
             destination_modified_time=FileConflictTableModel._format_mtime(
                 conflict.destination_mtime_ns
             )
-            or "(不明)",
+            or tr('(不明)'),
             item_position=f"{max(1, item_index)} / {max(1, total_count)}",
             item_kind=(
-                f"{conflict.source_kind or '不明'} → "
-                f"{conflict.destination_kind or '不明'}"
+                f"{conflict.source_kind or tr('不明')} → "
+                f"{conflict.destination_kind or tr('不明')}"
             ),
             selected_action=selected_action.value,
         )
@@ -84,9 +87,9 @@ class ConflictPresentationModel:
     @staticmethod
     def _size_text(size: int | None, kind: str | None) -> str:
         if kind == "directory":
-            return "フォルダ（サイズ不明）"
+            return tr('フォルダ（サイズ不明）')
         if size is None:
-            return "(不明)"
+            return tr('(不明)')
         return f"{size:,} bytes"
 
 
@@ -121,7 +124,7 @@ class FileConflictTableModel(QAbstractTableModel):
             and orientation == Qt.Orientation.Horizontal
             and 0 <= section < len(self.HEADERS)
         ):
-            return self.HEADERS[section]
+            return tr(self.HEADERS[section])
         return None
 
     def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
@@ -132,16 +135,14 @@ class FileConflictTableModel(QAbstractTableModel):
             return conflict
         if role == Qt.ItemDataRole.ToolTipRole:
             return (
-                f"{conflict.message}\n"
-                f"元: {conflict.source_path or ''}\n"
-                f"先: {conflict.destination_path or ''}"
+                tr('{p0}\n元: {p1}\n先: {p2}', p0=conflict.message, p1=conflict.source_path or '', p2=conflict.destination_path or '')
             )
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         if index.column() == 0:
-            return os.path.basename(conflict.source_path or "") or "(不明)"
+            return os.path.basename(conflict.source_path or "") or tr('(不明)')
         if index.column() == 1:
-            return os.path.basename(conflict.destination_path or "") or "(不明)"
+            return os.path.basename(conflict.destination_path or "") or tr('(不明)')
         if index.column() == 2:
             return conflict.source_kind or ""
         if index.column() == 3:
@@ -225,7 +226,7 @@ class ConflictResolutionDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.plan = plan
-        self.setWindowTitle("ファイル名の衝突")
+        self.setWindowTitle(tr('ファイル名の衝突'))
         install_window_icon(self)
         self.setModal(True)
         self.resize(780, 440)
@@ -240,22 +241,22 @@ class ConflictResolutionDialog(QDialog):
             QAbstractScrollArea.SizeAdjustPolicy.AdjustToContentsOnFirstShow
         )
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.same_kind_checkbox = QCheckBox("同じ種類の衝突へ適用", self)
+        self.same_kind_checkbox = QCheckBox(tr('同じ種類の衝突へ適用'), self)
         self.detail_labels: dict[str, QLabel] = {}
         detail_layout = QGridLayout()
         detail_rows = (
-            ("position", "現在の処理"),
-            ("source_name", "同名ファイル名"),
-            ("source_path", "コピー元／移動元"),
-            ("source_meta", "元のサイズ／更新日時"),
-            ("destination_path", "コピー先／移動先"),
-            ("destination_meta", "先のサイズ／更新日時"),
-            ("kind", "種別"),
-            ("action", "選択中の処理"),
+            ("position", tr('現在の処理')),
+            ("source_name", tr('同名ファイル名')),
+            ("source_path", tr('コピー元／移動元')),
+            ("source_meta", tr('元のサイズ／更新日時')),
+            ("destination_path", tr('コピー先／移動先')),
+            ("destination_meta", tr('先のサイズ／更新日時')),
+            ("kind", tr('種別')),
+            ("action", tr('選択中の処理')),
         )
         for row, (key, caption) in enumerate(detail_rows):
             caption_label = QLabel(caption, self)
-            value_label = QLabel("(不明)", self)
+            value_label = QLabel(tr('(不明)'), self)
             value_label.setObjectName(f"conflict_{key}_label")
             value_label.setTextInteractionFlags(
                 Qt.TextInteractionFlag.TextSelectableByMouse
@@ -273,10 +274,10 @@ class ConflictResolutionDialog(QDialog):
         action_layout = QHBoxLayout()
         self.resolution_buttons: dict[ConflictResolution, QPushButton] = {}
         for text, resolution in (
-            ("スキップ", ConflictResolution.SKIP),
-            ("両方残す", ConflictResolution.KEEP_BOTH),
-            ("置き換え", ConflictResolution.REPLACE),
-            ("マージ", ConflictResolution.MERGE),
+            (tr('スキップ'), ConflictResolution.SKIP),
+            (tr('両方残す'), ConflictResolution.KEEP_BOTH),
+            (tr('置き換え'), ConflictResolution.REPLACE),
+            (tr('マージ'), ConflictResolution.MERGE),
         ):
             button = QPushButton(text, self)
             button.clicked.connect(
@@ -298,7 +299,7 @@ class ConflictResolutionDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(
             QLabel(
-                "処理を選択してください。既定では安全のためスキップします。",
+                tr('処理を選択してください。既定では安全のためスキップします。'),
                 self,
             )
         )

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from PySide6.QtCore import QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QContextMenuEvent, QMouseEvent, QPainter
 from PySide6.QtWidgets import QMenu, QWidget
@@ -127,11 +130,11 @@ class BrowserRatingFilterWidget(QWidget):
         reference = self.rating_at(event.pos()) or self._reference or 3
         menu = QMenu(self)
         self._context_menu = menu
-        at_least = menu.addAction(f"★{reference}以上")
-        equal = menu.addAction(f"★{reference}のみ")
-        unrated = menu.addAction("未評価")
+        at_least = menu.addAction(tr('★{p0}以上', p0=reference))
+        equal = menu.addAction(tr('★{p0}のみ', p0=reference))
+        unrated = menu.addAction(tr('未評価'))
         menu.addSeparator()
-        clear = menu.addAction("フィルタ解除")
+        clear = menu.addAction(tr('フィルタ解除'))
         at_least.triggered.connect(
             lambda _checked=False: self.set_filter(
                 RatingFilterMode.AT_LEAST,
@@ -161,17 +164,15 @@ class BrowserRatingFilterWidget(QWidget):
 
     def _update_tool_tip(self) -> None:
         if self._mode is RatingFilterMode.AT_LEAST:
-            state = f"現在: ★{self._reference}以上"
+            state = tr('現在: ★{p0}以上', p0=self._reference)
         elif self._mode is RatingFilterMode.EQUAL:
-            state = f"現在: ★{self._reference}のみ"
+            state = tr('現在: ★{p0}のみ', p0=self._reference)
         elif self._mode is RatingFilterMode.UNRATED:
-            state = "現在: 未評価"
+            state = tr('現在: 未評価')
         else:
-            state = "現在: 絞り込みなし"
+            state = tr('現在: 絞り込みなし')
         self.setToolTip(
-            f"{state}\n"
-            "クリック: ★X以上で絞り込み（同じ条件で解除）\n"
-            "右クリック: ★Xのみ／未評価／解除"
+            tr('{p0}\nクリック: ★X以上で絞り込み（同じ条件で解除）\n右クリック: ★Xのみ／未評価／解除', p0=state)
         )
 
     def paintEvent(self, event) -> None:  # noqa: N802

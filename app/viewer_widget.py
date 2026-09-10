@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
@@ -1240,11 +1243,11 @@ class ViewerWidget(QWidget):
             painter.setPen(QColor("#777777"))
             surface = self._presentation_surface
             if surface.mode is PresentationSurfaceMode.EMPTY:
-                message = "画像を開いてください"
+                message = tr('画像を開いてください')
             elif surface.mode is PresentationSurfaceMode.ERROR:
-                message = surface.message or "画像を開けませんでした"
+                message = surface.message or tr('画像を開けませんでした')
             else:
-                message = surface.message or "読み込み中…"
+                message = surface.message or tr('読み込み中…')
             painter.drawText(
                 self.rect(),
                 Qt.AlignmentFlag.AlignCenter,
@@ -2541,7 +2544,7 @@ class ViewerWidget(QWidget):
                 return
             if pending_accepts:
                 pending.failed_keys[result.key] = (
-                    result.error or "画像の表示準備に失敗しました。"
+                    result.error or tr('画像の表示準備に失敗しました。')
                 )
                 self._commit_pending_display()
             for request in prepared_accepts:
@@ -2841,10 +2844,10 @@ class ViewerWidget(QWidget):
         painter.fillRect(rect, QColor("#151515"))
         if image.error:
             painter.setPen(QColor("#ff6b6b"))
-            text = f"読み込みエラー\nPage {image.page_index + 1}"
+            text = tr('読み込みエラー\nPage {p0}', p0=image.page_index + 1)
         else:
             painter.setPen(QColor("#888888"))
-            text = f"読み込み中...\nPage {image.page_index + 1}"
+            text = tr('読み込み中...\nPage {p0}', p0=image.page_index + 1)
         inner = rect.adjusted(16, 16, -16, -16)
         painter.drawRect(rect.adjusted(0, 0, -1, -1))
         painter.drawText(inner, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, text)

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import ctypes
 import os
 import subprocess
@@ -115,14 +118,14 @@ class SystemFileOpener:
             return SystemOpenResult(
                 SystemOpenStatus.FAILED,
                 error_message=(
-                    "NivisViewerの未完了一時ファイルは開けません"
+                    tr('NivisViewerの未完了一時ファイルは開けません')
                 ),
             )
         adapter = self._adapter_for_platform()
         if adapter is None:
             return SystemOpenResult(
                 SystemOpenStatus.FAILED,
-                error_message="Windowsの関連付け機能を利用できません",
+                error_message=tr('Windowsの関連付け機能を利用できません'),
             )
         try:
             result = adapter.open_default(target, parent_hwnd)
@@ -139,7 +142,7 @@ class SystemFileOpener:
         return SystemOpenResult(
             SystemOpenStatus.FAILED,
             error_code=result,
-            error_message=f"関連付けアプリを起動できませんでした (Shell error {result})",
+            error_message=tr('関連付けアプリを起動できませんでした (Shell error {p0})', p0=result),
         )
 
     def open_with_application_picker(
@@ -152,14 +155,14 @@ class SystemFileOpener:
             return SystemOpenResult(
                 SystemOpenStatus.FAILED,
                 error_message=(
-                    "NivisViewerの未完了一時ファイルは開けません"
+                    tr('NivisViewerの未完了一時ファイルは開けません')
                 ),
             )
         adapter = self._adapter_for_platform()
         if adapter is None:
             return SystemOpenResult(
                 SystemOpenStatus.FAILED,
-                error_message="Windowsのアプリ選択画面を利用できません",
+                error_message=tr('Windowsのアプリ選択画面を利用できません'),
             )
         try:
             result = adapter.open_picker(target, parent_hwnd)
@@ -174,7 +177,7 @@ class SystemFileOpener:
         return SystemOpenResult(
             SystemOpenStatus.FAILED,
             error_code=result,
-            error_message=f"アプリ選択画面を開けませんでした (HRESULT {result})",
+            error_message=tr('アプリ選択画面を開けませんでした (HRESULT {p0})', p0=result),
         )
 
     def open_in_explorer(
@@ -190,13 +193,13 @@ class SystemFileOpener:
         ):
             return SystemOpenResult(
                 SystemOpenStatus.FAILED,
-                error_message="対象が見つかりません",
+                error_message=tr('対象が見つかりません'),
             )
         adapter = self._adapter_for_platform()
         if adapter is None:
             return SystemOpenResult(
                 SystemOpenStatus.FAILED,
-                error_message="Windows Explorerを利用できません",
+                error_message=tr('Windows Explorerを利用できません'),
             )
         try:
             result = adapter.open_explorer(target, bool(is_directory))
@@ -211,7 +214,7 @@ class SystemFileOpener:
         return SystemOpenResult(
             SystemOpenStatus.FAILED,
             error_code=result,
-            error_message=f"Explorerを開けませんでした (error {result})",
+            error_message=tr('Explorerを開けませんでした (error {p0})', p0=result),
         )
 
     def _adapter_for_platform(self) -> SystemOpenAdapter | None:
