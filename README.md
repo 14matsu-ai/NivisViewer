@@ -76,4 +76,14 @@ Browser中央へのExplorer dropはコピー／移動ではなく「場所を表
 
 ## License
 
-NivisViewer本体は[MIT License](LICENSE)で公開します。直接依存するソフトウェアについては[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)を参照してください。
+NivisViewerの現在のプロジェクトライセンスは **GNU AGPL version 3 or later
+(`AGPL-3.0-or-later`)** です。[LICENSE](LICENSE)に正式本文、
+[PROJECT_LICENSE.md](PROJECT_LICENSE.md)に適用通知と著作権表示を記載しています。
+ZipPlaForkからの構造移植の由来は[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)と
+[比較記録](docs/ZIPPLAFORK_COMPARISON.md)を参照してください。
+依存ライブラリのMIT・BSD・Apache・LGPL・GPL等のライセンスはそのまま保持します。
+過去の版について有効に付与されたMITの許諾を取り消すものではありません。
+
+これは公開準備であり、公開済み／配布条件監査済みという宣言ではありません。
+公開前には[ライセンス監査と残課題](docs/RELEASE_LICENSE_AUDIT.md)および
+[リリースチェックリスト](docs/RELEASE_CHECKLIST.md)を完了する必要があります。

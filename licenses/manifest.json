@@ -1,47 +1,108 @@
 {
   "manual_review_required": true,
+  "scope": "installed distributions, not a complete frozen-binary SBOM or release approval",
   "runtime": [
     {
       "name": "PySide6",
       "version": "6.11.2",
       "files": [
         "LicenseRef-Qt-Commercial.txt"
-      ]
+      ],
+      "file_sha256": {
+        "LicenseRef-Qt-Commercial.txt": "4f54763ac0fe2abd8f7f8d8fe370a94a08ebf84786aa0b91045bd6628deb08a3"
+      },
+      "declared_license": "LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only",
+      "declared_license_files": [
+        "LicenseRef-Qt-Commercial.txt"
+      ],
+      "supplement": {
+        "path": "Qt/6.11.2/SOURCES.json",
+        "scope": "license texts and limited attribution, not complete source/module compliance"
+      }
     },
     {
       "name": "PySide6_Addons",
       "version": "6.11.2",
       "files": [
         "LicenseRef-Qt-Commercial.txt"
-      ]
+      ],
+      "file_sha256": {
+        "LicenseRef-Qt-Commercial.txt": "4f54763ac0fe2abd8f7f8d8fe370a94a08ebf84786aa0b91045bd6628deb08a3"
+      },
+      "declared_license": "LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only",
+      "declared_license_files": [
+        "LicenseRef-Qt-Commercial.txt"
+      ],
+      "supplement": {
+        "path": "Qt/6.11.2/SOURCES.json",
+        "scope": "license texts and limited attribution, not complete source/module compliance"
+      }
     },
     {
       "name": "PySide6_Essentials",
       "version": "6.11.2",
       "files": [
         "LicenseRef-Qt-Commercial.txt"
-      ]
+      ],
+      "file_sha256": {
+        "LicenseRef-Qt-Commercial.txt": "4f54763ac0fe2abd8f7f8d8fe370a94a08ebf84786aa0b91045bd6628deb08a3"
+      },
+      "declared_license": "LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only",
+      "declared_license_files": [
+        "LicenseRef-Qt-Commercial.txt"
+      ],
+      "supplement": {
+        "path": "Qt/6.11.2/SOURCES.json",
+        "scope": "license texts and limited attribution, not complete source/module compliance"
+      }
     },
     {
       "name": "shiboken6",
       "version": "6.11.2",
       "files": [
         "LicenseRef-Qt-Commercial.txt"
-      ]
+      ],
+      "file_sha256": {
+        "LicenseRef-Qt-Commercial.txt": "4f54763ac0fe2abd8f7f8d8fe370a94a08ebf84786aa0b91045bd6628deb08a3"
+      },
+      "declared_license": "LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only",
+      "declared_license_files": [
+        "LicenseRef-Qt-Commercial.txt"
+      ],
+      "supplement": {
+        "path": "Qt/6.11.2/SOURCES.json",
+        "scope": "license texts and limited attribution, not complete source/module compliance"
+      }
     },
     {
       "name": "Pillow",
       "version": "12.3.0",
       "files": [
         "LICENSE"
-      ]
+      ],
+      "file_sha256": {
+        "LICENSE": "4f7866a74802c6326f81faff59a56546b6aec2b10b91973e0e9308de95e79857"
+      },
+      "declared_license": "MIT-CMU",
+      "declared_license_files": [
+        "LICENSE"
+      ],
+      "supplement": null
     },
     {
       "name": "natsort",
       "version": "8.4.0",
       "files": [
         "LICENSE"
-      ]
+      ],
+      "file_sha256": {
+        "LICENSE": "81d078140eae25b31f257407190f4cdcb80177979749726e2aae4f2cdd90f623"
+      },
+      "declared_license": "MIT",
+      "declared_license_files": [
+        "LICENSE"
+      ],
+      "supplement": null
     },
     {
       "name": "pypdfium2",
@@ -66,7 +127,51 @@
         "data__windows_x64__BUILD_LICENSES__pdfium.txt",
         "data__windows_x64__BUILD_LICENSES__simdutf.txt",
         "data__windows_x64__BUILD_LICENSES__zlib.txt"
-      ]
+      ],
+      "file_sha256": {
+        "LICENSES__Apache-2.0.txt": "3ddf9be5c28fe27dad143a5dc76eea25222ad1dd68934a047064e56ed2fa40c5",
+        "LICENSES__BSD-3-Clause.txt": "ad9a9e823df025f42389c1812eae28019f657d1ed7b3a4ebfd5010b0736a0da4",
+        "LICENSES__CC-BY-4.0.txt": "f1b1748301cd4274f46733c218d510929661b4990855de5fc645dacd69c4371c",
+        "data__windows_x64__BUILD_LICENSES__abseil.txt": "f54fff0b905df5b3464527c652a30e903b172d6dcab4d89b5e6f105d5e4a4603",
+        "data__windows_x64__BUILD_LICENSES__agg23.txt": "c110d3ea2ad77467ce0dcff7d3337e6c8be8049a5103f4b9bd5fd911a77972e5",
+        "data__windows_x64__BUILD_LICENSES__fast_float.txt": "bf1b57355feca8fce77ee95f48002f8d4789fb71b30ec7599c06cda4901fbb2b",
+        "data__windows_x64__BUILD_LICENSES__freetype.txt": "f4b133e25df1f86ad3ffea453aa0e613f0474f34778dbbb3e437e7b2724937d8",
+        "data__windows_x64__BUILD_LICENSES__icu.txt": "93679f4389d53b6835d89843f251844fb9bc455b35bab036d3c8e7abe497a47a",
+        "data__windows_x64__BUILD_LICENSES__lcms.txt": "7312b68c5b25e9bf2b828706fb4e29588f22705112f411fd42e1f7d84c3d139a",
+        "data__windows_x64__BUILD_LICENSES__libjpeg_turbo.ijg": "db16a04128171879c60708d171b88d97345a2dd20f9bfc173680a4497c73f704",
+        "data__windows_x64__BUILD_LICENSES__libjpeg_turbo.md": "be2b2b5ab168bce87bc3e31f2a5c5adba4b7f6e9e51d618e958d1d46972ebd95",
+        "data__windows_x64__BUILD_LICENSES__libopenjpeg.txt": "c5ab0890a737c2dfa7ba675036554f6d17741d98629b0c2a145354d00617e6b2",
+        "data__windows_x64__BUILD_LICENSES__libpng.txt": "452390433ba0f88aa3e2b122c647741b72a0c117cd6ed7a329b49785aecb5511",
+        "data__windows_x64__BUILD_LICENSES__libtiff.txt": "92b72ba97e6c2749c2a94bc0ef646b47080217f1e772a482b33cf5a5f98a6506",
+        "data__windows_x64__BUILD_LICENSES__llvm-libc.txt": "3b6226c32e168c83b891d8d6f0d3c29c2116dc3ef93dc93c307b54f279ecf383",
+        "data__windows_x64__BUILD_LICENSES__pdfium-binaries.txt": "8854f4388f1ca13b3ad9baa42e95f5546b4c0b17109c159256d3eca7be39b09b",
+        "data__windows_x64__BUILD_LICENSES__pdfium.txt": "961eacd9633fff6d051db7208b755e9210e30efac7adec3e6a6d52798f0ccf0e",
+        "data__windows_x64__BUILD_LICENSES__simdutf.txt": "c172a0ba936ff31230febb5dad869e25cb7c1a07480c7a381be8cf011bb52719",
+        "data__windows_x64__BUILD_LICENSES__zlib.txt": "33fd641c9f3b0e0be64bc78fea9e94807674cdd70c48477599226cb8956565fe"
+      },
+      "declared_license": "BSD-3-Clause, Apache-2.0, dependency licenses",
+      "declared_license_files": [
+        "LICENSES/Apache-2.0.txt",
+        "LICENSES/BSD-3-Clause.txt",
+        "LICENSES/CC-BY-4.0.txt",
+        "data/windows_x64/BUILD_LICENSES/abseil.txt",
+        "data/windows_x64/BUILD_LICENSES/agg23.txt",
+        "data/windows_x64/BUILD_LICENSES/fast_float.txt",
+        "data/windows_x64/BUILD_LICENSES/freetype.txt",
+        "data/windows_x64/BUILD_LICENSES/icu.txt",
+        "data/windows_x64/BUILD_LICENSES/lcms.txt",
+        "data/windows_x64/BUILD_LICENSES/libjpeg_turbo.ijg",
+        "data/windows_x64/BUILD_LICENSES/libjpeg_turbo.md",
+        "data/windows_x64/BUILD_LICENSES/libopenjpeg.txt",
+        "data/windows_x64/BUILD_LICENSES/libpng.txt",
+        "data/windows_x64/BUILD_LICENSES/libtiff.txt",
+        "data/windows_x64/BUILD_LICENSES/llvm-libc.txt",
+        "data/windows_x64/BUILD_LICENSES/pdfium-binaries.txt",
+        "data/windows_x64/BUILD_LICENSES/pdfium.txt",
+        "data/windows_x64/BUILD_LICENSES/simdutf.txt",
+        "data/windows_x64/BUILD_LICENSES/zlib.txt"
+      ],
+      "supplement": null
     }
   ],
   "build_tools": [
@@ -75,13 +180,32 @@
       "version": "6.22.2",
       "files": [
         "COPYING.txt"
-      ]
+      ],
+      "file_sha256": {
+        "COPYING.txt": "dcf75fdb959db1e3b41c0f8505069d2ece781b5ec6b3d0a4d30975cfc6580245"
+      },
+      "declared_license": "GPLv2-or-later with a special exception which allows to use PyInstaller to build and distribute non-free programs (including commercial ones)",
+      "declared_license_files": [
+        "COPYING.txt"
+      ],
+      "supplement": null
     }
   ],
   "warnings": [
-    "PySide6 6.11.2: only a commercial license reference was present; public-distribution terms require manual collection",
-    "PySide6_Addons 6.11.2: only a commercial license reference was present; public-distribution terms require manual collection",
-    "PySide6_Essentials 6.11.2: only a commercial license reference was present; public-distribution terms require manual collection",
-    "shiboken6 6.11.2: only a commercial license reference was present; public-distribution terms require manual collection"
-  ]
+    "PySide6 6.11.2: wheel has only a commercial reference; official open-source texts supplemented, but module/third-party/source review remains",
+    "PySide6: installed 6.11.2 differs from release pin 6.11.1",
+    "PySide6_Addons 6.11.2: wheel has only a commercial reference; official open-source texts supplemented, but module/third-party/source review remains",
+    "PySide6_Essentials 6.11.2: wheel has only a commercial reference; official open-source texts supplemented, but module/third-party/source review remains",
+    "shiboken6 6.11.2: wheel has only a commercial reference; official open-source texts supplemented, but module/third-party/source review remains",
+    "Pillow: installed 12.3.0 differs from release pin 12.1.1",
+    "pypdfium2: installed 5.13.0 differs from release pin 5.12.1",
+    "PyInstaller: installed 6.22.2 differs from release pin 6.20.0"
+  ],
+  "interpreter": {
+    "name": "CPython",
+    "version": "3.11.9",
+    "file": "Python/LICENSE.txt",
+    "sha256": "e502c6b880ff58d614901495a9009c136539cd0b1e2a2abb8fc00b934c203419",
+    "source": "installed interpreter LICENSE.txt; native dependency inventory still requires review"
+  }
 }

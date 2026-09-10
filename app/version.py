@@ -6,6 +6,7 @@ COMPANY_NAME = "14matsu-ai"
 PRODUCT_NAME = "NivisViewer"
 APP_USER_MODEL_ID = "14matsu-ai.NivisViewer"
 COPYRIGHT = "Copyright (c) 2026 14matsu-ai"
+LICENSE_IDENTIFIER = "AGPL-3.0-or-later"
 
 
 def windows_version_info_text() -> str:
@@ -32,6 +33,7 @@ def windows_version_info_text() -> str:
           StringStruct('FileVersion', '{dotted}'),
           StringStruct('InternalName', '{PRODUCT_NAME}'),
           StringStruct('LegalCopyright', '{COPYRIGHT}'),
+          StringStruct('Comments', 'License: {LICENSE_IDENTIFIER}'),
           StringStruct('OriginalFilename', '{PRODUCT_NAME}.exe'),
           StringStruct('ProductName', '{PRODUCT_NAME}'),
           StringStruct('ProductVersion', '{__version__}')

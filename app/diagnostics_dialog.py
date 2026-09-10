@@ -28,7 +28,7 @@ from .pdfium_service import (
     PdfAvailabilityState,
     PdfiumService,
 )
-from .version import __version__
+from .version import COPYRIGHT, LICENSE_IDENTIFIER, __version__
 
 
 def diagnostic_text(
@@ -46,7 +46,9 @@ def diagnostic_text(
         registration_status = tr("設定画面で確認")
     lines = [
         f"NivisViewer {__version__}",
-        "License: MIT",
+        f"License: {LICENSE_IDENTIFIER}",
+        COPYRIGHT,
+        "License and warranty: LICENSE / PROJECT_LICENSE.md; third-party notices: THIRD_PARTY_NOTICES.md",
         f"Mode: {'frozen' if getattr(sys, 'frozen', False) else 'source'}",
         f"Executable: {sys.executable}",
         f"Profile: {Path(profile_dir)}",

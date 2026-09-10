@@ -1,5 +1,32 @@
 # Release checklist
 
+## Publication approval gates
+
+Current project license: **AGPL-3.0-or-later**. The previous MIT description is
+historical, not the current combined-work distribution license. See
+`PROJECT_LICENSE.md` and `docs/RELEASE_LICENSE_AUDIT.md`.
+
+This checklist is not permission to publish, build, commit or push. Work in a
+separately approved isolated source/output tree; preserve the current worktree.
+
+- [ ] Owner explicitly approves the exact candidate for publication.
+- [ ] Reconcile release pins with the tested environment and freeze complete
+      dependency/tool/source hashes (current pins do not match the installed build).
+- [ ] Inventory actual Qt modules/plugins, especially GPLv3 Qt Virtual Keyboard
+      and Qt PDF's separate PDFium tree; complete applicable copyright/notices.
+- [ ] Complete exact Corresponding Source, build/rebuild instructions and any
+      required installation/relinking/replacement information; test that route.
+- [ ] Provide and verify the chosen license-compliant, version-matched source
+      delivery mechanism alongside binaries; a LICENSE file alone is insufficient.
+- [ ] Review Python/OpenSSL/VC runtime/other native notices and redistribution terms.
+- [ ] Confirm About, root/internal package license notices and source links agree.
+- [ ] Separately complete secrets/privacy/Git-history, asset/contribution-rights
+      and source-package allowlist review; exclude tracked portable backups.
+- [ ] Reviewer signs off the manifest's unresolved warnings; collection success
+      or `--strict` success is not a compliance certificate.
+
+## Functional / packaging review
+
 - clean checkout相当のソースとバージョンを確認
 - 全テスト、compileall、diff check
 - clean one-folder buildとfrozen smoke

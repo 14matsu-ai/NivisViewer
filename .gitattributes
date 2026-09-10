@@ -1,0 +1,5 @@
+# Keep reviewed verbatim license text hashes stable on Windows checkouts.
+/LICENSE -text
+/licenses/Qt/6.11.2/*.txt -text
+/licenses/Qt/6.11.2/NOTICE.md -text
+/licenses/Python/LICENSE.txt -text
