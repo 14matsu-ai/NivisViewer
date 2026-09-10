@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from pathlib import Path
 from threading import Event, RLock
 
@@ -181,6 +184,6 @@ class PdfImageSource(ImageSource):
             return self._index_by_id[image_id]
         except KeyError as exc:
             raise ImageSourceError(
-                "PDFページが範囲外です。",
+                tr('PDFページが範囲外です。'),
                 code=PdfErrorCode.PAGE_OUT_OF_RANGE.value,
             ) from exc

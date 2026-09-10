@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -68,7 +71,7 @@ class RatingRenameService:
                 destination,
                 normalized_rating,
                 False,
-                error_message="同名の項目が既に存在します。",
+                error_message=tr('同名の項目が既に存在します。'),
                 original_mtime_ns=source_stat.st_mtime_ns,
             )
         try:

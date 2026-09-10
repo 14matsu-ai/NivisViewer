@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import os
 import sqlite3
 import threading
@@ -83,7 +86,7 @@ class MetadataStore(QObject):
         if initialize:
             self._initialize()
         else:
-            self.last_error = "プロファイルは読み取り専用です。"
+            self.last_error = tr('プロファイルは読み取り専用です。')
 
     @property
     def schema_version(self) -> int:

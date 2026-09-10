@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from dataclasses import dataclass
 import inspect
 import logging
@@ -170,7 +173,7 @@ class _BookOpenWorker(QRunnable):
                 (),
                 self.generation,
                 error=ImageSourceError(
-                    f"本を開けません: {self.requested_path}",
+                    tr('本を開けません: {p0}', p0=self.requested_path),
                     code="open_failed",
                 ),
                 trace_id=self.trace_id,
@@ -320,7 +323,7 @@ class BookSession(QObject):
             )
             if not image_ids:
                 raise ImageSourceError(
-                    "表示可能な画像がありません。",
+                    tr('表示可能な画像がありません。'),
                     code="no_images",
                 )
             self.model.set_prepared_source(
@@ -341,7 +344,7 @@ class BookSession(QObject):
         except Exception as exc:
             if new_source is not None:
                 self._close_source(new_source)
-            error = ImageSourceError(f"本を開けません: {requested_path}")
+            error = ImageSourceError(tr('本を開けません: {p0}', p0=requested_path))
             self.error_occurred.emit(str(error))
             raise error from exc
 
@@ -536,7 +539,7 @@ class BookSession(QObject):
             return
         if result.error is not None or result.source is None:
             error = result.error or ImageSourceError(
-                f"本を開けません: {result.requested_path}"
+                tr('本を開けません: {p0}', p0=result.requested_path)
             )
             failed = AsyncBookOpenFailed(
                 result.requested_path,
@@ -550,7 +553,7 @@ class BookSession(QObject):
         if not result.image_ids:
             self._close_source(result.source)
             error = ImageSourceError(
-                "表示可能な画像がありません。",
+                tr('表示可能な画像がありません。'),
                 code="no_images",
             )
             self.error_occurred.emit(str(error))
@@ -577,7 +580,7 @@ class BookSession(QObject):
             )
         except Exception as exc:
             self._close_source(result.source)
-            error = ImageSourceError(f"本を開けません: {result.requested_path}")
+            error = ImageSourceError(tr('本を開けません: {p0}', p0=result.requested_path))
             error.__cause__ = exc
             self.error_occurred.emit(str(error))
             self.async_open_failed.emit(
@@ -922,7 +925,7 @@ class BookSession(QObject):
         try:
             source.close()
         except Exception as exc:
-            self.error_occurred.emit(f"画像ソースを閉じられません: {exc}")
+            self.error_occurred.emit(tr('画像ソースを閉じられません: {p0}', p0=exc))
 
 
 def _invoke_source_factory(

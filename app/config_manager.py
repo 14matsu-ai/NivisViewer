@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import json
 import re
 from copy import deepcopy
@@ -9,6 +12,7 @@ from typing import Any
 from PySide6.QtCore import QObject, Signal
 from .browser_sort import normalize_browser_random_seed, normalize_browser_sort_key
 from .thumbnail_render import THUMBNAIL_ENCODER_QUALITY, normalize_thumbnail_webp_quality
+from .i18n import normalize_ui_language
 
 from .browser_wheel_scroll import (
     normalize_browser_wheel_custom_rows,
@@ -77,6 +81,7 @@ class ConfigManager(QObject):
     }
 
     DEFAULTS: dict[str, Any] = {
+        "ui_language": "ja",
         "last_open_path": "",
         "recent_paths": [],
         "reading_positions": {},
@@ -294,7 +299,7 @@ class ConfigManager(QObject):
             self.data.pop(key, None)
 
         if not self.writable:
-            self.last_error = "プロファイルは読み取り専用です。"
+            self.last_error = tr('プロファイルは読み取り専用です。')
             return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -338,6 +343,7 @@ class ConfigManager(QObject):
     @classmethod
     def _normalize(cls, values: dict[str, Any]) -> dict[str, Any]:
         normalized = values
+        normalized["ui_language"] = normalize_ui_language(normalized.get("ui_language"))
         if normalized.get("archive_backend_preference") not in {
             "auto",
             "winrar",

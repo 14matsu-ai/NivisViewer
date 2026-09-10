@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import active_ui_language, tr
+
+
 from collections.abc import Callable
 import logging
 from pathlib import Path
@@ -185,7 +188,7 @@ class SettingsDialog(QDialog):
         file_registration_service: WindowsFileRegistrationService | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("設定")
+        self.setWindowTitle(tr('設定'))
         install_window_icon(self)
         self.setModal(True)
         self.resize(620, 680)
@@ -240,13 +243,14 @@ class SettingsDialog(QDialog):
         self._scroll_areas: list[QScrollArea] = []
         self.tabs.addTab(self._scrollable_tab(self._build_viewer_tab()), "Viewer")
         self.tabs.addTab(self._scrollable_tab(self._build_browser_tab()), "Browser")
-        self.tabs.addTab(self._scrollable_tab(self._build_file_tab()), "ファイル")
-        self.tabs.addTab(self._scrollable_tab(self._build_archive_tab()), "書庫")
+        self.tabs.addTab(self._scrollable_tab(self._build_file_tab()), tr('ファイル'))
+        self.tabs.addTab(self._scrollable_tab(self._build_archive_tab()), tr('書庫'))
         self.tabs.addTab(self._scrollable_tab(self._build_mouse_tab()), "Mouse")
         self.tabs.addTab(
             self._scrollable_tab(self._build_windows_tab()),
-            "Windows連携",
+            tr('Windows連携'),
         )
+        self.tabs.addTab(self._scrollable_tab(self._build_general_tab()), tr('一般'))
 
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -263,6 +267,11 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(self.tabs, 1)
         layout.addWidget(self.button_box)
+        if active_ui_language() == "en":
+            # Longer translated labels may need a row above their controls.
+            # Keep the existing Japanese layout and fonts unchanged.
+            for form in self.findChildren(QFormLayout):
+                form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
 
     def _scrollable_tab(self, content: QWidget) -> QScrollArea:
         scroll = QScrollArea(self)
@@ -278,17 +287,35 @@ class SettingsDialog(QDialog):
         self._scroll_areas.append(scroll)
         return scroll
 
+    def _build_general_tab(self) -> QWidget:
+        tab = QWidget(self)
+        form = QFormLayout(tab)
+        self.ui_language_combo = QComboBox(tab)
+        self.ui_language_combo.setObjectName("ui_language")
+        self.ui_language_combo.addItem("日本語", "ja")
+        self.ui_language_combo.addItem("English", "en")
+        # Intentionally bilingual so this control is discoverable in either UI.
+        self.ui_language_label = QLabel("表示言語 / Language", tab)
+        self.ui_language_label.setBuddy(self.ui_language_combo)
+        form.addRow(self.ui_language_label, self.ui_language_combo)
+        self.ui_language_restart_note = QLabel(
+            tr('言語の変更はNivisViewerの再起動後に反映されます。'), tab,
+        )
+        self.ui_language_restart_note.setWordWrap(True)
+        form.addRow(self.ui_language_restart_note)
+        return tab
+
     def _build_windows_tab(self) -> QWidget:
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
         self.registration_status_label = QLabel(tab)
         self.registration_status_label.setWordWrap(True)
         layout.addWidget(self.registration_status_label)
-        self.register_images_checkbox = QCheckBox("画像を登録", tab)
-        self.register_archives_checkbox = QCheckBox("漫画書庫を登録", tab)
-        self.register_pdf_checkbox = QCheckBox("PDFを登録", tab)
+        self.register_images_checkbox = QCheckBox(tr('画像を登録'), tab)
+        self.register_archives_checkbox = QCheckBox(tr('漫画書庫を登録'), tab)
+        self.register_pdf_checkbox = QCheckBox(tr('PDFを登録'), tab)
         self.register_context_menu_checkbox = QCheckBox(
-            "「NivisViewerで開く」を右クリックメニューへ追加",
+            tr('「NivisViewerで開く」を右クリックメニューへ追加'),
             tab,
         )
         for checkbox in (
@@ -299,17 +326,16 @@ class SettingsDialog(QDialog):
         ):
             layout.addWidget(checkbox)
         note = QLabel(
-            "登録は「プログラムから開く」と既定アプリ候補を追加するだけで、"
-            "既定アプリを強制変更しません。",
+            tr('登録は「プログラムから開く」と既定アプリ候補を追加するだけで、既定アプリを強制変更しません。'),
             tab,
         )
         note.setWordWrap(True)
         layout.addWidget(note)
         buttons = QHBoxLayout()
-        self.register_button = QPushButton("Windowsへ登録", tab)
-        self.unregister_button = QPushButton("登録を解除", tab)
+        self.register_button = QPushButton(tr('Windowsへ登録'), tab)
+        self.unregister_button = QPushButton(tr('登録を解除'), tab)
         self.default_apps_button = QPushButton(
-            "Windowsの既定のアプリ設定を開く", tab
+            tr('Windowsの既定のアプリ設定を開く'), tab
         )
         buttons.addWidget(self.register_button)
         buttons.addWidget(self.unregister_button)
@@ -332,110 +358,110 @@ class SettingsDialog(QDialog):
         behavior_group = QGroupBox("ViewerWindow", tab)
         behavior_form = QFormLayout(behavior_group)
         self.open_behavior_combo = QComboBox(behavior_group)
-        self.open_behavior_combo.addItem("アクティブなViewerを再利用", "reuse_active")
-        self.open_behavior_combo.addItem("常に新しいViewerを開く", "always_new")
+        self.open_behavior_combo.addItem(tr('アクティブなViewerを再利用'), "reuse_active")
+        self.open_behavior_combo.addItem(tr('常に新しいViewerを開く'), "always_new")
         self.open_behavior_combo.addItem(
-            "Viewerがあれば再利用し、なければ作成",
+            tr('Viewerがあれば再利用し、なければ作成'),
             "reuse_or_create",
         )
-        behavior_form.addRow("ファイルを開く方法:", self.open_behavior_combo)
+        behavior_form.addRow(tr('ファイルを開く方法:'), self.open_behavior_combo)
         self.bring_to_front_checkbox = QCheckBox(
-            "本を開いたときViewerWindowを一度だけ前面へ出す",
+            tr('本を開いたときViewerWindowを一度だけ前面へ出す'),
             behavior_group,
         )
         behavior_form.addRow(self.bring_to_front_checkbox)
         self.loop_navigation_checkbox = QCheckBox(
-            "最後の書庫から先頭へループする",
+            tr('最後の書庫から先頭へループする'),
             behavior_group,
         )
         behavior_form.addRow(self.loop_navigation_checkbox)
 
-        spread_group = QGroupBox("ページ表示", tab)
+        spread_group = QGroupBox(tr('ページ表示'), tab)
         spread_form = QFormLayout(spread_group)
-        self.join_spread_checkbox = QCheckBox("見開きページを中央で密着表示", spread_group)
+        self.join_spread_checkbox = QCheckBox(tr('見開きページを中央で密着表示'), spread_group)
         self.join_spread_checkbox.toggled.connect(self._sync_gap_enabled)
         spread_form.addRow(self.join_spread_checkbox)
         self.gap_spin = QSpinBox(spread_group)
         self.gap_spin.setRange(0, 100)
         self.gap_spin.setSuffix(" px")
-        self.gap_note = QLabel("密着表示時はページ間隔を使用しません。", spread_group)
+        self.gap_note = QLabel(tr('密着表示時はページ間隔を使用しません。'), spread_group)
         gap_container = QWidget(spread_group)
         gap_layout = QVBoxLayout(gap_container)
         gap_layout.setContentsMargins(0, 0, 0, 0)
         gap_layout.addWidget(self.gap_spin)
         gap_layout.addWidget(self.gap_note)
-        spread_form.addRow("通常時のページ間隔:", gap_container)
-        self.single_first_checkbox = QCheckBox("表紙を単独表示", spread_group)
+        spread_form.addRow(tr('通常時のページ間隔:'), gap_container)
+        self.single_first_checkbox = QCheckBox(tr('表紙を単独表示'), spread_group)
         spread_form.addRow(self.single_first_checkbox)
-        self.wide_single_checkbox = QCheckBox("横長画像を単独表示", spread_group)
+        self.wide_single_checkbox = QCheckBox(tr('横長画像を単独表示'), spread_group)
         spread_form.addRow(self.wide_single_checkbox)
         self.book_open_position_combo = QComboBox(spread_group)
         self.book_open_position_combo.addItem(
-            "常に先頭ページから開く",
+            tr('常に先頭ページから開く'),
             "first_page",
         )
         self.book_open_position_combo.addItem(
-            "前回閉じたページから再開",
+            tr('前回閉じたページから再開'),
             "resume_last",
         )
         spread_form.addRow(
-            "書庫・PDF・フォルダーを開く位置:",
+            tr('書庫・PDF・フォルダーを開く位置:'),
             self.book_open_position_combo,
         )
         self.viewer_canvas_click_direction_combo = QComboBox(spread_group)
         self.viewer_canvas_click_direction_combo.addItem(
-            "右側で次へ／左側で前へ",
+            tr('右側で次へ／左側で前へ'),
             "right_next",
         )
         self.viewer_canvas_click_direction_combo.addItem(
-            "左側で次へ／右側で前へ",
+            tr('左側で次へ／右側で前へ'),
             "left_next",
         )
         self.viewer_canvas_click_direction_combo.addItem(
-            "綴じ方向に合わせる（自動）",
+            tr('綴じ方向に合わせる（自動）'),
             "auto",
         )
         spread_form.addRow(
-            "左右クリックのページ送り方向:",
+            tr('左右クリックのページ送り方向:'),
             self.viewer_canvas_click_direction_combo,
         )
         self.viewer_canvas_left_click_combo = QComboBox(spread_group)
         self.viewer_canvas_left_click_combo.addItem(
-            "クリックでページ移動しない",
+            tr('クリックでページ移動しない'),
             "none",
         )
         self.viewer_canvas_left_click_combo.addItem(
-            "1ページずつ移動",
+            tr('1ページずつ移動'),
             "next_single_page",
         )
         self.viewer_canvas_left_click_combo.addItem(
-            "現在のページ送り単位で移動",
+            tr('現在のページ送り単位で移動'),
             "next_display_unit",
         )
         spread_form.addRow(
-            "左右クリックのページ移動量:",
+            tr('左右クリックのページ移動量:'),
             self.viewer_canvas_left_click_combo,
         )
         self.viewer_slider_wheel_single_page_checkbox = QCheckBox(
-            "下部UI上のマウスホイールで1ページずつ移動する",
+            tr('下部UI上のマウスホイールで1ページずつ移動する'),
             spread_group,
         )
         spread_form.addRow(self.viewer_slider_wheel_single_page_checkbox)
 
-        memory_group = QGroupBox("Viewerメモリ", tab)
+        memory_group = QGroupBox(tr('Viewerメモリ'), tab)
         memory_form = QFormLayout(memory_group)
         self.viewer_memory_mode_combo = QComboBox(memory_group)
         for label, value in VIEWER_MEMORY_MODE_LABELS:
-            self.viewer_memory_mode_combo.addItem(label, value)
+            self.viewer_memory_mode_combo.addItem(tr(label), value)
         memory_form.addRow(
-            "ビューワーのメモリ使用量:",
+            tr('ビューワーのメモリ使用量:'),
             self.viewer_memory_mode_combo,
         )
 
-        resampling_group = QGroupBox("画像の拡大縮小", tab)
+        resampling_group = QGroupBox(tr('画像の拡大縮小'), tab)
         resampling_layout = QVBoxLayout(resampling_group)
 
-        normal_resampling_group = QGroupBox("通常表示", resampling_group)
+        normal_resampling_group = QGroupBox(tr('通常表示'), resampling_group)
         normal_resampling_form = QFormLayout(normal_resampling_group)
         self.viewer_downscale_algorithm_combo = QComboBox(
             normal_resampling_group
@@ -444,20 +470,20 @@ class SettingsDialog(QDialog):
             normal_resampling_group
         )
         for value, label in DOWNSCALE_ALGORITHM_LABELS.items():
-            self.viewer_downscale_algorithm_combo.addItem(label, value)
+            self.viewer_downscale_algorithm_combo.addItem(tr(label), value)
         for value, label in UPSCALE_ALGORITHM_LABELS.items():
-            self.viewer_upscale_algorithm_combo.addItem(label, value)
+            self.viewer_upscale_algorithm_combo.addItem(tr(label), value)
         normal_resampling_form.addRow(
-            "縮小方式:",
+            tr('縮小方式:'),
             self.viewer_downscale_algorithm_combo,
         )
         normal_resampling_form.addRow(
-            "拡大方式:",
+            tr('拡大方式:'),
             self.viewer_upscale_algorithm_combo,
         )
         resampling_layout.addWidget(normal_resampling_group)
 
-        magnifier_resampling_group = QGroupBox("拡大鏡", resampling_group)
+        magnifier_resampling_group = QGroupBox(tr('拡大鏡'), resampling_group)
         magnifier_resampling_form = QFormLayout(magnifier_resampling_group)
         self.magnifier_downscale_algorithm_combo = QComboBox(
             magnifier_resampling_group
@@ -466,48 +492,47 @@ class SettingsDialog(QDialog):
             magnifier_resampling_group
         )
         for value, label in DOWNSCALE_ALGORITHM_LABELS.items():
-            self.magnifier_downscale_algorithm_combo.addItem(label, value)
+            self.magnifier_downscale_algorithm_combo.addItem(tr(label), value)
         for value, label in UPSCALE_ALGORITHM_LABELS.items():
-            self.magnifier_upscale_algorithm_combo.addItem(label, value)
+            self.magnifier_upscale_algorithm_combo.addItem(tr(label), value)
         magnifier_resampling_form.addRow(
-            "縮小方式:",
+            tr('縮小方式:'),
             self.magnifier_downscale_algorithm_combo,
         )
         magnifier_resampling_form.addRow(
-            "拡大方式:",
+            tr('拡大方式:'),
             self.magnifier_upscale_algorithm_combo,
         )
         resampling_layout.addWidget(magnifier_resampling_group)
 
         resampling_note = QLabel(
-            "自動は倍率に応じて方式を選びます。設定の適用後は、"
-            "開いている画像を再読込せずに表示用フレームだけを作り直します。",
+            tr('自動は倍率に応じて方式を選びます。設定の適用後は、開いている画像を再読込せずに表示用フレームだけを作り直します。'),
             resampling_group,
         )
         resampling_note.setWordWrap(True)
         resampling_layout.addWidget(resampling_note)
 
-        prefetch_group = QGroupBox("PDF・旧形式の先読み", tab)
+        prefetch_group = QGroupBox(tr('PDF・旧形式の先読み'), tab)
         prefetch_layout = QVBoxLayout(prefetch_group)
         prefetch_form = QFormLayout()
         self.prefetch_preset_combo = QComboBox(prefetch_group)
         for label, value in (
-            ("無効", "disabled"),
-            ("省メモリ", "memory_saver"),
-            ("標準", "standard"),
-            ("多め", "more"),
-            ("カスタム", "custom"),
+            (tr('無効'), "disabled"),
+            (tr('省メモリ'), "memory_saver"),
+            (tr('標準'), "standard"),
+            (tr('多め'), "more"),
+            (tr('カスタム'), "custom"),
         ):
             self.prefetch_preset_combo.addItem(label, value)
-        prefetch_form.addRow("先読みプリセット:", self.prefetch_preset_combo)
+        prefetch_form.addRow(tr('先読みプリセット:'), self.prefetch_preset_combo)
         self.prefetch_direction_priority_checkbox = QCheckBox(
-            "進行方向を優先する",
+            tr('進行方向を優先する'),
             prefetch_group,
         )
         prefetch_form.addRow(self.prefetch_direction_priority_checkbox)
         prefetch_layout.addLayout(prefetch_form)
 
-        self.prefetch_custom_group = QGroupBox("カスタム設定", prefetch_group)
+        self.prefetch_custom_group = QGroupBox(tr('カスタム設定'), prefetch_group)
         custom_form = QFormLayout(self.prefetch_custom_group)
         self.prefetch_image_forward_spin = QSpinBox(self.prefetch_custom_group)
         self.prefetch_image_backward_spin = QSpinBox(self.prefetch_custom_group)
@@ -520,23 +545,20 @@ class SettingsDialog(QDialog):
             self.prefetch_pdf_backward_spin,
         ):
             spin.setRange(0, 20)
-            spin.setSuffix(" 表示単位")
+            spin.setSuffix(tr(' 表示単位'))
         custom_form.addRow(
-            "ZIP・Folder以外 進行方向:",
+            tr('ZIP・Folder以外 進行方向:'),
             self.prefetch_image_forward_spin,
         )
         custom_form.addRow(
-            "ZIP・Folder以外 逆方向:",
+            tr('ZIP・Folder以外 逆方向:'),
             self.prefetch_image_backward_spin,
         )
-        custom_form.addRow("PDF 進行方向:", self.prefetch_pdf_forward_spin)
-        custom_form.addRow("PDF 逆方向:", self.prefetch_pdf_backward_spin)
+        custom_form.addRow(tr('PDF 進行方向:'), self.prefetch_pdf_forward_spin)
+        custom_form.addRow(tr('PDF 逆方向:'), self.prefetch_pdf_backward_spin)
         prefetch_layout.addWidget(self.prefetch_custom_group)
         display_unit_note = QLabel(
-            "ZIP・Folderは上のメモリ量だけで保持量を決めます。"
-            "この先読み設定はPDFと旧pipeline形式だけに適用されます。\n"
-            "単ページ表示では1表示単位＝1ページ、"
-            "見開き表示では1表示単位＝1見開きです。",
+            tr('ZIP・Folderは上のメモリ量だけで保持量を決めます。この先読み設定はPDFと旧pipeline形式だけに適用されます。\n単ページ表示では1表示単位＝1ページ、見開き表示では1表示単位＝1見開きです。'),
             prefetch_group,
         )
         display_unit_note.setWordWrap(True)
@@ -545,20 +567,20 @@ class SettingsDialog(QDialog):
             self._on_prefetch_preset_changed
         )
 
-        fullscreen_group = QGroupBox("全画面UI", tab)
+        fullscreen_group = QGroupBox(tr('全画面UI'), tab)
         fullscreen_form = QFormLayout(fullscreen_group)
         self.fullscreen_hide_ui_checkbox = QCheckBox(
-            "全画面時にUIを隠す",
+            tr('全画面時にUIを隠す'),
             fullscreen_group,
         )
         fullscreen_form.addRow(self.fullscreen_hide_ui_checkbox)
         self.fullscreen_hide_cursor_checkbox = QCheckBox(
-            "全画面時にカーソルを隠す",
+            tr('全画面時にカーソルを隠す'),
             fullscreen_group,
         )
         fullscreen_form.addRow(self.fullscreen_hide_cursor_checkbox)
         self.fullscreen_auto_reveal_checkbox = QCheckBox(
-            "全画面時、画面端でUIを表示",
+            tr('全画面時、画面端でUIを表示'),
             fullscreen_group,
         )
         fullscreen_form.addRow(self.fullscreen_auto_reveal_checkbox)
@@ -566,14 +588,14 @@ class SettingsDialog(QDialog):
         self.fullscreen_top_edge_trigger_spin.setRange(4, 32)
         self.fullscreen_top_edge_trigger_spin.setSuffix(" px")
         fullscreen_form.addRow(
-            "上端の反応範囲:",
+            tr('上端の反応範囲:'),
             self.fullscreen_top_edge_trigger_spin,
         )
         self.fullscreen_bottom_edge_trigger_spin = QSpinBox(fullscreen_group)
         self.fullscreen_bottom_edge_trigger_spin.setRange(12, 64)
         self.fullscreen_bottom_edge_trigger_spin.setSuffix(" px")
         fullscreen_form.addRow(
-            "下端の反応範囲:",
+            tr('下端の反応範囲:'),
             self.fullscreen_bottom_edge_trigger_spin,
         )
         self.fullscreen_edge_trigger_spin = self.fullscreen_top_edge_trigger_spin
@@ -582,7 +604,7 @@ class SettingsDialog(QDialog):
         self.fullscreen_hide_delay_spin.setSingleStep(100)
         self.fullscreen_hide_delay_spin.setSuffix(" ms")
         fullscreen_form.addRow(
-            "自動的に隠すまで:",
+            tr('自動的に隠すまで:'),
             self.fullscreen_hide_delay_spin,
         )
 
@@ -598,33 +620,33 @@ class SettingsDialog(QDialog):
     def _build_archive_tab(self) -> QWidget:
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
-        preference_group = QGroupBox("外部書庫バックエンド", tab)
+        preference_group = QGroupBox(tr('外部書庫バックエンド'), tab)
         preference_form = QFormLayout(preference_group)
         self.archive_backend_combo = QComboBox(preference_group)
         self.archive_backend_combo.addItem(
-            "自動（Windowsの関連付けを優先）",
+            tr('自動（Windowsの関連付けを優先）'),
             "auto",
         )
         self.archive_backend_combo.addItem("WinRAR", "winrar")
         self.archive_backend_combo.addItem("7-Zip", "seven_zip")
-        preference_form.addRow("使用するバックエンド:", self.archive_backend_combo)
+        preference_form.addRow(tr('使用するバックエンド:'), self.archive_backend_combo)
         layout.addWidget(preference_group)
 
         winrar_group = QGroupBox("WinRAR", tab)
         winrar_form = QFormLayout(winrar_group)
         self.winrar_path_edit = QLineEdit(winrar_group)
-        self.winrar_path_edit.setPlaceholderText("空欄の場合は自動検出")
-        self.winrar_browse_button = QPushButton("参照…", winrar_group)
+        self.winrar_path_edit.setPlaceholderText(tr('空欄の場合は自動検出'))
+        self.winrar_browse_button = QPushButton(tr('参照…'), winrar_group)
         self.winrar_browse_button.clicked.connect(self.browse_winrar)
         winrar_path_row = QWidget(winrar_group)
         winrar_path_layout = QHBoxLayout(winrar_path_row)
         winrar_path_layout.setContentsMargins(0, 0, 0, 0)
         winrar_path_layout.addWidget(self.winrar_path_edit, 1)
         winrar_path_layout.addWidget(self.winrar_browse_button)
-        winrar_form.addRow("実行ファイル:", winrar_path_row)
-        self.winrar_auto_button = QPushButton("自動検出へ戻す", winrar_group)
+        winrar_form.addRow(tr('実行ファイル:'), winrar_path_row)
+        self.winrar_auto_button = QPushButton(tr('自動検出へ戻す'), winrar_group)
         self.winrar_auto_button.clicked.connect(self.use_automatic_winrar)
-        self.winrar_redetect_button = QPushButton("再検出", winrar_group)
+        self.winrar_redetect_button = QPushButton(tr('再検出'), winrar_group)
         self.winrar_redetect_button.clicked.connect(self.redetect_winrar)
         winrar_action_row = QWidget(winrar_group)
         winrar_action_layout = QHBoxLayout(winrar_action_row)
@@ -633,28 +655,28 @@ class SettingsDialog(QDialog):
         winrar_action_layout.addWidget(self.winrar_redetect_button)
         winrar_action_layout.addStretch(1)
         winrar_form.addRow(winrar_action_row)
-        self.winrar_status_label = QLabel("WinRAR：未確認", winrar_group)
+        self.winrar_status_label = QLabel(tr('WinRAR：未確認'), winrar_group)
         self.winrar_status_label.setWordWrap(True)
-        winrar_form.addRow("現在の状態:", self.winrar_status_label)
+        winrar_form.addRow(tr('現在の状態:'), self.winrar_status_label)
         layout.addWidget(winrar_group)
 
         group = QGroupBox("7-Zip", tab)
         form = QFormLayout(group)
 
         self.seven_zip_path_edit = QLineEdit(group)
-        self.seven_zip_path_edit.setPlaceholderText("空欄の場合は自動検出")
-        self.seven_zip_browse_button = QPushButton("参照…", group)
+        self.seven_zip_path_edit.setPlaceholderText(tr('空欄の場合は自動検出'))
+        self.seven_zip_browse_button = QPushButton(tr('参照…'), group)
         self.seven_zip_browse_button.clicked.connect(self.browse_seven_zip)
         path_row = QWidget(group)
         path_layout = QHBoxLayout(path_row)
         path_layout.setContentsMargins(0, 0, 0, 0)
         path_layout.addWidget(self.seven_zip_path_edit, 1)
         path_layout.addWidget(self.seven_zip_browse_button)
-        form.addRow("7-Zip実行ファイル:", path_row)
+        form.addRow(tr('7-Zip実行ファイル:'), path_row)
 
-        self.seven_zip_auto_button = QPushButton("自動検出へ戻す", group)
+        self.seven_zip_auto_button = QPushButton(tr('自動検出へ戻す'), group)
         self.seven_zip_auto_button.clicked.connect(self.use_automatic_seven_zip)
-        self.seven_zip_redetect_button = QPushButton("再検出", group)
+        self.seven_zip_redetect_button = QPushButton(tr('再検出'), group)
         self.seven_zip_redetect_button.clicked.connect(self.redetect_seven_zip)
         action_row = QWidget(group)
         action_layout = QHBoxLayout(action_row)
@@ -664,13 +686,11 @@ class SettingsDialog(QDialog):
         action_layout.addStretch(1)
         form.addRow(action_row)
 
-        self.seven_zip_status_label = QLabel("7-Zip：未確認", group)
+        self.seven_zip_status_label = QLabel(tr('7-Zip：未確認'), group)
         self.seven_zip_status_label.setWordWrap(True)
-        form.addRow("現在の状態:", self.seven_zip_status_label)
+        form.addRow(tr('現在の状態:'), self.seven_zip_status_label)
         note = QLabel(
-            "WinRARと7-Zipは第三者ソフトウェアです。Windowsの関連付けと"
-            "利用者が指定した実行ファイルだけを検証し、自動ダウンロードや"
-            "自動インストールは行いません。",
+            tr('WinRARと7-Zipは第三者ソフトウェアです。Windowsの関連付けと利用者が指定した実行ファイルだけを検証し、自動ダウンロードや自動インストールは行いません。'),
             group,
         )
         note.setWordWrap(True)
@@ -681,7 +701,7 @@ class SettingsDialog(QDialog):
 
     def _build_browser_wheel_scroll_group(self, parent: QWidget) -> QGroupBox:
         self.browser_wheel_scroll_group = QGroupBox(
-            "Browser マウスホイール",
+            tr('Browser マウスホイール'),
             parent,
         )
         browser_wheel_form = QFormLayout(self.browser_wheel_scroll_group)
@@ -697,14 +717,13 @@ class SettingsDialog(QDialog):
         ):
             self.browser_wheel_scroll_mode_combo.addItem(label, mode)
         self.browser_wheel_scroll_mode_combo.setToolTip(
-            "標準ホイール1目盛りあたりの移動量です。"
-            "System / DefaultではQtとWindowsの現在の動作をそのまま使用します。"
+            tr('標準ホイール1目盛りあたりの移動量です。System / DefaultではQtとWindowsの現在の動作をそのまま使用します。')
         )
         self.browser_wheel_scroll_mode_combo.currentIndexChanged.connect(
             self._sync_browser_wheel_scroll_controls
         )
         browser_wheel_form.addRow(
-            "スクロール量:",
+            tr('スクロール量:'),
             self.browser_wheel_scroll_mode_combo,
         )
         self.browser_wheel_scroll_custom_spin = QSpinBox(
@@ -714,13 +733,13 @@ class SettingsDialog(QDialog):
             BROWSER_WHEEL_SCROLL_CUSTOM_MIN_ROWS,
             BROWSER_WHEEL_SCROLL_CUSTOM_MAX_ROWS,
         )
-        self.browser_wheel_scroll_custom_spin.setSuffix(" 行／1目盛り")
+        self.browser_wheel_scroll_custom_spin.setSuffix(tr(' 行／1目盛り'))
         browser_wheel_form.addRow(
-            "Customの行数:",
+            tr('Customの行数:'),
             self.browser_wheel_scroll_custom_spin,
         )
         self.browser_wheel_scroll_restore_button = QPushButton(
-            "既定に戻す",
+            tr('既定に戻す'),
             self.browser_wheel_scroll_group,
         )
         self.browser_wheel_scroll_restore_button.clicked.connect(
@@ -728,7 +747,7 @@ class SettingsDialog(QDialog):
         )
         browser_wheel_form.addRow(self.browser_wheel_scroll_restore_button)
         browser_wheel_note = QLabel(
-            "Smallは1行、Mediumは2行、Largeは3行を移動します。",
+            tr('Smallは1行、Mediumは2行、Largeは3行を移動します。'),
             self.browser_wheel_scroll_group,
         )
         browser_wheel_note.setWordWrap(True)
@@ -739,14 +758,14 @@ class SettingsDialog(QDialog):
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
 
-        self.file_operation_group = QGroupBox("ファイル操作", tab)
+        self.file_operation_group = QGroupBox(tr('ファイル操作'), tab)
         file_operation_layout = QVBoxLayout(self.file_operation_group)
         self.delete_skip_confirmation_checkbox = QCheckBox(
-            "削除確認を表示せずゴミ箱へ移動",
+            tr('削除確認を表示せずゴミ箱へ移動'),
             self.file_operation_group,
         )
         self.delete_confirm_focus_yes_checkbox = QCheckBox(
-            "削除確認で「はい」を初期選択",
+            tr('削除確認で「はい」を初期選択'),
             self.file_operation_group,
         )
         self.delete_skip_confirmation_checkbox.toggled.connect(
@@ -755,7 +774,7 @@ class SettingsDialog(QDialog):
         file_operation_layout.addWidget(self.delete_skip_confirmation_checkbox)
         file_operation_layout.addWidget(self.delete_confirm_focus_yes_checkbox)
         recycle_note = QLabel(
-            "どちらの設定でも削除先はWindowsのゴミ箱です。",
+            tr('どちらの設定でも削除先はWindowsのゴミ箱です。'),
             self.file_operation_group,
         )
         recycle_note.setWordWrap(True)
@@ -768,11 +787,11 @@ class SettingsDialog(QDialog):
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
 
-        list_group = QGroupBox("一覧表示", tab)
+        list_group = QGroupBox(tr('一覧表示'), tab)
         list_form = QFormLayout(list_group)
         self.browser_grid_preset_combo = QComboBox(list_group)
         for density, size in GRID_PRESET_THUMBNAIL_SIZES.items():
-            label = BROWSER_DISPLAY_DENSITY_LABELS[density]
+            label = tr(BROWSER_DISPLAY_DENSITY_LABELS[density])
             self.browser_grid_preset_combo.addItem(
                 f"{label} ({size}px)",
                 density.value,
@@ -780,48 +799,48 @@ class SettingsDialog(QDialog):
         self.browser_grid_preset_combo.activated.connect(
             self._apply_browser_grid_preset
         )
-        list_form.addRow("一覧プリセット:", self.browser_grid_preset_combo)
+        list_form.addRow(tr('一覧プリセット:'), self.browser_grid_preset_combo)
 
         self.browser_display_density_combo = QComboBox(list_group)
         for value, label in BROWSER_DISPLAY_DENSITY_LABELS.items():
-            self.browser_display_density_combo.addItem(label, value.value)
-        list_form.addRow("表示密度:", self.browser_display_density_combo)
+            self.browser_display_density_combo.addItem(tr(label), value.value)
+        list_form.addRow(tr('表示密度:'), self.browser_display_density_combo)
 
         self.browser_sort_key_combo = QComboBox(list_group)
         for label, key, order in BROWSER_SORT_CHOICES:
-            self.browser_sort_key_combo.addItem(label, f"{key}:{order}")
+            self.browser_sort_key_combo.addItem(tr(label), f"{key}:{order}")
         self.browser_sort_key_combo.activated.connect(self._activate_browser_sort)
-        list_form.addRow("並び替え:", self.browser_sort_key_combo)
+        list_form.addRow(tr('並び替え:'), self.browser_sort_key_combo)
 
         self.browser_folders_first_checkbox = QCheckBox(
-            "フォルダを常に先頭へ表示",
+            tr('フォルダを常に先頭へ表示'),
             list_group,
         )
         list_form.addRow(self.browser_folders_first_checkbox)
         self.browser_location_history_limit_spin = QSpinBox(list_group)
         self.browser_location_history_limit_spin.setRange(1, 1000)
-        self.browser_location_history_limit_spin.setSuffix(" 件")
+        self.browser_location_history_limit_spin.setSuffix(tr(' 件'))
         list_form.addRow(
-            "場所の履歴を保持する件数:",
+            tr('場所の履歴を保持する件数:'),
             self.browser_location_history_limit_spin,
         )
         self.browser_search_history_limit_spin = QSpinBox(list_group)
         self.browser_search_history_limit_spin.setRange(0, 1000)
-        self.browser_search_history_limit_spin.setSuffix(" 件")
-        self.browser_search_history_limit_spin.setSpecialValueText("保存しない")
+        self.browser_search_history_limit_spin.setSuffix(tr(' 件'))
+        self.browser_search_history_limit_spin.setSpecialValueText(tr('保存しない'))
         list_form.addRow(
-            "検索履歴の保持件数:",
+            tr('検索履歴の保持件数:'),
             self.browser_search_history_limit_spin,
         )
         self.browser_preserve_search_for_viewer_roundtrip_checkbox = QCheckBox(
-            "検索結果からViewerを開いたとき、戻るまで検索を維持",
+            tr('検索結果からViewerを開いたとき、戻るまで検索を維持'),
             list_group,
         )
         list_form.addRow(
             self.browser_preserve_search_for_viewer_roundtrip_checkbox
         )
         self.browser_spacing_preset_checkbox = QCheckBox(
-            "密度プリセットに従う",
+            tr('密度プリセットに従う'),
             list_group,
         )
         self.browser_spacing_preset_checkbox.toggled.connect(
@@ -832,89 +851,88 @@ class SettingsDialog(QDialog):
         self.browser_item_spacing_spin.setRange(0, 32)
         self.browser_item_spacing_spin.setSuffix(" px")
         list_form.addRow(
-            "サムネイル間隔:",
+            tr('サムネイル間隔:'),
             self.browser_item_spacing_spin,
         )
         self.browser_cell_padding_spin = QSpinBox(list_group)
         self.browser_cell_padding_spin.setRange(0, 12)
         self.browser_cell_padding_spin.setSuffix(" px")
         list_form.addRow(
-            "セル内余白:",
+            tr('セル内余白:'),
             self.browser_cell_padding_spin,
         )
         self.browser_filename_display_combo = QComboBox(list_group)
-        self.browser_filename_display_combo.addItem("非表示", "hidden")
-        self.browser_filename_display_combo.addItem("1行", "one_line")
-        self.browser_filename_display_combo.addItem("2行", "two_lines")
-        list_form.addRow("ファイル名:", self.browser_filename_display_combo)
+        self.browser_filename_display_combo.addItem(tr('非表示'), "hidden")
+        self.browser_filename_display_combo.addItem(tr('1行'), "one_line")
+        self.browser_filename_display_combo.addItem(tr('2行'), "two_lines")
+        list_form.addRow(tr('ファイル名:'), self.browser_filename_display_combo)
         self.browser_filename_gap_spin = QSpinBox(list_group)
         self.browser_filename_gap_spin.setRange(0, 32)
         self.browser_filename_gap_spin.setSuffix(" px")
-        list_form.addRow("画像との間隔:", self.browser_filename_gap_spin)
+        list_form.addRow(tr('画像との間隔:'), self.browser_filename_gap_spin)
         self.browser_filename_padding_y_spin = QSpinBox(list_group)
         self.browser_filename_padding_y_spin.setRange(0, 16)
         self.browser_filename_padding_y_spin.setSuffix(" px")
-        list_form.addRow("ファイル名上下余白:", self.browser_filename_padding_y_spin)
+        list_form.addRow(tr('ファイル名上下余白:'), self.browser_filename_padding_y_spin)
         self.browser_show_hidden_checkbox = QCheckBox(
-            "隠しファイルとフォルダを表示",
+            tr('隠しファイルとフォルダを表示'),
             list_group,
         )
         list_form.addRow(self.browser_show_hidden_checkbox)
         self.browser_show_unsupported_checkbox = QCheckBox(
-            "非対応ファイルも表示",
+            tr('非対応ファイルも表示'),
             list_group,
         )
         list_form.addRow(self.browser_show_unsupported_checkbox)
         self.browser_show_system_checkbox = QCheckBox(
-            "保護されたシステム項目を表示",
+            tr('保護されたシステム項目を表示'),
             list_group,
         )
         self.browser_show_system_checkbox.setToolTip(
-            "Windowsの保護されたシステム項目を表示します。操作時は注意してください。"
+            tr('Windowsの保護されたシステム項目を表示します。操作時は注意してください。')
         )
         list_form.addRow(self.browser_show_system_checkbox)
 
-        cache_group = QGroupBox("サムネイル", tab)
+        cache_group = QGroupBox(tr('サムネイル'), tab)
         form = QFormLayout(cache_group)
 
         self.thumbnail_size_spin = QSpinBox(cache_group)
         self.thumbnail_size_spin.setRange(96, 384)
         self.thumbnail_size_spin.setSingleStep(32)
         self.thumbnail_size_spin.setSuffix(" px")
-        form.addRow("サムネイルサイズ:", self.thumbnail_size_spin)
+        form.addRow(tr('サムネイルサイズ:'), self.thumbnail_size_spin)
 
         self.thumbnail_frame_ratio_combo = QComboBox(cache_group)
         for ratio_id, (_ratio, label) in FRAME_RATIOS.items():
-            self.thumbnail_frame_ratio_combo.addItem(label, ratio_id)
-        form.addRow("画像枠の比率:", self.thumbnail_frame_ratio_combo)
+            self.thumbnail_frame_ratio_combo.addItem(tr(label), ratio_id)
+        form.addRow(tr('画像枠の比率:'), self.thumbnail_frame_ratio_combo)
 
         self.browser_thumbnail_display_mode_combo = QComboBox(cache_group)
         for mode, label in BROWSER_THUMBNAIL_DISPLAY_MODES.items():
-            self.browser_thumbnail_display_mode_combo.addItem(label, mode)
+            self.browser_thumbnail_display_mode_combo.addItem(tr(label), mode)
         self.browser_thumbnail_display_mode_combo.setToolTip(
-            "全体表示は画像全体を枠内へ収めます。"
-            "中央クロップは縦横比を保ったまま画像中央で枠を埋めます。"
+            tr('全体表示は画像全体を枠内へ収めます。中央クロップは縦横比を保ったまま画像中央で枠を埋めます。')
         )
         form.addRow(
-            "Browser表示方式:",
+            tr('Browser表示方式:'),
             self.browser_thumbnail_display_mode_combo,
         )
 
         folder_editor = FallbackBackgroundEditor(
             cache_group, default_color=BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR,
-            auto_label="自動（ZipPla互換の黒）", restore_label="既定に戻す",
+            auto_label=tr('自動（ZipPla互換の黒）'), restore_label=tr('既定に戻す'),
         )
         file_editor = FallbackBackgroundEditor(
             cache_group, default_color=BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR,
-            auto_label="自動（既定の黒）", restore_label="デフォルトに戻す",
+            auto_label=tr('自動（既定の黒）'), restore_label=tr('デフォルトに戻す'),
         )
         # One explicit catalog drives both loading and serialization.
         self._fallback_background_editors = {
             "browser_folder_fallback_background": folder_editor,
             "browser_file_fallback_background": file_editor,
         }
-        form.addRow("フォルダーの代替サムネイル背景:", folder_editor)
-        form.addRow("ファイルの代替サムネイル背景:", file_editor)
+        form.addRow(tr('フォルダーの代替サムネイル背景:'), folder_editor)
+        form.addRow(tr('ファイルの代替サムネイル背景:'), file_editor)
         # Keep existing control accessors; these are aliases, not state.
         self.browser_folder_fallback_background_combo = folder_editor.combo
         self.browser_folder_fallback_color_button = folder_editor.color_button
@@ -925,43 +943,40 @@ class SettingsDialog(QDialog):
 
         self.thumbnail_crop_mode_combo = QComboBox(cache_group)
         for mode, label in CROP_MODES.items():
-            self.thumbnail_crop_mode_combo.addItem(label, mode)
-        form.addRow("切り抜き:", self.thumbnail_crop_mode_combo)
+            self.thumbnail_crop_mode_combo.addItem(tr(label), mode)
+        form.addRow(tr('切り抜き:'), self.thumbnail_crop_mode_combo)
 
         self.thumbnail_quality_mode_combo = QComboBox(cache_group)
-        self.thumbnail_quality_mode_combo.addItem("容量優先", "economy")
-        self.thumbnail_quality_mode_combo.addItem("自動・推奨", "auto")
-        self.thumbnail_quality_mode_combo.addItem("高画質", "high")
+        self.thumbnail_quality_mode_combo.addItem(tr('容量優先'), "economy")
+        self.thumbnail_quality_mode_combo.addItem(tr('自動・推奨'), "auto")
+        self.thumbnail_quality_mode_combo.addItem(tr('高画質'), "high")
         self.thumbnail_quality_mode_combo.setToolTip(
-            "容量優先: 表示に近い解像度。自動: 高DPIと再縮小を考慮。"
-            "高画質: より大きなキャッシュを使用します。"
+            tr('容量優先: 表示に近い解像度。自動: 高DPIと再縮小を考慮。高画質: より大きなキャッシュを使用します。')
         )
-        form.addRow("生成品質:", self.thumbnail_quality_mode_combo)
+        form.addRow(tr('生成品質:'), self.thumbnail_quality_mode_combo)
 
         self.thumbnail_cache_max_edge_spin = QSpinBox(cache_group)
         self.thumbnail_cache_max_edge_spin.setRange(256, 2048)
         self.thumbnail_cache_max_edge_spin.setSingleStep(256)
         self.thumbnail_cache_max_edge_spin.setSuffix(" px")
-        form.addRow("生成最大辺:", self.thumbnail_cache_max_edge_spin)
+        form.addRow(tr('生成最大辺:'), self.thumbnail_cache_max_edge_spin)
 
         self.thumbnail_webp_quality_spin = QSpinBox(cache_group)
         self.thumbnail_webp_quality_spin.setObjectName("thumbnail_webp_quality_spin")
         self.thumbnail_webp_quality_spin.setRange(1, 100)
-        form.addRow("保存サムネイルの圧縮品質:", self.thumbnail_webp_quality_spin)
+        form.addRow(tr('保存サムネイルの圧縮品質:'), self.thumbnail_webp_quality_spin)
         compression_note = QLabel(
-            "高いほど高画質・容量大。WebP非対応時はPNG（可逆圧縮）で保存します。\n"
-            "新しく生成するサムネイルに適用され、既存キャッシュは順次更新されます。",
+            tr('高いほど高画質・容量大。WebP非対応時はPNG（可逆圧縮）で保存します。\n新しく生成するサムネイルに適用され、既存キャッシュは順次更新されます。'),
             cache_group,
         )
         compression_note.setWordWrap(True)
         self.thumbnail_webp_quality_spin.setToolTip(compression_note.text())
         form.addRow(compression_note)
-        self.thumbnail_preserve_alpha_checkbox = QCheckBox("保存サムネイルの透明度を保持", cache_group)
+        self.thumbnail_preserve_alpha_checkbox = QCheckBox(tr('保存サムネイルの透明度を保持'), cache_group)
         self.thumbnail_preserve_alpha_checkbox.setObjectName("thumbnail_preserve_alpha_checkbox")
         form.addRow(self.thumbnail_preserve_alpha_checkbox)
         alpha_note = QLabel(
-            "通常はBrowserの背景色で透明部分を埋めて保存します。\n"
-            "オン: 透明度はそのまま保持し、色は指定品質で非可逆圧縮します。",
+            tr('通常はBrowserの背景色で透明部分を埋めて保存します。\nオン: 透明度はそのまま保持し、色は指定品質で非可逆圧縮します。'),
             cache_group,
         )
         alpha_note.setWordWrap(True)
@@ -969,16 +984,14 @@ class SettingsDialog(QDialog):
         form.addRow(alpha_note)
 
         bucket_note = QLabel(
-            "論理表示サイズと画面DPIから物理解像度を選び、複数のbucketを"
-            "再利用します。設定変更後も互換キャッシュは再利用されます。"
-            "完全に作り直す場合だけ「キャッシュを削除」を使用してください。",
+            tr('論理表示サイズと画面DPIから物理解像度を選び、複数のbucketを再利用します。設定変更後も互換キャッシュは再利用されます。完全に作り直す場合だけ「キャッシュを削除」を使用してください。'),
             cache_group,
         )
         bucket_note.setWordWrap(True)
         form.addRow(bucket_note)
 
         self.disk_cache_checkbox = QCheckBox(
-            "ディスクサムネイルキャッシュを使用する",
+            tr('ディスクサムネイルキャッシュを使用する'),
             cache_group,
         )
         form.addRow(self.disk_cache_checkbox)
@@ -986,39 +999,39 @@ class SettingsDialog(QDialog):
         self.cache_limit_spin = QSpinBox(cache_group)
         self.cache_limit_spin.setRange(128, 4096)
         self.cache_limit_spin.setSuffix(" MB")
-        form.addRow("キャッシュ最大容量:", self.cache_limit_spin)
+        form.addRow(tr('キャッシュ最大容量:'), self.cache_limit_spin)
 
         self.cache_unused_days_combo = QComboBox(cache_group)
         for label, days in (
-            ("使用しない", 0),
-            ("30日", 30),
-            ("90日（推奨）", 90),
-            ("180日", 180),
-            ("365日", 365),
-            ("カスタム", -1),
+            (tr('使用しない'), 0),
+            (tr('30日'), 30),
+            (tr('90日（推奨）'), 90),
+            (tr('180日'), 180),
+            (tr('365日'), 365),
+            (tr('カスタム'), -1),
         ):
             self.cache_unused_days_combo.addItem(label, days)
         self.cache_unused_days_spin = QSpinBox(cache_group)
         self.cache_unused_days_spin.setRange(7, 3650)
-        self.cache_unused_days_spin.setSuffix(" 日")
+        self.cache_unused_days_spin.setSuffix(tr(' 日'))
         self.cache_unused_days_combo.currentIndexChanged.connect(
             lambda _index: self.cache_unused_days_spin.setEnabled(
                 int(self.cache_unused_days_combo.currentData()) == -1
             )
         )
-        form.addRow("未使用期間の整理:", self.cache_unused_days_combo)
-        form.addRow("カスタム日数:", self.cache_unused_days_spin)
+        form.addRow(tr('未使用期間の整理:'), self.cache_unused_days_combo)
+        form.addRow(tr('カスタム日数:'), self.cache_unused_days_spin)
         cleanup_warning = QLabel(
-            "短い期間では再生成とSSD書き込みが増える可能性があります。",
+            tr('短い期間では再生成とSSD書き込みが増える可能性があります。'),
             cache_group,
         )
         cleanup_warning.setWordWrap(True)
         form.addRow(cleanup_warning)
 
         self.cache_usage_label = QLabel(cache_group)
-        self.clear_cache_button = QPushButton("キャッシュを削除", cache_group)
+        self.clear_cache_button = QPushButton(tr('キャッシュを削除'), cache_group)
         self.clear_cache_button.clicked.connect(self.request_cache_clear)
-        self.cleanup_cache_button = QPushButton("今すぐ整理", cache_group)
+        self.cleanup_cache_button = QPushButton(tr('今すぐ整理'), cache_group)
         self.cleanup_cache_button.clicked.connect(
             self.cache_cleanup_requested.emit
         )
@@ -1028,48 +1041,48 @@ class SettingsDialog(QDialog):
         usage_layout.addWidget(self.cache_usage_label, 1)
         usage_layout.addWidget(self.cleanup_cache_button)
         usage_layout.addWidget(self.clear_cache_button)
-        form.addRow("現在の使用量:", usage_row)
+        form.addRow(tr('現在の使用量:'), usage_row)
 
         layout.addWidget(list_group)
         layout.addWidget(cache_group)
 
-        preview_group = QGroupBox("汎用ファイルプレビュー", tab)
+        preview_group = QGroupBox(tr('汎用ファイルプレビュー'), tab)
         preview_form = QFormLayout(preview_group)
         self.text_preview_checkbox = QCheckBox(
-            "テキストファイルの内容をプレビューする",
+            tr('テキストファイルの内容をプレビューする'),
             preview_group,
         )
         preview_form.addRow(self.text_preview_checkbox)
         self.video_thumbnail_checkbox = QCheckBox(
-            "動画のサムネイルを表示する",
+            tr('動画のサムネイルを表示する'),
             preview_group,
         )
         preview_form.addRow(self.video_thumbnail_checkbox)
         self.video_thumbnail_backend_combo = QComboBox(preview_group)
-        self.video_thumbnail_backend_combo.addItem("自動・推奨", "auto")
+        self.video_thumbnail_backend_combo.addItem(tr('自動・推奨'), "auto")
         self.video_thumbnail_backend_combo.addItem(
-            "Windows Shellのみ",
+            tr('Windows Shellのみ'),
             "windows_shell",
         )
-        self.video_thumbnail_backend_combo.addItem("FFmpegのみ", "ffmpeg")
-        self.video_thumbnail_backend_combo.addItem("無効", "disabled")
+        self.video_thumbnail_backend_combo.addItem(tr('FFmpegのみ'), "ffmpeg")
+        self.video_thumbnail_backend_combo.addItem(tr('無効'), "disabled")
         preview_form.addRow(
-            "動画バックエンド:",
+            tr('動画バックエンド:'),
             self.video_thumbnail_backend_combo,
         )
         self.video_thumbnail_frame_mode_combo = QComboBox(preview_group)
-        self.video_thumbnail_frame_mode_combo.addItem("代表フレーム（推奨）", "smart")
-        self.video_thumbnail_frame_mode_combo.addItem("再生時間の1/3", "one_third")
+        self.video_thumbnail_frame_mode_combo.addItem(tr('代表フレーム（推奨）'), "smart")
+        self.video_thumbnail_frame_mode_combo.addItem(tr('再生時間の1/3'), "one_third")
         self.video_thumbnail_frame_mode_combo.addItem(
-            "Windows Shellの選択",
+            tr('Windows Shellの選択'),
             "windows_shell",
         )
         preview_form.addRow(
-            "動画フレーム:",
+            tr('動画フレーム:'),
             self.video_thumbnail_frame_mode_combo,
         )
         self.video_thumbnail_shell_placeholder_checkbox = QCheckBox(
-            "FFmpeg結果までShell画像を一時表示する",
+            tr('FFmpeg結果までShell画像を一時表示する'),
             preview_group,
         )
         preview_form.addRow(self.video_thumbnail_shell_placeholder_checkbox)
@@ -1078,103 +1091,102 @@ class SettingsDialog(QDialog):
         ffmpeg_path_layout = QHBoxLayout(ffmpeg_path_row)
         ffmpeg_path_layout.setContentsMargins(0, 0, 0, 0)
         ffmpeg_path_layout.addWidget(self.ffmpeg_path_edit, 1)
-        self.ffmpeg_browse_button = QPushButton("参照...", preview_group)
+        self.ffmpeg_browse_button = QPushButton(tr('参照...'), preview_group)
         self.ffmpeg_browse_button.clicked.connect(self.browse_ffmpeg)
         ffmpeg_path_layout.addWidget(self.ffmpeg_browse_button)
-        self.ffmpeg_redetect_button = QPushButton("再検出", preview_group)
+        self.ffmpeg_redetect_button = QPushButton(tr('再検出'), preview_group)
         self.ffmpeg_redetect_button.clicked.connect(self.redetect_ffmpeg)
         ffmpeg_path_layout.addWidget(self.ffmpeg_redetect_button)
         preview_form.addRow("FFmpeg:", ffmpeg_path_row)
-        self.ffmpeg_status_label = QLabel("FFmpeg：未確認", preview_group)
+        self.ffmpeg_status_label = QLabel(tr('FFmpeg：未確認'), preview_group)
         self.ffmpeg_status_label.setWordWrap(True)
-        preview_form.addRow("現在の状態:", self.ffmpeg_status_label)
+        preview_form.addRow(tr('現在の状態:'), self.ffmpeg_status_label)
         ffmpeg_note = QLabel(
-            "FFmpegは任意です。自動ダウンロードや自動同梱は行いません。",
+            tr('FFmpegは任意です。自動ダウンロードや自動同梱は行いません。'),
             preview_group,
         )
         ffmpeg_note.setWordWrap(True)
         preview_form.addRow(ffmpeg_note)
         self.browser_external_drop_combo = QComboBox(preview_group)
         self.browser_external_drop_combo.addItem(
-            "一覧で選択・中央表示のみ",
+            tr('一覧で選択・中央表示のみ'),
             "focus_only",
         )
         self.browser_external_drop_combo.addItem(
-            "選択後に対応ファイルを開く",
+            tr('選択後に対応ファイルを開く'),
             "focus_and_open",
         )
         preview_form.addRow(
-            "Browser中央への外部ドロップ:",
+            tr('Browser中央への外部ドロップ:'),
             self.browser_external_drop_combo,
         )
         layout.addWidget(preview_group)
 
-        sidebar_group = QGroupBox("サイドバー", tab)
+        sidebar_group = QGroupBox(tr('サイドバー'), tab)
         sidebar_form = QFormLayout(sidebar_group)
         self.browser_sidebar_layout_combo = QComboBox(sidebar_group)
         for value, label in (
-            ("favorites_top_tree_bottom", "お気に入り上／ツリー下"),
-            ("tree_top_favorites_bottom", "ツリー上／お気に入り下"),
-            ("tabs", "タブ"),
-            ("favorites_only", "お気に入りのみ"),
-            ("tree_only", "ツリーのみ"),
+            ("favorites_top_tree_bottom", tr('お気に入り上／ツリー下')),
+            ("tree_top_favorites_bottom", tr('ツリー上／お気に入り下')),
+            ("tabs", tr('タブ')),
+            ("favorites_only", tr('お気に入りのみ')),
+            ("tree_only", tr('ツリーのみ')),
         ):
             self.browser_sidebar_layout_combo.addItem(label, value)
         sidebar_form.addRow(
-            "レイアウト:",
+            tr('レイアウト:'),
             self.browser_sidebar_layout_combo,
         )
         self.folder_tree_sync_mode_combo = QComboBox(sidebar_group)
-        self.folder_tree_sync_mode_combo.addItem("同期しない", "off")
+        self.folder_tree_sync_mode_combo.addItem(tr('同期しない'), "off")
         self.folder_tree_sync_mode_combo.addItem(
-            "現在フォルダを選択",
+            tr('現在フォルダを選択'),
             "select_current",
         )
         self.folder_tree_sync_mode_combo.addItem(
-            "現在フォルダへフォーカス",
+            tr('現在フォルダへフォーカス'),
             "focus_current",
         )
         sidebar_form.addRow(
-            "フォルダツリー同期:",
+            tr('フォルダツリー同期:'),
             self.folder_tree_sync_mode_combo,
         )
         self.folder_tree_collapse_checkbox = QCheckBox(
-            "無関係な自動展開を折りたたむ",
+            tr('無関係な自動展開を折りたたむ'),
             sidebar_group,
         )
         sidebar_form.addRow(self.folder_tree_collapse_checkbox)
         self.folder_tree_focus_rebase_checkbox = QCheckBox(
-            "現在フォルダを基準にツリーの表示ルートを絞る",
+            tr('現在フォルダを基準にツリーの表示ルートを絞る'),
             sidebar_group,
         )
         sidebar_form.addRow(self.folder_tree_focus_rebase_checkbox)
         self.folder_tree_ancestor_levels_spin = QSpinBox(sidebar_group)
         self.folder_tree_ancestor_levels_spin.setRange(0, 12)
         sidebar_form.addRow(
-            "現在フォルダの上位階層:",
+            tr('現在フォルダの上位階層:'),
             self.folder_tree_ancestor_levels_spin,
         )
         self.favorite_row_padding_spin = QSpinBox(sidebar_group)
         self.favorite_row_padding_spin.setRange(0, 8)
         sidebar_form.addRow(
-            "お気に入り上下余白:",
+            tr('お気に入り上下余白:'),
             self.favorite_row_padding_spin,
         )
         self.favorite_row_spacing_spin = QSpinBox(sidebar_group)
         self.favorite_row_spacing_spin.setRange(0, 8)
         sidebar_form.addRow(
-            "お気に入り行間隔:",
+            tr('お気に入り行間隔:'),
             self.favorite_row_spacing_spin,
         )
         self.favorite_icon_size_spin = QSpinBox(sidebar_group)
         self.favorite_icon_size_spin.setRange(14, 24)
         sidebar_form.addRow(
-            "お気に入りアイコン:",
+            tr('お気に入りアイコン:'),
             self.favorite_icon_size_spin,
         )
         tree_focus_note = QLabel(
-            "深いフォルダでインデントが増えすぎないよう、現在フォルダから"
-            "指定した階層だけ上をツリーの表示基準にします。",
+            tr('深いフォルダでインデントが増えすぎないよう、現在フォルダから指定した階層だけ上をツリーの表示基準にします。'),
             sidebar_group,
         )
         tree_focus_note.setWordWrap(True)
@@ -1189,52 +1201,51 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(self._build_browser_wheel_scroll_group(tab))
 
-        gesture_group = QGroupBox("Viewer画像表示領域", tab)
+        gesture_group = QGroupBox(tr('Viewer画像表示領域'), tab)
         gesture_form = QFormLayout(gesture_group)
         self.mouse_gestures_checkbox = QCheckBox(
-            "Viewer画像表示領域でマウスジェスチャーを使用する",
+            tr('Viewer画像表示領域でマウスジェスチャーを使用する'),
             gesture_group,
         )
         self.mouse_gestures_checkbox.toggled.connect(self._sync_gesture_controls)
         gesture_form.addRow(self.mouse_gestures_checkbox)
         self.mouse_gesture_trail_checkbox = QCheckBox(
-            "操作中に軌跡を表示する（Viewer・Browser共通）",
+            tr('操作中に軌跡を表示する（Viewer・Browser共通）'),
             gesture_group,
         )
         gesture_form.addRow(self.mouse_gesture_trail_checkbox)
         self.mouse_gesture_distance_spin = QSpinBox(gesture_group)
         self.mouse_gesture_distance_spin.setRange(12, 200)
         self.mouse_gesture_distance_spin.setSuffix(" px")
-        gesture_form.addRow("認識最小距離:", self.mouse_gesture_distance_spin)
+        gesture_form.addRow(tr('認識最小距離:'), self.mouse_gesture_distance_spin)
         self.gesture_down_combo = self._command_combo(gesture_group)
         self.gesture_up_combo = self._command_combo(gesture_group)
-        gesture_form.addRow("下へドラッグ (D):", self.gesture_down_combo)
-        gesture_form.addRow("上へドラッグ (U):", self.gesture_up_combo)
+        gesture_form.addRow(tr('下へドラッグ (D):'), self.gesture_down_combo)
+        gesture_form.addRow(tr('上へドラッグ (U):'), self.gesture_up_combo)
 
         browser_gesture_group = QGroupBox(
-            "Browserサムネイル一覧領域",
+            tr('Browserサムネイル一覧領域'),
             tab,
         )
         browser_gesture_layout = QVBoxLayout(browser_gesture_group)
         self.browser_folder_gestures_checkbox = QCheckBox(
-            "Browserのサムネイル一覧でフォルダージェスチャーを使用する",
+            tr('Browserのサムネイル一覧でフォルダージェスチャーを使用する'),
             browser_gesture_group,
         )
         browser_gesture_layout.addWidget(self.browser_folder_gestures_checkbox)
         browser_gesture_description = QLabel(
-            "上：上の階層へ移動　左：前のフォルダー　"
-            "右：次のフォルダー　下：フォルダーを更新",
+            tr('上：上の階層へ移動\u3000左：前のフォルダー\u3000右：次のフォルダー\u3000下：フォルダーを更新'),
             browser_gesture_group,
         )
         browser_gesture_description.setWordWrap(True)
         browser_gesture_layout.addWidget(browser_gesture_description)
 
-        button_group = QGroupBox("マウス追加ボタン", tab)
+        button_group = QGroupBox(tr('マウス追加ボタン'), tab)
         button_form = QFormLayout(button_group)
         self.mouse_back_action_combo = self._command_combo(button_group)
         self.mouse_forward_action_combo = self._command_combo(button_group)
-        button_form.addRow("戻る / XButton1:", self.mouse_back_action_combo)
-        button_form.addRow("進む / XButton2:", self.mouse_forward_action_combo)
+        button_form.addRow(tr('戻る / XButton1:'), self.mouse_back_action_combo)
+        button_form.addRow(tr('進む / XButton2:'), self.mouse_forward_action_combo)
 
         layout.addWidget(gesture_group)
         layout.addWidget(browser_gesture_group)
@@ -1243,6 +1254,9 @@ class SettingsDialog(QDialog):
         return tab
 
     def load_current_values(self) -> None:
+        self.ui_language_combo.setCurrentIndex(max(
+            0, self.ui_language_combo.findData(self.config.get("ui_language", "ja")),
+        ))
         behavior = str(self.config.get("open_viewer_behavior", "reuse_or_create"))
         index = self.open_behavior_combo.findData(behavior)
         self.open_behavior_combo.setCurrentIndex(max(0, index))
@@ -1692,23 +1706,22 @@ class SettingsDialog(QDialog):
         service = self._file_registration_service
         if service is None:
             self.registration_status_label.setText(
-                "Windows関連付けはこの起動環境では利用できません。"
+                tr('Windows関連付けはこの起動環境では利用できません。')
             )
             return
         status = service.get_status()
         if status.registered:
             match = (
-                "現在の実行ファイルと一致"
+                tr('現在の実行ファイルと一致')
                 if status.matches_current_executable
-                else "現在の実行ファイルと不一致（移動後は再登録が必要）"
+                else tr('現在の実行ファイルと不一致（移動後は再登録が必要）')
             )
             self.registration_status_label.setText(
-                f"登録済み: {', '.join(status.registered_extensions)}\n"
-                f"{status.executable_path}\n{match}"
+                tr('登録済み: {p0}\n{p1}\n{p2}', p0=', '.join(status.registered_extensions), p1=status.executable_path, p2=match)
             )
         else:
             detail = f"\n{status.error_message}" if status.error_message else ""
-            self.registration_status_label.setText(f"未登録{detail}")
+            self.registration_status_label.setText(tr('未登録{p0}', p0=detail))
 
     def _register_with_windows(self) -> None:
         service = self._file_registration_service
@@ -1724,12 +1737,12 @@ class SettingsDialog(QDialog):
         if self.register_pdf_checkbox.isChecked():
             extensions.update(FORMAT_CATEGORIES["pdf"])
         if not extensions:
-            QMessageBox.information(self, "Windows連携", "登録する形式を選択してください。")
+            QMessageBox.information(self, tr('Windows連携'), tr('登録する形式を選択してください。'))
             return
         answer = QMessageBox.question(
             self,
-            "Windowsへ登録",
-            "選択した形式の「プログラムから開く」候補へNivisViewerを登録しますか？",
+            tr('Windowsへ登録'),
+            tr('選択した形式の「プログラムから開く」候補へNivisViewerを登録しますか？'),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -1741,7 +1754,7 @@ class SettingsDialog(QDialog):
         )
         self.refresh_registration_status()
         if status.error_message:
-            QMessageBox.warning(self, "Windows連携", status.error_message)
+            QMessageBox.warning(self, tr('Windows連携'), status.error_message)
 
     def _unregister_from_windows(self) -> None:
         service = self._file_registration_service
@@ -1749,8 +1762,8 @@ class SettingsDialog(QDialog):
             return
         answer = QMessageBox.question(
             self,
-            "登録を解除",
-            "NivisViewerが作成したWindows関連付け情報を解除しますか？",
+            tr('登録を解除'),
+            tr('NivisViewerが作成したWindows関連付け情報を解除しますか？'),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -1759,15 +1772,15 @@ class SettingsDialog(QDialog):
         status = service.unregister()
         self.refresh_registration_status()
         if status.error_message:
-            QMessageBox.warning(self, "Windows連携", status.error_message)
+            QMessageBox.warning(self, tr('Windows連携'), status.error_message)
 
     def _open_default_apps(self) -> None:
         service = self._file_registration_service
         if service is not None and not service.open_default_apps_settings():
             QMessageBox.warning(
                 self,
-                "Windows連携",
-                "Windowsの既定のアプリ設定を開けませんでした。",
+                tr('Windows連携'),
+                tr('Windowsの既定のアプリ設定を開けませんでした。'),
             )
 
     def _on_prefetch_preset_changed(self, index: int) -> None:
@@ -1824,6 +1837,7 @@ class SettingsDialog(QDialog):
             self._custom_prefetch_values = self._prefetch_spin_values()
         custom_prefetch = self._custom_prefetch_values
         return {
+            "ui_language": self.ui_language_combo.currentData(),
             "open_viewer_behavior": self.open_behavior_combo.currentData(),
             "bring_viewer_to_front_on_open": self.bring_to_front_checkbox.isChecked(),
             "file_operation_delete_confirm_focus_yes": (
@@ -2213,9 +2227,9 @@ class SettingsDialog(QDialog):
         start = self.ffmpeg_path_edit.text().strip()
         path, _selected_filter = QFileDialog.getOpenFileName(
             self,
-            "FFmpeg実行ファイルを選択",
+            tr('FFmpeg実行ファイルを選択'),
             start,
-            "FFmpeg executable (ffmpeg.exe);;実行ファイル (*.exe);;すべてのファイル (*.*)",
+            tr('FFmpeg executable (ffmpeg.exe);;実行ファイル (*.exe);;すべてのファイル (*.*)'),
         )
         if path:
             self.ffmpeg_path_edit.setText(path)
@@ -2227,7 +2241,7 @@ class SettingsDialog(QDialog):
         explicit = self.ffmpeg_path_edit.text().strip().strip('"')
         self._ffmpeg_probe_generation += 1
         generation = self._ffmpeg_probe_generation
-        self.ffmpeg_status_label.setText("FFmpeg：確認中…")
+        self.ffmpeg_status_label.setText(tr('FFmpeg：確認中…'))
         self.ffmpeg_redetect_button.setEnabled(False)
         worker = _FFmpegProbeWorker(
             generation,
@@ -2251,10 +2265,10 @@ class SettingsDialog(QDialog):
         self.ffmpeg_redetect_button.setEnabled(True)
         if executable is None:
             self.ffmpeg_status_label.setText(
-                "FFmpeg：見つかりません（動画はWindows Shellを使用します）"
+                tr('FFmpeg：見つかりません（動画はWindows Shellを使用します）')
             )
         else:
-            self.ffmpeg_status_label.setText(f"FFmpeg：検出済み\n{executable}")
+            self.ffmpeg_status_label.setText(tr('FFmpeg：検出済み\n{p0}', p0=executable))
 
     def browse_winrar(self) -> None:
         if self._probes_closed:
@@ -2262,9 +2276,9 @@ class SettingsDialog(QDialog):
         start = self.winrar_path_edit.text().strip()
         path, _selected_filter = QFileDialog.getOpenFileName(
             self,
-            "WinRAR実行ファイルを選択",
+            tr('WinRAR実行ファイルを選択'),
             start,
-            "WinRAR executable (WinRAR.exe UnRAR.exe Rar.exe);;実行ファイル (*.exe);;すべてのファイル (*.*)",
+            tr('WinRAR executable (WinRAR.exe UnRAR.exe Rar.exe);;実行ファイル (*.exe);;すべてのファイル (*.*)'),
         )
         if path:
             self.winrar_path_edit.setText(path)
@@ -2292,7 +2306,7 @@ class SettingsDialog(QDialog):
         generation = self._winrar_probe_generation
         self._pending_winrar_path = path if apply_on_success else None
         self._accept_after_winrar_probe = bool(accept_after)
-        self.winrar_status_label.setText("WinRAR：確認中…")
+        self.winrar_status_label.setText(tr('WinRAR：確認中…'))
         self.winrar_redetect_button.setEnabled(False)
         worker = _WinRARProbeWorker(
             generation,
@@ -2317,16 +2331,16 @@ class SettingsDialog(QDialog):
         if info.available:
             version = f"\n{info.version_text}" if info.version_text else ""
             source = (
-                "\nWindows関連付けから検出"
+                tr('\nWindows関連付けから検出')
                 if getattr(info, "discovery_source", None) == "association"
                 else ""
             )
             self.winrar_status_label.setText(
-                f"WinRAR：検出済み{source}\n{info.executable_path}{version}"
+                tr('WinRAR：検出済み{p0}\n{p1}{p2}', p0=source, p1=info.executable_path, p2=version)
             )
         else:
             detail = f"\n{info.error_message}" if info.error_message else ""
-            self.winrar_status_label.setText(f"WinRAR：見つかりません{detail}")
+            self.winrar_status_label.setText(tr('WinRAR：見つかりません{p0}', p0=detail))
 
         pending = self._pending_winrar_path
         close_after = self._accept_after_winrar_probe
@@ -2354,9 +2368,9 @@ class SettingsDialog(QDialog):
         start = self.seven_zip_path_edit.text().strip()
         path, _selected_filter = QFileDialog.getOpenFileName(
             self,
-            "7-Zip実行ファイルを選択",
+            tr('7-Zip実行ファイルを選択'),
             start,
-            "7-Zip executable (7z.exe 7zz.exe);;実行ファイル (*.exe);;すべてのファイル (*.*)",
+            tr('7-Zip executable (7z.exe 7zz.exe);;実行ファイル (*.exe);;すべてのファイル (*.*)'),
         )
         if path:
             self.seven_zip_path_edit.setText(path)
@@ -2384,7 +2398,7 @@ class SettingsDialog(QDialog):
         generation = self._probe_generation
         self._pending_explicit_path = path if apply_on_success else None
         self._accept_after_probe = bool(accept_after)
-        self.seven_zip_status_label.setText("7-Zip：確認中…")
+        self.seven_zip_status_label.setText(tr('7-Zip：確認中…'))
         self.seven_zip_redetect_button.setEnabled(False)
         worker = _SevenZipProbeWorker(
             generation,
@@ -2409,11 +2423,11 @@ class SettingsDialog(QDialog):
         if info.available:
             version = f"\n{info.version_text}" if info.version_text else ""
             self.seven_zip_status_label.setText(
-                f"7-Zip：検出済み\n{info.executable_path}{version}"
+                tr('7-Zip：検出済み\n{p0}{p1}', p0=info.executable_path, p1=version)
             )
         else:
             detail = f"\n{info.error_message}" if info.error_message else ""
-            self.seven_zip_status_label.setText(f"7-Zip：見つかりません{detail}")
+            self.seven_zip_status_label.setText(tr('7-Zip：見つかりません{p0}', p0=detail))
 
         pending = self._pending_explicit_path
         close_after = self._accept_after_probe
@@ -2436,15 +2450,15 @@ class SettingsDialog(QDialog):
         if confirm:
             answer = QMessageBox.question(
                 self,
-                "サムネイルキャッシュを削除",
-                "保存済みのサムネイルキャッシュを削除しますか？",
+                tr('サムネイルキャッシュを削除'),
+                tr('保存済みのサムネイルキャッシュを削除しますか？'),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
         self.cache_clear_requested.emit()
-        self.cache_usage_label.setText("削除処理を要求しました。")
+        self.cache_usage_label.setText(tr('削除処理を要求しました。'))
 
     def refresh_cache_usage(self) -> None:
         if self._cache_statistics_getter is not None:
@@ -2456,15 +2470,14 @@ class SettingsDialog(QDialog):
                 used = max(0, int(stats.get("usage_bytes", 0)))
                 entries = max(0, int(stats.get("entry_count", 0)))
                 growth = max(0, int(stats.get("session_growth_bytes", 0)))
-                last_cleanup = str(stats.get("last_cleanup_display", "未実行"))
+                last_cleanup = str(stats.get("last_cleanup_display", tr('未実行')))
                 self.cache_usage_label.setText(
-                    f"{self._format_bytes(used)} / {entries}件"
-                    f"（今回 +{self._format_bytes(growth)}）"
+                    tr('{p0} / {p1}件（今回 +{p2}）', p0=self._format_bytes(used), p1=entries, p2=self._format_bytes(growth))
                 )
                 self.cache_usage_label.setToolTip(
                     "\n".join(
                         (
-                            f"最後の整理: {last_cleanup}",
+                            tr('最後の整理: {p0}', p0=last_cleanup),
                             f"memory hit: {int(stats.get('memory_hit', 0))}",
                             f"disk hit: {int(stats.get('disk_hit', 0))}",
                             f"generated: {int(stats.get('generated', 0))}",
@@ -2477,7 +2490,7 @@ class SettingsDialog(QDialog):
         try:
             used = max(0, int(self._cache_usage_getter())) if self._cache_usage_getter else 0
         except Exception:
-            self.cache_usage_label.setText("取得できません")
+            self.cache_usage_label.setText(tr('取得できません'))
             return
         self.cache_usage_label.setText(self._format_bytes(used))
 
@@ -2490,8 +2503,8 @@ class SettingsDialog(QDialog):
             self._last_save_error_reported = error
             QMessageBox.warning(
                 self,
-                "設定を保存できません",
-                f"設定ファイルへ保存できませんでした。\n{error}",
+                tr('設定を保存できません'),
+                tr('設定ファイルへ保存できませんでした。\n{p0}', p0=error),
             )
         return True
 
@@ -2514,7 +2527,7 @@ class SettingsDialog(QDialog):
     def _command_combo(parent: QWidget) -> QComboBox:
         combo = QComboBox(parent)
         for label, command in COMMAND_CHOICES:
-            combo.addItem(label, command)
+            combo.addItem(tr(label), command)
         return combo
 
     @staticmethod

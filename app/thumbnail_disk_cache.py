@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import hashlib
 import json
 import os
@@ -543,7 +546,7 @@ class ThumbnailDiskCache:
                     time.localtime(self._cached_last_cleanup),
                 )
                 if self._cached_last_cleanup > 0
-                else "未実行"
+                else tr('未実行')
             )
             return {
                 "usage_bytes": self._cached_usage_bytes if self.enabled else 0,

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from .i18n import tr
+from .menu_icons import install_text_icon_menu_style, settings_icon
+
+
 import inspect
 import logging
 import math
@@ -669,7 +673,7 @@ class ViewerWindow(QMainWindow):
 
         self._updating_page_list_selection = False
         self.page_list_filter = QLineEdit(self)
-        self.page_list_filter.setPlaceholderText("ページ名で絞り込み")
+        self.page_list_filter.setPlaceholderText(tr('ページ名で絞り込み'))
         self.page_list_filter.textChanged.connect(
             lambda _text: self._page_list_filter_timer.start()
         )
@@ -695,7 +699,7 @@ class ViewerWindow(QMainWindow):
         page_list_layout.setSpacing(4)
         page_list_layout.addWidget(self.page_list_filter)
         page_list_layout.addWidget(self.page_list, 1)
-        self.page_list_dock = QDockWidget("ページ一覧", self)
+        self.page_list_dock = QDockWidget(tr('ページ一覧'), self)
         self.page_list_dock.setObjectName("page_list_dock")
         self.page_list_dock.setWidget(page_list_container)
         self.page_list_dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
@@ -817,30 +821,30 @@ class ViewerWindow(QMainWindow):
     def _create_menus(self) -> None:
         menu_bar = self.menuBar()
 
-        file_menu = menu_bar.addMenu("ファイル")
-        open_action = QAction("開く", self)
+        file_menu = menu_bar.addMenu(tr('ファイル'))
+        open_action = QAction(tr('開く'), self)
         open_action.setShortcut(QKeySequence.StandardKey.Open)
         open_action.triggered.connect(self.open_dialog)
-        reload_action = QAction("再読み込み", self)
+        reload_action = QAction(tr('再読み込み'), self)
         reload_action.setShortcut("F5")
         reload_action.triggered.connect(self.reload_current_book)
-        export_view_action = QAction("現在の表示をPNG保存", self)
+        export_view_action = QAction(tr('現在の表示をPNG保存'), self)
         export_view_action.triggered.connect(self.export_current_view)
-        copy_path_action = QAction("現在画像のパスをコピー", self)
+        copy_path_action = QAction(tr('現在画像のパスをコピー'), self)
         copy_path_action.setShortcut("Ctrl+Shift+C")
         copy_path_action.triggered.connect(self.copy_current_image_path)
-        copy_image_action = QAction("現在画像をコピー", self)
+        copy_image_action = QAction(tr('現在画像をコピー'), self)
         copy_image_action.setShortcut(QKeySequence.StandardKey.Copy)
         copy_image_action.triggered.connect(self.copy_current_image)
-        copy_view_action = QAction("現在の表示をコピー", self)
+        copy_view_action = QAction(tr('現在の表示をコピー'), self)
         copy_view_action.setShortcut("Ctrl+Alt+C")
         copy_view_action.triggered.connect(self.copy_current_view)
-        page_info_action = QAction("ページ情報", self)
+        page_info_action = QAction(tr('ページ情報'), self)
         page_info_action.setShortcut("Ctrl+I")
         page_info_action.triggered.connect(self.show_page_info)
-        open_location_action = QAction("現在の場所を開く", self)
+        open_location_action = QAction(tr('現在の場所を開く'), self)
         open_location_action.triggered.connect(self.open_current_location)
-        exit_action = QAction("終了", self)
+        exit_action = QAction(tr('終了'), self)
         exit_action.setShortcut(QKeySequence.StandardKey.Quit)
         exit_action.triggered.connect(
             lambda _checked=False: self.dispatch_command(commands.CLOSE_VIEWER)
@@ -854,29 +858,29 @@ class ViewerWindow(QMainWindow):
         file_menu.addAction(page_info_action)
         file_menu.addAction(open_location_action)
         file_menu.addSeparator()
-        self.reopen_last_action = QAction("起動時に前回の本を開く", self, checkable=True)
+        self.reopen_last_action = QAction(tr('起動時に前回の本を開く'), self, checkable=True)
         self.reopen_last_action.triggered.connect(self.set_reopen_last_on_start)
-        self.recursive_folder_action = QAction("サブフォルダも読み込む", self, checkable=True)
+        self.recursive_folder_action = QAction(tr('サブフォルダも読み込む'), self, checkable=True)
         self.recursive_folder_action.triggered.connect(self.set_recursive_folder)
-        self.sort_descending_action = QAction("逆順で読む", self, checkable=True)
+        self.sort_descending_action = QAction(tr('逆順で読む'), self, checkable=True)
         self.sort_descending_action.triggered.connect(self.set_sort_descending)
-        self.auto_open_adjacent_book_action = QAction("終端で隣の本へ移動", self, checkable=True)
+        self.auto_open_adjacent_book_action = QAction(tr('終端で隣の本へ移動'), self, checkable=True)
         self.auto_open_adjacent_book_action.triggered.connect(self.set_auto_open_adjacent_book)
         file_menu.addAction(self.reopen_last_action)
         file_menu.addAction(self.recursive_folder_action)
         file_menu.addAction(self.sort_descending_action)
         file_menu.addAction(self.auto_open_adjacent_book_action)
         file_menu.addSeparator()
-        self.recent_menu = file_menu.addMenu("最近開いたもの")
+        self.recent_menu = file_menu.addMenu(tr('最近開いたもの'))
         self._rebuild_recent_menu()
         file_menu.addSeparator()
         file_menu.addAction(exit_action)
 
-        view_menu = menu_bar.addMenu("表示")
+        view_menu = menu_bar.addMenu(tr('表示'))
 
-        self.single_action = QAction("単ページ表示", self, checkable=True)
+        self.single_action = QAction(tr('単ページ表示'), self, checkable=True)
         self.single_action.triggered.connect(lambda: self.set_view_mode("single"))
-        self.spread_action = QAction("見開き表示", self, checkable=True)
+        self.spread_action = QAction(tr('見開き表示'), self, checkable=True)
         self.spread_action.triggered.connect(lambda: self.set_view_mode("spread"))
         view_group = QActionGroup(self)
         view_group.addAction(self.single_action)
@@ -886,9 +890,9 @@ class ViewerWindow(QMainWindow):
         view_menu.addAction(self.spread_action)
         view_menu.addSeparator()
 
-        self.ltr_action = QAction("左綴じ", self, checkable=True)
+        self.ltr_action = QAction(tr('左綴じ'), self, checkable=True)
         self.ltr_action.triggered.connect(lambda: self.set_reading_direction("ltr"))
-        self.rtl_action = QAction("右綴じ", self, checkable=True)
+        self.rtl_action = QAction(tr('右綴じ'), self, checkable=True)
         self.rtl_action.triggered.connect(lambda: self.set_reading_direction("rtl"))
         direction_group = QActionGroup(self)
         direction_group.addAction(self.ltr_action)
@@ -898,26 +902,26 @@ class ViewerWindow(QMainWindow):
         view_menu.addAction(self.rtl_action)
         view_menu.addSeparator()
 
-        self.single_first_action = QAction("表紙を単独表示", self, checkable=True)
+        self.single_first_action = QAction(tr('表紙を単独表示'), self, checkable=True)
         self.single_first_action.triggered.connect(self.set_single_first_page)
-        self.wide_single_action = QAction("横長画像を単独表示", self, checkable=True)
+        self.wide_single_action = QAction(tr('横長画像を単独表示'), self, checkable=True)
         self.wide_single_action.triggered.connect(self.set_treat_wide_image_as_single)
-        self.split_wide_action = QAction("横長画像を左右分割", self, checkable=True)
+        self.split_wide_action = QAction(tr('横長画像を左右分割'), self, checkable=True)
         self.split_wide_action.triggered.connect(self.set_split_wide_image)
         view_menu.addAction(self.single_first_action)
         view_menu.addAction(self.wide_single_action)
         view_menu.addAction(self.split_wide_action)
         view_menu.addSeparator()
 
-        self.fit_window_action = QAction("ウィンドウに合わせる", self, checkable=True)
+        self.fit_window_action = QAction(tr('ウィンドウに合わせる'), self, checkable=True)
         self.fit_window_action.triggered.connect(lambda: self.set_fit_mode("fit_window"))
-        self.fit_no_upscale_action = QAction("ウィンドウに合わせる（拡大しない）", self, checkable=True)
+        self.fit_no_upscale_action = QAction(tr('ウィンドウに合わせる（拡大しない）'), self, checkable=True)
         self.fit_no_upscale_action.triggered.connect(lambda: self.set_fit_mode("fit_no_upscale"))
-        self.fit_width_action = QAction("幅に合わせる", self, checkable=True)
+        self.fit_width_action = QAction(tr('幅に合わせる'), self, checkable=True)
         self.fit_width_action.triggered.connect(lambda: self.set_fit_mode("fit_width"))
-        self.fit_height_action = QAction("高さに合わせる", self, checkable=True)
+        self.fit_height_action = QAction(tr('高さに合わせる'), self, checkable=True)
         self.fit_height_action.triggered.connect(lambda: self.set_fit_mode("fit_height"))
-        self.actual_size_action = QAction("原寸表示", self, checkable=True)
+        self.actual_size_action = QAction(tr('原寸表示'), self, checkable=True)
         self.actual_size_action.triggered.connect(lambda: self.set_fit_mode("actual_size"))
         fit_group = QActionGroup(self)
         fit_group.addAction(self.fit_window_action)
@@ -933,9 +937,9 @@ class ViewerWindow(QMainWindow):
         view_menu.addAction(self.actual_size_action)
         view_menu.addSeparator()
 
-        self.normal_resampling_menu = view_menu.addMenu("リサンプリング（通常表示）")
-        normal_downscale_menu = self.normal_resampling_menu.addMenu("縮小")
-        normal_upscale_menu = self.normal_resampling_menu.addMenu("拡大")
+        self.normal_resampling_menu = view_menu.addMenu(tr('リサンプリング（通常表示）'))
+        normal_downscale_menu = self.normal_resampling_menu.addMenu(tr('縮小', disambiguation="resampling"))
+        normal_upscale_menu = self.normal_resampling_menu.addMenu(tr('拡大', disambiguation="resampling"))
         self.viewer_downscale_actions: dict[str, QAction] = {}
         self.viewer_upscale_actions: dict[str, QAction] = {}
         normal_downscale_group = QActionGroup(self)
@@ -943,7 +947,7 @@ class ViewerWindow(QMainWindow):
         normal_downscale_group.setExclusive(True)
         normal_upscale_group.setExclusive(True)
         for algorithm, label in DOWNSCALE_ALGORITHM_LABELS.items():
-            action = QAction(label, self, checkable=True)
+            action = QAction(tr(label), self, checkable=True)
             action.triggered.connect(
                 lambda _checked=False, selected=algorithm: (
                     self.set_viewer_downscale_algorithm(selected)
@@ -953,7 +957,7 @@ class ViewerWindow(QMainWindow):
             normal_downscale_menu.addAction(action)
             self.viewer_downscale_actions[algorithm] = action
         for algorithm, label in UPSCALE_ALGORITHM_LABELS.items():
-            action = QAction(label, self, checkable=True)
+            action = QAction(tr(label), self, checkable=True)
             action.triggered.connect(
                 lambda _checked=False, selected=algorithm: (
                     self.set_viewer_upscale_algorithm(selected)
@@ -964,10 +968,10 @@ class ViewerWindow(QMainWindow):
             self.viewer_upscale_actions[algorithm] = action
 
         self.magnifier_resampling_menu = view_menu.addMenu(
-            "リサンプリング（拡大鏡）"
+            tr('リサンプリング（拡大鏡）')
         )
-        magnifier_downscale_menu = self.magnifier_resampling_menu.addMenu("縮小")
-        magnifier_upscale_menu = self.magnifier_resampling_menu.addMenu("拡大")
+        magnifier_downscale_menu = self.magnifier_resampling_menu.addMenu(tr('縮小', disambiguation="resampling"))
+        magnifier_upscale_menu = self.magnifier_resampling_menu.addMenu(tr('拡大', disambiguation="resampling"))
         self.magnifier_downscale_actions: dict[str, QAction] = {}
         self.magnifier_upscale_actions: dict[str, QAction] = {}
         magnifier_downscale_group = QActionGroup(self)
@@ -975,7 +979,7 @@ class ViewerWindow(QMainWindow):
         magnifier_downscale_group.setExclusive(True)
         magnifier_upscale_group.setExclusive(True)
         for algorithm, label in DOWNSCALE_ALGORITHM_LABELS.items():
-            action = QAction(label, self, checkable=True)
+            action = QAction(tr(label), self, checkable=True)
             action.triggered.connect(
                 lambda _checked=False, selected=algorithm: (
                     self.set_magnifier_downscale_algorithm(selected)
@@ -985,7 +989,7 @@ class ViewerWindow(QMainWindow):
             magnifier_downscale_menu.addAction(action)
             self.magnifier_downscale_actions[algorithm] = action
         for algorithm, label in UPSCALE_ALGORITHM_LABELS.items():
-            action = QAction(label, self, checkable=True)
+            action = QAction(tr(label), self, checkable=True)
             action.triggered.connect(
                 lambda _checked=False, selected=algorithm: (
                     self.set_magnifier_upscale_algorithm(selected)
@@ -995,12 +999,12 @@ class ViewerWindow(QMainWindow):
             magnifier_upscale_menu.addAction(action)
             self.magnifier_upscale_actions[algorithm] = action
 
-        alignment_menu = view_menu.addMenu("横位置")
-        self.align_left_action = QAction("左寄せ", self, checkable=True)
+        alignment_menu = view_menu.addMenu(tr('横位置'))
+        self.align_left_action = QAction(tr('左寄せ'), self, checkable=True)
         self.align_left_action.triggered.connect(lambda: self.set_horizontal_alignment("left"))
-        self.align_center_action = QAction("中央", self, checkable=True)
+        self.align_center_action = QAction(tr('中央'), self, checkable=True)
         self.align_center_action.triggered.connect(lambda: self.set_horizontal_alignment("center"))
-        self.align_right_action = QAction("右寄せ", self, checkable=True)
+        self.align_right_action = QAction(tr('右寄せ'), self, checkable=True)
         self.align_right_action.triggered.connect(lambda: self.set_horizontal_alignment("right"))
         alignment_group = QActionGroup(self)
         alignment_group.addAction(self.align_left_action)
@@ -1012,50 +1016,50 @@ class ViewerWindow(QMainWindow):
         alignment_menu.addAction(self.align_right_action)
         view_menu.addSeparator()
 
-        fullscreen_action = QAction("全画面", self)
+        fullscreen_action = QAction(tr('全画面'), self)
         fullscreen_action.setShortcut("F")
         fullscreen_action.triggered.connect(
             lambda _checked=False: self.dispatch_command(commands.TOGGLE_FULLSCREEN)
         )
         view_menu.addAction(fullscreen_action)
-        self.hide_ui_fullscreen_action = QAction("全画面時にUIを隠す", self, checkable=True)
+        self.hide_ui_fullscreen_action = QAction(tr('全画面時にUIを隠す'), self, checkable=True)
         self.hide_ui_fullscreen_action.triggered.connect(self.set_hide_ui_in_fullscreen)
         view_menu.addAction(self.hide_ui_fullscreen_action)
-        self.hide_cursor_fullscreen_action = QAction("全画面時にカーソルを隠す", self, checkable=True)
+        self.hide_cursor_fullscreen_action = QAction(tr('全画面時にカーソルを隠す'), self, checkable=True)
         self.hide_cursor_fullscreen_action.triggered.connect(self.set_hide_cursor_in_fullscreen)
         view_menu.addAction(self.hide_cursor_fullscreen_action)
-        self.page_list_action = QAction("ページ一覧", self, checkable=True)
+        self.page_list_action = QAction(tr('ページ一覧'), self, checkable=True)
         self.page_list_action.triggered.connect(self.set_page_list_visible)
         view_menu.addAction(self.page_list_action)
         view_menu.addSeparator()
 
-        rotate_left_action = QAction("左に回転", self)
+        rotate_left_action = QAction(tr('左に回転'), self)
         rotate_left_action.setShortcut("Ctrl+Left")
         rotate_left_action.triggered.connect(self.rotate_left)
-        rotate_right_action = QAction("右に回転", self)
+        rotate_right_action = QAction(tr('右に回転'), self)
         rotate_right_action.setShortcut("Ctrl+Right")
         rotate_right_action.triggered.connect(self.rotate_right)
-        reset_rotation_action = QAction("回転を解除", self)
+        reset_rotation_action = QAction(tr('回転を解除'), self)
         reset_rotation_action.setShortcut("Ctrl+0")
         reset_rotation_action.triggered.connect(self.reset_rotation)
         view_menu.addAction(rotate_left_action)
         view_menu.addAction(rotate_right_action)
         view_menu.addAction(reset_rotation_action)
         view_menu.addSeparator()
-        self.magnifier_action = QAction("拡大鏡の切り替え", self)
+        self.magnifier_action = QAction(tr('拡大鏡の切り替え'), self)
         self.magnifier_action.setShortcut("Z")
         self.magnifier_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
         self.magnifier_action.triggered.connect(self.toggle_magnifier)
-        magnifier_settings_action = QAction("拡大鏡の設定", self)
+        magnifier_settings_action = QAction(tr('拡大鏡の設定'), self)
         magnifier_settings_action.triggered.connect(self.set_magnifier_options_dialog)
         view_menu.addAction(self.magnifier_action)
         view_menu.addAction(magnifier_settings_action)
-        self.magnifier_zoom_menu = view_menu.addMenu("部分拡大倍率")
+        self.magnifier_zoom_menu = view_menu.addMenu(tr('部分拡大倍率'))
         self.magnifier_zoom_actions: dict[float, QAction] = {}
         magnifier_zoom_group = QActionGroup(self)
         magnifier_zoom_group.setExclusive(True)
         for zoom in (1.5, 2.0, 3.0, 4.0):
-            action = QAction(f"{zoom:g}倍", self, checkable=True)
+            action = QAction(tr('{p0:g}倍', p0=zoom), self, checkable=True)
             action.triggered.connect(
                 lambda _checked=False, selected=zoom: self.set_magnifier_zoom(
                     selected
@@ -1065,35 +1069,38 @@ class ViewerWindow(QMainWindow):
             self.magnifier_zoom_menu.addAction(action)
             self.magnifier_zoom_actions[zoom] = action
 
-        slideshow_menu = menu_bar.addMenu("スライドショー")
-        self.slideshow_action = QAction("開始/停止", self, checkable=True)
+        slideshow_menu = menu_bar.addMenu(tr('スライドショー'))
+        self.slideshow_action = QAction(tr('開始/停止'), self, checkable=True)
         self.slideshow_action.setShortcut("S")
         self.slideshow_action.triggered.connect(self.toggle_slideshow)
-        slideshow_interval_action = QAction("間隔を設定", self)
+        slideshow_interval_action = QAction(tr('間隔を設定'), self)
         slideshow_interval_action.triggered.connect(self.set_slideshow_interval_dialog)
         slideshow_menu.addAction(self.slideshow_action)
         slideshow_menu.addAction(slideshow_interval_action)
 
-        self.bookmark_menu = menu_bar.addMenu("ブックマーク")
+        self.bookmark_menu = menu_bar.addMenu(tr('ブックマーク'))
         self._rebuild_bookmark_menu()
         self.bookmark_menu.aboutToShow.connect(
             self._rebuild_bookmark_menu
         )
 
-        settings_menu = menu_bar.addMenu("設定")
-        gap_action = QAction("画像間の余白", self)
+        settings_menu = menu_bar.addMenu(tr('設定'))
+        install_text_icon_menu_style(menu_bar)
+        settings_menu.setObjectName("viewer_settings_menu")
+        settings_menu.setIcon(settings_icon())
+        gap_action = QAction(tr('画像間の余白'), self)
         gap_action.triggered.connect(self.set_gap_dialog)
-        background_color_action = QAction("背景色", self)
+        background_color_action = QAction(tr('背景色'), self)
         background_color_action.triggered.connect(self.set_background_color_dialog)
-        thumbnail_size_action = QAction("サムネイルサイズ", self)
+        thumbnail_size_action = QAction(tr('サムネイルサイズ'), self)
         thumbnail_size_action.triggered.connect(self.set_thumbnail_size_dialog)
-        brightness_action = QAction("明るさ", self)
+        brightness_action = QAction(tr('明るさ'), self)
         brightness_action.triggered.connect(self.set_brightness_dialog)
-        contrast_action = QAction("コントラスト", self)
+        contrast_action = QAction(tr('コントラスト'), self)
         contrast_action.triggered.connect(self.set_contrast_dialog)
-        gamma_action = QAction("ガンマ", self)
+        gamma_action = QAction(tr('ガンマ'), self)
         gamma_action.triggered.connect(self.set_gamma_dialog)
-        reset_adjustments_action = QAction("画像補正をリセット", self)
+        reset_adjustments_action = QAction(tr('画像補正をリセット'), self)
         reset_adjustments_action.triggered.connect(self.reset_image_adjustments)
         settings_menu.addAction(gap_action)
         settings_menu.addAction(background_color_action)
@@ -1104,48 +1111,48 @@ class ViewerWindow(QMainWindow):
         settings_menu.addAction(gamma_action)
         settings_menu.addAction(reset_adjustments_action)
 
-        move_menu = menu_bar.addMenu("移動")
-        self.history_back_action = QAction("表示履歴を戻る", self)
+        move_menu = menu_bar.addMenu(tr('移動', disambiguation="navigation"))
+        self.history_back_action = QAction(tr('表示履歴を戻る'), self)
         self.history_back_action.setShortcut("Alt+Left")
         self.history_back_action.triggered.connect(self.go_back_in_page_history)
-        self.history_forward_action = QAction("表示履歴を進む", self)
+        self.history_forward_action = QAction(tr('表示履歴を進む'), self)
         self.history_forward_action.setShortcut("Alt+Right")
         self.history_forward_action.triggered.connect(self.go_forward_in_page_history)
-        next_action = QAction("次ページ", self)
+        next_action = QAction(tr('次ページ'), self)
         next_action.setShortcut(Qt.Key.Key_Right)
         next_action.triggered.connect(
             lambda _checked=False: self.dispatch_command(commands.NEXT_PAGE)
         )
-        previous_action = QAction("前ページ", self)
+        previous_action = QAction(tr('前ページ'), self)
         previous_action.setShortcut(Qt.Key.Key_Left)
         previous_action.triggered.connect(
             lambda _checked=False: self.dispatch_command(commands.PREVIOUS_PAGE)
         )
-        next_one_page_action = QAction("1ページ進む", self)
+        next_one_page_action = QAction(tr('1ページ進む'), self)
         next_one_page_action.setShortcut("Shift+Right")
         next_one_page_action.triggered.connect(self.next_one_page)
-        previous_one_page_action = QAction("1ページ戻る", self)
+        previous_one_page_action = QAction(tr('1ページ戻る'), self)
         previous_one_page_action.setShortcut("Shift+Left")
         previous_one_page_action.triggered.connect(self.previous_one_page)
-        next_book_action = QAction("次の本", self)
+        next_book_action = QAction(tr('次の本'), self)
         next_book_action.setShortcut("Ctrl+PgDown")
         next_book_action.triggered.connect(
             lambda _checked=False: self.dispatch_command(commands.NEXT_BOOK)
         )
-        previous_book_action = QAction("前の本", self)
+        previous_book_action = QAction(tr('前の本'), self)
         previous_book_action.setShortcut("Ctrl+PgUp")
         previous_book_action.triggered.connect(
             lambda _checked=False: self.dispatch_command(commands.PREVIOUS_BOOK)
         )
-        go_to_page_action = QAction("ページ指定", self)
+        go_to_page_action = QAction(tr('ページ指定'), self)
         go_to_page_action.setShortcut("G")
         go_to_page_action.triggered.connect(self.go_to_page_dialog)
-        first_action = QAction("先頭", self)
+        first_action = QAction(tr('先頭'), self)
         first_action.setShortcut(Qt.Key.Key_Home)
         first_action.triggered.connect(
             lambda _checked=False: self.dispatch_command(commands.FIRST_PAGE)
         )
-        last_action = QAction("最後", self)
+        last_action = QAction(tr('最後'), self)
         last_action.setShortcut(Qt.Key.Key_End)
         last_action.triggered.connect(
             lambda _checked=False: self.dispatch_command(commands.LAST_PAGE)
@@ -1165,11 +1172,11 @@ class ViewerWindow(QMainWindow):
         move_menu.addAction(next_book_action)
         move_menu.addAction(previous_book_action)
 
-        help_menu = menu_bar.addMenu("ヘルプ")
-        shortcuts_action = QAction("ショートカット一覧", self)
+        help_menu = menu_bar.addMenu(tr('ヘルプ'))
+        shortcuts_action = QAction(tr('ショートカット一覧'), self)
         shortcuts_action.triggered.connect(self.show_shortcuts_help)
         help_menu.addAction(shortcuts_action)
-        about_action = QAction("NivisViewerについて／診断情報", self)
+        about_action = QAction(tr('NivisViewerについて／診断情報'), self)
         about_action.triggered.connect(self.show_diagnostics)
         help_menu.addAction(about_action)
 
@@ -1702,13 +1709,13 @@ class ViewerWindow(QMainWindow):
         start = self.settings.get("last_open_path") or str(Path.home())
         extensions = sorted(SUPPORTED_EXTENSIONS | ARCHIVE_EXTENSIONS | PDF_EXTENSIONS)
         patterns = " ".join(f"*{extension}" for extension in extensions)
-        image_filter = f"画像/書庫 ({patterns});;すべてのファイル (*.*)"
-        path, _ = QFileDialog.getOpenFileName(self, "画像、ZIP/CBZ、またはフォルダを開く", start, image_filter)
+        image_filter = tr('画像/書庫 ({p0});;すべてのファイル (*.*)', p0=patterns)
+        path, _ = QFileDialog.getOpenFileName(self, tr('画像、ZIP/CBZ、またはフォルダを開く'), start, image_filter)
         if path:
             self._request_open_path(path)
             return
 
-        folder = QFileDialog.getExistingDirectory(self, "フォルダを開く", start)
+        folder = QFileDialog.getExistingDirectory(self, tr('フォルダを開く'), start)
         if folder:
             self._request_open_path(folder)
 
@@ -1765,9 +1772,9 @@ class ViewerWindow(QMainWindow):
         )
         if suffix in ARCHIVE_EXTENSIONS | PDF_EXTENSIONS:
             self._set_status_override(
-                "PDFを読み込んでいます…"
+                tr('PDFを読み込んでいます…')
                 if suffix in PDF_EXTENSIONS
-                else "書庫を読み込んでいます…"
+                else tr('書庫を読み込んでいます…')
             )
         return True
 
@@ -1783,9 +1790,9 @@ class ViewerWindow(QMainWindow):
             self._pending_browser_navigation = None
             self._cancel_interactive_open()
             if modal_on_empty:
-                QMessageBox.warning(self, "画像なし", "対応画像が見つかりませんでした。")
+                QMessageBox.warning(self, tr('画像なし'), tr('対応画像が見つかりませんでした。'))
             else:
-                self._set_status_override("表示可能な画像がありません", 5000)
+                self._set_status_override(tr('表示可能な画像がありません'), 5000)
             self.book_session.close_book()
             self._metadata_book_path = ""
             self._metadata_book_item_type = ""
@@ -1930,7 +1937,7 @@ class ViewerWindow(QMainWindow):
             self._clear_status_override()
         else:
             self._set_status_override(
-                failed.message or "書庫を開けません",
+                failed.message or tr('書庫を開けません'),
                 5000,
             )
         if self.book_session.is_open:
@@ -2184,7 +2191,7 @@ class ViewerWindow(QMainWindow):
         self.recent_menu.clear()
         recent = self.settings.get("recent_paths", [])
         if not isinstance(recent, list) or not recent:
-            empty_action = QAction("履歴なし", self)
+            empty_action = QAction(tr('履歴なし'), self)
             empty_action.setEnabled(False)
             self.recent_menu.addAction(empty_action)
             return
@@ -2194,7 +2201,7 @@ class ViewerWindow(QMainWindow):
             action.triggered.connect(lambda checked=False, value=path: self._open_recent_path(value))
             self.recent_menu.addAction(action)
         self.recent_menu.addSeparator()
-        clear_action = QAction("履歴をクリア", self)
+        clear_action = QAction(tr('履歴をクリア'), self)
         clear_action.triggered.connect(self._clear_recent_paths)
         self.recent_menu.addAction(clear_action)
 
@@ -2253,24 +2260,24 @@ class ViewerWindow(QMainWindow):
         if snapshot is not None and snapshot[1] is not None:
             resolution = f"{snapshot[1][0]} x {snapshot[1][1]}"
         elif snapshot is not None and snapshot[2]:
-            resolution = f"読み込みエラー: {snapshot[2]}"
+            resolution = tr('読み込みエラー: {p0}', p0=snapshot[2])
         elif cached is not None and cached.original_size is not None:
             resolution = f"{cached.original_size[0]} x {cached.original_size[1]}"
         elif cached is not None and cached.error:
-            resolution = f"読み込みエラー: {cached.error}"
+            resolution = tr('読み込みエラー: {p0}', p0=cached.error)
 
         QMessageBox.information(
             self,
-            "ページ情報",
+            tr('ページ情報'),
             "\n".join(
                 [
-                    f"ページ: {page_index + 1} / {self.model.total_pages}",
-                    f"パス: {self.model.display_path_for_index(page_index)}",
-                    f"サイズ: {self._format_file_size(self.model.file_size_for_index(page_index)) or '-'}",
-                    f"解像度: {resolution or '-'}",
-                    f"表示モード: {self.view_mode}",
-                    f"綴じ方向: {'右綴じ' if self.reading_direction == 'rtl' else '左綴じ'}",
-                    f"画像補正: 明るさ {self.brightness:.2f} / コントラスト {self.contrast:.2f} / ガンマ {self.gamma:.2f}",
+                    tr('ページ: {p0} / {p1}', p0=page_index + 1, p1=self.model.total_pages),
+                    tr('パス: {p0}', p0=self.model.display_path_for_index(page_index)),
+                    tr('サイズ: {p0}', p0=self._format_file_size(self.model.file_size_for_index(page_index)) or '-'),
+                    tr('解像度: {p0}', p0=resolution or '-'),
+                    tr('表示モード: {p0}', p0=self.view_mode),
+                    tr('綴じ方向: {p0}', p0=tr('右綴じ') if self.reading_direction == 'rtl' else tr('左綴じ')),
+                    tr('画像補正: 明るさ {p0:.2f} / コントラスト {p1:.2f} / ガンマ {p2:.2f}', p0=self.brightness, p1=self.contrast, p2=self.gamma),
                 ]
             ),
         )
@@ -2303,10 +2310,10 @@ class ViewerWindow(QMainWindow):
             generation,
         )
         if not request_id:
-            self._set_status_override("現在確認できません", 3000)
+            self._set_status_override(tr('現在確認できません'), 3000)
             return
         self._pending_path_probe = (request_id, generation, purpose, path)
-        self._set_status_override("場所を確認しています…")
+        self._set_status_override(tr('場所を確認しています…'))
 
     def _on_path_probe_result(self, result: PathAvailabilityResult) -> None:
         pending = self._pending_path_probe
@@ -2329,10 +2336,10 @@ class ViewerWindow(QMainWindow):
                 QDesktopServices.openUrl(QUrl.fromLocalFile(path))
             return
         message = {
-            PathAvailability.MISSING: "見つかりません",
-            PathAvailability.UNAVAILABLE: "現在アクセスできません",
-            PathAvailability.ERROR: "確認できません",
-        }.get(result.state, "確認できません")
+            PathAvailability.MISSING: tr('見つかりません'),
+            PathAvailability.UNAVAILABLE: tr('現在アクセスできません'),
+            PathAvailability.ERROR: tr('確認できません'),
+        }.get(result.state, tr('確認できません'))
         self._set_status_override(message, 3000)
 
     @staticmethod
@@ -2351,16 +2358,16 @@ class ViewerWindow(QMainWindow):
         default_name = f"NivisViewer_page_{self.model.current_index + 1}.png"
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "現在の表示をPNG保存",
+            tr('現在の表示をPNG保存'),
             default_name,
-            "PNG画像 (*.png)",
+            tr('PNG画像 (*.png)'),
         )
         if not path:
             return
         if not path.lower().endswith(".png"):
             path += ".png"
         if not self.viewer.grab().save(path, "PNG"):
-            QMessageBox.warning(self, "保存エラー", "現在の表示を保存できませんでした。")
+            QMessageBox.warning(self, tr('保存エラー'), tr('現在の表示を保存できませんでした。'))
 
     def reload_current_book(
         self,
@@ -2451,7 +2458,7 @@ class ViewerWindow(QMainWindow):
             self._sync_actions()
 
     def set_gap_dialog(self) -> None:
-        gap, accepted = QInputDialog.getInt(self, "画像間の余白", "ピクセル:", self.gap, 0, 100, 1)
+        gap, accepted = QInputDialog.getInt(self, tr('画像間の余白'), tr('ピクセル:'), self.gap, 0, 100, 1)
         if not accepted:
             return
         self.gap = gap
@@ -2460,7 +2467,7 @@ class ViewerWindow(QMainWindow):
         self._refresh_view()
 
     def set_background_color_dialog(self) -> None:
-        color = QColorDialog.getColor(self.viewer.background_color, self, "背景色")
+        color = QColorDialog.getColor(self.viewer.background_color, self, tr('背景色'))
         if not color.isValid():
             return
         self.background_color = color.name()
@@ -2470,8 +2477,8 @@ class ViewerWindow(QMainWindow):
     def set_thumbnail_size_dialog(self) -> None:
         size, accepted = QInputDialog.getInt(
             self,
-            "サムネイルサイズ",
-            "ピクセル:",
+            tr('サムネイルサイズ'),
+            tr('ピクセル:'),
             self.thumbnail_size,
             80,
             500,
@@ -2485,17 +2492,17 @@ class ViewerWindow(QMainWindow):
         self._refresh_page_list_thumbnail_spec()
 
     def set_brightness_dialog(self) -> None:
-        value, accepted = QInputDialog.getDouble(self, "明るさ", "倍率:", self.brightness, 0.1, 3.0, 2)
+        value, accepted = QInputDialog.getDouble(self, tr('明るさ'), tr('倍率:'), self.brightness, 0.1, 3.0, 2)
         if accepted:
             self._set_image_adjustments(brightness=value)
 
     def set_contrast_dialog(self) -> None:
-        value, accepted = QInputDialog.getDouble(self, "コントラスト", "倍率:", self.contrast, 0.1, 3.0, 2)
+        value, accepted = QInputDialog.getDouble(self, tr('コントラスト'), tr('倍率:'), self.contrast, 0.1, 3.0, 2)
         if accepted:
             self._set_image_adjustments(contrast=value)
 
     def set_gamma_dialog(self) -> None:
-        value, accepted = QInputDialog.getDouble(self, "ガンマ", "値:", self.gamma, 0.1, 5.0, 2)
+        value, accepted = QInputDialog.getDouble(self, tr('ガンマ'), tr('値:'), self.gamma, 0.1, 5.0, 2)
         if accepted:
             self._set_image_adjustments(gamma=value)
 
@@ -2524,19 +2531,20 @@ class ViewerWindow(QMainWindow):
             self._refresh_view()
 
     def set_magnifier_options_dialog(self) -> None:
-        choices = ("1.5倍", "2倍", "3倍", "4倍")
+        choices = (tr('1.5倍'), tr('2倍'), tr('3倍'), tr('4倍'))
         current = (1.5, 2.0, 3.0, 4.0).index(self.magnifier_zoom)
         selected, accepted = QInputDialog.getItem(
             self,
-            "拡大鏡の倍率",
-            "倍率:",
+            tr('拡大鏡の倍率'),
+            tr('倍率:'),
             choices,
             current,
             False,
         )
         if not accepted:
             return
-        self.set_magnifier_zoom(float(selected.removesuffix("倍")))
+        # Labels are presentation only; the matching choice owns its value.
+        self.set_magnifier_zoom((1.5, 2.0, 3.0, 4.0)[choices.index(selected)])
 
     def open_next_book(self) -> None:
         self._open_adjacent_book(1)
@@ -2551,7 +2559,7 @@ class ViewerWindow(QMainWindow):
         require_browser_snapshot: bool = False,
     ) -> None:
         if self._adjacent_book_handler is None:
-            self._set_status_override("移動できる書庫がありません", 2500)
+            self._set_status_override(tr('移動できる書庫がありません'), 2500)
             return
         try:
             parameters = tuple(
@@ -2578,14 +2586,14 @@ class ViewerWindow(QMainWindow):
             else self._adjacent_book_handler(self, direction)
         )
         if result == "boundary":
-            message = "前の書庫はありません" if direction < 0 else "次の書庫はありません"
+            message = tr('前の書庫はありません') if direction < 0 else tr('次の書庫はありません')
             self._set_status_override(message, 2500)
         elif result == "unavailable":
-            self._set_status_override("移動できる書庫がありません", 2500)
+            self._set_status_override(tr('移動できる書庫がありません'), 2500)
 
     def show_adjacent_book_searching(self, direction: int) -> None:
-        label = "前" if direction < 0 else "次"
-        self._set_status_override(f"{label}の本を検索中…")
+        label = tr('前') if direction < 0 else tr('次')
+        self._set_status_override(tr('{p0}の本を検索中…', p0=label))
 
     def complete_adjacent_book_search(self, direction: int, result: str) -> None:
         if result == "opened":
@@ -2593,10 +2601,10 @@ class ViewerWindow(QMainWindow):
             self._status_override_message = None
             self._update_status()
         elif result == "boundary":
-            message = "前の書庫はありません" if direction < 0 else "次の書庫はありません"
+            message = tr('前の書庫はありません') if direction < 0 else tr('次の書庫はありません')
             self._set_status_override(message, 2500)
         elif result in {"unavailable", "error"}:
-            self._set_status_override("移動できる書庫がありません", 2500)
+            self._set_status_override(tr('移動できる書庫がありません'), 2500)
 
     def _bookmark_pages(self) -> list[int]:
         if not self._current_book_key:
@@ -2993,18 +3001,18 @@ class ViewerWindow(QMainWindow):
         has_book = bool(self._current_book_key and self.model.total_pages > 0)
         pages = self._bookmark_pages() if has_book else []
 
-        toggle_text = "現在ページをブックマーク"
+        toggle_text = tr('現在ページをブックマーク')
         if has_book and self.model.current_index in pages:
-            toggle_text = "現在ページのブックマークを解除"
+            toggle_text = tr('現在ページのブックマークを解除')
         toggle_action = QAction(toggle_text, self)
         toggle_action.setEnabled(has_book)
         toggle_action.triggered.connect(self.toggle_current_bookmark)
         self.bookmark_menu.addAction(toggle_action)
 
-        next_action = QAction("次のブックマーク", self)
+        next_action = QAction(tr('次のブックマーク'), self)
         next_action.setEnabled(bool(pages))
         next_action.triggered.connect(self.next_bookmark)
-        previous_action = QAction("前のブックマーク", self)
+        previous_action = QAction(tr('前のブックマーク'), self)
         previous_action.setEnabled(bool(pages))
         previous_action.triggered.connect(self.previous_bookmark)
         self.bookmark_menu.addAction(next_action)
@@ -3013,17 +3021,17 @@ class ViewerWindow(QMainWindow):
 
         if pages:
             for page in pages:
-                action = QAction(f"{page + 1} ページ", self)
+                action = QAction(tr('{p0} ページ', p0=page + 1), self)
                 action.triggered.connect(lambda checked=False, value=page: self._go_to_bookmark(value))
                 self.bookmark_menu.addAction(action)
             self.bookmark_menu.addSeparator()
         else:
-            empty_action = QAction("ブックマークなし", self)
+            empty_action = QAction(tr('ブックマークなし'), self)
             empty_action.setEnabled(False)
             self.bookmark_menu.addAction(empty_action)
             self.bookmark_menu.addSeparator()
 
-        clear_action = QAction("この本のブックマークをクリア", self)
+        clear_action = QAction(tr('この本のブックマークをクリア'), self)
         clear_action.setEnabled(bool(pages))
         clear_action.triggered.connect(self.clear_bookmarks_for_current_book)
         self.bookmark_menu.addAction(clear_action)
@@ -3432,7 +3440,7 @@ class ViewerWindow(QMainWindow):
         if runtime is not None:
             runtime.cancel(clear_artifacts=False)
         self._release_raster_interactive_lane()
-        message = "Raster Viewer runtimeは要求を受け付けられません。"
+        message = tr('Raster Viewer runtimeは要求を受け付けられません。')
         self.presentation_state.fail_pending(message)
         self._project_presentation_surface()
         self._set_status_override(message)
@@ -3733,7 +3741,7 @@ class ViewerWindow(QMainWindow):
         failed_indexes = set(event.failed_page_indexes)
         errors_by_page = {
             slot.page_index: (
-                slot.error or "画像を表示できません。"
+                slot.error or tr('画像を表示できません。')
             )
             for slot in requested.display_tracker.slots
             if slot.page_index in failed_indexes
@@ -3923,7 +3931,7 @@ class ViewerWindow(QMainWindow):
             # Raster-runtime books never fall back per feature or decoder
             # failure. A missing runtime is a book-lifetime error, not an
             # eligibility decision.
-            message = "Raster Viewer runtimeを初期化できません。"
+            message = tr('Raster Viewer runtimeを初期化できません。')
             self.presentation_state.fail_pending(message)
             self._project_presentation_surface()
             self._set_status_override(message)
@@ -4693,7 +4701,7 @@ class ViewerWindow(QMainWindow):
                     error=(
                         None
                         if state is ViewerSlotState.LOADING
-                        else "画像ソースを利用できません。"
+                        else tr('画像ソースを利用できません。')
                     ),
                 )
                 if state is ViewerSlotState.LOADING:
@@ -4703,7 +4711,7 @@ class ViewerWindow(QMainWindow):
                         ViewerWidget.error_page(
                             slot.page_index,
                             slot.image_id,
-                            "画像ソースを利用できません。",
+                            tr('画像ソースを利用できません。'),
                         )
                     )
             elif cached.error:
@@ -4735,9 +4743,9 @@ class ViewerWindow(QMainWindow):
                     page_index=slot.page_index,
                     image_id=slot.image_id,
                     state=ViewerSlotState.FAILED,
-                    error="画像を表示できません。",
+                    error=tr('画像を表示できません。'),
                 )
-                pages.append(ViewerWidget.error_page(slot.page_index, slot.image_id, "画像を表示できません。"))
+                pages.append(ViewerWidget.error_page(slot.page_index, slot.image_id, tr('画像を表示できません。')))
 
         # A navigation target replaces the canvas only after every slot has
         # reached a terminal state. Until then the last complete frame stays
@@ -4841,7 +4849,7 @@ class ViewerWindow(QMainWindow):
         create_pixmap: bool | None = None,
     ) -> list[ViewerImage]:
         if cached.qimage is None or cached.original_size is None:
-            return [ViewerWidget.error_page(cached.page_index, cached.image_id, "画像を表示できません。")]
+            return [ViewerWidget.error_page(cached.page_index, cached.image_id, tr('画像を表示できません。'))]
 
         if create_pixmap is None:
             # QPixmap is a GUI-thread display artifact.  All normal modes,
@@ -5508,8 +5516,8 @@ class ViewerWindow(QMainWindow):
 
     def _show_viewer_context_menu(self, position) -> None:
         menu = QMenu(self)
-        back_history_action = menu.addAction("表示履歴を戻る")
-        forward_history_action = menu.addAction("表示履歴を進む")
+        back_history_action = menu.addAction(tr('表示履歴を戻る'))
+        forward_history_action = menu.addAction(tr('表示履歴を進む'))
         back_history_action.setEnabled(
             bool(self.presentation_state.back_history)
         )
@@ -5517,17 +5525,17 @@ class ViewerWindow(QMainWindow):
             bool(self.presentation_state.forward_history)
         )
         menu.addSeparator()
-        next_action = menu.addAction("次ページ")
-        previous_action = menu.addAction("前ページ")
+        next_action = menu.addAction(tr('次ページ'))
+        previous_action = menu.addAction(tr('前ページ'))
         menu.addSeparator()
-        bookmark_action = menu.addAction("現在ページをブックマーク")
-        copy_path_action = menu.addAction("パスをコピー")
-        copy_image_action = menu.addAction("画像をコピー")
-        copy_view_action = menu.addAction("表示をコピー")
-        page_info_action = menu.addAction("ページ情報")
-        open_location_action = menu.addAction("場所を開く")
+        bookmark_action = menu.addAction(tr('現在ページをブックマーク'))
+        copy_path_action = menu.addAction(tr('パスをコピー'))
+        copy_image_action = menu.addAction(tr('画像をコピー'))
+        copy_view_action = menu.addAction(tr('表示をコピー'))
+        page_info_action = menu.addAction(tr('ページ情報'))
+        open_location_action = menu.addAction(tr('場所を開く'))
         menu.addSeparator()
-        fullscreen_action = menu.addAction("全画面切替")
+        fullscreen_action = menu.addAction(tr('全画面切替'))
 
         selected = menu.exec(self.viewer.mapToGlobal(position))
         if selected == back_history_action:
@@ -5556,33 +5564,33 @@ class ViewerWindow(QMainWindow):
     def show_shortcuts_help(self) -> None:
         QMessageBox.information(
             self,
-            "ショートカット一覧",
+            tr('ショートカット一覧'),
             "\n".join(
                 [
-                    "Right: 次ページ",
-                    "Left: 前ページ",
-                    "Alt+Left / Alt+Right: 表示履歴を戻る / 進む",
-                    "Space / PageDown: 下スクロールまたは次ページ",
-                    "Backspace / PageUp: 上スクロールまたは前ページ",
-                    "Shift+Right: 1ページ進む",
-                    "Shift+Left: 1ページ戻る",
-                    "Home / End: 先頭 / 最後",
-                    "G: ページ指定",
-                    "D: 単ページ / 見開き切替",
-                    "R: 左綴じ / 右綴じ切替",
-                    "F: 全画面切替",
-                    "Esc: 全画面解除",
-                    "Z: 拡大鏡の切り替え",
-                    "+ / - / Ctrl+Wheel: ズーム",
-                    "0: ウィンドウに合わせる",
-                    "S: スライドショー",
-                    "B / Ctrl+B: ブックマーク切替",
-                    "Ctrl+PageDown / Ctrl+PageUp: 次 / 前の本",
-                    "Ctrl+C: 現在画像をコピー",
-                    "Ctrl+Shift+C: 現在画像のパスをコピー",
-                    "Ctrl+Alt+C: 現在の表示をコピー",
-                    "Ctrl+I: ページ情報",
-                    "Double Click: 全画面切替",
+                    tr('Right: 次ページ'),
+                    tr('Left: 前ページ'),
+                    tr('Alt+Left / Alt+Right: 表示履歴を戻る / 進む'),
+                    tr('Space / PageDown: 下スクロールまたは次ページ'),
+                    tr('Backspace / PageUp: 上スクロールまたは前ページ'),
+                    tr('Shift+Right: 1ページ進む'),
+                    tr('Shift+Left: 1ページ戻る'),
+                    tr('Home / End: 先頭 / 最後'),
+                    tr('G: ページ指定'),
+                    tr('D: 単ページ / 見開き切替'),
+                    tr('R: 左綴じ / 右綴じ切替'),
+                    tr('F: 全画面切替'),
+                    tr('Esc: 全画面解除'),
+                    tr('Z: 拡大鏡の切り替え'),
+                    tr('+ / - / Ctrl+Wheel: ズーム'),
+                    tr('0: ウィンドウに合わせる'),
+                    tr('S: スライドショー'),
+                    tr('B / Ctrl+B: ブックマーク切替'),
+                    tr('Ctrl+PageDown / Ctrl+PageUp: 次 / 前の本'),
+                    tr('Ctrl+C: 現在画像をコピー'),
+                    tr('Ctrl+Shift+C: 現在画像のパスをコピー'),
+                    tr('Ctrl+Alt+C: 現在の表示をコピー'),
+                    tr('Ctrl+I: ページ情報'),
+                    tr('Double Click: 全画面切替'),
                 ]
             ),
         )
@@ -5738,7 +5746,7 @@ class ViewerWindow(QMainWindow):
                         self._dispatch_dropped_paths(dispatch)
                     else:
                         self._set_status_override(
-                            "ドロップした項目はNivisViewerで表示できません",
+                            tr('ドロップした項目はNivisViewerで表示できません'),
                             3000,
                         )
 
@@ -5763,7 +5771,7 @@ class ViewerWindow(QMainWindow):
                 failures += 1
         if failures:
             self._set_status_override(
-                f"{failures}件を開けませんでした",
+                tr('{p0}件を開けませんでした', p0=failures),
                 3000,
             )
 
@@ -5781,7 +5789,7 @@ class ViewerWindow(QMainWindow):
         values = self.presentation_state.status_values
         feedback = self.presentation_state.navigation_feedback
         if feedback is None:
-            self.status.showMessage("画像が読み込まれていません")
+            self.status.showMessage(tr('画像が読み込まれていません'))
             return
 
         page_text = f"{feedback.page_index + 1} / {feedback.total_pages}"
@@ -6347,8 +6355,8 @@ class ViewerWindow(QMainWindow):
     def set_slideshow_interval_dialog(self) -> None:
         seconds, accepted = QInputDialog.getDouble(
             self,
-            "スライドショー間隔",
-            "秒数:",
+            tr('スライドショー間隔'),
+            tr('秒数:'),
             self.slideshow_interval_ms / 1000,
             0.5,
             60.0,
@@ -6420,8 +6428,8 @@ class ViewerWindow(QMainWindow):
             return
         page, accepted = QInputDialog.getInt(
             self,
-            "ページ指定",
-            "ページ番号:",
+            tr('ページ指定'),
+            tr('ページ番号:'),
             self.model.current_index + 1,
             1,
             self.model.total_pages,

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from dataclasses import dataclass
 
 from PIL import Image
@@ -172,7 +175,7 @@ class PageModel:
     def load_image_at(self, index: int) -> Image.Image:
         image_id = self.image_id_at(index)
         if image_id is None or self.source is None:
-            raise ImageSourceError("画像が選択されていません。")
+            raise ImageSourceError(tr('画像が選択されていません。'))
         return self.source.open_image(image_id)
 
     def get_image_size(self, index: int) -> tuple[int, int] | None:

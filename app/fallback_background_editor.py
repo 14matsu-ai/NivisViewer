@@ -4,6 +4,8 @@ No persistence or Browser effects live here: SettingsDialog applies the draft
 through ConfigManager, and BrowserWindow owns repainting.
 """
 
+from .i18n import tr
+
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QColorDialog, QComboBox, QHBoxLayout, QPushButton, QWidget
 
@@ -16,8 +18,8 @@ class FallbackBackgroundEditor(QWidget):
         self.custom_color = default_color
         self.combo = QComboBox(self)
         self.combo.addItem(auto_label, "auto")
-        self.combo.addItem("カスタム色", "custom")
-        self.color_button = QPushButton("色を選択…", self)
+        self.combo.addItem(tr('カスタム色'), "custom")
+        self.color_button = QPushButton(tr('色を選択…'), self)
         self.restore_button = QPushButton(restore_label, self)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -40,7 +42,7 @@ class FallbackBackgroundEditor(QWidget):
         return self.custom_color if self.combo.currentData() == "custom" else "auto"
 
     def choose_color(self) -> None:
-        color = QColorDialog.getColor(QColor(self.custom_color), self.window(), "代替サムネイル背景色")
+        color = QColorDialog.getColor(QColor(self.custom_color), self.window(), tr('代替サムネイル背景色'))
         if color.isValid():
             self.custom_color = color.name()
             self.combo.setCurrentIndex(self.combo.findData("custom"))

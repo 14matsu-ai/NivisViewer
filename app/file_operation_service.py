@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import errno
 import logging
 import os
@@ -418,7 +421,7 @@ class FileOperationService:
                     source,
                     None,
                     FileOperationErrorCode.CANCELLED,
-                    "操作がキャンセルされました",
+                    tr('操作がキャンセルされました'),
                     operation=request.operation,
                 )
                 was_cancelled = True
@@ -568,7 +571,7 @@ class FileOperationService:
                 source,
                 None,
                 FileOperationErrorCode.INTERNAL_STAGING_ARTIFACT,
-                "NivisViewerの未完了一時ファイルは通常のファイル操作対象にできません。",
+                tr('NivisViewerの未完了一時ファイルは通常のファイル操作対象にできません。'),
                 operation=request.operation,
             )
         if not os.path.lexists(source):
@@ -576,14 +579,14 @@ class FileOperationService:
                 source,
                 None,
                 FileOperationErrorCode.NOT_FOUND,
-                "対象が見つかりません",
+                tr('対象が見つかりません'),
             )
         if self._is_reparse_path(source):
             return self._failure(
                 source,
                 None,
                 FileOperationErrorCode.IO_ERROR,
-                "再解析ポイントはファイル操作の再帰対象にしません",
+                tr('再解析ポイントはファイル操作の再帰対象にしません'),
             )
         if request.operation is FileOperationKind.RENAME:
             return self._rename_item(source, request.new_name, request)
@@ -595,7 +598,7 @@ class FileOperationService:
             source,
             None,
             FileOperationErrorCode.IO_ERROR,
-            "未対応のファイル操作です",
+            tr('未対応のファイル操作です'),
         )
 
     def _rename_item(
@@ -614,7 +617,7 @@ class FileOperationService:
                 source,
                 None,
                 FileOperationErrorCode.INVALID_NAME,
-                validation.error_message or "名前が無効です",
+                validation.error_message or tr('名前が無効です'),
             )
         destination = os.path.join(os.path.dirname(source), validation.normalized_name)
         same_key = self._path_key(source) == self._path_key(destination)
@@ -623,7 +626,7 @@ class FileOperationService:
                 source,
                 destination,
                 FileOperationErrorCode.SAME_PATH,
-                "名前が変更されていません",
+                tr('名前が変更されていません'),
             )
         if (
             same_key
@@ -636,14 +639,14 @@ class FileOperationService:
                 source,
                 destination,
                 FileOperationErrorCode.COLLISION,
-                "大文字／小文字だけの名前変更をスキップしました",
+                tr('大文字／小文字だけの名前変更をスキップしました'),
             )
         if self._name_exists(destination, ignore_path=source if same_key else None):
             return self._failure(
                 source,
                 destination,
                 FileOperationErrorCode.COLLISION,
-                "同じ名前の項目が存在します",
+                tr('同じ名前の項目が存在します'),
             )
         try:
             if same_key:
@@ -728,7 +731,7 @@ class FileOperationService:
                 source,
                 destination_root or None,
                 FileOperationErrorCode.INVALID_DESTINATION,
-                "コピー／移動先がフォルダではありません",
+                tr('コピー／移動先がフォルダではありません'),
             )
         destination = os.path.join(destination_root, os.path.basename(source))
         if self._path_key(source) == self._path_key(destination):
@@ -751,7 +754,7 @@ class FileOperationService:
                         source,
                         destination,
                         FileOperationErrorCode.COLLISION,
-                        "衝突しない名前を生成できません",
+                        tr('衝突しない名前を生成できません'),
                     )
                 destination = os.path.join(destination_root, generated)
             else:
@@ -759,14 +762,14 @@ class FileOperationService:
                     source,
                     destination,
                     FileOperationErrorCode.SAME_PATH,
-                    "コピー元とコピー先が同じです",
+                    tr('コピー元とコピー先が同じです'),
                 )
         if os.path.isdir(source) and self._is_descendant(destination_root, source):
             return self._failure(
                 source,
                 destination,
                 FileOperationErrorCode.DESCENDANT_DESTINATION,
-                "フォルダ自身の子階層へコピー／移動できません",
+                tr('フォルダ自身の子階層へコピー／移動できません'),
             )
         if self._name_exists(destination):
             resolution = self._collision_resolution(request, destination)
@@ -784,7 +787,7 @@ class FileOperationService:
                         source,
                         destination,
                         FileOperationErrorCode.COLLISION,
-                        "衝突しない名前を生成できません",
+                        tr('衝突しない名前を生成できません'),
                     )
                 destination = os.path.join(destination_root, generated)
             elif resolution == FileCollisionPolicy.CANCEL.value:
@@ -802,7 +805,7 @@ class FileOperationService:
                     source,
                     destination,
                     FileOperationErrorCode.COLLISION,
-                    "同名項目があるためスキップしました",
+                    tr('同名項目があるためスキップしました'),
                 )
         try:
             if request.operation is FileOperationKind.COPY:
@@ -941,7 +944,7 @@ class FileOperationService:
             source,
             None,
             code,
-            result.error_message or "ごみ箱へ移動できません",
+            result.error_message or tr('ごみ箱へ移動できません'),
         )
 
     def _create_directory(
@@ -969,14 +972,14 @@ class FileOperationService:
                 None,
                 None,
                 FileOperationErrorCode.INVALID_NAME,
-                validation.error_message or "名前が無効です",
+                validation.error_message or tr('名前が無効です'),
             )
         elif not os.path.isdir(parent):
             item = self._failure(
                 None,
                 parent or None,
                 FileOperationErrorCode.INVALID_DESTINATION,
-                "作成先がフォルダではありません",
+                tr('作成先がフォルダではありません'),
             )
         else:
             destination = os.path.join(parent, validation.normalized_name)
@@ -985,7 +988,7 @@ class FileOperationService:
                     None,
                     destination,
                     FileOperationErrorCode.COLLISION,
-                    "同じ名前の項目が存在します",
+                    tr('同じ名前の項目が存在します'),
                 )
             else:
                 try:
@@ -1041,7 +1044,7 @@ class FileOperationService:
             if cancelled.is_set():
                 raise _OperationCancelled
             if not os.path.lexists(temporary):
-                raise OSError("stagingの完成を確認できません")
+                raise OSError(tr('stagingの完成を確認できません'))
             if replace_existing:
                 os.replace(temporary, destination)
             else:
@@ -1056,13 +1059,13 @@ class FileOperationService:
                 not os.path.lexists(destination)
                 or os.path.lexists(temporary)
             ):
-                raise OSError("publish後の事後条件を満たしていません")
+                raise OSError(tr('publish後の事後条件を満たしていません'))
             return True
         except CopyCancelled as exc:
             cleanup = FileOperationArtifactPolicy.cleanup_staging_path(temporary)
             if not cleanup.removed:
                 raise _ArtifactOperationError(
-                    "キャンセル後にstagingを回収できません",
+                    tr('キャンセル後にstagingを回収できません'),
                     artifact_path=temporary,
                     cleanup=cleanup,
                     published=published,
@@ -1072,7 +1075,7 @@ class FileOperationService:
             cleanup = FileOperationArtifactPolicy.cleanup_staging_path(temporary)
             if not cleanup.removed:
                 raise _ArtifactOperationError(
-                    "キャンセル後にstagingを回収できません",
+                    tr('キャンセル後にstagingを回収できません'),
                     artifact_path=temporary,
                     cleanup=cleanup,
                     published=published,
@@ -1082,7 +1085,7 @@ class FileOperationService:
             cleanup = FileOperationArtifactPolicy.cleanup_staging_path(temporary)
             if not cleanup.removed:
                 raise _ArtifactOperationError(
-                    f"publishに失敗し、stagingも回収できません: {exc}",
+                    tr('publishに失敗し、stagingも回収できません: {p0}', p0=exc),
                     artifact_path=temporary,
                     cleanup=cleanup,
                     published=published,
@@ -1127,7 +1130,7 @@ class FileOperationService:
             cleanup = FileOperationArtifactPolicy.cleanup_staging_path(backup)
             if not cleanup.removed:
                 raise _ArtifactOperationError(
-                    "置換後のbackup artifactを回収できません",
+                    tr('置換後のbackup artifactを回収できません'),
                     artifact_path=backup,
                     cleanup=cleanup,
                     published=True,
@@ -1136,7 +1139,7 @@ class FileOperationService:
                 not os.path.lexists(destination)
                 or os.path.lexists(temporary)
             ):
-                raise OSError("置換publish後の事後条件を満たしていません")
+                raise OSError(tr('置換publish後の事後条件を満たしていません'))
         except BaseException as exc:
             temporary_cleanup = (
                 FileOperationArtifactPolicy.cleanup_staging_path(temporary)
@@ -1151,9 +1154,9 @@ class FileOperationService:
                 and not os.path.lexists(destination)
             ):
                 rollback_message = (
-                    f"backup復元に失敗しました: {rollback_error}"
+                    tr('backup復元に失敗しました: {p0}', p0=rollback_error)
                     if rollback_error is not None
-                    else "backup復元後の事後条件を満たしていません"
+                    else tr('backup復元後の事後条件を満たしていません')
                 )
                 rollback_cleanup = ArtifactCleanupResult(
                     backup,
@@ -1167,7 +1170,7 @@ class FileOperationService:
                     if os.path.lexists(temporary):
                         artifact_paths.append(temporary)
                 raise _ArtifactOperationError(
-                    f"置換publishに失敗し、backupを復元できません: {exc}",
+                    tr('置換publishに失敗し、backupを復元できません: {p0}', p0=exc),
                     artifact_paths=tuple(artifact_paths),
                     cleanups=tuple(cleanups),
                     published=published,
@@ -1176,7 +1179,7 @@ class FileOperationService:
                 raise
             if not temporary_cleanup.removed:
                 raise _ArtifactOperationError(
-                    f"置換に失敗し、stagingも回収できません: {exc}",
+                    tr('置換に失敗し、stagingも回収できません: {p0}', p0=exc),
                     artifact_path=temporary,
                     cleanup=temporary_cleanup,
                     published=published,
@@ -1196,7 +1199,7 @@ class FileOperationService:
                 if self._is_reparse_path(child_source):
                     raise OSError(
                         errno.ELOOP,
-                        "再解析ポイントはコピーできません",
+                        tr('再解析ポイントはコピーできません'),
                         child_source,
                     )
                 if entry.is_dir(follow_symlinks=False):
@@ -1244,7 +1247,7 @@ class FileOperationService:
                         child_source,
                         child_destination,
                         FileOperationErrorCode.CANCELLED,
-                        "操作がキャンセルされました",
+                        tr('操作がキャンセルされました'),
                         operation=request.operation,
                     )
                 )
@@ -1263,7 +1266,7 @@ class FileOperationService:
                     child_source,
                     child_destination,
                     FileOperationErrorCode.CANCELLED,
-                    "操作がキャンセルされました",
+                    tr('操作がキャンセルされました'),
                     operation=request.operation,
                 )
             except BaseException as exc:
@@ -1314,7 +1317,7 @@ class FileOperationService:
                 child_source,
                 child_destination,
                 FileOperationErrorCode.IO_ERROR,
-                "再解析ポイントはマージできません",
+                tr('再解析ポイントはマージできません'),
                 operation=request.operation,
             )
         if not os.path.lexists(child_destination):
@@ -1386,7 +1389,7 @@ class FileOperationService:
                     child_source,
                     child_destination,
                     FileOperationErrorCode.COLLISION,
-                    "衝突しない名前を生成できません",
+                    tr('衝突しない名前を生成できません'),
                     operation=request.operation,
                 )
             target = os.path.join(os.path.dirname(child_destination), generated)
@@ -1417,7 +1420,7 @@ class FileOperationService:
             child_source,
             child_destination,
             FileOperationErrorCode.COLLISION,
-            "同名項目があるためスキップしました",
+            tr('同名項目があるためスキップしました'),
             operation=request.operation,
         )
 
@@ -1507,15 +1510,15 @@ class FileOperationService:
         elif partial:
             code = FileOperationErrorCode.PARTIAL_SUCCESS.value
             message = (
-                "フォルダの一部だけを処理しました"
+                tr('フォルダの一部だけを処理しました')
                 + (f": {root_remove_error}" if root_remove_error else "")
             )
         elif cancelled:
             code = FileOperationErrorCode.CANCELLED.value
-            message = "操作がキャンセルされました"
+            message = tr('操作がキャンセルされました')
         else:
             code = FileOperationErrorCode.IO_ERROR.value
-            message = root_remove_error or "フォルダを統合できませんでした"
+            message = root_remove_error or tr('フォルダを統合できませんでした')
         return FileOperationItemResult(
             source,
             destination,
@@ -1547,7 +1550,7 @@ class FileOperationService:
         try:
             os.rename(source, destination)
             if os.path.lexists(source) or not os.path.lexists(destination):
-                raise OSError("移動後の事後条件を満たしていません")
+                raise OSError(tr('移動後の事後条件を満たしていません'))
             if _LOG.isEnabledFor(logging.DEBUG):
                 _LOG.debug(
                     "same-volume rename completed source=%s destination=%s "
@@ -1573,7 +1576,7 @@ class FileOperationService:
                 self._remove_source(destination)
                 raise _OperationCancelled
             raise _SourceDeleteFailed(
-                "移動先は完成しましたが、キャンセルにより元項目を残しました"
+                tr('移動先は完成しましたが、キャンセルにより元項目を残しました')
             )
         try:
             if _LOG.isEnabledFor(logging.DEBUG):
@@ -1592,7 +1595,7 @@ class FileOperationService:
                     exc,
                 )
             raise _SourceDeleteFailed(
-                f"コピーは完了しましたがコピー元を削除できませんでした: {exc}"
+                tr('コピーは完了しましたがコピー元を削除できませんでした: {p0}', p0=exc)
             ) from exc
         if _LOG.isEnabledFor(logging.DEBUG):
             _LOG.debug(
@@ -1604,10 +1607,10 @@ class FileOperationService:
             )
         if os.path.lexists(source):
             raise _SourceDeleteFailed(
-                "コピーは完了しましたがコピー元が残っています"
+                tr('コピーは完了しましたがコピー元が残っています')
             )
         if not os.path.lexists(destination):
-            raise OSError("移動先の完成を確認できません")
+            raise OSError(tr('移動先の完成を確認できません'))
 
     def _move_replace(
         self,
@@ -1621,7 +1624,7 @@ class FileOperationService:
             try:
                 os.replace(source, destination)
                 if os.path.lexists(source) or not os.path.lexists(destination):
-                    raise OSError("置換後の事後条件を満たしていません")
+                    raise OSError(tr('置換後の事後条件を満たしていません'))
                 return
             except OSError as exc:
                 if exc.errno != errno.EXDEV:
@@ -1646,7 +1649,7 @@ class FileOperationService:
                     exc,
                 )
             raise _SourceDeleteFailed(
-                f"置換は完了しましたがコピー元を削除できませんでした: {exc}"
+                tr('置換は完了しましたがコピー元を削除できませんでした: {p0}', p0=exc)
             ) from exc
         if _LOG.isEnabledFor(logging.DEBUG):
             _LOG.debug(
@@ -1658,10 +1661,10 @@ class FileOperationService:
             )
         if os.path.lexists(source):
             raise _SourceDeleteFailed(
-                "置換は完了しましたがコピー元が残っています"
+                tr('置換は完了しましたがコピー元が残っています')
             )
         if not os.path.lexists(destination):
-            raise OSError("置換先の完成を確認できません")
+            raise OSError(tr('置換先の完成を確認できません'))
 
     @staticmethod
     def _remove_source(source: str) -> None:
@@ -1870,9 +1873,9 @@ class FileOperationService:
             False,
             FileOperationErrorCode.PARTIAL_SUCCESS.value,
             (
-                "移動先は完成しましたが、元項目が残っています"
+                tr('移動先は完成しましたが、元項目が残っています')
                 if destination_exists and source_exists
-                else "移動後のファイル状態を確認できません"
+                else tr('移動後のファイル状態を確認できません')
             ),
             destination_exists and source_exists,
             state=state,

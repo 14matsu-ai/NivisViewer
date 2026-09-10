@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import os
 from dataclasses import dataclass, field
 from enum import Enum
@@ -341,7 +344,7 @@ def scan_directory(
             request.path,
             request.generation,
             BrowserScanStatus.NOT_FOUND,
-            f"フォルダを読み込めません: {request.path} ({exc})",
+            tr('フォルダを読み込めません: {p0} ({p1})', p0=request.path, p1=exc),
         )
     except NotADirectoryError as exc:
         if request.trace_id:
@@ -354,7 +357,7 @@ def scan_directory(
             request.path,
             request.generation,
             BrowserScanStatus.NOT_DIRECTORY,
-            f"フォルダを読み込めません: {request.path} ({exc})",
+            tr('フォルダを読み込めません: {p0} ({p1})', p0=request.path, p1=exc),
         )
     except PermissionError as exc:
         if request.trace_id:
@@ -367,7 +370,7 @@ def scan_directory(
             request.path,
             request.generation,
             BrowserScanStatus.ACCESS_DENIED,
-            f"フォルダを読み込めません: {request.path} ({exc})",
+            tr('フォルダを読み込めません: {p0} ({p1})', p0=request.path, p1=exc),
         )
     except OSError as exc:
         if request.trace_id:
@@ -380,7 +383,7 @@ def scan_directory(
             request.path,
             request.generation,
             BrowserScanStatus.IO_ERROR,
-            f"フォルダを読み込めません: {request.path} ({exc})",
+            tr('フォルダを読み込めません: {p0} ({p1})', p0=request.path, p1=exc),
         )
     else:
         if batch_count and not cancelled.is_set():

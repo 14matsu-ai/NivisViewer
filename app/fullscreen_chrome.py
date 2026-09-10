@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 
 from app.viewer_page_slider import ViewerPageSlider
 from app.windows_fullscreen import WindowsFullscreenAdapter
+from app.menu_icons import install_text_icon_menu_style
 
 
 CURSOR_IDLE_HIDE_MS = 800
@@ -120,6 +121,7 @@ class FullscreenChromeController(QObject):
         self._top_layout.setContentsMargins(0, 0, 0, 0)
         self._top_layout.setSpacing(0)
         self.fullscreen_menu_bar = QMenuBar(self.top_overlay)
+        install_text_icon_menu_style(self.fullscreen_menu_bar)
         self._top_layout.addWidget(self.fullscreen_menu_bar)
 
         self.bottom_overlay = QFrame(parent)

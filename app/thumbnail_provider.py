@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from io import BytesIO
@@ -1393,7 +1396,7 @@ class BrowserThumbnailProvider(QObject):
                 self.thumbnail_failed.emit(
                     path,
                     generation,
-                    "サムネイルを生成できませんでした",
+                    tr('サムネイルを生成できませんでした'),
                 )
             return
         self._cache[cache_key] = QImage(image)

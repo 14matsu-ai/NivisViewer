@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from collections.abc import Iterable
 
 from PySide6.QtCore import QObject, Qt, Signal
@@ -137,14 +140,14 @@ class SidebarLayoutController(QObject):
     ) -> QWidget:
         tabs = QTabWidget(self.container)
         if show_tree:
-            tabs.addTab(self.folder_tree, "フォルダ")
+            tabs.addTab(self.folder_tree, tr('フォルダ'))
         if show_favorites:
             tabs.addTab(
                 self._favorites_panel(True, show_history=False),
-                "お気に入り",
+                tr('お気に入り'),
             )
         if show_history:
-            tabs.addTab(self.history_view, "履歴")
+            tabs.addTab(self.history_view, tr('履歴'))
         self.tabs = tabs
         return tabs
 
@@ -162,11 +165,11 @@ class SidebarLayoutController(QObject):
             return QWidget(self.container)
         tabs = QTabWidget(self.container)
         if show_favorites:
-            tabs.addTab(self.favorites_view, "フォルダ")
+            tabs.addTab(self.favorites_view, tr('フォルダ'))
             if self.bookmarks_view is not None:
-                tabs.addTab(self.bookmarks_view, "本")
+                tabs.addTab(self.bookmarks_view, tr('本'))
         if show_history:
-            tabs.addTab(self.history_view, "履歴")
+            tabs.addTab(self.history_view, tr('履歴'))
         return tabs
 
     def _record_splitter_sizes(self, splitter: QSplitter) -> None:

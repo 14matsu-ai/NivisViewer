@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from datetime import datetime
 
 from PySide6.QtCore import QAbstractListModel, QModelIndex, QObject, Qt, Slot
@@ -70,7 +73,7 @@ class HistoryModel(QAbstractListModel):
             page = str(entry.page_index + 1)
             if entry.total_pages:
                 page = f"{page} / {entry.total_pages}"
-            type_label = self._TYPE_LABELS.get(entry.item_type, entry.item_type)
+            type_label = tr(self._TYPE_LABELS.get(entry.item_type, entry.item_type))
             missing = self._availability_suffix(self._state(entry.path))
             return (
                 f"{entry.display_name}\n"
@@ -164,19 +167,19 @@ class HistoryModel(QAbstractListModel):
     @staticmethod
     def _availability_suffix(state: PathAvailability) -> str:
         if state is PathAvailability.CHECKING:
-            return " — 確認中"
+            return tr(' — 確認中')
         if state is PathAvailability.MISSING:
-            return " — 見つかりません"
+            return tr(' — 見つかりません')
         if state in {PathAvailability.UNAVAILABLE, PathAvailability.ERROR}:
-            return " — 現在確認できません"
+            return tr(' — 現在確認できません')
         return ""
 
     @staticmethod
     def _availability_tooltip(state: PathAvailability) -> str:
         if state is PathAvailability.CHECKING:
-            return "確認中"
+            return tr('確認中')
         if state is PathAvailability.MISSING:
-            return "見つかりません"
+            return tr('見つかりません')
         if state in {PathAvailability.UNAVAILABLE, PathAvailability.ERROR}:
-            return "現在確認できません"
+            return tr('現在確認できません')
         return ""

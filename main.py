@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from app.i18n import tr
+
+
 import os
 import sys
 from pathlib import Path
@@ -95,9 +98,8 @@ def main(arguments: list[str] | None = None) -> int:
     if not paths.writable:
         QMessageBox.warning(
             controller.get_browser_window(),
-            "読み取り専用プロファイル",
-            "設定、履歴、サムネイルキャッシュ、ログを保存できません。\n"
-            f"使用中のプロファイル: {paths.profile_dir}",
+            tr('読み取り専用プロファイル'),
+            tr('設定、履歴、サムネイルキャッシュ、ログを保存できません。\n使用中のプロファイル: {p0}', p0=paths.profile_dir),
         )
     try:
         return application.exec()

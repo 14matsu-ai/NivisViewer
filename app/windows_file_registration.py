@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import ctypes
 import os
 import subprocess
@@ -150,7 +153,7 @@ class WindowsFileRegistrationService:
     def get_status(self) -> FileRegistrationStatus:
         if self.registry is None:
             return FileRegistrationStatus(
-                False, None, False, (), "Windowsでのみ利用できます。"
+                False, None, False, (), tr('Windowsでのみ利用できます。')
             )
         try:
             command = self.registry.get_value(
@@ -212,7 +215,7 @@ class WindowsFileRegistrationService:
             )
             self.registry.set_value(CAPABILITIES, "ApplicationName", "NivisViewer")
             self.registry.set_value(
-                CAPABILITIES, "ApplicationDescription", "漫画・画像ビューア"
+                CAPABILITIES, "ApplicationDescription", tr('漫画・画像ビューア')
             )
             self.registry.set_value(
                 REGISTERED_APPLICATIONS, "NivisViewer", CAPABILITIES
@@ -240,7 +243,7 @@ class WindowsFileRegistrationService:
                 )
                 if add_context_menu:
                     self.registry.set_value(
-                        context_root, "", "NivisViewerで開く"
+                        context_root, "", tr('NivisViewerで開く')
                     )
                     self.registry.set_value(
                         context_root + r"\command", "", command

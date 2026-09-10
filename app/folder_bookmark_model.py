@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -72,14 +75,14 @@ class FolderBookmarkModel(QAbstractListModel):
             return None
         if role == int(Qt.ItemDataRole.DisplayRole):
             if entry.availability is PathAvailability.CHECKING:
-                suffix = " — 確認中"
+                suffix = tr(' — 確認中')
             elif entry.availability is PathAvailability.MISSING:
-                suffix = " — 見つかりません"
+                suffix = tr(' — 見つかりません')
             elif entry.availability in {
                 PathAvailability.UNAVAILABLE,
                 PathAvailability.ERROR,
             }:
-                suffix = " — 現在確認できません"
+                suffix = tr(' — 現在確認できません')
             else:
                 suffix = ""
             return f"{entry.label}{suffix}"

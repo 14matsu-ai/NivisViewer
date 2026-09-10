@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .i18n import tr
+
+
 import logging
 import platform
 import sys
@@ -94,8 +97,7 @@ def install_exception_hook(logger: logging.Logger) -> None:
                     QMessageBox.critical(
                         None,
                         "NivisViewer",
-                        "予期しないエラーが発生しました。"
-                        "詳細はローカルのログを確認してください。",
+                        tr('予期しないエラーが発生しました。詳細はローカルのログを確認してください。'),
                     )
             except Exception:
                 pass
