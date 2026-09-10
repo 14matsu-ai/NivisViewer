@@ -4,26 +4,22 @@ Status: **not cleared for public release**. This is a scoped engineering
 inventory/checklist, not a legal opinion or a statement that placing a license
 file beside a binary fulfills every condition. No binary was rebuilt or
 published. Existing `dist/`, portable backups, upstream source/reference trees,
-and historical notices were not edited. AGENTS.md's personal-use/no-publication
+and third-party notices were not edited. AGENTS.md's personal-use/no-publication
 working restrictions remain unchanged.
 
-## Project-level inconsistency resolved
+## Current project license
 
-The old root MIT grant, README's MIT publication statement, and About's
-`License: MIT` did not describe the current documented ZipPlaFork-derived
-application. At the owner's direction the current project distribution license
-is **AGPL-3.0-or-later**. Root `LICENSE` is the verbatim official GNU AGPLv3 text;
+NivisViewer has never been publicly released, as confirmed by the owner on
+2026-09-11. Its current project distribution license is **AGPL-3.0-or-later**.
+Root `LICENSE` is the verbatim official GNU AGPLv3 text;
 `PROJECT_LICENSE.md` contains GNU's recommended program notice with the explicit
 "or later" choice and original `Copyright (c) 2026 14matsu-ai` attribution.
 `app/version.py` supplies the identifier to About and generated Windows version
 metadata. Both the spec's internal resources and the build script's top-level
-copies now include the project notice. Existing built artifacts still contain
-their old notices; they must not be represented as updated releases.
+copies now include the project notice. Existing local build artifacts were not
+updated by this source-document review and are not approved for public distribution.
 
-The former MIT notice survives in `licenses/NivisViewer-Historical-MIT.txt`.
-Valid permissions previously granted for earlier versions are not revoked;
-that historical notice does not offer the current combined application under
-MIT. No upstream MIT/BSD/Apache/GPL/LGPL text was replaced or relicensed.
+No upstream MIT/BSD/Apache/GPL/LGPL text was replaced or relicensed.
 
 ZipPlaFork's fixed revision remains
 `07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, AGPL-3.0-or-later, with Rio's
@@ -221,7 +217,7 @@ THIRD_PARTY_NOTICES.md, .gitattributes, NivisViewer.spec; app/version.py and
 app/diagnostics_dialog.py; scripts/collect_licenses.py, build_portable.ps1 and
 verify_portable_build.py; docs/PORTABLE_BUILD.md, RELEASE_CHECKLIST.md and this
 audit; licenses/README.md and manifest.json; new licenses/Qt/6.11.2/ texts/index/
-notice, licenses/Python/LICENSE.txt and NivisViewer-Historical-MIT.txt;
+notice and licenses/Python/LICENSE.txt;
 tests/test_release_licensing.py. Existing dependency notices and ZipPlaFork
 source/provenance/notice files were not changed.
 

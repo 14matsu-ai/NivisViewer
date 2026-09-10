@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-NivisViewer's current project license is **AGPL-3.0-or-later**, not MIT.
+NivisViewer's current project license is **AGPL-3.0-or-later**.
 See `PROJECT_LICENSE.md` and the full GNU text in `LICENSE`. Dependency license
 choices and original copyright notices are retained, not relicensed en masse.
 The 2026-09-10 installed-versus-pinned and existing-portable inventory review,

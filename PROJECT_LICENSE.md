@@ -36,11 +36,6 @@ this licensing-document update is dated 2026-09-10.
 
 Third-party components retain their respective copyrights and licenses.
 Nothing here replaces their MIT, BSD, Apache, LGPL, GPL, or other notices.
-`licenses/NivisViewer-Historical-MIT.txt` preserves the old original-project
-notice for attribution/history; it is not a second license option for the
-current combined application. Valid permissions already granted for earlier
-versions are not revoked by this change. The previous root MIT wording did
-not supersede the licenses of incorporated third-party material.
 
 ## Before any public binary distribution
 

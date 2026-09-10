@@ -82,7 +82,6 @@ NivisViewerの現在のプロジェクトライセンスは **GNU AGPL version 3
 ZipPlaForkからの構造移植の由来は[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)と
 [比較記録](docs/ZIPPLAFORK_COMPARISON.md)を参照してください。
 依存ライブラリのMIT・BSD・Apache・LGPL・GPL等のライセンスはそのまま保持します。
-過去の版について有効に付与されたMITの許諾を取り消すものではありません。
 
 これは公開準備であり、公開済み／配布条件監査済みという宣言ではありません。
 公開前には[ライセンス監査と残課題](docs/RELEASE_LICENSE_AUDIT.md)および

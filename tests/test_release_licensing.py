@@ -22,18 +22,17 @@ def test_project_license_about_and_future_package_sources(qapp, tmp_path):
     )  # Verbatim official GNU agpl-3.0.txt, including its final newline.
     notice = (ROOT / "PROJECT_LICENSE.md").read_text(encoding="utf-8")
     assert COPYRIGHT in notice and "any later version" in notice
-    assert "Permission is hereby granted" in (ROOT / "licenses/NivisViewer-Historical-MIT.txt").read_text()
     assert LICENSE_IDENTIFIER in windows_version_info_text()
     dialog = DiagnosticsDialog(tmp_path)
     try:
         text = dialog.text_edit.toPlainText()
         assert f"License: {LICENSE_IDENTIFIER}" in text
-        assert COPYRIGHT in text and "License: MIT" not in text
+        assert COPYRIGHT in text
     finally:
         dialog.close()
     for file in ("NivisViewer.spec", "scripts/build_portable.ps1", "scripts/verify_portable_build.py"):
         assert "PROJECT_LICENSE.md" in (ROOT / file).read_text(encoding="utf-8")
-    assert "[MIT License](LICENSE)" not in (ROOT / "README.md").read_text(encoding="utf-8")
+    assert LICENSE_IDENTIFIER in (ROOT / "README.md").read_text(encoding="utf-8")
 
 
 def fake_distribution(tmp_path, files, *, version="6.11.2"):

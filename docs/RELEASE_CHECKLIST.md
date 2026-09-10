@@ -2,8 +2,8 @@
 
 ## Publication approval gates
 
-Current project license: **AGPL-3.0-or-later**. The previous MIT description is
-historical, not the current combined-work distribution license. See
+Current project license: **AGPL-3.0-or-later**. NivisViewer has not been publicly
+released. See
 `PROJECT_LICENSE.md` and `docs/RELEASE_LICENSE_AUDIT.md`.
 
 This checklist is not permission to publish, build, commit or push. Work in a

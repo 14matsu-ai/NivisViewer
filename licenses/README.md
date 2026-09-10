@@ -8,8 +8,6 @@ public release. No license text is inferred or synthesized.
 
 The project itself is AGPL-3.0-or-later; see root `LICENSE` and
 `PROJECT_LICENSE.md`. This does not relicense third-party texts in this folder.
-`NivisViewer-Historical-MIT.txt` retains the original project's old notice,
-not an MIT alternative for the current combined work.
 
 `Qt/6.11.2/` is a curated, version-matched supplement from official upstream
 sources. Its `SOURCES.json` records hashes/URLs; the collector verifies and
