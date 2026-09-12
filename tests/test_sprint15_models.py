@@ -43,7 +43,9 @@ def test_sprint15_config_defaults_and_ranges(tmp_path: Path) -> None:
     assert settings["fullscreen_auto_reveal_ui"] is True
     assert settings["fullscreen_edge_trigger_px"] == 32
     assert settings["fullscreen_ui_hide_delay_ms"] == 1
-    assert settings["browser_item_spacing"] == 0
+    assert settings["browser_item_spacing_x"] == 0
+    assert settings["browser_item_spacing_y"] == 0
+    assert "browser_item_spacing" not in settings
     assert settings["browser_cell_padding"] == 12
     assert settings["browser_sidebar_splitter_sizes"] == [40, 4000]
     assert settings["browser_sidebar_layout"] == "favorites_top_tree_bottom"

@@ -6,12 +6,13 @@ from pathlib import Path
 from threading import Event
 from time import monotonic
 
-from PIL import Image, ImageEnhance
+from PIL import Image
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
 from PySide6.QtGui import QImage
 
 from .archive_backend import ArchiveErrorCode
 from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
+from .image_adjustments import apply_image_adjustments
 from .image_source import ImageSource, ImageSourceError
 from .pdf_backend import PageRenderSpec, PdfErrorCode, PdfRenderPriority
 from .performance_trace import performance_trace
@@ -256,38 +257,7 @@ class _ImageLoadTask(QRunnable):
         return pil_to_qimage(image)
 
     def _apply_adjustments(self, image: Image.Image) -> Image.Image:
-        brightness, contrast, gamma = self.adjustments
-        if (brightness, contrast, gamma) == (1.0, 1.0, 1.0):
-            return image
-        adjusted = image
-        if brightness != 1.0:
-            adjusted = ImageEnhance.Brightness(adjusted).enhance(brightness)
-        if contrast != 1.0:
-            adjusted = ImageEnhance.Contrast(adjusted).enhance(contrast)
-        if gamma != 1.0:
-            inverse_gamma = 1.0 / gamma
-            lut = [min(255, max(0, int(((value / 255.0) ** inverse_gamma) * 255.0 + 0.5))) for value in range(256)]
-            if adjusted.mode == "RGBA":
-                red, green, blue, alpha = adjusted.split()
-                adjusted = Image.merge(
-                    "RGBA",
-                    (
-                        red.point(lut),
-                        green.point(lut),
-                        blue.point(lut),
-                        alpha,
-                    ),
-                )
-            elif adjusted.mode == "RGB":
-                adjusted = Image.merge(
-                    "RGB",
-                    tuple(channel.point(lut) for channel in adjusted.split()),
-                )
-            elif adjusted.mode == "L":
-                adjusted = adjusted.point(lut)
-            else:
-                adjusted = adjusted.convert("RGBA")
-        return adjusted
+        return apply_image_adjustments(image, self.adjustments)
 
 
 class ImageCache(QObject):

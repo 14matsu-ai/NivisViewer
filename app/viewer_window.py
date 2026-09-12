@@ -54,6 +54,7 @@ from .drag_drop import FolderDropProbe
 from .external_drop_open import ExternalDropOpenController
 from .fullscreen_chrome import FullscreenChromeController
 from .image_cache import CachedImage
+from .pdf_loupe import PdfLoupeCache
 from .image_work_coordinator import ImageWorkCoordinator
 from .image_source import (
     ARCHIVE_EXTENSIONS,
@@ -473,6 +474,8 @@ class ViewerWindow(QMainWindow):
         self._pdf_prefetch_visible_indexes: tuple[int, ...] = tuple()
         self._pdf_prefetch_direction = 0
         self._pdf_magnifier_targets: dict[int, QSize] = {}
+        self._pdf_loupe_cache = PdfLoupeCache(self)
+        self._pdf_loupe_cache.ready.connect(self._on_pdf_loupe_ready)
         self._last_preload_source: ImageSource | None = None
         self._last_preload_generation = -1
         self._last_preload_center: int | None = None
@@ -1627,6 +1630,7 @@ class ViewerWindow(QMainWindow):
                     <= total_bytes
                 ):
                     break
+            self._limit_pdf_loupe_cache()
         finally:
             self._enforcing_combined_cache_budget = False
 
@@ -1731,6 +1735,7 @@ class ViewerWindow(QMainWindow):
             self._reload_page_index = None
         self.viewer.cancel_pending_canvas_click()
         self.viewer.cancel_magnifier()
+        self._pdf_loupe_cache.set_source(None)
         self._save_current_reading_position(flush_metadata=False)
         self._pending_book_open_projection = None
         self._pending_progress_seed = None
@@ -2526,6 +2531,11 @@ class ViewerWindow(QMainWindow):
             self.gamma = max(0.1, min(5.0, float(gamma)))
             self._update_shared_setting("gamma", self.gamma)
         self.image_cache.set_adjustments(brightness=self.brightness, contrast=self.contrast, gamma=self.gamma)
+        if self.viewer._pdf_loupe_requests:
+            # The normalized anchor and last lens surface survive adjustments;
+            # only the isolated final artifact policy changes.
+            for page, size in tuple(self._pdf_magnifier_targets.items()):
+                self._request_pdf_magnifier_resolution(page, size)
         self._refresh_page_list_thumbnail_spec()
         if self.model.total_pages > 0:
             self._refresh_view()
@@ -3857,6 +3867,11 @@ class ViewerWindow(QMainWindow):
             navigation,
         )
         request_id = presentation_request.token.request_serial
+        pdf_source = self.book_session.source
+        self._pdf_loupe_cache.set_source(
+            pdf_source if isinstance(pdf_source, PdfImageSource) else None
+        )
+        self._pdf_loupe_cache.retain_pages({slot.page_index for slot in spread.slots})
         if tuple(
             slot.page_index for slot in spread.slots
         ) != self.viewer.displayed_page_indexes or (
@@ -3961,6 +3976,8 @@ class ViewerWindow(QMainWindow):
                 # magnifier/resize.  The prepared pixmap remains the paint
                 # artifact, so this does not recreate it during navigation.
                 self.viewer.attach_current_sources(source_pages)
+                if self.viewer.magnifier_active or self.viewer.magnifier_selecting:
+                    self.viewer.resume_magnifier_after_source_render()
         first_frame_gate = (
             self._awaiting_first_frame
             and self._first_frame_image_id is not None
@@ -6050,16 +6067,6 @@ class ViewerWindow(QMainWindow):
             page_scale = page_scales.get(page_index, 1.0)
             logical_width = max(1, round(width * page_scale))
             logical_height = max(1, round(height * page_scale))
-            magnifier_target = self._pdf_magnifier_targets.get(page_index)
-            if magnifier_target is not None:
-                logical_width = max(
-                    logical_width,
-                    math.ceil(magnifier_target.width() / dpr),
-                )
-                logical_height = max(
-                    logical_height,
-                    math.ceil(magnifier_target.height() / dpr),
-                )
             specs[page_index] = PageRenderSpec(
                 logical_width,
                 logical_height,
@@ -6095,15 +6102,29 @@ class ViewerWindow(QMainWindow):
             max(1, physical_size.width()),
             max(1, physical_size.height()),
         )
-        current = self._pdf_magnifier_targets.get(page_index)
-        if (
-            current is not None
-            and current.width() >= requested.width()
-            and current.height() >= requested.height()
-        ):
-            return
         self._pdf_magnifier_targets[page_index] = requested
-        self._rerender_pdf()
+        self._pdf_loupe_cache.set_source(self.book_session.source)
+        self._limit_pdf_loupe_cache()
+        for image in self.viewer._images:
+            key = self.viewer._pdf_loupe_requests.get(image.image_id)
+            if image.page_index == page_index and key is not None:
+                self._pdf_loupe_cache.request(
+                    page_index, key, (self.brightness, self.contrast, self.gamma),
+                )
+
+    def _on_pdf_loupe_ready(self, key, pixmap) -> None:
+        if (self._pdf_loupe_cache.source is self.book_session.source
+                and key.adjustments == (self.brightness, self.contrast, self.gamma)):
+            self.viewer.apply_pdf_loupe_artifact(key.render, pixmap)
+
+    def _limit_pdf_loupe_cache(self) -> None:
+        cache = getattr(self, "_pdf_loupe_cache", None)
+        if cache is not None and hasattr(self, "viewer"):
+            # Evict reusable loupe entries before taking space from normal-fit
+            # content. Current lens bindings remain bounded working surfaces.
+            cache.set_byte_limit(max(0, self.viewer_cache_budget_bytes
+                                     - self.image_cache.cache_bytes
+                                     - self.viewer.render_cache_bytes()))
 
     def _request_raster_magnifier_resolution(
         self,
@@ -6162,7 +6183,6 @@ class ViewerWindow(QMainWindow):
         if not self._pdf_magnifier_targets:
             return
         self._pdf_magnifier_targets.clear()
-        self._schedule_pdf_rerender()
 
     def set_view_mode(self, mode: str) -> None:
         self.viewer.cancel_magnifier()
@@ -6527,6 +6547,8 @@ class ViewerWindow(QMainWindow):
         self.viewer.cancel_mouse_gesture()
         self.viewer.cancel_pending_canvas_click()
         self._deactivate_zip_runtime(clear_artifacts=True)
+        if not self._pdf_loupe_cache.shutdown(max(5000, wait_msecs)):
+            raise RuntimeError("PDF loupe worker shutdown did not complete")
         self.viewer.shutdown_rendering(max(5000, wait_msecs))
         self.slideshow_timer.stop()
         self._pdf_render_timer.stop()

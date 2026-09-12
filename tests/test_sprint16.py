@@ -40,7 +40,8 @@ def test_filename_modes_have_exact_height_and_no_bottom_margin() -> None:
             filename_padding_y=0,
             horizontal_margin=0,
             cell_padding=0,
-            item_spacing=0,
+            item_spacing_x=0,
+            item_spacing_y=0,
         )
         assert metrics.title_height == title_height
         assert metrics.cell_size.height() == 96 + title_height
@@ -60,7 +61,8 @@ def test_filename_gap_and_padding_are_the_only_vertical_extras() -> None:
         filename_padding_y=2,
         horizontal_margin=4,
         cell_padding=1,
-        item_spacing=0,
+        item_spacing_x=0,
+        item_spacing_y=0,
     )
     assert metrics.cell_size.height() == 128 + 3 + 24 + 4 + 2
     assert metrics.selection_rect(metrics.cell_rect()).width() < metrics.cell_size.width()

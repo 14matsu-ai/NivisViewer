@@ -426,6 +426,9 @@ class ViewerWidget(QWidget):
         self._magnifier_spread_pixmaps: dict[str, QPixmap] = {}
         self._magnifier_spread_promotions: dict[str, QSize] = {}
         self._magnifier_spread_zoom = 1.0
+        self._pdf_loupe_fallbacks: dict[str, QPixmap] = {}
+        self._pdf_loupe_requests: dict[str, ViewerRenderKey] = {}
+        self._pdf_loupe_ready: dict[str, QPixmap] = {}
         self.mouse_gestures_enabled = True
         self.mouse_gesture_show_trail = True
         self.mouse_gesture_min_distance = 36
@@ -666,6 +669,8 @@ class ViewerWidget(QWidget):
                 self.viewportChanged.emit()
             else:
                 self._refresh_current_render()
+            if self._pdf_loupe_fallbacks:
+                self._request_pdf_loupe_artifacts()
         return handled
 
     def set_horizontal_alignment(self, alignment: str) -> None:
@@ -712,6 +717,9 @@ class ViewerWidget(QWidget):
         self.update()
 
     def cancel_magnifier(self) -> bool:
+        self._pdf_loupe_fallbacks.clear()
+        self._pdf_loupe_requests.clear()
+        self._pdf_loupe_ready.clear()
         self._magnifier_spread_layout = ()
         self._magnifier_spread_keys.clear()
         self._magnifier_spread_pixmaps.clear()
@@ -950,8 +958,6 @@ class ViewerWidget(QWidget):
             self._pan = QPoint(0, 0)
             self._view_transform.zoom_anchor = None
             self._view_transform.generation += 1
-        if same_display_unit and self._magnifier_waiting_for_pdf:
-            self._resume_magnifier_after_pdf_render()
         self._prepare_display(spread, pages, frame_token=frame_token)
 
     def set_direct_display_mode(self, active: bool) -> None:
@@ -2204,7 +2210,18 @@ class ViewerWidget(QWidget):
                 )
                 for image, key in zip(unit.images, concrete_keys)
             )
-            self.cancel_magnifier()
+            # Resolution/refresh commits of this same source and unit retain
+            # the lens. A page/book change must still fence every old result.
+            if (
+                identity != tuple(
+                    (slot.page_index, slot.image_id) for slot in self._spread.slots
+                )
+                or any(
+                    image.source_identity != str(source_identity)
+                    for image in self._images
+                )
+            ):
+                self.cancel_magnifier()
             self._display_request_generation += 1
             self._pending_display = None
             self._prepared_units.move_to_end(unit_key)
@@ -2878,6 +2895,13 @@ class ViewerWidget(QWidget):
         self._magnifier_pixmap = None
         self._magnifier_key = None
         self._magnifier_waiting_for_pdf = False
+        if all(page.rendered_size is not None for _, page, _ in self._last_image_layout):
+            # QPixmap is implicitly shared. Entry retains only already painted
+            # surfaces: no toImage, whole-page allocation, or resize job.
+            self._pdf_loupe_fallbacks = {
+                page.image_id: QPixmap(pixmap)
+                for _, page, pixmap in self._last_image_layout
+            }
         if len(self._last_image_layout) > 1:
             # Snapshot actual painted placement, including unequal sizes,
             # rotation, pan and the gutter. Never reconstruct a page order.
@@ -3004,8 +3028,8 @@ class ViewerWidget(QWidget):
                 image.qimage.size()
                 if image.qimage is not None
                 else (
-                    QSize(*image.original_size)
-                    if image.original_size is not None
+                    QSize(*(image.rendered_size or image.original_size))
+                    if image.rendered_size is not None or image.original_size is not None
                     else QSize()
                 )
             )
@@ -3026,6 +3050,9 @@ class ViewerWidget(QWidget):
         )
 
     def _request_magnifier_render(self, *, allow_pdf_request: bool = True) -> None:
+        if self._pdf_loupe_fallbacks:
+            self._request_pdf_loupe_artifacts()
+            return
         if self._magnifier_spread_layout:
             self._request_spread_magnifier_render(allow_promotion=allow_pdf_request)
             return
@@ -3036,16 +3063,6 @@ class ViewerWidget(QWidget):
             return
 
         source_size = self._rotated_source_size(image)
-        left = max(0, min(source_size.width() - 1, math.floor(source_rect.left())))
-        top = max(0, min(source_size.height() - 1, math.floor(source_rect.top())))
-        right = max(
-            left + 1,
-            min(source_size.width(), math.ceil(source_rect.right())),
-        )
-        bottom = max(
-            top + 1,
-            min(source_size.height(), math.ceil(source_rect.bottom())),
-        )
         dpr = max(1.0, float(self.devicePixelRatioF()))
         normalized_width = source_rect.width() / max(1, source_size.width())
         normalized_height = source_rect.height() / max(1, source_size.height())
@@ -3071,13 +3088,19 @@ class ViewerWidget(QWidget):
                 return
             self._magnifier_waiting_for_pdf = True
             self._magnifier_pdf_source_key = 0
-            self.magnifierSourceResolutionRequested.emit(
+            signal = (
+                self.magnifierPdfResolutionRequested
+                if image.rendered_size is not None
+                else self.magnifierSourceResolutionRequested
+            )
+            signal.emit(
                 image.page_index,
                 QSize(target_width, target_height),
             )
             self.update()
             return
 
+        promotion = None
         if allow_pdf_request and image.source_is_preview:
             source_key = int(image.qimage.cacheKey())
             if not (
@@ -3086,19 +3109,16 @@ class ViewerWidget(QWidget):
             ):
                 self._magnifier_waiting_for_pdf = True
                 self._magnifier_pdf_source_key = source_key
-                self.magnifierSourceResolutionRequested.emit(
-                    image.page_index,
-                    QSize(target_width, target_height),
-                )
+                promotion = self.magnifierSourceResolutionRequested, QSize(target_width, target_height)
 
         elif allow_pdf_request and image.rendered_size is not None:
             required_width = max(
                 source_size.width(),
-                math.ceil(target_width * source_size.width() / (right - left)),
+                target_width,
             )
             required_height = max(
                 source_size.height(),
-                math.ceil(target_height * source_size.height() / (bottom - top)),
+                target_height,
             )
             if (
                 required_width > source_size.width()
@@ -3111,10 +3131,7 @@ class ViewerWidget(QWidget):
                 ):
                     self._magnifier_waiting_for_pdf = True
                     self._magnifier_pdf_source_key = source_key
-                    self.magnifierPdfResolutionRequested.emit(
-                        image.page_index,
-                        QSize(required_width, required_height),
-                    )
+                    promotion = self.magnifierPdfResolutionRequested, QSize(required_width, required_height)
 
         rotation = 0 if image.pre_rotated else self.rotation_angle
         key = ViewerRenderKey(
@@ -3166,12 +3183,17 @@ class ViewerWidget(QWidget):
             self.magnifier_selecting = False
             self.magnifier_active = True
             self.update()
-            return
-        self._queue_render(
-            image.qimage,
-            key,
-            priority=int(ImageWorkPriority.VIEWER_INTERACTIVE_RERENDER),
-        )
+        else:
+            self._queue_render(
+                image.qimage,
+                key,
+                priority=int(ImageWorkPriority.VIEWER_INTERACTIVE_RERENDER),
+            )
+        # Promotion can synchronously commit a prepared display or cancel the
+        # lens. Install the fallback first and never overwrite that newer state.
+        if promotion is not None:
+            signal, size = promotion
+            signal.emit(image.page_index, size)
 
     def _magnifier_retained_bytes(self) -> int:
         retained = list(self._magnifier_artifact_cache.values())
@@ -3270,6 +3292,10 @@ class ViewerWidget(QWidget):
         self._resume_magnifier_after_pdf_render()
 
     def _resume_magnifier_after_pdf_render(self) -> None:
+        if self._pdf_loupe_fallbacks:
+            # Normal-fit source hydration must not replace the independent
+            # loupe artifacts or change its snapshot/normalized pointer anchor.
+            return
         if self._magnifier_spread_layout:
             self._request_spread_magnifier_render(allow_promotion=False)
             return
@@ -3293,6 +3319,9 @@ class ViewerWidget(QWidget):
         self._request_magnifier_render(allow_pdf_request=False)
 
     def _draw_magnifier(self, painter: QPainter) -> None:
+        if self.magnifier_active and self._pdf_loupe_fallbacks:
+            self._draw_pdf_loupe(painter)
+            return
         if self.magnifier_active and self._magnifier_spread_layout:
             crop = self.magnifier_source_rect
             if crop is None:
@@ -3337,6 +3366,109 @@ class ViewerWidget(QWidget):
             pen.setWidth(2)
             painter.setPen(pen)
             painter.drawRect(self._magnifier_selection_rect.adjusted(0, 0, -1, -1))
+
+    def _request_pdf_loupe_artifacts(self) -> None:
+        dpr = max(1.0, self.devicePixelRatioF())
+        if self._magnifier_spread_layout:
+            area = sum(rect.width() * rect.height() for rect, _ in self._magnifier_spread_layout)
+            zoom = min(self.magnifier_zoom,
+                       (_MAX_MAGNIFIER_ARTIFACT_PIXELS / max(1., area * dpr * dpr)) ** .5)
+            if not math.isclose(zoom, self._magnifier_spread_zoom):
+                self._magnifier_spread_zoom = zoom
+                position = self._mouse_pos or self._magnifier_selection_rect.center()
+                self._update_magnifier_selection(position)
+            targets = {
+                image_id: (max(1, round(rect.width() * self._magnifier_spread_zoom * dpr)),
+                           max(1, round(rect.height() * self._magnifier_spread_zoom * dpr)))
+                for rect, image_id in self._magnifier_spread_layout
+            }
+        else:
+            normalized = self._magnifier_source_normalized
+            if normalized is None:
+                return
+            width = max(1, round(self.width() * dpr / max(.0001, normalized.width())))
+            height = max(1, round(self.height() * dpr / max(.0001, normalized.height())))
+            scale = min(1., (_MAX_MAGNIFIER_ARTIFACT_PIXELS / (width * height)) ** .5)
+            targets = {self._magnifier_source_image_id: (max(1, round(width * scale)),
+                                                       max(1, round(height * scale)))}
+        promotions = []
+        for image in self._images:
+            if image.image_id not in targets:
+                continue
+            width, height = targets[image.image_id]
+            key = ViewerRenderKey(
+                image_id=image.image_id, source_cache_key=0,
+                target_width=width, target_height=height,
+                mode=self.magnifier_resampling_mode, rotation=self.rotation_angle,
+                device_pixel_ratio_milli=round(dpr * 1000), purpose="magnifier",
+                source_identity=image.source_identity,
+                downscale_algorithm=(self.magnifier_downscale_algorithm
+                                     if self._use_explicit_resampling_policy else None),
+                upscale_algorithm=(self.magnifier_upscale_algorithm
+                                   if self._use_explicit_resampling_policy else None),
+            )
+            if self._pdf_loupe_requests.get(image.image_id) != key:
+                self._pdf_loupe_requests[image.image_id] = key
+                previous = self._pdf_loupe_ready.pop(image.image_id, None)
+                if previous is not None:
+                    self._pdf_loupe_fallbacks[image.image_id] = previous
+                promotions.append((image.page_index, QSize(width, height)))
+        # Even a blocked PDF service or resize worker cannot delay entry.
+        self.magnifier_active = True
+        self.magnifier_selecting = False
+        self.update()
+        for page_index, size in promotions:
+            if not self._pdf_loupe_requests:
+                break
+            self.magnifierPdfResolutionRequested.emit(page_index, size)
+
+    def apply_pdf_loupe_artifact(self, key: ViewerRenderKey, pixmap: QPixmap) -> bool:
+        if (not self.magnifier_active
+                or self._pdf_loupe_requests.get(key.image_id) != key):
+            return False
+        self._pdf_loupe_ready[key.image_id] = pixmap
+        for _, image, normal in self._last_image_layout:
+            if image.image_id == key.image_id:
+                self._pdf_loupe_fallbacks[key.image_id] = QPixmap(normal)
+                break
+        self.update()
+        return True
+
+    def _draw_pdf_loupe(self, painter: QPainter) -> None:
+        # Only the visible destination is sampled. Temporary enlargement uses
+        # a cheap paint transform, never a new whole-page scaled QPixmap.
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        if self._magnifier_spread_layout:
+            crop = self.magnifier_source_rect
+            if crop is not None:
+                painter.fillRect(self.rect(), self.background_color)
+                zoom = self._magnifier_spread_zoom
+                for rect, image_id in self._magnifier_spread_layout:
+                    pixmap = self._pdf_loupe_ready.get(image_id, self._pdf_loupe_fallbacks[image_id])
+                    target = QRectF((rect.x() - crop.x()) * zoom, (rect.y() - crop.y()) * zoom,
+                                    rect.width() * zoom, rect.height() * zoom)
+                    visible = target.intersected(QRectF(self.rect()))
+                    if visible.isEmpty():
+                        continue
+                    source = QRectF((visible.x() - target.x()) / target.width() * pixmap.width(),
+                                    (visible.y() - target.y()) / target.height() * pixmap.height(),
+                                    visible.width() / target.width() * pixmap.width(),
+                                    visible.height() / target.height() * pixmap.height())
+                    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform,
+                                          image_id in self._pdf_loupe_ready)
+                    painter.drawPixmap(visible, pixmap, source)
+        else:
+            normalized = self._magnifier_source_normalized
+            image_id = self._magnifier_source_image_id
+            if normalized is not None and image_id in self._pdf_loupe_fallbacks:
+                pixmap = self._pdf_loupe_ready.get(image_id, self._pdf_loupe_fallbacks[image_id])
+                source = QRectF(normalized.x() * pixmap.width(), normalized.y() * pixmap.height(),
+                                normalized.width() * pixmap.width(), normalized.height() * pixmap.height())
+                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform,
+                                      image_id in self._pdf_loupe_ready)
+                painter.drawPixmap(QRectF(self.rect()), pixmap, source)
+        painter.restore()
 
     def _draw_gesture_trail(self, painter: QPainter) -> None:
         if (

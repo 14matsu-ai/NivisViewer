@@ -47,7 +47,7 @@ class PdfImageSource(ImageSource):
             self._source_mtime_ns = None
         self._closed = Event()
         self._request_lock = RLock()
-        self._active_requests: dict[str, set[Event]] = {}
+        self._active_requests: dict[tuple[str, str], set[Event]] = {}
         try:
             self.document_info: PdfDocumentInfo = pdfium_service.open_document(
                 str(self.source_path),
@@ -85,6 +85,7 @@ class PdfImageSource(ImageSource):
         priority: int = int(PdfRenderPriority.VIEWER_CURRENT),
         generation: int = 0,
         purpose: str = "viewer",
+        cancel_token: Event | None = None,
     ) -> Image.Image:
         page_index = self._page_index(image_id)
         page = self.document_info.pages[page_index]
@@ -95,11 +96,12 @@ class PdfImageSource(ImageSource):
             if render_spec is not None
             else bucket_render_size(*logical_size)
         )
-        cancelled = Event()
+        cancelled = cancel_token if cancel_token is not None else Event()
+        request_group = (image_id, purpose)
         with self._request_lock:
             if self._closed.is_set():
                 cancelled.set()
-            self._active_requests.setdefault(image_id, set()).add(cancelled)
+            self._active_requests.setdefault(request_group, set()).add(cancelled)
         try:
             result = self.pdfium_service.render_page(
                 PdfRenderRequest(
@@ -130,11 +132,11 @@ class PdfImageSource(ImageSource):
             raise ImageSourceError(exc.user_message, code=exc.code.value) from exc
         finally:
             with self._request_lock:
-                requests = self._active_requests.get(image_id)
+                requests = self._active_requests.get(request_group)
                 if requests is not None:
                     requests.discard(cancelled)
                     if not requests:
-                        self._active_requests.pop(image_id, None)
+                        self._active_requests.pop(request_group, None)
 
     def logical_size(self, image_id: str) -> tuple[int, int]:
         page = self.document_info.pages[self._page_index(image_id)]
@@ -166,8 +168,13 @@ class PdfImageSource(ImageSource):
 
     def cancel_image_request(self, image_id: str) -> None:
         with self._request_lock:
-            for cancelled in tuple(self._active_requests.get(image_id, ())):
-                cancelled.set()
+            # ImageCache owns normal-page cancellation. Loupe jobs own their
+            # individual tokens; a normal spec/queue update must not kill them.
+            # Document close still cancels every purpose below.
+            for (requested_id, purpose), requests in self._active_requests.items():
+                if requested_id == image_id and purpose != "magnifier":
+                    for cancelled in requests:
+                        cancelled.set()
 
     def close(self) -> None:
         if self._closed.is_set():

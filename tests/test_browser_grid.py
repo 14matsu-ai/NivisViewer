@@ -135,7 +135,7 @@ def test_delegate_uses_fixed_cell_and_uniform_thumbnail_rect(qapp):
     option = QStyleOptionViewItem()
     first = delegate.sizeHint(option, BrowserItemModel().index(0, 0))
     second = delegate.sizeHint(option, BrowserItemModel().index(99, 0))
-    assert first == second == QSize(171, 192)
+    assert first == second == QSize(131, 192)
 
     cell = QRect(0, 0, first.width(), first.height())
     thumbnail = thumbnail_rect_for_cell(
@@ -601,7 +601,7 @@ def test_four_density_profiles_keep_selection_with_minimal_scroll(
 
     selected = window.item_model.item_at(window.list_view.currentIndex())
     assert selected is not None and selected.path == items[55].path
-    assert window.list_view.gridSize() == QSize(231, 195)
+    assert window.list_view.gridSize() == QSize(131, 195)
     restored_selected = window.item_model.index(
         window.item_model.row_for_path(items[55].path),
         0,
@@ -646,7 +646,7 @@ def test_ratio_and_crop_changes_use_2d_cache_generation(tmp_path, qapp):
 
     assert ratio_generation == initial_generation + 1
     assert crop_generation == ratio_generation + 1
-    assert landscape_grid.width() == 224
+    assert landscape_grid.width() == 184
     assert landscape_grid.height() < initial_height
     assert window.config.get("thumbnail_frame_ratio") == "landscape_16_9"
     assert window.config.get("thumbnail_crop_mode") == "letterbox"

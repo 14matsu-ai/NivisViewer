@@ -25,7 +25,8 @@ class BrowserGridMetrics:
     filename_padding_y: int = 0
     horizontal_margin: int = 0
     cell_padding: int = 0
-    item_spacing: int = 0
+    item_spacing_x: int = 0
+    item_spacing_y: int = 0
 
     @property
     def title_lines(self) -> int:
@@ -55,7 +56,9 @@ class BrowserGridMetrics:
 
     @property
     def grid_size(self) -> QSize:
-        return self.cell_size
+        # QListView ignores spacing() with a fixed gridSize. Keep item/hit
+        # rectangles unchanged and express inter-item gaps in the grid pitch.
+        return self.cell_size + QSize(self.item_spacing_x, self.item_spacing_y)
 
     def cell_rect(self, origin_x: int = 0, origin_y: int = 0) -> QRect:
         return QRect(origin_x, origin_y, self.cell_size.width(), self.cell_size.height())
@@ -82,6 +85,12 @@ class BrowserGridMetrics:
     def selection_rect(self, cell_rect: QRect) -> QRect:
         return self.thumbnail_frame_rect(cell_rect).adjusted(1, 1, -2, -2)
 
+    def title_text_rect(self, cell_rect: QRect) -> QRect:
+        title = self.title_rect(cell_rect)
+        if title.isEmpty():
+            return title
+        return title.adjusted(0, self.filename_padding_y, 0, -self.filename_padding_y)
+
 
 def build_browser_grid_metrics(
     *,
@@ -93,7 +102,8 @@ def build_browser_grid_metrics(
     filename_padding_y: int,
     horizontal_margin: int,
     cell_padding: int,
-    item_spacing: int,
+    item_spacing_x: int = 0,
+    item_spacing_y: int = 0,
 ) -> BrowserGridMetrics:
     return BrowserGridMetrics(
         frame_size_from_long_edge(thumbnail_size, frame_ratio_id),
@@ -107,5 +117,6 @@ def build_browser_grid_metrics(
         filename_padding_y=max(0, min(16, int(filename_padding_y))),
         horizontal_margin=max(0, int(horizontal_margin)),
         cell_padding=max(0, min(12, int(cell_padding))),
-        item_spacing=max(0, min(32, int(item_spacing))),
+        item_spacing_x=max(0, min(32, int(item_spacing_x))),
+        item_spacing_y=max(0, min(32, int(item_spacing_y))),
     )
