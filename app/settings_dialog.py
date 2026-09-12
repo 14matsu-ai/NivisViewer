@@ -839,27 +839,29 @@ class SettingsDialog(QDialog):
         list_form.addRow(
             self.browser_preserve_search_for_viewer_roundtrip_checkbox
         )
-        self.browser_spacing_preset_checkbox = QCheckBox(
-            tr('密度プリセットに従う'),
-            list_group,
+        self.browser_item_spacing_x_spin = QSpinBox(list_group)
+        self.browser_item_spacing_x_spin.setRange(0, 32)
+        self.browser_item_spacing_x_spin.setSuffix(" px")
+        self.browser_item_spacing_x_spin.setToolTip(
+            tr('隣り合う項目の間に追加する横方向の空白です。画像やファイル名の幅は変えません。0で最小間隔。')
         )
-        self.browser_spacing_preset_checkbox.toggled.connect(
-            self._sync_browser_spacing_controls
+        list_form.addRow(tr('項目の横間隔:'), self.browser_item_spacing_x_spin)
+        self.browser_item_spacing_y_spin = QSpinBox(list_group)
+        self.browser_item_spacing_y_spin.setRange(0, 32)
+        self.browser_item_spacing_y_spin.setSuffix(" px")
+        self.browser_item_spacing_y_spin.setToolTip(
+            tr('ファイル名領域の下から次の行までに追加する空白です。0で最小間隔。')
         )
-        list_form.addRow(self.browser_spacing_preset_checkbox)
-        self.browser_item_spacing_spin = QSpinBox(list_group)
-        self.browser_item_spacing_spin.setRange(0, 32)
-        self.browser_item_spacing_spin.setSuffix(" px")
-        list_form.addRow(
-            tr('サムネイル間隔:'),
-            self.browser_item_spacing_spin,
-        )
+        list_form.addRow(tr('項目の縦間隔:'), self.browser_item_spacing_y_spin)
         self.browser_cell_padding_spin = QSpinBox(list_group)
         self.browser_cell_padding_spin.setRange(0, 12)
         self.browser_cell_padding_spin.setSuffix(" px")
         list_form.addRow(
-            tr('セル内余白:'),
+            tr('項目内余白（全辺）:'),
             self.browser_cell_padding_spin,
+        )
+        self.browser_cell_padding_spin.setToolTip(
+            tr('各項目の内側に確保する余白です。画像サイズは変えず、横幅と高さをそれぞれ値の2倍だけ増やします。')
         )
         self.browser_filename_display_combo = QComboBox(list_group)
         self.browser_filename_display_combo.addItem(tr('非表示'), "hidden")
@@ -869,11 +871,20 @@ class SettingsDialog(QDialog):
         self.browser_filename_gap_spin = QSpinBox(list_group)
         self.browser_filename_gap_spin.setRange(0, 32)
         self.browser_filename_gap_spin.setSuffix(" px")
-        list_form.addRow(tr('画像との間隔:'), self.browser_filename_gap_spin)
+        list_form.addRow(tr('画像とファイル名の間隔:'), self.browser_filename_gap_spin)
+        self.browser_filename_gap_spin.setToolTip(
+            tr('画像枠の下端とファイル名領域の間の空白です。ファイル名非表示時は使いません。')
+        )
         self.browser_filename_padding_y_spin = QSpinBox(list_group)
         self.browser_filename_padding_y_spin.setRange(0, 16)
         self.browser_filename_padding_y_spin.setSuffix(" px")
-        list_form.addRow(tr('ファイル名上下余白:'), self.browser_filename_padding_y_spin)
+        list_form.addRow(tr('ファイル名内余白（上下）:'), self.browser_filename_padding_y_spin)
+        self.browser_filename_padding_y_spin.setToolTip(
+            tr('ファイル名領域の内側で、文字の上と下にそれぞれ追加する余白です。0で文字の行高のみ。非表示時は使いません。')
+        )
+        self.browser_filename_display_combo.currentIndexChanged.connect(
+            self._sync_browser_filename_controls
+        )
         self.browser_show_hidden_checkbox = QCheckBox(
             tr('隠しファイルとフォルダを表示'),
             list_group,
@@ -1479,11 +1490,11 @@ class SettingsDialog(QDialog):
                 )
             )
         )
-        self.browser_spacing_preset_checkbox.setChecked(
-            self.config.get("browser_item_spacing_mode", "preset") == "preset"
+        self.browser_item_spacing_x_spin.setValue(
+            int(self.config.get("browser_item_spacing_x", 0))
         )
-        self.browser_item_spacing_spin.setValue(
-            int(self.config.get("browser_item_spacing", 2))
+        self.browser_item_spacing_y_spin.setValue(
+            int(self.config.get("browser_item_spacing_y", 0))
         )
         self.browser_cell_padding_spin.setValue(
             int(self.config.get("browser_cell_padding", 0))
@@ -1517,9 +1528,7 @@ class SettingsDialog(QDialog):
         self.favorite_icon_size_spin.setValue(
             int(self.config.get("favorite_icon_size", 16))
         )
-        self._sync_browser_spacing_controls(
-            self.browser_spacing_preset_checkbox.isChecked()
-        )
+        self._sync_browser_filename_controls()
         self.disk_cache_checkbox.setChecked(
             bool(self.config.get("thumbnail_disk_cache_enabled", True))
         )
@@ -1698,9 +1707,10 @@ class SettingsDialog(QDialog):
         self.browser_grid_preset_combo.setCurrentIndex(index if index >= 0 else -1)
         self.browser_grid_preset_combo.blockSignals(False)
 
-    def _sync_browser_spacing_controls(self, use_preset: bool) -> None:
-        self.browser_item_spacing_spin.setEnabled(not use_preset)
-        self.browser_cell_padding_spin.setEnabled(True)
+    def _sync_browser_filename_controls(self) -> None:
+        visible = self.browser_filename_display_combo.currentData() != "hidden"
+        self.browser_filename_gap_spin.setEnabled(visible)
+        self.browser_filename_padding_y_spin.setEnabled(visible)
 
     def refresh_registration_status(self) -> None:
         service = self._file_registration_service
@@ -1958,12 +1968,8 @@ class SettingsDialog(QDialog):
             "browser_preserve_search_for_viewer_roundtrip": (
                 self.browser_preserve_search_for_viewer_roundtrip_checkbox.isChecked()
             ),
-            "browser_item_spacing_mode": (
-                "preset"
-                if self.browser_spacing_preset_checkbox.isChecked()
-                else "custom"
-            ),
-            "browser_item_spacing": self.browser_item_spacing_spin.value(),
+            "browser_item_spacing_x": self.browser_item_spacing_x_spin.value(),
+            "browser_item_spacing_y": self.browser_item_spacing_y_spin.value(),
             "browser_cell_padding": self.browser_cell_padding_spin.value(),
             "browser_filename_display": str(
                 self.browser_filename_display_combo.currentData()

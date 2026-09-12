@@ -457,6 +457,18 @@ FullscreenChromeControllerはfullscreen、UI非表示設定、上下overlay、po
 
 `BrowserGridMetrics`はthumbnail frame、title、selection、cell、delegate sizeHint、QListView gridSize、item spacing、cell padding、thumbnail-title gapをlogical pixelで一元計算します。ファイル名はhidden／one_line／two_linesを選択でき、高さはfont metricsの0／1／2行分と明示paddingだけです。セル下端に追加marginを置きません。one_lineは拡張子を残しやすいmiddle elideを使い、完全名はtooltipとstatusで確認できます。
 
+横方向の旧density別title allowance（4～104px）は全densityで4 logical pxに統一しました。
+cell幅はframe幅 + 4 + cell_padding×2です。frameサイズ、縦方向、font、filename行数、
+描画内のFit/Crop余白は変更しません。実測値、Qtの列端rounding、タイトル幅のtradeoffは
+`docs/BROWSER_HORIZONTAL_SPACING.md`に記録しています。
+
+続く間隔設定の修正では、`BrowserGridMetrics.cell_size`（項目とhit領域）と
+`grid_size = cell_size + QSize(item_spacing_x, item_spacing_y)`（配置pitch）を分離しました。
+両軸の既定は0で、上記compactな既定geometryを維持します。QListViewの固定gridSize時に
+無効だったspacing/preset設定は横・縦の明示gapへ移行します。filenameの外側gapと内側の上下paddingは
+`title_rect` / `title_text_rect`で区別し、paintも実際に上側paddingを反映します。
+旧custom値の移行、表示位置の保持、実測と検証は`docs/BROWSER_SPACING_SETTINGS.md`参照。
+
 `ExplorerSelectionController`と`ExplorerListView`は通常の項目左ドラッグをファイルdragにし、空白からのrubber bandはShift押下時だけ許可します。単クリック、Ctrl追加／解除、Shift anchor範囲はQtのExtendedSelectionを維持し、drag開始にはOSのstartDragDistanceとstartDragTimeを使います。`FileDragController`は`text/uri-list`とUTF-8 JSONの`application/x-nivisviewer-paths+json`を生成し、絶対ローカルpath、重複排除、256件上限を適用します。
 
 Browser一覧のfolder item、folder tree、favorite itemへのdropは既存`FileOperationCoordinator`へcopy／move要求を渡します。同一Windows volumeまたは同一UNC shareはmove、異なる／不明volumeはcopy、Ctrlはcopy、Shiftはmoveです。自分自身、子孫、同じfolderへのmoveを開始前に拒否します。Browser空白の対応fileはViewerで開き、単一folderは非同期folder probe後にnavigateします。favorite空白のfolder dropもworkerで種類確認してからMetadataStoreへ登録するため、GUI threadで同期statせず履歴を増やしません。favorite内部dragはsort_order更新です。

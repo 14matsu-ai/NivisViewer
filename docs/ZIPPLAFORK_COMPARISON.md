@@ -7968,3 +7968,24 @@ ZIP/fullscreen follow-up.
 No real application, native input, private image content, external GUI,
 portable rebuild, commit or push was used. Offscreen results do not establish
 native Windows menu/compositor or clipboard interoperability behavior.
+
+## 50. PDF loupe immediate entry and separate artifact lifetime (2026-09-12)
+
+This follow-up consulted this document's existing section 44 comparison of
+`ViewerForm.MagnifierCanvas`, `bwMagnifierMaker_DoWork`, `pbView_Paint` and
+`GetMagnifierRectangle` at repository https://github.com/himamon/ZipPlaFork,
+fixed revision `07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`.
+**No fresh ZipPlaFork source inspection, copy, translation or port occurred.**
+The existing AGPL-3.0-or-later provenance and Copyright (C) 2016 Rio's Toolbox
+notices in `licenses/ZipPlaFork` remain unchanged.
+
+Four-way assessment and measurements are in `PDF_LOUPE_ENTRY_PERFORMANCE.md`.
+Starting NivisViewer waited for an enlarged fallback and changed normal PDF
+cache specs. The previously documented ZipPla page-offset composition is
+retained as existing geometry, without claiming that its PDF path supplies an
+immediate fallback. The selected Hybrid keeps NivisViewer coordinates, controls,
+quality and PDFium service, adds direct painting of retained normal pixels, and
+uses an independent bounded final-artifact lifetime. New region/tile rendering
+remains deferred. Newly written counterparts are the PDF loupe methods in
+`app/viewer_widget.py`, Window integration and `app/pdf_loupe.py`; none is newly
+derived ZipPlaFork code. No new dependency or license text is required.

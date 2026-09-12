@@ -120,8 +120,8 @@ def test_custom_spacing_and_padding_preserve_selection_anchor_and_generation(
 
     window.config.apply(
         {
-            "browser_item_spacing_mode": "custom",
-            "browser_item_spacing": 32,
+            "browser_item_spacing_x": 32,
+            "browser_item_spacing_y": 17,
             "browser_cell_padding": 12,
         }
     )
@@ -131,12 +131,17 @@ def test_custom_spacing_and_padding_preserve_selection_anchor_and_generation(
     after = window._capture_list_view_state()
     assert set(after.selected_paths) == set(before.selected_paths)
     assert after.current_path == before.current_path
-    anchor_row = window.item_model.row_for_path(before.anchor_path or "")
-    assert anchor_row >= 0
+    # Existing restore semantics prioritize the explicit current selection.
+    # Effective spacing can rewrap into fewer columns, putting the old first
+    # visible anchor more than one viewport away; both need not fit together.
+    current_row = window.item_model.row_for_path(before.current_path or "")
+    assert current_row >= 0
     assert window.list_view.visualRect(
-        window.item_model.index(anchor_row, 0)
+        window.item_model.index(current_row, 0)
     ).intersects(window.list_view.viewport().rect())
-    assert window.list_view.spacing() == 32
+    assert window.list_view.spacing() == 0
+    assert window.list_view.gridSize().width() == window.item_delegate.cell_size.width() + 32
+    assert window.list_view.gridSize().height() == window.item_delegate.cell_size.height() + 17
     assert window.item_delegate.cell_padding == 12
     assert window.thumbnail_provider.generation == generation
     assert len(window.navigation_history) == history_length

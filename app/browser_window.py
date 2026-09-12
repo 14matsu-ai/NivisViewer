@@ -782,11 +782,11 @@ class BrowserWindow(QMainWindow):
                 BrowserDisplayDensity.STANDARD.value,
             )
         )
-        self.browser_item_spacing_mode = str(
-            self.settings.get("browser_item_spacing_mode", "preset")
+        self.browser_item_spacing_x = max(
+            0, min(32, int(self.settings.get("browser_item_spacing_x", 0)))
         )
-        self.browser_item_spacing = max(
-            0, min(32, int(self.settings.get("browser_item_spacing", 2)))
+        self.browser_item_spacing_y = max(
+            0, min(32, int(self.settings.get("browser_item_spacing_y", 0)))
         )
         self.browser_cell_padding = max(
             0, min(12, int(self.settings.get("browser_cell_padding", 0)))
@@ -1352,7 +1352,10 @@ class BrowserWindow(QMainWindow):
         grid = self.list_view.gridSize()
         visible_range = calculate_grid_visible_range(
             row_count=count,
-            viewport_width=viewport.width(),
+            # IconMode wraps at an exact grid-width boundary. Include that
+            # strict edge in the existing range calculation so newly chosen
+            # item gaps cannot demote the actual first visible row.
+            viewport_width=max(1, viewport.width() - 1),
             viewport_height=viewport.height(),
             grid_width=grid.width(),
             grid_height=grid.height(),
@@ -3640,8 +3643,8 @@ class BrowserWindow(QMainWindow):
             "browser_sort_order",
             "browser_folders_first",
             "browser_display_density",
-            "browser_item_spacing_mode",
-            "browser_item_spacing",
+            "browser_item_spacing_x",
+            "browser_item_spacing_y",
             "browser_cell_padding",
             "browser_filename_display",
             "browser_filename_gap",
@@ -3668,13 +3671,13 @@ class BrowserWindow(QMainWindow):
             self.browser_display_density = normalize_browser_display_density(
                 changed["browser_display_density"]
             )
-        if "browser_item_spacing_mode" in changed:
-            self.browser_item_spacing_mode = str(
-                changed["browser_item_spacing_mode"]
+        if "browser_item_spacing_x" in changed:
+            self.browser_item_spacing_x = max(
+                0, min(32, int(changed["browser_item_spacing_x"]))
             )
-        if "browser_item_spacing" in changed:
-            self.browser_item_spacing = max(
-                0, min(32, int(changed["browser_item_spacing"]))
+        if "browser_item_spacing_y" in changed:
+            self.browser_item_spacing_y = max(
+                0, min(32, int(changed["browser_item_spacing_y"]))
             )
         if "browser_cell_padding" in changed:
             self.browser_cell_padding = max(
@@ -3797,8 +3800,8 @@ class BrowserWindow(QMainWindow):
         geometry_changed = thumbnail_changed or bool(
             {
                 "browser_display_density",
-                "browser_item_spacing_mode",
-                "browser_item_spacing",
+                "browser_item_spacing_x",
+                "browser_item_spacing_y",
                 "browser_cell_padding",
                 "browser_filename_display",
                 "browser_filename_gap",
@@ -4262,16 +4265,13 @@ class BrowserWindow(QMainWindow):
             filename_display=self.browser_filename_display,
             filename_gap=self.browser_filename_gap,
             filename_padding_y=self.browser_filename_padding_y,
-            item_spacing=(
-                self.item_delegate.profile.spacing
-                if self.browser_item_spacing_mode == "preset"
-                else self.browser_item_spacing
-            ),
+            item_spacing_x=self.browser_item_spacing_x,
+            item_spacing_y=self.browser_item_spacing_y,
             **self._fallback_background_delegate_options(),
         )
         self.list_view.setIconSize(QSize(self.thumbnail_size, self.thumbnail_size))
         self.list_view.setGridSize(self.item_delegate.grid_metrics.grid_size)
-        self.list_view.setSpacing(self.item_delegate.grid_metrics.item_spacing)
+        self.list_view.setSpacing(0)  # Inter-item gaps belong to grid_size.
         self.list_view.setWordWrap(
             self.item_delegate.grid_metrics.title_lines > 1
         )
@@ -5104,7 +5104,8 @@ class BrowserWindow(QMainWindow):
             filename_display=self.browser_filename_display,
             filename_gap=self.browser_filename_gap,
             filename_padding_y=self.browser_filename_padding_y,
-            item_spacing=0,
+            item_spacing_x=self.browser_item_spacing_x,
+            item_spacing_y=self.browser_item_spacing_y,
             **self._fallback_background_delegate_options(),
         )
         self.list_view.setItemDelegate(self.item_delegate)
@@ -6037,7 +6038,9 @@ class BrowserWindow(QMainWindow):
         grid = self.list_view.gridSize()
         return calculate_grid_visible_range(
             row_count=self.item_model.rowCount(),
-            viewport_width=viewport.width(),
+            # Match QListView's strict right-edge wrapping, including when
+            # the chosen item spacing makes the viewport an exact multiple.
+            viewport_width=max(1, viewport.width() - 1),
             viewport_height=viewport.height(),
             grid_width=grid.width(),
             grid_height=grid.height(),

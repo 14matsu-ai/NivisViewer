@@ -229,10 +229,13 @@ def test_pdf_spread_zoom_upgrades_both_promotion_targets_once(live_spread, qapp)
     finish(widget, qapp)
     widget.set_resampling_algorithms(magnifier_upscale="bilinear")
     finish(widget, qapp)
+    # Requests now identify exact final artifacts (size and filter). The
+    # Window's independent PDF cache deduplicates/reuses completed artifacts.
+    final_count = len(promotions)
     widget.resume_magnifier_after_source_render()
     for x in (150, 300, 450):
         widget._update_magnifier_selection(QPoint(x, 200))
-    assert len(promotions) == 4
+    assert len(promotions) == final_count == 10
 
 
 @pytest.mark.parametrize("rtl", [False, True])

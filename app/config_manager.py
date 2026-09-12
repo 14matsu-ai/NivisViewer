@@ -135,8 +135,8 @@ class ConfigManager(QObject):
         "browser_search_history": [],
         "browser_preserve_search_for_viewer_roundtrip": True,
         "browser_display_density": "standard",
-        "browser_item_spacing_mode": "preset",
-        "browser_item_spacing": 2,
+        "browser_item_spacing_x": 0,
+        "browser_item_spacing_y": 0,
         "browser_cell_padding": 0,
         "browser_filename_display": "one_line",
         "browser_filename_gap": 0,
@@ -256,6 +256,7 @@ class ConfigManager(QObject):
             return self.data
 
         if isinstance(loaded, dict):
+            loaded = self._migrate_browser_item_spacing(loaded)
             loaded = self._migrate_legacy_resampling_settings(loaded)
             if "viewer_memory_mode" not in loaded:
                 preset = str(loaded.get("viewer_prefetch_preset", "standard"))
@@ -323,7 +324,7 @@ class ConfigManager(QObject):
 
     def apply(self, updates: dict[str, Any], *, save: bool = False) -> dict[str, Any]:
         merged = deepcopy(self.data)
-        merged.update(updates)
+        merged.update(self._migrate_browser_item_spacing(updates))
         merged.pop(self._LEGACY_VIEWER_CACHE_MEMORY_KEY, None)
         for key in self._LEGACY_RESAMPLING_KEYS:
             merged.pop(key, None)
@@ -339,6 +340,26 @@ class ConfigManager(QObject):
         if save:
             self.save()
         return changed
+
+    @classmethod
+    def _migrate_browser_item_spacing(cls, values: dict[str, Any]) -> dict[str, Any]:
+        migrated = dict(values)
+        if "browser_item_spacing_mode" in migrated or "browser_item_spacing" in migrated:
+            # Preset spacing was ignored by Qt's fixed grid. Preserve its
+            # compact appearance; retain an explicitly chosen custom amount
+            # as an effective gap on both axes. New axis values take priority.
+            gap = (
+                cls._clamped_int(
+                    migrated.get("browser_item_spacing"),
+                    default=2, minimum=0, maximum=32,
+                )
+                if migrated.get("browser_item_spacing_mode") == "custom" else 0
+            )
+            migrated.setdefault("browser_item_spacing_x", gap)
+            migrated.setdefault("browser_item_spacing_y", gap)
+            migrated.pop("browser_item_spacing_mode", None)
+            migrated.pop("browser_item_spacing", None)
+        return migrated
 
     @classmethod
     def _normalize(cls, values: dict[str, Any]) -> dict[str, Any]:
@@ -549,16 +570,10 @@ class ConfigManager(QObject):
             normalized["browser_display_density"] = cls.DEFAULTS[
                 "browser_display_density"
             ]
-        if normalized.get("browser_item_spacing_mode") not in {"preset", "custom"}:
-            normalized["browser_item_spacing_mode"] = cls.DEFAULTS[
-                "browser_item_spacing_mode"
-            ]
-        normalized["browser_item_spacing"] = cls._clamped_int(
-            normalized.get("browser_item_spacing"),
-            default=int(cls.DEFAULTS["browser_item_spacing"]),
-            minimum=0,
-            maximum=32,
-        )
+        for key in ("browser_item_spacing_x", "browser_item_spacing_y"):
+            normalized[key] = cls._clamped_int(
+                normalized.get(key), default=0, minimum=0, maximum=32,
+            )
         normalized["browser_cell_padding"] = cls._clamped_int(
             normalized.get("browser_cell_padding"),
             default=int(cls.DEFAULTS["browser_cell_padding"]),

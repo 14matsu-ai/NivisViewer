@@ -1264,8 +1264,9 @@ def test_pdf_magnifier_requests_higher_resolution_before_crop(
     assert len(requests) == 1
     assert requests[0][0] == 0
     assert requests[0][1].width() > 240
-    assert widget._magnifier_waiting_for_pdf
-    assert not widget.magnifier_active
+    assert widget._pdf_loupe_requests
+    assert widget.magnifier_active  # Retained fit pixels appear before promotion.
+    assert not widget._render_pending  # No enlarged fallback job on entry.
     widget.close()
 
 

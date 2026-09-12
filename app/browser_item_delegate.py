@@ -30,14 +30,17 @@ class BrowserGridProfile:
 
 
 GRID_PROFILES = {
+    # Keep a two-pixel side allowance per cell at every density. Wider legacy
+    # title allowances inflated horizontal gaps even with a fixed thumbnail
+    # size; title elision already handles the available cell width.
     BrowserDisplayDensity.EXTRA_COMPACT: BrowserGridProfile(4, 22, 0, 7, 1),
-    BrowserDisplayDensity.COMPACT: BrowserGridProfile(20, 32, 2, 8, 1),
+    BrowserDisplayDensity.COMPACT: BrowserGridProfile(4, 32, 2, 8, 1),
     # The medium preset changes only the thumbnail content scale.  Reuse the
     # compact text/spacing contract instead of inventing a parallel layout.
-    BrowserDisplayDensity.MEDIUM: BrowserGridProfile(20, 32, 2, 8, 1),
-    BrowserDisplayDensity.STANDARD: BrowserGridProfile(44, 58, 6, 9, 2),
-    BrowserDisplayDensity.COMFORTABLE: BrowserGridProfile(72, 88, 12, 10, 2),
-    BrowserDisplayDensity.LARGE: BrowserGridProfile(104, 118, 16, 11, 2),
+    BrowserDisplayDensity.MEDIUM: BrowserGridProfile(4, 32, 2, 8, 1),
+    BrowserDisplayDensity.STANDARD: BrowserGridProfile(4, 58, 6, 9, 2),
+    BrowserDisplayDensity.COMFORTABLE: BrowserGridProfile(4, 88, 12, 10, 2),
+    BrowserDisplayDensity.LARGE: BrowserGridProfile(4, 118, 16, 11, 2),
 }
 
 GRID_PRESET_THUMBNAIL_SIZES = {
@@ -381,7 +384,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
         filename_display: str = "one_line",
         filename_gap: int = 0,
         filename_padding_y: int = 0,
-        item_spacing: int = 0,
+        item_spacing_x: int = 0,
+        item_spacing_y: int = 0,
         folder_fallback_background: str = "auto",
         file_fallback_background: str = "auto",
         shell_icon_provider: ShellAssociatedIconProvider | None = None,
@@ -399,7 +403,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
         self.filename_display = filename_display
         self.filename_gap = max(0, min(32, int(filename_gap)))
         self.filename_padding_y = max(0, min(16, int(filename_padding_y)))
-        self.item_spacing = max(0, min(32, int(item_spacing)))
+        self.item_spacing_x = max(0, min(32, int(item_spacing_x)))
+        self.item_spacing_y = max(0, min(32, int(item_spacing_y)))
         self.folder_fallback_background = self._normalize_folder_fallback_background(
             folder_fallback_background
         )
@@ -439,7 +444,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
             filename_padding_y=self.filename_padding_y,
             horizontal_margin=self.profile.horizontal_margin,
             cell_padding=self.cell_padding,
-            item_spacing=self.item_spacing,
+            item_spacing_x=self.item_spacing_x,
+            item_spacing_y=self.item_spacing_y,
         )
 
     def configure(
@@ -453,7 +459,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
         filename_display: str | None = None,
         filename_gap: int | None = None,
         filename_padding_y: int | None = None,
-        item_spacing: int | None = None,
+        item_spacing_x: int | None = None,
+        item_spacing_y: int | None = None,
         folder_fallback_background: str | None = None,
         file_fallback_background: str | None = None,
     ) -> None:
@@ -480,8 +487,10 @@ class BrowserItemDelegate(QStyledItemDelegate):
             self.filename_gap = max(0, min(32, int(filename_gap)))
         if filename_padding_y is not None:
             self.filename_padding_y = max(0, min(16, int(filename_padding_y)))
-        if item_spacing is not None:
-            self.item_spacing = max(0, min(32, int(item_spacing)))
+        if item_spacing_x is not None:
+            self.item_spacing_x = max(0, min(32, int(item_spacing_x)))
+        if item_spacing_y is not None:
+            self.item_spacing_y = max(0, min(32, int(item_spacing_y)))
         if file_fallback_background is not None:
             self.file_fallback_background = self._normalize_folder_fallback_background(
                 file_fallback_background
@@ -803,7 +812,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
             if grid.title_lines == 1
             else elided_title_lines(metrics, title, title_rect.width(), 2)
         )
-        y = title_rect.top()
+        y = grid.title_text_rect(option.rect).top()
         for line in lines:
             line_rect = QRect(title_rect.left(), y, title_rect.width(), metrics.height())
             painter.drawText(
