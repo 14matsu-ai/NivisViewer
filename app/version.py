@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-__version__ = "0.1.0-dev"
-VERSION_TUPLE = (0, 1, 0, 0)
+__version__ = "1.01"
+VERSION_TUPLE = (1, 1, 0, 0)
 COMPANY_NAME = "14matsu-ai"
 PRODUCT_NAME = "NivisViewer"
 APP_USER_MODEL_ID = "14matsu-ai.NivisViewer"
@@ -11,7 +11,6 @@ LICENSE_IDENTIFIER = "AGPL-3.0-or-later"
 
 def windows_version_info_text() -> str:
     numeric = ", ".join(str(part) for part in VERSION_TUPLE)
-    dotted = ".".join(str(part) for part in VERSION_TUPLE)
     return f"""VSVersionInfo(
   ffi=FixedFileInfo(
     filevers=({numeric}),
@@ -30,7 +29,7 @@ def windows_version_info_text() -> str:
         [
           StringStruct('CompanyName', '{COMPANY_NAME}'),
           StringStruct('FileDescription', '{PRODUCT_NAME}'),
-          StringStruct('FileVersion', '{dotted}'),
+          StringStruct('FileVersion', '{__version__}'),
           StringStruct('InternalName', '{PRODUCT_NAME}'),
           StringStruct('LegalCopyright', '{COPYRIGHT}'),
           StringStruct('Comments', 'License: {LICENSE_IDENTIFIER}'),

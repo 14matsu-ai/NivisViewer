@@ -43,4 +43,4 @@ def test_new_window_and_reuse_are_mutually_exclusive():
 
 
 def test_version_text_uses_central_version():
-    assert version_text().startswith("NivisViewer 0.1.0")
+    assert version_text() == "NivisViewer 1.01"

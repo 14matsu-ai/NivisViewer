@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import os
+import runpy
+import sys
+
+import pytest
 
 from scripts.verify_portable_build import verify
 
@@ -56,3 +62,28 @@ def test_portable_verifier_requires_runtime_branding_assets(tmp_path):
         (tmp_path / name).write_bytes(b"branding")
     errors = verify(tmp_path)
     assert not any(error.startswith("branding asset not found:") for error in errors)
+
+
+def test_frozen_smoke_hook_records_early_import_error(tmp_path, monkeypatch):
+    output = tmp_path / "smoke.json"
+    monkeypatch.setattr(sys, "argv", ["NivisViewer.exe", "--smoke-test-output", str(output)])
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+
+    def exit_process(code):
+        raise SystemExit(code)
+
+    monkeypatch.setattr(os, "_exit", exit_process)
+    runpy.run_path(str(ROOT / "scripts" / "frozen_smoke_hook.py"))
+    with pytest.raises(SystemExit, match="1"):
+        sys.excepthook(ImportError, ImportError("synthetic missing DLL"), None)
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["success"] is False
+    assert result["stage"] == "startup"
+    assert "synthetic missing DLL" in result["errors"][0]
+
+
+def test_frozen_smoke_hook_leaves_normal_startup_unchanged(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["NivisViewer.exe"])
+    previous = sys.excepthook
+    runpy.run_path(str(ROOT / "scripts" / "frozen_smoke_hook.py"))
+    assert sys.excepthook is previous

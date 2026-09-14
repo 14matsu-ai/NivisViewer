@@ -12,11 +12,15 @@ $RepoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $BuildDir = Join-Path $RepoRoot "build"
 $DistDir = Join-Path $RepoRoot "dist"
 $BundleDir = Join-Path $DistDir "NivisViewer"
-$Python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
+$Python = Join-Path $RepoRoot ".venv311\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
+    $Python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
+}
 if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
     $Python = "python"
 }
 
+$PreviousBuildPath = $env:PATH
 Push-Location $RepoRoot
 try {
     $Architecture = & $Python -c "import platform,sys; print(f'{sys.version_info.major}.{sys.version_info.minor}|{platform.architecture()[0]}')"
@@ -27,6 +31,19 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller is missing. Run: python -m pip install -r requirements-build.txt"
     }
+    $ResolvedPython = (Get-Command $Python -ErrorAction Stop).Source
+    $PythonBase = & $ResolvedPython -c "import sys; print(sys.base_prefix)"
+    if ($LASTEXITCODE -ne 0) { throw "Cannot resolve Python runtime directory." }
+    $Python = $ResolvedPython
+    # Ambient toolchains (for example Poppler) may supply an incompatible ICU
+    # under the same DLL name as Windows. Do not let Analysis collect those.
+    $env:PATH = @(
+        (Split-Path -Parent $Python),
+        $PythonBase.Trim(),
+        (Join-Path $PythonBase.Trim() "DLLs"),
+        (Join-Path $env:SystemRoot "System32"),
+        $env:SystemRoot
+    ) -join ";"
     if ($Clean) {
         foreach ($Target in @($BuildDir, $DistDir)) {
             $ResolvedParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $Target))
@@ -96,5 +113,6 @@ try {
     Write-Host "Portable build: $BundleDir"
 }
 finally {
+    $env:PATH = $PreviousBuildPath
     Pop-Location
 }

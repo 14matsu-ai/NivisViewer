@@ -59,6 +59,16 @@ class BrowserItem:
     accessed_time_ns: int | None = None
 
     @property
+    def thumbnail_revision(self) -> tuple[object, ...]:
+        """The scanned content identity, excluding read/access metadata."""
+        return (
+            self.kind,
+            self.file_size,
+            self.modified_time_ns if self.modified_time_ns is not None else self.modified_at,
+            self.created_time_ns,
+        )
+
+    @property
     def can_open(self) -> bool:
         return self.openable_by_nivisviewer
 
@@ -178,7 +188,7 @@ class BrowserItemModel(QAbstractListModel):
         self._source_keys: set[str] = set()
         self._icons: dict[str, QIcon] = {}
         self._thumbnail_images: dict[str, QImage] = {}
-        self._thumbnail_signatures: dict[str, tuple[int, float | None]] = {}
+        self._thumbnail_signatures: dict[str, tuple[int, tuple[object, ...]]] = {}
         self._low_resolution_thumbnails: set[str] = set()
         self._thumbnail_errors: dict[str, str] = {}
         self._preview_statuses: dict[str, str] = {}
@@ -355,9 +365,7 @@ class BrowserItemModel(QAbstractListModel):
             if (
                 item.page_count is None
                 and previous is not None
-                and previous.kind is item.kind
-                and previous.file_size == item.file_size
-                and previous.modified_time_ns == item.modified_time_ns
+                and previous.thumbnail_revision == item.thumbnail_revision
             ):
                 item = replace(item, page_count=previous.page_count)
             reused.append(item)
@@ -550,7 +558,7 @@ class BrowserItemModel(QAbstractListModel):
         item = self._items[row]
         key = self._key(item.path)
         signature = (
-            (int(request_token), item.modified_at)
+            (int(request_token), item.thumbnail_revision)
             if request_token is not None
             else None
         )
@@ -827,7 +835,7 @@ class BrowserItemModel(QAbstractListModel):
             key in self._thumbnail_images
             and key not in self._low_resolution_thumbnails
             and self._thumbnail_signatures.get(key)
-            == (int(request_token), item.modified_at)
+            == (int(request_token), item.thumbnail_revision)
         )
 
     def set_cut_paths(self, paths: tuple[str | Path, ...] | list[str | Path]) -> bool:
@@ -866,7 +874,7 @@ class BrowserItemModel(QAbstractListModel):
                 key in self._thumbnail_images
                 and key not in self._low_resolution_thumbnails
                 and (item := items_by_key.get(key)) is not None
-                and signature[1] == item.modified_at
+                and signature[1] == item.thumbnail_revision
             )
         }
         self._thumbnail_images = {
