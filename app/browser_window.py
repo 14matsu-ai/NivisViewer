@@ -214,7 +214,7 @@ BROWSER_STATUS_BAR_SPACING = 3
 BROWSER_STATUS_LEFT_SPACING = 12
 BROWSER_STATUS_DETAIL_SPACING = 14
 BROWSER_STATUS_BAR_MIN_IDLE_HEIGHT = 22
-BROWSER_DIRECTORY_CHANGE_COALESCE_MS = 80
+BROWSER_DIRECTORY_CHANGE_COALESCE_MS = 350
 
 
 @dataclass(frozen=True)
@@ -1177,8 +1177,13 @@ class BrowserWindow(QMainWindow):
             state = self._capture_list_view_state()
             pending.refresh_entries.clear()
             items = self.item_model.reuse_known_page_counts(items)
-            if tuple(items) != self.item_model.source_items:
-                self._generation = self.thumbnail_provider.begin_generation()
+            # A completed write can release a sharing lock without changing
+            # listing metadata. Retry failed previews once per coalesced event.
+            filesystem_change = pending.navigation_source == "filesystem_watch"
+            if tuple(items) != self.item_model.source_items or filesystem_change:
+                self._generation = self.thumbnail_provider.begin_generation(
+                    retry_failed=filesystem_change,
+                )
                 self.item_model.set_sorted_items(
                     items,
                     preserve_thumbnails=True,

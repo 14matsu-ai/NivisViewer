@@ -203,10 +203,10 @@ def test_memory_cache_hit_uses_cow_image_handles_without_sharing_mutation(
         str(item.path),
         generation,
         120,
-        item.modified_at,
+        item.thumbnail_revision,
         source,
     )
-    cache_key = (provider._path_key(item.path), 120, item.modified_at)
+    cache_key = (provider._path_key(item.path), 120, item.thumbnail_revision)
     cached = provider._cache[cache_key]
     assert cached is not source
     assert cached.cacheKey() == source.cacheKey()

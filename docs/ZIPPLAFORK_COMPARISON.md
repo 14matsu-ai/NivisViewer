@@ -7989,3 +7989,128 @@ uses an independent bounded final-artifact lifetime. New region/tile rendering
 remains deferred. Newly written counterparts are the PDF loupe methods in
 `app/viewer_widget.py`, Window integration and `app/pdf_loupe.py`; none is newly
 derived ZipPlaFork code. No new dependency or license text is required.
+
+## 51. Browser download completion and preview recovery (2026-09-14)
+
+### Primary source inspected for this change
+
+Repository: https://github.com/himamon/ZipPlaFork
+
+Fixed revision: `07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`.
+The existing local reference at `../ZipPlaViewer` was inspected read-only.
+Its HEAD is `b59e43966ae14bc5207cce54e9075c6099a30272`, **not** the fixed
+revision. `git cat-file -t` confirmed that the fixed commit exists locally;
+`git diff <fixed-revision> -- source/ZipPla/CatalogForm.cs
+source/ZipPla/CatalogForm.Designer.cs` was empty, including worktree changes.
+Thus the inspected versions of these two files match the fixed source.
+No checkout, global Git configuration change, or source modification occurred.
+
+- `source/ZipPla/CatalogForm.Designer.cs:3254-3263`,
+  `CatalogForm.InitializeComponent`: subscribes to Changed/Created/Deleted/
+  Renamed with FileName, DirectoryName, Size, LastWrite and LastAccess filters.
+- `source/ZipPla/CatalogForm.cs:25493-25610`, `fileSystemWatcherStopper`,
+  `fileSystemWatcher_Created`, `fileSystemWatcher_Changed`,
+  `fileSystemWatcher_Renamed`: checks current location/loading identity,
+  passes `thumbnailChanged: true` for a write, and handles rename separately.
+- Same file:25688-25766, `renameItem`: keeps a successful thumbnail only when
+  type and thumbnail metadata remain compatible; otherwise requests reload.
+- Same file:25769-25904, both `addOrReloadItem` overloads: selects explicit
+  reload behavior even for an existing item, and calls
+  `ReloadOneThumbnailForSubThread` via `Task.Run`, retaining `startingGuid`.
+
+These observations come from fresh primary-source reading, not only section 37.
+AGPL-3.0-or-later provenance applies to the adopted event-to-retry process.
+Copyright notices checked at the fixed commit: `license/About.txt`,
+`Copyright ©  2016 Rio's Toolbox`; `Properties/AssemblyInfo.cs`,
+`Copyright © 2016-2017 Rio's Toolbox`. Existing `licenses/ZipPlaFork/AGPL.txt`
+and `About.txt` are retained. No dependency, binary or C# source is added.
+
+### Diagnosis and four-way comparison
+
+The Windows Qt directory watcher already delivered real create and size-change
+notifications in the existing offscreen test (18 watcher tests passed before
+editing). Replacing the watcher is therefore not supported by this evidence.
+The broken downstream contracts were:
+
+1. Model and provider ready/failure cache identities used float modification
+   time alone. A growing file with unchanged mtime could retain old pixels or
+   a failed decode. Nanosecond differences could also collapse into one float.
+2. A notification with unchanged listing metadata skipped reconciliation,
+   preventing recovery from a transient read/sharing failure.
+3. Cancelled loaders could add failure records or save old pixels after a new
+   generation. Disk persistence/stat-based page counts could label old work
+   with the file's newer size/mtime instead of the scanned version.
+4. The scanner unconditionally removed `.part` and `.crdownload`, contrary to
+   the requested visible-temporary-file behavior.
+
+| Option | Assessment |
+| --- | --- |
+| ZipPlaFork | Explicit Changed → reload/retry and rename type checks cover the needed principle. Per-event item mutation and WinForms array ownership do not fit the current Qt model. |
+| Existing NivisViewer | Retain the generation-fenced Qt watcher, worker scanner, sorting/filter pipeline and selection/viewport restoration. Mtime-only preview reuse and unchanged-metadata early exit need correction. |
+| Hybrid (selected) | Adopt explicit event-driven retry from ZipPlaFork, but coalesce notifications and reconcile through the existing NivisViewer model. Use scanned content identity for ready/failure caches and preserve compatible successful thumbnails. |
+| New design | Native per-path notification journal, content hashing or permanent polling could detect additional metadata-preserving changes, at substantially larger ownership/I/O scope. Not required for the reproduced download transitions. |
+
+### NivisViewer mapping
+
+- `app/browser_scanner.py::scan_entry_from_dir_entry`: temporary extensions
+  follow ordinary unsupported-file visibility; internal NivisViewer operation
+  artifacts remain excluded. Renaming reclassifies the new path normally.
+- `app/browser_model.py::BrowserItem.thumbnail_revision`, thumbnail retention
+  and known-page-count reuse: kind, size, nanosecond mtime (float fallback only
+  for manually constructed items), creation time. Access time is excluded.
+- `app/thumbnail_provider.py`: memory candidates, completed-result identity,
+  failure/quiet caches use that revision. `begin_generation(retry_failed=True)`
+  cancels old work before clearing failures; cancelled decode completion cannot
+  repopulate the failure cache or proceed to normal disk persistence.
+- `app/browser_window.py::_on_scan_completed`: a filesystem reconciliation
+  also retries failures when listing metadata is equal; compatible ready
+  pixels, search, sort and the existing view-state restoration remain in use.
+  The notification quiet interval is 350 ms instead of 80 ms. Continuous
+  notifications postpone the scan; completion settles after a quiet interval.
+- `app/thumbnail_disk_cache.py::_source_for_item`: worker-side cache reads,
+  writes and page-count updates reject a scanned size/mtime that no longer
+  matches the source. Old decoded pixels cannot acquire a newer fingerprint.
+
+No GUI-thread decode, archive extraction, new timer polling, file enumeration
+in the widget, or Viewer pipeline change was introduced.
+
+### Verification and limits
+
+`tests/test_browser_download_refresh.py` adds 10 checks: actual Qt notifications
+and visible pixel convergence for temporary rename, growth with fixed mtime,
+in-place rewrite, atomic replacement, and incomplete → valid PNG; same-mtime
+failure recovery; cancelled success/failure completion; stale disk/count
+publication; and eight 100 ms notifications coalesced into one scan/retry with
+no subsequent idle scan. All fixtures are synthetic, including Japanese names.
+Temporary rename also asserts that the temporary row is visible before rename.
+
+Focused commands (existing `.venv311/Scripts/python.exe`, offscreen Qt):
+
+```text
+-m pytest tests/test_browser_download_refresh.py tests/test_browser_model.py tests/test_thumbnail_provider.py tests/test_browser_directory_watcher.py -q
+-m pytest tests/test_thumbnail_disk_cache.py tests/test_browser_scanner.py tests/test_browser_sort.py tests/test_browser_thumbnail_resampling.py tests/test_browser_thumbnail_scheduler.py -q
+-m pytest tests/test_browser_navigation_window.py tests/test_browser_navigation.py tests/test_browser_search_history.py tests/test_browser_file_operations.py -q
+```
+
+The first validation produced 55, 125 and 78 passes (258 total). After the
+page-count guard adjustment, the first two affected groups passed together
+(180 passed); the unchanged navigation/search/file-operation group remains
+78 passed. Python syntax compilation and `git diff --check` also passed.
+Initial new-test failures
+exposed the temporary suffix exclusion; no pre-existing failure or Qt abort was
+observed in these focused groups. This is not a claim that the full suite passed.
+
+Required offscreen Viewer evaluation used 9 synthetic 2400×3600 JPEG pages in a
+ZIP, 1280×900 viewport and 256 MiB cache via
+`scripts/benchmark_viewer_navigation.py`. Status completed, terminal errors 0.
+Request-to-paint: initial 20.583 ms; sequential 1.376 ms; reverse 1.319 ms;
+direction reversal 1.609 ms; ping-pong median/max 1.342/10.281 ms;
+rapid final 2.113 ms. This supplementary synthetic measurement is not a native
+Windows responsiveness claim. No real app, private media or native input was used.
+
+Limits: delivery still depends on filesystem notifications; no polling fallback
+was added for lost network-share notifications. A successful image changed while
+preserving every compared metadata value is not content-hash detected. During
+continuous notifications the old listing remains until a 350 ms quiet interval.
+Transient unchanged-metadata failures retry on a later event, not indefinitely.
+The consultation review remains the next step; no native check is requested here.

@@ -109,7 +109,10 @@ def run_frozen_smoke(
 
             config = ConfigManager(app_paths.config_path, writable=True)
             config.load()
-            config.save({"background_color": "#102030"})
+            config.save({
+                "background_color": "#102030",
+                "last_browser_path": str(images),
+            })
             metadata = MetadataStore(app_paths.metadata_path)
             checks["metadata"] = metadata.enabled
             cache = ThumbnailDiskCache(app_paths.thumbnail_cache_dir, enabled=True)

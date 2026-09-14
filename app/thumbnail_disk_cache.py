@@ -173,7 +173,7 @@ class ThumbnailDiskCache:
         with self._lock:
             if not self.enabled or self._connection is None:
                 return None
-            source = self._stat_path(item.path)
+            source = self._source_for_item(item)
             if source is None:
                 return None
             try:
@@ -241,7 +241,7 @@ class ThumbnailDiskCache:
         with self._lock:
             if not self.enabled or self._connection is None:
                 return None
-            source = self._stat_path(item.path)
+            source = self._source_for_item(item)
             if source is None:
                 return None
             try:
@@ -476,7 +476,7 @@ class ThumbnailDiskCache:
         with self._lock:
             if not self.enabled or self._connection is None:
                 return None
-            source = self._stat_path(item.path)
+            source = self._source_for_item(item)
             if source is None:
                 return None
             try:
@@ -510,7 +510,7 @@ class ThumbnailDiskCache:
         with self._lock:
             if not self.enabled or self._connection is None:
                 return 0
-            source = self._stat_path(item.path)
+            source = self._source_for_item(item)
             if source is None:
                 return 0
             try:
@@ -901,7 +901,7 @@ class ThumbnailDiskCache:
         *,
         format_version: str | None = None,
     ) -> _Fingerprint | None:
-        source = self._stat_path(item.path)
+        source = self._source_for_item(item)
         if source is None:
             return None
         if item.kind == BrowserItemKind.FOLDER:
@@ -1079,6 +1079,19 @@ class ThumbnailDiskCache:
             return int(info.st_size), int(info.st_mtime_ns)
         except OSError:
             return None
+
+    def _source_for_item(self, item: BrowserItem) -> tuple[int, int] | None:
+        # A decode/count from the scanned version must never be published into
+        # a later write's cache identity. Called only on the worker/cache path.
+        source = self._stat_path(item.path)
+        if source is None:
+            return None
+        if item.kind is not BrowserItemKind.FOLDER and (
+            (item.file_size is not None and item.file_size != source[0])
+            or (item.modified_time_ns is not None and item.modified_time_ns != source[1])
+        ):
+            return None
+        return source
 
     @staticmethod
     def _normalize_path(path: Path) -> str:

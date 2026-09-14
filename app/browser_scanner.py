@@ -29,7 +29,6 @@ if TYPE_CHECKING:
 
 
 DEFAULT_SCAN_BATCH_SIZE = 128
-_INCOMPLETE_DOWNLOAD_SUFFIXES = (".part", ".crdownload")
 _RETIRED_SCANNERS: set[BrowserDirectoryScanner] = set()
 _TEXT_PREVIEW_EXTENSIONS = {
     ".txt", ".md", ".log", ".ini", ".cfg", ".conf", ".json", ".yaml",
@@ -143,11 +142,7 @@ def scan_entry_from_dir_entry(
     visibility_policy: BrowserVisibilityPolicy = LEGACY_SUPPORTED_ITEMS_POLICY,
 ) -> BrowserScanEntry | None:
     name = entry.name
-    if (
-        name in {".", ".."}
-        or name.startswith("~$")
-        or name.endswith(_INCOMPLETE_DOWNLOAD_SUFFIXES)
-    ):
+    if name in {".", ".."} or name.startswith("~$"):
         return None
     if FileOperationArtifactPolicy.is_internal_operation_artifact(name):
         FileOperationArtifactPolicy.record_orphan(entry.path)

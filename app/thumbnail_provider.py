@@ -119,7 +119,7 @@ class _ThumbnailWorker(QRunnable):
                     if isinstance(self.size, ThumbnailRenderSpec)
                     else self.size
                 ),
-                self.item.modified_at,
+                self.item.thumbnail_revision,
                 image,
             )
 
@@ -162,7 +162,7 @@ class _ThumbnailWorker(QRunnable):
                 if isinstance(self.size, ThumbnailRenderSpec)
                 else self.size
             ),
-            self.item.modified_at,
+            self.item.thumbnail_revision,
             result,
         )
 
@@ -196,9 +196,9 @@ class BrowserThumbnailProvider(QObject):
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(1)
         self._cache_capacity = max(1, cache_capacity)
-        self._cache: OrderedDict[tuple[str, int, float | None], QImage] = OrderedDict()
+        self._cache: OrderedDict[tuple[str, int, tuple[object, ...]], QImage] = OrderedDict()
         self._cache_page_counts: dict[
-            tuple[str, int, float | None], int
+            tuple[str, int, tuple[object, ...]], int
         ] = {}
         self._cache_specs: dict[int, ThumbnailRenderSpec] = {}
         self._active_request_tokens: dict[str, set[int]] = {}
@@ -243,9 +243,9 @@ class BrowserThumbnailProvider(QObject):
             and disk_cache is not None
             and disk_cache.enabled
         )
-        self._failed: set[tuple[str, int, float | None]] = set()
+        self._failed: set[tuple[str, int, tuple[object, ...]]] = set()
         self._quiet_results: dict[
-            tuple[str, int, float | None],
+            tuple[str, int, tuple[object, ...]],
             PreviewResultKind,
         ] = {}
         self._maintenance_started = False
@@ -269,7 +269,7 @@ class BrowserThumbnailProvider(QObject):
     def generation(self) -> int:
         return self._generation
 
-    def begin_generation(self) -> int:
+    def begin_generation(self, *, retry_failed: bool = False) -> int:
         self._generation += 1
         self._active_request_tokens.clear()
         with self._failure_lock:
@@ -279,6 +279,9 @@ class BrowserThumbnailProvider(QObject):
                 pending.worker.cancelled.set()
                 self._try_take(pending.worker)
             self._pending.clear()
+        if retry_failed:
+            with self._failure_lock:
+                self._failed.clear()
         if self._coordinator is None:
             self._pool.clear()
         return self._generation
@@ -328,7 +331,7 @@ class BrowserThumbnailProvider(QObject):
             }[normalized_priority]
         )
         self._active_request_tokens.setdefault(path_key, set()).add(cache_token)
-        cache_key = (path_key, cache_token, item.modified_at)
+        cache_key = (path_key, cache_token, item.thumbnail_revision)
         cached = self._cache.get(cache_key)
         if cached is not None:
             self._increment_stat("memory_hit")
@@ -350,7 +353,7 @@ class BrowserThumbnailProvider(QObject):
         if isinstance(normalized_size, ThumbnailRenderSpec):
             candidate = self._memory_candidate(
                 path_key,
-                item.modified_at,
+                item.thumbnail_revision,
                 normalized_size,
             )
             if candidate is not None:
@@ -561,7 +564,7 @@ class BrowserThumbnailProvider(QObject):
         generation: int | None = None,
     ) -> bool:
         token = size.cache_token if isinstance(size, ThumbnailRenderSpec) else int(size)
-        failure_key = (self._path_key(item.path), token, item.modified_at)
+        failure_key = (self._path_key(item.path), token, item.thumbnail_revision)
         with self._failure_lock:
             self._failed.discard(failure_key)
             self._quiet_results.pop(failure_key, None)
@@ -968,7 +971,7 @@ class BrowserThumbnailProvider(QObject):
         page_count_callback: Callable[[int], None] | None = None,
     ) -> ThumbnailLoadResult:
         cache_token = size.cache_token if isinstance(size, ThumbnailRenderSpec) else int(size)
-        failure_key = (self._path_key(item.path), cache_token, item.modified_at)
+        failure_key = (self._path_key(item.path), cache_token, item.thumbnail_revision)
         disk_cache = self._disk_cache
         disk_entry_path = (
             self._preview_registry.disk_cache_variant(item)
@@ -977,6 +980,8 @@ class BrowserThumbnailProvider(QObject):
         )
 
         def publish_page_count(page_count: int) -> None:
+            if cancel_token is not None and cancel_token.is_set():
+                return
             normalized = max(0, int(page_count))
             if self._disk_cache_enabled and disk_cache is not None:
                 disk_cache.update_page_count(item, normalized)
@@ -1109,16 +1114,22 @@ class BrowserThumbnailProvider(QObject):
                 if isinstance(loaded, ThumbnailLoadResult)
                 else ThumbnailLoadResult(loaded)
             )
+        if cancel_token is not None and cancel_token.is_set():
+            return ThumbnailLoadResult(
+                None, result_kind=PreviewResultKind.CANCELLED, persist_to_disk=False
+            )
         if result.image is None or result.image.isNull():
             if result.resolved_kind is PreviewResultKind.FAILED:
                 with self._failure_lock:
-                    self._failed.add(failure_key)
+                    if cancel_token is None or not cancel_token.is_set():
+                        self._failed.add(failure_key)
             elif result.resolved_kind not in {
                 PreviewResultKind.CANCELLED,
                 PreviewResultKind.PENDING,
             }:
                 with self._failure_lock:
-                    self._quiet_results[failure_key] = result.resolved_kind
+                    if cancel_token is None or not cancel_token.is_set():
+                        self._quiet_results[failure_key] = result.resolved_kind
             return ThumbnailLoadResult(
                 None,
                 provisional_image=provisional,
@@ -1209,7 +1220,7 @@ class BrowserThumbnailProvider(QObject):
         path: str,
         generation: int,
         _size_token: int,
-        _modified_at: float | None,
+        _modified_at: tuple[object, ...],
         image: QImage | None,
     ) -> None:
         if (
@@ -1350,7 +1361,7 @@ class BrowserThumbnailProvider(QObject):
         path: str,
         generation: int,
         size_token: int,
-        modified_at: float | None,
+        modified_at: tuple[object, ...],
         result: ThumbnailLoadResult | QImage | None,
     ) -> None:
         path_key = self._path_key(Path(path))
@@ -1421,7 +1432,7 @@ class BrowserThumbnailProvider(QObject):
         path: str,
         generation: int,
         _size_token: int,
-        _modified_at: float | None,
+        _modified_at: tuple[object, ...],
         result: ThumbnailLoadResult | QImage | None,
     ) -> None:
         path_key = self._path_key(Path(path))
@@ -1479,7 +1490,7 @@ class BrowserThumbnailProvider(QObject):
     def _memory_candidate(
         self,
         path_key: str,
-        modified_at: float | None,
+        modified_at: tuple[object, ...],
         requested: ThumbnailRenderSpec,
     ) -> tuple[QImage, ThumbnailRenderSpec, int | None] | None:
         candidates: list[

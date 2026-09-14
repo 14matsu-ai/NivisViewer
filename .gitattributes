@@ -3,3 +3,7 @@
 /licenses/Qt/6.11.2/*.txt -text
 /licenses/Qt/6.11.2/NOTICE.md -text
 /licenses/Python/LICENSE.txt -text
+
+# Preserve local historical artifacts but omit them from release source archives.
+/portable-backups export-ignore
+/NivisViewer_review.zip export-ignore
