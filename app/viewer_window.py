@@ -3539,6 +3539,7 @@ class ViewerWindow(QMainWindow):
             self._dispatch_pending_zip_runtime_request()
 
     def _finish_slider_navigation(self) -> None:
+        self._navigation_admission.finish_slider()
         if self._pending_raster_input_kind is NavigationInputKind.SLIDER_SCRUB:
             self._zip_runtime_request_timer.stop()
             self._dispatch_pending_zip_runtime_request()

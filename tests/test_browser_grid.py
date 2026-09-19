@@ -102,6 +102,27 @@ class AlphaShellIconProvider:
         return image
 
 
+class SolidAssociationProvider:
+    def __init__(self, color: str | None) -> None:
+        self.color = color
+        self.calls: list[tuple[BrowserItemKind, int, float]] = []
+
+    def image_for(
+        self,
+        item,
+        *,
+        logical_size: int,
+        device_pixel_ratio: float,
+    ) -> QImage:
+        self.calls.append((item.kind, logical_size, device_pixel_ratio))
+        if self.color is None:
+            return QImage()
+        size = max(1, round(logical_size * device_pixel_ratio))
+        image = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(QColor(self.color))
+        return image
+
+
 def make_item(path: Path, kind: BrowserItemKind) -> BrowserItem:
     return BrowserItem(path.name, path, kind, None)
 
@@ -531,6 +552,94 @@ def test_type_icon_keeps_alpha_without_translucent_backing_plate(
     )
     assert canvas.pixelColor(outside_icon) == QColor("white")
     assert canvas.pixelColor(icon_center).red() > 180
+
+
+@pytest.mark.parametrize(
+    ("kind", "name"),
+    [
+        (BrowserItemKind.FOLDER, "folder"),
+        (BrowserItemKind.IMAGE, "page.jpg"),
+        (BrowserItemKind.PDF, "book.pdf"),
+        (BrowserItemKind.ARCHIVE, "book.cbz"),
+        (BrowserItemKind.OTHER, "notes.txt"),
+    ],
+)
+def test_pending_preview_prefers_shell_association_for_all_item_kinds(
+    qapp,
+    tmp_path: Path,
+    kind: BrowserItemKind,
+    name: str,
+) -> None:
+    provider = SolidAssociationProvider("#d03030")
+    delegate = BrowserItemDelegate(
+        shell_icon_provider=provider,
+        thumbnail_size=180,
+        density=BrowserDisplayDensity.STANDARD,
+    )
+    item = make_item(tmp_path / name, kind)
+    model = BrowserItemModel()
+    model.set_items([item])
+    fallback = QPixmap(32, 32)
+    fallback.fill(QColor("#30a050"))
+    model.set_fallback_icons({kind: QIcon(fallback)})
+    option = QStyleOptionViewItem()
+    option.rect = QRect(QPoint(), delegate.cell_size)
+    option.palette = qapp.palette()
+    option.state = QStyle.StateFlag.State_Enabled
+    canvas = QImage(
+        delegate.cell_size,
+        QImage.Format.Format_ARGB32_Premultiplied,
+    )
+    canvas.fill(option.palette.window().color())
+
+    painter = QPainter(canvas)
+    delegate.paint(painter, option, model.index(0, 0))
+    painter.end()
+
+    content = thumbnail_content_rect(
+        delegate.grid_metrics.thumbnail_frame_rect(option.rect),
+    ).toRect()
+    central = canvas.pixelColor(content.center())
+    assert central == QColor("#d03030")
+    assert provider.calls[0][0] is kind
+    assert {size for _kind, size, _dpr in provider.calls} >= {18, 96}
+
+
+def test_pending_preview_uses_decoration_fallback_when_shell_association_fails(
+    qapp,
+    tmp_path: Path,
+) -> None:
+    provider = SolidAssociationProvider(None)
+    delegate = BrowserItemDelegate(
+        shell_icon_provider=provider,
+        thumbnail_size=180,
+        density=BrowserDisplayDensity.STANDARD,
+    )
+    item = make_item(tmp_path / "book.pdf", BrowserItemKind.PDF)
+    model = BrowserItemModel()
+    model.set_items([item])
+    fallback = QPixmap(32, 32)
+    fallback.fill(QColor("#30a050"))
+    model.set_fallback_icons({BrowserItemKind.PDF: QIcon(fallback)})
+    option = QStyleOptionViewItem()
+    option.rect = QRect(QPoint(), delegate.cell_size)
+    option.palette = qapp.palette()
+    option.state = QStyle.StateFlag.State_Enabled
+    canvas = QImage(
+        delegate.cell_size,
+        QImage.Format.Format_ARGB32_Premultiplied,
+    )
+    canvas.fill(option.palette.window().color())
+
+    painter = QPainter(canvas)
+    delegate.paint(painter, option, model.index(0, 0))
+    painter.end()
+
+    content = thumbnail_content_rect(
+        delegate.grid_metrics.thumbnail_frame_rect(option.rect),
+    ).toRect()
+    assert canvas.pixelColor(content.center()) == QColor("#30a050")
+    assert provider.calls
 
 
 def test_type_badges_distinguish_supported_item_types_and_are_bottom_left(tmp_path):

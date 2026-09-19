@@ -957,6 +957,12 @@ class BrowserWindow(QMainWindow):
             self._flush_directory_changes
         )
         self._build_ui()
+        application = QApplication.instance()
+        if application is not None:
+            # Side-button events can target a viewport child or delegate
+            # helper while history restore replaces the model. Observe them
+            # before the target interprets the packet as an ordinary click.
+            application.installEventFilter(self)
         self._refresh_thumbnail_encoding_policy()
         QTimer.singleShot(1000, self, self._run_idle_cache_cleanup)
         self.config.settings_changed.connect(self.apply_settings)
@@ -1299,6 +1305,12 @@ class BrowserWindow(QMainWindow):
                     pending.restore_location,
                     update_status=False,
                 )
+            # A snapshot history restore can reach this refresh completion
+            # before its first-paint callback runs.  That callback is fenced
+            # by the newer scan generation, so explicitly re-arm the bounded
+            # visible-range request here. Compatible memory/disk thumbnails
+            # remain provider cache hits; only missing visible work starts.
+            self._schedule_thumbnail_requests(0)
         else:
             pending.buffered_entries.clear()
             self._commit_pending_scan(pending)
@@ -5539,7 +5551,60 @@ class BrowserWindow(QMainWindow):
             QTimer.singleShot(0, self._reevaluate_thumbnail_dpr)
         return handled
 
+    def _handle_extra_button_event(
+        self,
+        watched: object,
+        event: QEvent,
+    ) -> bool | None:
+        if (
+            event.type()
+            not in {
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.MouseButtonRelease,
+                QEvent.Type.MouseButtonDblClick,
+            }
+            or not isinstance(event, QMouseEvent)
+            or event.button()
+            not in {
+                Qt.MouseButton.BackButton,
+                Qt.MouseButton.ForwardButton,
+            }
+        ):
+            return None
+        owned = isinstance(watched, QWidget) and (
+            watched is self or self.isAncestorOf(watched)
+        )
+        button = event.button()
+        if event.type() == QEvent.Type.MouseButtonRelease:
+            self._pressed_extra_buttons.discard(button)
+            return True if owned else None
+        if not owned:
+            return None
+        address_target = (
+            watched is self.address_bar
+            or self.address_bar.isAncestorOf(watched)
+        )
+        if event.type() == QEvent.Type.MouseButtonDblClick:
+            # Qt can classify a rapid XButton press as DblClick. If the
+            # leading press was already handled, consume only the duplicate;
+            # if it was the first observable packet, admit it once here.
+            if button in self._pressed_extra_buttons:
+                return True
+        elif button in self._pressed_extra_buttons:
+            # A lost release must not latch the next physical press forever.
+            self._pressed_extra_buttons.discard(button)
+        self._pressed_extra_buttons.add(button)
+        if not address_target:
+            if button == Qt.MouseButton.BackButton:
+                self.go_back()
+            else:
+                self.go_forward()
+        return True
+
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
+        extra_button_result = self._handle_extra_button_event(watched, event)
+        if extra_button_result is not None:
+            return extra_button_result
         if (
             watched in (self.list_view, self.list_view.viewport(), getattr(self, 'rating_filter_widget', None))
             and event.type() == QEvent.Type.KeyPress
@@ -5631,44 +5696,6 @@ class BrowserWindow(QMainWindow):
                 self.list_view.setFocus(Qt.FocusReason.ShortcutFocusReason)
                 return True
         if (
-            watched is self.address_bar
-            and event.type()
-            in (
-                QEvent.Type.MouseButtonPress,
-                QEvent.Type.MouseButtonRelease,
-            )
-            and isinstance(event, QMouseEvent)
-            and event.button()
-            in (
-                Qt.MouseButton.BackButton,
-                Qt.MouseButton.ForwardButton,
-            )
-        ):
-            return True
-
-        if watched is not self.address_bar and event.type() in (
-            QEvent.Type.MouseButtonPress,
-            QEvent.Type.MouseButtonRelease,
-        ):
-            mouse_event = event
-            if isinstance(mouse_event, QMouseEvent):
-                button = mouse_event.button()
-                if button in (
-                    Qt.MouseButton.BackButton,
-                    Qt.MouseButton.ForwardButton,
-                ):
-                    if event.type() == QEvent.Type.MouseButtonPress:
-                        if button not in self._pressed_extra_buttons:
-                            self._pressed_extra_buttons.add(button)
-                            if button == Qt.MouseButton.BackButton:
-                                self.go_back()
-                            else:
-                                self.go_forward()
-                    else:
-                        self._pressed_extra_buttons.discard(button)
-                    return True
-
-        if (
             watched is not self.address_bar
             and event.type() == QEvent.Type.KeyPress
             and isinstance(event, QKeyEvent)
@@ -5708,6 +5735,9 @@ class BrowserWindow(QMainWindow):
             return
         self.prepare_shutdown()
         self.closing.emit(self)
+        application = QApplication.instance()
+        if application is not None:
+            application.removeEventFilter(self)
         super().closeEvent(event)
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]

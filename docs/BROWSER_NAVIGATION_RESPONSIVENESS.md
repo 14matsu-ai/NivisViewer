@@ -229,6 +229,14 @@ recycle, copy or create actions. A missing or failed refresh leaves the cached
 view visible and reports the normal access status; it does not treat the
 snapshot as authoritative filesystem state.
 
+The reconciliation completion also schedules the bounded visible-range
+thumbnail pass. This is required when the refresh finishes before the
+snapshot's first-paint callback: that callback is correctly rejected by the
+newer scan generation, but rejecting it must not leave the restored rows
+without a request. Provider memory/disk hits still return asynchronously and
+uncached items use the same visible, selected, read-ahead and safety plan as
+tree navigation; the fix does not enumerate or decode the whole folder.
+
 Focused coverage is in `tests/test_browser_folder_snapshot_cache.py` and
 `tests/test_browser_navigation_window.py`. The latter checks that a 160-item
 history return publishes a partial cached model before reconciliation and then

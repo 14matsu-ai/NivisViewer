@@ -34,6 +34,10 @@ class NavigationAdmissionPolicy:
     """
 
     DEFAULT_RAPID_WHEEL_NS = 40_000_000
+    # A real pointer drag normally produces packets faster than this.  Keep
+    # those packets replaceable until release, while a paced drag gets a
+    # chance to admit each target and show the page before the thumb stops.
+    DEFAULT_RAPID_SLIDER_NS = 50_000_000
     _MIN_WHEEL_FLUSH_NS = 6_000_000
     _MAX_WHEEL_FLUSH_NS = 28_000_000
     _WHEEL_FLUSH_PADDING_NS = 2_000_000
@@ -42,16 +46,22 @@ class NavigationAdmissionPolicy:
         self,
         *,
         rapid_wheel_ns: int = DEFAULT_RAPID_WHEEL_NS,
+        rapid_slider_ns: int = DEFAULT_RAPID_SLIDER_NS,
         clock: Callable[[], int] = perf_counter_ns,
     ) -> None:
         normalized_window = int(rapid_wheel_ns)
         if normalized_window < 0:
             raise ValueError("rapid_wheel_ns must be non-negative")
+        normalized_slider_window = int(rapid_slider_ns)
+        if normalized_slider_window < 0:
+            raise ValueError("rapid_slider_ns must be non-negative")
         self._rapid_wheel_ns = normalized_window
+        self._rapid_slider_ns = normalized_slider_window
         self._clock = clock
         self._last_wheel_ns: int | None = None
         self._wheel_direction = 0
         self._wheel_flush_delay_ns = 0
+        self._last_slider_admitted_ns: int | None = None
         self._repeat_key: Hashable | None = None
 
     @property
@@ -92,12 +102,28 @@ class NavigationAdmissionPolicy:
                 return NavigationAdmissionDecision.IMMEDIATE
             return NavigationAdmissionDecision.STAGE
         if normalized_kind is NavigationInputKind.SLIDER_SCRUB:
-            self.reset()
-            return (
-                NavigationAdmissionDecision.STAGE
-                if slider_drag_active
-                else NavigationAdmissionDecision.IMMEDIATE
-            )
+            self.finish_wheel()
+            self.finish_key_repeat()
+            if not slider_drag_active:
+                self.finish_slider()
+                return NavigationAdmissionDecision.IMMEDIATE
+            observed_ns = int(self._clock() if now_ns is None else now_ns)
+            if observed_ns < 0:
+                raise ValueError("now_ns must be non-negative")
+            previous_ns = self._last_slider_admitted_ns
+            if previous_ns is None:
+                # Admit the leading target so a cold drag can start painting
+                # while the handle continues moving.
+                self._last_slider_admitted_ns = observed_ns
+                return NavigationAdmissionDecision.IMMEDIATE
+            elapsed_ns = observed_ns - previous_ns
+            if 0 <= elapsed_ns <= self._rapid_slider_ns:
+                return NavigationAdmissionDecision.STAGE
+            # Measure the cadence from the last admitted target rather than
+            # the last observed packet. Continuous pointer packets can be
+            # frequent even when the user is dragging at a readable pace.
+            self._last_slider_admitted_ns = observed_ns
+            return NavigationAdmissionDecision.IMMEDIATE
         self.reset()
         return NavigationAdmissionDecision.IMMEDIATE
 
@@ -114,11 +140,17 @@ class NavigationAdmissionPolicy:
         if repeat_key is None or repeat_key == self._repeat_key:
             self._repeat_key = None
 
+    def finish_slider(self) -> None:
+        """End a slider gesture before the next drag gets a leading admit."""
+
+        self._last_slider_admitted_ns = None
+
     def reset(self) -> None:
         """Forget every gesture when a book or input context changes."""
 
         self.finish_wheel()
         self.finish_key_repeat()
+        self.finish_slider()
 
     def _decide_wheel(
         self,

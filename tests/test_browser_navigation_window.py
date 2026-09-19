@@ -8,19 +8,40 @@ from PIL import Image
 from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QPointF, Qt
 from PySide6.QtGui import QContextMenuEvent, QMouseEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QListView, QToolButton
+from PySide6.QtWidgets import QApplication, QListView, QToolButton, QWidget
 
 from app.browser_window import BrowserWindow
 from app.browser_filter import BrowserFilterState, RatingFilterMode
 from app.config_manager import ConfigManager
 from app.browser_location_bar import LocationPopupEntry
 from app.browser_navigation import BrowserLocation
+from app.browser_thumbnail_scheduler import ThumbnailPriority
+from app.thumbnail_provider import BrowserThumbnailProvider
 
 
 def write_image(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with Image.new("RGB", (8, 12), "white") as image:
         image.save(path)
+
+
+class RecordingThumbnailProvider(BrowserThumbnailProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requests: list[tuple[str, int, ThumbnailPriority]] = []
+
+    def request(
+        self,
+        item,
+        size,
+        *,
+        generation: int | None = None,
+        priority: ThumbnailPriority = ThumbnailPriority.VISIBLE,
+    ) -> bool:
+        self.requests.append(
+            (str(item.path), int(generation or 0), ThumbnailPriority(priority))
+        )
+        return True
 
 
 def make_window(
@@ -118,11 +139,17 @@ def send_extra_button(
     widget,
     event_type: QEvent.Type,
     button: Qt.MouseButton,
+    *,
+    position: QPointF | None = None,
 ) -> None:
-    point = QPointF(10, 10)
+    point = position or QPointF(10, 10)
     buttons = (
         button
-        if event_type == QEvent.Type.MouseButtonPress
+        if event_type
+        in {
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonDblClick,
+        }
         else Qt.MouseButton.NoButton
     )
     event = QMouseEvent(
@@ -260,6 +287,62 @@ def test_history_restore_publishes_cached_listing_before_reconcile(
     assert not window._snapshot_reconcile_pending
     window.close()
     qapp.processEvents()
+
+
+def test_history_snapshot_reconcile_rearms_visible_thumbnail_requests(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    first = tmp_path / "A"
+    second = tmp_path / "B"
+    second.mkdir()
+    for number in range(36):
+        write_image(first / f"{number:03}.jpg")
+    for number in range(8):
+        write_image(second / f"{number:03}.jpg")
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.set("last_browser_path", str(first))
+    provider = RecordingThumbnailProvider()
+    window = BrowserWindow(
+        config_manager=config,
+        thumbnail_provider=provider,
+    )
+    window.resize(500, 360)
+    window.show()
+    try:
+        finish_scan(window, qapp)
+        provider.requests.clear()
+        assert window.navigate_to(second)
+        finish_scan(window, qapp)
+        provider.requests.clear()
+
+        for navigate, expected in (
+            (window.go_back, first),
+            (window.go_forward, second),
+            (window.go_back, first),
+        ):
+            provider.requests.clear()
+            assert navigate()
+            finish_scan(window, qapp)
+            assert window.current_path == expected.absolute()
+            requested_paths = [
+                Path(path)
+                for path, _generation, _priority in provider.requests
+            ]
+            assert requested_paths
+            visible_range = window._visible_row_range()
+            assert visible_range is not None
+            visible = {
+                item.path
+                for row in range(visible_range[0], visible_range[1] + 1)
+                if (item := window.item_model.item_at(row)) is not None
+            }
+            assert visible.intersection(requested_paths)
+            assert len(requested_paths) <= 30
+    finally:
+        window.close()
+        qapp.processEvents()
 
 
 def test_folder_snapshot_cache_limit_applies_immediately_from_config(
@@ -1570,6 +1653,107 @@ def test_extra_buttons_on_child_fire_once_on_press_and_do_not_mix_actions(
     assert window.current_path == third.absolute()
     window.close()
     qapp.processEvents()
+
+
+def test_extra_button_double_click_child_is_consumed_once_without_selection(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    first = tmp_path / "A"
+    second = tmp_path / "B"
+    third = tmp_path / "C"
+    first.mkdir()
+    second.mkdir()
+    third.mkdir()
+    write_image(second / "keep.jpg")
+    write_image(third / "hit.jpg")
+    window = make_window(tmp_path, first, qapp)
+    assert window.navigate_to(second)
+    finish_scan(window, qapp)
+    keep = second / "keep.jpg"
+    keep_index = window.item_model.index(window.item_model.row_for_path(keep), 0)
+    window.list_view.setCurrentIndex(keep_index)
+    qapp.processEvents()
+    assert window.navigate_to(third)
+    finish_scan(window, qapp)
+    hit = third / "hit.jpg"
+    hit_index = window.item_model.index(window.item_model.row_for_path(hit), 0)
+    hit_point = window.list_view.visualRect(hit_index).center()
+    child = QWidget(window.list_view.viewport())
+    child.setGeometry(hit_point.x() - 2, hit_point.y() - 2, 4, 4)
+    child.show()
+    try:
+        # Some Windows/Qt streams expose the first observable XButton packet
+        # as DblClick. It must still navigate once and never enter item click.
+        send_extra_button(
+            child,
+            QEvent.Type.MouseButtonDblClick,
+            Qt.MouseButton.BackButton,
+        )
+        finish_scan(window, qapp)
+        assert window.current_path == second.absolute()
+        restored = window.item_model.item_at(window.list_view.currentIndex())
+        assert restored is not None and restored.path == keep.absolute()
+
+        # Release can be delivered to a different widget after model reset;
+        # it still only clears the latch and cannot navigate a second time.
+        send_extra_button(
+            window.list_view.viewport(),
+            QEvent.Type.MouseButtonRelease,
+            Qt.MouseButton.BackButton,
+        )
+        finish_scan(window, qapp)
+        assert window.current_path == second.absolute()
+    finally:
+        child.deleteLater()
+        window.close()
+        qapp.processEvents()
+
+
+def test_extra_button_missing_release_does_not_drop_next_press(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    first = tmp_path / "A"
+    second = tmp_path / "B"
+    third = tmp_path / "C"
+    first.mkdir()
+    second.mkdir()
+    third.mkdir()
+    window = make_window(tmp_path, first, qapp)
+    assert window.navigate_to(second)
+    finish_scan(window, qapp)
+    assert window.navigate_to(third)
+    finish_scan(window, qapp)
+    viewport = window.list_view.viewport()
+
+    try:
+        # Deliberately omit the release for the first physical input.
+        send_extra_button(
+            viewport,
+            QEvent.Type.MouseButtonPress,
+            Qt.MouseButton.BackButton,
+        )
+        finish_scan(window, qapp)
+        assert window.current_path == second.absolute()
+
+        # A new press supersedes the stale latch and performs exactly one more
+        # history move instead of being silently discarded.
+        send_extra_button(
+            viewport,
+            QEvent.Type.MouseButtonPress,
+            Qt.MouseButton.BackButton,
+        )
+        finish_scan(window, qapp)
+        assert window.current_path == first.absolute()
+        send_extra_button(
+            viewport,
+            QEvent.Type.MouseButtonRelease,
+            Qt.MouseButton.BackButton,
+        )
+    finally:
+        window.close()
+        qapp.processEvents()
 
 
 def test_extra_buttons_without_history_do_nothing(
