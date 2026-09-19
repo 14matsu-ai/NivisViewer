@@ -69,7 +69,7 @@ def _window(
     return window, session, source, archive
 
 
-def test_viewer_releases_final_frame_completed_while_staged(tmp_path, qapp):
+def test_viewer_admits_leading_slider_target_before_release(tmp_path, qapp):
     archive = _write_zip(tmp_path, pages=2)
 
     class BlockedSource(ZipImageSource):
@@ -98,11 +98,12 @@ def test_viewer_releases_final_frame_completed_while_staged(tmp_path, qapp):
         runtime = session.viewer_runtime
         window.slider.setSliderDown(True)
         window._go_to_index_with_history(1, input_kind=NavigationInputKind.SLIDER_SCRUB)
-        assert window._pending_zip_runtime_request is not None
+        assert window._pending_zip_runtime_request is None
         source.release.set()
         _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
-        assert window.presentation_state.displayed_page == 0
+        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 1)
         assert window.presentation_state.requested_page == 1
+        assert window.slider.isSliderDown()
         window.slider.setSliderDown(False)
         assert window.presentation_state.displayed_page == 1
         assert window._pending_zip_runtime_request is None
@@ -456,6 +457,145 @@ def test_input_kind_admission_is_immediate_except_rapid_bursts(
             _key_event(QEvent.Type.KeyRelease, Qt.Key.Key_Right),
         )
         assert released[-1] is staged[-1]
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_slider_admission_paces_cold_targets_and_coalesces_rapid_scrub(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    window, session, _source, archive = _window(tmp_path, pages=8)
+    try:
+        window.set_view_mode("single")
+        opened = session.open_book(archive)
+        runtime = session.viewer_runtime
+        assert runtime is not None
+        requested: list[ZipRasterRequest] = []
+        staged: list[ZipRasterRequest] = []
+        monkeypatch.setattr(runtime, "has_unfinished_tasks", lambda: True)
+        monkeypatch.setattr(
+            runtime,
+            "has_cached_current",
+            lambda _request: False,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "request",
+            lambda request: requested.append(request) or True,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "stage",
+            lambda request, **_kwargs: staged.append(request) or True,
+        )
+        assert window._finish_opened_book(opened, modal_on_empty=False)
+        requested.clear()
+        window._navigation_admission.reset()
+        clock_values = iter(
+            (1_000_000_000, 1_080_000_000, 1_100_000_000, 1_170_000_000)
+        )
+        monkeypatch.setattr(
+            window._navigation_admission,
+            "_clock",
+            lambda: next(clock_values),
+        )
+
+        window.slider.setSliderDown(True)
+        window._go_to_index_with_history(
+            1,
+            input_kind=NavigationInputKind.SLIDER_SCRUB,
+        )
+        window._go_to_index_with_history(
+            2,
+            input_kind=NavigationInputKind.SLIDER_SCRUB,
+        )
+        window._go_to_index_with_history(
+            3,
+            input_kind=NavigationInputKind.SLIDER_SCRUB,
+        )
+        assert [request.current.pages[0].page_index for request in requested] == [1, 2]
+        assert [request.current.pages[0].page_index for request in staged] == [3]
+        assert window._pending_zip_runtime_request is staged[-1]
+
+        # A paced target promotes the latest staged intent and clears the
+        # replaceable rapid-scrub boundary instead of stacking another job.
+        window._go_to_index_with_history(
+            4,
+            input_kind=NavigationInputKind.SLIDER_SCRUB,
+        )
+        assert [request.current.pages[0].page_index for request in requested] == [1, 2, 4]
+        assert window._pending_zip_runtime_request is None
+        assert len(staged) == 1
+        window.slider.setSliderDown(False)
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_continuous_slider_scrub_periodically_admits_and_releases_latest(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    window, session, _source, archive = _window(tmp_path, pages=50)
+    try:
+        window.set_view_mode("single")
+        opened = session.open_book(archive)
+        runtime = session.viewer_runtime
+        assert runtime is not None
+        requested: list[ZipRasterRequest] = []
+        staged: list[ZipRasterRequest] = []
+        released: list[ZipRasterRequest] = []
+        monkeypatch.setattr(runtime, "has_unfinished_tasks", lambda: True)
+        monkeypatch.setattr(
+            runtime,
+            "has_cached_current",
+            lambda _request: False,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "request",
+            lambda request: requested.append(request) or True,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "stage",
+            lambda request, **_kwargs: staged.append(request) or True,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "release_staged",
+            lambda request: released.append(request) or True,
+        )
+        assert window._finish_opened_book(opened, modal_on_empty=False)
+        requested.clear()
+        window._navigation_admission.reset()
+        clock_values = iter(index * 12_000_000 for index in range(40))
+        monkeypatch.setattr(
+            window._navigation_admission,
+            "_clock",
+            lambda: next(clock_values),
+        )
+
+        window.slider.setSliderDown(True)
+        for target in range(1, 41):
+            window._go_to_index_with_history(
+                target,
+                input_kind=NavigationInputKind.SLIDER_SCRUB,
+            )
+
+        assert 7 <= len(requested) <= 10
+        assert requested[0].current.pages[0].page_index == 1
+        assert staged[-1].current.pages[0].page_index == 40
+        assert window._pending_zip_runtime_request is staged[-1]
+
+        window.slider.setSliderDown(False)
+        window._finish_slider_navigation()
+        assert released[-1] is staged[-1]
+        assert window._pending_zip_runtime_request is None
     finally:
         window.close()
         qapp.processEvents()

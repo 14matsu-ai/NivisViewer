@@ -107,9 +107,15 @@ def test_slider_drag_keeps_target_and_programmatic_feedback_is_silent(blocked_vi
     assert emitted == [3]
     assert window.slider.isSliderDown()
     assert window.presentation_state.displayed_page == 0
-    window.slider.setSliderDown(False)
     source.release.set()
-    _wait_until(qapp, lambda: window.presentation_state.displayed_page == 3)
+    _wait_until(
+        qapp,
+        lambda: window.presentation_state.displayed_page == 3,
+    )
+    # A paced/leading cold slider target is admitted during the drag. The
+    # thumb still owns the gesture while the completed image becomes visible.
+    assert window.slider.isSliderDown()
+    window.slider.setSliderDown(False)
     _assert_controls(window, 3)
 
 

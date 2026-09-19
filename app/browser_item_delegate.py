@@ -713,20 +713,26 @@ class BrowserItemDelegate(QStyledItemDelegate):
                     display_mode=self.thumbnail_display_mode,
                 )
             else:
-                icon = index.data(Qt.ItemDataRole.DecorationRole)
-                if item.kind is BrowserItemKind.OTHER or not isinstance(icon, QIcon):
-                    icon_size = max(
-                        16,
-                        min(
-                            96,
-                            min(thumbnail_rect.width(), thumbnail_rect.height()) - 8,
-                        ),
-                    )
-                    icon = self._association_image(
-                        item,
-                        icon_size,
-                        dpr,
-                    )
+                # Keep the pending-preview icon consistent with the lower-left
+                # type badge.  DecorationRole remains the local fallback when
+                # the shell association lookup cannot supply an image.
+                icon_size = max(
+                    16,
+                    min(
+                        96,
+                        min(thumbnail_rect.width(), thumbnail_rect.height()) - 8,
+                    ),
+                )
+                association_image = self._association_image(
+                    item,
+                    icon_size,
+                    dpr,
+                )
+                icon = (
+                    association_image
+                    if not association_image.isNull()
+                    else index.data(Qt.ItemDataRole.DecorationRole)
+                )
                 self._paint_fallback_icon(painter, content_rect, icon, option)
             if bool(index.data(BrowserItemModel.ThumbnailLowResolutionRole)):
                 color = option.palette.highlight().color()
@@ -1134,11 +1140,13 @@ class BrowserItemDelegate(QStyledItemDelegate):
     ) -> QImage:
         image_for = getattr(self.shell_icon_provider, "image_for", None)
         if callable(image_for):
-            return image_for(
+            image = image_for(
                 item,
                 logical_size=logical_size,
                 device_pixel_ratio=dpr,
             )
+            if isinstance(image, QImage) and not image.isNull():
+                return image
         icon_for = getattr(self.shell_icon_provider, "icon_for", None)
         icon = icon_for(item) if callable(icon_for) else QIcon()
         if not isinstance(icon, QIcon) or icon.isNull():
