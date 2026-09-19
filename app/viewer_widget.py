@@ -330,6 +330,7 @@ class ViewerWidget(QWidget):
         self.smooth_scaling = True
         self.horizontal_alignment = "center"
         self.magnifier_zoom = 2.0
+        self.magnifier_allow_outside_image = True
         self.magnifier_size = 220
         self.resampling_mode = "standard"
         self.magnifier_resampling_mode = "high_quality"
@@ -687,17 +688,28 @@ class ViewerWidget(QWidget):
         if not enabled:
             self.cancel_magnifier()
 
-    def set_magnifier_options(self, *, zoom: float | None = None, size: int | None = None) -> None:
+    def set_magnifier_options(
+        self, *, zoom: float | None = None, size: int | None = None,
+        allow_outside_image: bool | None = None,
+    ) -> None:
         rerender = False
+        zoom_changed = False
+        if (
+            allow_outside_image is not None
+            and allow_outside_image != self.magnifier_allow_outside_image
+        ):
+            self.magnifier_allow_outside_image = allow_outside_image
+            rerender = self.magnifier_selecting or self.magnifier_active
         if zoom is not None:
             normalized_zoom = min(4.0, max(1.5, float(zoom)))
             if not math.isclose(normalized_zoom, self.magnifier_zoom):
                 self.magnifier_zoom = normalized_zoom
+                zoom_changed = True
                 rerender = self.magnifier_selecting or self.magnifier_active
         if size is not None:
             self.magnifier_size = min(600, max(80, int(size)))
         if rerender:
-            if self._magnifier_spread_layout:
+            if self._magnifier_spread_layout and zoom_changed:
                 dpr = max(1.0, self.devicePixelRatioF())
                 area = sum(r.width() * r.height() for r, _ in self._magnifier_spread_layout)
                 self._magnifier_spread_zoom = min(
@@ -2927,22 +2939,27 @@ class ViewerWidget(QWidget):
         if not (self.magnifier_selecting or self.magnifier_active):
             return
         if self._magnifier_spread_layout:
-            bounds = QRectF()
-            for rect, _image_id in self._magnifier_spread_layout:
-                bounds = bounds.united(rect)
             zoom = self._magnifier_spread_zoom
             width, height = self.width() / zoom, self.height() / zoom
-
-            def origin(center: float, start: float, extent: float, crop: float) -> float:
-                if crop >= extent:
-                    return start + (extent - crop) / 2
-                return max(start, min(center - crop / 2, start + extent - crop))
-
             self.magnifier_source_rect = QRectF(
-                origin(position.x(), bounds.left(), bounds.width(), width),
-                origin(position.y(), bounds.top(), bounds.height(), height),
+                position.x() - width / 2,
+                position.y() - height / 2,
                 width, height,
             )
+            if not self.magnifier_allow_outside_image:
+                bounds = QRectF()
+                for rect, _image_id in self._magnifier_spread_layout:
+                    bounds = bounds.united(rect)
+
+                def origin(center: float, start: float, extent: float, crop: float) -> float:
+                    if crop >= extent:
+                        return start + (extent - crop) / 2
+                    return max(start, min(center - crop / 2, start + extent - crop))
+
+                self.magnifier_source_rect.moveTo(
+                    origin(position.x(), bounds.left(), bounds.width(), width),
+                    origin(position.y(), bounds.top(), bounds.height(), height),
+                )
             self._magnifier_selection_rect = self.magnifier_source_rect.toAlignedRect()
             self.update()
             return
@@ -2966,22 +2983,17 @@ class ViewerWidget(QWidget):
 
         screen_scale_x = image_rect.width() / max(1, source_size.width())
         screen_scale_y = image_rect.height() / max(1, source_size.height())
-        crop_width = min(
-            source_size.width(),
-            max(
-                1.0,
-                self.width()
-                / max(0.0001, screen_scale_x * self.magnifier_zoom),
-            ),
+        crop_width = max(
+            1.0,
+            self.width() / max(0.0001, screen_scale_x * self.magnifier_zoom),
         )
-        crop_height = min(
-            source_size.height(),
-            max(
-                1.0,
-                self.height()
-                / max(0.0001, screen_scale_y * self.magnifier_zoom),
-            ),
+        crop_height = max(
+            1.0,
+            self.height() / max(0.0001, screen_scale_y * self.magnifier_zoom),
         )
+        if not self.magnifier_allow_outside_image:
+            crop_width = min(source_size.width(), crop_width)
+            crop_height = min(source_size.height(), crop_height)
         target_aspect = self.width() / max(1, self.height())
         if crop_width / max(1.0, crop_height) > target_aspect:
             crop_width = crop_height * target_aspect
@@ -2994,16 +3006,16 @@ class ViewerWidget(QWidget):
         relative_y = (
             position.y() - image_rect.top()
         ) / max(1, image_rect.height())
-        center_x = min(1.0, max(0.0, relative_x)) * source_size.width()
-        center_y = min(1.0, max(0.0, relative_y)) * source_size.height()
-        left = min(
-            max(0.0, center_x - crop_width / 2),
-            max(0.0, source_size.width() - crop_width),
-        )
-        top = min(
-            max(0.0, center_y - crop_height / 2),
-            max(0.0, source_size.height() - crop_height),
-        )
+        # Keep the pointer anchor continuous across page edges. Normalized
+        # coordinates intentionally extend beyond [0, 1]; painting clips the
+        # page while preserving the scale and fills the rest with background.
+        center_x = relative_x * source_size.width()
+        center_y = relative_y * source_size.height()
+        left = center_x - crop_width / 2
+        top = center_y - crop_height / 2
+        if not self.magnifier_allow_outside_image:
+            left = min(max(0.0, left), max(0.0, source_size.width() - crop_width))
+            top = min(max(0.0, top), max(0.0, source_size.height() - crop_height))
         source_rect = QRectF(left, top, crop_width, crop_height)
         self.magnifier_source_rect = source_rect
         self._magnifier_source_normalized = QRectF(
@@ -3017,7 +3029,7 @@ class ViewerWidget(QWidget):
             round(image_rect.top() + source_rect.top() * screen_scale_y),
             max(1, round(source_rect.width() * screen_scale_x)),
             max(1, round(source_rect.height() * screen_scale_y)),
-        ).intersected(image_rect)
+        )
         self.update()
 
     def _rotated_source_size(self, image: ViewerImage) -> QSize:
@@ -3342,20 +3354,7 @@ class ViewerWidget(QWidget):
             normalized = self._magnifier_source_normalized
             if normalized is None:
                 return
-            source = QRectF(
-                normalized.left() * self._magnifier_pixmap.width(),
-                normalized.top() * self._magnifier_pixmap.height(),
-                normalized.width() * self._magnifier_pixmap.width(),
-                normalized.height() * self._magnifier_pixmap.height(),
-            ).intersected(
-                QRectF(
-                    0,
-                    0,
-                    self._magnifier_pixmap.width(),
-                    self._magnifier_pixmap.height(),
-                )
-            )
-            painter.drawPixmap(QRectF(self.rect()), self._magnifier_pixmap, source)
+            self._draw_single_magnifier_page(painter, self._magnifier_pixmap, normalized)
             return
         if self.magnifier_selecting and self._magnifier_selection_rect is not None:
             painter.fillRect(
@@ -3366,6 +3365,27 @@ class ViewerWidget(QWidget):
             pen.setWidth(2)
             painter.setPen(pen)
             painter.drawRect(self._magnifier_selection_rect.adjusted(0, 0, -1, -1))
+
+    def _draw_single_magnifier_page(
+        self, painter: QPainter, pixmap: QPixmap, normalized: QRectF,
+    ) -> None:
+        painter.fillRect(self.rect(), self.background_color)
+        # Clip both source and destination together: clipping only the source
+        # would stretch the remaining edge pixels across the whole viewport.
+        visible = normalized.intersected(QRectF(0, 0, 1, 1))
+        if visible.isEmpty():
+            return
+        target = QRectF(
+            (visible.x() - normalized.x()) / normalized.width() * self.width(),
+            (visible.y() - normalized.y()) / normalized.height() * self.height(),
+            visible.width() / normalized.width() * self.width(),
+            visible.height() / normalized.height() * self.height(),
+        )
+        source = QRectF(
+            visible.x() * pixmap.width(), visible.y() * pixmap.height(),
+            visible.width() * pixmap.width(), visible.height() * pixmap.height(),
+        )
+        painter.drawPixmap(target, pixmap, source)
 
     def _request_pdf_loupe_artifacts(self) -> None:
         dpr = max(1.0, self.devicePixelRatioF())
@@ -3463,11 +3483,9 @@ class ViewerWidget(QWidget):
             image_id = self._magnifier_source_image_id
             if normalized is not None and image_id in self._pdf_loupe_fallbacks:
                 pixmap = self._pdf_loupe_ready.get(image_id, self._pdf_loupe_fallbacks[image_id])
-                source = QRectF(normalized.x() * pixmap.width(), normalized.y() * pixmap.height(),
-                                normalized.width() * pixmap.width(), normalized.height() * pixmap.height())
                 painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform,
                                       image_id in self._pdf_loupe_ready)
-                painter.drawPixmap(QRectF(self.rect()), pixmap, source)
+                self._draw_single_magnifier_page(painter, pixmap, normalized)
         painter.restore()
 
     def _draw_gesture_trail(self, painter: QPainter) -> None:

@@ -1,5 +1,102 @@
 # ZipPlaFork comparison record
 
+## 2026-09-19: tag click/menu/label correction after TODO18 feedback
+
+Freshly inspected local `../ZipPlaViewer` against repository
+https://github.com/himamon/ZipPlaFork, fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`.
+`git cat-file -t` confirmed the commit and `git diff --exit-code` for
+`source/ZipPla/Program.cs`, `CatalogForm.cs`, and `CatalogForm.Designer.cs`
+returned zero with no differences. No checkout or reference changes occurred.
+AGPL-3.0-or-later; Copyright © 2016 Rio's Toolbox, assembly © 2016–2017
+Rio's Toolbox. Existing `licenses/ZipPlaFork/AGPL.txt` and `About.txt` retained.
+
+| Fixed source / observed behavior | Adopted mapping |
+| --- | --- |
+| `Program.cs:1352`, `Program.SetTagsToToolStripMenuItems`: all/none/mixed initial state, both mouse buttons toggle, right button keeps dropdown open | `browser_tag_dialogs.py:TagSelectionMenu`, explicit Qt mouse handling and colored registry swatches |
+| `Program.cs:1918–1954`, `PrefixEscapedToolStripMenuItem.ToggleCheck`: unchecked -> checked; mixed -> unchecked; checked -> mixed only if initially mixed, otherwise unchecked | `next_tag_state`, `TagCheckBox.nextCheckState`, `TagSelectionMenu._toggle` (behavioral translation) |
+| `CatalogForm.cs:12693–12857`, `cmsRightClickPrepareAndShow`: uncheck-all, tag list, editor, register unknown tags from selected filenames; disable conflicting operations while draft changed | Real tag submenu, uncheck-all, manager, unknown-tag registration draft; other file-operation actions disabled while tag edits pending |
+| `CatalogForm.cs:13578`, `renameForTextBoxRatingTagPageSequence`, and `cmsRightClick_Closed:19815`: apply tag draft on root menu close; keyboard close cancels; mixed preserves each file's membership and unknown tags survive | Root menu return applies through existing rename batch; left click closes, right click stays; Escape discards. `edited_tags` remains authoritative for preservation. Root hide also hides child menu. |
+| `CatalogForm.cs:6846–6926`, `drawTags`: reverse **filename** tag order from bottom right, grow left, wrap upward; reserve bottom-left icon area, clip to thumbnail | `BrowserItemDelegate._paint_tags`; registry supplies color/existence only, not draw order. Maintain Nivis upper rating band and reserve the largest existing type badge. |
+| `CatalogForm.cs:6659–6662`, draw margins top=1/bottom=0; label size follows measured text | Replace Qt line-height+4 with actual glyph bounding height+4. Two logical pixels each side guard hinted/fractional-DPI glyphs; no font shrink. One-pixel guard failed edge tests, so was not retained. |
+
+Bug reproduced: the original Qt `setTristate(True)` on every checkbox cycles
+unchecked -> partial -> checked, making a single click on an absent tag a no-op
+on Apply, even for a single selected item. It now follows the observed ZipPla
+cycle. A single item never gains a partial state through clicks. For initially
+mixed selection the cycle is dash -> empty (remove all) -> check (add all) ->
+dash (preserve original per-file membership). Untouched dash remains unchanged.
+JA/EN explanations explicitly identify all three meanings.
+
+Toolbar tag control now belongs to the same corner container as the rating
+filter, immediately to its left, as the user explicitly requested. It is no
+longer attached after the filename search toolbar. The reference toolbar's
+`setTagFilterLocation` (around 23768–23826) and tag-filter code were read; its
+general-search injection is NOT adopted. Existing exact independent tag filters,
+filename-string identities, no IDs/history/aliases, no mass file rename on
+registry edits and unknown-tag discoverability remain intentional differences.
+The existing toolbar selected-item dialog retains explicit Apply/Cancel; the
+new context tag submenu follows the reference's close-to-apply behavior.
+Delete remains separated immediately above Properties; ZIP remains above Cut.
+
+Verification: real Qt mouse clicks + Apply exercise single add/remove,
+old-OFF/new-ON replacement with unknown tag preservation, mixed selection's
+four outcomes, Cancel, context left-close/right-stay/Escape, manager remove and
+re-register, exact filter keyboard selection + Apply and toolbar geometry.
+Synthetic render checks cover filename order vs reversed registry order,
+compact color-box height, actual JA and descending Latin glyphs inside the
+background at DPR 1/1.25/1.5/2. Offscreen Qt exposes no fonts here, so rendering
+tests load the existing Windows Meiryo font into the test process only (not an
+installation). A transient test crash was caused by sending an input-method
+event to a null focus widget; the test now obtains and validates the actual
+table editor. No production input workaround was added.
+
+Final focused results: 53 operation/tag/menu tests and four separate font/pixel
+tests passed; the actual global `py -3.11` also passed all 10 operation-click
+tests. Standard nine-page 2400x3600 high-detail forward/reverse/reversal/
+ping-pong/rapid offscreen evaluation completed (`out/tag-ux-navigation.json`).
+No dependency, user media, real GUI/native input, build, commit or push.
+
+## 2026-09-19: Browser filename tags (TODO18)
+
+Source: https://github.com/himamon/ZipPlaFork, fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, AGPL-3.0-or-later.
+Copyright © 2016 Rio's Toolbox; source assembly copyright © 2016-2017 Rio's Toolbox.
+The existing `licenses/ZipPlaFork/AGPL.txt` and `About.txt` remain the notices.
+The local reference checkout's inspected files were verified with `git diff
+--exit-code` against this fixed revision before inspection.
+
+| Source file / class / method | Adopted behavior | NivisViewer mapping |
+| --- | --- | --- |
+| `source/ZipPla/ZipPlaInfo.cs`, `ZipPlaInfo`, `TagArray`, `CanBeTag`, `GetPathOfCurrentInfo` (lines 23–38, 77–80, 140–147, 262–306) | Comma-separated `t` filename membership, physical rename, permitted tag characters | `zippla_filename_metadata.py`, `browser_tags.py`, `rating_rename_service.py` |
+| `source/ZipPla/Program.cs`, `SetTagsToToolStripMenuItems` (1352–1385); `CatalogForm.cs`, `renameForTextBoxRatingTagPageSequence` (13602–13766) | All/none/mixed selection; preserve mixed membership and unregistered tags | `ItemTagsDialog`, `edited_tags`, `BrowserWindow.set_tags_for_paths`, shared rating rename batch |
+| `source/ZipPla/TagEditForm.cs`, `loadTags`, `saveTags`, validation and color/order controls (90, 121–230, 300–430); `ZipTag.cs`, `ZipTagConfig` (170–183) | Separate registered names/colors/order; registry rename/delete never rewrite existing file tags | `TagManagerDialog`, `ConfigManager.browser_tag_registry` |
+| `source/ZipPla/CatalogForm.cs`, `drawTags` (6846–6910) | Only registered exact names receive colored labels; re-registering the name restores labels | `visible_tags`, `BrowserItemDelegate._paint_tags` |
+
+This is a structural/behavioral adaptation under the above license, not a
+WinForms UI port. Filename tag strings are identities: no IDs, alias history,
+historical-name reservations or automatic library-wide replacement. The manager
+is a draft until OK; only the selected-item editor's Apply requests renames.
+Unregistered names remain visible in that editor so users can remove old tags
+and add new ones in one Apply. Tag-only serialization preserves unrelated
+parameter text, including cover precision. Distinct folder collisions are automatically
+skipped rather than offering replace/merge. Case-only tag edits use the established
+staging/rollback rename path for files and folders; its collision check ignores
+only the exact source directory entry, never a different case-folded target.
+Equal normalized model keys retain their thumbnail caches. File renames retain the existing
+Windows no-overwrite and timestamp behavior. Affected open Viewers use the
+existing close-confirmation contract; they are not silently rebound to stale
+source paths. Physical folders/images/archives are supported, not virtual entries.
+
+Intentional user-approved divergence: ZipPla's tag buttons inject general
+filename search terms (`CatalogForm.cs` 23636–23668; `SearchManager.cs` 54–128,
+154–242). Nivis instead matches exact tag membership independently: all/any
+included names plus exclusion, AND-composed with the existing literal filename
+search and rating predicate. The visible-list pipeline and snapshot identities
+carry these conditions; Esc clears all filters. Label layout is a bounded row
+beside the type icon, preserving Nivis's thumbnail geometry and rating hit area.
+
+
 ## 1. Scope, fixed revision, and license provenance
 
 この比較と構造移植は、次の固定snapshotだけを移植元として監査した。
@@ -5275,6 +5372,52 @@ control, composable predicate boundary, Unicode plain-search policy, debounce,
 session-only state and immutable Browser-to-Viewer snapshot are
 NivisViewer-specific modernizations.
 
+### 24.6 Registered-tag quick buttons in the menu-bar corner
+
+The fixed ZipPlaFork source builds one `ToolStripMenuItem` per registered tag
+in `CatalogForm.setTagFilteringMenuItems` and places the tag items beside the
+rating item in `menuStripForTagFilter`. A normal click applies an AND include;
+Shift applies an AND exclude; Ctrl applies an OR include; Ctrl+Shift applies an
+OR exclude. Middle-click selects the direct include/exclude variants, and the
+overflow button retains every registered tag when the available width is too
+small (`CatalogForm.cs:21967-22055,22057-22105,22256-22315`).
+
+NivisViewer keeps the existing `タグ` menu as the complete editor/filter
+entry point and adds `BrowserTagQuickFilterStrip` immediately to its left.
+Registered tags follow management order from left to right. Left-click toggles
+an AND include while preserving the current
+search, rating and exclusion predicates. Ctrl-click toggles an include and
+selects the existing OR mode; Shift-click toggles an exclusion; Ctrl+Shift
+keeps the OR mode while toggling an exclusion. The quick buttons never rewrite
+filename search text, and the full TagFilterDialog remains authoritative for
+explicit AND/OR and mixed include/exclude editing.
+
+The saved `browser_tag_grouped` option (default off) hides the separate strip
+and puts all registered filter checkboxes at the top of the existing `タグ`
+popup, followed by selected-item tags, detailed filtering, tag management and
+`選択の解除`. That last action is enabled only while include/exclude tag
+filters exist; it clears those filter selections while retaining filename
+search, rating and file selection. Exclusion is shown with a leading `−` in
+the grouped popup. The separate mode keeps the compact strip and overflow
+button, while both modes rebuild immediately after registry edits and filter
+changes.
+
+The strip measures the actual menu-bar corner space before Settings and the
+existing tag/rating controls. It shows as many registered buttons as fit,
+keeps the management order and moves later entries to a compact overflow menu.
+If even that overflow affordance cannot fit, the
+strip collapses while the existing `タグ` menu remains available, so no
+registered tag becomes inaccessible. Registry edits rebuild the button order,
+colors and overflow contents immediately. Offscreen tests cover real button
+clicks, search/rating/exclusion preservation, OR toggles, registry changes,
+overflow reachability and resize geometry.
+
+This is a Qt-specific responsive adaptation rather than a WinForms control
+port. The source remains `himamon/ZipPlaFork`, fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, under AGPL-3.0-or-later; the
+existing license and copyright notices remain in the locations listed in
+section 24.3.
+
 ## 25. Immediate post-open ZIP navigation and speculative-work preemption
 
 2026-08-23に、固定revision
@@ -6610,6 +6753,70 @@ Actual ordinary/auto-hide taskbar suppression, Alt+Tab, dialogs and native
 multi-monitor transitions remain unverified. No real application, native
 input, external GUI, shell configuration change, commit or push was performed.
 
+### 39.8 Windows taskbar-edge recurrence and native maximize state (2026-09-14)
+
+Portable 1.04 still allowed the Windows taskbar to appear when the pointer
+reached the bottom edge. Its temporary `HWND_TOPMOST` change affected only
+z-order; it did not change the window's screen-occupation state or the shell's
+auto-hide edge policy. Microsoft documents auto-hide and foreground-window
+handling separately from z-order. The user's recurrence confirms that
+topmost alone was insufficient; native taskbar activation was not reproduced
+inside this offscreen-only environment.
+
+The fixed ZipPlaFork source was reread directly at revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`:
+[`source/ZipPla/ViewerForm.cs`, `ViewerForm.FullScreen`](https://github.com/himamon/ZipPlaFork/blob/07955f5267e2fb92d6fc6e40fde2507d8fb07b3b/source/ZipPla/ViewerForm.cs#L1872-L1975).
+It hides a visible maximized form, normalizes `WindowState` to `Normal`, then
+sets `FormBorderStyle.None` followed by `WindowState.Maximized`. The source
+comment identifies the normalization as a workaround for a taskbar left
+visible during transition. `TopMostInFullscreen` defaults to false, and this
+path does not call taskbar/AppBar APIs. This evidence distinguishes a stale
+taskbar after a state transition from the separate edge-hover activation
+reported here.
+
+Qt exposes distinct [`WindowFullScreen` and `WindowMaximized` states](https://doc.qt.io/qt-6/qt.html#WindowState-enum), while
+Win32 identifies a maximized window by [`WS_MAXIMIZE`](https://learn.microsoft.com/en-us/windows/win32/winmsg/window-features#minimized-maximized-and-restored-windows).
+Windows documents taskbar auto-hide and full-screen coverage as separate
+behavior from ordinary z-order ([Taskbar](https://learn.microsoft.com/en-us/windows/win32/shell/taskbar)).
+NivisViewer previously
+used `showFullScreen()` even on Windows, then corrected bounds with native
+`rcMonitor` and temporarily promoted the HWND to topmost. The current Windows
+translation keeps the existing hidden/normal/borderless transition and saved
+restore snapshot, but finishes with `showMaximized()` so Qt requests the
+OS-managed maximized state; the typed Win32 adapter then projects the outer
+rectangle to the captured monitor's `rcMonitor` for full-display coverage.
+Non-Windows platforms retain `showFullScreen()`. The application-level
+fullscreen contract is derived from the controller's owned transition so
+chrome, page-list, cursor and state-snapshot behavior remain fullscreen while
+Qt reports the Windows surface as maximized. No taskbar preference is changed
+and no blanket topmost state is applied.
+
+Alternatives were evaluated explicitly: ZipPla's borderless/maximized
+transition addresses shell state normalization; the prior NivisViewer
+`WindowFullScreen` plus topmost approach did not address the reported symptom;
+the adopted hybrid retains Qt's chrome/controller and restoration contract
+while using Windows' maximized state and native monitor bounds; a new
+AppBar/taskbar manager was rejected because ZipPla does not use one and it
+would alter shell-owned behavior. Whether the shell now suppresses this user's
+edge activation remains an inference until real Windows verification.
+
+Focused offscreen/fake coverage in `tests/test_viewer_fullscreen_state.py`
+checks the Windows branch remains Qt-maximized, restores the prior normal
+bounds/state, still reveals the bottom chrome on a synthetic pointer event,
+and retains native `rcMonitor` coverage for mixed-DPI origins. No real window,
+native pointer, taskbar, or monitor was exercised. Portable 1.04 was left
+untouched and was not rebuilt.
+
+Provenance: repository `himamon/ZipPlaFork`, fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, AGPL-3.0-or-later; source file
+`source/ZipPla/ViewerForm.cs`, class `ViewerForm`, property `FullScreen` and
+its saved-state / entry / exit process. The translated structure corresponds
+to `app/fullscreen_chrome.py` (`enter_true_fullscreen`,
+`leave_true_fullscreen`, native Windows branch) and
+`app/viewer_window.py` (`_is_fullscreen_mode`). No C# code was copied and no
+dependency was added. The license text and copyright notice remain in
+`licenses/ZipPlaFork/AGPL.txt` and `licenses/ZipPlaFork/About.txt`.
+
 ## 40. Browser snapshot-owned navigation index (2026-09-05)
 
 ### 40.1 Fixed source and design choice
@@ -7418,9 +7625,9 @@ set_reading_direction changes the next click immediately. There is currently
 no separate per-book reading-direction override in BookSession/MetadataStore
 to apply or migrate. UI locale is not consulted.
 
-`right_next` and `left_next` remain fixed physical-side choices. Missing or
-invalid values retain the existing `right_next` default; no preference is
-silently migrated. Existing single-page/display-unit actions still use
+`right_next` and `left_next` remain fixed physical-side choices. New profiles
+and missing/invalid values use `auto`, while an existing saved fixed value is
+preserved; no private preference is silently rewritten. Existing single-page/display-unit actions still use
 PageNavigationController and the existing navigation policy. Pointer gesture,
 pan, loupe, overlay and context-token handling are unchanged; this option
 does not remap the right mouse button, wheel, keys or XButtons.
@@ -8114,3 +8321,29 @@ preserving every compared metadata value is not content-hash detected. During
 continuous notifications the old listing remains until a 350 ms quiet interval.
 Transient unchanged-metadata failures retry on a later event, not indefinitely.
 The consultation review remains the next step; no native check is requested here.
+
+## 2026-09-19 TODO19: saved-thumbnail startup maintenance
+
+Reference: himamon/ZipPlaFork, fixed revision
+07955f5267e2fb92d6fc6e40fde2507d8fb07b3b, AGPL-3.0-or-later.
+CatalogForm.cs active SetBackgroundMode at 10914–11194 reorders visible work
+and adapts worker count; the 10703 alternative is under #if FALSE. Designer's
+ThreadCount=1 is not its runtime policy. Source comparison only: no ZipPla code
+was copied, translated or transplanted in this change.
+
+Fresh-process synthetic saved-cache startup revealed a different barrier:
+NivisViewer ran whole-cache daily maintenance before its first thumbnail read.
+With 10,000 indexed cached mixed-format entries, the pass took about 1.1 s.
+A bounded 1-versus-2 Browser-worker comparison did not remove its cache lock
+barrier. Keep the current Viewer lane and visible-first scheduler; reuse the
+existing Browser idle cleanup after initial scan/thumbnail work, retrying if
+Viewer interaction temporarily rejects submission. This is the selected Hybrid
+of preserving current resource contracts while removing an observed startup
+barrier, not an adoption of CPU-scaled ZipPla concurrency.
+
+The JPEG letterbox prototype and its proposed identity change are NOT adopted.
+No decoder, cache identity/schema, worker-count or format-priority change ships
+in this phase. Detailed comparison of ZipPla, unchanged Nivis, Hybrid and new
+separate maintenance/read designs, limitations and fresh-process results are in
+BROWSER_WARM_STARTUP_INVESTIGATION.md. Further concurrency/structural work waits
+for review; the overall TODO19 issue is not declared universally resolved.

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -17,6 +18,62 @@ from PySide6.QtWidgets import (
 )
 
 from .app_icon import install_window_icon
+
+
+class _PropertiesNameEdit(QLineEdit):
+    """Select the editable basename once on entry, then allow normal editing."""
+
+    def __init__(self, path: Path, parent) -> None:
+        super().__init__(path.name, parent)
+        self._is_directory = path.is_dir()
+        self._first_click = True
+        self._entry_press = None
+
+    def _select_basename(self) -> None:
+        name = self.text()
+        suffix = "" if self._is_directory else Path(name).suffix
+        basename = name[:-len(suffix)] if suffix else name
+        # Qt selection offsets are UTF-16 code units, including emoji pairs.
+        self.setSelection(0, len(basename.encode("utf-16-le")) // 2)
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        self._first_click = True
+        self._select_basename()
+
+    def focusOutEvent(self, event) -> None:
+        self._entry_press = None
+        super().focusOutEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        self._entry_press = (
+            event.position().toPoint()
+            if self._first_click and event.button() == Qt.MouseButton.LeftButton
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier else None
+        )
+        self._first_click = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if (
+            self._entry_press is not None
+            and (event.position().toPoint() - self._entry_press).manhattanLength()
+            >= QApplication.startDragDistance()
+        ):
+            self._entry_press = None
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        select = self._entry_press is not None and event.button() == Qt.MouseButton.LeftButton
+        self._entry_press = None
+        super().mouseReleaseEvent(event)
+        if select:
+            self._select_basename()
+
+    def keyPressEvent(self, event) -> None:
+        self._first_click = False
+        self._entry_press = None
+        super().keyPressEvent(event)
 
 
 class FilePropertiesDialog(QDialog):
@@ -30,7 +87,7 @@ class FilePropertiesDialog(QDialog):
         self.setModal(True)
         self.resize(520, 240)
 
-        self.name_edit = QLineEdit(self._path.name, self)
+        self.name_edit = _PropertiesNameEdit(self._path, self)
         self.name_edit.setObjectName("properties_name_edit")
         self.type_label = QLabel(self)
         self.location_label = QLabel(self)

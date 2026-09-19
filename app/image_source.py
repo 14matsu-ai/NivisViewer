@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .i18n import tr
+from . import pillow_plugins  # noqa: F401 - registers the JXL Pillow decoder
 
 
 import io
@@ -467,6 +468,12 @@ class ImageSourceError(RuntimeError):
         super().__init__(message)
 
 
+def _require_image_decoder(image_id: str) -> None:
+    message = pillow_plugins.decoder_unavailable_message(image_id)
+    if message is not None:
+        raise ImageSourceError(message, code="decoder_unavailable")
+
+
 class ImageSource(ABC):
     load_sizes_lazily = False
     compatible_jpeg_unknown_area_multiplier = 1
@@ -678,6 +685,7 @@ class FolderImageSource(ImageSource):
             # Detach the decoder from the filesystem before Pillow performs
             # potentially expensive pixel decoding.  On Windows this avoids
             # holding the source file open while a queued Viewer task runs.
+            _require_image_decoder(image_id)
             data = _read_image_file_bytes(image_id)
             self._file_size_cache[self._path_identity(image_id)] = len(data)
             with Image.open(io.BytesIO(data)) as image:
@@ -686,6 +694,8 @@ class FolderImageSource(ImageSource):
                 result.load()
                 self._size_cache[image_id] = result.size
                 return result
+        except ImageSourceError:
+            raise
         except Exception as exc:
             raise ImageSourceError(tr('画像を読み込めません: {p0}', p0=image_id)) from exc
 
@@ -830,6 +840,7 @@ class ZipImageSource(ImageSource):
         return list(self._listed_images)
 
     def open_image(self, image_id: str) -> Image.Image:
+        _require_image_decoder(image_id)
         cancelled = self._begin_request(image_id)
         try:
             stream = self._read_entry_stream(image_id, cancelled)
@@ -1481,6 +1492,7 @@ class SevenZipImageSource(ImageSource):
                         self._active_requests.pop(image_id, None)
 
     def open_image(self, image_id: str) -> Image.Image:
+        _require_image_decoder(image_id)
         data = self._read_payload(image_id)
         try:
             with Image.open(io.BytesIO(data)) as image:
@@ -1520,6 +1532,7 @@ class SevenZipImageSource(ImageSource):
         return jpeg_native_reduction_size(logical_size, maximum_size)
 
     def probe_image_size(self, image_id: str) -> tuple[int, int] | None:
+        _require_image_decoder(image_id)
         data = self._read_payload(image_id)
         try:
             with Image.open(io.BytesIO(data)) as image:

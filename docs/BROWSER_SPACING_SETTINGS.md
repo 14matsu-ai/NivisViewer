@@ -44,6 +44,43 @@ updates without restarting. Cancel retains the existing Settings semantics.
 All spacing defaults remain zero. Item x/y and image gap range: 0–32;
 filename padding: 0–16 per side; cell padding: 0–12 per side.
 
+## Long filename elision and title font
+
+`ファイル名の拡張子を表示` defaults to on. It affects only the drawn Browser
+title; the model name and path, filtering, sorting, opening, copying and file
+type icons are unchanged. Folders, extensionless names and single-dot names such
+as `.env` keep their full text. A recognized compound suffix such as `.tar.gz`
+is treated as one display extension.
+
+`長いファイル名:` selects how a title is shortened. New profiles and invalid
+saved values use `right`: preserve the beginning and place the ellipsis before
+the extension when the full extension and ellipsis fit (for example,
+`long-title….zip`). If a suffix is too wide for the available title width, the
+normal Qt right-elision is used as a safe fallback. `middle` remains available
+for the former `AAAA…CC` presentation (Qt `ElideMiddle`); showing the extension
+retains its existing trailing-text behavior, while hiding it removes the suffix
+before elision. In two-line mode, word wrapping remains unchanged; extension
+visibility applies to both lines, and a shortened final line preserves a normal
+suffix when there is room. Hidden names disable filename presentation controls
+without discarding their saved choices.
+
+`ファイル名フォントサイズ:` defaults to automatic (`0` in the profile), which
+keeps the existing density-specific 7–11 pt sizes. Explicit sizes are 6–24 pt.
+The same resolved font metrics drive painting and title/cell/grid height: the
+thumbnail frame and width do not change. A larger font can naturally shorten a
+line sooner because text width is measured with that font. Japanese and other
+Unicode filename text remains intact; only an optional terminal suffix is
+separated for presentation. The underlying display name and path are not
+rewritten.
+
+These filename presentation settings use the existing ConfigManager/Settings
+Apply path. Font-size changes recompute list geometry and restore selection and
+viewport while preserving thumbnail images, generation and render
+specifications; the existing visible
+request scheduler can reuse cached images or request items that became visible.
+Elision-only changes repaint text without changing item geometry or scheduling
+thumbnail work. No directory scan is started by either setting.
+
 ## Geometry and measured behavior
 
 `cell width = frame width + 4 + 2 × cell padding`

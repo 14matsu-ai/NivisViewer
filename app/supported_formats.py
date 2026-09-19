@@ -6,6 +6,8 @@ IMAGE_EXTENSIONS = frozenset(
         ".jpeg",
         ".png",
         ".webp",
+        ".avif",
+        ".jxl",
         ".bmp",
         ".gif",
         ".tif",

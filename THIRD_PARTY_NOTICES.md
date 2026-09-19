@@ -17,6 +17,18 @@ do not fulfill the source, module-specific, or third-party attribution duties.
 In particular, the inspected portable folder also contains GPLv3-only Qt Virtual
 Keyboard and Qt PDF's separate native dependency tree; it is not all LGPL Qt.
 
+## JPEG XL decoder
+
+The JPEG XL decoder dependency added for TODO 6 is `pillow-jxl-plugin 1.3.8`
+(https://github.com/Isotr0py/pillow-jpegxl-plugin/tree/v1.3.8), by Isotr0py.
+Its installed Windows CPython 3.11 wheel declares `GPL-3.0-or-later`.
+The original wheel license is retained at `licenses/pillow-jxl-plugin/LICENSE`.
+The existing `packaging 26.3` package is now also a runtime dependency of the
+codec; its Apache-2.0 OR BSD-2-Clause license texts are in `licenses/packaging/`.
+Exact wheel hash, bundled-DLL limitations and integration are recorded in
+`docs/AVIF_JXL_SUPPORT.md`. No dependency is relicensed by this notice.
+
+
 ## ZipPlaFork-derived Viewer scheduling and raster-loading structure
 
 This notice supersedes any earlier description that treated ZipPlaFork only as

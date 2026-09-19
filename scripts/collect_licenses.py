@@ -15,6 +15,8 @@ RUNTIME_DISTRIBUTIONS = (
     "PySide6_Essentials",
     "shiboken6",
     "Pillow",
+    "pillow-jxl-plugin",
+    "packaging",
     "natsort",
     "pypdfium2",
 )

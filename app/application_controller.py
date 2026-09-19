@@ -151,6 +151,8 @@ class ApplicationController(QObject):
         self._adjacent_request_sequence = 0
         self._adjacent_generation = 0
         self._adjacent_request_by_window: dict[int, int] = {}
+        self._side_folder_contexts: dict[int, tuple] = {}
+        self._side_folder_pending: dict[int, tuple] = {}
         self._adjacent_context: dict[
             int,
             tuple[weakref.ReferenceType[object], int, int, str, str],
@@ -316,7 +318,18 @@ class ApplicationController(QObject):
         self._quit_requested = False
         window.activated.connect(self._on_viewer_activated)
         window.closing.connect(self._on_viewer_closing)
+        window.slideshow_stopped.connect(
+            lambda target: self._cancel_adjacent_search(target, clear_status=True),
+        )
         window.book_changed.connect(self._on_viewer_book_changed)
+        window.displayed_item_changed.connect(self._on_viewer_displayed_item_changed)
+        window.side_folder_requested.connect(self.open_side_folder)
+        window.book_session.async_opened.connect(
+            lambda result, target=window: self._finish_side_folder(target, result, success=True),
+        )
+        window.book_session.async_open_failed.connect(
+            lambda result, target=window: self._finish_side_folder(target, result, success=False),
+        )
         window.interactive_open_started.connect(
             self._on_viewer_interactive_open_started
         )
@@ -469,6 +482,87 @@ class ApplicationController(QObject):
             window.complete_adjacent_book_search(request.direction, "unavailable")
             return "unavailable"
         return "searching"
+
+    def open_side_folder(self, window: object, direction: int) -> str:
+        if (
+            self._shutdown or not isinstance(window, ViewerWindow)
+            or window not in self._viewer_windows or window._shutdown_prepared
+            or not bool(self.settings.get("mouse_side_buttons_folder_navigation", False))
+            or not isinstance(window.book_session.source, FolderImageSource)
+        ):
+            return "unavailable"
+        source = window.book_session.source
+        epoch = window.book_session.generation
+        context = self._side_folder_contexts.get(id(window))
+        retained_folder_anchor = context is not None and context[2:] == (epoch, id(source))
+        if retained_folder_anchor:
+            anchor, snapshot = context[:2]
+        else:
+            anchor, snapshot = window.browser_navigation_path, window.browser_navigation_snapshot
+        browser = self.get_browser_window()
+        # Refresh only the relevant parent. Reading pages inside an opened
+        # folder must never rebase navigation onto that folder's children.
+        parent = snapshot.parent_folder if snapshot is not None else str(Path(anchor).parent)
+        if (browser is not None and browser.current_path is not None
+                and adjacent_path_key(browser.current_path) == adjacent_path_key(parent)):
+            refreshed = browser.adjacent_book_snapshot(parent)
+            if refreshed is not None and refreshed.contains_viewer_path(anchor):
+                snapshot = refreshed
+        if snapshot is None:
+            window._set_status_override(tr('移動元のBrowser一覧がありません'), 2500)
+            return "unavailable"
+        if not retained_folder_anchor:
+            # This property validates the committed display's epoch/source.
+            # Membership keeps a folder opened from its parent anchored to
+            # that folder, rather than rebasing onto the child being painted.
+            displayed_path = window.displayed_browser_path
+            if displayed_path is not None and snapshot.contains_viewer_path(displayed_path):
+                anchor = displayed_path
+        status, candidate = snapshot.adjacent_folder_path(
+            anchor, direction, loop=bool(self.settings.get("loop_book_navigation", False)),
+        )
+        if candidate is None:
+            window._set_status_override(tr('移動できるフォルダーがありません'), 2500)
+            return status.value
+        self._side_folder_pending.pop(id(window), None)
+        self._cancel_adjacent_search(window, clear_status=True)
+        self._open_path_in_viewer(window, candidate, bring_to_front=False, browser_snapshot=snapshot)
+        # BookSession publishes only the matching generation. Preserve an
+        # additional request fence for the no-images Browser fallback.
+        self._side_folder_pending[id(window)] = (
+            window.book_session._open_generation, candidate, snapshot,
+        )
+        return "opening"
+
+    def _finish_side_folder(self, window: ViewerWindow, result, *, success: bool) -> None:
+        pending = self._side_folder_pending.get(id(window))
+        if pending is None:
+            return
+        # Successful opens carry the committed book epoch, whereas failures
+        # carry the request generation. Failed/cancelled opens separate them.
+        if success:
+            if (result.generation != window.book_session.generation
+                    or adjacent_path_key(result.requested_path) != adjacent_path_key(pending[1])):
+                return
+        elif pending[0] != result.generation:
+            return
+        self._side_folder_pending.pop(id(window), None)
+        if (
+            self._shutdown or window not in self._viewer_windows or window._shutdown_prepared
+            or pending[0] != window.book_session._open_generation
+            or not bool(self.settings.get("mouse_side_buttons_folder_navigation", False))
+            or (not success and (result.cancelled or result.code != "no_images"))
+        ):
+            return
+        _, candidate, snapshot = pending
+        self._side_folder_contexts[id(window)] = (
+            candidate, snapshot, window.book_session.generation, id(window.book_session.source),
+        )
+        if not success and window is self.get_active_viewer():
+            browser = self.get_browser_window() or self.create_browser_window()
+            browser.navigate_to(candidate)
+            browser.show()
+            window._set_status_override(tr('画像がないためBrowserでフォルダーを表示しました'), 3000)
 
     def handle_browser_folder_navigation(
         self,
@@ -683,6 +777,7 @@ class ApplicationController(QObject):
         bring_to_front: bool = True,
         folder_snapshot: FolderListingSnapshot | None = None,
         browser_snapshot: AdjacentBookBrowserSnapshot | None = None,
+        slideshow_transition: bool = False,
     ) -> bool:
         self._cancel_adjacent_search(window, clear_status=True)
         self._active_viewer = window
@@ -697,11 +792,10 @@ class ApplicationController(QObject):
             f"path={path} browser_pending={pending}",
         )
         window.set_next_open_trace(trace_id)
-        opened = window.open_path(
-            path,
-            folder_snapshot=folder_snapshot,
-            browser_snapshot=browser_snapshot,
-        )
+        open_kwargs = dict(folder_snapshot=folder_snapshot, browser_snapshot=browser_snapshot)
+        if slideshow_transition:
+            open_kwargs["slideshow_transition"] = True
+        opened = window.open_path(path, **open_kwargs)
         if (
             opened
             and bring_to_front
@@ -849,6 +943,8 @@ class ApplicationController(QObject):
     def _on_viewer_activated(self, window: object) -> None:
         if isinstance(window, ViewerWindow) and window in self._viewer_windows:
             self._active_viewer = window
+            if self._sync_displayed_item_in_current_browser(window):
+                return
             if window.book_session.current_path is not None:
                 self._synchronize_browser_to_viewer_item(
                     window,
@@ -863,6 +959,32 @@ class ApplicationController(QObject):
             window.browser_navigation_path or path,
         )
 
+    def _sync_displayed_item_in_current_browser(self, window: ViewerWindow) -> bool:
+        browser = self.get_browser_window()
+        path = window.displayed_browser_path
+        if (
+            browser is None or browser._shutdown_prepared
+            or browser.current_path is None or path is None
+            or adjacent_path_key(browser.current_path) != adjacent_path_key(Path(path).parent)
+        ):
+            return False
+        browser.synchronize_viewer_item(
+            path, expected_parent=browser.current_path, preserve_selection=True,
+        )
+        # A filtered-out item must not trigger a fallback navigation/search reset.
+        return True
+
+    def _on_viewer_displayed_item_changed(self, window: object, path: str) -> None:
+        if (
+            not isinstance(window, ViewerWindow)
+            or window not in self._viewer_windows
+            or window is not self.get_active_viewer()
+            or window._shutdown_prepared
+            or path != window.displayed_browser_path
+        ):
+            return
+        self._sync_displayed_item_in_current_browser(window)
+
     def _on_viewer_interactive_open_started(self, _window: object) -> None:
         self.image_work_coordinator.begin_viewer_interactive()
 
@@ -874,6 +996,8 @@ class ApplicationController(QObject):
 
     def _on_viewer_closing(self, window: object) -> None:
         if isinstance(window, ViewerWindow):
+            self._side_folder_contexts.pop(id(window), None)
+            self._side_folder_pending.pop(id(window), None)
             context = self._viewer_search_return_context
             if context is not None and context.viewer_ref() is window:
                 self._invalidate_viewer_search_return_context()
@@ -1408,10 +1532,9 @@ class ApplicationController(QObject):
             if operation == "browser_folder":
                 window.navigate_to(result.candidate_path)
                 return
+            transition = {"slideshow_transition": True} if window._slideshow_waiting_for_next else {}
             opened = self._open_path_in_viewer(
-                window,
-                result.candidate_path,
-                bring_to_front=False,
+                window, result.candidate_path, bring_to_front=False, **transition,
             )
             window.complete_adjacent_book_search(
                 direction,

@@ -137,6 +137,27 @@ class AdjacentBookBrowserSnapshot:
                 return AdjacentBookSearchStatus.BOUNDARY, None
         return AdjacentBookSearchStatus.FOUND, paths[next_index]
 
+    def adjacent_folder_path(
+        self, current_path: str | Path, direction: int, *, loop: bool = False,
+    ) -> tuple[AdjacentBookSearchStatus, str | None]:
+        """Skip nonfolders without changing the captured mixed-list order."""
+        current = path_key(current_path)
+        index = next((i for i, entry in enumerate(self.entries)
+                      if path_key(entry.absolute_path) == current), None)
+        if index is None:
+            return AdjacentBookSearchStatus.UNAVAILABLE, None
+        step = -1 if direction < 0 else 1
+        for offset in range(1, len(self.entries)):
+            candidate_index = index + offset * step
+            if not 0 <= candidate_index < len(self.entries):
+                if not loop:
+                    break
+                candidate_index %= len(self.entries)
+            entry = self.entries[candidate_index]
+            if entry.item_kind == "folder":
+                return AdjacentBookSearchStatus.FOUND, lexical_absolute(entry.absolute_path)
+        return AdjacentBookSearchStatus.BOUNDARY, None
+
 
 @dataclass(frozen=True)
 class AdjacentBookSearchRequest:

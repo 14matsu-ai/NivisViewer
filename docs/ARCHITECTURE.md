@@ -223,6 +223,8 @@ FileOperationCoordinator
 
 同名項目は自動上書きしません。現在は`FileOperationPlanner`が衝突をまとめ、1つの`ConflictResolutionDialog`でskip、両方残す、replace、folder merge、同種への一括適用、全体cancelを選択します。拡張子を維持した「`book - コピー.zip`」「`book - コピー (2).zip`」形式の別名生成も同じ計画・queue経路を通ります。
 
+Browser右クリックの「zipに圧縮」は誤操作しやすい削除から離し、切り取りの上に区切り線付きで配置します。選択したファイル・フォルダを一つのZIPにまとめ、現在のフォルダへ保存します。名前入力の候補は単独なら選択名（拡張子を含む）+.zip、複数なら現在のフォルダ名+.zipです。同名時はworkerが公開時に「元の名前 (1).zip」「元の名前 (2).zip」…の空き名を選び、公開直前の競合も再試行します。元項目・既存ZIPは上書きも削除もしません。既存Coordinator／Queue／Service経路で標準ライブラリzipfileを使い、1 MiB単位の読み書き・進捗通知・キャンセル確認を行います。処理中は対象名、処理済みbyte、キャンセルを持つ非モーダル進捗ダイアログを表示します。日本語名、階層、空フォルダを保持し、リンク／ジャンクションと内部一時物は失敗として通知します。完成前は既存の内部一時名に保存し、失敗・キャンセル時は自身の一時物だけ回収します。回収失敗はartifact情報付きで報告し、成功後は一覧を再走査して実際の出力名を選択します。
+
 通常のDeleteとコンテキストメニューの「ごみ箱へ移動」はWindows Shellの`SHFileOperationW`へ`FOF_ALLOWUNDO`、`FOF_NOCONFIRMATION`、`FOF_NOERRORUI`を指定します。NivisViewerが対象件数または単一名を一度確認するため、OS確認ダイアログを重ねません。Shell API失敗、キャンセル、API利用不能、操作後も元パスが残る場合は失敗として返し、`os.remove()`や`shutil.rmtree()`による永久削除へ切り替えません。Shift+Deleteと完全削除APIは未実装です。
 
 renameとmoveの成功後だけMetadataStoreのパスをSQLiteトランザクションで追従させます。フォルダ操作では配下のlibrary_itemsをprefix置換し、reading_history、browser_bookmarks、rating、tags、commentは同じlibrary_itemとの関連を維持します。新パスに既存項目がある場合は、最新の読書履歴、open_countの合算、タグの和集合、既存側優先のrating/commentという安全な統合を行い、UNIQUE制約を破壊しません。トランザクション失敗時はロールバックします。コピーではメタデータを複製せず、ごみ箱移動では履歴やブックマークを即時削除しません。
@@ -367,6 +369,8 @@ BrowserWindowから本を開いたときは、ApplicationControllerが`open_view
 
 ### Viewerコマンドとマウス入力
 
+スライドショーはViewer内の編集欄・ダイアログを除くフォーカスで、1〜9とSを同時に保持するとその秒数で開始します。順序はどちらでもよく、数字を離してからSを押す逐次入力は対象外です。S単独はキーreleaseで従来の開始／停止を行い、Shift+Sは間隔ダイアログでEnterを押すと開始します。`SlideshowKeys`がQtイベントを一か所で扱い、auto-repeatを抑制してfocus lossで保持状態を破棄します。SのQAction shortcutは併設しません。メニューにはカスタムと1/3/5/10/20/30/60秒、独立した本内の繰り返し(`slideshow_repeat`、既定false)、既存の終端で隣の本へ移動を置きます。両方ONなら次の本を優先し、検索・open中はタイマーを止め、成功後に再開します。次がない／開けない場合は本内繰り返しまたは停止へ移り、同じ本で失敗を毎周回再試行しません。書庫列全体の`loop_book_navigation`とは別の設定です。
+
 `app/viewer_commands.py`がページ移動、書庫移動、全画面、Viewer終了、表示切替、フィット、ズームの安定したコマンド識別子を定義します。`ViewerWindow.dispatch_command()`だけが識別子と実処理を対応付け、キー、メニュー、マウス追加ボタン、マウスジェスチャーは可能な範囲でこの経路を共有します。未知の識別子は実行しません。
 
 ViewerWidgetは`BackButton / XButton1`と`ForwardButton / XButton2`を押下時だけ通知し、解放時には再通知しません。既定では前／次の本へ移動します。ApplicationControllerは現在の本と同じ親フォルダから、対応画像を含む直下フォルダ、ZIP/CBZ、対応画像のまとまりを重複排除して自然順で列挙します。形式判定は`BOOK_FILE_EXTENSIONS`へ集約し、移動時は`loop_book_navigation`を尊重します。移動先Viewerを前面へ出し直しません。
@@ -376,6 +380,8 @@ ViewerWidgetは`BackButton / XButton1`と`ForwardButton / XButton2`を押下時�
 軌跡はViewerWidgetの最終オーバーレイとして半透明の線を描くだけで、表示完了またはキャンセル時に消去します。画像、ImageCache、PageModelには書き込みません。ジェスチャー有効化、軌跡、最小距離、XButton、D/Uの割り当てはSettingsDialogから変更でき、ConfigManagerの変更通知により既存ViewerWindowへ即時反映されます。
 
 書庫移動後の`book_changed`は既存の同期経路を通ります。操作対象が最後にアクティブだったViewerWindowの場合だけBrowserWindowの選択が追従するため、別の非アクティブViewerWindowからの変更でBrowser選択を奪いません。`D → close_viewer`も対象ViewerWindowの通常のclose経路だけを通り、アプリ終了の判定はApplicationControllerに残します。
+
+設定`mouse_side_buttons_folder_navigation`（既定OFF）を有効にすると、物理画像／フォルダーを表示中の前／次の本に割り当てたサイドボタンは、Browser一覧の画像位置または開いたフォルダーを基準に、同じ一覧のフォルダーだけを移動します。降順・ランダムを含む捕捉済みの並びを保持し、該当する親をBrowserが表示中なら一覧を更新します。画像なしの移動先はアクティブViewerの場合だけBrowserで開き、元の画像を維持したまま移動基準を更新します。移動先の読み込みは非同期で、要求番号と本の世代を区別して古い結果を排除します。Browser一覧を保持していない場合は移動不可です。書庫／PDF、キーボード、メニュー、他のサイドボタン割り当てには適用しません。
 
 ### 見開き密着表示
 
@@ -391,6 +397,14 @@ ViewerWidgetの描画矩形は`calculate_spread_layout()`で計算します。2�
 
 ### 設定の所有と保存
 
+アクティブViewerのページ表示後、既存のpaint token／book epoch／source identity検証を通った確定画像から`displayed_item_changed`を通知します。フォルダ内画像はその実ファイル、書庫／PDFはcontainerを、現在のBrowser一覧の場所が一致するときだけ選択します。ページ送りだけではBrowserの移動・検索解除・前面化を行わず、同じ表示対象の再描画では通知を重複させません。選択済み対象への同期では複数選択を保持し、filterで隠れた対象のために現在選択を消しません。本を開く際の既存snapshot／navigation契約は維持します。
+
+Viewer設定の「ルーペを画像の外側にも移動できる」(`magnifier_allow_outside_image`、既定true)により、画像上で開始した拡大鏡をViewer内の余白へ連続して移動できます。OFFは従来の画像／見開き全体の範囲制限を維持します。ページ外や見開きの隙間にはViewer背景色を描き、単ページの部分的な切り出しでは画像と描画先を同時に切り詰めて伸縮を防ぎます。通常画像とPDFで同じ単ページ描画処理を使い、移動では拡大画像を再利用します。設定は適用時に表示中の拡大鏡へ反映し、キャンセルでは変更しません。アプリ外への移動やグローバル入力は扱いません。
+
+Browserの代替サムネイル背景の`auto`はフォルダ`#ffffe0`、ファイル`#c1c1c1`を使用します。新規設定・未設定キー・既定に戻す操作は同じ色になり、明示的なカスタム色（黒を含む）は保持します。変更の適用は既存の再描画経路を使い、画像の再生成や設定ファイルの移行は行いません。
+
+設定の「一般」タブには「ヘルプ」欄を置き、Browserだけの利用時にもショートカット一覧と「NivisViewerについて／診断情報」を開けます。ショートカット一覧は`shortcuts_help`をViewerと共有し、診断情報は既存の`DiagnosticsDialog`へ同じprofileと共有PDF serviceを渡します。ヘルプ操作では編集中の設定を適用せず、従来の適用／OK／キャンセルと起動時の表示言語を維持します。
+
 共有設定はApplicationControllerが所有するConfigManagerへ変更時に反映します。ConfigManagerは変更キーを`settings_changed`シグナルで配信し、開いているBrowserWindowとViewerWindowが必要な項目だけを即時反映します。ViewerWindowを閉じる際にローカルな設定スナップショットを一括保存しないため、古い状態のウィンドウを後から閉じても共有設定は巻き戻りません。
 
 共有設定には表示モード、綴じ方向、フィットモード、余白、表紙・横長画像の扱い、背景色、`viewer_memory_mode`、prefetch有効化と方向優先、`open_viewer_behavior`、書庫移動ループ、前面表示設定、マウスジェスチャーと追加ボタンの割り当て、`archive_backend_preference`、`winrar_executable`、`seven_zip_executable`などが含まれます。Viewer memory modeの変更は開いているRaster bookにもbyte-exactに反映される。旧free-form MiB値しかないconfigは最も近い固定bucketへ一度だけ移行し、それ以外の未知値は`auto`へ正規化する。
@@ -400,6 +414,8 @@ ViewerWidgetの描画矩形は`calculate_spread_layout()`で計算します。2�
 BrowserWindowは`last_browser_path`、`browser_sidebar_visible`、`browser_sidebar_width`、`browser_window_geometry`、並び替えキー・順序、フォルダ優先、表示密度を保存します。サムネイルサイズは共有の`thumbnail_size`を使用し、96～384ピクセルへ正規化します。Extra Compact／Compact／Medium／Standard／Comfortable／Largeプリセットは、サムネイルサイズ、フォント、セル間隔、タイトル行数を一括で選択します。個別設定も保持でき、プリセットと一致しない組み合わせはカスタム状態として扱います。ページ間隔は0～100、ディスクキャッシュ容量は128～4096MBへ正規化します。設定とキャッシュをユーザーの画像フォルダへ書き込みません。
 
 ### Browser固定セルとサムネイル要求
+
+2026-09-19: 初回サムネイル／ページ数のキャッシュ参照は、全体の期限切れ整理を待たずに項目単位で検証する。既存の起動後idle timerが走査・サムネイル要求の終了を待ち、低優先度で日次整理を実行する。Viewer操作によって投入を一時拒否された場合は再試行する。キャッシュ識別・保存形式・Browser worker数・形式間の優先順は変えない。根拠と別プロセス起動測定は `BROWSER_WARM_STARTUP_INVESTIGATION.md` を参照。
 
 Browser一覧は`QListView`のIconModeと固定`gridSize`、`BrowserItemDelegate`を使用します。デリゲートの`sizeHint()`は項目内容に依存せず、サムネイル領域とタイトル領域の大きさを表示密度ごとに固定します。`thumbnail_size`は画像枠の長辺のlogical pixelであり、選択した`thumbnail_frame_ratio`から枠の幅と高さを決定します。後着したQImageは項目固有のroleだけを更新するためセル配置を変更しません。
 
@@ -994,7 +1010,11 @@ frozen版の異常終了snapshot永続化は未実装の接続点であり、現
 
 ## 次の構成
 
-次段階では既存ImageSourceとPDFのtarget-aware renderingを踏まえてPageSource抽象化を進めます。基本操作と対応形式の安定後にMetadataStoreのレート／タグAPIへ編集UI、検索、絞り込み、サムネイル上の表示を接続します。ZipPlaの`{zpi$...}`は明示的な読み取り互換から始め、元ファイルへ自動的に書き戻さない境界を維持します。
+次段階では既存ImageSourceとPDFのtarget-aware renderingを踏まえてPageSource抽象化を進めます。Browserの評価とタグはZipPla互換ファイル名`{zpi$...}`を正本とし、SQLiteの旧レート／タグAPIへ二重保存しません。
+
+Browserの「タグ」メニューには登録管理、選択項目の編集、タグ絞り込みを置きます。登録名・色・順番は`browser_tag_registry`設定で保持し、登録名の変更・削除では実ファイルを変更しません。未登録タグは色付きラベルを隠し、同名の再登録で表示を戻します。選択項目の編集では未登録名も表示し、全件あり／なし／混在を扱います。明示的な「適用」でのみファイル名を変更し、混在や無関係のタグ、評価、その他のメタデータを保持します。旧タグOFFと新タグONを同時に適用でき、登録名の履歴やライブラリ全体の置換は持ちません。
+
+タグ名そのものを厳密一致で絞り込み、含む条件はAND/OR、除外は指定タグのいずれかを持つ項目を除外します。通常の表示名検索・評価とは独立した条件として同じin-memory filter pipelineで合成します。検索更新やViewer往復ではタグ条件を保持し、Escで全条件を解除します。名前変更は既存の安全な評価変更バッチを共有し、衝突は上書きせず失敗として扱います。開いているViewerは既存の確認・終了契約を維持し、古いパスで読込みを続けさせません。選択と表示位置は変更後の可視パスへ対応付けます。
 
 `ApplicationController`は引き続きアプリ全体の寿命、共有設定、単一MetadataStore、ウィンドウ群、ウィンドウ間イベントを管理します。`BrowserWindow`は本を探して選ぶ責務、`ViewerWindow`はBookSessionとViewerWidgetを接続して読む責務を持ちます。PageModelはGUIに依存しない状態を保ちます。
 

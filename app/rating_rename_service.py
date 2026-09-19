@@ -34,10 +34,16 @@ class RatingRenameService:
         *,
         is_directory: bool | None = None,
     ) -> RatingRenameResult:
-        source = Path(path)
-        normalized_rating = (
-            int(rating) if rating is not None and 1 <= int(rating) <= 5 else None
+        return self.set_metadata(
+            ZipPlaFilenameMetadata.parse(path).with_rating(rating), is_directory=is_directory,
         )
+
+    def set_metadata(
+        self, metadata: ZipPlaFilenameMetadata, *, is_directory: bool | None = None,
+    ) -> RatingRenameResult:
+        path = metadata.original_path
+        source = Path(path)
+        normalized_rating = metadata.rating
         try:
             source_stat = source.stat()
         except OSError as exc:
@@ -49,13 +55,9 @@ class RatingRenameService:
                 error_message=str(exc),
             )
         directory = source.is_dir() if is_directory is None else bool(is_directory)
-        metadata = ZipPlaFilenameMetadata.parse(source).with_rating(
-            normalized_rating
-        )
         destination = metadata.serialized_path(is_directory=directory)
-        if os.path.normcase(os.fspath(source)) == os.path.normcase(
-            os.fspath(destination)
-        ):
+        same_key = os.path.normcase(os.fspath(source)) == os.path.normcase(os.fspath(destination))
+        if os.fspath(source) == os.fspath(destination):
             return RatingRenameResult(
                 source,
                 destination,
@@ -65,7 +67,7 @@ class RatingRenameService:
                 original_mtime_ns=source_stat.st_mtime_ns,
                 final_mtime_ns=source_stat.st_mtime_ns,
             )
-        if destination.exists():
+        if destination.exists() and not same_key:
             return RatingRenameResult(
                 source,
                 destination,
@@ -75,7 +77,16 @@ class RatingRenameService:
                 original_mtime_ns=source_stat.st_mtime_ns,
             )
         try:
-            os.rename(source, destination)
+            if same_key:
+                # Reuse the established staging/rollback case-rename path,
+                # which checks directory entries rather than folded identity.
+                from .file_operation_service import FileOperationService
+                result = FileOperationService().rename(source, destination.name)
+                item = result.effective_items[0] if result.effective_items else None
+                if item is None or not item.success:
+                    raise OSError(item.error_message if item is not None else tr('変更できません'))
+            else:
+                os.rename(source, destination)
             destination_stat = destination.stat()
             if destination_stat.st_mtime_ns != source_stat.st_mtime_ns:
                 os.utime(

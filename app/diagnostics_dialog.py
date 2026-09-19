@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from .app_icon import install_window_icon
 from .logging_setup import dependency_versions
+from .pillow_plugins import JXL_IMPORT_ERROR, jxl_status_text
 from .pdfium_service import (
     PdfAvailabilitySnapshot,
     PdfAvailabilityState,
@@ -55,6 +56,8 @@ def diagnostic_text(
         f"Python: {platform.python_version()}",
         f"PySide6: {versions['PySide6']}",
         f"Pillow: {versions['Pillow']}",
+        f"JPEG XL: {jxl_status_text()}",
+        *([f"JPEG XL loader: {JXL_IMPORT_ERROR}"] if JXL_IMPORT_ERROR else []),
         f"pypdfium2: {versions['pypdfium2']}",
         f"PDF: {_pdf_status_text(pdf_snapshot, pdf_available)}",
         f"Archive backends: {archive_status}",

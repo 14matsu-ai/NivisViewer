@@ -27,6 +27,7 @@ from .file_operation_plan import (
     FileOperationState,
 )
 from .file_operation_service import (
+    FileOperationKind,
     FileOperationErrorCode,
     FileOperationItemResult,
     FileOperationRequest,
@@ -613,13 +614,16 @@ class FileOperationQueue(QObject):
             destination = os.path.abspath(
                 os.path.normpath(request.destination_directory)
             )
+            if request.operation is FileOperationKind.CREATE_ZIP:
+                # Numbered output names are chosen at publication time.
+                return sources, (os.path.normcase(destination).casefold(),)
             for source in request.source_paths:
                 targets.append(
                     os.path.normcase(
                         os.path.join(destination, os.path.basename(source))
                     ).casefold()
                 )
-            if not request.source_paths and request.new_name:
+            if request.new_name and not request.source_paths:
                 targets.append(
                     os.path.normcase(
                         os.path.join(destination, request.new_name)

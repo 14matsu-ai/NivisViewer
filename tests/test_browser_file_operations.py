@@ -16,12 +16,15 @@ from app.config_manager import ConfigManager
 from app.file_operation_coordinator import FileOperationCoordinator
 from app.file_operation_service import (
     FileOperationKind,
+    FileOperationProgress,
+    FileOperationRequest,
     FileOperationResult,
     FileOperationService,
 )
 from app.file_operation_worker import FileOperationExecutor
 from app.metadata_store import MetadataStore
 from app.settings_dialog import SettingsDialog
+from app.system_file_opener import SystemFileOpener
 from app.windows_recycle_bin import RecycleBinResult
 from app.zippla_filename_metadata import ZipPlaFilenameMetadata
 
@@ -1214,7 +1217,7 @@ def test_context_menu_has_exact_labels_and_separator_order(
             items.append(None)
 
         def addMenu(self, text: str):
-            items.append(text)
+            items.append(text.title() if isinstance(text, QMenu) else text)
 
             class FakeSubMenu:
                 @staticmethod
@@ -1235,12 +1238,16 @@ def test_context_menu_has_exact_labels_and_separator_order(
         "関連付けで開く...",
         "エクスプローラーで開く",
         None,
+        "zipに圧縮",
+        None,
         "切り取り",
         "コピー",
         "貼り付け",
         None,
-        "削除",
         "レート",
+        "タグ",
+        None,
+        "削除",
         None,
         "プロパティ",
     ]
@@ -1252,6 +1259,7 @@ def test_context_menu_has_exact_labels_and_separator_order(
     ):
         assert unwanted not in items
     assert not actions["削除"].enabled
+    assert not actions["zipに圧縮"].enabled
     assert not actions["関連付けで開く..."].enabled
     assert "名前をコピー" not in items
     close_window(window, coordinator, qapp)
@@ -1564,6 +1572,61 @@ def test_context_menu_open_with_picker_enablement(
     close_window(window, coordinator, qapp)
 
 
+@pytest.mark.parametrize("case", ["empty", "single", "multiple", "folder", "failure", "uninitialized"])
+def test_context_menu_opens_current_folder_independently_of_selection(
+    tmp_path: Path, qapp: QApplication, monkeypatch, case: str,
+) -> None:
+    folder = tmp_path / "現在の階層 日本語"
+    folder.mkdir()
+    first = folder / "最初.zip"
+    second = folder / "次のフォルダ"
+    if case in {"single", "multiple", "folder", "failure"}:
+        write_file(first)
+        second.mkdir()
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    calls = []
+
+    class Adapter:
+        def open_explorer(self, path, is_directory):
+            calls.append((path, is_directory))
+            return 5 if case == "failure" else 0
+
+    window.system_file_opener = SystemFileOpener(Adapter())
+    selections = {
+        "single": [first], "multiple": [first, second], "folder": [second], "failure": [second],
+    }.get(case, [])
+    select_paths(window, selections)
+    if case == "uninitialized":
+        window.current_path = None
+    position = QPoint(-10, -10)
+    if selections:
+        index = window.item_model.index(window.item_model.row_for_path(selections[-1]), 0)
+        position = window.list_view.visualRect(index).center()
+
+    class FakeMenu(QMenu):
+        def exec(self, _position):
+            actions = {action.text(): action for action in self.actions()}
+            current = actions.get("現在の階層をエクスプローラーで開く")
+            assert (current is not None) == (case in {"multiple", "folder", "failure"})
+            assert actions["エクスプローラーで開く"].isEnabled() == bool(selections)
+            return current if current is not None else (
+                actions["エクスプローラーで開く"] if case == "single" else None
+            )
+
+    monkeypatch.setattr("app.browser_window.QMenu", FakeMenu)
+    try:
+        window._show_context_menu(position)
+        if case in {"empty", "uninitialized"}:
+            assert calls == []
+        else:
+            assert calls == [(str(first if case == "single" else second), False)]
+            if case == "failure":
+                assert "error 5" in window.statusBar().currentMessage()
+            assert set(window.selected_file_operation_paths()) == set(map(str, selections))
+    finally:
+        close_window(window, coordinator, qapp)
+
+
 def test_context_menu_explorer_uses_clicked_item_with_multiple_selection(
     tmp_path: Path,
     qapp: QApplication,
@@ -1618,6 +1681,65 @@ def test_context_menu_explorer_uses_clicked_item_with_multiple_selection(
 
     assert len(opened) == 1
     assert opened[0].path == second
+    close_window(window, coordinator, qapp)
+
+
+def test_zip_operation_shows_progress_dialog_and_closes_on_completion(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "folder"
+    source = folder / "large.zip"
+    write_file(source)
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    cancelled: list[bool] = []
+    monkeypatch.setattr(coordinator, "cancel", lambda: cancelled.append(True))
+    request = FileOperationRequest(
+        88,
+        FileOperationKind.CREATE_ZIP,
+        (str(source),),
+        str(folder),
+        "large.zip.zip",
+    )
+
+    window._on_file_operation_started(request)
+    dialog = window._zip_progress_dialog
+    assert dialog is not None
+    assert dialog.isVisible()
+    assert dialog.windowTitle() == "ZIPに圧縮中"
+    assert dialog.maximum() == 0
+
+    window._on_file_operation_progress(
+        FileOperationProgress(
+            88,
+            FileOperationKind.CREATE_ZIP,
+            0,
+            1,
+            str(source),
+            str(folder / "large.zip.zip"),
+            bytes_completed=3 * 1024 * 1024,
+            bytes_total=6 * 1024 * 1024,
+        )
+    )
+    assert "large.zip" in dialog.labelText()
+    assert "3.0 MiB" in dialog.labelText()
+    assert dialog.maximum() == 1000
+    assert dialog.value() == 500
+
+    dialog.canceled.emit()
+    qapp.processEvents()
+    assert cancelled == [True]
+    window._on_file_operation_completed(
+        FileOperationResult(
+            FileOperationKind.CREATE_ZIP,
+            (),
+            cancelled=True,
+            request_id=88,
+        )
+    )
+    qapp.processEvents()
+    assert window._zip_progress_dialog is None
     close_window(window, coordinator, qapp)
 
 

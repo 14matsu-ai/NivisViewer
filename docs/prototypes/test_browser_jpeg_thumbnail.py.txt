@@ -1,0 +1,172 @@
+from dataclasses import replace
+from io import BytesIO
+import logging
+from zipfile import ZipFile
+
+from PIL import Image, ImageChops, ImageDraw, ImageStat
+import pytest
+
+from app.browser_model import BrowserItem, BrowserItemKind
+from app.thumbnail_disk_cache import ThumbnailDiskCache
+from app.thumbnail_provider import BrowserThumbnailProvider as Provider
+from app.thumbnail_render import ThumbnailRenderSpec, render_pil_thumbnail, render_owned_jpeg_letterbox
+
+
+def jpeg(size=(801, 1203), orientation=1, mode='RGB', progressive=False):
+    image = Image.new('RGB', size, '#809070')
+    draw = ImageDraw.Draw(image)
+    w, h = size
+    for box, color in [((0, 0, w//2, h//2), 'red'), ((w//2, 0, w, h//2), 'green'),
+                       ((0, h//2, w//2, h), 'blue'), ((w//2, h//2, w, h), 'yellow')]:
+        draw.rectangle(box, fill=color)
+    draw.line((0, h//3, w, h*2//3), fill='white', width=7)
+    exif = Image.Exif()
+    exif[274] = orientation
+    output = BytesIO()
+    image.convert(mode).save(output, 'JPEG', quality=92, exif=exif, progressive=progressive)
+    return output.getvalue()
+
+
+def spec(size=(181, 256), crop='letterbox'):
+    return ThumbnailRenderSpec(*size, 'portrait_1_sqrt2', crop)
+
+
+def pixels(image):
+    rgb = image.convertToFormat(image.Format.Format_RGB888)
+    return Image.frombytes('RGB', (rgb.width(), rgb.height()), bytes(rgb.constBits()),
+                           'raw', 'RGB', rgb.bytesPerLine())
+
+
+def baseline(data, request):
+    with Image.open(BytesIO(data)) as image:
+        return render_pil_thumbnail(image, request)[0]
+
+
+@pytest.mark.parametrize('orientation', range(1, 9))
+@pytest.mark.parametrize('size,bounds', [((801, 1203), (181, 256)), ((1203, 801), (133, 257)),
+                                        ((17, 29), (181, 256)), ((101, 3), (13, 9)),
+                                        ((1, 301), (3, 17))])
+def test_orientations_odd_fit_and_no_upscale(orientation, size, bounds):
+    data = jpeg(size, orientation)
+    actual, crop = Provider._render_thumbnail_source(data, spec(bounds), None, ())
+    expected = baseline(data, spec(bounds))
+    assert actual.size() == expected.size()
+    assert crop is None
+    error = ImageStat.Stat(ImageChops.difference(pixels(actual), pixels(expected)))
+    assert sum(error.mean) / 3 < 5
+    logical = size[::-1] if orientation >= 5 else size
+    assert actual.width() <= logical[0] and actual.height() <= logical[1]
+
+
+@pytest.mark.parametrize('mode,progressive', [('RGB', True), ('L', False), ('L', True), ('CMYK', False)])
+def test_jpeg_variants(mode, progressive):
+    data = jpeg(mode=mode, progressive=progressive, orientation=7)
+    actual, _ = Provider._render_thumbnail_source(data, spec(), None, ())
+    expected = baseline(data, spec())
+    assert actual.size() == expected.size()
+    assert sum(ImageStat.Stat(ImageChops.difference(pixels(actual), pixels(expected))).mean) / 3 < 5
+    if mode == 'CMYK':
+        assert actual == expected
+
+
+@pytest.mark.parametrize('crop', ['center_crop', 'smart_crop'])
+def test_crop_modes_keep_full_path(crop):
+    data = jpeg(orientation=6)
+    request = spec(crop=crop)
+    actual, _ = Provider._render_thumbnail_source(data, request, None, ())
+    assert actual == baseline(data, request)
+
+
+@pytest.mark.parametrize('kind', ['image', 'folder', 'archive'])
+def test_owned_source_routes_and_original_metadata(tmp_path, caplog, kind):
+    data = jpeg(orientation=6)
+    source = tmp_path / '原本.jpg'
+    source.write_bytes(data)
+    mtime = source.stat().st_mtime_ns
+    if kind == 'folder':
+        path, item_kind = tmp_path, BrowserItemKind.FOLDER
+    elif kind == 'archive':
+        path, item_kind = tmp_path / '書庫.cbz', BrowserItemKind.ARCHIVE
+        with ZipFile(path, 'w') as archive:
+            archive.writestr('原本.jpg', data)
+    else:
+        path, item_kind = source, BrowserItemKind.IMAGE
+    item = BrowserItem(path.name, path, item_kind, path.stat().st_mtime)
+    with caplog.at_level(logging.DEBUG, logger='nivisviewer.thumbnail'):
+        result = Provider.load_thumbnail_result(item, spec())
+    assert result.image.size() == baseline(data, spec()).size()
+    assert 'source=(801, 1203)' in caplog.text
+    assert source.read_bytes() == data and source.stat().st_mtime_ns == mtime
+    if kind == 'folder':
+        assert result.cover_path == source and result.page_count == 1
+    if kind == 'archive':
+        assert result.entry_path == '原本.jpg' and result.page_count == 1
+
+
+def test_failed_draft_reopens_full_source(monkeypatch):
+    data = jpeg()
+    expected = baseline(data, spec())
+    calls = []
+    def fail_after_mutation(image, request):
+        image.draft(None, (100, 100))
+        calls.append(image.size)
+        raise OSError('synthetic decoder failure')
+    monkeypatch.setattr('app.thumbnail_provider.render_owned_jpeg_letterbox', fail_after_mutation)
+    actual, _ = Provider._render_thumbnail_source(data, spec(), None, ())
+    assert calls[0] != (801, 1203)
+    assert actual == expected
+
+
+def test_borrowed_pil_api_preserves_reusable_decode_size():
+    with Image.open(BytesIO(jpeg(orientation=6))) as image:
+        rendered, _ = render_pil_thumbnail(image, spec())
+        assert rendered.width() > rendered.height()
+        assert image.size == (801, 1203)
+        assert image.getexif()[274] == 6
+
+
+@pytest.mark.parametrize('orientation', [0, 9])
+def test_unknown_orientation_falls_back(orientation):
+    data = jpeg(orientation=orientation)
+    actual, _ = Provider._render_thumbnail_source(data, spec(), None, ())
+    assert actual == baseline(data, spec())
+
+
+def test_nonjpeg_alpha_path_unchanged():
+    stream = BytesIO()
+    Image.new('RGBA', (801, 1203), (31, 75, 130, 81)).save(stream, 'PNG')
+    data = stream.getvalue()
+    actual, _ = Provider._render_thumbnail_source(data, spec(), None, ())
+    assert actual == baseline(data, spec())
+    assert actual.pixelColor(0, 0).alpha() == 81
+
+
+def test_bad_jpeg_returns_failure_and_folder_skips_bad_cover(tmp_path):
+    bad = tmp_path / '0.jpg'
+    bad.write_bytes(b'\xff\xd8\xfftruncated')
+    assert Provider._load_image_path(bad, spec()) is None
+    (tmp_path / '1.jpg').write_bytes(jpeg())
+    result = Provider._load_folder_result(tmp_path, spec())
+    assert result.image is not None and result.cover_path.name == '1.jpg'
+
+
+def test_lazy_cache_identity_rejects_old_exact_and_compatible_size(tmp_path):
+    source = tmp_path / 'image.jpg'
+    source.write_bytes(jpeg())
+    item = BrowserItem(source.name, source, BrowserItemKind.IMAGE, source.stat().st_mtime)
+    current = spec()
+    old = replace(current, jpeg_letterbox_version=0)
+    assert current.cache_token != old.cache_token
+    assert current.family_token != old.family_token
+    for crop in ('center_crop', 'smart_crop'):
+        assert spec(crop=crop).cache_token == replace(spec(crop=crop), jpeg_letterbox_version=0).cache_token
+        assert spec(crop=crop).family_token == replace(spec(crop=crop), jpeg_letterbox_version=0).family_token
+    cache = ThumbnailDiskCache(tmp_path / 'cache')
+    try:
+        assert cache.put(item, old, baseline(source.read_bytes(), old))
+        assert cache.get_suitable(item, old) is not None
+        assert cache.get_suitable(item, current) is None
+        assert cache.get_suitable(item, replace(current, frame_width=90, frame_height=128)) is None
+        assert cache.get_suitable(item, old) is not None  # No global clearing.
+    finally:
+        cache.close()

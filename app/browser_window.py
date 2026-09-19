@@ -35,11 +35,15 @@ from PySide6.QtGui import (
     QClipboard,
     QContextMenuEvent,
     QDesktopServices,
+    QColor,
+    QFontMetrics,
     QKeyEvent,
     QKeySequence,
     QMouseEvent,
     QPainter,
     QPalette,
+    QIcon,
+    QPixmap,
     QResizeEvent,
     QShortcut,
 )
@@ -58,6 +62,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QSizePolicy,
     QSplitter,
@@ -129,6 +134,7 @@ from .browser_sort import (
 )
 from .browser_filter import BrowserFilterState, RatingFilterMode
 from .browser_rating_filter_widget import BrowserRatingFilterWidget
+from .browser_tag_quick_filters import BrowserTagQuickFilterStrip
 from .browser_search_history import BrowserSearchHistory
 from .browser_image_detail import (
     BrowserImageDetailProbe,
@@ -154,7 +160,7 @@ from .file_properties_dialog import FilePropertiesDialog
 from .file_operation_artifact import FileOperationArtifactPolicy
 from .file_operation_coordinator import FileOperationCoordinator
 from .file_operation_panel import FileOperationPanel
-from .file_operation_plan import ConflictResolution, FileOperationPlan
+from .file_operation_plan import ConflictResolution, FileOperationPlan, FileConflictKind
 from .file_operation_service import (
     FileCollisionPolicy,
     FileOperationKind,
@@ -237,6 +243,7 @@ class _RatingRenameBatch:
     replacements: list[tuple[str, str, int | None]] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
     active_request_id: int | None = None
+    tag_edit: bool = False
 
 
 @dataclass
@@ -667,6 +674,8 @@ class BrowserWindow(QMainWindow):
         self._screen_tracking_window = None
         self._pressed_extra_buttons: set[Qt.MouseButton] = set()
         self._shutdown_prepared = False
+        self._zip_progress_dialog: QProgressDialog | None = None
+        self._zip_progress_request_id: int | None = None
         self._fast_scrolling = False
         self._thumbnail_scroll_direction = 1
         self._last_scroll_value = 0
@@ -776,6 +785,9 @@ class BrowserWindow(QMainWindow):
         # Search text and quick rating filters are intentionally session-only:
         # reopening the app must never start with files unexpectedly hidden.
         self.browser_filter_state = BrowserFilterState()
+        self.browser_tag_grouped = bool(
+            self.settings.get("browser_tag_grouped", False)
+        )
         self.browser_display_density = normalize_browser_display_density(
             self.settings.get(
                 "browser_display_density",
@@ -793,6 +805,15 @@ class BrowserWindow(QMainWindow):
         )
         self.browser_filename_display = str(
             self.settings.get("browser_filename_display", "one_line")
+        )
+        self.browser_filename_elide_mode = str(
+            self.settings.get("browser_filename_elide_mode", "right")
+        )
+        self.browser_filename_font_size = max(
+            0, min(24, int(self.settings.get("browser_filename_font_size", 0)))
+        )
+        self.browser_filename_show_extension = bool(
+            self.settings.get("browser_filename_show_extension", True)
         )
         self.browser_filename_gap = max(
             0, min(32, int(self.settings.get("browser_filename_gap", 0)))
@@ -974,6 +995,7 @@ class BrowserWindow(QMainWindow):
                 f"search={self.browser_filter_state.search_text.casefold()!r}:"
                 f"rating={self.browser_filter_state.rating_mode.value}:"
                 f"reference={self.browser_filter_state.rating_reference}"
+                f":tags={(self.browser_filter_state.include_tags, self.browser_filter_state.exclude_tags, self.browser_filter_state.tag_match)!r}"
             ),
         )
 
@@ -1200,11 +1222,18 @@ class BrowserWindow(QMainWindow):
         else:
             pending.buffered_entries.clear()
             self._commit_pending_scan(pending)
-            initial_count = (
-                len(items)
-                if pending.atomic_restore
-                else self._initial_scan_item_count(len(items))
-            )
+            initial_count = self._initial_scan_item_count(len(items))
+            if pending.atomic_restore:
+                # History Back/Forward used to materialize all rows before the
+                # first paint so the saved scrollbar could be restored. That
+                # made the thumbnail request wait behind a large model reset.
+                # Materialize through the saved viewport (and selected item)
+                # instead; the remaining rows are appended with the same
+                # generation and the final restore keeps the exact location.
+                initial_count = self._initial_restore_scan_item_count(
+                    items,
+                    pending.restore_location,
+                )
             initial_items = items[:initial_count]
             if initial_count < len(items):
                 pending.remaining_items = items
@@ -1376,6 +1405,64 @@ class BrowserWindow(QMainWindow):
         )
         return min(count, max(1, min(80, len(plan.requested_rows))))
 
+    def _initial_restore_scan_item_count(
+        self,
+        items: tuple[BrowserItem, ...] | list[BrowserItem],
+        location: BrowserLocation,
+    ) -> int:
+        """Keep history's first paint bounded while retaining its viewport."""
+
+        count = len(items)
+        if count <= 40:
+            return count
+        viewport = self.list_view.viewport()
+        grid = self.list_view.gridSize()
+        visible_range = calculate_grid_visible_range(
+            row_count=count,
+            viewport_width=max(1, viewport.width() - 1),
+            viewport_height=viewport.height(),
+            grid_width=grid.width(),
+            grid_height=grid.height(),
+            vertical_offset=max(0, int(location.vertical_scroll)),
+        )
+        target = self._initial_scan_item_count(count)
+        if visible_range is not None:
+            target = max(target, visible_range[1] + 1)
+        filter_state = self.item_model.filter_state
+        if filter_state.active:
+            # ``items`` is the sorted source sequence, while the first model
+            # reset applies the active filter.  A visible row in that filtered
+            # sequence can therefore be much farther into the source prefix
+            # when matching entries are sparse.  Find the source cutoff for
+            # the saved filtered viewport without materializing every row.
+            filtered_matches = [filter_state.matches(item) for item in items]
+            filtered_count = sum(filtered_matches)
+            filtered_range = calculate_grid_visible_range(
+                row_count=filtered_count,
+                viewport_width=max(1, viewport.width() - 1),
+                viewport_height=viewport.height(),
+                grid_width=grid.width(),
+                grid_height=grid.height(),
+                vertical_offset=max(0, int(location.vertical_scroll)),
+            )
+            if filtered_range is not None:
+                required_filtered_row = filtered_range[1]
+                matched_rows = 0
+                for source_row, is_match in enumerate(filtered_matches):
+                    if not is_match:
+                        continue
+                    matched_rows += 1
+                    if matched_rows > required_filtered_row:
+                        target = max(target, source_row + 1)
+                        break
+        if location.selected_path:
+            selected_key = self._path_key(location.selected_path)
+            for row, item in enumerate(items):
+                if self._path_key(item.path) == selected_key:
+                    target = max(target, row + 1)
+                    break
+        return min(count, max(1, target))
+
     def _cancel_pending_scan(self, *, rollback_history: bool) -> None:
         pending = self._pending_scan
         if pending is None:
@@ -1508,6 +1595,7 @@ class BrowserWindow(QMainWindow):
         path: str | Path,
         *,
         expected_parent: str | Path,
+        preserve_selection: bool = False,
     ) -> bool:
         """Select one visible Viewer item without changing Browser location."""
 
@@ -1522,6 +1610,8 @@ class BrowserWindow(QMainWindow):
         if selection_model is None:
             return False
         if row < 0:
+            if preserve_selection:
+                return False
             selection_model.clearSelection()
             selection_model.setCurrentIndex(
                 QModelIndex(),
@@ -1539,17 +1629,24 @@ class BrowserWindow(QMainWindow):
         if (
             current_item is not None
             and self._same_path(current_item.path, target)
-            and len(selected_items) == 1
-            and selected_items[0] is not None
-            and self._same_path(selected_items[0].path, target)
+            and (preserve_selection or len(selected_items) == 1)
+            and any(selected is not None and self._same_path(selected.path, target)
+                    for selected in selected_items)
         ):
             self._update_status()
             return True
 
         state = self._capture_list_view_state()
+        selected_paths = (
+            state.selected_paths
+            if preserve_selection and any(
+                selected is not None and self._same_path(selected.path, target)
+                for selected in selected_items
+            ) else (str(target),)
+        )
         self._restore_list_view_state(
             _ListViewState(
-                selected_paths=(str(target),),
+                selected_paths=selected_paths,
                 current_path=str(target),
                 anchor_path=state.anchor_path,
                 anchor_row=state.anchor_row,
@@ -2111,6 +2208,18 @@ class BrowserWindow(QMainWindow):
         )
         return False
 
+    def _open_current_folder_in_explorer(self, item: BrowserItem) -> bool:
+        result = self.system_file_opener.open_in_explorer(
+            item.path,
+            is_directory=False,
+        )
+        if result.success:
+            return True
+        self._show_temporary_status(
+            result.error_message or tr('Explorerを開けませんでした')
+        )
+        return False
+
     def _folder_snapshot_for_item(
         self,
         item: BrowserItem,
@@ -2166,6 +2275,7 @@ class BrowserWindow(QMainWindow):
                 f"search={self.browser_filter_state.search_text.casefold()!r}:"
                 f"rating={self.browser_filter_state.rating_mode.value}:"
                 f"reference={self.browser_filter_state.rating_reference}"
+                f":tags={(self.browser_filter_state.include_tags, self.browser_filter_state.exclude_tags, self.browser_filter_state.tag_match)!r}"
             ),
         )
 
@@ -2527,6 +2637,25 @@ class BrowserWindow(QMainWindow):
             destination=target,
         )
 
+    def compress_selected_to_zip(self) -> bool:
+        paths = self.selected_file_operation_paths()
+        if not paths or self.current_path is None:
+            return False
+        base_name = Path(paths[0]).name if len(paths) == 1 else self.current_path.name
+        name = self._prompt_for_filename(
+            tr('zipに圧縮'), tr('ZIPファイル名:'), (base_name or "Archive") + ".zip",
+        )
+        if name is None:
+            return False
+        if not name.lower().endswith(".zip"):
+            name += ".zip"
+        return self._start_file_operation(
+            FileOperationKind.CREATE_ZIP,
+            sources=paths,
+            destination=self.current_path,
+            new_name=name,
+        )
+
     def create_new_folder(self) -> bool:
         if self.current_path is None:
             return False
@@ -2640,6 +2769,17 @@ class BrowserWindow(QMainWindow):
         ):
             if self.file_operation_coordinator.queue is not None:
                 self.file_operation_coordinator.queue.cancel(plan.operation_id)
+            return
+        if (self._rating_batch is not None and self._rating_batch.tag_edit
+                and self._rating_batch.active_request_id == plan.request_id):
+            # REPLACE here permits only the planner's case-only rename;
+            # the rename service still rejects any distinct target entry.
+            self.file_operation_coordinator.queue.resolve_conflicts(
+                plan.operation_id,
+                {conflict.conflict_id: (ConflictResolution.REPLACE
+                 if conflict.kind is FileConflictKind.CASE_ONLY_NAME else ConflictResolution.SKIP)
+                 for conflict in plan.conflicts},
+            )
             return
         dialog = ConflictResolutionDialog(plan, self)
         self._conflict_dialogs[plan.operation_id] = dialog
@@ -2861,6 +3001,23 @@ class BrowserWindow(QMainWindow):
     def _on_file_operation_started(self, request: FileOperationRequest) -> None:
         if self._shutdown_prepared:
             return
+        if request.operation is FileOperationKind.CREATE_ZIP:
+            self._close_zip_progress_dialog()
+            dialog = QProgressDialog(tr('ZIPに圧縮する準備をしています…'), tr('キャンセル'), 0, 0, self)
+            dialog.setWindowTitle(tr('ZIPに圧縮中'))
+            dialog.setWindowModality(Qt.WindowModality.NonModal)
+            dialog.setAutoClose(False)
+            dialog.setAutoReset(False)
+            dialog.setMinimumDuration(0)
+            dialog.setMinimumWidth(380)
+            queue = self.file_operation_coordinator.queue
+            dialog.canceled.connect(
+                (lambda: queue.cancel(request.operation_id))
+                if queue is not None else self.file_operation_coordinator.cancel
+            )
+            self._zip_progress_dialog = dialog
+            self._zip_progress_request_id = request.request_id
+            dialog.show()
         self.statusBar().setMaximumHeight(16777215)
         self._active_file_operation_id = request.request_id
         self.cancel_operation_button.setVisible(
@@ -2871,6 +3028,14 @@ class BrowserWindow(QMainWindow):
         self.statusBar().showMessage(
             tr('{p0}中… 0 / {p1}', p0=self._operation_label(request.operation), p1=max(1, len(request.source_paths)))
         )
+
+    def _close_zip_progress_dialog(self) -> None:
+        dialog = self._zip_progress_dialog
+        self._zip_progress_dialog = None
+        self._zip_progress_request_id = None
+        if dialog is not None:
+            dialog.reset()
+            dialog.deleteLater()
 
     def _on_file_operation_progress(
         self,
@@ -2884,6 +3049,16 @@ class BrowserWindow(QMainWindow):
         if self._close_after_cancel:
             self.statusBar().showMessage(tr('ファイル操作を中止しています…'))
             return
+        dialog = self._zip_progress_dialog
+        if dialog is not None and self._zip_progress_request_id == progress.request_id and not dialog.wasCanceled():
+            dialog.setLabelText(tr(
+                'ZIPに圧縮中… {p0}\n{p1:.1f} MiB 処理済み',
+                p0=Path(progress.source_path).name if progress.source_path else "",
+                p1=progress.bytes_completed / (1024 * 1024),
+            ))
+            if progress.bytes_total > 0:
+                dialog.setRange(0, 1000)
+                dialog.setValue(min(1000, progress.bytes_completed * 1000 // progress.bytes_total))
         self.statusBar().showMessage(
             tr('{p0}中… {p1} / {p2}', p0=self._operation_label(progress.operation), p1=progress.completed, p2=progress.total)
         )
@@ -2896,6 +3071,8 @@ class BrowserWindow(QMainWindow):
             result.request_id,
             None,
         )
+        if result.request_id == self._zip_progress_request_id:
+            self._close_zip_progress_dialog()
         request = self._file_operation_requests.pop(result.request_id, None)
         before_paths, before_row = self._file_operation_selection_before.pop(
             result.request_id,
@@ -3104,6 +3281,7 @@ class BrowserWindow(QMainWindow):
                 FileOperationKind.RENAME,
                 FileOperationKind.RECYCLE,
                 FileOperationKind.CREATE_DIRECTORY,
+                FileOperationKind.CREATE_ZIP,
             }
             and (source_is_current or destination_is_current)
         ) or (
@@ -3179,6 +3357,7 @@ class BrowserWindow(QMainWindow):
             FileOperationKind.MOVE: tr('移動'),
             FileOperationKind.RECYCLE: tr('削除'),
             FileOperationKind.CREATE_DIRECTORY: tr('フォルダ作成'),
+            FileOperationKind.CREATE_ZIP: tr('zipに圧縮'),
         }[operation]
 
     def add_browser_bookmark(
@@ -3501,6 +3680,7 @@ class BrowserWindow(QMainWindow):
         if self._shutdown_prepared:
             return
         self._shutdown_prepared = True
+        self._close_zip_progress_dialog()
         self.clear_file_clipboard()
         if (
             self._owns_file_operation_coordinator
@@ -3543,8 +3723,16 @@ class BrowserWindow(QMainWindow):
             self.path_availability_service.close()
 
     def _run_idle_cache_cleanup(self) -> None:
-        if not self._shutdown_prepared:
-            self.thumbnail_provider.cleanup_caches_async(force=False)
+        if self._shutdown_prepared:
+            return
+        # A large initial scan may outlast the startup timer. Do not let its
+        # cache-wide walk get ahead of the first visible thumbnail requests.
+        if self._pending_scan is not None or self.thumbnail_provider.pending_count:
+            QTimer.singleShot(500, self, self._run_idle_cache_cleanup)
+            return
+        if not self.thumbnail_provider.cleanup_caches_async(force=False):
+            # Viewer interaction can temporarily reject Browser submissions.
+            QTimer.singleShot(500, self, self._run_idle_cache_cleanup)
 
     def _fallback_background_delegate_options(self) -> dict[str, str]:
         """Project window-owned values for initial, layout and live updates."""
@@ -3571,6 +3759,16 @@ class BrowserWindow(QMainWindow):
         self.list_view.viewport().update()
 
     def apply_settings(self, changed: dict[str, object]) -> None:
+        if "browser_tag_grouped" in changed:
+            self.browser_tag_grouped = bool(changed["browser_tag_grouped"])
+            self._rebuild_tag_menu()
+            self._sync_tag_quick_filter_registry()
+            self._sync_browser_filter_controls()
+        if 'browser_tag_registry' in changed:
+            self.item_delegate.tag_registry = self.config.get('browser_tag_registry', [])
+            self.list_view.viewport().update()
+            self._rebuild_tag_menu()
+            self._sync_tag_quick_filter_registry()
         wheel_settings_changed = bool(
             {
                 "browser_wheel_scroll_mode",
@@ -3652,6 +3850,9 @@ class BrowserWindow(QMainWindow):
             "browser_item_spacing_y",
             "browser_cell_padding",
             "browser_filename_display",
+            "browser_filename_elide_mode",
+            "browser_filename_font_size",
+            "browser_filename_show_extension",
             "browser_filename_gap",
             "browser_filename_padding_y",
         }
@@ -3690,6 +3891,18 @@ class BrowserWindow(QMainWindow):
             )
         if "browser_filename_display" in changed:
             self.browser_filename_display = str(changed["browser_filename_display"])
+        if "browser_filename_elide_mode" in changed:
+            self.browser_filename_elide_mode = str(
+                changed["browser_filename_elide_mode"]
+            )
+        if "browser_filename_font_size" in changed:
+            self.browser_filename_font_size = max(
+                0, min(24, int(changed["browser_filename_font_size"]))
+            )
+        if "browser_filename_show_extension" in changed:
+            self.browser_filename_show_extension = bool(
+                changed["browser_filename_show_extension"]
+            )
         if "browser_filename_gap" in changed:
             self.browser_filename_gap = max(
                 0, min(32, int(changed["browser_filename_gap"]))
@@ -3809,12 +4022,24 @@ class BrowserWindow(QMainWindow):
                 "browser_item_spacing_y",
                 "browser_cell_padding",
                 "browser_filename_display",
+                "browser_filename_font_size",
                 "browser_filename_gap",
                 "browser_filename_padding_y",
             }.intersection(changed)
         )
         if geometry_changed:
             self._apply_list_view_geometry()
+        elif {
+            "browser_filename_elide_mode",
+            "browser_filename_show_extension",
+        }.intersection(changed):
+            self.item_delegate.configure(
+                thumbnail_size=self.thumbnail_size,
+                density=self.browser_display_density,
+                filename_elide_mode=self.browser_filename_elide_mode,
+                show_filename_extension=self.browser_filename_show_extension,
+            )
+            self.list_view.viewport().update()
 
         if list_changed:
             self._sync_browser_controls()
@@ -4050,6 +4275,15 @@ class BrowserWindow(QMainWindow):
 
         return self._replace_active_search_query("")
 
+    def clear_browser_filters(self) -> None:
+        """Cancel queued search and clear both transient filter controls."""
+        if QApplication.activeModalWidget() is not None or QApplication.activePopupWidget() is not None:
+            return
+        self._browser_search_timer.stop()
+        self._set_browser_filter(BrowserFilterState.normalized())
+        # Explicit clearing invalidates even a temporarily hidden return query.
+        self.search_query_edited.emit(self, "")
+
     def restore_viewer_roundtrip_search(self, query: str) -> bool:
         """Restore one controller-authorized transient Viewer return query."""
 
@@ -4067,6 +4301,9 @@ class BrowserWindow(QMainWindow):
             search_text=query,
             rating_mode=self.browser_filter_state.rating_mode,
             rating_reference=self.browser_filter_state.rating_reference,
+            include_tags=self.browser_filter_state.include_tags,
+            exclude_tags=self.browser_filter_state.exclude_tags,
+            tag_match=self.browser_filter_state.tag_match,
         )
         if preserve_view_state:
             return self._set_browser_filter(state)
@@ -4173,6 +4410,9 @@ class BrowserWindow(QMainWindow):
                 search_text=self.browser_search_edit.text(),
                 rating_mode=self.browser_filter_state.rating_mode,
                 rating_reference=self.browser_filter_state.rating_reference,
+                include_tags=self.browser_filter_state.include_tags,
+                exclude_tags=self.browser_filter_state.exclude_tags,
+                tag_match=self.browser_filter_state.tag_match,
             )
         )
 
@@ -4188,6 +4428,9 @@ class BrowserWindow(QMainWindow):
                 search_text=self.browser_search_edit.text(),
                 rating_mode=mode,
                 rating_reference=reference,
+                include_tags=self.browser_filter_state.include_tags,
+                exclude_tags=self.browser_filter_state.exclude_tags,
+                tag_match=self.browser_filter_state.tag_match,
             )
         )
 
@@ -4196,6 +4439,9 @@ class BrowserWindow(QMainWindow):
             search_text=state.search_text,
             rating_mode=state.rating_mode,
             rating_reference=state.rating_reference,
+            include_tags=state.include_tags,
+            exclude_tags=state.exclude_tags,
+            tag_match=state.tag_match,
         )
         if normalized == self.browser_filter_state:
             self._sync_browser_filter_controls()
@@ -4213,6 +4459,16 @@ class BrowserWindow(QMainWindow):
         return True
 
     def _sync_browser_filter_controls(self) -> None:
+        if hasattr(self, 'tag_quick_filter_strip'):
+            self.tag_quick_filter_strip.set_filter_state(
+                self.browser_filter_state
+            )
+        if hasattr(self, 'tag_button'):
+            count = len(self.browser_filter_state.include_tags) + len(self.browser_filter_state.exclude_tags)
+            self.tag_button.setText(tr('タグ') if not count else tr('タグ ({p0})', p0=count))
+            self._reserve_tag_button_width()
+            self._sync_grouped_tag_menu_actions()
+            self._update_tag_quick_filter_geometry(force=True)
         if not hasattr(self, "rating_filter_widget"):
             return
         if self.browser_search_edit.text() != self.browser_filter_state.search_text:
@@ -4231,6 +4487,227 @@ class BrowserWindow(QMainWindow):
             )
         finally:
             self.rating_filter_widget.blockSignals(False)
+
+    def _reserve_tag_button_width(self) -> None:
+        """Reserve the translated two-digit label without displaying a dummy."""
+        button = getattr(self, 'tag_button', None)
+        if button is None:
+            return
+        metrics = QFontMetrics(button.font())
+        current_width = metrics.horizontalAdvance(button.text())
+        natural_width = button.sizeHint().width()
+        if not hasattr(self, '_tag_button_text_extra_width'):
+            self._tag_button_text_extra_width = max(
+                0,
+                natural_width - current_width,
+            )
+        representative = tr('タグ ({p0})', p0=99)
+        reserved = metrics.horizontalAdvance(representative) + int(
+            self._tag_button_text_extra_width
+        )
+        if reserved > button.minimumWidth():
+            button.setMinimumWidth(reserved)
+
+    def _rebuild_tag_menu(self) -> None:
+        menu = getattr(self, 'tag_menu', None)
+        if menu is None:
+            return
+        menu.clear()
+        self._grouped_tag_actions: dict[str, QAction] = {}
+        registry = self.config.get('browser_tag_registry', [])
+        if self.browser_tag_grouped:
+            for entry in registry:
+                name = entry['name']
+                action = menu.addAction(name.replace('&', '&&'))
+                action.setCheckable(True)
+                pixmap = QPixmap(10, 10)
+                pixmap.fill(QColor(entry['color']))
+                action.setIcon(QIcon(pixmap))
+                action.triggered.connect(
+                    lambda _checked=False, tag=name: self._on_tag_quick_filter_activated(
+                        tag,
+                        QApplication.keyboardModifiers(),
+                        Qt.MouseButton.LeftButton,
+                    )
+                )
+                self._grouped_tag_actions[name] = action
+            if self._grouped_tag_actions:
+                menu.addSeparator()
+        menu.addAction(tr('選択項目のタグ'), lambda: self.edit_selected_tags())
+        menu.addAction(tr('タグで絞り込み'), self.edit_tag_filter)
+        menu.addSeparator()
+        menu.addAction(tr('タグの管理'), lambda: self.manage_tags())
+        self._tag_clear_action = menu.addAction(
+            tr('選択の解除'), self._clear_tag_filters
+        )
+        self._sync_grouped_tag_menu_actions()
+
+    def _sync_grouped_tag_menu_actions(self) -> None:
+        actions = getattr(self, '_grouped_tag_actions', {})
+        include = set(self.browser_filter_state.include_tags)
+        exclude = set(self.browser_filter_state.exclude_tags)
+        for name, action in actions.items():
+            action.setChecked(name in include)
+            label = f'− {name}' if name in exclude else name
+            action.setText(label.replace('&', '&&'))
+            action.setToolTip(
+                tr('タグを除外中: {p0}', p0=name)
+                if name in exclude
+                else tr('クリックでタグ絞り込み: {p0}', p0=name)
+            )
+        clear_action = getattr(self, '_tag_clear_action', None)
+        if clear_action is not None:
+            clear_action.setEnabled(bool(include or exclude))
+
+    def _clear_tag_filters(self) -> None:
+        self._browser_search_timer.stop()
+        self._set_browser_filter(
+            BrowserFilterState.normalized(
+                search_text=self.browser_search_edit.text(),
+                rating_mode=self.browser_filter_state.rating_mode,
+                rating_reference=self.browser_filter_state.rating_reference,
+                tag_match='all',
+            )
+        )
+
+    def _sync_tag_quick_filter_registry(self) -> None:
+        strip = getattr(self, 'tag_quick_filter_strip', None)
+        layout = getattr(self, '_rating_filter_layout', None)
+        if strip is None or layout is None:
+            return
+        registry = self.config.get('browser_tag_registry', [])
+        strip.set_registry(registry)
+        in_layout = layout.indexOf(strip) >= 0
+        has_tags = bool(strip.registry)
+        if self.browser_tag_grouped:
+            if in_layout:
+                layout.removeWidget(strip)
+            strip.hide()
+            self._refresh_rating_filter_corner_layout()
+            return
+        if has_tags and not in_layout:
+            layout.insertWidget(
+                0,
+                strip,
+                0,
+                Qt.AlignmentFlag.AlignVCenter,
+            )
+        elif not has_tags and in_layout:
+            layout.removeWidget(strip)
+            strip.hide()
+        if has_tags:
+            strip.show()
+        self._refresh_rating_filter_corner_layout()
+        self._update_tag_quick_filter_geometry(force=True)
+
+    def _refresh_rating_filter_corner_layout(self) -> None:
+        """Propagate corner-widget size changes through QMenuBar immediately."""
+        container = getattr(self, 'rating_filter_container', None)
+        layout = getattr(self, '_rating_filter_layout', None)
+        if container is None or layout is None:
+            return
+        layout.invalidate()
+        layout.activate()
+        hint = layout.sizeHint()
+        if hint.isValid():
+            container.setFixedWidth(max(0, hint.width()))
+        container.updateGeometry()
+        menu_bar = self.menuBar()
+        menu_bar.updateGeometry()
+        menu_layout = menu_bar.layout()
+        if menu_layout is not None:
+            menu_layout.invalidate()
+            menu_layout.activate()
+        # QMenuBar does not always reposition an already installed corner
+        # widget when only its size hint changes. Keep the rating group
+        # anchored to the menu bar's right edge synchronously.
+        if container.parentWidget() is menu_bar:
+            geometry = container.geometry()
+            container.move(
+                max(0, menu_bar.width() - container.width()),
+                geometry.y(),
+            )
+        menu_bar.update()
+
+    def _update_tag_quick_filter_geometry(self, *, force: bool = False) -> None:
+        strip = getattr(self, 'tag_quick_filter_strip', None)
+        if self.browser_tag_grouped:
+            self._refresh_rating_filter_corner_layout()
+            return
+        if strip is None or not strip.registry:
+            return
+        menu_bar = self.menuBar()
+        settings_action = getattr(self, 'settings_action', None)
+        if settings_action is None:
+            strip.set_available_width(menu_bar.width())
+            return
+        settings_rect = menu_bar.actionGeometry(settings_action)
+        rating_layout = getattr(self, '_rating_filter_layout', None)
+        if rating_layout is None:
+            return
+        fixed_width = (
+            max(
+                self.tag_button.minimumWidth(),
+                self.tag_button.sizeHint().width(),
+            )
+            + self.rating_filter_widget.sizeHint().width()
+            + rating_layout.contentsMargins().left()
+            + rating_layout.contentsMargins().right()
+            + rating_layout.spacing() * 2
+        )
+        # The quick buttons grow into the space before the right-anchored
+        # corner controls. Reserve the menu action row and the existing tag /
+        # rating controls so Settings and the menu actions remain reachable.
+        menu_width = menu_bar.width()
+        if settings_rect.isValid() and settings_rect.width() > 0:
+            available = menu_width - settings_rect.right() - fixed_width - 8
+        else:
+            available = menu_width - fixed_width - 8
+        strip.set_available_width(max(0, available))
+        self._refresh_rating_filter_corner_layout()
+
+    def _on_tag_quick_filter_activated(
+        self,
+        name: str,
+        modifiers: object,
+        _button: object,
+    ) -> None:
+        # A click can arrive during the 100 ms search debounce. Compose with
+        # the editor's current text so the pending keystrokes are not lost.
+        self._browser_search_timer.stop()
+        modifier_flags = Qt.KeyboardModifier(modifiers)
+        include = list(self.browser_filter_state.include_tags)
+        exclude = list(self.browser_filter_state.exclude_tags)
+        if modifier_flags & Qt.KeyboardModifier.ShiftModifier:
+            if name in exclude:
+                exclude.remove(name)
+            else:
+                exclude.append(name)
+                if name in include:
+                    include.remove(name)
+        else:
+            if name in include:
+                include.remove(name)
+            else:
+                include.append(name)
+                if name in exclude:
+                    exclude.remove(name)
+            # Ctrl-click follows ZipPlaFork's OR include gesture while keeping
+            # the existing exclusion list and filename/rating predicates.
+        if modifier_flags & Qt.KeyboardModifier.ControlModifier:
+            tag_match = 'any'
+        else:
+            tag_match = self.browser_filter_state.tag_match
+        self._set_browser_filter(
+            BrowserFilterState.normalized(
+                search_text=self.browser_search_edit.text(),
+                rating_mode=self.browser_filter_state.rating_mode,
+                rating_reference=self.browser_filter_state.rating_reference,
+                include_tags=tuple(include),
+                exclude_tags=tuple(exclude),
+                tag_match=tag_match,
+            )
+        )
 
     def _coerce_list_view_state_to_visible(
         self,
@@ -4268,6 +4745,9 @@ class BrowserWindow(QMainWindow):
             thumbnail_display_mode=self.browser_thumbnail_display_mode,
             cell_padding=self.browser_cell_padding,
             filename_display=self.browser_filename_display,
+            filename_elide_mode=self.browser_filename_elide_mode,
+            filename_font_size=self.browser_filename_font_size,
+            show_filename_extension=self.browser_filename_show_extension,
             filename_gap=self.browser_filename_gap,
             filename_padding_y=self.browser_filename_padding_y,
             item_spacing_x=self.browser_item_spacing_x,
@@ -4338,6 +4818,8 @@ class BrowserWindow(QMainWindow):
         self,
         paths: tuple[str, ...],
         rating: int | None,
+        *,
+        tag_changes: dict[str, bool | None] | None = None,
     ) -> bool:
         """Apply filename ratings without rescanning or decoding thumbnails."""
 
@@ -4363,6 +4845,13 @@ class BrowserWindow(QMainWindow):
             )
         if not existing_items:
             return False
+        if tag_changes is not None:
+            # A draft applied without edits must not close an open Viewer.
+            existing_items = [(path, kind) for path, kind in existing_items
+                              if ZipPlaFilenameMetadata.parse(path).with_tag_changes(tag_changes)
+                              != ZipPlaFilenameMetadata.parse(path)]
+            if not existing_items:
+                return False
         existing = tuple(path for path, _kind in existing_items)
         # A selection-triggered Pillow header probe briefly owns a Windows
         # file handle. Retire its stale pending work and drain only the active
@@ -4389,23 +4878,23 @@ class BrowserWindow(QMainWindow):
         batch = _RatingRenameBatch(
             normalized_rating,
             state,
+            tag_edit=tag_changes is not None,
         )
         for path, kind in existing_items:
+            original_metadata = ZipPlaFilenameMetadata.parse(path)
+            metadata = (original_metadata.with_tag_changes(tag_changes) if tag_changes is not None
+                        else original_metadata.with_rating(normalized_rating))
+            if tag_changes is not None and metadata == original_metadata:
+                continue
             if kind is BrowserItemKind.FOLDER:
-                destination = (
-                    ZipPlaFilenameMetadata.parse(path)
-                    .with_rating(normalized_rating)
-                    .serialized_path(is_directory=True)
-                )
-                if self._same_path(Path(path), destination):
+                destination = metadata.serialized_path(is_directory=True)
+                if str(Path(path)) == str(destination):
                     continue
                 batch.pending_folders.append((path, destination.name))
                 continue
 
-            result = self.rating_rename_service.set_rating(
-                path,
-                normalized_rating,
-            )
+            result = (self.rating_rename_service.set_metadata(metadata) if tag_changes is not None
+                      else self.rating_rename_service.set_rating(path, normalized_rating))
             if not result.success:
                 batch.failures.append(
                     f"{Path(path).name}: {result.error_message or tr('変更できません')}"
@@ -4462,7 +4951,8 @@ class BrowserWindow(QMainWindow):
             and item.destination_path
         ):
             batch.replacements.append(
-                (item.source_path, item.destination_path, batch.rating)
+                (item.source_path, item.destination_path,
+                 ZipPlaFilenameMetadata.parse(item.destination_path).rating)
             )
         else:
             source = (
@@ -4517,6 +5007,7 @@ class BrowserWindow(QMainWindow):
         changed_count = len(replacements)
         if batch.failures:
             summary = (
+                tr('タグ変更: {p0}件成功、{p1}件失敗', p0=changed_count, p1=len(batch.failures)) if getattr(batch, 'tag_edit', False) else
                 tr('レート変更: {p0}件成功、{p1}件失敗', p0=changed_count, p1=len(batch.failures))
             )
             self._show_temporary_status(summary, 5000)
@@ -4524,8 +5015,42 @@ class BrowserWindow(QMainWindow):
                 "%s: %s", summary, "; ".join(batch.failures)
             )
         elif changed_count:
-            self._show_temporary_status(tr('{p0}件のレートを変更しました', p0=changed_count))
+            self._show_temporary_status(tr('{p0}件のタグを変更しました', p0=changed_count) if getattr(batch, 'tag_edit', False) else
+                                        tr('{p0}件のレートを変更しました', p0=changed_count))
         return changed_count > 0 and not batch.failures
+
+    def manage_tags(self, new_names=()) -> None:
+        from .browser_tag_dialogs import TagManagerDialog
+        registry = list(self.config.get('browser_tag_registry', []))
+        registry.extend({'name': name, 'color': '#80bfff'} for name in new_names
+                        if name not in {tag['name'] for tag in registry})
+        dialog = TagManagerDialog(registry, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.config.apply({'browser_tag_registry': dialog.registry()}, save=True)
+
+    def edit_selected_tags(self, paths=None) -> None:
+        from .browser_tag_dialogs import ItemTagsDialog
+        paths = tuple(paths) if paths is not None else self.selected_file_operation_paths()
+        if not paths or self.file_operation_coordinator.busy or self._rating_batch is not None:
+            return
+        dialog = ItemTagsDialog(paths, self.config.get('browser_tag_registry', []), self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.set_tags_for_paths(paths, dialog.changes())
+
+    def set_tags_for_paths(self, paths: tuple[str, ...], changes: dict[str, bool | None]) -> bool:
+        return self.set_rating_for_paths(paths, None, tag_changes=changes)
+
+    def edit_tag_filter(self) -> None:
+        from .browser_tag_dialogs import TagFilterDialog
+        dialog = TagFilterDialog(self.browser_filter_state, self.config.get('browser_tag_registry', []), self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._browser_search_timer.stop()
+            self._set_browser_filter(BrowserFilterState.normalized(
+                search_text=self.browser_search_edit.text(),
+                rating_mode=self.browser_filter_state.rating_mode,
+                rating_reference=self.browser_filter_state.rating_reference,
+                **dialog.filter_values(),
+            ))
 
     @staticmethod
     def _format_file_size(size: int | None) -> str:
@@ -4751,6 +5276,7 @@ class BrowserWindow(QMainWindow):
             self.config,
             self,
             cache_usage_getter=self.thumbnail_provider.disk_cache_usage_bytes,
+            pdfium_service=self.pdfium_service,
             cache_statistics_getter=self.thumbnail_provider.cache_statistics,
             seven_zip_locator=(
                 self.archive_backend_registry.locator
@@ -4781,11 +5307,26 @@ class BrowserWindow(QMainWindow):
             QEvent.Type.Show,
             QEvent.Type.ScreenChangeInternal,
         }:
+            if event.type() == QEvent.Type.Show:
+                self._update_tag_quick_filter_geometry(force=True)
             QTimer.singleShot(0, self._install_screen_tracking)
             QTimer.singleShot(0, self._reevaluate_thumbnail_dpr)
         return handled
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
+        if (
+            watched in (self.list_view, self.list_view.viewport(), getattr(self, 'rating_filter_widget', None))
+            and event.type() == QEvent.Type.KeyPress
+            and isinstance(event, QKeyEvent)
+            and event.key() == Qt.Key.Key_Escape
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and QApplication.activeModalWidget() is None
+            and QApplication.activePopupWidget() is None
+            and (self.browser_search_edit.text()
+                 or self.browser_filter_state != BrowserFilterState.normalized())
+        ):
+            self.clear_browser_filters()
+            return True
         if (
             watched in (self.list_view, self.list_view.viewport())
             and isinstance(event, QContextMenuEvent)
@@ -4945,6 +5486,7 @@ class BrowserWindow(QMainWindow):
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
         super().resizeEvent(event)
+        self._update_tag_quick_filter_geometry()
         if hasattr(self, "location_directory_loader"):
             self._close_location_directory_popup(cancel_pending=True)
             self._close_owned_popup("_navigation_history_menu")
@@ -5107,6 +5649,9 @@ class BrowserWindow(QMainWindow):
             thumbnail_display_mode=self.browser_thumbnail_display_mode,
             cell_padding=self.browser_cell_padding,
             filename_display=self.browser_filename_display,
+            filename_elide_mode=self.browser_filename_elide_mode,
+            filename_font_size=self.browser_filename_font_size,
+            show_filename_extension=self.browser_filename_show_extension,
             filename_gap=self.browser_filename_gap,
             filename_padding_y=self.browser_filename_padding_y,
             item_spacing_x=self.browser_item_spacing_x,
@@ -5404,6 +5949,13 @@ class BrowserWindow(QMainWindow):
         rating_layout.setContentsMargins(4, 0, 6, 0)
         rating_layout.setSpacing(BROWSER_CHROME_CONTROL_SPACING)
         rating_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self._rating_filter_layout = rating_layout
+        self.tag_quick_filter_strip = BrowserTagQuickFilterStrip(
+            self.rating_filter_container
+        )
+        self.tag_quick_filter_strip.activated.connect(
+            self._on_tag_quick_filter_activated
+        )
         self.rating_filter_widget = BrowserRatingFilterWidget(
             self.rating_filter_container
         )
@@ -5425,8 +5977,24 @@ class BrowserWindow(QMainWindow):
             Qt.ShortcutContext.WidgetShortcut
         )
         self.clear_browser_search_shortcut.activated.connect(
-            self.browser_search_edit.clear
+            self.clear_browser_filters
         )
+        self.rating_filter_widget.installEventFilter(self)
+        self.tag_button = QToolButton(self)
+        self.tag_button.setText(tr('タグ'))
+        self.tag_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.tag_menu = QMenu(self.tag_button)
+        self.tag_button.setMenu(self.tag_menu)
+        self._reserve_tag_button_width()
+        self._rebuild_tag_menu()
+        rating_layout.insertWidget(
+            0,
+            self.tag_button,
+            0,
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+        self._sync_tag_quick_filter_registry()
+        self.item_delegate.tag_registry = self.config.get('browser_tag_registry', [])
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.navigation_toolbar)
 
         self.focus_address_shortcut = QShortcut(QKeySequence("Ctrl+L"), self)
@@ -6883,6 +7451,10 @@ class BrowserWindow(QMainWindow):
         open_action = menu.addAction(tr('開く'))
         open_with_action = menu.addAction(tr('関連付けで開く...'))
         location_action = menu.addAction(tr('エクスプローラーで開く'))
+        current_location_action = (
+            menu.addAction(tr('現在の階層をエクスプローラーで開く'))
+            if item is not None and item.kind is BrowserItemKind.FOLDER else None
+        )
         target_exists = bool(
             item is not None
             and self._absolute_browser_path(item.path).exists()
@@ -6895,6 +7467,13 @@ class BrowserWindow(QMainWindow):
             and target_exists
         )
         location_action.setEnabled(item is not None and target_exists)
+        if current_location_action is not None:
+            current_location_action.setEnabled(target_exists)
+        menu.addSeparator()
+        zip_action = menu.addAction(tr('zipに圧縮'))
+        zip_action.setEnabled(
+            selection_count > 0 and self.current_path is not None and not busy
+        )
         menu.addSeparator()
         cut_action = menu.addAction(tr('切り取り'))
         copy_action = menu.addAction(tr('コピー'))
@@ -6910,9 +7489,11 @@ class BrowserWindow(QMainWindow):
             and bool(self._clipboard_paths or self._clipboard_file_urls())
         )
         menu.addSeparator()
-        recycle_action = menu.addAction(tr('削除'))
-        recycle_action.setEnabled(selection_count > 0 and not busy)
         rating_menu = menu.addMenu(tr('レート'))
+        from .browser_tag_dialogs import TagSelectionMenu
+        tags_menu = TagSelectionMenu(rating_paths, self.config.get('browser_tag_registry', []), menu)
+        menu.addMenu(tags_menu)
+        tags_menu.setEnabled(bool(rating_paths) and not busy and self._rating_batch is None)
         rating_actions: dict[QAction, int | None] = {}
         for label, value in (
             (tr('なし'), None),
@@ -6926,12 +7507,18 @@ class BrowserWindow(QMainWindow):
             action.setEnabled(bool(rating_paths) and not busy)
             rating_actions[action] = value
         menu.addSeparator()
+        recycle_action = menu.addAction(tr('削除'))
+        recycle_action.setEnabled(selection_count > 0 and not busy)
+        menu.addSeparator()
         properties_action = menu.addAction(tr('プロパティ'))
         properties_action.setEnabled(selection_count == 1 and not busy)
         anchor = position
         if keyboard and not self.list_view.viewport().rect().contains(anchor):
             anchor = self.list_view.viewport().rect().center()
         selected = menu.exec(self.list_view.viewport().mapToGlobal(anchor))
+        if tags_menu.changes():
+            self.set_tags_for_paths(rating_paths, tags_menu.changes())
+            return
         if filename_edit is not None and selected == selected_text_copy:
             filename_edit.copy_selected_text()
         elif filename_edit is not None and selected == selected_text_search:
@@ -6947,6 +7534,8 @@ class BrowserWindow(QMainWindow):
             self._open_with_application_picker(item)
         elif selected == location_action and item is not None:
             self._open_item_in_explorer(item)
+        elif current_location_action is not None and selected == current_location_action:
+            self._open_current_folder_in_explorer(item)
         elif selected == cut_action:
             self.cut_selected_items()
         elif selected == copy_action:
@@ -6957,8 +7546,14 @@ class BrowserWindow(QMainWindow):
             self.paste_items()
         elif selected == recycle_action:
             self.move_selected_to_recycle_bin()
+        elif selected == zip_action:
+            self.compress_selected_to_zip()
         elif selected in rating_actions:
             self.set_rating_for_paths(rating_paths, rating_actions[selected])
+        elif selected == tags_menu.editor_action:
+            self.manage_tags()
+        elif selected == tags_menu.import_action:
+            self.manage_tags(tags_menu.unknown)
         elif selected == properties_action:
             self.show_selected_properties()
 

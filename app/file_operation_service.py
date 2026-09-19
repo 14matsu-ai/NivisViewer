@@ -10,6 +10,7 @@ import shutil
 import stat
 import time
 import uuid
+import zipfile
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -34,6 +35,7 @@ class FileOperationKind(str, Enum):
     MOVE = "move"
     RECYCLE = "recycle"
     CREATE_DIRECTORY = "create_directory"
+    CREATE_ZIP = "create_zip"
 
 
 class FileCollisionPolicy(str, Enum):
@@ -288,6 +290,8 @@ class FileOperationService:
         cancel_event = cancelled or Event()
         if request.operation is FileOperationKind.CREATE_DIRECTORY:
             return self._create_directory(request, cancel_event, progress)
+        if request.operation is FileOperationKind.CREATE_ZIP:
+            return self._create_zip(request, cancel_event, progress)
 
         sources = self._prepare_sources(request.source_paths)
         results: list[FileOperationItemResult] = []
@@ -1021,6 +1025,161 @@ class FileOperationService:
             operation_id=request.operation_id,
         )
 
+    def _create_zip(
+        self,
+        request: FileOperationRequest,
+        cancelled: Event,
+        progress: ProgressCallback | None,
+    ) -> FileOperationResult:
+        destination: str | None = None
+        temporary: str | None = None
+        owns_temporary = False
+        published = False
+        copied_bytes = 0
+        last_progress = 0.0
+
+        def check_cancel() -> None:
+            if cancelled.is_set():
+                raise _OperationCancelled
+
+        def write_entry(archive: zipfile.ZipFile, source: str, name: str) -> None:
+            nonlocal copied_bytes, last_progress
+            check_cancel()
+            if FileOperationArtifactPolicy.is_internal_operation_artifact(source):
+                raise OSError(tr('未完了の一時ファイルはZIPに含められません'))
+            source_stat = os.lstat(source)
+            if stat.S_ISLNK(source_stat.st_mode) or self._is_reparse_path(source):
+                raise OSError(tr('リンクやジャンクションはZIPに含められません'))
+            if stat.S_ISDIR(source_stat.st_mode):
+                archive.writestr(name + "/", b"")
+                with os.scandir(source) as entries:
+                    for entry in entries:
+                        write_entry(archive, entry.path, name + "/" + entry.name)
+            elif stat.S_ISREG(source_stat.st_mode):
+                info = zipfile.ZipInfo.from_file(source, name, strict_timestamps=False)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                with (
+                    open(source, "rb") as reader,
+                    archive.open(info, "w", force_zip64=True) as writer,
+                ):
+                    while True:
+                        check_cancel()
+                        chunk = reader.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        writer.write(chunk)
+                        copied_bytes += len(chunk)
+                        now = time.monotonic()
+                        if progress is not None and now - last_progress >= 0.1:
+                            last_progress = now
+                            progress(FileOperationProgress(
+                                request.request_id, request.operation, 0, 1,
+                                source, destination,
+                                bytes_completed=copied_bytes,
+                                bytes_total=request.planned_total_bytes,
+                                operation_id=request.operation_id,
+                            ))
+            else:
+                raise OSError(tr('通常のファイルまたはフォルダだけをZIPにできます'))
+
+        try:
+            check_cancel()
+            validation = validate_windows_filename(request.new_name or "")
+            if not validation.valid:
+                raise ValueError(validation.error_message or tr('名前が無効です'))
+            parent = self._absolute(request.destination_directory)
+            if not request.destination_directory or not os.path.isdir(parent):
+                raise NotADirectoryError(tr('作成先がフォルダではありません'))
+            destination = os.path.join(parent, validation.normalized_name)
+            sources = self._prepare_sources(request.source_paths)
+            if not sources:
+                raise ValueError(tr('圧縮する項目が選択されていません'))
+            # Browser selections are direct children of the output folder.
+            # Enforce that boundary so the archive cannot include its own staging file.
+            if any(
+                self._path_key(os.path.dirname(source)) != self._path_key(parent)
+                for source in sources
+            ):
+                raise ValueError(tr('現在のフォルダ内の項目を選択してください'))
+            temporary = FileOperationArtifactPolicy.create_staging_path(destination)
+            with open(temporary, "xb") as output:
+                owns_temporary = True
+                with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                    for source in sources:
+                        write_entry(archive, source, os.path.basename(source))
+            stem, suffix = os.path.splitext(validation.normalized_name)
+            number = 0
+            while True:
+                check_cancel()
+                name = (
+                    validation.normalized_name if number == 0
+                    else f"{stem} ({number}){suffix}"
+                )
+                if not validate_windows_filename(name).valid:
+                    raise ValueError(tr('名前が長すぎます'))
+                destination = os.path.join(parent, name)
+                number += 1
+                if self._name_exists(destination):
+                    continue
+                try:
+                    if os.name == "nt":
+                        os.rename(temporary, destination)  # Windows: never replaces.
+                    else:
+                        os.link(temporary, destination)  # POSIX: never replaces.
+                    break
+                except FileExistsError:
+                    # Another operation may publish after the name check.
+                    continue
+            published = True
+            item = FileOperationItemResult(
+                None, destination, True, operation=request.operation,
+                destination_exists_after=True, destination_published=True,
+                copied_bytes=copied_bytes, published_destination_paths=(destination,),
+            )
+        except _OperationCancelled:
+            item = self._failure(
+                None, destination, FileOperationErrorCode.CANCELLED,
+                tr('操作がキャンセルされました'), operation=request.operation,
+            )
+        except FileExistsError as exc:
+            item = self._failure(
+                None, destination, FileOperationErrorCode.COLLISION,
+                str(exc), operation=request.operation,
+            )
+        except ValueError as exc:
+            item = self._failure(
+                None, destination, FileOperationErrorCode.INVALID_NAME,
+                str(exc), operation=request.operation,
+            )
+        except BaseException as exc:
+            item = self._exception_failure(None, destination, exc, operation=request.operation)
+        finally:
+            if owns_temporary and temporary is not None:
+                cleanup = FileOperationArtifactPolicy.cleanup_staging_path(temporary)
+                if not cleanup.removed:
+                    item = replace(
+                        item, success=False,
+                        error_code=FileOperationErrorCode.ARTIFACT_CLEANUP_FAILED.value,
+                        error_message=cleanup.error_message,
+                        artifact_paths=(temporary,),
+                        cleanup_errors=(cleanup.error_message or "cleanup failed",),
+                        destination_published=published,
+                        partial_success=published,
+                        state=FileOperationItemState.FAILED,
+                        lifecycle_state=FileOperationLifecycleState.FAILED,
+                    )
+        if progress is not None and item.success:
+            progress(FileOperationProgress(
+                request.request_id, request.operation, 1, 1,
+                destination_path=destination, bytes_completed=copied_bytes,
+                bytes_total=copied_bytes, operation_id=request.operation_id,
+            ))
+        return FileOperationResult(
+            request.operation, (item,),
+            cancelled=item.error_code == FileOperationErrorCode.CANCELLED.value,
+            request_id=request.request_id, operation_id=request.operation_id,
+        )
+
     def _copy_atomic(
         self, source: str, destination: str, cancelled: Event,
         *, replace_existing: bool = False,
@@ -1737,13 +1896,15 @@ class FileOperationService:
     @classmethod
     def _name_exists(cls, path: str, *, ignore_path: str | None = None) -> bool:
         target_name = os.path.basename(path).casefold()
-        ignore_key = cls._path_key(ignore_path) if ignore_path else None
+        ignore_entry = os.path.abspath(ignore_path) if ignore_path else None
         try:
             with os.scandir(os.path.dirname(path)) as entries:
                 for entry in entries:
                     if entry.name.casefold() != target_name:
                         continue
-                    if ignore_key is not None and cls._path_key(entry.path) == ignore_key:
+                    # Ignore only the actual source entry, not another object
+                    # with the same folded name in a case-sensitive directory.
+                    if ignore_entry is not None and os.path.abspath(entry.path) == ignore_entry:
                         continue
                     return True
         except OSError:

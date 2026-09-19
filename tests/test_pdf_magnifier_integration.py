@@ -117,6 +117,9 @@ def pdf_window(tmp_path, qapp):
 @pytest.mark.parametrize("rotation,direction", [(0, "ltr"), (0, "rtl"), (90, "ltr"), (270, "rtl")])
 def test_pdf_loupe_survives_resolution_refresh(pdf_window, qapp, spread, prepared, rotation, direction):
     window, backend = pdf_window
+    # Leave real canvas margins even with two unrotated pages.
+    if spread and rotation == 0:
+        window.resize(1200, 480)
     window.set_reading_direction(direction)
     for _ in range(rotation // 90):
         window.rotate_right()
@@ -171,6 +174,26 @@ def test_pdf_loupe_survives_resolution_refresh(pdf_window, qapp, spread, prepare
             _paint(widget)
         assert widget._pdf_loupe_requests == keys
         assert len(backend.requests) == requests
+    # Moving outside the pages samples Viewer background, without new PDF work.
+    keys = dict(widget._pdf_loupe_requests)
+    requests = len(backend.requests)
+    margin = next(point for point in (
+        QPoint(2, 2), QPoint(widget.width() - 3, 2),
+        QPoint(2, widget.height() - 3),
+    ) if not any(rect.adjusted(-2, -2, 2, 2).contains(point) for rect in normal_rects))
+    widget._update_magnifier_selection(margin)
+    assert _paint(widget).pixelColor(widget.width() // 2, widget.height() // 2) == widget.background_color
+    assert widget._pdf_loupe_requests == keys
+    assert len(backend.requests) == requests
+    widget._mouse_pos = margin
+    window.config.apply({'magnifier_allow_outside_image': False})
+    assert not widget.magnifier_allow_outside_image
+    assert widget.magnifier_active or widget.magnifier_selecting
+    window.config.apply({'magnifier_allow_outside_image': True})
+    assert widget.magnifier_allow_outside_image
+    _settle(window, qapp)
+    assert _paint(widget).pixelColor(widget.width() // 2, widget.height() // 2) == widget.background_color
+    widget._update_magnifier_selection(normal_rects[0].center())
     # A same-page refresh with an already prepared frame must retain the lens.
     unit = window.model.spread_at()
     widget.prepare_display_units([(0, unit, list(widget._images), True)])

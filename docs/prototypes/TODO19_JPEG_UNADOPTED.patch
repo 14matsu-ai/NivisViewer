@@ -1,0 +1,172 @@
+diff --git a/app/thumbnail_provider.py b/app/thumbnail_provider.py
+index fd092f3..5e09807 100644
+--- a/app/thumbnail_provider.py
++++ b/app/thumbnail_provider.py
+@@ -37,6 +37,7 @@ from .thumbnail_render import (
+     ThumbnailRenderSpec,
+     pil_to_qimage,
+     render_pil_thumbnail,
++    render_owned_jpeg_letterbox,
+     smart_crop_cache_key,
+ )
+ 
+@@ -1549,9 +1550,8 @@ class BrowserThumbnailProvider(QObject):
+     ) -> QImage | None:
+         try:
+             stat = path.stat()
+-            with Image.open(path) as image:
+-                rendered, _crop = BrowserThumbnailProvider._render_image(
+-                    image,
++            rendered, _crop = BrowserThumbnailProvider._render_thumbnail_source(
++                    path,
+                     spec,
+                     smart_crop_cache,
+                     smart_crop_cache_key(
+@@ -1561,7 +1561,7 @@ class BrowserThumbnailProvider(QObject):
+                         ratio_id=spec.frame_ratio_id,
+                     ),
+                 )
+-                return rendered
++            return rendered
+         except Exception:
+             return None
+ 
+@@ -1685,9 +1685,8 @@ class BrowserThumbnailProvider(QObject):
+                     try:
+                         with source.open(name, "r") as file:
+                             data = file.read()
+-                        with Image.open(BytesIO(data)) as image:
+-                            qimage, _crop = BrowserThumbnailProvider._render_image(
+-                                image,
++                        qimage, _crop = BrowserThumbnailProvider._render_thumbnail_source(
++                                data,
+                                 spec,
+                                 smart_crop_cache,
+                                 smart_crop_cache_key(
+@@ -1818,6 +1817,34 @@ class BrowserThumbnailProvider(QObject):
+         prepared.thumbnail((size, size), Image.Resampling.LANCZOS)
+         return pil_to_qimage(prepared)
+ 
++    @staticmethod
++    def _render_thumbnail_source(
++        source: Path | bytes,
++        spec: ThumbnailRenderSpec,
++        smart_crop_cache: SmartCropCache | None,
++        crop_key: tuple[object, ...],
++    ) -> tuple[QImage, tuple[float, float, float, float] | None]:
++        # These inputs own a fresh decode, unlike external/PDF/shared PIL inputs.
++        def open_source():
++            return Image.open(BytesIO(source) if isinstance(source, bytes) else source)
++
++        with open_source() as image:
++            original_size = image.size
++            try:
++                rendered = render_owned_jpeg_letterbox(image, spec)
++            except Exception:
++                # A failed draft/load may have mutated decoder state. Reopen
++                # below for a real full-resolution fallback; never reuse it.
++                pass
++            else:
++                if rendered is not None:
++                    _THUMBNAIL_LOG.debug("JPEG letterbox source=%s cache=%sx%s",
++                                         original_size, rendered.width(), rendered.height())
++                    return rendered, None
++                return BrowserThumbnailProvider._render_image(image, spec, smart_crop_cache, crop_key)
++        with open_source() as image:
++            return BrowserThumbnailProvider._render_image(image, spec, smart_crop_cache, crop_key)
++
+     @staticmethod
+     def _render_image(
+         image: Image.Image,
+diff --git a/app/thumbnail_render.py b/app/thumbnail_render.py
+index f9f43ad..51748ef 100644
+--- a/app/thumbnail_render.py
++++ b/app/thumbnail_render.py
+@@ -148,6 +148,15 @@ class ThumbnailRenderSpec:
+     logical_thumbnail_size: int = 0
+     preserve_alpha: bool = False
+     matte_color: str = "#ffffff"
++    jpeg_letterbox_version: int = 1
++
++    @property
++    def _decode_variant(self) -> str:
++        # Lazy regeneration, including compatible-size lookup. Crop families
++        # keep their old identity; no global cache/schema reset is needed.
++        if self.crop_mode == "letterbox" and self.jpeg_letterbox_version:
++            return f"|jpeg-letterbox:{self.jpeg_letterbox_version}"
++        return ""
+ 
+     @property
+     def encoding_policy(self) -> ThumbnailEncodingPolicy:
+@@ -227,7 +236,7 @@ class ThumbnailRenderSpec:
+             f"{self.crop_mode}|{self.quality_mode}|{self.encoder_format}|"
+             f"{self.encoder_quality}|{self.render_policy_version}|"
+             f"{self.smart_crop_version}|{self.implementation_version}"
+-            f"{display_variant}{logical_variant}|{self.encoding_policy.alpha_token}"
++            f"{display_variant}{logical_variant}|{self.encoding_policy.alpha_token}{self._decode_variant}"
+         ).encode("utf-8")
+         return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & (
+             (1 << 63) - 1
+@@ -245,7 +254,7 @@ class ThumbnailRenderSpec:
+             f"{self.frame_ratio_id}|{self.crop_mode}|{self.quality_mode}|"
+             f"{self.encoder_format}|{self.encoder_quality}|"
+             f"{self.render_policy_version}|{self.smart_crop_version}|"
+-            f"{self.implementation_version}{display_variant}|{self.encoding_policy.alpha_token}"
++            f"{self.implementation_version}{display_variant}|{self.encoding_policy.alpha_token}{self._decode_variant}"
+         ).encode("utf-8")
+         return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & (
+             (1 << 63) - 1
+@@ -481,6 +490,53 @@ def detect_smart_crop(
+         return normalized_center_crop(image.size, target_size)
+ 
+ 
++def render_owned_jpeg_letterbox(
++    image: Image.Image,
++    spec: ThumbnailRenderSpec,
++) -> QImage | None:
++    """Consume a fresh caller-owned JPEG; None requests the ordinary renderer.
++
++    Never pass a shared/reusable PIL image here: draft changes decoder state.
++    The owner must reopen its source before fallback if this raises. Original
++    source metadata must be captured before entry, not from the reduced image.
++    """
++    if spec.crop_mode != "letterbox" or image.format != "JPEG" or image.mode not in {"RGB", "L"}:
++        return None
++    orientation = image.getexif().get(274, 1)
++    if type(orientation) is not int or orientation not in range(1, 9):
++        return None
++    swapped = orientation in {5, 6, 7, 8}
++    width, height = image.size[::-1] if swapped else image.size
++    bound_width, bound_height = spec.frame_width, spec.frame_height
++    if min(width, height, bound_width, bound_height) <= 0:
++        return None
++    if width <= bound_width and height <= bound_height:
++        return None
++    # Match the full renderer's integer aspect fit using ORIGINAL oriented
++    # dimensions, not the rounded dimensions produced by native JPEG scaling.
++    aspect = width / height
++    if width * bound_height <= height * bound_width:
++        exact = bound_height * aspect
++        fitted_width = max(1, min((math.floor(exact), math.ceil(exact)),
++                                  key=lambda value: abs(aspect - value / bound_height)))
++        target = (fitted_width, bound_height)
++    else:
++        exact = bound_width / aspect
++        fitted_height = max(1, min((math.floor(exact), math.ceil(exact)),
++                                   key=lambda value: abs(aspect - bound_width / value) if value else math.inf))
++        target = (bound_width, fitted_height)
++    raw_target = target[::-1] if swapped else target
++    # A 3x intermediate margin retains detail before the final LANCZOS resize.
++    # Pillow's draft box preserves fractional edges for odd JPEG dimensions.
++    drafted = image.draft(None, tuple(value * 3 for value in raw_target))
++    image.load()
++    with image.resize(raw_target, Image.Resampling.LANCZOS,
++                      box=drafted[1] if drafted else None,
++                      reducing_gap=3.0) as reduced:
++        with ImageOps.exif_transpose(reduced) as oriented:
++            return pil_to_qimage(oriented)
++
++
+ def render_pil_thumbnail(
+     image: Image.Image,
+     spec: ThumbnailRenderSpec,

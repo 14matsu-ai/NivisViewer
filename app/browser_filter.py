@@ -72,6 +72,9 @@ class BrowserFilterState:
     search_text: str = ""
     rating_mode: RatingFilterMode = RatingFilterMode.OFF
     rating_reference: int = 0
+    include_tags: tuple[str, ...] = ()
+    exclude_tags: tuple[str, ...] = ()
+    tag_match: str = 'all'
     _predicates: tuple[BrowserItemPredicate, ...] = field(
         init=False,
         repr=False,
@@ -91,6 +94,9 @@ class BrowserFilterState:
         object.__setattr__(self, "search_text", str(self.search_text))
         object.__setattr__(self, "rating_mode", mode)
         object.__setattr__(self, "rating_reference", reference)
+        object.__setattr__(self, 'include_tags', tuple(dict.fromkeys(self.include_tags)))
+        object.__setattr__(self, 'exclude_tags', tuple(dict.fromkeys(self.exclude_tags)))
+        object.__setattr__(self, 'tag_match', 'any' if self.tag_match == 'any' else 'all')
         object.__setattr__(
             self,
             "_predicates",
@@ -107,6 +113,9 @@ class BrowserFilterState:
         search_text: object = "",
         rating_mode: object = RatingFilterMode.OFF,
         rating_reference: object = 0,
+        include_tags: tuple[str, ...] = (),
+        exclude_tags: tuple[str, ...] = (),
+        tag_match: str = 'all',
     ) -> BrowserFilterState:
         mode = normalize_rating_filter_mode(rating_mode)
         try:
@@ -117,17 +126,27 @@ class BrowserFilterState:
             reference = max(1, min(5, reference))
         else:
             reference = 0
-        return cls(str(search_text), mode, reference)
+        return cls(str(search_text), mode, reference, include_tags, exclude_tags, tag_match)
 
     @property
     def active(self) -> bool:
-        return bool(self.search_text.strip()) or self.rating_mode is not RatingFilterMode.OFF
+        return bool(self.search_text.strip() or self.include_tags or self.exclude_tags) or self.rating_mode is not RatingFilterMode.OFF
 
     def predicates(self) -> tuple[BrowserItemPredicate, ...]:
         return self._predicates
 
     def matches(self, item: BrowserItem) -> bool:
-        return all(predicate.matches(item) for predicate in self.predicates())
+        if not all(predicate.matches(item) for predicate in self.predicates()):
+            return False
+        if not self.include_tags and not self.exclude_tags:
+            return True
+        from .browser_tags import filename_tags
+        tags = set(filename_tags(str(item.path)))
+        include = not self.include_tags or (
+            any(name in tags for name in self.include_tags) if self.tag_match == 'any'
+            else all(name in tags for name in self.include_tags)
+        )
+        return include and not any(name in tags for name in self.exclude_tags)
 
 
 __all__ = [

@@ -1,6 +1,12 @@
-"""Header-only image dimension probe for the Browser detail bar."""
+"""Worker-side image dimension probe for the Browser detail bar.
+
+Some Pillow plugins (including JPEG XL) decode pixels during Image.open, so
+dimension probing must stay off the GUI thread even without an explicit load.
+"""
 
 from __future__ import annotations
+
+from . import pillow_plugins  # noqa: F401 - also supports standalone probes
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,8 +37,8 @@ class _ProbeWorker(QRunnable):
     def run(self) -> None:
         dimensions: tuple[int, int] | None = None
         try:
-            # Pillow parses the container/header here but ``load`` is never
-            # called, so selecting an item cannot decode its pixel payload.
+            # Do not request a separate pixel load. Image.open itself may
+            # decode the full payload in plugins such as pillow-jxl-plugin.
             with Image.open(self.path) as image:
                 width, height = image.size
                 try:
@@ -42,7 +48,10 @@ class _ProbeWorker(QRunnable):
                 if orientation in {5, 6, 7, 8}:
                     width, height = height, width
                 dimensions = (max(1, int(width)), max(1, int(height)))
-        except (OSError, ValueError):
+        except Exception:
+            # Third-party codecs can raise RuntimeError (or other ordinary
+            # exceptions) for incomplete/corrupt payloads. Always complete
+            # the probe so its owner can release this worker.
             dimensions = None
         self.signals.completed.emit(
             BrowserImageDetailResult(

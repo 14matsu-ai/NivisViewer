@@ -23,6 +23,7 @@ class BrowserGridMetrics:
     filename_display: str = "one_line"
     filename_gap: int = 0
     filename_padding_y: int = 0
+    filename_font_size: int = 0
     horizontal_margin: int = 0
     cell_padding: int = 0
     item_spacing_x: int = 0
@@ -100,6 +101,7 @@ def build_browser_grid_metrics(
     filename_display: str,
     filename_gap: int,
     filename_padding_y: int,
+    filename_font_size: int = 0,
     horizontal_margin: int,
     cell_padding: int,
     item_spacing_x: int = 0,
@@ -115,6 +117,7 @@ def build_browser_grid_metrics(
         ),
         filename_gap=max(0, min(32, int(filename_gap))),
         filename_padding_y=max(0, min(16, int(filename_padding_y))),
+        filename_font_size=max(0, min(24, int(filename_font_size))),
         horizontal_margin=max(0, int(horizontal_margin)),
         cell_padding=max(0, min(12, int(cell_padding))),
         item_spacing_x=max(0, min(32, int(item_spacing_x))),
