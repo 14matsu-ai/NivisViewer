@@ -6,7 +6,7 @@ from threading import Event
 from time import monotonic
 
 import pytest
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication
 
 from app.browser_model import (
@@ -135,6 +135,55 @@ def make_committed_window(
     qapp.processEvents()
     assert window.current_path == initial.absolute()
     return window, scanner
+
+
+def test_initial_chrome_paints_before_initial_scan_completes(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "起動時のフォルダ"
+    folder.mkdir()
+    scanner = FakeScanner()
+    window = BrowserWindow(
+        config_manager=make_config(tmp_path, folder),
+        scanner=scanner,
+    )
+    painted: set[str] = set()
+    surfaces = {
+        "menu": window.menuBar(),
+        "list": window.list_view.viewport(),
+        "status": window.statusBar(),
+    }
+
+    class PaintRecorder(QObject):
+        def eventFilter(self, watched, event):
+            if event.type() == QEvent.Type.Paint:
+                painted.update(
+                    name for name, widget in surfaces.items() if watched is widget
+                )
+            return False
+
+    recorder = PaintRecorder(window)
+    for widget in surfaces.values():
+        widget.installEventFilter(recorder)
+    try:
+        window.show_initial()
+        for _ in range(3):
+            qapp.processEvents()
+        assert painted == set(surfaces)
+        assert len(scanner.requests) == 1
+        assert window._pending_scan is not None
+        assert window.current_path is None
+        assert "読み込み中" in window.statusBar().currentMessage()
+        complete_empty(scanner, scanner.requests[0])
+        qapp.processEvents()
+        assert window.current_path == folder.absolute()
+        assert window._pending_scan is None
+    finally:
+        for widget in surfaces.values():
+            widget.removeEventFilter(recorder)
+        window.close()
+        qapp.processEvents()
 
 
 def test_navigate_returns_before_scan_and_event_loop_remains_responsive(

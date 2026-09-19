@@ -184,6 +184,7 @@ def test_folder_fallback_background_restore_default_uses_auto(
     assert dialog.browser_folder_fallback_background_combo.currentData() == "auto"
     assert not dialog.browser_folder_fallback_color_button.isEnabled()
     assert dialog.values()["browser_folder_fallback_background"] == "auto"
+    assert dialog.browser_folder_fallback_color_button.text() == "#FFFFE0"
     dialog.reject()
 
 
@@ -627,7 +628,7 @@ def test_viewer_canvas_click_controls_use_requested_labels(
     config = make_config(tmp_path)
     dialog = SettingsDialog(config)
 
-    assert dialog.viewer_canvas_click_direction_combo.currentData() == "right_next"
+    assert dialog.viewer_canvas_click_direction_combo.currentData() == "auto"
     assert dialog.viewer_canvas_left_click_combo.currentData() == "next_single_page"
     assert not dialog.viewer_slider_wheel_single_page_checkbox.isChecked()
     assert [

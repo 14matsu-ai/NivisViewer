@@ -553,6 +553,6 @@ def test_viewer_canvas_side_and_slider_wheel_settings_are_normalized(
 
     restored = ConfigManager(path).load()
 
-    assert restored["viewer_canvas_click_direction"] == "right_next"
+    assert restored["viewer_canvas_click_direction"] == "auto"
     assert restored["viewer_canvas_left_click_action"] == "next_single_page"
     assert restored["viewer_slider_wheel_single_page_enabled"] is False

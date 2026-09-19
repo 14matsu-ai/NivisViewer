@@ -332,7 +332,10 @@ def test_first_selected_count_reuses_q90_metadata_before_retirement(tmp_path, mo
             no_source_read.setattr("zipfile.ZipFile", lambda *_a, **_k: pytest.fail("re-enumerated source"))
             result = provider._load_page_count_pipeline(item, 149)
         assert result.page_count == 42
-        assert cache.statistics()["entry_count"] == 0  # Maintenance still ran.
+        assert cache.statistics()["entry_count"] == 1  # Read is no longer a maintenance barrier.
+        provider.cleanup_caches_async(force=False)
+        assert provider.wait_for_done(3000)
+        assert cache.statistics()["entry_count"] == 0  # Idle maintenance still retires old payloads.
     finally:
         provider.close()
         qapp.processEvents()

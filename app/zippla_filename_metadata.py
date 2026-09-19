@@ -7,7 +7,7 @@ rating authority; NivisViewer does not mirror ratings into its SQLite store.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import re
 
@@ -42,6 +42,7 @@ class ZipPlaFilenameMetadata:
     tags: tuple[str, ...] | None = None
     legacy_direction: str | None = None
     matched: bool = False
+    _tags_only: bool = field(default=False, compare=False, repr=False)
 
     @classmethod
     def parse(cls, path: str | Path) -> ZipPlaFilenameMetadata:
@@ -95,10 +96,30 @@ class ZipPlaFilenameMetadata:
         normalized = int(rating) if rating is not None else None
         if normalized is not None and not 1 <= normalized <= 5:
             normalized = None
-        return replace(self, rating=normalized)
+        return replace(self, rating=normalized, _tags_only=False)
+
+    def with_tag_changes(self, changes: dict[str, bool | None]) -> ZipPlaFilenameMetadata:
+        from .browser_tags import edited_tags
+        original = self.parse(self.original_path)
+        tags_only = (self.cover, self.binding, self.rating, self.legacy_direction) == (
+            original.cover, original.binding, original.rating, original.legacy_direction,
+        )
+        return replace(self, tags=edited_tags(self.tags or (), changes) or None, _tags_only=tags_only)
 
     def serialized_path(self, *, is_directory: bool = False) -> Path:
         """Serialize known metadata in ZipPlaInfo's canonical parameter order."""
+
+        if self._tags_only:
+            match = _INFO_BLOCK_RE.search(self.original_path.name)
+            if match is not None:
+                # Change only t; preserve other parameter text and precision.
+                parts = [part for part in (match.group(1) or '').split(';')
+                         if part.strip() and _PARAMETER_RES[3][1].fullmatch(part) is None]
+                if self.tags:
+                    parts.append('t=' + ','.join(self.tags))
+                block = ' {zpi$' + ';'.join(parts) + '}' if parts else ''
+                name = self.original_path.name
+                return self.original_path.with_name(name[:match.start()] + block + name[match.end():])
 
         name = self.original_path.name
         if is_directory:

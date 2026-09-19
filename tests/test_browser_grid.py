@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QListView, QStyle, QStyleOptionViewItem
 
 from app.browser_item_delegate import (
     BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR,
+    BROWSER_FILE_FALLBACK_DEFAULT_COLOR,
     BROWSER_PLACEHOLDER_ICON_MAX_RATIO,
     BrowserItemDelegate,
     browser_item_type_key,
@@ -201,7 +202,7 @@ def test_center_crop_delegate_fills_frame_from_image_center(qapp):
 
 
 @pytest.mark.parametrize("dark", [False, True])
-def test_folder_without_preview_uses_exact_black_thumbnail_rectangle(
+def test_folder_and_file_without_preview_use_independent_backgrounds(
     qapp,
     tmp_path,
     dark,
@@ -275,10 +276,14 @@ def test_folder_without_preview_uses_exact_black_thumbnail_rectangle(
         assert render(row, selected=True).pixelColor(probe) == QColor(color)
 
     for row, item in enumerate((folder, image_file)):
-        assert_placeholder(row, BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR)
+        default_color = (
+            BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR if row == 0
+            else BROWSER_FILE_FALLBACK_DEFAULT_COLOR
+        )
+        assert_placeholder(row, default_color)
         model.set_preview_status(item.path, "loading")
         assert render(row, selected=True).pixelColor(probe) == QColor(
-            BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR
+            default_color
         )
 
     delegate.configure(
@@ -295,13 +300,13 @@ def test_folder_without_preview_uses_exact_black_thumbnail_rectangle(
         file_fallback_background="auto",
     )
     assert_placeholder(0, "#804020")
-    assert_placeholder(1, BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR)
+    assert_placeholder(1, BROWSER_FILE_FALLBACK_DEFAULT_COLOR)
     delegate.configure(
         thumbnail_size=180, density=BrowserDisplayDensity.STANDARD,
         folder_fallback_background="auto",
     )
     assert_placeholder(0, BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR)
-    assert_placeholder(1, BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR)
+    assert_placeholder(1, BROWSER_FILE_FALLBACK_DEFAULT_COLOR)
 
     preview = QImage(
         content.size() * 2,
@@ -407,7 +412,7 @@ def test_broken_archive_uses_shared_placeholder_canvas(
         display_mode=delegate.thumbnail_display_mode,
     ).toRect()
     expected = QColor(
-        BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR
+        BROWSER_FILE_FALLBACK_DEFAULT_COLOR
         if background == "auto"
         else background
     )

@@ -12,6 +12,24 @@ retain the upstream AGPL provenance. Qt/Python resource ownership, cancellation,
 generation checks and display integration adapt those structures to NivisViewer.
 See `THIRD_PARTY_NOTICES.md` for the retained notices and port boundaries.
 
+| Fixed source / observed behavior | Adopted mapping |
+| --- | --- |
+| `Program.cs:1352`, `Program.SetTagsToToolStripMenuItems`: all/none/mixed initial state, both mouse buttons toggle, right button keeps dropdown open | `browser_tag_dialogs.py:TagSelectionMenu`, explicit Qt mouse handling and colored registry swatches |
+| `Program.cs:1918–1954`, `PrefixEscapedToolStripMenuItem.ToggleCheck`: unchecked -> checked; mixed -> unchecked; checked -> mixed only if initially mixed, otherwise unchecked | `next_tag_state`, `TagCheckBox.nextCheckState`, `TagSelectionMenu._toggle` (behavioral translation) |
+| `CatalogForm.cs:12693–12857`, `cmsRightClickPrepareAndShow`: uncheck-all, tag list, editor, register unknown tags from selected filenames; disable conflicting operations while draft changed | Real tag submenu, uncheck-all, manager, unknown-tag registration draft; other file-operation actions disabled while tag edits pending |
+| `CatalogForm.cs:13578`, `renameForTextBoxRatingTagPageSequence`, and `cmsRightClick_Closed:19815`: apply tag draft on root menu close; keyboard close cancels; mixed preserves each file's membership and unknown tags survive | Root menu return applies through existing rename batch; left click closes, right click stays; Escape discards. `edited_tags` remains authoritative for preservation. Root hide also hides child menu. |
+| `CatalogForm.cs:6846–6926`, `drawTags`: reverse **filename** tag order from bottom right, grow left, wrap upward; reserve bottom-left icon area, clip to thumbnail | `BrowserItemDelegate._paint_tags`; registry supplies color/existence only, not draw order. Maintain Nivis upper rating band and reserve the largest existing type badge. |
+| `CatalogForm.cs:6659–6662`, draw margins top=1/bottom=0; label size follows measured text | Replace Qt line-height+4 with actual glyph bounding height+4. Two logical pixels each side guard hinted/fractional-DPI glyphs; no font shrink. One-pixel guard failed edge tests, so was not retained. |
+
+
+| Source file / class / method | Adopted behavior | NivisViewer mapping |
+| --- | --- | --- |
+| `source/ZipPla/ZipPlaInfo.cs`, `ZipPlaInfo`, `TagArray`, `CanBeTag`, `GetPathOfCurrentInfo` (lines 23–38, 77–80, 140–147, 262–306) | Comma-separated `t` filename membership, physical rename, permitted tag characters | `zippla_filename_metadata.py`, `browser_tags.py`, `rating_rename_service.py` |
+| `source/ZipPla/Program.cs`, `SetTagsToToolStripMenuItems` (1352–1385); `CatalogForm.cs`, `renameForTextBoxRatingTagPageSequence` (13602–13766) | All/none/mixed selection; preserve mixed membership and unregistered tags | `ItemTagsDialog`, `edited_tags`, `BrowserWindow.set_tags_for_paths`, shared rating rename batch |
+| `source/ZipPla/TagEditForm.cs`, `loadTags`, `saveTags`, validation and color/order controls (90, 121–230, 300–430); `ZipTag.cs`, `ZipTagConfig` (170–183) | Separate registered names/colors/order; registry rename/delete never rewrite existing file tags | `TagManagerDialog`, `ConfigManager.browser_tag_registry` |
+| `source/ZipPla/CatalogForm.cs`, `drawTags` (6846–6910) | Only registered exact names receive colored labels; re-registering the name restores labels | `visible_tags`, `BrowserItemDelegate._paint_tags` |
+
+
 | 段階 | File / class / method | 固定revisionで確認した処理 |
 | --- | --- | --- |
 | 入力受付 | `ViewerForm.cs:1066-1085`, `ViewerForm` constructor; `:15852-15855`, default shortcut table | `PreviewKeyDown`、`KeyboardShortcut`、mouse gestureを接続し、既定のWheelDown/UpをNext/Previousへ割り当てる。 |

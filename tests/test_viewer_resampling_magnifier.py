@@ -1190,12 +1190,15 @@ def test_spread_magnifier_targets_only_page_under_cursor(
     widget.close()
 
 
-def test_rotated_source_mapping_is_clamped_to_rotated_bounds(
+@pytest.mark.parametrize("allow_outside", [True, False])
+def test_rotated_source_mapping_respects_outside_option(
     qapp: QApplication,
+    allow_outside: bool,
 ) -> None:
     widget = ViewerWidget()
     widget.resize(480, 320)
     widget.set_rotation_angle(90)
+    widget.set_magnifier_options(allow_outside_image=allow_outside)
     widget.show()
     qapp.processEvents()
     _set_single_page(widget, image=_image(300, 120))
@@ -1215,8 +1218,8 @@ def test_rotated_source_mapping_is_clamped_to_rotated_bounds(
     assert source is not None
     assert source.left() >= 0
     assert source.top() >= 0
-    assert source.right() <= 120
-    assert source.bottom() <= 300
+    assert (source.right() > 120) is allow_outside
+    assert (source.bottom() > 300) is allow_outside
     widget.cancel_magnifier()
     widget.close()
 

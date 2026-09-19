@@ -1,7 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+from PyInstaller.utils.hooks import (
+    collect_data_files, collect_dynamic_libs, collect_delvewheel_libs_directory,
+)
 
 from app.version import windows_version_info_text
 
@@ -16,12 +18,15 @@ pypdfium_data = collect_data_files(
     include_py_files=False,
 )
 app_icon = root / "assets" / "icons" / "nivisviewer.ico"
+jxl_data, jxl_binaries = collect_delvewheel_libs_directory(
+    "pillow_jxl", libdir_name="pillow_jxl_plugin.libs",
+)
 
 a = Analysis(
     [str(root / "main.py")],
     pathex=[str(root)],
-    binaries=pypdfium_binaries,
-    datas=pypdfium_data
+    binaries=pypdfium_binaries + jxl_binaries,
+    datas=pypdfium_data + jxl_data
     + [
         (str(root / "LICENSE"), "."),
         (str(root / "PROJECT_LICENSE.md"), "."),
@@ -31,7 +36,7 @@ a = Analysis(
         (str(root / "licenses"), "licenses"),
         (str(root / "assets" / "icons"), "assets/icons"),
     ],
-    hiddenimports=[],
+    hiddenimports=["pillow_jxl.JpegXLImagePlugin", "PIL.AvifImagePlugin"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[str(root / "scripts" / "frozen_smoke_hook.py")],

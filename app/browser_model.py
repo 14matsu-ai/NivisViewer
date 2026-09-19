@@ -185,7 +185,7 @@ class BrowserItemModel(QAbstractListModel):
         self._sort_policy = BrowserSortPolicy()
         self._filter_state = BrowserFilterState()
         self._scan_generation: int | None = None
-        self._source_keys: set[str] = set()
+        self._source_positions: dict[str, list[int]] = {}
         self._icons: dict[str, QIcon] = {}
         self._thumbnail_images: dict[str, QImage] = {}
         self._thumbnail_signatures: dict[str, tuple[int, tuple[object, ...]]] = {}
@@ -320,7 +320,7 @@ class BrowserItemModel(QAbstractListModel):
     ) -> None:
         self.beginResetModel()
         self._source_items = list(items)
-        self._source_keys = {self._key(item.path) for item in self._source_items}
+        self._rebuild_source_index()
         # Scanner results supplied here are already in current sort order.
         # Predicates preserve that order and avoid a redundant full sort.
         self._items = [
@@ -379,7 +379,7 @@ class BrowserItemModel(QAbstractListModel):
     ) -> None:
         self.beginResetModel()
         self._source_items = list(items)
-        self._source_keys = {self._key(item.path) for item in self._source_items}
+        self._rebuild_source_index()
         self._items = [
             item for item in self._source_items if self._filter_state.matches(item)
         ]
@@ -407,9 +407,9 @@ class BrowserItemModel(QAbstractListModel):
         addition_keys: list[str] = []
         for entry in entries:
             key = self._key(entry.path)
-            if key in self._source_keys:
+            if key in self._source_positions:
                 continue
-            self._source_keys.add(key)
+            self._source_positions[key] = [len(self._source_items) + len(additions)]
             additions.append(entry)
             addition_keys.append(key)
         if not additions:
@@ -434,7 +434,7 @@ class BrowserItemModel(QAbstractListModel):
     def begin_directory_scan(self, *, generation: int) -> None:
         self.beginResetModel()
         self._source_items = []
-        self._source_keys.clear()
+        self._source_positions.clear()
         self._items = []
         self._icons.clear()
         self._thumbnail_images.clear()
@@ -463,9 +463,9 @@ class BrowserItemModel(QAbstractListModel):
             ):
                 continue
             key = self._key(entry.path)
-            if key in self._source_keys:
+            if key in self._source_positions:
                 continue
-            self._source_keys.add(key)
+            self._source_positions[key] = [len(self._source_items) + len(additions)]
             additions.append(entry)
         if not additions:
             return 0
@@ -515,6 +515,9 @@ class BrowserItemModel(QAbstractListModel):
             search_text=state.search_text,
             rating_mode=state.rating_mode,
             rating_reference=state.rating_reference,
+            include_tags=state.include_tags,
+            exclude_tags=state.exclude_tags,
+            tag_match=state.tag_match,
         )
         if normalized == self._filter_state:
             return False
@@ -698,8 +701,11 @@ class BrowserItemModel(QAbstractListModel):
         key = self._key(Path(path))
         normalized = max(0, int(page_count))
         changed = False
-        for position, item in enumerate(self._source_items):
-            if self._key(item.path) != key or item.page_count == normalized:
+        # Thumbnail memory hits can publish many counts in one GUI turn.
+        # Resolve only this source instead of walking the entire folder per hit.
+        for position in self._source_positions.get(key, ()):
+            item = self._source_items[position]
+            if item.page_count == normalized:
                 continue
             self._source_items[position] = replace(
                 item,
@@ -726,10 +732,8 @@ class BrowserItemModel(QAbstractListModel):
         row = self._row_by_key.get(key, -1)
         if row >= 0:
             return self._items[row].page_count
-        for item in self._source_items:
-            if self._key(item.path) == key:
-                return item.page_count
-        return None
+        positions = self._source_positions.get(key)
+        return self._source_items[positions[0]].page_count if positions else None
 
     def apply_rating_renames(
         self,
@@ -788,7 +792,7 @@ class BrowserItemModel(QAbstractListModel):
         # artifacts above remain intact across this visible-list reset.
         self.beginResetModel()
         self._source_items = new_source
-        self._source_keys = {self._key(item.path) for item in new_source}
+        self._rebuild_source_index()
         self._items = list(self.visible_items(new_source))
         self._rebuild_row_index()
         self.endResetModel()
@@ -796,6 +800,8 @@ class BrowserItemModel(QAbstractListModel):
 
     @staticmethod
     def _move_cache_key(cache: dict, old_key: str, new_key: str) -> None:
+        if old_key == new_key:
+            return
         if old_key in cache:
             cache[new_key] = cache.pop(old_key)
 
@@ -864,6 +870,11 @@ class BrowserItemModel(QAbstractListModel):
         self._row_by_key = {
             self._key(item.path): row for row, item in enumerate(self._items)
         }
+
+    def _rebuild_source_index(self) -> None:
+        self._source_positions = {}
+        for position, item in enumerate(self._source_items):
+            self._source_positions.setdefault(self._key(item.path), []).append(position)
 
     def _retain_compatible_thumbnails(self) -> None:
         items_by_key = {self._key(item.path): item for item in self._source_items}

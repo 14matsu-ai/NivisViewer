@@ -100,7 +100,7 @@ class ConfigManager(QObject):
         "fullscreen_top_edge_trigger_px": 8,
         "fullscreen_bottom_edge_trigger_px": 28,
         "fullscreen_ui_hide_delay_ms": 0,
-        "viewer_canvas_click_direction": "right_next",
+        "viewer_canvas_click_direction": "auto",
         "viewer_canvas_left_click_action": "next_single_page",
         "viewer_slider_wheel_single_page_enabled": False,
         "show_page_list": False,
@@ -133,12 +133,17 @@ class ConfigManager(QObject):
         "browser_location_history_limit": 50,
         "browser_search_history_limit": 50,
         "browser_search_history": [],
+        "browser_tag_registry": [],
+        "browser_tag_grouped": False,
         "browser_preserve_search_for_viewer_roundtrip": True,
         "browser_display_density": "standard",
         "browser_item_spacing_x": 0,
         "browser_item_spacing_y": 0,
         "browser_cell_padding": 0,
         "browser_filename_display": "one_line",
+        "browser_filename_elide_mode": "right",
+        "browser_filename_font_size": 0,
+        "browser_filename_show_extension": True,
         "browser_filename_gap": 0,
         "browser_filename_padding_y": 0,
         "browser_show_hidden_items": True,
@@ -178,6 +183,7 @@ class ConfigManager(QObject):
         "browser_folder_gestures_enabled": True,
         "mouse_back_button_action": "previous_book",
         "mouse_forward_button_action": "next_book",
+        "mouse_side_buttons_folder_navigation": False,
         "join_spread_pages": False,
         "thumbnail_disk_cache_enabled": True,
         "thumbnail_cache_limit_mb": 512,
@@ -189,6 +195,7 @@ class ConfigManager(QObject):
         "seven_zip_executable": "",
         "magnifier_enabled": False,
         "magnifier_zoom": 2.0,
+        "magnifier_allow_outside_image": True,
         "magnifier_size": 220,
         "viewer_downscale_algorithm": "auto",
         "viewer_upscale_algorithm": "auto",
@@ -212,6 +219,7 @@ class ConfigManager(QObject):
         "viewer_memory_mode": "auto",
         "rotation_angle": 0,
         "slideshow_interval_ms": 3000,
+        "slideshow_repeat": False,
         "background_color": "#000000",
         "window_geometry": "",
         "window_state": "",
@@ -364,6 +372,8 @@ class ConfigManager(QObject):
     @classmethod
     def _normalize(cls, values: dict[str, Any]) -> dict[str, Any]:
         normalized = values
+        from .browser_tags import normalize_tag_registry
+        normalized['browser_tag_registry'] = normalize_tag_registry(normalized.get('browser_tag_registry'))
         normalized["ui_language"] = normalize_ui_language(normalized.get("ui_language"))
         if normalized.get("archive_backend_preference") not in {
             "auto",
@@ -391,6 +401,8 @@ class ConfigManager(QObject):
             "hide_ui_in_fullscreen",
             "hide_cursor_in_fullscreen",
             "browser_show_hidden_items",
+            "browser_filename_show_extension",
+            "browser_tag_grouped",
             "browser_show_unsupported_files",
             "browser_show_system_items",
             "text_preview_enabled",
@@ -471,6 +483,20 @@ class ConfigManager(QObject):
             minimum=0,
             maximum=16,
         )
+        filename_elide_mode = normalized.get("browser_filename_elide_mode")
+        if not isinstance(filename_elide_mode, str) or filename_elide_mode not in {
+            "right",
+            "middle",
+        }:
+            normalized["browser_filename_elide_mode"] = "right"
+        normalized["browser_filename_font_size"] = cls._clamped_int(
+            normalized.get("browser_filename_font_size"),
+            default=0,
+            minimum=0,
+            maximum=24,
+        )
+        if 0 < normalized["browser_filename_font_size"] < 6:
+            normalized["browser_filename_font_size"] = 0
         if normalized.get("thumbnail_frame_ratio") not in {
             "square_1_1",
             "landscape_3_2",
@@ -715,15 +741,22 @@ class ConfigManager(QObject):
             if magnifier_zoom in {1.5, 2.0, 3.0, 4.0}
             else 2.0
         )
+        normalized["slideshow_interval_ms"] = cls._clamped_int(
+            normalized.get("slideshow_interval_ms"), default=3000, minimum=500, maximum=60000,
+        )
         for key in (
             "bring_viewer_to_front_on_open",
             "loop_book_navigation",
+            "slideshow_repeat",
+            "auto_open_adjacent_book",
             "restore_last_reading_position",
             "metadata_migration_v1_completed",
             "mouse_gestures_enabled",
+            "mouse_side_buttons_folder_navigation",
             "mouse_gesture_show_trail",
             "browser_folder_gestures_enabled",
             "viewer_slider_wheel_single_page_enabled",
+            "magnifier_allow_outside_image",
             "join_spread_pages",
             "single_first_page",
             "treat_wide_image_as_single",

@@ -52,7 +52,8 @@ GRID_PRESET_THUMBNAIL_SIZES = {
     BrowserDisplayDensity.LARGE: 320,
 }
 
-BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR = "#000000"
+BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR = "#ffffe0"
+BROWSER_FILE_FALLBACK_DEFAULT_COLOR = "#c1c1c1"
 BROWSER_PLACEHOLDER_ICON_MAX_RATIO = 0.50
 BROWSER_DISPLAY_SURFACE_CACHE_MAX_ITEMS = 96
 BROWSER_DISPLAY_SURFACE_CACHE_MAX_BYTES = 32 * 1024 * 1024
@@ -332,36 +333,137 @@ def thumbnail_content_rect(
     )
 
 
+_COMPOUND_FILENAME_EXTENSIONS = (
+    ".tar.gz",
+    ".tar.bz2",
+    ".tar.xz",
+    ".tar.zst",
+    ".tar.lz",
+    ".tar.lzma",
+)
+
+
+def split_filename_extension(text: str) -> tuple[str, str]:
+    """Split one display filename without treating a leading-dot name as an extension."""
+    name = str(text)
+    folded = name.casefold()
+    for suffix in _COMPOUND_FILENAME_EXTENSIONS:
+        if len(name) > len(suffix) and folded.endswith(suffix):
+            return name[:-len(suffix)], name[-len(suffix):]
+    dot = name.rfind(".")
+    if dot <= 0 or dot == len(name) - 1:
+        return name, ""
+    return name[:dot], name[dot:]
+
+
+def filename_for_display(
+    text: str,
+    *,
+    show_extension: bool = True,
+    is_folder: bool = False,
+) -> str:
+    """Format only the Browser title; the model name and file path stay intact."""
+    name = str(text)
+    if show_extension or is_folder:
+        return name
+    stem, extension = split_filename_extension(name)
+    return stem if extension else name
+
+
+def elide_filename_line(
+    metrics: QFontMetrics,
+    text: str,
+    width: int,
+    elide_mode: str = "right",
+    *,
+    preserve_extension: bool = False,
+) -> str:
+    """Elide a display line, reserving space for a normal suffix in right mode."""
+    value = str(text)
+    available = max(1, int(width))
+    mode = (
+        Qt.TextElideMode.ElideMiddle
+        if elide_mode == "middle"
+        else Qt.TextElideMode.ElideRight
+    )
+    if metrics.horizontalAdvance(value) <= available:
+        return value
+    if elide_mode == "right" and preserve_extension:
+        stem, suffix = split_filename_extension(value)
+        if suffix:
+            suffix_width = metrics.horizontalAdvance(suffix)
+            ellipsis_width = metrics.horizontalAdvance("…")
+            stem_width = available - suffix_width
+            if stem_width >= ellipsis_width:
+                shortened_stem = metrics.elidedText(
+                    stem,
+                    Qt.TextElideMode.ElideRight,
+                    stem_width,
+                )
+                if shortened_stem:
+                    return shortened_stem + suffix
+    shortened = metrics.elidedText(value, mode, available)
+    return shortened or "…"
+
+
 def elided_title_lines(
     metrics: QFontMetrics,
     text: str,
     width: int,
     maximum_lines: int,
+    elide_mode: str = "right",
+    *,
+    preserve_extension: bool = False,
 ) -> tuple[str, ...]:
     remaining = str(text).strip()
     if not remaining:
         return ("",)
+    line_count = max(1, int(maximum_lines))
+    available = max(1, int(width))
+    _, original_extension = split_filename_extension(remaining)
     lines: list[str] = []
-    for line_number in range(max(1, int(maximum_lines))):
-        if line_number == maximum_lines - 1:
+    for line_number in range(line_count):
+        if line_number == line_count - 1:
             lines.append(
-                metrics.elidedText(
+                elide_filename_line(
+                    metrics,
                     remaining,
-                    Qt.TextElideMode.ElideRight,
-                    max(1, width),
+                    available,
+                    elide_mode,
+                    preserve_extension=(
+                        preserve_extension
+                        and bool(original_extension)
+                        and remaining.casefold().endswith(
+                            original_extension.casefold()
+                        )
+                    ),
                 )
             )
             break
         fit = 0
         for index in range(1, len(remaining) + 1):
-            if metrics.horizontalAdvance(remaining[:index]) > width:
+            if metrics.horizontalAdvance(remaining[:index]) > available:
                 break
             fit = index
         if fit >= len(remaining):
             lines.append(remaining)
             break
         if fit <= 0:
-            lines.append(metrics.elidedText(remaining, Qt.TextElideMode.ElideRight, width))
+            lines.append(
+                elide_filename_line(
+                    metrics,
+                    remaining,
+                    available,
+                    elide_mode,
+                    preserve_extension=(
+                        preserve_extension
+                        and bool(original_extension)
+                        and remaining.casefold().endswith(
+                            original_extension.casefold()
+                        )
+                    ),
+                )
+            )
             break
         split = max(remaining.rfind(" ", 0, fit + 1), remaining.rfind("_", 0, fit + 1))
         if split <= 0:
@@ -382,6 +484,9 @@ class BrowserItemDelegate(QStyledItemDelegate):
         thumbnail_display_mode: str = "fit",
         cell_padding: int = 0,
         filename_display: str = "one_line",
+        filename_elide_mode: str = "right",
+        filename_font_size: int = 0,
+        show_filename_extension: bool = True,
         filename_gap: int = 0,
         filename_padding_y: int = 0,
         item_spacing_x: int = 0,
@@ -392,6 +497,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
     ) -> None:
         super().__init__(parent)
         self.thumbnail_size = int(thumbnail_size)
+        self.tag_registry = []
         self.density = density
         self.frame_ratio_id = frame_ratio_id
         self.thumbnail_display_mode = (
@@ -401,6 +507,9 @@ class BrowserItemDelegate(QStyledItemDelegate):
         )
         self.cell_padding = max(0, min(12, int(cell_padding)))
         self.filename_display = filename_display
+        self.filename_elide_mode = self._normalize_filename_elide_mode(filename_elide_mode)
+        self.filename_font_size = self._normalize_filename_font_size(filename_font_size)
+        self.show_filename_extension = bool(show_filename_extension)
         self.filename_gap = max(0, min(32, int(filename_gap)))
         self.filename_padding_y = max(0, min(16, int(filename_padding_y)))
         self.item_spacing_x = max(0, min(32, int(item_spacing_x)))
@@ -421,6 +530,22 @@ class BrowserItemDelegate(QStyledItemDelegate):
         return GRID_PROFILES[self.density]
 
     @property
+    def effective_filename_font_size(self) -> int:
+        return self.filename_font_size or self.profile.font_size
+
+    @staticmethod
+    def _normalize_filename_elide_mode(value: object) -> str:
+        return value if isinstance(value, str) and value in {"right", "middle"} else "right"
+
+    @staticmethod
+    def _normalize_filename_font_size(value: object) -> int:
+        try:
+            size = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return size if size == 0 or 6 <= size <= 24 else 0
+
+    @property
     def cell_size(self) -> QSize:
         return self.grid_metrics.cell_size
 
@@ -434,7 +559,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
     @property
     def grid_metrics(self):
         font = QFont()
-        font.setPointSize(self.profile.font_size)
+        font.setPointSize(self.effective_filename_font_size)
         return build_browser_grid_metrics(
             thumbnail_size=self.thumbnail_size,
             frame_ratio_id=self.frame_ratio_id,
@@ -442,6 +567,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
             filename_display=self.filename_display,
             filename_gap=self.filename_gap,
             filename_padding_y=self.filename_padding_y,
+            filename_font_size=self.effective_filename_font_size,
             horizontal_margin=self.profile.horizontal_margin,
             cell_padding=self.cell_padding,
             item_spacing_x=self.item_spacing_x,
@@ -457,6 +583,9 @@ class BrowserItemDelegate(QStyledItemDelegate):
         thumbnail_display_mode: str | None = None,
         cell_padding: int | None = None,
         filename_display: str | None = None,
+        filename_elide_mode: str | None = None,
+        filename_font_size: int | None = None,
+        show_filename_extension: bool | None = None,
         filename_gap: int | None = None,
         filename_padding_y: int | None = None,
         item_spacing_x: int | None = None,
@@ -483,6 +612,16 @@ class BrowserItemDelegate(QStyledItemDelegate):
             self.cell_padding = max(0, min(12, int(cell_padding)))
         if filename_display is not None:
             self.filename_display = filename_display
+        if filename_elide_mode is not None:
+            self.filename_elide_mode = self._normalize_filename_elide_mode(
+                filename_elide_mode
+            )
+        if filename_font_size is not None:
+            self.filename_font_size = self._normalize_filename_font_size(
+                filename_font_size
+            )
+        if show_filename_extension is not None:
+            self.show_filename_extension = bool(show_filename_extension)
         if filename_gap is not None:
             self.filename_gap = max(0, min(32, int(filename_gap)))
         if filename_padding_y is not None:
@@ -604,7 +743,14 @@ class BrowserItemDelegate(QStyledItemDelegate):
             if thumbnail_error:
                 self._paint_error_badge(painter, thumbnail_rect)
             self._paint_rating(painter, option, index)
-            self._paint_title(painter, option, thumbnail_rect, item.display_name)
+            self._paint_tags(painter, option, thumbnail_rect, item)
+            self._paint_title(
+                painter,
+                option,
+                thumbnail_rect,
+                item.display_name,
+                is_folder=item.kind is BrowserItemKind.FOLDER,
+            )
             painter.setOpacity(1.0)
             self._paint_interaction_frame(
                 painter,
@@ -645,7 +791,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
 
     def file_fallback_background_color(self) -> QColor:
         return QColor(
-            BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR
+            BROWSER_FILE_FALLBACK_DEFAULT_COLOR
             if self.file_fallback_background == "auto"
             else self.file_fallback_background
         )
@@ -782,13 +928,14 @@ class BrowserItemDelegate(QStyledItemDelegate):
         option: QStyleOptionViewItem,
         thumbnail_rect: QRect,
         title: str,
+        *,
+        is_folder: bool = False,
     ) -> None:
-        profile = self.profile
         grid = self.grid_metrics
         if grid.title_lines == 0:
             return
         font = QFont(option.font)
-        font.setPointSize(profile.font_size)
+        font.setPointSize(self.effective_filename_font_size)
         painter.setFont(font)
         painter.setPen(
             option.palette.highlightedText().color()
@@ -797,20 +944,35 @@ class BrowserItemDelegate(QStyledItemDelegate):
         )
         metrics = QFontMetrics(font)
         title_rect = grid.title_rect(option.rect)
+        display_title = filename_for_display(
+            title,
+            show_extension=self.show_filename_extension,
+            is_folder=is_folder,
+        )
+        preserve_extension = self.show_filename_extension and not is_folder
         if option.state & QStyle.StateFlag.State_Selected:
             selected_background = option.palette.highlight().color()
             selected_background.setAlpha(96)
             painter.fillRect(title_rect.adjusted(-2, 0, 2, 0), selected_background)
         lines = (
             (
-                metrics.elidedText(
-                    title.replace("\n", " "),
-                    Qt.TextElideMode.ElideMiddle,
+                elide_filename_line(
+                    metrics,
+                    display_title.replace("\n", " "),
                     title_rect.width(),
+                    self.filename_elide_mode,
+                    preserve_extension=preserve_extension,
                 ),
             )
             if grid.title_lines == 1
-            else elided_title_lines(metrics, title, title_rect.width(), 2)
+            else elided_title_lines(
+                metrics,
+                display_title,
+                title_rect.width(),
+                2,
+                self.filename_elide_mode,
+                preserve_extension=preserve_extension,
+            )
         )
         y = grid.title_text_rect(option.rect).top()
         for line in lines:
@@ -821,6 +983,52 @@ class BrowserItemDelegate(QStyledItemDelegate):
                 line,
             )
             y += metrics.lineSpacing()
+
+    def _paint_tags(self, painter, option, rect, item) -> None:
+        from .browser_tags import filename_tags
+        registered = {tag['name']: tag for tag in self.tag_registry}
+        # ZipPlaFork CatalogForm.drawTags (07955f5, AGPL-3.0-or-later):
+        # filename order, reversed from bottom right; see ZIPPLAFORK_COMPARISON.md.
+        tags = [registered[name] for name in reversed(filename_tags(str(item.path))) if name in registered]
+        if not tags:
+            return
+        painter.save()
+        try:
+            painter.setClipRect(rect)
+            font = QFont(option.font)
+            font.setPointSize(max(7, min(10, self.profile.font_size)))
+            painter.setFont(font)
+            metrics = QFontMetrics(font)
+            ink = metrics.tightBoundingRect(''.join(tag['name'] for tag in tags))
+            height = max(1, ink.height()) + 4  # Small rasterization guard, not line spacing.
+            rating_font = QFont(option.font)
+            rating_font.setPointSize(max(8, min(11, self.profile.font_size)))
+            top_limit = rect.top() + QFontMetrics(rating_font).height() + 8
+            # Keep the bottom-left type icon and the upper rating band clear.
+            right = rect.right() - 2
+            x, y = right, rect.bottom() - height - 3
+            for tag in tags:
+                left = rect.left() + (28 if y + height > rect.bottom() - 25 else 2)
+                desired = metrics.horizontalAdvance(tag['name']) + 6
+                if x < right and x - left < desired:
+                    x, y = right, y - height - 3
+                    left = rect.left() + (28 if y + height > rect.bottom() - 25 else 2)
+                if y < top_limit:
+                    break
+                available = x - left
+                if available < 12:
+                    break
+                label = metrics.elidedText(tag['name'], Qt.TextElideMode.ElideRight, available - 6)
+                width = min(available, metrics.horizontalAdvance(label) + 6)
+                box = QRect(x - width, y, width, height)
+                color = QColor(tag['color'])
+                painter.fillRect(box, color)
+                luminance = color.red() * .299 + color.green() * .587 + color.blue() * .114
+                painter.setPen(QColor('black' if luminance > 150 else 'white'))
+                painter.drawText(box.left() + 3, box.top() + 2 - ink.top(), label)
+                x -= width + 3
+        finally:
+            painter.restore()
 
     def rating_overlay_rect(
         self,

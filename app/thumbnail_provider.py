@@ -248,7 +248,6 @@ class BrowserThumbnailProvider(QObject):
             tuple[str, int, tuple[object, ...]],
             PreviewResultKind,
         ] = {}
-        self._maintenance_started = False
         self._archive_backend_registry = archive_backend_registry
         self._pdfium_service = pdfium_service
         self._owns_preview_registry = preview_registry is None
@@ -758,10 +757,10 @@ class BrowserThumbnailProvider(QObject):
             self._disk_cache.set_max_unused_days(days)
             self.cleanup_caches_async(force=True)
 
-    def cleanup_caches_async(self, *, force: bool = True) -> None:
+    def cleanup_caches_async(self, *, force: bool = True) -> bool:
         disk_cache = self._disk_cache
         if disk_cache is None or not self._disk_cache_enabled:
-            return
+            return True
 
         item = BrowserItem(
             display_name="cache-cleanup",
@@ -785,7 +784,7 @@ class BrowserThumbnailProvider(QObject):
             self._generation,
             lambda _item, _size: cleanup(),
         )
-        self._start_worker(worker, ThumbnailPriority.PREFETCH)
+        return self._start_worker(worker, ThumbnailPriority.PREFETCH)
 
     def clear_memory_cache(self) -> None:
         self._cache.clear()
@@ -995,7 +994,8 @@ class BrowserThumbnailProvider(QObject):
                 if not self._session_disk_baseline_initialized:
                     self._session_start_disk_bytes = disk_cache.usage_bytes()
                     self._session_disk_baseline_initialized = True
-            self._run_initial_maintenance(disk_cache)
+            # Validation below is per requested item. Whole-cache maintenance
+            # belongs to Browser's idle cleanup, never the first visible read.
             if isinstance(size, ThumbnailRenderSpec) and hasattr(
                 disk_cache, "get_suitable"
             ):
@@ -1249,13 +1249,6 @@ class BrowserThumbnailProvider(QObject):
             max(0, int(page_count)),
         )
 
-    def _run_initial_maintenance(self, disk_cache: ThumbnailDiskCache) -> None:
-        with self._pending_lock:
-            if self._maintenance_started:
-                return
-            self._maintenance_started = True
-        disk_cache.cleanup_if_due()
-
     def _load_page_count_pipeline(
         self,
         item: BrowserItem,
@@ -1267,9 +1260,8 @@ class BrowserThumbnailProvider(QObject):
         if self._disk_cache_enabled and disk_cache is not None:
             disk_cache.set_enabled(True)
             cached = disk_cache.get_page_count(item)
-            # Read source metadata before maintenance can retire an old codec's
-            # payload. A quality change alone must not force this enumeration.
-            self._run_initial_maintenance(disk_cache)
+            # A quality change alone must not force source enumeration. Full
+            # cache maintenance is scheduled separately after Browser work.
             if cached is not None:
                 return ThumbnailLoadResult(
                     None,

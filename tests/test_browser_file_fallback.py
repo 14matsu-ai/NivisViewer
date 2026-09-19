@@ -66,7 +66,7 @@ def test_file_fallback_pixels_and_success_transition(qapp, tmp_path, kind, state
     assert canvas.pixelColor(round(content.center().x() * dpr), round(content.center().y() * dpr)) == QColor("#20a050")
 
 
-@pytest.mark.parametrize("value,expected", [(None, "auto"), ("#31597D", "#31597d"), ("bad", "auto"), ("auto", "auto")])
+@pytest.mark.parametrize("value,expected", [(None, "auto"), ("#31597D", "#31597d"), ("#000000", "#000000"), ("bad", "auto"), ("auto", "auto")])
 def test_file_color_config_roundtrip(tmp_path, value, expected):
     config = ConfigManager(tmp_path / "settings.json")
     # Legacy config predates the independent file-background key.
@@ -105,6 +105,7 @@ def test_file_color_settings_apply_reset_cancel_and_repaint_only(tmp_path, qapp)
             update(*args)
         patches.setattr(viewport, "update", repaint)
         dialog = SettingsDialog(window.config)
+        assert dialog.browser_file_fallback_color_button.text() == "#C1C1C1"
         dialog.show()
         dialog.tabs.setCurrentIndex(1)
         browser_tab = dialog.tabs.currentWidget()
@@ -124,6 +125,7 @@ def test_file_color_settings_apply_reset_cancel_and_repaint_only(tmp_path, qapp)
         assert ConfigManager(window.config.path).load()["browser_file_fallback_background"] == "#31597d"
         dialog.browser_file_fallback_restore_button.click()
         assert dialog.values()["browser_file_fallback_background"] == "auto"
+        assert dialog.browser_file_fallback_color_button.text() == "#C1C1C1"
         dialog.reject()  # Cancel unapplied reset.
         assert window.config.get("browser_file_fallback_background") == "#31597d"
         dialog = SettingsDialog(window.config)
@@ -132,7 +134,7 @@ def test_file_color_settings_apply_reset_cancel_and_repaint_only(tmp_path, qapp)
             dialog.browser_file_fallback_restore_button.click()
             dialog.apply_settings()
         qapp.processEvents()
-        assert window.item_delegate.file_fallback_background_color() == QColor("#000000")
+        assert window.item_delegate.file_fallback_background_color() == QColor("#c1c1c1")
         assert ConfigManager(window.config.path).load()["browser_file_fallback_background"] == "auto"
         assert window.item_delegate.folder_fallback_background_color() == QColor("#804020")
         assert provider.generation == generation and window._scan_generation == scan

@@ -4,12 +4,18 @@ from types import SimpleNamespace
 import ctypes
 import pytest
 
-from PySide6.QtCore import QByteArray, QCoreApplication, QEvent, QRect, Qt
+from PySide6.QtCore import QByteArray, QCoreApplication, QEvent, QPoint, QPointF, QRect, Qt
+from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QMainWindow, QSlider, QStatusBar, QVBoxLayout, QWidget
 
 from app import fullscreen_chrome as fullscreen_module
 from app.fullscreen_chrome import FullscreenChromeController
-from app.windows_fullscreen import WindowsFullscreenAdapter, _MonitorInfo, FULLSCREEN_POSITION_FLAGS
+from app.windows_fullscreen import (
+    FULLSCREEN_POSITION_FLAGS,
+    HWND_TOP,
+    WindowsFullscreenAdapter,
+    _MonitorInfo,
+)
 
 
 class _ObservedWindow(QMainWindow):
@@ -214,6 +220,79 @@ def test_windowed_fullscreen_cycles_restore_flags_and_geometry_without_drift(
     _dispose_window(qapp, window, controller)
 
 
+def test_windows_borderless_maximized_state_preserves_bottom_reveal(
+    qapp,
+    monkeypatch,
+) -> None:
+    window, controller = _make_controller()
+    original_geometry = QRect(140, 110, 910, 670)
+    window.setGeometry(original_geometry)
+    calls: list[tuple[str, int]] = []
+
+    class Adapter:
+        def monitor_for_window(self, _hwnd):
+            return 77
+
+        def apply(self, _hwnd, monitor):
+            calls.append(("bounds", monitor))
+            return True
+
+    adapter = Adapter()
+    monkeypatch.setattr(
+        fullscreen_module,
+        "_is_native_windows_platform",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        fullscreen_module,
+        "WindowsFullscreenAdapter",
+        lambda: adapter,
+    )
+    monkeypatch.setattr(controller, "_native_window_id", lambda: 1234)
+    monkeypatch.setattr(controller, "_apply_native_fullscreen_frame", lambda _active: None)
+
+    window.show()
+    qapp.processEvents()
+    controller.enter_true_fullscreen()
+    qapp.processEvents()
+    assert calls == [("bounds", 77)]
+    assert window.isMaximized()
+    assert not window.isFullScreen()
+    assert window.windowFlags() & Qt.WindowType.FramelessWindowHint
+    controller.set_fullscreen_state(
+        True,
+        hide_ui=True,
+        hide_cursor=False,
+    )
+
+    global_position = controller.overlay_parent.mapToGlobal(
+        QPoint(20, controller.overlay_parent.height() - 1)
+    )
+    local_position = controller.viewer.mapFromGlobal(global_position)
+    mouse_move = QMouseEvent(
+        QEvent.Type.MouseMove,
+        QPointF(local_position),
+        QPointF(global_position),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QCoreApplication.sendEvent(controller.viewer, mouse_move)
+    assert controller.bottom_overlay_visible
+    assert controller.bottom_reveal_strip.isVisible()
+
+    controller.leave_true_fullscreen()
+    assert not window.isFullScreen()
+    assert not window.isMaximized()
+    assert window.geometry() == original_geometry
+    controller.set_fullscreen_state(
+        False,
+        hide_ui=True,
+        hide_cursor=False,
+    )
+    _dispose_window(qapp, window, controller)
+
+
 @pytest.mark.parametrize("scale", [1.0, 1.25, 1.5, 2.0])
 @pytest.mark.parametrize("origin", [(0, 0), (-3840, -240), (1920, 180)])
 def test_windows_native_projection_uses_monitor_native_bounds(
@@ -284,7 +363,7 @@ def test_windows_native_projection_uses_monitor_native_bounds(
     assert len(calls) == 1
     hwnd, insert_after, x, y, width, height, flags = calls[0]
     assert hwnd == 1234
-    assert insert_after == 0  # HWND_TOP, deliberately not TOPMOST.
+    assert insert_after == HWND_TOP
     assert (x, y, width, height) == native
     assert flags == FULLSCREEN_POSITION_FLAGS
     assert api.SetWindowPos.restype is ctypes.wintypes.BOOL

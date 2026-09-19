@@ -144,7 +144,10 @@ _ZIP_RUNTIME_BROWSER_RESUME_GRACE_MS = 500
 class ViewerWindow(QMainWindow):
     activated = Signal(object)
     closing = Signal(object)
+    slideshow_stopped = Signal(object)
     book_changed = Signal(object, str)
+    displayed_item_changed = Signal(object, str)
+    side_folder_requested = Signal(object, int)
     interactive_open_started = Signal(object)
     first_frame_ready = Signal(object)
     interactive_open_cancelled = Signal(object)
@@ -231,6 +234,7 @@ class ViewerWindow(QMainWindow):
         self._adjacent_book_handler = adjacent_book_handler
         self._browser_navigation_snapshot: AdjacentBookBrowserSnapshot | None = None
         self._browser_navigation_path = ""
+        self._last_displayed_browser_item = None
         self._pending_browser_navigation: (
             tuple[str, AdjacentBookBrowserSnapshot | None] | None
         ) = None
@@ -296,6 +300,10 @@ class ViewerWindow(QMainWindow):
         self.cache_size = int(self.settings.get("cache_size", 10))
         self.rotation_angle = int(self.settings.get("rotation_angle", 0)) % 360
         self.slideshow_interval_ms = int(self.settings.get("slideshow_interval_ms", 3000))
+        self.slideshow_repeat = bool(self.settings.get("slideshow_repeat", False))
+        self._slideshow_waiting_for_next = False
+        self._slideshow_opening_next = False
+        self._slideshow_skip_next_for_book: str | None = None
         self.reopen_last_on_start = bool(self.settings.get("reopen_last_on_start", False))
         self.recursive_folder = bool(self.settings.get("recursive_folder", False))
         self.sort_descending = bool(self.settings.get("sort_descending", False))
@@ -359,7 +367,7 @@ class ViewerWindow(QMainWindow):
             )
         )
         self.viewer_canvas_click_direction = str(
-            self.settings.get("viewer_canvas_click_direction", "right_next")
+            self.settings.get("viewer_canvas_click_direction", "auto")
         )
         self.viewer_slider_wheel_single_page_enabled = bool(
             self.settings.get(
@@ -527,6 +535,13 @@ class ViewerWindow(QMainWindow):
             self._on_zip_runtime_frame_painted
         )
         self._connect_shortcuts()
+        from .slideshow_keys import SlideshowKeys
+
+        self.slideshow_keys = SlideshowKeys(
+            self, start=lambda seconds: self.start_slideshow(seconds),
+            toggle=lambda: self.toggle_slideshow(),
+            choose=lambda: self.set_slideshow_interval_dialog(start=True),
+        )
         self._restore_window_state()
         self._apply_settings_to_widgets()
         self.config.settings_changed.connect(self.apply_settings)
@@ -580,6 +595,16 @@ class ViewerWindow(QMainWindow):
             return ""
         return str(self.book_session.current_path)
 
+    def _is_fullscreen_mode(self) -> bool:
+        chrome = getattr(self, "fullscreen_chrome", None)
+        return bool(
+            self.isFullScreen()
+            or (
+                chrome is not None
+                and chrome.owns_true_fullscreen_transition
+            )
+        )
+
     @property
     def browser_navigation_snapshot(self) -> AdjacentBookBrowserSnapshot | None:
         pending = self._pending_browser_navigation
@@ -593,6 +618,23 @@ class ViewerWindow(QMainWindow):
         if pending is not None:
             return pending[0]
         return self._browser_navigation_path or self._opened_path
+
+    @property
+    def displayed_browser_path(self) -> str | None:
+        displayed = self.presentation_state.displayed
+        source = self.book_session.source
+        if (
+            displayed is None or source is None
+            or displayed.token.book.epoch != self.book_session.generation
+            or displayed.token.book.source_identity != id(source)
+        ):
+            return None
+        if isinstance(source, FolderImageSource):
+            return next(
+                (page.image_id for page in displayed.unit.pages
+                 if page.index == displayed.values.page_index), None,
+            )
+        return str(source.source_path)
 
     def show_initial(self) -> None:
         if self._start_fullscreen:
@@ -618,7 +660,7 @@ class ViewerWindow(QMainWindow):
         return {
             "window_geometry": bytes(geometry.toBase64()).decode("ascii"),
             "window_state": bytes(self.saveState().toBase64()).decode("ascii"),
-            "fullscreen": self.isFullScreen(),
+            "fullscreen": self._is_fullscreen_mode(),
             "rotation_angle": self.rotation_angle,
         }
 
@@ -1072,14 +1114,34 @@ class ViewerWindow(QMainWindow):
             self.magnifier_zoom_menu.addAction(action)
             self.magnifier_zoom_actions[zoom] = action
 
-        slideshow_menu = menu_bar.addMenu(tr('スライドショー'))
+        slideshow_menu = self.slideshow_menu = menu_bar.addMenu(tr('スライドショー'))
         self.slideshow_action = QAction(tr('開始/停止'), self, checkable=True)
-        self.slideshow_action.setShortcut("S")
         self.slideshow_action.triggered.connect(self.toggle_slideshow)
-        slideshow_interval_action = QAction(tr('間隔を設定'), self)
-        slideshow_interval_action.triggered.connect(self.set_slideshow_interval_dialog)
         slideshow_menu.addAction(self.slideshow_action)
-        slideshow_menu.addAction(slideshow_interval_action)
+        self.slideshow_custom_action = QAction(tr('カスタム'), self, checkable=True)
+        self.slideshow_custom_action.triggered.connect(
+            lambda: self.set_slideshow_interval_dialog(),
+        )
+        slideshow_menu.addAction(self.slideshow_custom_action)
+        interval_group = QActionGroup(self)
+        interval_group.setExclusive(True)
+        interval_group.addAction(self.slideshow_custom_action)
+        self.slideshow_interval_actions = {}
+        for seconds in (1, 3, 5, 10, 20, 30, 60):
+            action = QAction(tr('{seconds}秒', seconds=seconds), self, checkable=True)
+            action.triggered.connect(
+                lambda _checked=False, value=seconds: self.set_slideshow_interval(value),
+            )
+            interval_group.addAction(action)
+            slideshow_menu.addAction(action)
+            self.slideshow_interval_actions[seconds] = action
+        slideshow_menu.addSeparator()
+        self.slideshow_repeat_action = QAction(tr('最後のページで先頭に戻って繰り返す'), self, checkable=True)
+        self.slideshow_repeat_action.triggered.connect(
+            lambda checked: self._update_shared_setting("slideshow_repeat", checked),
+        )
+        slideshow_menu.addAction(self.slideshow_repeat_action)
+        slideshow_menu.addAction(self.auto_open_adjacent_book_action)
 
         self.bookmark_menu = menu_bar.addMenu(tr('ブックマーク'))
         self._rebuild_bookmark_menu()
@@ -1200,12 +1262,13 @@ class ViewerWindow(QMainWindow):
             ("PgDown", self.next_page_or_scroll),
             ("PgUp", self.previous_page_or_scroll),
             ("+", lambda: self.dispatch_command(commands.ZOOM_IN)),
+            ("Shift++", lambda: self.dispatch_command(commands.ZOOM_IN)),
             ("=", lambda: self.dispatch_command(commands.ZOOM_IN)),
             ("-", lambda: self.dispatch_command(commands.ZOOM_OUT)),
             ("0", lambda: self.dispatch_command(commands.FIT_WINDOW)),
             ("Esc", self._handle_escape),
             ("D", lambda: self.dispatch_command(commands.TOGGLE_SPREAD)),
-            ("R", lambda: self.dispatch_command(commands.TOGGLE_READING_DIRECTION)),
+            ("Shift+R", lambda: self.dispatch_command(commands.TOGGLE_READING_DIRECTION)),
             ("B", self.toggle_current_bookmark),
             ("Ctrl+B", self.toggle_current_bookmark),
         ]
@@ -1240,6 +1303,9 @@ class ViewerWindow(QMainWindow):
         self.viewer.set_rotation_angle(self.rotation_angle)
         self.viewer.set_horizontal_alignment(self.horizontal_alignment)
         self.viewer.set_magnifier_options(zoom=self.magnifier_zoom, size=self.magnifier_size)
+        self.viewer.set_magnifier_options(
+            allow_outside_image=bool(self.settings.get("magnifier_allow_outside_image", True)),
+        )
         self.viewer.set_resampling_algorithms(
             normal_downscale=self.viewer_downscale_algorithm,
             normal_upscale=self.viewer_upscale_algorithm,
@@ -1309,6 +1375,18 @@ class ViewerWindow(QMainWindow):
         if "magnifier_zoom" in changed:
             self.magnifier_zoom = float(changed["magnifier_zoom"])
             self.viewer.set_magnifier_options(zoom=self.magnifier_zoom)
+        if "slideshow_interval_ms" in changed:
+            self.slideshow_interval_ms = int(changed["slideshow_interval_ms"])
+            self.slideshow_timer.setInterval(self.slideshow_interval_ms)
+        if "slideshow_repeat" in changed:
+            self.slideshow_repeat = bool(changed["slideshow_repeat"])
+        if "auto_open_adjacent_book" in changed:
+            self.auto_open_adjacent_book = bool(changed["auto_open_adjacent_book"])
+            self._slideshow_skip_next_for_book = None
+        if "magnifier_allow_outside_image" in changed:
+            self.viewer.set_magnifier_options(
+                allow_outside_image=bool(changed["magnifier_allow_outside_image"]),
+            )
         if "hide_ui_in_fullscreen" in changed:
             self.hide_ui_in_fullscreen = bool(changed["hide_ui_in_fullscreen"])
             fullscreen_policy_changed = True
@@ -1388,7 +1466,7 @@ class ViewerWindow(QMainWindow):
             self.viewer_canvas_click_direction = (
                 direction
                 if direction in {"right_next", "left_next", "auto"}
-                else "right_next"
+                else "auto"
             )
         if "viewer_slider_wheel_single_page_enabled" in changed:
             self.viewer_slider_wheel_single_page_enabled = bool(
@@ -1679,7 +1757,13 @@ class ViewerWindow(QMainWindow):
         self.align_left_action.setChecked(self.horizontal_alignment == "left")
         self.align_center_action.setChecked(self.horizontal_alignment == "center")
         self.align_right_action.setChecked(self.horizontal_alignment == "right")
-        self.slideshow_action.setChecked(self.slideshow_timer.isActive())
+        self.slideshow_action.setChecked(self.slideshow_timer.isActive() or self._slideshow_waiting_for_next)
+        self.slideshow_repeat_action.setChecked(self.slideshow_repeat)
+        for seconds, action in self.slideshow_interval_actions.items():
+            action.setChecked(self.slideshow_interval_ms == seconds * 1000)
+        self.slideshow_custom_action.setChecked(
+            self.slideshow_interval_ms not in {seconds * 1000 for seconds in self.slideshow_interval_actions}
+        )
         self.reopen_last_action.setChecked(self.reopen_last_on_start)
         self.recursive_folder_action.setChecked(self.recursive_folder)
         self.sort_descending_action.setChecked(self.sort_descending)
@@ -1730,7 +1814,14 @@ class ViewerWindow(QMainWindow):
         folder_snapshot: FolderListingSnapshot | None = None,
         browser_snapshot: AdjacentBookBrowserSnapshot | None = None,
         preserve_current_page: bool = False,
+        slideshow_transition: bool = False,
     ) -> bool:
+        if slideshow_transition and self._slideshow_waiting_for_next:
+            self._slideshow_opening_next = True
+        else:
+            self._slideshow_waiting_for_next = False
+            self._slideshow_opening_next = False
+        self._slideshow_skip_next_for_book = None
         if not preserve_current_page:
             self._reload_page_index = None
         self.viewer.cancel_pending_canvas_click()
@@ -1925,9 +2016,19 @@ class ViewerWindow(QMainWindow):
     def _on_async_book_opened(self, opened: BookOpened) -> None:
         if self._shutdown_prepared:
             return
-        self._finish_opened_book(opened, modal_on_empty=False)
+        succeeded = self._finish_opened_book(opened, modal_on_empty=False)
+        if self._slideshow_opening_next:
+            self._slideshow_opening_next = False
+            self._slideshow_waiting_for_next = False
+            if succeeded:
+                self.slideshow_timer.start()
+            else:
+                self._slideshow_repeat_or_stop()
+            self._sync_actions()
 
     def _on_async_book_open_failed(self, failed: AsyncBookOpenFailed) -> None:
+        resume_slideshow = self._slideshow_opening_next
+        self._slideshow_opening_next = False
         self._pending_browser_navigation = None
         self._reload_page_index = None
         self._cancel_interactive_open()
@@ -1954,6 +2055,15 @@ class ViewerWindow(QMainWindow):
             self._refresh_view()
         else:
             self._presentation_viewport_refresh_required = False
+
+        if resume_slideshow:
+            self._slideshow_waiting_for_next = False
+            self._slideshow_skip_next_for_book = self._current_book_key
+            if not failed.cancelled:
+                self._slideshow_repeat_or_stop()
+            else:
+                self.slideshow_timer.stop()
+                self._sync_actions()
 
     def _uses_configured_book_open_position(self, opened: BookOpened) -> bool:
         return (
@@ -2453,7 +2563,7 @@ class ViewerWindow(QMainWindow):
         self._sync_actions()
 
     def _on_page_list_dock_visibility_changed(self, visible: bool) -> None:
-        if self.isFullScreen():
+        if self._is_fullscreen_mode():
             self._refresh_page_list_model()
             return
         self.show_page_list = visible
@@ -2567,10 +2677,10 @@ class ViewerWindow(QMainWindow):
         direction: int,
         *,
         require_browser_snapshot: bool = False,
-    ) -> None:
+    ) -> str | None:
         if self._adjacent_book_handler is None:
             self._set_status_override(tr('移動できる書庫がありません'), 2500)
-            return
+            return "unavailable"
         try:
             parameters = tuple(
                 inspect.signature(
@@ -2600,12 +2710,17 @@ class ViewerWindow(QMainWindow):
             self._set_status_override(message, 2500)
         elif result == "unavailable":
             self._set_status_override(tr('移動できる書庫がありません'), 2500)
+        return result
 
     def show_adjacent_book_searching(self, direction: int) -> None:
         label = tr('前') if direction < 0 else tr('次')
         self._set_status_override(tr('{p0}の本を検索中…', p0=label))
 
     def complete_adjacent_book_search(self, direction: int, result: str) -> None:
+        if direction > 0 and self._slideshow_waiting_for_next and result != "opened":
+            self._slideshow_waiting_for_next = False
+            self._slideshow_skip_next_for_book = self._current_book_key
+            self._slideshow_repeat_or_stop()
         if result == "opened":
             self._status_override_token += 1
             self._status_override_message = None
@@ -2870,6 +2985,11 @@ class ViewerWindow(QMainWindow):
         # Persistence is based on the already committed immutable snapshot,
         # but does not block the ViewerWidget's first paint of that frame.
         self.book_session.notify_page_changed()
+        path = self.displayed_browser_path
+        identity = (token.book.epoch, id(source), path)
+        if path is not None and identity != self._last_displayed_browser_item:
+            self._last_displayed_browser_item = identity
+            self.displayed_item_changed.emit(self, path)
 
     def _on_page_list_current_changed(
         self,
@@ -5512,6 +5632,17 @@ class ViewerWindow(QMainWindow):
         self.dispatch_command(command)
 
     def _on_extra_mouse_button(self, button: str) -> None:
+        command = (
+            self.mouse_back_button_action if button == "back"
+            else self.mouse_forward_button_action if button == "forward" else ""
+        )
+        if (
+            bool(self.settings.get("mouse_side_buttons_folder_navigation", False))
+            and isinstance(self.book_session.source, FolderImageSource)
+            and command in {commands.PREVIOUS_BOOK, commands.NEXT_BOOK}
+        ):
+            self.side_folder_requested.emit(self, -1 if command == commands.PREVIOUS_BOOK else 1)
+            return
         if button == "back":
             if self.mouse_back_button_action == commands.PREVIOUS_BOOK:
                 self._open_adjacent_book(-1, require_browser_snapshot=True)
@@ -5579,38 +5710,9 @@ class ViewerWindow(QMainWindow):
             self.dispatch_command(commands.TOGGLE_FULLSCREEN)
 
     def show_shortcuts_help(self) -> None:
-        QMessageBox.information(
-            self,
-            tr('ショートカット一覧'),
-            "\n".join(
-                [
-                    tr('Right: 次ページ'),
-                    tr('Left: 前ページ'),
-                    tr('Alt+Left / Alt+Right: 表示履歴を戻る / 進む'),
-                    tr('Space / PageDown: 下スクロールまたは次ページ'),
-                    tr('Backspace / PageUp: 上スクロールまたは前ページ'),
-                    tr('Shift+Right: 1ページ進む'),
-                    tr('Shift+Left: 1ページ戻る'),
-                    tr('Home / End: 先頭 / 最後'),
-                    tr('G: ページ指定'),
-                    tr('D: 単ページ / 見開き切替'),
-                    tr('R: 左綴じ / 右綴じ切替'),
-                    tr('F: 全画面切替'),
-                    tr('Esc: 全画面解除'),
-                    tr('Z: 拡大鏡の切り替え'),
-                    tr('+ / - / Ctrl+Wheel: ズーム'),
-                    tr('0: ウィンドウに合わせる'),
-                    tr('S: スライドショー'),
-                    tr('B / Ctrl+B: ブックマーク切替'),
-                    tr('Ctrl+PageDown / Ctrl+PageUp: 次 / 前の本'),
-                    tr('Ctrl+C: 現在画像をコピー'),
-                    tr('Ctrl+Shift+C: 現在画像のパスをコピー'),
-                    tr('Ctrl+Alt+C: 現在の表示をコピー'),
-                    tr('Ctrl+I: ページ情報'),
-                    tr('Double Click: 全画面切替'),
-                ]
-            ),
-        )
+        from .shortcuts_help import show_shortcuts_help
+
+        show_shortcuts_help(self)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # type: ignore[override]
         if ExternalDropOpenController.local_paths(event.mimeData()):
@@ -6331,10 +6433,12 @@ class ViewerWindow(QMainWindow):
         self.fullscreen_chrome.reevaluate_visibility()
 
     def zoom_in(self) -> None:
-        self.viewer.set_manual_zoom(self.viewer.manual_zoom * 1.15)
+        base = self.viewer._scale_for_current_mode()
+        self.viewer.set_manual_zoom(base * 1.15)
 
     def zoom_out(self) -> None:
-        self.viewer.set_manual_zoom(self.viewer.manual_zoom / 1.15)
+        base = self.viewer._scale_for_current_mode()
+        self.viewer.set_manual_zoom(base / 1.15)
 
     def rotate_left(self) -> None:
         self.rotation_angle = (self.rotation_angle - 90) % 360
@@ -6365,14 +6469,35 @@ class ViewerWindow(QMainWindow):
         self._rerender_pdf()
 
     def toggle_slideshow(self) -> None:
-        if self.slideshow_timer.isActive():
-            self.slideshow_timer.stop()
+        if self.slideshow_timer.isActive() or self._slideshow_waiting_for_next:
+            self.stop_slideshow()
         else:
             if self.model.total_pages > 0:
+                self._slideshow_skip_next_for_book = None
                 self.slideshow_timer.start()
         self._sync_actions()
 
-    def set_slideshow_interval_dialog(self) -> None:
+    def set_slideshow_interval(self, seconds: float) -> None:
+        self.slideshow_interval_ms = min(60000, max(500, round(seconds * 1000)))
+        self._update_shared_setting("slideshow_interval_ms", self.slideshow_interval_ms)
+        self.slideshow_timer.setInterval(self.slideshow_interval_ms)
+        self._sync_actions()
+
+    def stop_slideshow(self) -> None:
+        self.slideshow_timer.stop()
+        self._slideshow_waiting_for_next = False
+        self._slideshow_opening_next = False
+        self.slideshow_stopped.emit(self)
+        self._sync_actions()
+
+    def start_slideshow(self, seconds: float) -> None:
+        self.set_slideshow_interval(seconds)
+        self._slideshow_skip_next_for_book = None
+        if self.model.total_pages > 0 and not self._slideshow_waiting_for_next:
+            self.slideshow_timer.start()
+        self._sync_actions()
+
+    def set_slideshow_interval_dialog(self, *, start: bool = False) -> None:
         seconds, accepted = QInputDialog.getDouble(
             self,
             tr('スライドショー間隔'),
@@ -6383,17 +6508,40 @@ class ViewerWindow(QMainWindow):
             1,
         )
         if not accepted:
+            self._sync_actions()
             return
-        self.slideshow_interval_ms = int(seconds * 1000)
-        self._update_shared_setting("slideshow_interval_ms", self.slideshow_interval_ms)
-        self.slideshow_timer.setInterval(self.slideshow_interval_ms)
+        if start:
+            self.start_slideshow(seconds)
+        else:
+            self.set_slideshow_interval(seconds)
 
     def _advance_slideshow(self) -> None:
-        old = self.model.current_index
-        self.next_page(input_kind=NavigationInputKind.REFRESH)
-        if self.model.current_index == old:
+        if self._slideshow_waiting_for_next:
+            return
+        previous_anchor = self.model.current_index
+        self.page_navigation.next_display_unit(input_kind=NavigationInputKind.REFRESH)
+        if self.model.current_index != previous_anchor:
+            return
+        if (
+            self.model.total_pages > 0 and self.auto_open_adjacent_book
+            and self._slideshow_skip_next_for_book != self._current_book_key
+        ):
+            self._slideshow_waiting_for_next = True
             self.slideshow_timer.stop()
+            result = self._open_adjacent_book(1)
+            if result not in {"searching", "opened"} and self._slideshow_waiting_for_next:
+                self.complete_adjacent_book_search(1, result or "unavailable")
             self._sync_actions()
+            return
+        self._slideshow_repeat_or_stop()
+
+    def _slideshow_repeat_or_stop(self) -> None:
+        if self.slideshow_repeat and self.model.total_pages > 0:
+            self.page_navigation.first_page(input_kind=NavigationInputKind.REFRESH)
+            self.slideshow_timer.start()
+        else:
+            self.slideshow_timer.stop()
+        self._sync_actions()
 
     def next_page(
         self,
@@ -6463,7 +6611,7 @@ class ViewerWindow(QMainWindow):
         *,
         input_kind: NavigationInputKind = NavigationInputKind.DISCRETE,
     ) -> None:
-        self.slideshow_timer.stop()
+        self.stop_slideshow()
         if self.slideshow_action.isChecked():
             self.slideshow_action.setChecked(False)
         self.page_navigation.first_page(input_kind=input_kind)
@@ -6473,26 +6621,20 @@ class ViewerWindow(QMainWindow):
         *,
         input_kind: NavigationInputKind = NavigationInputKind.DISCRETE,
     ) -> None:
-        self.slideshow_timer.stop()
+        self.stop_slideshow()
         if self.slideshow_action.isChecked():
             self.slideshow_action.setChecked(False)
         self.page_navigation.last_page(input_kind=input_kind)
 
     def toggle_fullscreen(self) -> None:
-        if (
-            self.isFullScreen()
-            or self.fullscreen_chrome.owns_true_fullscreen_transition
-        ):
+        if self._is_fullscreen_mode():
             self.fullscreen_chrome.leave_true_fullscreen()
         else:
             self.fullscreen_chrome.enter_true_fullscreen()
         self._apply_chrome_visibility()
 
     def exit_fullscreen(self) -> None:
-        if (
-            self.isFullScreen()
-            or self.fullscreen_chrome.owns_true_fullscreen_transition
-        ):
+        if self._is_fullscreen_mode():
             self.fullscreen_chrome.leave_true_fullscreen()
         self._apply_chrome_visibility()
 
@@ -6502,7 +6644,7 @@ class ViewerWindow(QMainWindow):
             self._apply_chrome_visibility()
 
     def _apply_chrome_visibility(self) -> None:
-        fullscreen = self.isFullScreen()
+        fullscreen = self._is_fullscreen_mode()
         self.fullscreen_chrome.set_fullscreen_state(
             fullscreen,
             hide_ui=self.hide_ui_in_fullscreen,
@@ -6513,7 +6655,7 @@ class ViewerWindow(QMainWindow):
     def _apply_cursor_visibility_policy(self) -> None:
         self.viewer.set_auto_hide_cursor(False)
         self.fullscreen_chrome.set_hide_cursor_enabled(
-            self.isFullScreen() and self.hide_cursor_in_fullscreen
+            self._is_fullscreen_mode() and self.hide_cursor_in_fullscreen
         )
 
     def prepare_shutdown(self, *, wait_msecs: int = 250) -> None:

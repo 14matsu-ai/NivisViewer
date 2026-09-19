@@ -40,13 +40,18 @@ from .browser_sort import (
     BrowserSortKey,
 )
 from .app_icon import install_window_icon
-from .browser_item_delegate import BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR, GRID_PRESET_THUMBNAIL_SIZES
+from .browser_item_delegate import (
+    BROWSER_FILE_FALLBACK_DEFAULT_COLOR,
+    BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR,
+    GRID_PRESET_THUMBNAIL_SIZES,
+)
 from .fallback_background_editor import FallbackBackgroundEditor
 from .browser_wheel_scroll import (
     BROWSER_WHEEL_SCROLL_CUSTOM_MAX_ROWS,
     BROWSER_WHEEL_SCROLL_CUSTOM_MIN_ROWS,
 )
 from .config_manager import ConfigManager
+from .pdfium_service import PdfiumService
 from .ffmpeg_thumbnail_backend import FFmpegLocator
 from .thumbnail_render import (
     BROWSER_THUMBNAIL_DISPLAY_MODES,
@@ -186,6 +191,7 @@ class SettingsDialog(QDialog):
         winrar_locator: WinRARLocator | None = None,
         ffmpeg_locator: FFmpegLocator | None = None,
         file_registration_service: WindowsFileRegistrationService | None = None,
+        pdfium_service: PdfiumService | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(tr('設定'))
@@ -193,6 +199,7 @@ class SettingsDialog(QDialog):
         self.setModal(True)
         self.resize(620, 680)
         self.config = config_manager
+        self._pdfium_service = pdfium_service
         self._cache_usage_getter = cache_usage_getter
         self._cache_statistics_getter = cache_statistics_getter
         self._last_save_error_reported: str | None = None
@@ -303,7 +310,31 @@ class SettingsDialog(QDialog):
         )
         self.ui_language_restart_note.setWordWrap(True)
         form.addRow(self.ui_language_restart_note)
+        help_group = QGroupBox(tr('ヘルプ'), tab)
+        help_layout = QVBoxLayout(help_group)
+        self.shortcuts_help_button = QPushButton(tr('ショートカット一覧'), help_group)
+        self.diagnostics_button = QPushButton(
+            tr('NivisViewerについて／診断情報'), help_group,
+        )
+        self.shortcuts_help_button.clicked.connect(self.show_shortcuts_help)
+        self.diagnostics_button.clicked.connect(self.show_diagnostics)
+        help_layout.addWidget(self.shortcuts_help_button)
+        help_layout.addWidget(self.diagnostics_button)
+        form.addRow(help_group)
         return tab
+
+    def show_shortcuts_help(self) -> None:
+        from .shortcuts_help import show_shortcuts_help
+
+        show_shortcuts_help(self)
+
+    def show_diagnostics(self) -> None:
+        from .diagnostics_dialog import DiagnosticsDialog
+
+        dialog = DiagnosticsDialog(
+            self.config.base_dir, self, pdfium_service=self._pdfium_service,
+        )
+        dialog.exec()
 
     def _build_windows_tab(self) -> QWidget:
         tab = QWidget(self)
@@ -485,6 +516,10 @@ class SettingsDialog(QDialog):
 
         magnifier_resampling_group = QGroupBox(tr('拡大鏡'), resampling_group)
         magnifier_resampling_form = QFormLayout(magnifier_resampling_group)
+        self.magnifier_allow_outside_image_checkbox = QCheckBox(
+            tr('ルーペを画像の外側にも移動できる'), magnifier_resampling_group,
+        )
+        magnifier_resampling_form.addRow(self.magnifier_allow_outside_image_checkbox)
         self.magnifier_downscale_algorithm_combo = QComboBox(
             magnifier_resampling_group
         )
@@ -839,6 +874,14 @@ class SettingsDialog(QDialog):
         list_form.addRow(
             self.browser_preserve_search_for_viewer_roundtrip_checkbox
         )
+        self.browser_tag_grouped_checkbox = QCheckBox(
+            tr('タグボタンをまとめる'),
+            list_group,
+        )
+        self.browser_tag_grouped_checkbox.setToolTip(
+            tr('登録タグの絞り込みを「タグ」ボタンのメニューへまとめます。')
+        )
+        list_form.addRow(self.browser_tag_grouped_checkbox)
         self.browser_item_spacing_x_spin = QSpinBox(list_group)
         self.browser_item_spacing_x_spin.setRange(0, 32)
         self.browser_item_spacing_x_spin.setSuffix(" px")
@@ -868,6 +911,13 @@ class SettingsDialog(QDialog):
         self.browser_filename_display_combo.addItem(tr('1行'), "one_line")
         self.browser_filename_display_combo.addItem(tr('2行'), "two_lines")
         list_form.addRow(tr('ファイル名:'), self.browser_filename_display_combo)
+        self.browser_filename_extension_checkbox = QCheckBox(
+            tr('ファイル名の拡張子を表示'), list_group
+        )
+        list_form.addRow(self.browser_filename_extension_checkbox)
+        self.browser_filename_extension_checkbox.setToolTip(
+            tr('ファイル名の表示だけを変えます。既定では拡張子を表示します。実際の名前、検索・並び替え・開く・コピーなどの動作や、ファイル種類のアイコンは変わりません。フォルダ名と拡張子がない名前はそのままです。')
+        )
         self.browser_filename_gap_spin = QSpinBox(list_group)
         self.browser_filename_gap_spin.setRange(0, 32)
         self.browser_filename_gap_spin.setSuffix(" px")
@@ -881,6 +931,34 @@ class SettingsDialog(QDialog):
         list_form.addRow(tr('ファイル名内余白（上下）:'), self.browser_filename_padding_y_spin)
         self.browser_filename_padding_y_spin.setToolTip(
             tr('ファイル名領域の内側で、文字の上と下にそれぞれ追加する余白です。0で文字の行高のみ。非表示時は使いません。')
+        )
+        self.browser_filename_elide_combo = QComboBox(list_group)
+        self.browser_filename_elide_combo.addItem(
+            tr('先頭を優先（後方を省略）'), "right"
+        )
+        self.browser_filename_elide_combo.addItem(
+            tr('中央を省略'), "middle"
+        )
+        list_form.addRow(
+            tr('長いファイル名:'), self.browser_filename_elide_combo
+        )
+        self.browser_filename_elide_combo.setToolTip(
+            tr('1行表示と2行表示の末尾行で使う省略方式です。先頭優先は先頭側を残し、後方に省略記号を表示します。2行表示の折り返し位置は変えません。')
+        )
+        self.browser_filename_font_size_combo = QComboBox(list_group)
+        self.browser_filename_font_size_combo.addItem(
+            tr('自動（密度に合わせる）'), 0
+        )
+        for point_size in range(6, 25):
+            self.browser_filename_font_size_combo.addItem(
+                f"{point_size} pt", point_size
+            )
+        list_form.addRow(
+            tr('ファイル名フォントサイズ:'),
+            self.browser_filename_font_size_combo,
+        )
+        self.browser_filename_font_size_combo.setToolTip(
+            tr('ファイル名の文字サイズです。表示領域の高さも文字に合わせて変わり、画像サイズは変わりません。自動は密度ごとの既定サイズを使います。')
         )
         self.browser_filename_display_combo.currentIndexChanged.connect(
             self._sync_browser_filename_controls
@@ -931,11 +1009,11 @@ class SettingsDialog(QDialog):
 
         folder_editor = FallbackBackgroundEditor(
             cache_group, default_color=BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR,
-            auto_label=tr('自動（ZipPla互換の黒）'), restore_label=tr('既定に戻す'),
+            auto_label=tr('自動（薄い黄色）'), restore_label=tr('既定に戻す'),
         )
         file_editor = FallbackBackgroundEditor(
-            cache_group, default_color=BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR,
-            auto_label=tr('自動（既定の黒）'), restore_label=tr('デフォルトに戻す'),
+            cache_group, default_color=BROWSER_FILE_FALLBACK_DEFAULT_COLOR,
+            auto_label=tr('自動（グレー）'), restore_label=tr('デフォルトに戻す'),
         )
         # One explicit catalog drives both loading and serialization.
         self._fallback_background_editors = {
@@ -1257,6 +1335,10 @@ class SettingsDialog(QDialog):
         self.mouse_forward_action_combo = self._command_combo(button_group)
         button_form.addRow(tr('戻る / XButton1:'), self.mouse_back_action_combo)
         button_form.addRow(tr('進む / XButton2:'), self.mouse_forward_action_combo)
+        self.mouse_side_buttons_folder_navigation_checkbox = QCheckBox(
+            tr('画像表示中はサイドボタンでフォルダー間を移動'), button_group,
+        )
+        button_form.addRow(self.mouse_side_buttons_folder_navigation_checkbox)
 
         layout.addWidget(gesture_group)
         layout.addWidget(browser_gesture_group)
@@ -1265,6 +1347,12 @@ class SettingsDialog(QDialog):
         return tab
 
     def load_current_values(self) -> None:
+        self.mouse_side_buttons_folder_navigation_checkbox.setChecked(
+            bool(self.config.get("mouse_side_buttons_folder_navigation", False))
+        )
+        self.magnifier_allow_outside_image_checkbox.setChecked(
+            bool(self.config.get("magnifier_allow_outside_image", True))
+        )
         self.ui_language_combo.setCurrentIndex(max(
             0, self.ui_language_combo.findData(self.config.get("ui_language", "ja")),
         ))
@@ -1310,7 +1398,7 @@ class SettingsDialog(QDialog):
         )
         self._select_data(
             self.viewer_canvas_click_direction_combo,
-            self.config.get("viewer_canvas_click_direction", "right_next"),
+            self.config.get("viewer_canvas_click_direction", "auto"),
         )
         self._select_data(
             self.viewer_canvas_left_click_combo,
@@ -1447,6 +1535,20 @@ class SettingsDialog(QDialog):
         )
         self.browser_filename_padding_y_spin.setValue(
             int(self.config.get("browser_filename_padding_y", 0))
+        )
+        self.browser_tag_grouped_checkbox.setChecked(
+            bool(self.config.get("browser_tag_grouped", False))
+        )
+        self.browser_filename_extension_checkbox.setChecked(
+            bool(self.config.get("browser_filename_show_extension", True))
+        )
+        self._select_data(
+            self.browser_filename_elide_combo,
+            self.config.get("browser_filename_elide_mode", "right"),
+        )
+        self._select_data(
+            self.browser_filename_font_size_combo,
+            int(self.config.get("browser_filename_font_size", 0)),
         )
         self.browser_show_hidden_checkbox.setChecked(
             bool(self.config.get("browser_show_hidden_items", True))
@@ -1711,6 +1813,9 @@ class SettingsDialog(QDialog):
         visible = self.browser_filename_display_combo.currentData() != "hidden"
         self.browser_filename_gap_spin.setEnabled(visible)
         self.browser_filename_padding_y_spin.setEnabled(visible)
+        self.browser_filename_extension_checkbox.setEnabled(visible)
+        self.browser_filename_elide_combo.setEnabled(visible)
+        self.browser_filename_font_size_combo.setEnabled(visible)
 
     def refresh_registration_status(self) -> None:
         service = self._file_registration_service
@@ -1873,6 +1978,7 @@ class SettingsDialog(QDialog):
             "viewer_slider_wheel_single_page_enabled": (
                 self.viewer_slider_wheel_single_page_checkbox.isChecked()
             ),
+            "magnifier_allow_outside_image": self.magnifier_allow_outside_image_checkbox.isChecked(),
             "viewer_prefetch_preset": preset,
             "viewer_prefetch_direction_priority_enabled": (
                 self.prefetch_direction_priority_checkbox.isChecked()
@@ -1968,6 +2074,7 @@ class SettingsDialog(QDialog):
             "browser_preserve_search_for_viewer_roundtrip": (
                 self.browser_preserve_search_for_viewer_roundtrip_checkbox.isChecked()
             ),
+            "browser_tag_grouped": self.browser_tag_grouped_checkbox.isChecked(),
             "browser_item_spacing_x": self.browser_item_spacing_x_spin.value(),
             "browser_item_spacing_y": self.browser_item_spacing_y_spin.value(),
             "browser_cell_padding": self.browser_cell_padding_spin.value(),
@@ -1977,6 +2084,15 @@ class SettingsDialog(QDialog):
             "browser_filename_gap": self.browser_filename_gap_spin.value(),
             "browser_filename_padding_y": (
                 self.browser_filename_padding_y_spin.value()
+            ),
+            "browser_filename_show_extension": (
+                self.browser_filename_extension_checkbox.isChecked()
+            ),
+            "browser_filename_elide_mode": str(
+                self.browser_filename_elide_combo.currentData()
+            ),
+            "browser_filename_font_size": int(
+                self.browser_filename_font_size_combo.currentData()
             ),
             "browser_show_hidden_items": (
                 self.browser_show_hidden_checkbox.isChecked()
@@ -2045,6 +2161,7 @@ class SettingsDialog(QDialog):
             "mouse_forward_button_action": str(
                 self.mouse_forward_action_combo.currentData() or ""
             ),
+            "mouse_side_buttons_folder_navigation": self.mouse_side_buttons_folder_navigation_checkbox.isChecked(),
         }
 
     def apply_settings(self) -> dict[str, object]:

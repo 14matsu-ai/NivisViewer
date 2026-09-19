@@ -230,10 +230,15 @@ class FullscreenChromeController(QObject):
         )
         self._set_target_screen(screen)
         self.window.setGeometry(target_geometry)
-        self.window.showFullScreen()
-        # Qt owns the fullscreen state; the explicit full-monitor projection
-        # prevents a stale availableGeometry/working-area rectangle from
-        # surviving the native transition.
+        if _is_native_windows_platform():
+            # Keep Win32's maximized state on a borderless HWND. This matches
+            # the shell-recognized transition used by ZipPla; Qt's separate
+            # WindowFullScreen state does not set WS_MAXIMIZE.
+            self.window.showMaximized()
+        else:
+            self.window.showFullScreen()
+        # The explicit full-monitor projection prevents stale Qt work-area
+        # bounds from leaving the native taskbar edge uncovered.
         self.window.setGeometry(target_geometry)
         self._apply_native_fullscreen_bounds(native_monitor)
 
@@ -286,12 +291,11 @@ class FullscreenChromeController(QObject):
             return None
 
     def _apply_native_fullscreen_bounds(self, monitor: int | None) -> None:
-        """Project full-monitor bounds to the Windows HWND without topmost.
+        """Project full-monitor bounds onto the borderless native window.
 
-        This does not modify taskbar settings or z-order the Viewer above
-        other applications.  It only closes Qt/native transition gaps by
-        applying the monitor rectangle to the already frameless fullscreen
-        HWND.
+        On Windows the caller has already entered Qt's maximized state. Keep
+        that OS-visible state while correcting the bounds for mixed-DPI
+        monitors; z-order is left to the foreground window and Windows shell.
         """
 
         if not _is_native_windows_platform() or not self.window.isVisible():
@@ -854,7 +858,7 @@ class FullscreenChromeController(QObject):
         top_global = self.overlay_parent.mapToGlobal(QPoint(0, local_top)).y()
         frame = self.window.frameGeometry()
         bottom_bounds = QRect(frame)
-        if self.window.isFullScreen():
+        if self.fullscreen or self.window.isFullScreen():
             screen = self.window.screen()
             if screen is not None:
                 # QRect uses inclusive right/bottom coordinates, while
@@ -881,7 +885,7 @@ class FullscreenChromeController(QObject):
         )
         left = overlay_region.left()
         right = overlay_region.right()
-        if self.window.isFullScreen():
+        if self.fullscreen or self.window.isFullScreen():
             screen = self.window.screen()
             if screen is not None:
                 # Preserve the existing high-DPI boundary allowance only

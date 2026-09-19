@@ -53,7 +53,7 @@ def test_click_config_compatibility_and_settings(tmp_path, qapp, value):
     if value is not None:
         config.apply({"viewer_canvas_click_direction": value})
     config.save()
-    expected = value if value in {"right_next", "left_next", "auto"} else "right_next"
+    expected = value if value in {"right_next", "left_next", "auto"} else "auto"
     assert ConfigManager(config.path).load()["viewer_canvas_click_direction"] == expected
     dialog = SettingsDialog(config)
     try:
