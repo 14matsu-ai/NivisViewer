@@ -180,6 +180,18 @@ def test_settings_all_tabs_are_english_and_values_remain_ids(tmp_path, qapp):
         assert dialog.browser_sort_key_combo.itemText(0) == "Type (Ascending)"
         assert dialog.browser_wheel_scroll_mode_combo.findData("custom") >= 0
         assert dialog.gesture_down_combo.findData("next_page") >= 0
+        assert dialog.browser_folder_snapshot_cache_help_button.accessibleName() == (
+            "Folder listing memory cache help"
+        )
+        assert dialog.thumbnail_webp_quality_help_button.accessibleName() == (
+            "Saved thumbnail quality help"
+        )
+        assert dialog.thumbnail_cache_max_edge_help_button.accessibleName() == (
+            "Maximum generated edge help"
+        )
+        assert dialog.thumbnail_preserve_alpha_help_button.accessibleName() == (
+            "Saved thumbnail transparency help"
+        )
         clipped = []
         for index in range(dialog.tabs.count()):
             dialog.tabs.setCurrentIndex(index)

@@ -130,6 +130,10 @@ def test_real_settings_alpha_cancel_apply_and_palette_identity(tmp_path, qapp, m
             assert viewport.rect().contains(control.mapTo(viewport, control.rect().center()))
             assert not control.isChecked()
             assert dialog.thumbnail_webp_quality_spin.value() == 40
+            assert "\n" in dialog.thumbnail_preserve_alpha_help_button.toolTip()
+            assert dialog.thumbnail_preserve_alpha_help_button.accessibleName() == (
+                "保存サムネイルの透明度の説明"
+            )
             control.setChecked(True)
             assert config.get("thumbnail_preserve_alpha") is False
             if apply: dialog.apply_settings()

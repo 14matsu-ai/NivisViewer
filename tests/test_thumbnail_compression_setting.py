@@ -1,6 +1,7 @@
 from dataclasses import replace
 from io import BytesIO
 from threading import Event, Thread
+from unittest.mock import patch
 
 import pytest
 from PIL import Image
@@ -55,7 +56,7 @@ def test_real_settings_compression_control_cancel_apply_and_runtime(tmp_path, qa
                 assert viewport.rect().contains(control.mapTo(viewport, control.rect().center()))
                 assert (control.minimum(), control.maximum(), control.value()) == (1, 100, 60)
                 assert control.parentWidget().title() == "サムネイル"
-                assert control.parentWidget().layout().labelForField(control).text() == "保存サムネイルの圧縮品質:"
+                assert dialog.thumbnail_webp_quality_label.text() == "保存サムネイルの圧縮品質:"
                 control.setValue(37)
                 assert config.get("thumbnail_webp_quality") == 60
                 assert window.thumbnail_render_spec == old
@@ -87,6 +88,80 @@ def test_real_settings_compression_control_cancel_apply_and_runtime(tmp_path, qa
             dialog.reject()
         window.close()
         qapp.processEvents()
+
+
+def test_thumbnail_help_buttons_are_adjacent_and_open_detailed_help(
+    tmp_path, qapp
+):
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    dialog = SettingsDialog(config)
+    dialog.show()
+    dialog.tabs.setCurrentIndex(1)
+    browser_tab = dialog.tabs.currentWidget()
+    browser_tab.ensureWidgetVisible(dialog.thumbnail_webp_quality_help_button)
+    qapp.processEvents()
+
+    def assert_help_follows(text_widget, help_button):
+        assert help_button.parentWidget() is text_widget.parentWidget()
+        gap = help_button.geometry().left() - text_widget.geometry().right() - 1
+        assert 0 <= gap <= 8
+
+    assert dialog.browser_folder_snapshot_cache_checkbox.text() == (
+        "フォルダ一覧をメモリに一時保存する"
+    )
+    assert_help_follows(
+        dialog.browser_folder_snapshot_cache_checkbox,
+        dialog.browser_folder_snapshot_cache_help_button,
+    )
+    assert_help_follows(
+        dialog.thumbnail_webp_quality_label,
+        dialog.thumbnail_webp_quality_help_button,
+    )
+    assert_help_follows(
+        dialog.thumbnail_cache_max_edge_label,
+        dialog.thumbnail_cache_max_edge_help_button,
+    )
+    assert_help_follows(
+        dialog.thumbnail_preserve_alpha_checkbox,
+        dialog.thumbnail_preserve_alpha_help_button,
+    )
+    assert dialog.thumbnail_webp_quality_help_button.accessibleName() == (
+        "保存サムネイルの圧縮品質の説明"
+    )
+    assert dialog.thumbnail_preserve_alpha_help_button.accessibleName() == (
+        "保存サムネイルの透明度の説明"
+    )
+    assert dialog.thumbnail_cache_max_edge_help_button.accessibleName() == (
+        "生成最大辺の説明"
+    )
+    assert dialog.browser_folder_snapshot_cache_help_button.accessibleName() == (
+        "フォルダ一覧メモリ保存の説明"
+    )
+    assert "\n" in dialog.thumbnail_webp_quality_help_button.toolTip()
+    assert "\n" in dialog.thumbnail_cache_max_edge_help_button.toolTip()
+    assert "\n" in dialog.thumbnail_preserve_alpha_help_button.toolTip()
+
+    popup_calls: list[tuple[str, str]] = []
+    with patch(
+        "app.settings_dialog.QMessageBox.information",
+        side_effect=lambda _parent, title, text: popup_calls.append(
+            (str(title), str(text))
+        ),
+    ):
+        dialog.thumbnail_cache_max_edge_help_button.click()
+        dialog.thumbnail_webp_quality_help_button.click()
+        dialog.thumbnail_preserve_alpha_help_button.click()
+    assert len(popup_calls) == 3
+    assert "論理表示サイズ" in popup_calls[0][1]
+    assert "画面DPI" in popup_calls[0][1]
+    assert "bucket" in popup_calls[0][1]
+    assert "1～100（既定値60）" in popup_calls[1][1]
+    assert "高いほど画質" in popup_calls[1][1]
+    assert "既定ではオフ" in popup_calls[2][1]
+    assert "RGB" in popup_calls[2][1]
+    assert "アルファ" in popup_calls[2][1]
+    dialog.reject()
 
 
 @pytest.mark.parametrize("quality", [1, 37, 60, 100])

@@ -103,7 +103,6 @@ cache initialization had not happened, so it does NOT test full cleanup overlap.
 | --- | --- |
 | Browser constructor -> `_run_idle_cache_cleanup` | One 1,000 ms timer per new Browser. Retries at 500 ms while scan/thumbnail work is pending or submission is refused. Successful submission does not schedule a navigation-driven repeat. |
 | Provider `cleanup_caches_async(force=False)` -> `cleanup_if_due` | Touch active requested tokens, check daily timestamp; run full prune only when due and cache is initialized. |
-| Settings explicit cleanup button | `force=True`; bypass daily check. |
 | Changed `thumbnail_cache_max_unused_days` setting | `force=True`; no such change occurs on ordinary folder navigation. |
 | Changed `thumbnail_cache_limit_mb` setting | Queue `prune()` directly. Ordinary navigation does not reapply it. |
 | `ThumbnailDiskCache.put` | Every 32 successful saves calls full `prune(remove_orphans=True)`, independent of daily timestamp. This CAN repeat during cold generation; it is not an expiry check per folder. |

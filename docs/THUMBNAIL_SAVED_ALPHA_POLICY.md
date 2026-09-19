@@ -27,10 +27,13 @@ The compression default remains60, integer range1-100. The new
 (missing/invalid -> false). Apply/Cancel/reopen use the existing Settings flow.
 Actual user config was not edited during implementation.
 
-Helper text:
+The compact circled `?` after the checkbox has a concise multi-line hover
+summary. Clicking it opens the detailed help:
 
-> 通常はBrowserの背景色で透明部分を埋めて保存します。
-> オン: 透明度はそのまま保持し、色は指定品質で非可逆圧縮します。
+> 保存サムネイルの透明度保持は既定ではオフです。
+> オフ: Browserの背景色で透明部分を埋め、透明度を破棄してRGBを指定品質の非可逆WebPで保存します。
+> オン: 透明度（アルファ）をそのまま保持し、RGBは指定品質で非可逆圧縮します。
+> WebP非対応時はPNG（可逆圧縮）を使用します。
 
 Compression helper now correctly removes “透明画像は対象外” and explains that
 WebP-unavailable fallback is PNG. Existing lazy-update explanation remains.

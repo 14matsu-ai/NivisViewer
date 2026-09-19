@@ -9,11 +9,17 @@ plus lossy RGB, with optional exact alpha preservation. See
 
 Main Settings -> Browser -> サムネイル, immediately after 生成最大辺:
 
+- A compact circled `?` follows `生成最大辺:`. Its multi-line hover text
+  summarizes the physical-resolution and bucket behavior, and clicking it opens
+  the full explanation.
 - Label: `保存サムネイルの圧縮品質`.
 - Integer spin control: 1 through 100, default **60**.
-- Helper: `高いほど高画質・容量大。透明画像は対象外。`
-- Lazy-update explanation:
-  `新しく生成するサムネイルに適用され、既存キャッシュは順次更新されます。`
+- A compact circled `?` follows the label. Its multi-line hover text summarizes
+  the quality/size tradeoff, and clicking it opens the full explanation.
+- The detailed help states that the integer range is 1 through 100, the default
+  is **60**, higher values improve quality while increasing size, WebP fallback
+  is lossless PNG, and the setting applies to new thumbnails while existing
+  cache entries update gradually.
 
 The existing ConfigManager owns `thumbnail_webp_quality`. Missing, malformed,
 boolean, fractional and out-of-range values normalize to 60. Apply persists and

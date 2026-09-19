@@ -7575,11 +7575,11 @@ unchanged. This change adds no image decode, association lookup, thumbnail
 request or filesystem scan to painting.
 
 Settings -> Browser -> サムネイル now places
-`ファイルの代替サムネイル背景` beside `フォルダーの代替サムネイル背景`.
+`ファイルの代替サムネイル背景` beside `フォルダの代替サムネイル背景`.
 The independent `browser_file_fallback_background` stores `auto` or normalized
 `#rrggbb`; missing legacy keys and invalid values become `auto`. Shared
 normalization and color-picker/reset/button helpers preserve folder behavior.
-The explicit `デフォルトに戻す` button resets the staged value to `auto`;
+The explicit `既定に戻す` button resets the staged value to `auto`;
 Apply/OK persists and repaints open Browser views immediately. Cancel discards
 unapplied changes, including an unapplied reset; repeated reset remains valid.
 Color-only configuration does not invalidate display surfaces, decoded caches,

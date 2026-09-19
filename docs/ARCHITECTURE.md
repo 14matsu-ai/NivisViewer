@@ -497,7 +497,7 @@ FullscreenChromeControllerの既定hide delayは0msです。cursorがoverlayとe
 
 ディスクcacheはsource fingerprint、archive entry、ratio、crop、smart crop、encoder、render policyをrender variantとして、1 variantにつき最大2解像度、同一source／entry全体で最大4派生を保持します。3個目／5個目の保存時は現在保存中とBrowser memory／pendingで保護された要求を残し、inactive familyと最終利用が古いentryを先に削除します。全bucketは生成せず、可視要求の解像度だけをon-demand保存します。
 
-cleanupは欠損record、孤立file、任意の未使用期間、per-variant、per-item、global LRUの各制限を適用し、容量超過時は90%まで減らします。cache hitのaccess時刻は従来どおり遅延flushです。未使用期間は0（無効）または7～3650日で、起動後のworker、前回から24時間経過、設定変更、手動「今すぐ整理」でGUI外実行します。短期間設定は再生成とSSD書き込みを増やす可能性があるため設定画面に警告します。
+cleanupは欠損record、孤立file、任意の未使用期間、per-variant、per-item、global LRUの各制限を適用し、容量超過時は90%まで減らします。cache hitのaccess時刻は従来どおり遅延flushです。未使用期間は0（無効）または7～3650日で、起動後のworker、前回から24時間経過、設定変更でGUI外実行します。短期間設定は再生成とSSD書き込みを増やす可能性があるため設定画面に警告します。
 
 ### Sprint 17の信頼性境界
 

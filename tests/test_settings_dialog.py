@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 from PIL import Image
 from PySide6.QtCore import QCoreApplication, QEvent
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QPushButton, QWidget
 
 from app.browser_model import BrowserItem, BrowserItemKind
 from app.config_manager import ConfigManager
@@ -556,6 +556,48 @@ def test_cache_clear_button_emits_request(
 
     assert requests == [True]
     assert "要求" in dialog.cache_usage_label.text()
+    dialog.reject()
+
+
+def test_cache_usage_layout_keeps_one_row_and_has_no_manual_cleanup(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    dialog = SettingsDialog(
+        make_config(tmp_path),
+        cache_statistics_getter=lambda: {
+            "usage_bytes": 123456789,
+            "entry_count": 123456,
+            "session_growth_bytes": 9876543,
+            "last_cleanup_display": "2026-09-20 12:34",
+        },
+    )
+    dialog.resize(420, 680)
+    dialog.show()
+    dialog.tabs.setCurrentIndex(1)
+    browser_tab = dialog.tabs.currentWidget()
+    browser_tab.ensureWidgetVisible(dialog.clear_cache_button)
+    qapp.processEvents()
+
+    assert not hasattr(dialog, "cleanup_cache_button")
+    assert not hasattr(SettingsDialog, "cache_cleanup_requested")
+    assert all(
+        button.text() != "今すぐ整理"
+        for button in dialog.findChildren(QPushButton)
+    )
+    assert dialog.cache_usage_label.wordWrap()
+    usage_row = dialog.cache_usage_label.parentWidget()
+    assert usage_row is not None
+    assert usage_row.layout().count() == 2
+    assert not dialog.cache_usage_label.geometry().intersects(
+        dialog.clear_cache_button.geometry()
+    )
+    assert (
+        dialog.cache_usage_label.geometry().right()
+        < dialog.clear_cache_button.geometry().left()
+    )
+    assert dialog.clear_cache_button.isVisible()
+    assert "最後の整理:" in dialog.cache_usage_label.toolTip()
     dialog.reject()
 
 

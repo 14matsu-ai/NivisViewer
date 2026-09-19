@@ -3,7 +3,7 @@ from dataclasses import replace
 import pytest
 from PySide6.QtCore import QPoint, QRect, QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
-from PySide6.QtWidgets import QStyle, QStyleOptionViewItem
+from PySide6.QtWidgets import QLabel, QStyle, QStyleOptionViewItem
 
 from app.browser_item_delegate import BrowserItemDelegate, thumbnail_content_rect
 from app.browser_model import BrowserItemKind, BrowserItemModel
@@ -113,7 +113,12 @@ def test_file_color_settings_apply_reset_cancel_and_repaint_only(tmp_path, qapp)
         qapp.processEvents()
         assert dialog.tabs.tabText(1) == "Browser"
         assert dialog.browser_file_fallback_background_combo.isVisible()
-        assert dialog.browser_file_fallback_restore_button.text() == "デフォルトに戻す"
+        assert any(
+            label.text() == "フォルダの代替サムネイル背景:"
+            for label in dialog.findChildren(QLabel)
+        )
+        assert dialog.browser_folder_fallback_restore_button.text() == "既定に戻す"
+        assert dialog.browser_file_fallback_restore_button.text() == "既定に戻す"
         patches.setattr("app.settings_dialog.QColorDialog.getColor", lambda *_: QColor("#31597d"))
         dialog.browser_file_fallback_background_combo.setCurrentIndex(1)
         dialog.browser_file_fallback_color_button.click()
