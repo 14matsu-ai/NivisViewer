@@ -5522,9 +5522,6 @@ class BrowserWindow(QMainWindow):
         dialog.cache_clear_requested.connect(
             self.thumbnail_provider.clear_all_caches_async
         )
-        dialog.cache_cleanup_requested.connect(
-            lambda: self.thumbnail_provider.cleanup_caches_async(force=True)
-        )
         self.thumbnail_provider.cache_cleared.connect(dialog.refresh_cache_usage)
         dialog.exec()
 

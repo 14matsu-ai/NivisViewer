@@ -96,6 +96,35 @@ _FOLDER_SNAPSHOT_CACHE_HELP_TEXT = (
     '戻る・進むなどでは前回の一覧を先に表示し、バックグラウンドで追加・削除・変更を確認します。'
     '上限に達すると古い一覧から解放します。無効にすると保存しません。場所の履歴件数とは別の設定です。'
 )
+_THUMBNAIL_WEBP_QUALITY_TOOLTIP_TEXT = (
+    '保存サムネイルの圧縮品質です（1～100）。\n'
+    '高いほど画質は上がりますが、ファイルサイズも大きくなります。'
+)
+_THUMBNAIL_WEBP_QUALITY_HELP_TEXT = (
+    '保存サムネイルの圧縮品質は1～100（既定値60）です。\n'
+    '高いほど画質は上がりますが、ファイルサイズも大きくなります。'
+    'WebP非対応時はPNG（可逆圧縮）で保存します。\n'
+    '新しく生成するサムネイルに適用され、既存キャッシュは順次更新されます。'
+)
+_THUMBNAIL_ALPHA_TOOLTIP_TEXT = (
+    '保存時の透明度を保持するか選びます。\n'
+    '既定はオフで、オンにするとアルファを保持します。'
+)
+_THUMBNAIL_ALPHA_HELP_TEXT = (
+    '保存サムネイルの透明度保持は既定ではオフです。\n'
+    'オフ: Browserの背景色で透明部分を埋め、透明度を破棄してRGBを指定品質の非可逆WebPで保存します。\n'
+    'オン: 透明度（アルファ）をそのまま保持し、RGBは指定品質で非可逆圧縮します。\n'
+    'WebP非対応時はPNG（可逆圧縮）を使用します。'
+)
+_THUMBNAIL_MAX_EDGE_TOOLTIP_TEXT = (
+    'サムネイル生成時の長辺上限を設定します。\n'
+    '表示サイズや高DPIに合わせた物理解像度を調整できます。'
+)
+_THUMBNAIL_MAX_EDGE_HELP_TEXT = (
+    '論理表示サイズと画面DPIから物理解像度を選び、複数のbucketを再利用します。\n'
+    '設定変更後も互換キャッシュは再利用されます。\n'
+    '完全に作り直す場合だけ「キャッシュを削除」を使用してください。'
+)
 
 
 class _SevenZipProbeSignals(QObject):
@@ -237,7 +266,6 @@ _RETIRED_SETTINGS_DIALOGS: set[QDialog] = set()
 class SettingsDialog(QDialog):
     settings_applied = Signal(object)
     cache_clear_requested = Signal()
-    cache_cleanup_requested = Signal()
 
     def __init__(
         self,
@@ -1046,9 +1074,14 @@ class SettingsDialog(QDialog):
         )
         snapshot_cache_checkbox_layout.setContentsMargins(0, 0, 0, 0)
         snapshot_cache_checkbox_layout.setSpacing(4)
+        snapshot_cache_checkbox_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
         self.browser_folder_snapshot_cache_checkbox = QCheckBox(
             tr('フォルダ一覧をメモリに一時保存する'),
             self.browser_folder_snapshot_cache_checkbox_row,
+        )
+        self.browser_folder_snapshot_cache_checkbox.setSizePolicy(
+            QSizePolicy.Policy.Maximum,
+            QSizePolicy.Policy.Fixed,
         )
         self.browser_folder_snapshot_cache_checkbox.setToolTip(
             tr(_FOLDER_SNAPSHOT_CACHE_TOOLTIP_TEXT)
@@ -1138,14 +1171,14 @@ class SettingsDialog(QDialog):
         )
         file_editor = FallbackBackgroundEditor(
             cache_group, default_color=BROWSER_FILE_FALLBACK_DEFAULT_COLOR,
-            auto_label=tr('自動（グレー）'), restore_label=tr('デフォルトに戻す'),
+            auto_label=tr('自動（グレー）'), restore_label=tr('既定に戻す'),
         )
         # One explicit catalog drives both loading and serialization.
         self._fallback_background_editors = {
             "browser_folder_fallback_background": folder_editor,
             "browser_file_fallback_background": file_editor,
         }
-        form.addRow(tr('フォルダーの代替サムネイル背景:'), folder_editor)
+        form.addRow(tr('フォルダの代替サムネイル背景:'), folder_editor)
         form.addRow(tr('ファイルの代替サムネイル背景:'), file_editor)
         # Keep existing control accessors; these are aliases, not state.
         self.browser_folder_fallback_background_combo = folder_editor.combo
@@ -1173,36 +1206,133 @@ class SettingsDialog(QDialog):
         self.thumbnail_cache_max_edge_spin.setRange(256, 2048)
         self.thumbnail_cache_max_edge_spin.setSingleStep(256)
         self.thumbnail_cache_max_edge_spin.setSuffix(" px")
-        form.addRow(tr('生成最大辺:'), self.thumbnail_cache_max_edge_spin)
+        self.thumbnail_cache_max_edge_label_row = QWidget(cache_group)
+        thumbnail_cache_max_edge_label_layout = QHBoxLayout(
+            self.thumbnail_cache_max_edge_label_row
+        )
+        thumbnail_cache_max_edge_label_layout.setContentsMargins(0, 0, 0, 0)
+        thumbnail_cache_max_edge_label_layout.setSpacing(4)
+        thumbnail_cache_max_edge_label_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.thumbnail_cache_max_edge_label = QLabel(
+            tr('生成最大辺:'),
+            self.thumbnail_cache_max_edge_label_row,
+        )
+        self.thumbnail_cache_max_edge_label.setBuddy(
+            self.thumbnail_cache_max_edge_spin
+        )
+        thumbnail_cache_max_edge_label_layout.addWidget(
+            self.thumbnail_cache_max_edge_label
+        )
+        self.thumbnail_cache_max_edge_help_button = _CircularHelpButton(
+            self.thumbnail_cache_max_edge_label_row
+        )
+        self.thumbnail_cache_max_edge_help_button.setText('?')
+        self.thumbnail_cache_max_edge_help_button.setFixedSize(20, 20)
+        self.thumbnail_cache_max_edge_help_button.setAutoRaise(True)
+        self.thumbnail_cache_max_edge_help_button.setToolTip(
+            tr(_THUMBNAIL_MAX_EDGE_TOOLTIP_TEXT)
+        )
+        self.thumbnail_cache_max_edge_help_button.setAccessibleName(
+            tr('生成最大辺の説明')
+        )
+        self.thumbnail_cache_max_edge_help_button.clicked.connect(
+            self._show_thumbnail_max_edge_help
+        )
+        thumbnail_cache_max_edge_label_layout.addWidget(
+            self.thumbnail_cache_max_edge_help_button
+        )
+        self.thumbnail_cache_max_edge_spin.setToolTip(
+            tr(_THUMBNAIL_MAX_EDGE_TOOLTIP_TEXT)
+        )
+        form.addRow(
+            self.thumbnail_cache_max_edge_label_row,
+            self.thumbnail_cache_max_edge_spin,
+        )
 
         self.thumbnail_webp_quality_spin = QSpinBox(cache_group)
         self.thumbnail_webp_quality_spin.setObjectName("thumbnail_webp_quality_spin")
         self.thumbnail_webp_quality_spin.setRange(1, 100)
-        form.addRow(tr('保存サムネイルの圧縮品質:'), self.thumbnail_webp_quality_spin)
-        compression_note = QLabel(
-            tr('高いほど高画質・容量大。WebP非対応時はPNG（可逆圧縮）で保存します。\n新しく生成するサムネイルに適用され、既存キャッシュは順次更新されます。'),
-            cache_group,
+        self.thumbnail_webp_quality_label_row = QWidget(cache_group)
+        thumbnail_webp_quality_label_layout = QHBoxLayout(
+            self.thumbnail_webp_quality_label_row
         )
-        compression_note.setWordWrap(True)
-        self.thumbnail_webp_quality_spin.setToolTip(compression_note.text())
-        form.addRow(compression_note)
-        self.thumbnail_preserve_alpha_checkbox = QCheckBox(tr('保存サムネイルの透明度を保持'), cache_group)
+        thumbnail_webp_quality_label_layout.setContentsMargins(0, 0, 0, 0)
+        thumbnail_webp_quality_label_layout.setSpacing(4)
+        thumbnail_webp_quality_label_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.thumbnail_webp_quality_label = QLabel(
+            tr('保存サムネイルの圧縮品質:'),
+            self.thumbnail_webp_quality_label_row,
+        )
+        self.thumbnail_webp_quality_label.setBuddy(self.thumbnail_webp_quality_spin)
+        thumbnail_webp_quality_label_layout.addWidget(
+            self.thumbnail_webp_quality_label
+        )
+        self.thumbnail_webp_quality_help_button = _CircularHelpButton(
+            self.thumbnail_webp_quality_label_row
+        )
+        self.thumbnail_webp_quality_help_button.setText('?')
+        self.thumbnail_webp_quality_help_button.setFixedSize(20, 20)
+        self.thumbnail_webp_quality_help_button.setAutoRaise(True)
+        self.thumbnail_webp_quality_help_button.setToolTip(
+            tr(_THUMBNAIL_WEBP_QUALITY_TOOLTIP_TEXT)
+        )
+        self.thumbnail_webp_quality_help_button.setAccessibleName(
+            tr('保存サムネイルの圧縮品質の説明')
+        )
+        self.thumbnail_webp_quality_help_button.clicked.connect(
+            self._show_thumbnail_webp_quality_help
+        )
+        thumbnail_webp_quality_label_layout.addWidget(
+            self.thumbnail_webp_quality_help_button
+        )
+        self.thumbnail_webp_quality_spin.setToolTip(
+            tr(_THUMBNAIL_WEBP_QUALITY_TOOLTIP_TEXT)
+        )
+        form.addRow(
+            self.thumbnail_webp_quality_label_row,
+            self.thumbnail_webp_quality_spin,
+        )
+        self.thumbnail_preserve_alpha_row = QWidget(cache_group)
+        thumbnail_preserve_alpha_layout = QHBoxLayout(
+            self.thumbnail_preserve_alpha_row
+        )
+        thumbnail_preserve_alpha_layout.setContentsMargins(0, 0, 0, 0)
+        thumbnail_preserve_alpha_layout.setSpacing(4)
+        thumbnail_preserve_alpha_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.thumbnail_preserve_alpha_checkbox = QCheckBox(
+            tr('保存サムネイルの透明度を保持'),
+            self.thumbnail_preserve_alpha_row,
+        )
         self.thumbnail_preserve_alpha_checkbox.setObjectName("thumbnail_preserve_alpha_checkbox")
-        form.addRow(self.thumbnail_preserve_alpha_checkbox)
-        alpha_note = QLabel(
-            tr('通常はBrowserの背景色で透明部分を埋めて保存します。\nオン: 透明度はそのまま保持し、色は指定品質で非可逆圧縮します。'),
-            cache_group,
+        self.thumbnail_preserve_alpha_checkbox.setSizePolicy(
+            QSizePolicy.Policy.Maximum,
+            QSizePolicy.Policy.Fixed,
         )
-        alpha_note.setWordWrap(True)
-        self.thumbnail_preserve_alpha_checkbox.setToolTip(alpha_note.text())
-        form.addRow(alpha_note)
-
-        bucket_note = QLabel(
-            tr('論理表示サイズと画面DPIから物理解像度を選び、複数のbucketを再利用します。設定変更後も互換キャッシュは再利用されます。完全に作り直す場合だけ「キャッシュを削除」を使用してください。'),
-            cache_group,
+        self.thumbnail_preserve_alpha_checkbox.setToolTip(
+            tr(_THUMBNAIL_ALPHA_TOOLTIP_TEXT)
         )
-        bucket_note.setWordWrap(True)
-        form.addRow(bucket_note)
+        thumbnail_preserve_alpha_layout.addWidget(
+            self.thumbnail_preserve_alpha_checkbox
+        )
+        self.thumbnail_preserve_alpha_help_button = _CircularHelpButton(
+            self.thumbnail_preserve_alpha_row
+        )
+        self.thumbnail_preserve_alpha_help_button.setText('?')
+        self.thumbnail_preserve_alpha_help_button.setFixedSize(20, 20)
+        self.thumbnail_preserve_alpha_help_button.setAutoRaise(True)
+        self.thumbnail_preserve_alpha_help_button.setToolTip(
+            tr(_THUMBNAIL_ALPHA_TOOLTIP_TEXT)
+        )
+        self.thumbnail_preserve_alpha_help_button.setAccessibleName(
+            tr('保存サムネイルの透明度の説明')
+        )
+        self.thumbnail_preserve_alpha_help_button.clicked.connect(
+            self._show_thumbnail_preserve_alpha_help
+        )
+        thumbnail_preserve_alpha_layout.addWidget(
+            self.thumbnail_preserve_alpha_help_button
+        )
+        form.addRow(self.thumbnail_preserve_alpha_row)
 
         self.disk_cache_checkbox = QCheckBox(
             tr('ディスクサムネイルキャッシュを使用する'),
@@ -1243,18 +1373,27 @@ class SettingsDialog(QDialog):
         form.addRow(cleanup_warning)
 
         self.cache_usage_label = QLabel(cache_group)
-        self.clear_cache_button = QPushButton(tr('キャッシュを削除'), cache_group)
-        self.clear_cache_button.clicked.connect(self.request_cache_clear)
-        self.cleanup_cache_button = QPushButton(tr('今すぐ整理'), cache_group)
-        self.cleanup_cache_button.clicked.connect(
-            self.cache_cleanup_requested.emit
+        self.cache_usage_label.setWordWrap(True)
+        self.cache_usage_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
         )
+        self.clear_cache_button = QPushButton(tr('キャッシュを削除'), cache_group)
+        self.clear_cache_button.setSizePolicy(
+            QSizePolicy.Policy.Maximum,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.clear_cache_button.clicked.connect(self.request_cache_clear)
         usage_row = QWidget(cache_group)
         usage_layout = QHBoxLayout(usage_row)
         usage_layout.setContentsMargins(0, 0, 0, 0)
+        usage_layout.setSpacing(8)
         usage_layout.addWidget(self.cache_usage_label, 1)
-        usage_layout.addWidget(self.cleanup_cache_button)
-        usage_layout.addWidget(self.clear_cache_button)
+        usage_layout.addWidget(
+            self.clear_cache_button,
+            0,
+            Qt.AlignmentFlag.AlignTop,
+        )
         form.addRow(tr('現在の使用量:'), usage_row)
 
         layout.addWidget(list_group)
@@ -1892,6 +2031,27 @@ class SettingsDialog(QDialog):
             self,
             tr('フォルダ一覧メモリ保存の説明'),
             tr(_FOLDER_SNAPSHOT_CACHE_HELP_TEXT),
+        )
+
+    def _show_thumbnail_webp_quality_help(self) -> None:
+        QMessageBox.information(
+            self,
+            tr('保存サムネイルの圧縮品質の説明'),
+            tr(_THUMBNAIL_WEBP_QUALITY_HELP_TEXT),
+        )
+
+    def _show_thumbnail_preserve_alpha_help(self) -> None:
+        QMessageBox.information(
+            self,
+            tr('保存サムネイルの透明度の説明'),
+            tr(_THUMBNAIL_ALPHA_HELP_TEXT),
+        )
+
+    def _show_thumbnail_max_edge_help(self) -> None:
+        QMessageBox.information(
+            self,
+            tr('生成最大辺の説明'),
+            tr(_THUMBNAIL_MAX_EDGE_HELP_TEXT),
         )
 
     def _activate_browser_sort(self, index: int) -> None:
