@@ -329,6 +329,36 @@ def test_invalid_browser_settings_are_normalized_and_clamped(tmp_path: Path) -> 
     assert restored["browser_display_density"] == "standard"
 
 
+def test_folder_snapshot_cache_limit_defaults_and_normalizes_invalid_values(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "folder-cache-config.json"
+    path.write_text(
+        '{"browser_folder_snapshot_cache_max_entries": 12345}',
+        encoding="utf-8",
+    )
+    restored = ConfigManager(path).load()
+    assert restored["browser_folder_snapshot_cache_max_entries"] == 60_000
+
+    manager = ConfigManager(path)
+    manager.load()
+    manager.apply(
+        {"browser_folder_snapshot_cache_max_entries": 120_000},
+        save=True,
+    )
+    assert ConfigManager(path).load()[
+        "browser_folder_snapshot_cache_max_entries"
+    ] == 120_000
+
+    path.write_text(
+        '{"browser_folder_snapshot_cache_max_entries": "120000"}',
+        encoding="utf-8",
+    )
+    assert ConfigManager(path).load()[
+        "browser_folder_snapshot_cache_max_entries"
+    ] == 60_000
+
+
 def test_thumbnail_size_has_safe_lower_bound(tmp_path: Path) -> None:
     manager = ConfigManager(tmp_path / "config.json")
     manager.load()

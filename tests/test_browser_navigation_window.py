@@ -234,6 +234,55 @@ def test_back_restores_selection_and_scroll_position(
     qapp.processEvents()
 
 
+def test_history_restore_publishes_cached_listing_before_reconcile(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    first = tmp_path / "A"
+    second = tmp_path / "B"
+    second.mkdir()
+    for number in range(160):
+        write_image(first / f"{number:03}.jpg")
+
+    window = make_window(tmp_path, first, qapp)
+    assert window.navigate_to(second)
+    finish_scan(window, qapp)
+
+    assert window.go_back()
+    pending = window._pending_scan
+    assert pending is not None and pending.snapshot_hit
+    assert window.current_path == first.absolute()
+    assert 0 < window.item_model.rowCount() < 160
+    assert window._snapshot_reconcile_pending
+
+    finish_scan(window, qapp)
+    assert window.item_model.rowCount() == 160
+    assert not window._snapshot_reconcile_pending
+    window.close()
+    qapp.processEvents()
+
+
+def test_folder_snapshot_cache_limit_applies_immediately_from_config(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "A"
+    write_image(folder / "a.jpg")
+    window = make_window(tmp_path, folder, qapp)
+
+    assert window.folder_snapshot_cache.max_entries == 60_000
+    window.config.apply(
+        {"browser_folder_snapshot_cache_max_entries": 15_000}
+    )
+    assert window.folder_snapshot_cache.max_entries == 15_000
+
+    window.config.apply({"browser_folder_snapshot_cache_enabled": False})
+    assert not window.folder_snapshot_cache.enabled
+    assert window.folder_snapshot_cache.entry_count == 0
+    window.close()
+    qapp.processEvents()
+
+
 def test_large_back_never_paints_parent_before_saved_selection_is_restored(
     tmp_path: Path,
     qapp: QApplication,

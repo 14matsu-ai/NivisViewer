@@ -192,6 +192,52 @@ no selection, a deep scroll, and both actual Back and Forward restores. It
 checks the first paint's anchor for each route while confirming the initial
 filtered model is still partial.
 
+## Large-folder return listing snapshot (2026-09-20)
+
+The remaining slow case was different from thumbnail work. Small folders were
+already fast, and thumbnails requested normally after the list appeared. With
+about 15,000 entries, the first useful row waited for directory preparation,
+metadata conversion, sorting and the final model publication. The existing
+diagnostic probes showed that the GUI-side reset was the visible cost: warm
+1,000-row data reached its first reset at 71.38 ms and first visible render at
+133.45 ms; warm 10,000-row data reached its first reset at 276.43 ms and first
+visible render at 465.13 ms. The 10,000-row sort itself was about 34.36 ms,
+so adding thumbnail workers would not address this return-navigation wait.
+
+`BrowserFolderSnapshotCache` now keeps completed, sorted folder items for the
+current session. It is keyed by normalized path, visibility policy and sort
+policy, uses an LRU budget of at most 60,000 total items and an estimated 96 MiB,
+skips an individual snapshot that exceeds either limit, and does not retain an
+empty result because it provides no return-list benefit. It never pre-scans an
+unvisited folder and is cleared when disabled. The settings dialog exposes the
+session-only option `フォルダ一覧をメモリに一時保存する` and a total item
+cap with choices 15,000 / 30,000 / 60,000 / 120,000 / 240,000; the default is
+60,000. The cap changes the LRU retention immediately, while the 96 MiB safety
+budget remains internal and always applies. The UI shows rounded conservative
+estimates of about 12 / 23 / 46 / 92 / 184 MiB for those choices; actual
+retention can stop earlier at the internal safety cap. A compact circular `?`
+button follows the option label, with a concise multi-line tooltip and a
+click-open detailed help dialog.
+
+When Back/Forward or another return navigation finds a snapshot, the current
+folder is committed immediately and only the first visible tranche is reset.
+The rest is appended in bounded chunks through the event loop, then a normal
+scanner refresh reconciles additions, deletions, metadata and sort changes.
+Selection, saved scroll position, generation checks and the existing thumbnail
+cache remain separate. File operations are held while this provisional listing
+is being reconciled, so a stale snapshot cannot authorize rename, move,
+recycle, copy or create actions. A missing or failed refresh leaves the cached
+view visible and reports the normal access status; it does not treat the
+snapshot as authoritative filesystem state.
+
+Focused coverage is in `tests/test_browser_folder_snapshot_cache.py` and
+`tests/test_browser_navigation_window.py`. The latter checks that a 160-item
+history return publishes a partial cached model before reconciliation and then
+settles on the complete refreshed listing. The combined focused regression set
+for cache, navigation, async navigation, settings, help presentation, UI
+language and directory watching is 179 passed; changed modules also pass `py_compile` and
+`git diff --check`.
+
 ## Verification
 
 - New count-index tests cover filtered sources, both append routes, duplicate

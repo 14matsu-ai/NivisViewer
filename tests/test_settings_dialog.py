@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from threading import Event
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from PIL import Image
 from PySide6.QtCore import QCoreApplication, QEvent
@@ -185,6 +185,66 @@ def test_folder_fallback_background_restore_default_uses_auto(
     assert not dialog.browser_folder_fallback_color_button.isEnabled()
     assert dialog.values()["browser_folder_fallback_background"] == "auto"
     assert dialog.browser_folder_fallback_color_button.text() == "#FFFFE0"
+    dialog.reject()
+
+
+def test_folder_snapshot_cache_controls_persist_and_disable_cap(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    del qapp
+    config = make_config(tmp_path)
+    dialog = SettingsDialog(config)
+
+    assert dialog.browser_folder_snapshot_cache_checkbox.text() == (
+        "フォルダ一覧をメモリに一時保存する"
+    )
+    expected_tooltip = (
+        "ファイル数の多いフォルダの再表示を高速化します。\n"
+        "前回の一覧をメモリから先に表示し、あとで変更を確認します。\n"
+        "HDDや大量ファイルのフォルダで特に効果的です。"
+    )
+    assert dialog.browser_folder_snapshot_cache_checkbox.toolTip() == (
+        expected_tooltip
+    )
+    assert dialog.browser_folder_snapshot_cache_help_button.toolTip() == (
+        expected_tooltip
+    )
+    assert (
+        dialog.browser_folder_snapshot_cache_help_button.parentWidget()
+        is dialog.browser_folder_snapshot_cache_checkbox_row
+    )
+    assert dialog.browser_folder_snapshot_cache_max_entries_combo.currentData() == (
+        60_000
+    )
+    assert dialog.browser_folder_snapshot_cache_max_entries_combo.isEnabled()
+    assert dialog.browser_folder_snapshot_cache_max_entries_combo.itemText(
+        dialog.browser_folder_snapshot_cache_max_entries_combo.findData(60_000)
+    ) == "60,000項目（推定約46MiB）"
+    popup_calls: list[tuple[str, str]] = []
+    with patch(
+        "app.settings_dialog.QMessageBox.information",
+        side_effect=lambda _parent, title, text: popup_calls.append(
+            (str(title), str(text))
+        ),
+    ):
+        dialog.browser_folder_snapshot_cache_help_button.click()
+    assert popup_calls
+    assert "画像サムネイルではなく" in popup_calls[0][1]
+    assert "再表示するときの待ち時間を短くする" in popup_calls[0][1]
+    assert "HDDや大量ファイルのフォルダで特に効果的" in popup_calls[0][1]
+
+    dialog.browser_folder_snapshot_cache_checkbox.setChecked(False)
+    assert not dialog.browser_folder_snapshot_cache_max_entries_combo.isEnabled()
+    dialog.browser_folder_snapshot_cache_max_entries_combo.setCurrentIndex(
+        dialog.browser_folder_snapshot_cache_max_entries_combo.findData(120_000)
+    )
+    changed = dialog.apply_settings()
+
+    assert changed["browser_folder_snapshot_cache_enabled"] is False
+    assert changed["browser_folder_snapshot_cache_max_entries"] == 120_000
+    restored = ConfigManager(config.path).load()
+    assert restored["browser_folder_snapshot_cache_max_entries"] == 120_000
     dialog.reject()
 
 
