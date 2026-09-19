@@ -110,6 +110,7 @@ from .browser_item_delegate import (
 )
 from .browser_navigation import BrowserLocation, BrowserNavigationHistory
 from .browser_scanner import (
+    DEFAULT_SCAN_BATCH_SIZE,
     BrowserDirectoryScanner,
     BrowserScanBatch,
     BrowserScanCompleted,
@@ -146,6 +147,11 @@ from .browser_thumbnail_scheduler import (
     calculate_grid_visible_range,
 )
 from .browser_visibility import BrowserVisibilityPolicy
+from .browser_folder_snapshot_cache import (
+    DEFAULT_MAX_ENTRIES,
+    BrowserFolderSnapshotCache,
+    normalize_browser_folder_snapshot_cache_max_entries,
+)
 from .archive_backend_registry import ArchiveBackendRegistry
 from .adjacent_book_search import (
     AdjacentBookBrowserSnapshot,
@@ -266,6 +272,7 @@ class _PendingDirectoryScan:
     directory_watch_dirty: bool = False
     first_batch_arrived: bool = False
     first_batch_applied: bool = False
+    snapshot_hit: bool = False
 
 
 class _BrowserContextFilenameEdit(QLineEdit):
@@ -574,6 +581,18 @@ class BrowserWindow(QMainWindow):
         self.scanner.batch_ready.connect(self._on_scan_batch)
         self.scanner.scan_completed.connect(self._on_scan_completed)
         self.scanner.scan_failed.connect(self._on_scan_failed)
+        self.folder_snapshot_cache = BrowserFolderSnapshotCache(
+            enabled=bool(
+                self.settings.get("browser_folder_snapshot_cache_enabled", True)
+            ),
+            max_entries=normalize_browser_folder_snapshot_cache_max_entries(
+                self.settings.get(
+                    "browser_folder_snapshot_cache_max_entries",
+                    DEFAULT_MAX_ENTRIES,
+                )
+            ),
+        )
+        self._snapshot_reconcile_pending = False
         self._owns_directory_watcher = directory_watcher is None
         self.directory_watcher = directory_watcher or BrowserDirectoryWatcher(
             self
@@ -1005,19 +1024,27 @@ class BrowserWindow(QMainWindow):
     def wait_for_scan(self, msecs: int = 5000) -> bool:
         """Diagnostic/test helper; normal UI code must not wait for scans."""
         wait = getattr(self.scanner, "wait_for_done", None)
-        if callable(wait):
-            wait(max(0, int(msecs)))
-        for _ in range(3):
-            QCoreApplication.processEvents()
-        pending = self._pending_scan
-        if (
-            pending is not None
-            and pending.committed
-            and pending.remaining_items
-        ):
-            self._scan_batch_timer.stop()
-            self._flush_pending_scan_batch()
-            QCoreApplication.processEvents()
+        deadline = monotonic() + max(0, int(msecs)) / 1000.0
+        while monotonic() < deadline:
+            remaining_msecs = max(
+                1,
+                int((deadline - monotonic()) * 1000),
+            )
+            if callable(wait):
+                wait(min(100, remaining_msecs))
+            for _ in range(3):
+                QCoreApplication.processEvents()
+            pending = self._pending_scan
+            if (
+                pending is not None
+                and pending.committed
+                and pending.remaining_items
+            ):
+                self._scan_batch_timer.stop()
+                self._flush_pending_scan_batch()
+                continue
+            if pending is None:
+                return True
         return self._pending_scan is None
 
     def navigate_to(
@@ -1038,6 +1065,11 @@ class BrowserWindow(QMainWindow):
         if not self._starting_drop_focus_navigation:
             self._cancel_browser_drop_focus()
         target = self._absolute_browser_path(path)
+        if self._snapshot_reconcile_pending and not self._same_path(
+            self.current_path,
+            target,
+        ):
+            self._snapshot_reconcile_pending = False
 
         pending = self._pending_scan
         if (
@@ -1052,6 +1084,9 @@ class BrowserWindow(QMainWindow):
             return True
 
         same_path = self._same_path(self.current_path, target)
+        snapshot_reconcile_requested = bool(
+            self._snapshot_reconcile_pending and same_path and force_reload
+        )
         if same_path and not force_reload:
             if pending is not None:
                 self._cancel_pending_scan(
@@ -1066,8 +1101,33 @@ class BrowserWindow(QMainWindow):
             self._update_navigation_actions()
             return True
 
-        if capture_current:
-            self._update_current_navigation_state()
+        if not force_reload and not same_path:
+            if capture_current:
+                self._update_current_navigation_state()
+            snapshot = self.folder_snapshot_cache.get(
+                target,
+                self._current_browser_visibility_policy(),
+                self._current_browser_sort_policy(),
+            )
+            if snapshot is not None:
+                try:
+                    target_exists = target.is_dir()
+                except OSError:
+                    target_exists = False
+                if target_exists:
+                    return self._navigate_from_folder_snapshot(
+                        target,
+                        snapshot.items,
+                        record_history=record_history,
+                        restore_location=(
+                            restore_location or BrowserLocation(str(target))
+                        ),
+                        failure_history_revert=failure_history_revert,
+                        navigation_source=navigation_source,
+                        trace_id=trace_id,
+                        atomic_restore=atomic_restore,
+                    )
+
         self._cancel_pending_scan(rollback_history=not atomic_restore)
         self._scan_generation += 1
         if trace_id:
@@ -1079,11 +1139,7 @@ class BrowserWindow(QMainWindow):
         request = BrowserScanRequest(
             path=str(target),
             generation=self._scan_generation,
-            visibility_policy=BrowserVisibilityPolicy(
-                show_hidden_items=self.browser_show_hidden_items,
-                show_unsupported_files=self.browser_show_unsupported_files,
-                show_system_items=self.browser_show_system_items,
-            ),
+            visibility_policy=self._current_browser_visibility_policy(),
             priority=(
                 BrowserScanPriority.REFRESH
                 if force_reload
@@ -1103,7 +1159,11 @@ class BrowserWindow(QMainWindow):
             refresh=same_path and force_reload,
             failure_history_revert=failure_history_revert,
             trace_id=trace_id,
-            navigation_source=navigation_source,
+            navigation_source=(
+                "snapshot_reconcile"
+                if snapshot_reconcile_requested
+                else navigation_source
+            ),
             atomic_restore=atomic_restore,
         )
         if not self._same_path(self._directory_watch_path, target):
@@ -1149,13 +1209,31 @@ class BrowserWindow(QMainWindow):
             or not pending.remaining_items
         ):
             return
-        remaining = pending.remaining_items[pending.remaining_item_offset :]
-        pending.remaining_items = ()
-        pending.remaining_item_offset = 0
+        if pending.snapshot_hit:
+            batch_end = min(
+                len(pending.remaining_items),
+                pending.remaining_item_offset + DEFAULT_SCAN_BATCH_SIZE * 4,
+            )
+            remaining = pending.remaining_items[
+                pending.remaining_item_offset : batch_end
+            ]
+            pending.remaining_item_offset = batch_end
+        else:
+            remaining = pending.remaining_items[pending.remaining_item_offset :]
+            pending.remaining_items = ()
+            pending.remaining_item_offset = 0
         self.item_model.append_final_directory_scan(
             remaining,
             generation=pending.generation,
         )
+        if pending.snapshot_hit and pending.remaining_item_offset < len(
+            pending.remaining_items
+        ):
+            self._scan_batch_timer.start(0)
+            self._schedule_scan_status_update()
+            return
+        pending.remaining_items = ()
+        pending.remaining_item_offset = 0
         self.item_model.finish_directory_scan(generation=pending.generation)
         self._restore_pending_scan_location(pending, final=True)
         self._finish_pending_scan(pending)
@@ -1194,6 +1272,8 @@ class BrowserWindow(QMainWindow):
                     tuple(buffered_entries)
                 )
             )
+
+        self._store_folder_snapshot(result.path, items)
 
         if pending.refresh:
             state = self._capture_list_view_state()
@@ -1273,6 +1353,11 @@ class BrowserWindow(QMainWindow):
             return
         self._apply_pending_browser_focus(final=True)
         reconcile_again = pending.directory_watch_dirty
+        snapshot_reconcile_path = (
+            pending.path if pending.snapshot_hit else None
+        )
+        if pending.navigation_source == "snapshot_reconcile":
+            self._snapshot_reconcile_pending = False
         self._pending_scan = None
         self.directory_scan_committed.emit(str(pending.path))
         self._update_status()
@@ -1290,6 +1375,11 @@ class BrowserWindow(QMainWindow):
             QTimer.singleShot(0, self._restore_file_operation_selection)
         if reconcile_again:
             self._schedule_directory_reconciliation()
+        if snapshot_reconcile_path is not None:
+            QTimer.singleShot(
+                0,
+                lambda path=snapshot_reconcile_path: self._start_snapshot_reconcile(path),
+            )
 
     def _on_scan_failed(self, error: BrowserScanError) -> None:
         pending = self._matching_pending_scan(error.generation, error.path)
@@ -1307,6 +1397,8 @@ class BrowserWindow(QMainWindow):
         )
         if pending.navigation_source == "recent_location":
             self.navigation_history.remove_recent(str(pending.path))
+        if pending.navigation_source == "snapshot_reconcile":
+            self._snapshot_reconcile_pending = False
         if pending.committed:
             self.item_model.cancel_directory_scan(
                 generation=pending.generation
@@ -1477,6 +1569,8 @@ class BrowserWindow(QMainWindow):
             self._rollback_pending_history(pending)
         self._discard_pending_scan_buffers(pending)
         self._pending_scan = None
+        if pending.snapshot_hit:
+            self._snapshot_reconcile_pending = False
 
     def _restart_pending_scan(self, pending: _PendingDirectoryScan) -> bool:
         if self._pending_scan is not pending:
@@ -1542,6 +1636,108 @@ class BrowserWindow(QMainWindow):
             self.browser_folders_first,
             self.browser_random_seed,
         )
+
+    def _current_browser_visibility_policy(self) -> BrowserVisibilityPolicy:
+        return BrowserVisibilityPolicy(
+            show_hidden_items=self.browser_show_hidden_items,
+            show_unsupported_files=self.browser_show_unsupported_files,
+            show_system_items=self.browser_show_system_items,
+        )
+
+    def _store_folder_snapshot(
+        self,
+        path: str | Path,
+        items: tuple[BrowserItem, ...] | list[BrowserItem],
+    ) -> None:
+        self.folder_snapshot_cache.put(
+            path,
+            self._current_browser_visibility_policy(),
+            self._current_browser_sort_policy(),
+            items,
+        )
+
+    def _start_snapshot_reconcile(self, path: Path) -> None:
+        if self._shutdown_prepared or not self._same_path(self.current_path, path):
+            self._snapshot_reconcile_pending = False
+            return
+        if not self._refresh_current_folder(navigation_source="snapshot_reconcile"):
+            self._snapshot_reconcile_pending = False
+
+    def _navigate_from_folder_snapshot(
+        self,
+        path: Path,
+        snapshot_items: tuple[BrowserItem, ...],
+        *,
+        record_history: bool,
+        restore_location: BrowserLocation,
+        failure_history_revert: str | int | None,
+        navigation_source: str,
+        trace_id: int,
+        atomic_restore: bool,
+    ) -> bool:
+        """Publish a cached listing, then reconcile it through a normal refresh."""
+
+        self._cancel_pending_scan(rollback_history=not atomic_restore)
+        self._scan_generation += 1
+        if trace_id:
+            performance_trace.mark(
+                trace_id,
+                "navigation.generation.issued",
+                str(self._scan_generation),
+            )
+        pending = _PendingDirectoryScan(
+            path=path,
+            generation=self._scan_generation,
+            record_history=record_history,
+            restore_location=restore_location,
+            refresh=False,
+            failure_history_revert=failure_history_revert,
+            trace_id=trace_id,
+            navigation_source=navigation_source,
+            atomic_restore=atomic_restore,
+            snapshot_hit=True,
+        )
+        self._pending_scan = pending
+        self._snapshot_reconcile_pending = True
+        if not self._same_path(self._directory_watch_path, path):
+            self._set_active_directory_watch(path)
+        self.address_bar.setText(str(path))
+        self._commit_pending_scan(pending)
+
+        initial_count = self._initial_scan_item_count(len(snapshot_items))
+        if atomic_restore:
+            initial_count = self._initial_restore_scan_item_count(
+                snapshot_items,
+                restore_location,
+            )
+        initial_items = snapshot_items[:initial_count]
+        pending.remaining_items = snapshot_items
+        pending.remaining_item_offset = initial_count
+        self.item_model.begin_final_directory_scan(
+            initial_items,
+            generation=pending.generation,
+        )
+        if atomic_restore:
+            self.list_view.doItemsLayout()
+        pending.first_batch_applied = True
+        if pending.trace_id:
+            performance_trace.mark(
+                pending.trace_id,
+                "browser.model.first_batch.applied",
+                str(len(initial_items)),
+            )
+        self._restore_pending_scan_location(pending, final=False)
+        self._apply_pending_browser_focus(final=False)
+        self._scan_batch_timer.stop()
+        if pending.remaining_item_offset < len(pending.remaining_items):
+            self._scan_batch_timer.start(0)
+            self._schedule_scan_status_update()
+        else:
+            self.item_model.finish_directory_scan(generation=pending.generation)
+            self._restore_pending_scan_location(pending, final=True)
+            self._finish_pending_scan(pending)
+        self._update_status(force=True)
+        return True
 
     def _restore_pending_scan_location(
         self,
@@ -1739,6 +1935,8 @@ class BrowserWindow(QMainWindow):
     def _refresh_current_folder(self, *, navigation_source: str) -> bool:
         if self.current_path is None:
             return False
+        if self._snapshot_reconcile_pending:
+            navigation_source = "snapshot_reconcile"
         location = self._current_location()
         if not self.navigate_to(
             self.current_path,
@@ -2692,6 +2890,9 @@ class BrowserWindow(QMainWindow):
         destination: str | Path | None = None,
         new_name: str | None = None,
     ) -> bool:
+        if self._snapshot_reconcile_pending:
+            self._show_temporary_status(tr('一覧を更新中のため操作できません'))
+            return False
         filtered_sources = tuple(
             path
             for path in sources
@@ -3921,7 +4122,12 @@ class BrowserWindow(QMainWindow):
         )
         if sort_changed:
             pending_scan = self._pending_scan
-            if (
+            snapshot_scan = bool(
+                pending_scan is not None and pending_scan.snapshot_hit
+            )
+            if snapshot_scan:
+                self._cancel_pending_scan(rollback_history=False)
+            elif (
                 pending_scan is not None
                 and pending_scan.committed
                 and pending_scan.remaining_items
@@ -3936,6 +4142,12 @@ class BrowserWindow(QMainWindow):
                 self.browser_folders_first,
                 self.browser_random_seed,
             )
+            if snapshot_scan and self.current_path is not None:
+                self._snapshot_reconcile_pending = True
+                if not self._refresh_current_folder(
+                    navigation_source="snapshot_reconcile"
+                ):
+                    self._snapshot_reconcile_pending = False
 
         thumbnail_changed = bool(
             {
@@ -4169,7 +4381,8 @@ class BrowserWindow(QMainWindow):
         if visibility_changed:
             pending_scan = self._pending_scan
             if pending_scan is not None:
-                self.navigate_to(
+                snapshot_scan = pending_scan.snapshot_hit
+                reloaded = self.navigate_to(
                     pending_scan.path,
                     record_history=pending_scan.record_history,
                     restore_location=pending_scan.restore_location,
@@ -4178,12 +4391,28 @@ class BrowserWindow(QMainWindow):
                     failure_history_revert=(
                         pending_scan.failure_history_revert
                     ),
-                    navigation_source=pending_scan.navigation_source,
+                    navigation_source=(
+                        "snapshot_reconcile"
+                        if snapshot_scan
+                        else pending_scan.navigation_source
+                    ),
                     trace_id=pending_scan.trace_id,
                     atomic_restore=pending_scan.atomic_restore,
                 )
+                if snapshot_scan and reloaded:
+                    self._snapshot_reconcile_pending = True
             elif self.current_path is not None:
                 self.refresh_current_folder()
+        if "browser_folder_snapshot_cache_enabled" in changed:
+            self.folder_snapshot_cache.set_enabled(
+                bool(changed["browser_folder_snapshot_cache_enabled"])
+            )
+        if "browser_folder_snapshot_cache_max_entries" in changed:
+            self.folder_snapshot_cache.set_max_entries(
+                normalize_browser_folder_snapshot_cache_max_entries(
+                    changed["browser_folder_snapshot_cache_max_entries"]
+                )
+            )
         if "thumbnail_webp_quality" in changed or "thumbnail_preserve_alpha" in changed:
             self.thumbnail_webp_quality = normalize_thumbnail_webp_quality(
                 changed.get("thumbnail_webp_quality", self.thumbnail_webp_quality)

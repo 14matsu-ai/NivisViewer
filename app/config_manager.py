@@ -18,6 +18,10 @@ from .browser_wheel_scroll import (
     normalize_browser_wheel_custom_rows,
     normalize_browser_wheel_scroll_mode,
 )
+from .browser_folder_snapshot_cache import (
+    DEFAULT_MAX_ENTRIES as DEFAULT_BROWSER_FOLDER_SNAPSHOT_CACHE_MAX_ENTRIES,
+    normalize_browser_folder_snapshot_cache_max_entries,
+)
 from .viewer_commands import normalize_viewer_command
 from .viewer_memory_policy import (
     normalize_viewer_memory_mode,
@@ -149,6 +153,10 @@ class ConfigManager(QObject):
         "browser_show_hidden_items": True,
         "browser_show_unsupported_files": True,
         "browser_show_system_items": False,
+        "browser_folder_snapshot_cache_enabled": True,
+        "browser_folder_snapshot_cache_max_entries": (
+            DEFAULT_BROWSER_FOLDER_SNAPSHOT_CACHE_MAX_ENTRIES
+        ),
         "last_browser_path": "",
         "browser_sidebar_visible": True,
         "browser_sidebar_width": 280,
@@ -405,6 +413,7 @@ class ConfigManager(QObject):
             "browser_tag_grouped",
             "browser_show_unsupported_files",
             "browser_show_system_items",
+            "browser_folder_snapshot_cache_enabled",
             "text_preview_enabled",
             "video_thumbnail_enabled",
             "video_thumbnail_shell_placeholder",
@@ -413,6 +422,11 @@ class ConfigManager(QObject):
         ):
             if not isinstance(normalized.get(key), bool):
                 normalized[key] = cls.DEFAULTS[key]
+        normalized[
+            "browser_folder_snapshot_cache_max_entries"
+        ] = normalize_browser_folder_snapshot_cache_max_entries(
+            normalized.get("browser_folder_snapshot_cache_max_entries")
+        )
         if not isinstance(normalized.get("browser_window_geometry"), str):
             normalized["browser_window_geometry"] = cls.DEFAULTS["browser_window_geometry"]
         if normalized.get("video_thumbnail_backend") not in {

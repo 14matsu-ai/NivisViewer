@@ -5,6 +5,14 @@ search queries, persisted identifiers or other runtime user data here.
 """
 
 ENGLISH: dict[str, str] = {
+    "フォルダ一覧をメモリに一時保存する": "Keep folder listings in memory",
+    "ファイル数の多いフォルダの再表示を高速化します。\n前回の一覧をメモリから先に表示し、あとで変更を確認します。\nHDDや大量ファイルのフォルダで特に効果的です。": "Speeds up returning to folders with many files.\nShows the previous listing from memory first, then checks for changes.\nEspecially useful for HDDs or folders with many files.",
+    "メモリに保存する最大項目数": "Maximum items to keep in memory",
+    "メモリに一時保存する一覧の合計項目数です。上限に達すると古い一覧から解放します。表示のメモリ量は保守的な概算で、推定96MiBの安全上限により先に解放される場合があります。": "Total item limit for temporary in-memory listings. Older listings are released at the limit. The displayed memory amount is a conservative estimate; the estimated 96 MiB safety limit may release listings sooner.",
+    "{p0}項目（推定約{p1}MiB）": "{p0} items (approximately {p1} MiB)",
+    "フォルダ一覧メモリ保存の説明": "Folder listing memory cache help",
+    "この設定は、ファイル数の多いフォルダを戻る・進むなどで再表示するときの待ち時間を短くするためのものです。HDDや大量ファイルのフォルダで特に効果的です。\n\n画像サムネイルではなく、フォルダ一覧のメタデータだけを現在のセッション中メモリに一時保存します。戻る・進むなどでは前回の一覧を先に表示し、バックグラウンドで追加・削除・変更を確認します。上限に達すると古い一覧から解放します。無効にすると保存しません。場所の履歴件数とは別の設定です。": "This option shortens the wait when returning to folders with many files using Back or Forward. It is especially useful for HDDs or folders with many files.\n\nIt temporarily stores folder-list metadata in memory for the current session; it does not store image thumbnails. Back and Forward show the previous listing first, then check additions, deletions and changes in the background. Older listings are released at the limit. Disable it to keep nothing. It is independent of the location-history count.",
+    "一覧を更新中のため操作できません": "File operations are unavailable while the listing is being refreshed",
     "タグの管理": "Manage tags",
     "登録名の変更・削除ではファイルのタグは変わりません。同じ名前を登録すると、既存の一致するタグも表示されます。": "Renaming or removing a registered name does not change file tags. Registering a name also shows existing matching tags.",
     "タグ名": "Tag name",

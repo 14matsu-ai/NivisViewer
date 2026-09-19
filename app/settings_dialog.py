@@ -7,8 +7,16 @@ from collections.abc import Callable
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QGuiApplication
+from PySide6.QtCore import (
+    QObject,
+    QRunnable,
+    QSize,
+    QThreadPool,
+    Qt,
+    Signal,
+    Slot,
+)
+from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPalette
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -27,6 +35,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -50,6 +59,11 @@ from .browser_wheel_scroll import (
     BROWSER_WHEEL_SCROLL_CUSTOM_MAX_ROWS,
     BROWSER_WHEEL_SCROLL_CUSTOM_MIN_ROWS,
 )
+from .browser_folder_snapshot_cache import (
+    BROWSER_FOLDER_SNAPSHOT_CACHE_ENTRY_LIMITS,
+    estimate_browser_folder_snapshot_cache_mib,
+    normalize_browser_folder_snapshot_cache_max_entries,
+)
 from .config_manager import ConfigManager
 from .pdfium_service import PdfiumService
 from .ffmpeg_thumbnail_backend import FFmpegLocator
@@ -70,10 +84,55 @@ from .windows_file_registration import WindowsFileRegistrationService
 
 
 _LOGGER = logging.getLogger(__name__)
+_FOLDER_SNAPSHOT_CACHE_TOOLTIP_TEXT = (
+    'ファイル数の多いフォルダの再表示を高速化します。\n'
+    '前回の一覧をメモリから先に表示し、あとで変更を確認します。\n'
+    'HDDや大量ファイルのフォルダで特に効果的です。'
+)
+_FOLDER_SNAPSHOT_CACHE_HELP_TEXT = (
+    'この設定は、ファイル数の多いフォルダを戻る・進むなどで再表示するときの待ち時間を短くするためのものです。'
+    'HDDや大量ファイルのフォルダで特に効果的です。\n\n'
+    '画像サムネイルではなく、フォルダ一覧のメタデータだけを現在のセッション中メモリに一時保存します。'
+    '戻る・進むなどでは前回の一覧を先に表示し、バックグラウンドで追加・削除・変更を確認します。'
+    '上限に達すると古い一覧から解放します。無効にすると保存しません。場所の履歴件数とは別の設定です。'
+)
 
 
 class _SevenZipProbeSignals(QObject):
     completed = Signal(int, object)
+
+
+class _CircularHelpButton(QToolButton):
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return QSize(20, 20)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return QSize(20, 20)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        circle = self.rect().adjusted(1, 1, -1, -1)
+        palette = self.palette()
+        if self.isDown():
+            painter.setBrush(palette.brush(QPalette.ColorRole.Highlight))
+            painter.setPen(palette.color(QPalette.ColorRole.Highlight))
+            text_color = palette.color(QPalette.ColorRole.HighlightedText)
+        elif self.underMouse():
+            painter.setBrush(palette.brush(QPalette.ColorRole.AlternateBase))
+            painter.setPen(palette.color(QPalette.ColorRole.Mid))
+            text_color = palette.color(QPalette.ColorRole.Text)
+        else:
+            painter.setBrush(palette.brush(QPalette.ColorRole.Base))
+            painter.setPen(palette.color(QPalette.ColorRole.Mid))
+            text_color = palette.color(QPalette.ColorRole.Text)
+        painter.drawEllipse(circle)
+        font = self.font()
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(text_color)
+        painter.drawText(circle, Qt.AlignmentFlag.AlignCenter, '?')
 
 
 class _SevenZipProbeWorker(QRunnable):
@@ -981,6 +1040,72 @@ class SettingsDialog(QDialog):
             tr('Windowsの保護されたシステム項目を表示します。操作時は注意してください。')
         )
         list_form.addRow(self.browser_show_system_checkbox)
+        self.browser_folder_snapshot_cache_checkbox_row = QWidget(list_group)
+        snapshot_cache_checkbox_layout = QHBoxLayout(
+            self.browser_folder_snapshot_cache_checkbox_row
+        )
+        snapshot_cache_checkbox_layout.setContentsMargins(0, 0, 0, 0)
+        snapshot_cache_checkbox_layout.setSpacing(4)
+        self.browser_folder_snapshot_cache_checkbox = QCheckBox(
+            tr('フォルダ一覧をメモリに一時保存する'),
+            self.browser_folder_snapshot_cache_checkbox_row,
+        )
+        self.browser_folder_snapshot_cache_checkbox.setToolTip(
+            tr(_FOLDER_SNAPSHOT_CACHE_TOOLTIP_TEXT)
+        )
+        snapshot_cache_checkbox_layout.addWidget(
+            self.browser_folder_snapshot_cache_checkbox
+        )
+        self.browser_folder_snapshot_cache_help_button = _CircularHelpButton(
+            self.browser_folder_snapshot_cache_checkbox_row
+        )
+        self.browser_folder_snapshot_cache_help_button.setText('?')
+        self.browser_folder_snapshot_cache_help_button.setFixedSize(20, 20)
+        self.browser_folder_snapshot_cache_help_button.setAutoRaise(True)
+        self.browser_folder_snapshot_cache_help_button.setToolTip(
+            tr(_FOLDER_SNAPSHOT_CACHE_TOOLTIP_TEXT)
+        )
+        self.browser_folder_snapshot_cache_help_button.setAccessibleName(
+            tr('フォルダ一覧メモリ保存の説明')
+        )
+        self.browser_folder_snapshot_cache_help_button.clicked.connect(
+            self._show_browser_folder_snapshot_cache_help
+        )
+        snapshot_cache_checkbox_layout.addWidget(
+            self.browser_folder_snapshot_cache_help_button
+        )
+        list_form.addRow(self.browser_folder_snapshot_cache_checkbox_row)
+        self.browser_folder_snapshot_cache_max_entries_combo = QComboBox(
+            list_group
+        )
+        for limit in BROWSER_FOLDER_SNAPSHOT_CACHE_ENTRY_LIMITS:
+            self.browser_folder_snapshot_cache_max_entries_combo.addItem(
+                tr(
+                    '{p0}項目（推定約{p1}MiB）',
+                    p0=f'{limit:,}',
+                    p1=estimate_browser_folder_snapshot_cache_mib(limit),
+                ),
+                limit,
+            )
+        self.browser_folder_snapshot_cache_max_entries_combo.setToolTip(
+            tr('メモリに一時保存する一覧の合計項目数です。上限に達すると古い一覧から解放します。表示のメモリ量は保守的な概算で、推定96MiBの安全上限により先に解放される場合があります。')
+        )
+        snapshot_cache_cap_row = QWidget(list_group)
+        snapshot_cache_cap_layout = QHBoxLayout(snapshot_cache_cap_row)
+        snapshot_cache_cap_layout.setContentsMargins(0, 0, 0, 0)
+        snapshot_cache_cap_layout.setSpacing(4)
+        snapshot_cache_cap_layout.addWidget(
+            self.browser_folder_snapshot_cache_max_entries_combo,
+            1,
+        )
+        list_form.addRow(
+            tr('メモリに保存する最大項目数'),
+            snapshot_cache_cap_row,
+        )
+        self.browser_folder_snapshot_cache_checkbox.toggled.connect(
+            self._sync_browser_folder_snapshot_cache_controls
+        )
+        self._sync_browser_folder_snapshot_cache_controls()
 
         cache_group = QGroupBox(tr('サムネイル'), tab)
         form = QFormLayout(cache_group)
@@ -1559,6 +1684,24 @@ class SettingsDialog(QDialog):
         self.browser_show_system_checkbox.setChecked(
             bool(self.config.get("browser_show_system_items", False))
         )
+        self.browser_folder_snapshot_cache_checkbox.setChecked(
+            bool(
+                self.config.get(
+                    "browser_folder_snapshot_cache_enabled",
+                    True,
+                )
+            )
+        )
+        self._select_data(
+            self.browser_folder_snapshot_cache_max_entries_combo,
+            normalize_browser_folder_snapshot_cache_max_entries(
+                self.config.get(
+                    "browser_folder_snapshot_cache_max_entries",
+                    60_000,
+                )
+            ),
+        )
+        self._sync_browser_folder_snapshot_cache_controls()
         self._select_data(
             self.browser_wheel_scroll_mode_combo,
             self.config.get("browser_wheel_scroll_mode", "system"),
@@ -1744,6 +1887,13 @@ class SettingsDialog(QDialog):
         self.browser_wheel_scroll_custom_spin.setValue(3)
         self._sync_browser_wheel_scroll_controls()
 
+    def _show_browser_folder_snapshot_cache_help(self) -> None:
+        QMessageBox.information(
+            self,
+            tr('フォルダ一覧メモリ保存の説明'),
+            tr(_FOLDER_SNAPSHOT_CACHE_HELP_TEXT),
+        )
+
     def _activate_browser_sort(self, index: int) -> None:
         if BROWSER_SORT_CHOICES[index][1] == BrowserSortKey.RANDOM.value:
             self._browser_random_seed = new_browser_random_seed(self._browser_random_seed)
@@ -1755,6 +1905,14 @@ class SettingsDialog(QDialog):
     ) -> None:
         self.browser_wheel_scroll_custom_spin.setEnabled(
             self.browser_wheel_scroll_mode_combo.currentData() == "custom"
+        )
+
+    def _sync_browser_folder_snapshot_cache_controls(
+        self,
+        *_args: object,
+    ) -> None:
+        self.browser_folder_snapshot_cache_max_entries_combo.setEnabled(
+            self.browser_folder_snapshot_cache_checkbox.isChecked()
         )
 
     def _sync_delete_confirmation_controls(
@@ -2102,6 +2260,14 @@ class SettingsDialog(QDialog):
             ),
             "browser_show_system_items": (
                 self.browser_show_system_checkbox.isChecked()
+            ),
+            "browser_folder_snapshot_cache_enabled": (
+                self.browser_folder_snapshot_cache_checkbox.isChecked()
+            ),
+            "browser_folder_snapshot_cache_max_entries": (
+                int(
+                    self.browser_folder_snapshot_cache_max_entries_combo.currentData()
+                )
             ),
             "browser_sidebar_layout": str(
                 self.browser_sidebar_layout_combo.currentData()
