@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QItemSelectionModel, QPoint, QRect, QSize, Qt
+from PySide6.QtCore import QItemSelectionModel, QPoint, QPointF, QRect, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import QListView, QStyle, QStyleOptionViewItem
 
@@ -605,6 +605,107 @@ def test_pending_preview_prefers_shell_association_for_all_item_kinds(
     assert {size for _kind, size, _dpr in provider.calls} >= {18, 96}
 
 
+def test_file_type_icon_size_presets_scale_center_and_badge_independently(
+    qapp,
+    tmp_path: Path,
+) -> None:
+    provider = SolidAssociationProvider("#d03030")
+    delegate = BrowserItemDelegate(
+        shell_icon_provider=provider,
+        thumbnail_size=180,
+        density=BrowserDisplayDensity.STANDARD,
+        center_folder_icon_size="small",
+        center_file_icon_size="large",
+        badge_folder_icon_size="large",
+        badge_file_icon_size="custom",
+        badge_file_icon_custom_percent=130,
+    )
+    items = [
+        make_item(tmp_path / "folder", BrowserItemKind.FOLDER),
+        make_item(tmp_path / "book.pdf", BrowserItemKind.PDF),
+    ]
+    model = BrowserItemModel()
+    model.set_items(items)
+    option = QStyleOptionViewItem()
+    option.rect = QRect(QPoint(), delegate.cell_size)
+    option.palette = qapp.palette()
+    option.state = QStyle.StateFlag.State_Enabled
+    for row in range(len(items)):
+        canvas = QImage(delegate.cell_size, QImage.Format.Format_ARGB32_Premultiplied)
+        canvas.fill(option.palette.window().color())
+        painter = QPainter(canvas)
+        delegate.paint(painter, option, model.index(row, 0))
+        painter.end()
+
+    calls_by_kind = {
+        kind: [size for call_kind, size, _dpr in provider.calls if call_kind is kind]
+        for kind in (BrowserItemKind.FOLDER, BrowserItemKind.PDF)
+    }
+    assert 72 in calls_by_kind[BrowserItemKind.FOLDER]
+    frame = delegate.grid_metrics.thumbnail_frame_rect(option.rect)
+    expected_large_center = min(
+        round(96 * 1.5),
+        min(frame.width(), frame.height()) - 8,
+    )
+    assert expected_large_center in calls_by_kind[BrowserItemKind.PDF]
+    assert 27 in calls_by_kind[BrowserItemKind.FOLDER]
+    assert 23 in calls_by_kind[BrowserItemKind.PDF]
+
+    folder_badge = delegate._type_badge_rect(frame, items[0])
+    file_badge = delegate._type_badge_rect(frame, items[1])
+    assert folder_badge.size() == QSize(27, 27)
+    assert file_badge.size() == QSize(23, 23)
+    assert frame.contains(folder_badge)
+    assert frame.contains(file_badge)
+
+
+@pytest.mark.parametrize("dpr", [1.0, 1.25, 1.5, 2.0])
+def test_custom_large_badge_keeps_tag_color_pixels_clear(
+    tmp_path: Path,
+    qapp,
+    dpr: float,
+) -> None:
+    item = make_item(
+        tmp_path / "test {zpi$t=tag}.png",
+        BrowserItemKind.IMAGE,
+    )
+    model = BrowserItemModel()
+    model.set_items([item])
+    delegate = BrowserItemDelegate(
+        thumbnail_size=180,
+        density=BrowserDisplayDensity.STANDARD,
+        badge_file_icon_size="large",
+        shell_icon_provider=SolidAssociationProvider("#d03030"),
+    )
+    delegate.tag_registry = [{"name": "tag", "color": "#00ff00"}]
+    option = QStyleOptionViewItem()
+    option.rect = QRect(QPoint(), delegate.cell_size)
+    option.palette = qapp.palette()
+    option.state = QStyle.StateFlag.State_Enabled
+    canvas = QImage(
+        round(delegate.cell_size.width() * dpr),
+        round(delegate.cell_size.height() * dpr),
+        QImage.Format.Format_ARGB32,
+    )
+    canvas.setDevicePixelRatio(dpr)
+    canvas.fill(QColor("white"))
+    painter = QPainter(canvas)
+    delegate.paint(painter, option, model.index(0, 0))
+    painter.end()
+
+    frame = delegate.grid_metrics.thumbnail_frame_rect(option.rect)
+    badge = delegate._type_badge_rect(frame, item)
+    tag_color = QColor("#00ff00")
+    tag_pixels = [
+        QPointF(x / dpr, y / dpr)
+        for y in range(canvas.height())
+        for x in range(canvas.width())
+        if canvas.pixelColor(x, y) == tag_color
+    ]
+    assert tag_pixels
+    assert all(not QRectF(badge).contains(point) for point in tag_pixels)
+
+
 def test_pending_preview_uses_decoration_fallback_when_shell_association_fails(
     qapp,
     tmp_path: Path,
@@ -822,6 +923,38 @@ def test_folder_fallback_color_change_is_repaint_only(
         window.item_model.index(0, 0),
         BrowserItemModel.ThumbnailImageRole,
     ) is None
+    window.close()
+    qapp.processEvents()
+
+
+def test_file_type_icon_size_change_repaints_without_scan_or_thumbnail_requests(
+    tmp_path: Path,
+    qapp,
+) -> None:
+    provider = RecordingThumbnailProvider()
+    window = make_window(tmp_path, qapp, provider=provider)
+    folder = make_item(tmp_path / "一覧" / "folder", BrowserItemKind.FOLDER)
+    window.item_model.set_items([folder])
+    window._thumbnail_request_timer.stop()
+    provider.requests.clear()
+    thumbnail_generation = provider.generation
+    scan_generation = window._scan_generation
+
+    window.config.apply(
+        {
+            "browser_center_folder_icon_size": "large",
+            "browser_badge_folder_icon_size": "custom",
+            "browser_badge_folder_icon_custom_percent": 210,
+        }
+    )
+    qapp.processEvents()
+
+    assert window.item_delegate.center_folder_icon_size == "large"
+    assert window.item_delegate.badge_folder_icon_size == "custom"
+    assert window.item_delegate.badge_folder_icon_custom_percent == 210
+    assert provider.generation == thumbnail_generation
+    assert window._scan_generation == scan_generation
+    assert provider.requests == []
     window.close()
     qapp.processEvents()
 

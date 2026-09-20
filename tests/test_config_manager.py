@@ -31,6 +31,11 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
     assert manager.data["browser_folders_first"] is True
     assert manager.data["browser_display_density"] == "standard"
     assert manager.data["browser_folder_fallback_background"] == "auto"
+    assert manager.data["browser_center_folder_icon_size"] == "medium"
+    assert manager.data["browser_center_file_icon_size"] == "medium"
+    assert manager.data["browser_badge_folder_icon_size"] == "medium"
+    assert manager.data["browser_badge_file_icon_size"] == "medium"
+    assert manager.data["browser_center_folder_icon_custom_percent"] == 100
     assert manager.data["browser_location_history_limit"] == 50
     assert manager.data["browser_search_history_limit"] == 50
     assert manager.data["browser_search_history"] == []

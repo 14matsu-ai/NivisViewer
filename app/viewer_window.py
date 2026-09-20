@@ -27,8 +27,11 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
     QApplication,
     QColorDialog,
+    QComboBox,
+    QDialog,
     QDockWidget,
     QFileDialog,
     QInputDialog,
@@ -38,6 +41,8 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QStatusBar,
+    QPlainTextEdit,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -101,6 +106,11 @@ from .viewer_navigation_policy import (
     NavigationAdmissionDecision,
     NavigationAdmissionPolicy,
     NavigationInputKind,
+)
+from .viewer_close_shortcut import (
+    key_event_combined,
+    normalize_viewer_close_shortcut,
+    sequence_combined,
 )
 from .viewer_memory_policy import (
     ResolvedViewerMemoryPolicy,
@@ -229,6 +239,7 @@ class ViewerWindow(QMainWindow):
         self.book_session.async_opened.connect(self._on_async_book_opened)
         self.book_session.async_open_failed.connect(self._on_async_book_open_failed)
         self._open_path_handler = open_path_handler
+        self._close_request_handler: Callable[[object], object] | None = None
         self._drop_probe_workers: set[FolderDropProbe] = set()
         self._drop_active = False
         self._adjacent_book_handler = adjacent_book_handler
@@ -359,6 +370,15 @@ class ViewerWindow(QMainWindow):
         )
         self.mouse_forward_button_action = commands.normalize_viewer_command(
             self.settings.get("mouse_forward_button_action")
+        )
+        self.viewer_close_shortcut = normalize_viewer_close_shortcut(
+            self.settings.get("viewer_close_shortcut")
+        )
+        self._viewer_close_key_sequence = QKeySequence(
+            self.viewer_close_shortcut
+        )
+        self._viewer_close_key_combined = sequence_combined(
+            self._viewer_close_key_sequence
         )
         self.viewer_canvas_left_click_action = str(
             self.settings.get(
@@ -535,6 +555,9 @@ class ViewerWindow(QMainWindow):
             self._on_zip_runtime_frame_painted
         )
         self._connect_shortcuts()
+        application = QApplication.instance()
+        if application is not None:
+            application.installEventFilter(self)
         from .slideshow_keys import SlideshowKeys
 
         self.slideshow_keys = SlideshowKeys(
@@ -1338,6 +1361,16 @@ class ViewerWindow(QMainWindow):
         fullscreen_policy_changed = False
         normal_resampling_changed = False
         magnifier_resampling_changed = False
+        if "viewer_close_shortcut" in changed:
+            self.viewer_close_shortcut = normalize_viewer_close_shortcut(
+                changed["viewer_close_shortcut"]
+            )
+            self._viewer_close_key_sequence = QKeySequence(
+                self.viewer_close_shortcut
+            )
+            self._viewer_close_key_combined = sequence_combined(
+                self._viewer_close_key_sequence
+            )
         if "viewer_downscale_algorithm" in changed:
             self.viewer_downscale_algorithm = normalize_downscale_algorithm(
                 changed["viewer_downscale_algorithm"]
@@ -5615,7 +5648,7 @@ class ViewerWindow(QMainWindow):
             commands.PREVIOUS_BOOK: self.open_previous_book,
             commands.NEXT_BOOK: self.open_next_book,
             commands.TOGGLE_FULLSCREEN: self.toggle_fullscreen,
-            commands.CLOSE_VIEWER: self.close,
+            commands.CLOSE_VIEWER: self.request_close,
             commands.TOGGLE_SPREAD: self.toggle_view_mode,
             commands.TOGGLE_READING_DIRECTION: self.toggle_reading_direction,
             commands.FIT_WINDOW: lambda: self.set_fit_mode("fit_window"),
@@ -5654,6 +5687,68 @@ class ViewerWindow(QMainWindow):
                 self._open_adjacent_book(1, require_browser_snapshot=True)
                 return
             self.dispatch_command(self.mouse_forward_button_action)
+
+    def set_close_request_handler(
+        self,
+        handler: Callable[[object], object] | None,
+    ) -> None:
+        """Let a host replace a Viewer close with a navigation request."""
+        self._close_request_handler = handler
+
+    def request_close(self) -> bool:
+        handler = self._close_request_handler
+        if callable(handler):
+            result = handler(self)
+            return True if result is None else bool(result)
+        return bool(self.close())
+
+    def _viewer_close_key_is_eligible(self, watched: object) -> bool:
+        if not isinstance(watched, QWidget) or watched.window() is not self:
+            return False
+        application = QApplication.instance()
+        if application is not None and (
+            application.activeModalWidget() is not None
+            or application.activePopupWidget() is not None
+        ):
+            return False
+        focus = application.focusWidget() if application is not None else None
+        if focus is None or focus.window() is not self:
+            return False
+        current = focus
+        while current is not self:
+            if isinstance(
+                current,
+                (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QDialog),
+            ):
+                return False
+            if isinstance(current, QComboBox) and current.isEditable():
+                return False
+            current = current.parentWidget()
+            if current is None:
+                return False
+        return True
+
+    def _handle_viewer_close_key_event(
+        self,
+        watched: object,
+        event: QEvent,
+    ) -> bool:
+        if (
+            event.type()
+            not in {
+                QEvent.Type.ShortcutOverride,
+                QEvent.Type.KeyPress,
+            }
+            or not isinstance(event, QKeyEvent)
+            or self._viewer_close_key_sequence.isEmpty()
+            or not self._viewer_close_key_is_eligible(watched)
+            or key_event_combined(event) != self._viewer_close_key_combined
+        ):
+            return False
+        event.accept()
+        if event.type() == QEvent.Type.KeyPress and not event.isAutoRepeat():
+            self.request_close()
+        return True
 
     def _handle_escape(self) -> None:
         self.viewer.cancel_pending_canvas_click()
@@ -5806,6 +5901,8 @@ class ViewerWindow(QMainWindow):
         return True
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
+        if self._handle_viewer_close_key_event(watched, event):
+            return True
         if watched is getattr(self, "_page_list_viewport", None):
             if event.type() in {
                 QEvent.Type.Resize,
@@ -6721,6 +6818,9 @@ class ViewerWindow(QMainWindow):
         if callable(guard) and not guard(self):
             event.ignore()
             return
+        application = QApplication.instance()
+        if application is not None:
+            application.removeEventFilter(self)
         self.prepare_shutdown()
         self.closing.emit(self)
         super().closeEvent(event)

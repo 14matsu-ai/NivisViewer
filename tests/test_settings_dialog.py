@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 
 from PIL import Image
 from PySide6.QtCore import QCoreApplication, QEvent
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QImage, QKeySequence
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QPushButton, QWidget
 
 from app.browser_model import BrowserItem, BrowserItemKind
@@ -185,6 +185,54 @@ def test_folder_fallback_background_restore_default_uses_auto(
     assert not dialog.browser_folder_fallback_color_button.isEnabled()
     assert dialog.values()["browser_folder_fallback_background"] == "auto"
     assert dialog.browser_folder_fallback_color_button.text() == "#FFFFE0"
+    dialog.reject()
+
+
+def test_file_type_icon_size_controls_are_independent_and_persist(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    config = make_config(tmp_path)
+    dialog = SettingsDialog(config)
+    keys = (
+        "browser_center_folder_icon_size",
+        "browser_center_file_icon_size",
+        "browser_badge_folder_icon_size",
+        "browser_badge_file_icon_size",
+    )
+    custom_keys = tuple(key.replace("_size", "_custom_percent") for key in keys)
+    assert all(dialog.browser_icon_size_combos[key].currentData() == "medium" for key in keys)
+    assert all(dialog.browser_icon_size_custom_spins[key].value() == 100 for key in custom_keys)
+
+    dialog.browser_icon_size_combos[keys[0]].setCurrentIndex(
+        dialog.browser_icon_size_combos[keys[0]].findData("small")
+    )
+    dialog.browser_icon_size_combos[keys[1]].setCurrentIndex(
+        dialog.browser_icon_size_combos[keys[1]].findData("large")
+    )
+    dialog.browser_icon_size_combos[keys[2]].setCurrentIndex(
+        dialog.browser_icon_size_combos[keys[2]].findData("custom")
+    )
+    dialog.browser_icon_size_custom_spins[custom_keys[2]].setValue(237)
+    dialog.browser_icon_size_combos[keys[3]].setCurrentIndex(
+        dialog.browser_icon_size_combos[keys[3]].findData("custom")
+    )
+    dialog.browser_icon_size_custom_spins[custom_keys[3]].setValue(61)
+
+    changed = dialog.apply_settings()
+    assert {key: config.get(key) for key in keys} == {
+        keys[0]: "small",
+        keys[1]: "large",
+        keys[2]: "custom",
+        keys[3]: "custom",
+    }
+    assert {key: config.get(key) for key in custom_keys} == {
+        custom_keys[0]: 100,
+        custom_keys[1]: 100,
+        custom_keys[2]: 237,
+        custom_keys[3]: 61,
+    }
+    assert set(keys).issubset(changed)
     dialog.reject()
 
 
@@ -677,6 +725,49 @@ def test_mouse_settings_are_shown_applied_and_disableable(
     restored = ConfigManager(config.path).load()
     assert restored["mouse_gesture_bindings"]["D"] == "next_page"
     assert restored["browser_folder_gestures_enabled"] is False
+    dialog.reject()
+
+
+def test_viewer_close_shortcut_round_trip_disable_and_conflict_warning(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    config = make_config(tmp_path)
+    dialog = SettingsDialog(config)
+
+    assert dialog.viewer_close_shortcut_edit.keySequence() == QKeySequence(
+        "Ctrl+W"
+    )
+    dialog.viewer_close_shortcut_edit.setKeySequence(
+        QKeySequence("Ctrl+K, Ctrl+C")
+    )
+    assert not dialog.viewer_close_shortcut_status.isHidden()
+    assert dialog.apply_settings() == {}
+    assert config.get("viewer_close_shortcut") == "Ctrl+W"
+
+    dialog.viewer_close_shortcut_edit.setKeySequence(QKeySequence("Right"))
+    assert not dialog.viewer_close_shortcut_status.isHidden()
+    assert dialog.apply_settings() == {}
+    assert config.get("viewer_close_shortcut") == "Ctrl+W"
+
+    for reserved in ("S", "Shift+S", "1", "9"):
+        dialog.viewer_close_shortcut_edit.setKeySequence(QKeySequence(reserved))
+        assert not dialog.viewer_close_shortcut_status.isHidden()
+        assert dialog.apply_settings() == {}
+        assert config.get("viewer_close_shortcut") == "Ctrl+W"
+
+    for modified in ("Ctrl+S", "Ctrl+1"):
+        dialog.viewer_close_shortcut_edit.setKeySequence(QKeySequence(modified))
+        assert dialog.viewer_close_shortcut_status.isHidden()
+        changed = dialog.apply_settings()
+        assert changed["viewer_close_shortcut"] == modified
+        assert config.get("viewer_close_shortcut") == modified
+
+    dialog.viewer_close_shortcut_edit.clear()
+    assert dialog.viewer_close_shortcut_status.isHidden()
+    changed = dialog.apply_settings()
+    assert changed["viewer_close_shortcut"] == ""
+    assert config.get("viewer_close_shortcut") == ""
     dialog.reject()
 
 

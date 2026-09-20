@@ -49,6 +49,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractSpinBox,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -62,6 +63,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QProgressDialog,
     QPushButton,
     QSizePolicy,
@@ -72,6 +74,7 @@ from PySide6.QtWidgets import (
     QStyleOptionComboBox,
     QStyleOptionViewItem,
     QTabWidget,
+    QTextEdit,
     QToolBar,
     QToolButton,
     QTreeView,
@@ -107,6 +110,11 @@ from .browser_location_bar import (
 )
 from .browser_item_delegate import (
     BrowserItemDelegate,
+)
+from .browser_icon_size import (
+    ICON_SIZE_SETTING_SPECS,
+    normalize_browser_icon_size_custom_percent,
+    normalize_browser_icon_size_preset,
 )
 from .browser_navigation import BrowserLocation, BrowserNavigationHistory
 from .browser_scanner import (
@@ -766,6 +774,30 @@ class BrowserWindow(QMainWindow):
         )
         self.browser_file_fallback_background = str(
             self.settings.get("browser_file_fallback_background", "auto")
+        )
+        self.browser_center_folder_icon_size = normalize_browser_icon_size_preset(
+            self.settings.get("browser_center_folder_icon_size")
+        )
+        self.browser_center_folder_icon_custom_percent = normalize_browser_icon_size_custom_percent(
+            self.settings.get("browser_center_folder_icon_custom_percent")
+        )
+        self.browser_center_file_icon_size = normalize_browser_icon_size_preset(
+            self.settings.get("browser_center_file_icon_size")
+        )
+        self.browser_center_file_icon_custom_percent = normalize_browser_icon_size_custom_percent(
+            self.settings.get("browser_center_file_icon_custom_percent")
+        )
+        self.browser_badge_folder_icon_size = normalize_browser_icon_size_preset(
+            self.settings.get("browser_badge_folder_icon_size")
+        )
+        self.browser_badge_folder_icon_custom_percent = normalize_browser_icon_size_custom_percent(
+            self.settings.get("browser_badge_folder_icon_custom_percent")
+        )
+        self.browser_badge_file_icon_size = normalize_browser_icon_size_preset(
+            self.settings.get("browser_badge_file_icon_size")
+        )
+        self.browser_badge_file_icon_custom_percent = normalize_browser_icon_size_custom_percent(
+            self.settings.get("browser_badge_file_icon_custom_percent")
         )
         self.browser_wheel_scroll_mode = str(
             self.settings.get("browser_wheel_scroll_mode", "system")
@@ -3954,6 +3986,18 @@ class BrowserWindow(QMainWindow):
             "file_fallback_background": self.browser_file_fallback_background,
         }
 
+    def _browser_icon_delegate_options(self) -> dict[str, object]:
+        return {
+            "center_folder_icon_size": self.browser_center_folder_icon_size,
+            "center_folder_icon_custom_percent": self.browser_center_folder_icon_custom_percent,
+            "center_file_icon_size": self.browser_center_file_icon_size,
+            "center_file_icon_custom_percent": self.browser_center_file_icon_custom_percent,
+            "badge_folder_icon_size": self.browser_badge_folder_icon_size,
+            "badge_folder_icon_custom_percent": self.browser_badge_folder_icon_custom_percent,
+            "badge_file_icon_size": self.browser_badge_file_icon_size,
+            "badge_file_icon_custom_percent": self.browser_badge_file_icon_custom_percent,
+        }
+
     def _apply_fallback_background_settings(self, changed: dict[str, object]) -> None:
         """Color-only effect boundary: configure once and repaint; no layout/I/O."""
         folder_key = "browser_folder_fallback_background"
@@ -3968,6 +4012,37 @@ class BrowserWindow(QMainWindow):
             thumbnail_size=self.thumbnail_size,
             density=self.browser_display_density,
             **self._fallback_background_delegate_options(),
+            **self._browser_icon_delegate_options(),
+        )
+        self.list_view.viewport().update()
+
+    def _apply_browser_icon_size_settings(self, changed: dict[str, object]) -> None:
+        changed_keys = {
+            key
+            for spec in ICON_SIZE_SETTING_SPECS
+            for key in spec[:2]
+            if key in changed
+        }
+        if not changed_keys:
+            return
+        for key, custom_key, _label in ICON_SIZE_SETTING_SPECS:
+            attr = key
+            if key in changed:
+                setattr(
+                    self,
+                    attr,
+                    normalize_browser_icon_size_preset(changed[key]),
+                )
+            if custom_key in changed:
+                setattr(
+                    self,
+                    custom_key,
+                    normalize_browser_icon_size_custom_percent(changed[custom_key]),
+                )
+        self.item_delegate.configure(
+            thumbnail_size=self.thumbnail_size,
+            density=self.browser_display_density,
+            **self._browser_icon_delegate_options(),
         )
         self.list_view.viewport().update()
 
@@ -4006,6 +4081,7 @@ class BrowserWindow(QMainWindow):
                 self.browser_wheel_scroll_custom_rows,
             )
         self._apply_fallback_background_settings(changed)
+        self._apply_browser_icon_size_settings(changed)
         if "browser_location_history_limit" in changed:
             self.navigation_history.set_recent_limit(
                 int(changed["browser_location_history_limit"])
@@ -4994,6 +5070,7 @@ class BrowserWindow(QMainWindow):
             item_spacing_x=self.browser_item_spacing_x,
             item_spacing_y=self.browser_item_spacing_y,
             **self._fallback_background_delegate_options(),
+            **self._browser_icon_delegate_options(),
         )
         self.list_view.setIconSize(QSize(self.thumbnail_size, self.thumbnail_size))
         self.list_view.setGridSize(self.item_delegate.grid_metrics.grid_size)
@@ -5601,6 +5678,41 @@ class BrowserWindow(QMainWindow):
                 self.go_forward()
         return True
 
+    def _is_browser_history_key_surface(self, watched: object) -> bool:
+        """Return whether a key event belongs to a Browser navigation view."""
+        if not isinstance(watched, QWidget):
+            return False
+        application = QApplication.instance()
+        if application is not None and (
+            application.activeModalWidget() is not None
+            or application.activePopupWidget() is not None
+        ):
+            return False
+        for candidate in (watched, application.focusWidget() if application else None):
+            current = candidate
+            while isinstance(current, QWidget) and current is not self:
+                if isinstance(
+                    current,
+                    (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox),
+                ):
+                    return False
+                if isinstance(current, QComboBox) and current.isEditable():
+                    return False
+                current = current.parentWidget()
+        for name in (
+            "list_view",
+            "folder_tree",
+            "favorite_view",
+            "history_view",
+            "bookmark_view",
+        ):
+            view = getattr(self, name, None)
+            if isinstance(view, QWidget) and (
+                watched is view or view.isAncestorOf(watched)
+            ):
+                return True
+        return False
+
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
         extra_button_result = self._handle_extra_button_event(watched, event)
         if extra_button_result is not None:
@@ -5707,7 +5819,7 @@ class BrowserWindow(QMainWindow):
             self._show_temporary_status(tr('切り取り／コピー候補を解除しました'))
             return True
         if (
-            watched is not self.address_bar
+            self._is_browser_history_key_surface(watched)
             and event.type() == QEvent.Type.KeyPress
             and isinstance(event, QKeyEvent)
             and event.key() == Qt.Key.Key_Backspace
@@ -5721,7 +5833,9 @@ class BrowserWindow(QMainWindow):
         if (
             event.key() == Qt.Key.Key_Backspace
             and event.modifiers() == Qt.KeyboardModifier.NoModifier
-            and not self.address_bar.hasFocus()
+            and self._is_browser_history_key_surface(
+                QApplication.focusWidget()
+            )
         ):
             self.go_back()
             event.accept()
@@ -5913,6 +6027,7 @@ class BrowserWindow(QMainWindow):
             item_spacing_x=self.browser_item_spacing_x,
             item_spacing_y=self.browser_item_spacing_y,
             **self._fallback_background_delegate_options(),
+            **self._browser_icon_delegate_options(),
         )
         self.list_view.setItemDelegate(self.item_delegate)
         self.list_view.setViewMode(QListView.ViewMode.IconMode)

@@ -16,7 +16,13 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPalette
+from PySide6.QtGui import (
+    QColor,
+    QGuiApplication,
+    QKeySequence,
+    QPainter,
+    QPalette,
+)
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -31,6 +37,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QKeySequenceEdit,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
@@ -64,6 +71,13 @@ from .browser_folder_snapshot_cache import (
     estimate_browser_folder_snapshot_cache_mib,
     normalize_browser_folder_snapshot_cache_max_entries,
 )
+from .browser_icon_size import (
+    BROWSER_ICON_SIZE_CUSTOM_MAX_PERCENT,
+    BROWSER_ICON_SIZE_CUSTOM_MIN_PERCENT,
+    BROWSER_ICON_SIZE_PRESETS,
+    ICON_SIZE_SETTING_SPECS,
+    normalize_browser_icon_size_custom_percent,
+)
 from .config_manager import ConfigManager
 from .pdfium_service import PdfiumService
 from .ffmpeg_thumbnail_backend import FFmpegLocator
@@ -74,6 +88,10 @@ from .thumbnail_render import (
 )
 from .seven_zip_locator import SevenZipInfo, SevenZipLocator
 from .viewer_commands import COMMAND_CHOICES
+from .viewer_close_shortcut import (
+    normalize_viewer_close_shortcut,
+    viewer_close_shortcut_conflict,
+)
 from .viewer_memory_policy import VIEWER_MEMORY_MODE_LABELS
 from .viewer_render import (
     DOWNSCALE_ALGORITHM_LABELS,
@@ -483,6 +501,43 @@ class SettingsDialog(QDialog):
             "reuse_or_create",
         )
         behavior_form.addRow(tr('ファイルを開く方法:'), self.open_behavior_combo)
+        close_shortcut_row = QWidget(behavior_group)
+        close_shortcut_layout = QHBoxLayout(close_shortcut_row)
+        close_shortcut_layout.setContentsMargins(0, 0, 0, 0)
+        self.viewer_close_shortcut_edit = QKeySequenceEdit(close_shortcut_row)
+        self.viewer_close_shortcut_edit.setObjectName(
+            "viewer_close_shortcut_edit"
+        )
+        close_shortcut_layout.addWidget(self.viewer_close_shortcut_edit, 1)
+        self.viewer_close_shortcut_clear_button = QPushButton(
+            tr('割り当てなし'),
+            close_shortcut_row,
+        )
+        self.viewer_close_shortcut_clear_button.setObjectName(
+            "viewer_close_shortcut_clear_button"
+        )
+        close_shortcut_layout.addWidget(self.viewer_close_shortcut_clear_button)
+        behavior_form.addRow(
+            tr('Viewerを閉じるキー:'),
+            close_shortcut_row,
+        )
+        self.viewer_close_shortcut_status = QLabel(behavior_group)
+        self.viewer_close_shortcut_status.setWordWrap(True)
+        self.viewer_close_shortcut_status.setStyleSheet("color: #c62828;")
+        self.viewer_close_shortcut_status.hide()
+        behavior_form.addRow("", self.viewer_close_shortcut_status)
+        self.viewer_close_shortcut_note = QLabel(
+            tr('Escは一時状態の解除専用です。割り当てなしにするとキーでViewerを閉じません。'),
+            behavior_group,
+        )
+        self.viewer_close_shortcut_note.setWordWrap(True)
+        behavior_form.addRow("", self.viewer_close_shortcut_note)
+        self.viewer_close_shortcut_edit.keySequenceChanged.connect(
+            lambda _sequence: self._sync_viewer_close_shortcut_status()
+        )
+        self.viewer_close_shortcut_clear_button.clicked.connect(
+            self.viewer_close_shortcut_edit.clear
+        )
         self.bring_to_front_checkbox = QCheckBox(
             tr('本を開いたときViewerWindowを一度だけ前面へ出す'),
             behavior_group,
@@ -1399,6 +1454,50 @@ class SettingsDialog(QDialog):
         layout.addWidget(list_group)
         layout.addWidget(cache_group)
 
+        icon_size_group = QGroupBox(tr('ファイル種別アイコンの大きさ'), tab)
+        icon_size_form = QFormLayout(icon_size_group)
+        self.browser_icon_size_combos: dict[str, QComboBox] = {}
+        self.browser_icon_size_custom_spins: dict[str, QSpinBox] = {}
+        icon_size_labels = {
+            "small": tr('小（75%）'),
+            "medium": tr('中（100%）'),
+            "large": tr('大（150%）'),
+            "custom": tr('カスタム'),
+        }
+        for key, custom_key, label in ICON_SIZE_SETTING_SPECS:
+            row = QWidget(icon_size_group)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            combo = QComboBox(row)
+            for preset in BROWSER_ICON_SIZE_PRESETS:
+                combo.addItem(icon_size_labels[preset], preset)
+            custom_spin = QSpinBox(row)
+            custom_spin.setRange(
+                BROWSER_ICON_SIZE_CUSTOM_MIN_PERCENT,
+                BROWSER_ICON_SIZE_CUSTOM_MAX_PERCENT,
+            )
+            custom_spin.setSuffix(" %")
+            custom_spin.setEnabled(False)
+            row_layout.addWidget(combo, 1)
+            row_layout.addWidget(custom_spin)
+            icon_size_form.addRow(tr(label), row)
+            self.browser_icon_size_combos[key] = combo
+            self.browser_icon_size_custom_spins[custom_key] = custom_spin
+
+            def sync_custom_spin(index: int, *, combo=combo, spin=custom_spin) -> None:
+                spin.setEnabled(combo.itemData(index) == "custom")
+
+            combo.currentIndexChanged.connect(sync_custom_spin)
+        icon_size_note = QLabel(
+            tr('中（100%）は現在の表示サイズです。中央と左下、フォルダとそれ以外を個別に設定できます。'),
+            icon_size_group,
+        )
+        icon_size_note.setWordWrap(True)
+        icon_size_note.setStyleSheet("color: palette(mid);")
+        icon_size_form.addRow(icon_size_note)
+        layout.addWidget(icon_size_group)
+
         preview_group = QGroupBox(tr('汎用ファイルプレビュー'), tab)
         preview_form = QFormLayout(preview_group)
         self.text_preview_checkbox = QCheckBox(
@@ -1623,6 +1722,14 @@ class SettingsDialog(QDialog):
         behavior = str(self.config.get("open_viewer_behavior", "reuse_or_create"))
         index = self.open_behavior_combo.findData(behavior)
         self.open_behavior_combo.setCurrentIndex(max(0, index))
+        self.viewer_close_shortcut_edit.setKeySequence(
+            QKeySequence(
+                normalize_viewer_close_shortcut(
+                    self.config.get("viewer_close_shortcut")
+                )
+            )
+        )
+        self._sync_viewer_close_shortcut_status()
         self.bring_to_front_checkbox.setChecked(
             bool(self.config.get("bring_viewer_to_front_on_open", True))
         )
@@ -1772,6 +1879,19 @@ class SettingsDialog(QDialog):
         )
         for key, editor in self._fallback_background_editors.items():
             editor.load_value(str(self.config.get(key, "auto")))
+        for key, custom_key, _label in ICON_SIZE_SETTING_SPECS:
+            combo = self.browser_icon_size_combos[key]
+            self._select_data(
+                combo,
+                self.config.get(key, "medium"),
+            )
+            spin = self.browser_icon_size_custom_spins[custom_key]
+            spin.setValue(
+                normalize_browser_icon_size_custom_percent(
+                    self.config.get(custom_key, 100)
+                )
+            )
+            spin.setEnabled(combo.currentData() == "custom")
         self._select_data(
             self.thumbnail_quality_mode_combo,
             self.config.get("thumbnail_quality_mode", "auto"),
@@ -2254,6 +2374,29 @@ class SettingsDialog(QDialog):
             "pdf_backward_units": self.prefetch_pdf_backward_spin.value(),
         }
 
+    def _sync_viewer_close_shortcut_status(self) -> bool:
+        raw_sequence = self.viewer_close_shortcut_edit.keySequence()
+        if raw_sequence.count() > 1:
+            self.viewer_close_shortcut_status.setText(
+                tr('Viewerを閉じるキーは1つのキー組み合わせで指定してください')
+            )
+            self.viewer_close_shortcut_status.show()
+            return False
+        sequence = normalize_viewer_close_shortcut(raw_sequence, default="")
+        conflict = viewer_close_shortcut_conflict(sequence)
+        if conflict:
+            self.viewer_close_shortcut_status.setText(
+                tr(
+                    'このキーは既存のViewerショートカットと重複しています: {p0}',
+                    p0=conflict,
+                )
+            )
+            self.viewer_close_shortcut_status.show()
+            return False
+        self.viewer_close_shortcut_status.clear()
+        self.viewer_close_shortcut_status.hide()
+        return True
+
     def values(self) -> dict[str, object]:
         bindings = dict(self._gesture_bindings_base)
         for pattern, combo in (
@@ -2272,6 +2415,10 @@ class SettingsDialog(QDialog):
         return {
             "ui_language": self.ui_language_combo.currentData(),
             "open_viewer_behavior": self.open_behavior_combo.currentData(),
+            "viewer_close_shortcut": normalize_viewer_close_shortcut(
+                self.viewer_close_shortcut_edit.keySequence(),
+                default="",
+            ),
             "bring_viewer_to_front_on_open": self.bring_to_front_checkbox.isChecked(),
             "file_operation_delete_confirm_focus_yes": (
                 self.delete_confirm_focus_yes_checkbox.isChecked()
@@ -2358,6 +2505,14 @@ class SettingsDialog(QDialog):
                 self.browser_thumbnail_display_mode_combo.currentData()
             ),
             **{key: editor.value() for key, editor in self._fallback_background_editors.items()},
+            **{
+                key: str(self.browser_icon_size_combos[key].currentData() or "medium")
+                for key, _custom_key, _label in ICON_SIZE_SETTING_SPECS
+            },
+            **{
+                custom_key: self.browser_icon_size_custom_spins[custom_key].value()
+                for _key, custom_key, _label in ICON_SIZE_SETTING_SPECS
+            },
             "browser_wheel_scroll_mode": str(
                 self.browser_wheel_scroll_mode_combo.currentData() or "system"
             ),
@@ -2491,6 +2646,8 @@ class SettingsDialog(QDialog):
         }
 
     def apply_settings(self) -> dict[str, object]:
+        if not self._sync_viewer_close_shortcut_status():
+            return {}
         values = self.values()
         requested_winrar = str(values.pop("winrar_executable", "") or "")
         requested_path = str(values.pop("seven_zip_executable", "") or "")
@@ -2537,6 +2694,8 @@ class SettingsDialog(QDialog):
         return changed
 
     def accept(self) -> None:  # type: ignore[override]
+        if not self._sync_viewer_close_shortcut_status():
+            return
         requested_winrar = self.winrar_path_edit.text().strip().strip('"')
         current_winrar = str(self.config.get("winrar_executable", "") or "")
         if requested_winrar and requested_winrar != current_winrar:

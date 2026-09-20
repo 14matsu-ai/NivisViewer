@@ -22,7 +22,15 @@ from .browser_folder_snapshot_cache import (
     DEFAULT_MAX_ENTRIES as DEFAULT_BROWSER_FOLDER_SNAPSHOT_CACHE_MAX_ENTRIES,
     normalize_browser_folder_snapshot_cache_max_entries,
 )
+from .browser_icon_size import (
+    BROWSER_ICON_SIZE_DEFAULT_CUSTOM_PERCENT,
+    BROWSER_ICON_SIZE_DEFAULT_PRESET,
+    ICON_SIZE_SETTING_SPECS,
+    normalize_browser_icon_size_custom_percent,
+    normalize_browser_icon_size_preset,
+)
 from .viewer_commands import normalize_viewer_command
+from .viewer_close_shortcut import normalize_viewer_close_shortcut
 from .viewer_memory_policy import (
     normalize_viewer_memory_mode,
     viewer_memory_mode_from_legacy_mib,
@@ -114,6 +122,14 @@ class ConfigManager(QObject):
         "browser_thumbnail_display_mode": "fit",
         "browser_folder_fallback_background": "auto",
         "browser_file_fallback_background": "auto",
+        **{
+            key: BROWSER_ICON_SIZE_DEFAULT_PRESET
+            for key, _custom_key, _label in ICON_SIZE_SETTING_SPECS
+        },
+        **{
+            custom_key: BROWSER_ICON_SIZE_DEFAULT_CUSTOM_PERCENT
+            for _key, custom_key, _label in ICON_SIZE_SETTING_SPECS
+        },
         "browser_wheel_scroll_mode": "system",
         "browser_wheel_scroll_custom_rows": 3,
         "thumbnail_quality_mode": "auto",
@@ -188,6 +204,7 @@ class ConfigManager(QObject):
             "D": "close_viewer",
             "U": "toggle_fullscreen",
         },
+        "viewer_close_shortcut": "Ctrl+W",
         "browser_folder_gestures_enabled": True,
         "mouse_back_button_action": "previous_book",
         "mouse_forward_button_action": "next_book",
@@ -800,6 +817,9 @@ class ConfigManager(QObject):
         normalized["mouse_gesture_bindings"] = bindings
         for key in ("mouse_back_button_action", "mouse_forward_button_action"):
             normalized[key] = normalize_viewer_command(normalized.get(key))
+        normalized["viewer_close_shortcut"] = normalize_viewer_close_shortcut(
+            normalized.get("viewer_close_shortcut")
+        )
         normalized["gap"] = cls._clamped_int(
             normalized.get("gap"),
             default=int(cls.DEFAULTS["gap"]),
@@ -849,6 +869,11 @@ class ConfigManager(QObject):
                 if fallback_background == "auto"
                 or re.fullmatch(r"#[0-9a-f]{6}", fallback_background)
                 else cls.DEFAULTS[key]
+            )
+        for key, custom_key, _label in ICON_SIZE_SETTING_SPECS:
+            normalized[key] = normalize_browser_icon_size_preset(normalized.get(key))
+            normalized[custom_key] = normalize_browser_icon_size_custom_percent(
+                normalized.get(custom_key)
             )
         return normalized
 
