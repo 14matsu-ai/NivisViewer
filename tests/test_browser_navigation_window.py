@@ -5,10 +5,18 @@ from pathlib import Path
 from unittest.mock import patch
 
 from PIL import Image
-from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QPointF, Qt
+from PySide6.QtCore import (
+    QEvent,
+    QItemSelectionModel,
+    QModelIndex,
+    QObject,
+    QPoint,
+    QPointF,
+    Qt,
+)
 from PySide6.QtGui import QContextMenuEvent, QMouseEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QListView, QToolButton, QWidget
+from PySide6.QtWidgets import QApplication, QLineEdit, QListView, QToolButton, QWidget
 
 from app.browser_window import BrowserWindow
 from app.browser_filter import BrowserFilterState, RatingFilterMode
@@ -1592,6 +1600,82 @@ def test_backspace_navigates_when_list_has_focus_and_enter_opens_selection(
     window.list_view.setCurrentIndex(index)
     QTest.keyClick(window.list_view, Qt.Key.Key_Return)
     assert opened == [str(image.absolute())]
+    window.close()
+    qapp.processEvents()
+
+
+def test_backspace_history_is_limited_to_browser_navigation_surfaces(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    first = tmp_path / "A"
+    second = tmp_path / "B"
+    first.mkdir()
+    second.mkdir()
+    file_path = second / "notes.txt"
+    file_path.write_text("notes", encoding="utf-8")
+    window = make_window(tmp_path, first, qapp)
+    assert window.navigate_to(second)
+    finish_scan(window, qapp)
+    history_index = window.navigation_history.current_index
+    assert window.current_path == second.absolute()
+
+    row = window.item_model.row_for_path(file_path)
+    index = window.item_model.index(row, 0)
+    selection = window.list_view.selectionModel()
+    selection.select(
+        index,
+        QItemSelectionModel.SelectionFlag.ClearAndSelect,
+    )
+    window.list_view.setCurrentIndex(index)
+    assert window.show_selected_properties()
+    dialog = next(iter(window._properties_dialogs))
+    qapp.processEvents()
+    dialog.name_edit.setFocus()
+    dialog.name_edit.setCursorPosition(len(dialog.name_edit.text()))
+    original_name = dialog.name_edit.text()
+    QTest.keyClick(dialog.name_edit, Qt.Key.Key_Backspace)
+    assert dialog.name_edit.text() == original_name[:-1]
+    assert window.current_path == second.absolute()
+    assert window.navigation_history.current_index == history_index
+    dialog.reject()
+    qapp.processEvents()
+
+    search = window.browser_search_edit
+    search.setText("abc")
+    search.setFocus()
+    search.setCursorPosition(3)
+    QTest.keyClick(search, Qt.Key.Key_Backspace)
+    assert search.text() == "ab"
+    assert window.current_path == second.absolute()
+    assert window.navigation_history.current_index == history_index
+
+    address = window.address_bar
+    window.focus_address_bar()
+    address.setText("abc")
+    address.setCursorPosition(3)
+    QTest.keyClick(address, Qt.Key.Key_Backspace)
+    assert address.text() == "ab"
+    assert window.current_path == second.absolute()
+    assert window.navigation_history.current_index == history_index
+
+    inline_editor = QLineEdit(window.list_view.viewport())
+    inline_editor.setText("abc")
+    inline_editor.show()
+    inline_editor.setFocus()
+    qapp.processEvents()
+    QTest.keyClick(inline_editor, Qt.Key.Key_Backspace)
+    assert inline_editor.text() == "ab"
+    assert window.current_path == second.absolute()
+    assert window.navigation_history.current_index == history_index
+    inline_editor.close()
+    inline_editor.deleteLater()
+
+    window.list_view.setFocus()
+    QTest.keyClick(window.list_view, Qt.Key.Key_Backspace)
+    finish_scan(window, qapp)
+    assert window.current_path == first.absolute()
+    assert window.navigation_history.current_index == history_index - 1
     window.close()
     qapp.processEvents()
 

@@ -6,7 +6,13 @@ import pytest
 from PySide6.QtCore import QPoint, QPointF, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QPixmap, QShortcut, QWheelEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QInputDialog, QLineEdit, QMessageBox
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QInputDialog,
+    QLineEdit,
+    QMessageBox,
+)
 
 from tests.test_application_controller import make_controller, close_controller, finish_viewer_open, wait_until
 
@@ -318,3 +324,84 @@ def test_edit_field_owns_letters_and_copy(book, qapp):
         assert QApplication.clipboard().text() == 'dfz+-'
     finally:
         edit.close()
+
+
+def test_viewer_close_key_default_is_ctrl_w_and_escape_only_cancels_state(
+    book,
+    qapp,
+):
+    window, _ = book
+    requests = []
+    window.set_close_request_handler(lambda target: requests.append(target))
+    window.viewer.setFocus()
+
+    QTest.keyClick(
+        window.viewer,
+        Qt.Key.Key_W,
+        Qt.KeyboardModifier.ControlModifier,
+    )
+    assert requests == [window]
+    QTest.keyClick(window.viewer, Qt.Key.Key_Escape)
+    assert requests == [window]
+
+
+def test_viewer_close_key_applies_immediately_and_can_be_disabled(book, qapp):
+    window, _ = book
+    requests = []
+    window.set_close_request_handler(lambda target: requests.append(target))
+    window.viewer.setFocus()
+
+    window.config.apply({"viewer_close_shortcut": "Ctrl+Shift+W"})
+    QTest.keyClick(
+        window.viewer,
+        Qt.Key.Key_W,
+        Qt.KeyboardModifier.ControlModifier,
+    )
+    assert requests == []
+    QTest.keyClick(
+        window.viewer,
+        Qt.Key.Key_W,
+        Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier,
+    )
+    assert requests == [window]
+
+    window.config.apply({"viewer_close_shortcut": ""})
+    QTest.keyClick(
+        window.viewer,
+        Qt.Key.Key_W,
+        Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier,
+    )
+    assert requests == [window]
+
+
+def test_viewer_close_key_does_not_fire_in_text_or_modal_input(book, qapp):
+    window, _ = book
+    requests = []
+    window.set_close_request_handler(lambda target: requests.append(target))
+
+    edit = QLineEdit(window)
+    edit.show()
+    edit.setFocus()
+    qapp.processEvents()
+    QTest.keyClick(
+        edit,
+        Qt.Key.Key_W,
+        Qt.KeyboardModifier.ControlModifier,
+    )
+    assert requests == []
+    edit.close()
+
+    dialog = QDialog(window)
+    dialog.setModal(True)
+    modal_edit = QLineEdit(dialog)
+    modal_edit.show()
+    dialog.show()
+    modal_edit.setFocus()
+    qapp.processEvents()
+    QTest.keyClick(
+        modal_edit,
+        Qt.Key.Key_W,
+        Qt.KeyboardModifier.ControlModifier,
+    )
+    assert requests == []
+    dialog.close()

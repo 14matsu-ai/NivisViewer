@@ -8,6 +8,8 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPalette
 from PySide6.QtWidgets import QApplication, QStyle, QStyleOptionViewItem
 
 from app.browser_item_delegate import (
+    BROWSER_FILE_FALLBACK_DEFAULT_COLOR,
+    BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR,
     BROWSER_PLACEHOLDER_ICON_MAX_RATIO,
     GRID_PRESET_THUMBNAIL_SIZES,
     BrowserItemDelegate,
@@ -132,7 +134,12 @@ def test_medium_preset_keeps_images_placeholders_and_overlays_bounded(
         delegate.paint(painter, option, model.index(0, 0))
         painter.end()
         sample = QPoint(round(content.right()) - 2, round(content.top()) + 2)
-        assert canvas.pixelColor(sample) == QColor("black")
+        expected_fallback = (
+            BROWSER_FOLDER_FALLBACK_DEFAULT_COLOR
+            if kind is BrowserItemKind.FOLDER
+            else BROWSER_FILE_FALLBACK_DEFAULT_COLOR
+        )
+        assert canvas.pixelColor(sample) == QColor(expected_fallback)
         outside = QPoint(frame.right() - 2, frame.top() + 2)
         assert canvas.pixelColor(outside) == QColor("white")
 

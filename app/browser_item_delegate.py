@@ -9,6 +9,13 @@ from PySide6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
 from .browser_model import BrowserItem, BrowserItemKind, BrowserItemModel
 from .browser_grid_metrics import build_browser_grid_metrics
+from .browser_icon_size import (
+    BROWSER_ICON_SIZE_DEFAULT_CUSTOM_PERCENT,
+    BROWSER_ICON_SIZE_DEFAULT_PRESET,
+    browser_icon_size_scale,
+    normalize_browser_icon_size_custom_percent,
+    normalize_browser_icon_size_preset,
+)
 from .browser_sort import BrowserDisplayDensity
 from .shell_icon_provider import ShellAssociatedIconProvider
 from .thumbnail_render import (
@@ -222,7 +229,7 @@ def browser_item_type_key(item: BrowserItem) -> str:
 
 
 def type_badge_rect(thumbnail_rect: QRect, badge_size: int = 16) -> QRect:
-    size = max(12, int(badge_size))
+    size = max(8, int(badge_size))
     return QRect(
         thumbnail_rect.left() + 4,
         thumbnail_rect.bottom() - size - 3,
@@ -493,6 +500,14 @@ class BrowserItemDelegate(QStyledItemDelegate):
         item_spacing_y: int = 0,
         folder_fallback_background: str = "auto",
         file_fallback_background: str = "auto",
+        center_folder_icon_size: str = BROWSER_ICON_SIZE_DEFAULT_PRESET,
+        center_folder_icon_custom_percent: int = BROWSER_ICON_SIZE_DEFAULT_CUSTOM_PERCENT,
+        center_file_icon_size: str = BROWSER_ICON_SIZE_DEFAULT_PRESET,
+        center_file_icon_custom_percent: int = BROWSER_ICON_SIZE_DEFAULT_CUSTOM_PERCENT,
+        badge_folder_icon_size: str = BROWSER_ICON_SIZE_DEFAULT_PRESET,
+        badge_folder_icon_custom_percent: int = BROWSER_ICON_SIZE_DEFAULT_CUSTOM_PERCENT,
+        badge_file_icon_size: str = BROWSER_ICON_SIZE_DEFAULT_PRESET,
+        badge_file_icon_custom_percent: int = BROWSER_ICON_SIZE_DEFAULT_CUSTOM_PERCENT,
         shell_icon_provider: ShellAssociatedIconProvider | None = None,
     ) -> None:
         super().__init__(parent)
@@ -519,6 +534,30 @@ class BrowserItemDelegate(QStyledItemDelegate):
         )
         self.file_fallback_background = self._normalize_folder_fallback_background(
             file_fallback_background
+        )
+        self.center_folder_icon_size = normalize_browser_icon_size_preset(
+            center_folder_icon_size
+        )
+        self.center_folder_icon_custom_percent = normalize_browser_icon_size_custom_percent(
+            center_folder_icon_custom_percent
+        )
+        self.center_file_icon_size = normalize_browser_icon_size_preset(
+            center_file_icon_size
+        )
+        self.center_file_icon_custom_percent = normalize_browser_icon_size_custom_percent(
+            center_file_icon_custom_percent
+        )
+        self.badge_folder_icon_size = normalize_browser_icon_size_preset(
+            badge_folder_icon_size
+        )
+        self.badge_folder_icon_custom_percent = normalize_browser_icon_size_custom_percent(
+            badge_folder_icon_custom_percent
+        )
+        self.badge_file_icon_size = normalize_browser_icon_size_preset(
+            badge_file_icon_size
+        )
+        self.badge_file_icon_custom_percent = normalize_browser_icon_size_custom_percent(
+            badge_file_icon_custom_percent
         )
         self.shell_icon_provider = (
             shell_icon_provider or ShellAssociatedIconProvider()
@@ -592,6 +631,14 @@ class BrowserItemDelegate(QStyledItemDelegate):
         item_spacing_y: int | None = None,
         folder_fallback_background: str | None = None,
         file_fallback_background: str | None = None,
+        center_folder_icon_size: str | None = None,
+        center_folder_icon_custom_percent: int | None = None,
+        center_file_icon_size: str | None = None,
+        center_file_icon_custom_percent: int | None = None,
+        badge_folder_icon_size: str | None = None,
+        badge_folder_icon_custom_percent: int | None = None,
+        badge_file_icon_size: str | None = None,
+        badge_file_icon_custom_percent: int | None = None,
     ) -> None:
         previous_surface_geometry = (
             self.thumbnail_size,
@@ -640,6 +687,26 @@ class BrowserItemDelegate(QStyledItemDelegate):
                     folder_fallback_background
                 )
             )
+        for name, value in (
+            ("center_folder_icon_size", center_folder_icon_size),
+            ("center_file_icon_size", center_file_icon_size),
+            ("badge_folder_icon_size", badge_folder_icon_size),
+            ("badge_file_icon_size", badge_file_icon_size),
+        ):
+            if value is not None:
+                setattr(self, name, normalize_browser_icon_size_preset(value))
+        for name, value in (
+            ("center_folder_icon_custom_percent", center_folder_icon_custom_percent),
+            ("center_file_icon_custom_percent", center_file_icon_custom_percent),
+            ("badge_folder_icon_custom_percent", badge_folder_icon_custom_percent),
+            ("badge_file_icon_custom_percent", badge_file_icon_custom_percent),
+        ):
+            if value is not None:
+                setattr(
+                    self,
+                    name,
+                    normalize_browser_icon_size_custom_percent(value),
+                )
         if previous_surface_geometry != (
             self.thumbnail_size,
             self.frame_ratio_id,
@@ -716,13 +783,15 @@ class BrowserItemDelegate(QStyledItemDelegate):
                 # Keep the pending-preview icon consistent with the lower-left
                 # type badge.  DecorationRole remains the local fallback when
                 # the shell association lookup cannot supply an image.
+                center_scale = self._icon_scale(item, badge=False)
                 icon_size = max(
-                    16,
+                    8,
                     min(
-                        96,
+                        96 * center_scale,
                         min(thumbnail_rect.width(), thumbnail_rect.height()) - 8,
                     ),
                 )
+                icon_size = max(8, round(icon_size))
                 association_image = self._association_image(
                     item,
                     icon_size,
@@ -733,7 +802,13 @@ class BrowserItemDelegate(QStyledItemDelegate):
                     if not association_image.isNull()
                     else index.data(Qt.ItemDataRole.DecorationRole)
                 )
-                self._paint_fallback_icon(painter, content_rect, icon, option)
+                self._paint_fallback_icon(
+                    painter,
+                    content_rect,
+                    icon,
+                    option,
+                    icon_scale=center_scale,
+                )
             if bool(index.data(BrowserItemModel.ThumbnailLowResolutionRole)):
                 color = option.palette.highlight().color()
                 color.setAlpha(190)
@@ -824,14 +899,18 @@ class BrowserItemDelegate(QStyledItemDelegate):
         content_rect: QRectF,
         icon: object,
         option: QStyleOptionViewItem,
+        *,
+        icon_scale: float = 1.0,
     ) -> None:
+        icon_scale = max(0.25, min(3.0, float(icon_scale)))
+        icon_ratio = min(1.0, BROWSER_PLACEHOLDER_ICON_MAX_RATIO * icon_scale)
         available_width = max(
             1.0,
-            content_rect.width() * BROWSER_PLACEHOLDER_ICON_MAX_RATIO,
+            content_rect.width() * icon_ratio,
         )
         available_height = max(
             1.0,
-            content_rect.height() * BROWSER_PLACEHOLDER_ICON_MAX_RATIO,
+            content_rect.height() * icon_ratio,
         )
         if isinstance(icon, QImage) and not icon.isNull():
             dpr = max(0.5, painter.device().devicePixelRatioF())
@@ -990,6 +1069,39 @@ class BrowserItemDelegate(QStyledItemDelegate):
             )
             y += metrics.lineSpacing()
 
+    def _icon_scale(self, item: BrowserItem, *, badge: bool) -> float:
+        if item.kind is BrowserItemKind.FOLDER:
+            prefix = "badge_folder" if badge else "center_folder"
+        else:
+            prefix = "badge_file" if badge else "center_file"
+        return browser_icon_size_scale(
+            getattr(self, f"{prefix}_icon_size"),
+            getattr(self, f"{prefix}_icon_custom_percent"),
+        )
+
+    def _type_badge_size(self, thumbnail_rect: QRect, item: BrowserItem) -> int:
+        badge_sizes = {
+            BrowserDisplayDensity.EXTRA_COMPACT: 14,
+            BrowserDisplayDensity.COMPACT: 16,
+            BrowserDisplayDensity.MEDIUM: 16,
+            BrowserDisplayDensity.STANDARD: 18,
+            BrowserDisplayDensity.COMFORTABLE: 20,
+            BrowserDisplayDensity.LARGE: 22,
+        }
+        base_size = badge_sizes[self.density]
+        size = round(base_size * self._icon_scale(item, badge=True))
+        cell_cap = min(
+            max(8, thumbnail_rect.width() - 4),
+            max(8, thumbnail_rect.height() - 3),
+        )
+        return max(8, min(cell_cap, size))
+
+    def _type_badge_rect(self, thumbnail_rect: QRect, item: BrowserItem) -> QRect:
+        return type_badge_rect(
+            thumbnail_rect,
+            self._type_badge_size(thumbnail_rect, item),
+        )
+
     def _paint_tags(self, painter, option, rect, item) -> None:
         from .browser_tags import filename_tags
         registered = {tag['name']: tag for tag in self.tag_registry}
@@ -1013,12 +1125,23 @@ class BrowserItemDelegate(QStyledItemDelegate):
             # Keep the bottom-left type icon and the upper rating band clear.
             right = rect.right() - 2
             x, y = right, rect.bottom() - height - 3
+            badge = self._type_badge_rect(rect, item)
             for tag in tags:
-                left = rect.left() + (28 if y + height > rect.bottom() - 25 else 2)
+                tag_band = QRect(rect.left(), y, rect.width(), height)
+                left = (
+                    badge.right() + 7
+                    if tag_band.intersects(badge)
+                    else rect.left() + 2
+                )
                 desired = metrics.horizontalAdvance(tag['name']) + 6
                 if x < right and x - left < desired:
                     x, y = right, y - height - 3
-                    left = rect.left() + (28 if y + height > rect.bottom() - 25 else 2)
+                    tag_band = QRect(rect.left(), y, rect.width(), height)
+                    left = (
+                        badge.right() + 7
+                        if tag_band.intersects(badge)
+                        else rect.left() + 2
+                    )
                 if y < top_limit:
                     break
                 available = x - left
@@ -1111,16 +1234,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
         thumbnail_rect: QRect,
         item: BrowserItem,
     ) -> None:
-        badge_sizes = {
-            BrowserDisplayDensity.EXTRA_COMPACT: 14,
-            BrowserDisplayDensity.COMPACT: 16,
-            BrowserDisplayDensity.MEDIUM: 16,
-            BrowserDisplayDensity.STANDARD: 18,
-            BrowserDisplayDensity.COMFORTABLE: 20,
-            BrowserDisplayDensity.LARGE: 22,
-        }
-        badge_size = badge_sizes[self.density]
-        badge = type_badge_rect(thumbnail_rect, badge_size)
+        badge_size = self._type_badge_size(thumbnail_rect, item)
+        badge = self._type_badge_rect(thumbnail_rect, item)
         dpr = max(0.5, painter.device().devicePixelRatioF())
         badge_target = snap_logical_rect_to_physical_pixels(QRectF(badge), dpr)
         image = self._association_image(item, badge_size, dpr)

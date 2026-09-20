@@ -313,6 +313,7 @@ class ApplicationController(QObject):
             path_availability_service=self.path_availability_service,
         )
         self._viewer_windows.append(window)
+        window.set_close_request_handler(self.close_viewer_window)
         window._application_close_guard = self._allow_window_close
         self._active_viewer = window
         self._quit_requested = False

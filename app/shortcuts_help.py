@@ -6,6 +6,14 @@ from .i18n import tr
 
 
 def show_shortcuts_help(parent: QWidget) -> None:
+    config = getattr(parent, "config", None)
+    settings = (
+        config.data
+        if config is not None and hasattr(config, "data")
+        else getattr(parent, "settings", {})
+    )
+    close_key = str(settings.get("viewer_close_shortcut", "") or "")
+    close_key = close_key or tr('未設定')
     QMessageBox.information(
         parent,
         tr('ショートカット一覧'),
@@ -32,6 +40,7 @@ def show_shortcuts_help(parent: QWidget) -> None:
                 tr('1〜9を押しながらS（逆順も可）: 指定秒数でスライドショー開始'),
                 tr('Shift+S: 間隔を選択し、Enterでスライドショー開始'),
                 tr('B / Ctrl+B: ブックマーク切替'),
+                tr('Viewerを閉じるキー: {p0}', p0=close_key),
                 tr('Ctrl+PageDown / Ctrl+PageUp: 次 / 前の本'),
                 tr('Ctrl+C: 現在画像をコピー'),
                 tr('Ctrl+Shift+C: 現在画像のパスをコピー'),
