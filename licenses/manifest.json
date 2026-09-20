@@ -3,26 +3,6 @@
   "scope": "installed distributions, not a complete frozen-binary SBOM or release approval",
   "runtime": [
     {
-      "name": "pillow-jxl-plugin",
-      "version": "1.3.8",
-      "files": ["LICENSE"],
-      "file_sha256": {"LICENSE": "230184f60bae2feaf244f10a8bac053c8ff33a183bcc365b4d8b876d2b7f4809"},
-      "declared_license": "GPL-3.0-or-later",
-      "declared_license_files": ["LICENSE"]
-    },
-    {
-      "name": "packaging",
-      "version": "26.3",
-      "files": ["LICENSE", "LICENSE.APACHE", "LICENSE.BSD"],
-      "file_sha256": {
-        "LICENSE": "cad1ef5bd340d73e074ba614d26f7deaca5c7940c3d8c34852e65c4909686c48",
-        "LICENSE.APACHE": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
-        "LICENSE.BSD": "b70e7e9b742f1cc6f948b34c16aa39ffece94196364bc88ff0d2180f0028fac5"
-      },
-      "declared_license": "Apache-2.0 OR BSD-2-Clause",
-      "declared_license_files": ["LICENSE", "LICENSE.APACHE", "LICENSE.BSD"]
-    },
-    {
       "name": "PySide6",
       "version": "6.11.2",
       "files": [
@@ -106,6 +86,50 @@
       "declared_license": "MIT-CMU",
       "declared_license_files": [
         "LICENSE"
+      ],
+      "supplement": null
+    },
+    {
+      "name": "pillow-jxl-plugin",
+      "version": "1.3.8",
+      "files": [
+        "LICENSE"
+      ],
+      "file_sha256": {
+        "LICENSE": "230184f60bae2feaf244f10a8bac053c8ff33a183bcc365b4d8b876d2b7f4809"
+      },
+      "declared_license": "GPL-3.0-or-later",
+      "declared_license_files": [
+        "LICENSE"
+      ],
+      "supplement": null
+    },
+    {
+      "name": "packaging",
+      "version": "26.3",
+      "files": [
+        "LICENSE",
+        "LICENSE.APACHE",
+        "LICENSE.BSD",
+        "__init__.py",
+        "__pycache______init__.cpython-311.pyc",
+        "__pycache_____spdx.cpython-311.pyc",
+        "_spdx.py"
+      ],
+      "file_sha256": {
+        "LICENSE": "cad1ef5bd340d73e074ba614d26f7deaca5c7940c3d8c34852e65c4909686c48",
+        "LICENSE.APACHE": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+        "LICENSE.BSD": "b70e7e9b742f1cc6f948b34c16aa39ffece94196364bc88ff0d2180f0028fac5",
+        "__init__.py": "590d12eee73ddbec53b4e9ee5bfc64d9cb3aacb4940e8ebcba260757ce56740b",
+        "__pycache______init__.cpython-311.pyc": "4d3469877d4a3ba0504afd2d32181a7a9bd7e0a8bb70a3122914a89a1f5177c2",
+        "__pycache_____spdx.cpython-311.pyc": "81f7b4da480bb411e30c41fb039dbef40113a36265be77dd9e92a21515139f11",
+        "_spdx.py": "596ec35e2ca0ebcba9fd8343ff0a51625af548786257815f24b41f7e08613314"
+      },
+      "declared_license": "Apache-2.0 OR BSD-2-Clause",
+      "declared_license_files": [
+        "LICENSE",
+        "LICENSE.APACHE",
+        "LICENSE.BSD"
       ],
       "supplement": null
     },
