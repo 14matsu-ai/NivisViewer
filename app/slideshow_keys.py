@@ -9,12 +9,25 @@ from PySide6.QtWidgets import (
 
 
 class SlideshowKeys(QObject):
-    def __init__(self, window, *, start, toggle, choose):
+    def __init__(
+        self,
+        window,
+        *,
+        start,
+        toggle,
+        choose,
+        chord_enabled=lambda: True,
+        toggle_enabled=lambda: True,
+        choose_enabled=lambda: True,
+    ):
         super().__init__(window)
         self.window = window
         self.start = start
         self.toggle = toggle
         self.choose = choose
+        self.chord_enabled = chord_enabled
+        self.toggle_enabled = toggle_enabled
+        self.choose_enabled = choose_enabled
         self.digits = []
         self.s_held = False
         self.used = False
@@ -63,17 +76,41 @@ class SlideshowKeys(QObject):
         digit = int(key) - int(Qt.Key.Key_0) if Qt.Key.Key_1 <= key <= Qt.Key.Key_9 else None
         if not is_s and digit is None:
             return False
+        if not bool(self.chord_enabled()):
+            return False
         modifiers = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+        if digit is not None and modifiers != Qt.KeyboardModifier.NoModifier:
+            # Only unmodified digits belong to the held-key chord. Leave
+            # Shift/Ctrl/Alt digit shortcuts to Qt, including their override.
+            self.reset()
+            return False
+        is_shift_s = is_s and modifiers == Qt.KeyboardModifier.ShiftModifier
+        if is_shift_s and not bool(self.choose_enabled()):
+            # Shift+S belongs to the normal shortcut dispatcher once the
+            # interval action has been moved away from it.
+            return False
         if modifiers not in (Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.ShiftModifier):
             self.reset()
             return False
         if kind == QEvent.Type.ShortcutOverride:
-            if is_s or self.s_held:
+            if is_shift_s and bool(self.choose_enabled()):
+                event.accept()
+                return True
+            if is_s and modifiers == Qt.KeyboardModifier.NoModifier and (
+                self.s_held or self.digits or bool(self.toggle_enabled())
+            ):
+                event.accept()
+                return True
+            if digit is not None:
                 event.accept()
                 return True
             return False
         if event.isAutoRepeat():
-            return is_s or self.s_held
+            return (
+                is_shift_s
+                or bool(self.digits)
+                or (is_s and (self.s_held or bool(self.toggle_enabled())))
+            )
         if kind == QEvent.Type.KeyRelease:
             if digit is not None:
                 if digit in self.digits:
@@ -82,7 +119,7 @@ class SlideshowKeys(QObject):
             toggle = self.s_held and not self.used
             self.s_held = False
             self.used = False
-            if toggle:
+            if toggle and bool(self.toggle_enabled()):
                 self.toggle()
             return True
         if is_s:

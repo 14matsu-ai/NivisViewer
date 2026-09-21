@@ -266,6 +266,7 @@ class ItemTagsDialog(QDialog):
 class TagFilterDialog(QDialog):
     def __init__(self, state, registry, parent=None):
         super().__init__(parent)
+        self._initial_focus_pending = True
         self.setWindowTitle(tr('タグで絞り込み'))
         self.resize(500, 400)
         layout = QVBoxLayout(self)
@@ -291,9 +292,26 @@ class TagFilterDialog(QDialog):
             self.controls[name] = combo
         layout.addWidget(self.table)
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel, parent=self)
-        self.buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self.accept)
+        apply_button = self.buttons.button(QDialogButtonBox.StandardButton.Apply)
+        cancel_button = self.buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        button_layout = self.buttons.layout()
+        button_layout.removeWidget(apply_button)
+        button_layout.removeWidget(cancel_button)
+        button_layout.addWidget(apply_button)
+        button_layout.addWidget(cancel_button)
+        apply_button.setDefault(True)
+        cancel_button.setDefault(False)
+        apply_button.clicked.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._initial_focus_pending:
+            self._initial_focus_pending = False
+            self.buttons.button(
+                QDialogButtonBox.StandardButton.Apply
+            ).setFocus(Qt.FocusReason.OtherFocusReason)
 
     def filter_values(self):
         return dict(include_tags=tuple(name for name, c in self.controls.items() if c.currentData() == 'include'),

@@ -54,7 +54,11 @@ from .adjacent_book_search import (
 )
 from .app_icon import install_window_icon
 from .book_session import AsyncBookOpenFailed, BookOpened, BookSession
-from .config_manager import ConfigManager
+from .config_manager import (
+    SLIDESHOW_INTERVAL_MAX_MS,
+    SLIDESHOW_INTERVAL_MIN_MS,
+    ConfigManager,
+)
 from .drag_drop import FolderDropProbe
 from .external_drop_open import ExternalDropOpenController
 from .fullscreen_chrome import FullscreenChromeController
@@ -112,6 +116,7 @@ from .viewer_close_shortcut import (
     normalize_viewer_close_shortcut,
     sequence_combined,
 )
+from .shortcut_catalog import canonical_key, normalize_shortcut_bindings
 from .viewer_memory_policy import (
     ResolvedViewerMemoryPolicy,
     read_physical_memory_snapshot,
@@ -365,21 +370,35 @@ class ViewerWindow(QMainWindow):
         )
         bindings = self.settings.get("mouse_gesture_bindings", {})
         self.mouse_gesture_bindings = dict(bindings) if isinstance(bindings, dict) else {}
+        self.shortcut_bindings = normalize_shortcut_bindings(
+            self.settings.get("shortcut_bindings")
+        ).get("viewer", {})
+        self.viewer_slideshow_chord_enabled = bool(
+            self.settings.get("viewer_slideshow_chord_enabled", True)
+        )
         self.mouse_back_button_action = commands.normalize_viewer_command(
             self.settings.get("mouse_back_button_action")
         )
         self.mouse_forward_button_action = commands.normalize_viewer_command(
             self.settings.get("mouse_forward_button_action")
         )
-        self.viewer_close_shortcut = normalize_viewer_close_shortcut(
-            self.settings.get("viewer_close_shortcut")
-        )
+        self.viewer_close_shortcut = self.shortcut_bindings.get(
+            "viewer_close", [
+                normalize_viewer_close_shortcut(
+                    self.settings.get("viewer_close_shortcut")
+                )
+            ]
+        )[0] if self.shortcut_bindings.get("viewer_close", []) else ""
         self._viewer_close_key_sequence = QKeySequence(
             self.viewer_close_shortcut
         )
         self._viewer_close_key_combined = sequence_combined(
             self._viewer_close_key_sequence
         )
+        self._viewer_close_key_combinations = {
+            sequence_combined(QKeySequence(value))
+            for value in self.shortcut_bindings.get("viewer_close", [])
+        }
         self.viewer_canvas_left_click_action = str(
             self.settings.get(
                 "viewer_canvas_left_click_action",
@@ -396,7 +415,9 @@ class ViewerWindow(QMainWindow):
             )
         )
         self.slideshow_timer = QTimer(self)
-        self.slideshow_timer.setInterval(max(500, self.slideshow_interval_ms))
+        self.slideshow_timer.setInterval(
+            max(SLIDESHOW_INTERVAL_MIN_MS, self.slideshow_interval_ms)
+        )
         self.slideshow_timer.timeout.connect(self._advance_slideshow)
         self._pdf_render_timer = QTimer(self)
         self._pdf_render_timer.setSingleShot(True)
@@ -564,6 +585,9 @@ class ViewerWindow(QMainWindow):
             self, start=lambda seconds: self.start_slideshow(seconds),
             toggle=lambda: self.toggle_slideshow(),
             choose=lambda: self.set_slideshow_interval_dialog(start=True),
+            chord_enabled=lambda: self.viewer_slideshow_chord_enabled,
+            toggle_enabled=lambda: self._shortcut_has("viewer_slideshow_toggle", "S"),
+            choose_enabled=lambda: self._shortcut_has("viewer_slideshow_interval", "Shift+S"),
         )
         self._restore_window_state()
         self._apply_settings_to_widgets()
@@ -891,28 +915,37 @@ class ViewerWindow(QMainWindow):
 
         file_menu = menu_bar.addMenu(tr('ファイル'))
         open_action = QAction(tr('開く'), self)
+        self.viewer_open_action = open_action
         open_action.setShortcut(QKeySequence.StandardKey.Open)
         open_action.triggered.connect(self.open_dialog)
         reload_action = QAction(tr('再読み込み'), self)
+        self.viewer_reload_action = reload_action
         reload_action.setShortcut("F5")
         reload_action.triggered.connect(self.reload_current_book)
         export_view_action = QAction(tr('現在の表示をPNG保存'), self)
         export_view_action.triggered.connect(self.export_current_view)
         copy_path_action = QAction(tr('現在画像のパスをコピー'), self)
+        self.viewer_copy_path_action = copy_path_action
         copy_path_action.setShortcut("Ctrl+Shift+C")
         copy_path_action.triggered.connect(self.copy_current_image_path)
         copy_image_action = QAction(tr('現在画像をコピー'), self)
+        self.viewer_copy_image_action = copy_image_action
         copy_image_action.setShortcut(QKeySequence.StandardKey.Copy)
         copy_image_action.triggered.connect(self.copy_current_image)
         copy_view_action = QAction(tr('現在の表示をコピー'), self)
+        self.viewer_copy_view_action = copy_view_action
         copy_view_action.setShortcut("Ctrl+Alt+C")
         copy_view_action.triggered.connect(self.copy_current_view)
         page_info_action = QAction(tr('ページ情報'), self)
+        self.viewer_page_info_action = page_info_action
         page_info_action.setShortcut("Ctrl+I")
         page_info_action.triggered.connect(self.show_page_info)
         open_location_action = QAction(tr('現在の場所を開く'), self)
         open_location_action.triggered.connect(self.open_current_location)
-        exit_action = QAction(tr('終了'), self)
+        exit_action = QAction(tr('Viewerを閉じる'), self)
+        self.viewer_close_action = exit_action
+        # Keep the old attribute for extensions that inspected the menu action.
+        self.viewer_quit_action = exit_action
         exit_action.setShortcut(QKeySequence.StandardKey.Quit)
         exit_action.triggered.connect(
             lambda _checked=False: self.dispatch_command(commands.CLOSE_VIEWER)
@@ -1085,6 +1118,7 @@ class ViewerWindow(QMainWindow):
         view_menu.addSeparator()
 
         fullscreen_action = QAction(tr('全画面'), self)
+        self.viewer_toggle_fullscreen_action = fullscreen_action
         fullscreen_action.setShortcut("F")
         fullscreen_action.triggered.connect(
             lambda _checked=False: self.dispatch_command(commands.TOGGLE_FULLSCREEN)
@@ -1102,12 +1136,15 @@ class ViewerWindow(QMainWindow):
         view_menu.addSeparator()
 
         rotate_left_action = QAction(tr('左に回転'), self)
+        self.viewer_rotate_left_action = rotate_left_action
         rotate_left_action.setShortcut("Ctrl+Left")
         rotate_left_action.triggered.connect(self.rotate_left)
         rotate_right_action = QAction(tr('右に回転'), self)
+        self.viewer_rotate_right_action = rotate_right_action
         rotate_right_action.setShortcut("Ctrl+Right")
         rotate_right_action.triggered.connect(self.rotate_right)
         reset_rotation_action = QAction(tr('回転を解除'), self)
+        self.viewer_reset_rotation_action = reset_rotation_action
         reset_rotation_action.setShortcut("Ctrl+0")
         reset_rotation_action.triggered.connect(self.reset_rotation)
         view_menu.addAction(rotate_left_action)
@@ -1207,40 +1244,49 @@ class ViewerWindow(QMainWindow):
         self.history_forward_action.setShortcut("Alt+Right")
         self.history_forward_action.triggered.connect(self.go_forward_in_page_history)
         next_action = QAction(tr('次ページ'), self)
+        self.viewer_next_page_action = next_action
         next_action.setShortcut(Qt.Key.Key_Right)
         next_action.triggered.connect(
             lambda _checked=False: self.dispatch_command(commands.NEXT_PAGE)
         )
         previous_action = QAction(tr('前ページ'), self)
+        self.viewer_previous_page_action = previous_action
         previous_action.setShortcut(Qt.Key.Key_Left)
         previous_action.triggered.connect(
             lambda _checked=False: self.dispatch_command(commands.PREVIOUS_PAGE)
         )
         next_one_page_action = QAction(tr('1ページ進む'), self)
+        self.viewer_next_single_page_action = next_one_page_action
         next_one_page_action.setShortcut("Shift+Right")
         next_one_page_action.triggered.connect(self.next_one_page)
         previous_one_page_action = QAction(tr('1ページ戻る'), self)
+        self.viewer_previous_single_page_action = previous_one_page_action
         previous_one_page_action.setShortcut("Shift+Left")
         previous_one_page_action.triggered.connect(self.previous_one_page)
         next_book_action = QAction(tr('次の本'), self)
+        self.viewer_next_book_action = next_book_action
         next_book_action.setShortcut("Ctrl+PgDown")
         next_book_action.triggered.connect(
             lambda _checked=False: self.dispatch_command(commands.NEXT_BOOK)
         )
         previous_book_action = QAction(tr('前の本'), self)
+        self.viewer_previous_book_action = previous_book_action
         previous_book_action.setShortcut("Ctrl+PgUp")
         previous_book_action.triggered.connect(
             lambda _checked=False: self.dispatch_command(commands.PREVIOUS_BOOK)
         )
         go_to_page_action = QAction(tr('ページ指定'), self)
+        self.viewer_page_dialog_action = go_to_page_action
         go_to_page_action.setShortcut("G")
         go_to_page_action.triggered.connect(self.go_to_page_dialog)
         first_action = QAction(tr('先頭'), self)
+        self.viewer_first_page_action = first_action
         first_action.setShortcut(Qt.Key.Key_Home)
         first_action.triggered.connect(
             lambda _checked=False: self.dispatch_command(commands.FIRST_PAGE)
         )
         last_action = QAction(tr('最後'), self)
+        self.viewer_last_page_action = last_action
         last_action.setShortcut(Qt.Key.Key_End)
         last_action.triggered.connect(
             lambda _checked=False: self.dispatch_command(commands.LAST_PAGE)
@@ -1279,25 +1325,85 @@ class ViewerWindow(QMainWindow):
         dialog.exec()
 
     def _connect_shortcuts(self) -> None:
-        shortcuts = [
-            ("Space", self.next_page_or_scroll),
-            ("Backspace", self.previous_page_or_scroll),
-            ("PgDown", self.next_page_or_scroll),
-            ("PgUp", self.previous_page_or_scroll),
-            ("+", lambda: self.dispatch_command(commands.ZOOM_IN)),
-            ("Shift++", lambda: self.dispatch_command(commands.ZOOM_IN)),
-            ("=", lambda: self.dispatch_command(commands.ZOOM_IN)),
-            ("-", lambda: self.dispatch_command(commands.ZOOM_OUT)),
-            ("0", lambda: self.dispatch_command(commands.FIT_WINDOW)),
-            ("Esc", self._handle_escape),
-            ("D", lambda: self.dispatch_command(commands.TOGGLE_SPREAD)),
-            ("Shift+R", lambda: self.dispatch_command(commands.TOGGLE_READING_DIRECTION)),
-            ("B", self.toggle_current_bookmark),
-            ("Ctrl+B", self.toggle_current_bookmark),
-        ]
-        for key, callback in shortcuts:
-            shortcut = QShortcut(QKeySequence(key), self)
-            shortcut.activated.connect(callback)
+        self._viewer_dynamic_shortcuts: list[QShortcut] = []
+        self._rebuild_viewer_shortcuts()
+
+    def _shortcut_has(self, action_id: str, sequence: str) -> bool:
+        return canonical_key(sequence) in {
+            canonical_key(value)
+            for value in self.shortcut_bindings.get(action_id, [])
+        }
+
+    def _rebuild_viewer_shortcuts(self) -> None:
+        for shortcut in getattr(self, "_viewer_dynamic_shortcuts", []):
+            shortcut.setKey(QKeySequence())
+            shortcut.deleteLater()
+        self._viewer_dynamic_shortcuts = []
+        # These actions are driven by the press/repeat/release event path so
+        # that rapid navigation has one owner and never fires twice.
+        for attribute in (
+            "viewer_next_page_action",
+            "viewer_previous_page_action",
+            "viewer_next_single_page_action",
+            "viewer_previous_single_page_action",
+            "viewer_first_page_action",
+            "viewer_last_page_action",
+        ):
+            action = getattr(self, attribute, None)
+            if action is not None:
+                action.setShortcuts([])
+        action_map = {
+            "viewer_history_back": "history_back_action",
+            "viewer_history_forward": "history_forward_action",
+            "viewer_open": "viewer_open_action",
+            "viewer_reload": "viewer_reload_action",
+            "viewer_copy_path": "viewer_copy_path_action",
+            "viewer_copy_image": "viewer_copy_image_action",
+            "viewer_copy_view": "viewer_copy_view_action",
+            "viewer_page_info": "viewer_page_info_action",
+            "viewer_close": "viewer_close_action",
+            "viewer_toggle_fullscreen": "viewer_toggle_fullscreen_action",
+            "viewer_toggle_magnifier": "magnifier_action",
+            "viewer_rotate_left": "viewer_rotate_left_action",
+            "viewer_rotate_right": "viewer_rotate_right_action",
+            "viewer_reset_rotation": "viewer_reset_rotation_action",
+            "viewer_next_book": "viewer_next_book_action",
+            "viewer_previous_book": "viewer_previous_book_action",
+            "viewer_page_dialog": "viewer_page_dialog_action",
+        }
+        for action_id, attribute in action_map.items():
+            action = getattr(self, attribute, None)
+            if action is not None:
+                action.setShortcuts([
+                    QKeySequence(value)
+                    for value in self.shortcut_bindings.get(action_id, [])
+                ])
+        handlers: dict[str, Callable[[], object]] = {
+            "viewer_toggle_spread": lambda: self.dispatch_command(commands.TOGGLE_SPREAD),
+            "viewer_toggle_reading_direction": lambda: self.dispatch_command(commands.TOGGLE_READING_DIRECTION),
+            "viewer_fit_window": lambda: self.dispatch_command(commands.FIT_WINDOW),
+            "viewer_zoom_in": lambda: self.dispatch_command(commands.ZOOM_IN),
+            "viewer_zoom_out": lambda: self.dispatch_command(commands.ZOOM_OUT),
+            "viewer_toggle_magnifier": self.toggle_magnifier,
+            "viewer_toggle_bookmark": self.toggle_current_bookmark,
+            "viewer_cancel_temporary": self._handle_escape,
+            "viewer_slideshow_toggle": self.toggle_slideshow,
+            "viewer_slideshow_interval": lambda: self.set_slideshow_interval_dialog(start=True),
+        }
+        # Navigation keeps its press/repeat/release path in eventFilter.
+        for action_id, handler in handlers.items():
+            if action_id in action_map:
+                continue
+            values = self.shortcut_bindings.get(action_id, [])
+            for value in values:
+                if action_id == "viewer_slideshow_toggle" and value == "S" and self.viewer_slideshow_chord_enabled:
+                    continue
+                if action_id == "viewer_slideshow_interval" and value == "Shift+S" and self.viewer_slideshow_chord_enabled:
+                    continue
+                shortcut = QShortcut(QKeySequence(value), self)
+                shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+                shortcut.activated.connect(handler)
+                self._viewer_dynamic_shortcuts.append(shortcut)
 
     def _restore_window_state(self) -> None:
         geometry_text = self.settings.get("window_geometry", "")
@@ -1361,6 +1467,16 @@ class ViewerWindow(QMainWindow):
         fullscreen_policy_changed = False
         normal_resampling_changed = False
         magnifier_resampling_changed = False
+        shortcut_bindings_changed = "shortcut_bindings" in changed
+        if shortcut_bindings_changed:
+            self.shortcut_bindings = normalize_shortcut_bindings(
+                changed["shortcut_bindings"]
+            ).get("viewer", {})
+        if "viewer_slideshow_chord_enabled" in changed:
+            self.viewer_slideshow_chord_enabled = bool(
+                changed["viewer_slideshow_chord_enabled"]
+            )
+            shortcut_bindings_changed = True
         if "viewer_close_shortcut" in changed:
             self.viewer_close_shortcut = normalize_viewer_close_shortcut(
                 changed["viewer_close_shortcut"]
@@ -1371,6 +1487,18 @@ class ViewerWindow(QMainWindow):
             self._viewer_close_key_combined = sequence_combined(
                 self._viewer_close_key_sequence
             )
+        if shortcut_bindings_changed:
+            close_values = self.shortcut_bindings.get("viewer_close", [])
+            self.viewer_close_shortcut = close_values[0] if close_values else ""
+            self._viewer_close_key_sequence = QKeySequence(self.viewer_close_shortcut)
+            self._viewer_close_key_combined = sequence_combined(
+                self._viewer_close_key_sequence
+            )
+            self._viewer_close_key_combinations = {
+                sequence_combined(QKeySequence(value)) for value in close_values
+            }
+            self.slideshow_keys.reset()
+            self._rebuild_viewer_shortcuts()
         if "viewer_downscale_algorithm" in changed:
             self.viewer_downscale_algorithm = normalize_downscale_algorithm(
                 changed["viewer_downscale_algorithm"]
@@ -5740,10 +5868,22 @@ class ViewerWindow(QMainWindow):
                 QEvent.Type.KeyPress,
             }
             or not isinstance(event, QKeyEvent)
-            or self._viewer_close_key_sequence.isEmpty()
-            or not self._viewer_close_key_is_eligible(watched)
-            or key_event_combined(event) != self._viewer_close_key_combined
+            or not self._viewer_close_key_combinations
+            or key_event_combined(event) not in self._viewer_close_key_combinations
+            or not isinstance(watched, QWidget)
+            or watched.window() is not self
         ):
+            return False
+        # The close QAction carries both aliases for menu discoverability. If
+        # an editor owns the focus, consume only ShortcutOverride so that the
+        # QAction cannot bypass the editor-safety rule while the native
+        # KeyPress still reaches the editor.
+        if not self._viewer_close_key_is_eligible(watched):
+            if event.type() == QEvent.Type.ShortcutOverride:
+                event.accept()
+                return True
+            # Let the editor receive its native KeyPress (Ctrl+A, Backspace,
+            # printable input, copy/paste, and similar editing commands).
             return False
         event.accept()
         if event.type() == QEvent.Type.KeyPress and not event.isAutoRepeat():
@@ -5816,30 +5956,29 @@ class ViewerWindow(QMainWindow):
             return
         super().dragEnterEvent(event)
 
+    @staticmethod
+    def _event_sequence_text(event: QKeyEvent) -> str:
+        combined = int(event.key()) | int(event.modifiers().value)
+        return canonical_key(QKeySequence(combined))
+
     def _navigation_key_action(
         self,
         event: QKeyEvent,
     ) -> Callable[[NavigationInputKind], None] | None:
-        modifiers = event.modifiers()
-        key = event.key()
-        if modifiers == Qt.KeyboardModifier.NoModifier:
-            if key in {Qt.Key.Key_Space, Qt.Key.Key_PageDown}:
-                return lambda kind: self.next_page_or_scroll(input_kind=kind)
-            if key in {Qt.Key.Key_Backspace, Qt.Key.Key_PageUp}:
-                return lambda kind: self.previous_page_or_scroll(input_kind=kind)
-            if key == Qt.Key.Key_Right:
-                return lambda kind: self.next_page(input_kind=kind)
-            if key == Qt.Key.Key_Left:
-                return lambda kind: self.previous_page(input_kind=kind)
-            if key == Qt.Key.Key_Home:
-                return lambda kind: self.first_page(input_kind=kind)
-            if key == Qt.Key.Key_End:
-                return lambda kind: self.last_page(input_kind=kind)
-        if modifiers == Qt.KeyboardModifier.ShiftModifier:
-            if key == Qt.Key.Key_Right:
-                return lambda kind: self.next_one_page(input_kind=kind)
-            if key == Qt.Key.Key_Left:
-                return lambda kind: self.previous_one_page(input_kind=kind)
+        sequence = self._event_sequence_text(event)
+        actions: tuple[tuple[str, Callable[[NavigationInputKind], None]], ...] = (
+            ("viewer_next_page_or_scroll", lambda kind: self.next_page_or_scroll(input_kind=kind)),
+            ("viewer_previous_page_or_scroll", lambda kind: self.previous_page_or_scroll(input_kind=kind)),
+            ("viewer_next_page", lambda kind: self.next_page(input_kind=kind)),
+            ("viewer_previous_page", lambda kind: self.previous_page(input_kind=kind)),
+            ("viewer_first_page", lambda kind: self.first_page(input_kind=kind)),
+            ("viewer_last_page", lambda kind: self.last_page(input_kind=kind)),
+            ("viewer_next_single_page", lambda kind: self.next_one_page(input_kind=kind)),
+            ("viewer_previous_single_page", lambda kind: self.previous_one_page(input_kind=kind)),
+        )
+        for action_id, callback in actions:
+            if self._shortcut_has(action_id, sequence):
+                return callback
         return None
 
     def _handle_navigation_key_event(self, event: QKeyEvent) -> bool:
@@ -5900,8 +6039,38 @@ class ViewerWindow(QMainWindow):
         event.accept()
         return True
 
+    def _handle_rotation_key_event(self, watched: object, event: QKeyEvent) -> bool:
+        """Route modified arrows before menu shortcuts, with editor safety."""
+
+        if event.type() not in {
+            QEvent.Type.ShortcutOverride,
+            QEvent.Type.KeyPress,
+        } or not isinstance(watched, QWidget) or watched.window() is not self:
+            return False
+        sequence = self._event_sequence_text(event)
+        if self._shortcut_has("viewer_rotate_left", sequence):
+            callback = self.rotate_left
+        elif self._shortcut_has("viewer_rotate_right", sequence):
+            callback = self.rotate_right
+        else:
+            return False
+        if not self._viewer_close_key_is_eligible(watched):
+            if event.type() == QEvent.Type.ShortcutOverride:
+                event.accept()
+                return True
+            return False
+        event.accept()
+        if event.type() == QEvent.Type.KeyPress:
+            callback()
+        return True
+
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
         if self._handle_viewer_close_key_event(watched, event):
+            return True
+        if (
+            isinstance(event, QKeyEvent)
+            and self._handle_rotation_key_event(watched, event)
+        ):
             return True
         if watched is getattr(self, "_page_list_viewport", None):
             if event.type() in {
@@ -6576,7 +6745,10 @@ class ViewerWindow(QMainWindow):
         self._sync_actions()
 
     def set_slideshow_interval(self, seconds: float) -> None:
-        self.slideshow_interval_ms = min(60000, max(500, round(seconds * 1000)))
+        self.slideshow_interval_ms = min(
+            SLIDESHOW_INTERVAL_MAX_MS,
+            max(SLIDESHOW_INTERVAL_MIN_MS, round(seconds * 1000)),
+        )
         self._update_shared_setting("slideshow_interval_ms", self.slideshow_interval_ms)
         self.slideshow_timer.setInterval(self.slideshow_interval_ms)
         self._sync_actions()
@@ -6601,8 +6773,8 @@ class ViewerWindow(QMainWindow):
             tr('スライドショー間隔'),
             tr('秒数:'),
             self.slideshow_interval_ms / 1000,
-            0.5,
-            60.0,
+            SLIDESHOW_INTERVAL_MIN_MS / 1000,
+            SLIDESHOW_INTERVAL_MAX_MS / 1000,
             1,
         )
         if not accepted:

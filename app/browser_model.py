@@ -197,6 +197,17 @@ class BrowserItemModel(QAbstractListModel):
         self._image_dimensions: dict[str, tuple[int, int]] = {}
         self._fallback_icons: dict[BrowserItemKind, QIcon] = {}
         self._row_by_key: dict[str, int] = {}
+        self._filter_restore_limit = 0
+        self._unfiltered_view: tuple[list[BrowserItem], dict[str, int]] | None = None
+
+    def configure_filter_restore_cache(self, *, enabled: bool, max_entries: int) -> None:
+        """Keep at most one current-folder view, sharing immutable items."""
+        self._filter_restore_limit = max(0, int(max_entries)) if enabled else 0
+        if (
+            self._unfiltered_view is not None
+            and len(self._unfiltered_view[0]) > self._filter_restore_limit
+        ) or not enabled:
+            self._unfiltered_view = None
 
     @property
     def items(self) -> tuple[BrowserItem, ...]:
@@ -414,6 +425,7 @@ class BrowserItemModel(QAbstractListModel):
             addition_keys.append(key)
         if not additions:
             return 0
+        self._unfiltered_view = None
         self._source_items.extend(additions)
         visible_pairs = [
             (item, key)
@@ -432,6 +444,7 @@ class BrowserItemModel(QAbstractListModel):
         return len(additions)
 
     def begin_directory_scan(self, *, generation: int) -> None:
+        self._unfiltered_view = None
         self.beginResetModel()
         self._source_items = []
         self._source_positions.clear()
@@ -521,10 +534,28 @@ class BrowserItemModel(QAbstractListModel):
         )
         if normalized == self._filter_state:
             return False
+        empty = BrowserFilterState.normalized()
+        if (
+            self._filter_state == empty
+            and self._scan_generation is None
+            and 0 < len(self._items) <= self._filter_restore_limit
+        ):
+            self._unfiltered_view = (self._items, self._row_by_key)
         self.beginResetModel()
         self._filter_state = normalized
-        self._items = list(self.visible_items(self._source_items))
-        self._rebuild_row_index()
+        if normalized == empty and self._unfiltered_view is not None:
+            self._items, self._row_by_key = self._unfiltered_view
+            self._unfiltered_view = None
+        elif self._unfiltered_view is not None:
+            # Only filter transitions may reuse this view. Mutations/sort changes
+            # use visible_items and invalidate it, so they cannot read stale rows.
+            self._items = [
+                item for item in self._unfiltered_view[0] if normalized.matches(item)
+            ]
+            self._rebuild_row_index(invalidate_filter_cache=False)
+        else:
+            self._items = list(self.visible_items(self._source_items))
+            self._rebuild_row_index(invalidate_filter_cache=False)
         self.endResetModel()
         return True
 
@@ -712,6 +743,13 @@ class BrowserItemModel(QAbstractListModel):
                 page_count=normalized,
             )
             changed = True
+            # Counts do not affect filtering or sorting. Patch the retained row
+            # directly instead of dropping a large view on every thumbnail hit.
+            if self._unfiltered_view is not None:
+                saved_items, saved_rows = self._unfiltered_view
+                saved_row = saved_rows.get(key)
+                if saved_row is not None:
+                    saved_items[saved_row] = self._source_items[position]
         row = self._row_by_key.get(key, -1)
         if row >= 0 and self._items[row].page_count != normalized:
             self._items[row] = replace(
@@ -866,7 +904,9 @@ class BrowserItemModel(QAbstractListModel):
     def row_for_path(self, path: str | Path) -> int:
         return self._row_by_key.get(self._key(Path(path)), -1)
 
-    def _rebuild_row_index(self) -> None:
+    def _rebuild_row_index(self, *, invalidate_filter_cache: bool = True) -> None:
+        if invalidate_filter_cache:
+            self._unfiltered_view = None
         self._row_by_key = {
             self._key(item.path): row for row, item in enumerate(self._items)
         }

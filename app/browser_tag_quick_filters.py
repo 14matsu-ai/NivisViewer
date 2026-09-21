@@ -20,6 +20,36 @@ from .browser_tags import normalize_tag_registry
 from .i18n import tr
 
 
+class TagFilterMenuButton(QToolButton):
+    """Return from an InstantPopup without a delayed focus-stealing timer."""
+
+    def _finish_popup(self) -> None:
+        application = QApplication.instance()
+        if application.activeModalWidget() or application.activePopupWidget():
+            return
+        window = self.window()
+        active = application.activeWindow()
+        focus = application.focusWidget()
+        menu = self.menu()
+        if active is not None and active is not window and active is not menu:
+            return
+        if focus is not None and focus is not self and focus is not menu:
+            return
+        if self.isVisible():
+            window.activateWindow()
+            self.setFocus(Qt.FocusReason.PopupFocusReason)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        # InstantPopup runs its menu event loop in the base implementation.
+        # Restore only after it returns, when popup teardown has completed.
+        super().mousePressEvent(event)
+        self._finish_popup()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        super().keyPressEvent(event)
+        self._finish_popup()
+
+
 class _TagQuickFilterButton(QToolButton):
     activated = Signal(str, object, object)
 
@@ -99,10 +129,11 @@ class BrowserTagQuickFilterStrip(QWidget):
         self._layout = QHBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(2)
-        self._overflow = QToolButton(self)
+        self._overflow = TagFilterMenuButton(self)
         self._overflow.setText("…")
         self._overflow.setToolTip(tr("登録タグをすべて表示"))
         self._overflow.setAutoRaise(True)
+        self._overflow.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._overflow.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._overflow.setSizePolicy(
             QSizePolicy.Policy.Maximum,
@@ -200,13 +231,13 @@ class BrowserTagQuickFilterStrip(QWidget):
         hidden = names[len(visible):]
         if hidden and not visible and available < overflow_width:
             visible = []
-        for button in self._buttons.values():
-            button.hide()
+        # Hiding a focused button transfers focus, even if it is shown again
+        # immediately. Only change visibility for entries that actually move.
+        focused = QApplication.focusWidget()
+        for name, button in self._buttons.items():
+            button.setVisible(name in visible)
         while self._layout.count():
-            item = self._layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None and widget is not self._overflow:
-                widget.hide()
+            self._layout.takeAt(0)
         if hidden:
             self._overflow.show()
         else:
@@ -217,6 +248,9 @@ class BrowserTagQuickFilterStrip(QWidget):
             button.show()
         if hidden:
             self._layout.addWidget(self._overflow)
+        if focused in self._buttons.values() and not focused.isVisible():
+            if self._overflow.isVisible():
+                self._overflow.setFocus(Qt.FocusReason.OtherFocusReason)
         self._sync_overflow_menu(hidden)
 
     def _sync_buttons(self) -> None:
@@ -254,13 +288,24 @@ class BrowserTagQuickFilterStrip(QWidget):
         if hidden is None:
             hidden = self._registry_names_not_visible()
         hidden_names = tuple(hidden)
-        self._overflow_menu.clear()
+        actions = {action.data(): action for action in self._overflow_menu.actions()}
+        for name, action in tuple(actions.items()):
+            if name not in hidden_names:
+                self._overflow_menu.removeAction(action)
+                action.deleteLater()
+                del actions[name]
         include = set(self._state.include_tags)
         exclude = set(self._state.exclude_tags)
         entries = {entry["name"]: entry for entry in self._registry}
         for name in hidden_names:
-            action = self._overflow_menu.addAction(name.replace("&", "&&"))
-            action.setCheckable(True)
+            action = actions.get(name)
+            if action is None:
+                action = self._overflow_menu.addAction(name.replace("&", "&&"))
+                action.setData(name)
+                action.setCheckable(True)
+                action.triggered.connect(
+                    lambda _checked=False, tag=name: self._activate_overflow_tag(tag)
+                )
             action.setChecked(name in include)
             entry = entries[name]
             pixmap = QPixmap(10, 10)
@@ -271,9 +316,14 @@ class BrowserTagQuickFilterStrip(QWidget):
                 if name in exclude
                 else tr("クリックでタグ絞り込み: {p0}", p0=name)
             )
-            action.triggered.connect(
-                lambda _checked=False, tag=name: self._activate_overflow_tag(tag)
-            )
+        # Registry order can change independently of membership.
+        if tuple(action.data() for action in self._overflow_menu.actions()) != hidden_names:
+            ordered = {action.data(): action for action in self._overflow_menu.actions()}
+            before = None
+            for name in reversed(hidden_names):
+                action = ordered[name]
+                self._overflow_menu.insertAction(before, action)
+                before = action
 
     def _activate_overflow_tag(self, name: str) -> None:
         self.activated.emit(

@@ -2,10 +2,10 @@ import pytest
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QKeyEvent, QShortcut
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QMessageBox, QPushButton
+from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QPushButton, QTextBrowser
 
 from app.config_manager import ConfigManager
-from app.i18n import install_ui_language
+from app.i18n import install_ui_language, tr
 from app.viewer_window import ViewerWindow
 
 
@@ -106,15 +106,25 @@ def test_modal_non_text_focus_blocks_parent_shortcut(window, qapp):
         dialog.close()
 
 
-@pytest.mark.parametrize('language,expected', [('ja', 'Shift+R: 左綴じ / 右綴じ切替'),
-                                              ('en', 'Shift+R: Toggle left / right binding')])
-def test_help_matches_new_chord(window, monkeypatch, language, expected):
+@pytest.mark.parametrize('language', ['ja', 'en'])
+def test_help_matches_new_chord(window, monkeypatch, language):
     captured = []
-    monkeypatch.setattr(QMessageBox, 'information', lambda *args: captured.append(args[2]))
+
+    def capture_help(dialog):
+        captured.append(dialog.findChild(QTextBrowser).toPlainText())
+        dialog.reject()
+        return 0
+
+    monkeypatch.setattr(QDialog, 'exec', capture_help)
     install_ui_language(language)
     try:
         window.show_shortcuts_help()
-        assert expected in captured[0].splitlines()
-        assert not any(line.startswith('R:') for line in captured[0].splitlines())
+        lines = captured[0].splitlines()
+        assert any(
+            line.startswith(f'{tr("読み方向切替")}:')
+            and 'Shift+R' in line
+            for line in lines
+        )
+        assert not any(line.startswith('R:') for line in lines)
     finally:
         install_ui_language('ja')
