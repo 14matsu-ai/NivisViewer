@@ -19,12 +19,40 @@ from app.browser_scanner import (
     scan_entry_from_dir_entry,
 )
 from app.browser_sort import BrowserSortKey, BrowserSortOrder, BrowserSortPolicy
+from app.browser_visibility import BrowserVisibilityPolicy
+from app.zippla_filename_metadata import ZipPlaFilenameMetadata
 
 
 def write_image(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with Image.new("RGB", (8, 12), "white") as image:
         image.save(path)
+
+
+def test_scan_hot_path_preserves_filename_metadata_and_suffix(tmp_path: Path) -> None:
+    names = (
+        "日本語 {zpi$r=4;t=猫,青}.JPG",
+        "plain..jpg",
+        ".hidden.txt",
+        "book.CBZ",
+    )
+    for name in names:
+        (tmp_path / name).write_bytes(b"x")
+    policy = BrowserVisibilityPolicy()
+    with os.scandir(tmp_path) as entries:
+        scanned = {
+            entry.name: scan_entry_from_dir_entry(entry, policy)
+            for entry in entries
+        }
+    for name in names:
+        item = scanned[name]
+        assert item is not None
+        path = tmp_path / name
+        metadata = ZipPlaFilenameMetadata.parse(path)
+        assert item.path == str(path.absolute())
+        assert item.display_name == metadata.display_name
+        assert item.rating == metadata.rating
+        assert item.extension == path.suffix.casefold()
 
 
 def test_scanner_emits_batches_with_generation_and_supported_kinds(
