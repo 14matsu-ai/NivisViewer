@@ -1,36 +1,52 @@
-# Japanese / English UI language and Settings gear
+# Japanese / English / Chinese UI language and Settings gear
 
 ## User contract
 
 Open **設定 → 一般 → 表示言語 / Language** (English:
 **Settings → General → 表示言語 / Language**). The language caption is always
 bilingual, independent of the current UI language.
-The only choices are `日本語` and `English`. Japanese remains the default;
-missing, unsupported, and malformed saved values fall back to Japanese.
+The choices are `日本語`, `English`, `简体中文`, and `繁體中文`. Japanese
+remains the default for an existing profile whose language key is absent;
+unsupported and malformed saved values fall back to Japanese.
 
-The existing `ConfigManager` persists `ui_language` as `ja` or `en`. Apply and
-OK save through the existing Settings path; Cancel discards unapplied edits
-and does not undo an earlier Apply. A note beside the control explains that
-the change takes effect after restarting NivisViewer. Saving the setting does
-not partially switch already-open windows or asynchronous messages.
+On a truly new profile, NivisViewer reads the current Windows user's display
+language once through `GetUserDefaultUILanguage`: Japanese selects `ja`,
+Simplified Chinese selects `zh-Hans`, Traditional Chinese selects `zh-Hant`,
+and all other or unavailable languages select English. This is the display
+language API, not the regional/date-format locale. The selected value is
+persisted through the normal profile save path. Aliases such as `zh-CN`,
+`zh-TW`, `zh-Hans`, and `zh-Hant` normalize to the stable identifiers.
 
-English covers app-owned Browser/Viewer menus, late-created context menus,
-Settings labels/options/help, dialogs, status strings, and error messages.
-Filenames, paths, user bookmark names, search queries/MRU, history values,
-internal IDs, and file-operation clipboard payloads are not translated.
+The existing `ConfigManager` persists `ui_language` as `ja`, `en`, `zh-Hans`,
+or `zh-Hant`. Apply and OK save through the existing Settings path; Cancel
+discards unapplied edits and does not undo an earlier Apply. A note beside the
+control explains that the change takes effect after restarting NivisViewer.
+Saving the setting does not partially switch already-open windows or
+asynchronous messages.
+
+English and Chinese cover app-owned Browser/Viewer menus, late-created context
+menus, Settings labels/options/help, dialogs, status strings, and error
+messages. Filenames, paths, user bookmark names, search queries/MRU, history
+values, internal IDs, and file-operation clipboard payloads are not translated.
 Generated file/folder names also retain their existing naming behavior.
 Operating-system dialogs, Shell content, and external backend error details
-remain controlled by their original provider. This does not promise that
-every Windows-owned surface follows the application language.
+remain controlled by their original provider. This does not promise that every
+Windows-owned surface follows the application language.
 
 ## Translation authority
 
 `app/i18n.py` installs one application-owned `QTranslator` at controller
 startup, immediately after loading configuration and before constructing
 windows. Explicit `tr()` calls use the `NivisViewer` Qt translation context.
-Japanese source strings are paired with English in `app/translations_en.py`.
-No runtime widget-tree replacement, translated-text action dispatch, second
-configuration store, or dependency was added.
+Japanese source strings are paired with English in `app/translations_en.py` and
+with explicit Simplified/Traditional Chinese entries in
+`app/translations_zh_part1.py` through `app/translations_zh_part4.py`.
+`app/translations_zh.py` combines the four reviewed catalogs and rejects
+missing, extra, or duplicate source keys at import. New app-owned strings
+therefore require an explicit translation; no phrase substitution or kana
+stripping generates Chinese labels. No runtime
+widget-tree replacement, translated-text action dispatch, second configuration
+store, or dependency was added.
 
 Format dynamic values after translation:
 
@@ -41,8 +57,8 @@ tr("{count} 個の項目", count=count)
 Use a named argument for each value and preserve its formatting specification
 in the catalog. User text containing braces is an argument, never a format
 template. Existing shared option catalogs are translated when consumed by UI,
-not at module import; their persisted IDs and ordering are unchanged.
-Use `disambiguation` when one Japanese source has different meanings, such as
+not at module import; their persisted IDs and ordering are unchanged. Use
+`disambiguation` when one Japanese source has different meanings, such as
 navigation `移動` (Go) versus file-operation `移動` (Move), or the resampling
 headings `縮小` / `拡大` (Downscaling / Upscaling).
 
@@ -53,9 +69,10 @@ initialized process language when settings are applied or another controller
 is constructed. The explicit install helper also supports isolated tests.
 
 English captions were measured in the existing 620 × 680 logical-pixel Settings
-window. A few long captions were shortened; English forms allow long rows to
-wrap. Japanese layout and fonts are unchanged. The General tab is appended to
-the existing tab order rather than moving or duplicating earlier settings.
+window. Chinese labels were checked at the same logical size across all tabs;
+the controls use the existing word-wrapping and scroll layouts. Japanese layout
+and fonts are unchanged. The General tab is appended to the existing tab order
+rather than moving or duplicating earlier settings.
 
 ## Gear icon
 
@@ -81,8 +98,8 @@ The proxy owns its own base style, not the application's style object.
 
 New implementation and tests:
 
-- `app/i18n.py`, `app/translations_en.py`, `app/menu_icons.py`
-- `tests/test_ui_language.py`, this document
+- `app/i18n.py`, `app/translations_en.py`, `app/translations_zh.py`, `app/menu_icons.py`
+- `tests/test_ui_language.py`, `tests/test_ui_language_chinese.py`, this document
 
 Startup, config, and primary UI integration:
 
@@ -142,10 +159,10 @@ forward 1.051 ms, reverse 0.992 ms, reversal 1.313 ms, ping-pong median 0.959 ms
 rapid-final 1.630 ms; cold immediate target 63.422 ms. These are one synthetic
 regression run, not a native compositor measurement or performance claim.
 
-No real application launch, native input, external GUI, private-image inspection,
-portable rebuild, commit, push, or destructive Git command was performed.
-Native Windows theme rendering, dialogs, and external clipboard interoperability
-remain unverified by these offscreen tests.
+No real application launch, native input, external GUI, private-image
+inspection, portable rebuild, commit, push, or destructive Git command was
+performed. Native Windows theme rendering, dialogs, and external clipboard
+interoperability remain unverified by these offscreen tests.
 
 ### Small visual follow-up
 
@@ -166,3 +183,15 @@ processes. They compare new versus old raster alpha bounds, verify centering,
 light/dark contrast, compact/noncompact menu text and width, unchanged plain
 menu sizing and Browser chrome height, the exact bilingual caption, and existing
 language Apply/OK/Cancel/restart behavior. Syntax and diff checks passed.
+
+## Chinese localization follow-up (2026-09-21)
+
+The Chinese catalogs contain the full 1,013-entry English inventory with named
+format fields and line breaks preserved. Synthetic tests cover fresh profiles, pre-existing
+profiles missing `ui_language`, explicit language persistence, all supported
+Windows language IDs, two Chinese settings layouts, and every Settings tab's
+button size at 620 × 680 offscreen. Browser/Settings regression groups passed **134 cases**, and the
+Viewer/shortcut group passed **107 cases**. The full suite reached unrelated
+Windows file-lock tests before native Shell/PDF worker termination, so it was
+not used as the localization pass criterion. No real app, external GUI,
+commit, or push was performed.

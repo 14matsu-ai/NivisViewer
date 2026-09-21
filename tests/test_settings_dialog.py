@@ -250,6 +250,7 @@ def test_folder_snapshot_cache_controls_persist_and_disable_cap(
     expected_tooltip = (
         "ファイル数の多いフォルダの再表示を高速化します。\n"
         "前回の一覧をメモリから先に表示し、あとで変更を確認します。\n"
+        "保存した一覧を使い、検索・タグ・レートの絞り込みと解除も高速化します。\n"
         "HDDや大量ファイルのフォルダで特に効果的です。"
     )
     assert dialog.browser_folder_snapshot_cache_checkbox.toolTip() == (

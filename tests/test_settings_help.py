@@ -62,13 +62,15 @@ def test_settings_help_reuses_content_without_applying_draft(
         assert text_edit.isReadOnly()
         html = text_edit.toHtml()
         assert "font-size:14pt" in html.replace(" ", "")
-        assert "font-size:10pt" in html.replace(" ", "")
+        assert "font-size:10pt" not in html.replace(" ", "")
         assert "[Browser]" in html and "[Viewer]" in html
         available = help_dialogs[0].screen().availableGeometry()
         assert help_dialogs[0].width() <= available.width()
         assert help_dialogs[0].height() <= available.height()
         assert '[Browser]' in content
         assert '[Viewer]' in content
+        assert '\n \n[Viewer]' in content
+        assert f"{tr('戻る')}: Alt+Left\n{tr('進む')}: Alt+Right" in content
         for scope_specs in SPECS_BY_SCOPE.values():
             for spec in scope_specs:
                 assert tr(spec.label) in content
