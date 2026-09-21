@@ -5244,7 +5244,9 @@ class BrowserWindow(QMainWindow):
         # turn a direct star click into a spurious failure.
         self._detail_generation += 1
         self._detail_request_identity = None
-        self.image_detail_probe.close()
+        if any(kind in {BrowserItemKind.IMAGE, BrowserItemKind.FOLDER}
+               for _path, kind in existing_items):
+            self.image_detail_probe.close()
         # Folder books retain immutable page identities for their lifetime.
         # Reuse the established safety contract instead of leaving an open
         # Viewer with a stale page path after the metadata rename.
@@ -5265,6 +5267,15 @@ class BrowserWindow(QMainWindow):
             state,
             tag_edit=tag_changes is not None,
         )
+        # A single archive tag edit has no Pillow detail handle to drain.
+        # Publish its successful filename change before a possibly slow
+        # profile-database relocation on rotational storage.
+        quick_archive_tag = (
+            tag_changes is not None
+            and len(existing_items) == 1
+            and existing_items[0][1] is BrowserItemKind.ARCHIVE
+        )
+        pending_metadata_relocation: tuple[str, str] | None = None
         for path, kind in existing_items:
             original_metadata = ZipPlaFilenameMetadata.parse(path)
             metadata = (original_metadata.with_tag_changes(tag_changes) if tag_changes is not None
@@ -5290,7 +5301,9 @@ class BrowserWindow(QMainWindow):
             old_path = str(result.source_path)
             new_path = str(result.destination_path)
             batch.replacements.append((old_path, new_path, result.rating))
-            if self.metadata_store is not None:
+            if quick_archive_tag:
+                pending_metadata_relocation = (old_path, new_path)
+            elif self.metadata_store is not None:
                 self.metadata_store.relocate_item(old_path, new_path)
             self.navigation_history.relocate_tree(old_path, new_path)
 
@@ -5299,7 +5312,16 @@ class BrowserWindow(QMainWindow):
             if self._start_next_folder_rating_rename():
                 return True
             return bool(batch.replacements) and not batch.failures
-        return self._finalize_rating_batch(batch)
+        result = self._finalize_rating_batch(batch)
+        if pending_metadata_relocation is not None and self.metadata_store is not None:
+            new_path = pending_metadata_relocation[1]
+            row = self.item_model.row_for_path(new_path)
+            if row >= 0:
+                rect = self.list_view.visualRect(self.item_model.index(row, 0))
+                if not rect.isEmpty():
+                    self.list_view.viewport().repaint(rect)
+            self.metadata_store.relocate_item(*pending_metadata_relocation)
+        return result
 
     def _start_next_folder_rating_rename(self) -> bool:
         batch = self._rating_batch

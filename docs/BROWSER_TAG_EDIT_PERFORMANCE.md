@@ -53,3 +53,34 @@ view state restoration, while the 100-item batch is dominated by file rename
 and metadata work. Moving those operations to a worker would add cancellation
 and lifetime complexity for little measured gain, so they remain synchronous.
 These synthetic figures do not establish native desktop responsiveness.
+
+## 2026-09-22: single ZIP tag badge on slower storage
+
+The single-archive tag path still performed the successful filename rename,
+profile-database relocation, navigation-history relocation, and only then the
+model update that paints the tag badge. A fresh-process offscreen synthetic
+ZIP trace took about 1.8 ms without injected delay. With separate 50 ms
+delays around the rename and metadata relocation to model slower storage,
+`dataChanged` occurred around 102 ms after the click and the call returned
+around 102 ms. This shows that both synchronous operations can gate the
+badge; it does not identify the relative cost on a particular user's HDD.
+
+For a single archive tag edit, the successful rename now updates the model
+and repaints its visible row before relocating profile metadata. The
+navigation-history path is still updated synchronously. The Pillow image
+detail probe is not drained for archive/PDF edits because it cannot own those
+files; image and folder edits retain that handle-safety wait. The metadata
+relocation still completes before `set_tags_for_paths` returns, preserving
+bookmark/history consistency for subsequent actions. Multi-selection,
+rating edits, and folder operation order remain unchanged.
+
+Under the same injected 50 + 50 ms delays, `dataChanged` moved to about
+51 ms, and a visible offscreen viewport paint occurred around 52 ms, before
+metadata relocation finished and before the call returned around 103 ms.
+The filename rename itself remains synchronous and can still delay the badge
+on a slow or contended drive. An active archive thumbnail/page-count worker
+can temporarily hold a Windows ZIP handle; this change does not claim to
+remove that separate rename-failure condition. The test covers paint before
+metadata migration, retained bookmark relocation, and omission of the
+irrelevant image-probe wait. No ZIP payload is rewritten or decoded on the
+UI thread by this change.
