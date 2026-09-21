@@ -328,6 +328,65 @@ def test_external_modification_updates_metadata_and_only_drops_changed_thumbnail
         qapp.processEvents()
 
 
+def test_tag_rename_watch_reconciles_without_duplicate_reset_and_sees_external_add(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "folder"
+    old = folder / "book.png"
+    write_item(old)
+    window, watcher = make_window(tmp_path, folder, qapp)
+    resets: list[None] = []
+    window.item_model.modelReset.connect(lambda: resets.append(None))
+    generation = window.thumbnail_provider.generation
+    try:
+        assert window.set_rating_for_paths((str(old),), None, tag_changes={"Tagged": True})
+        renamed = folder / "book {zpi$t=Tagged}.png"
+        assert renamed.exists() and window.item_model.row_for_path(renamed) >= 0
+        assert not resets
+        watcher.notify()
+        window._flush_directory_changes()
+        assert window.wait_for_scan()
+        qapp.processEvents()
+        assert not resets
+        assert window.thumbnail_provider.generation == generation
+
+        added = folder / "external.png"
+        write_item(added)
+        watcher.notify()
+        window._flush_directory_changes()
+        assert window.wait_for_scan()
+        qapp.processEvents()
+        assert resets and window.item_model.row_for_path(added) >= 0
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_unchanged_watch_retries_failed_thumbnail_without_model_reset(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "folder"
+    item = folder / "book.png"
+    write_item(item)
+    window, watcher = make_window(tmp_path, folder, qapp)
+    resets: list[None] = []
+    window.item_model.modelReset.connect(lambda: resets.append(None))
+    generation = window.thumbnail_provider.generation
+    window.thumbnail_provider._failed.add((str(item), 0, ()))
+    try:
+        watcher.notify()
+        window._flush_directory_changes()
+        assert window.wait_for_scan()
+        assert not resets
+        assert window.thumbnail_provider.generation == generation + 1
+        assert not window.thumbnail_provider.has_failed_requests
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
 def test_burst_is_coalesced_and_idle_does_not_start_scans(
     tmp_path: Path,
     qapp: QApplication,

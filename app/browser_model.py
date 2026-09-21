@@ -785,26 +785,164 @@ class BrowserItemModel(QAbstractListModel):
             self._key(Path(old)): (Path(new), rating)
             for old, new, rating in replacements
         }
+        if len(replacements) > 1:
+            stable_rows = self._apply_stable_rating_batch(replacement_by_key)
+            if stable_rows is not None:
+                self._relocate_rating_caches(replacements)
+                for row in stable_rows:
+                    index = self.index(row, 0)
+                    self.dataChanged.emit(index, index)
+                return True
+        patched_row: int | None = None
+        if len(replacements) == 1:
+            old, new, rating = replacements[0]
+            old_key = self._key(Path(old))
+            new_key = self._key(Path(new))
+            positions = self._source_positions.get(old_key, ())
+            if len(positions) == 1 and (
+                new_key == old_key or new_key not in self._source_positions
+            ):
+                position = positions[0]
+                old_item = self._source_items[position]
+                new_item = replace(
+                    old_item, path=Path(new),
+                    display_name=zippla_display_name(Path(new)), rating=rating,
+                )
+                row = self._row_by_key.get(old_key)
+                if (
+                    self._filter_state.matches(new_item) == (row is not None)
+                    and self._rename_keeps_order(self._source_items, position, new_item)
+                    and (row is None or self._rename_keeps_order(self._items, row, new_item))
+                ):
+                    self._source_items[position] = new_item
+                    self._source_positions.pop(old_key)
+                    self._source_positions[new_key] = [position]
+                    if row is not None:
+                        self._items[row] = new_item
+                        self._row_by_key.pop(old_key)
+                        self._row_by_key[new_key] = row
+                        patched_row = row
+                    if self._unfiltered_view is not None:
+                        saved_items, saved_rows = self._unfiltered_view
+                        saved_row = saved_rows.pop(old_key, None)
+                        if saved_row is not None:
+                            saved_items[saved_row] = new_item
+                            saved_rows[new_key] = saved_row
+                    replacement_by_key = {}
         changed = False
         new_source: list[BrowserItem] = []
-        for item in self._source_items:
-            replacement_value = replacement_by_key.get(self._key(item.path))
-            if replacement_value is None:
-                new_source.append(item)
-                continue
-            new_path, rating = replacement_value
-            new_source.append(
-                replace(
-                    item,
-                    path=new_path,
-                    display_name=zippla_display_name(new_path),
+        new_visible: list[BrowserItem] | None = None
+        single_reindex: tuple[str, str, int, int, int | None, int | None] | None = None
+        if replacement_by_key and len(replacements) == 1:
+            old, new, rating = replacements[0]
+            old_key = self._key(Path(old))
+            positions = self._source_positions.get(old_key, ())
+            new_key = self._key(Path(new))
+            if len(positions) == 1 and (
+                new_key == old_key or new_key not in self._source_positions
+            ):
+                new_item = replace(
+                    self._source_items[positions[0]],
+                    path=Path(new),
+                    display_name=zippla_display_name(Path(new)),
                     rating=rating,
                 )
-            )
-            changed = True
-        if not changed:
+                new_source = list(self._source_items)
+                new_source.pop(positions[0])
+                new_source_position = self._rename_insertion_index(new_source, new_item)
+                new_source.insert(new_source_position, new_item)
+                new_visible = list(self._items)
+                row = self._row_by_key.get(old_key)
+                if row is not None:
+                    new_visible.pop(row)
+                new_row = None
+                if self._filter_state.matches(new_item):
+                    new_row = self._rename_insertion_index(new_visible, new_item)
+                    new_visible.insert(new_row, new_item)
+                single_reindex = (
+                    old_key, self._key(Path(new)), positions[0],
+                    new_source_position, row, new_row,
+                )
+                changed = True
+        if replacement_by_key and not changed:
+            for item in self._source_items:
+                replacement_value = replacement_by_key.get(self._key(item.path))
+                if replacement_value is None:
+                    new_source.append(item)
+                    continue
+                new_path, rating = replacement_value
+                new_source.append(
+                    replace(
+                        item,
+                        path=new_path,
+                        display_name=zippla_display_name(new_path),
+                        rating=rating,
+                    )
+                )
+                changed = True
+            if changed:
+                new_source = self._sort_policy.sorted_items(new_source)
+                new_visible = [
+                    item for item in new_source if self._filter_state.matches(item)
+                ]
+        if not changed and replacement_by_key:
             return False
 
+        self._relocate_rating_caches(replacements)
+
+        if not replacement_by_key:
+            if patched_row is not None:
+                index = self.index(patched_row, 0)
+                self.dataChanged.emit(index, index)
+            return True
+
+        # A rating edit can both reorder rows and add/remove a row from the
+        # active predicate result.  Publish one reset rather than claiming a
+        # layout-only change while the row count changes.  Path-keyed image
+        # artifacts above remain intact across this visible-list reset.
+        self.beginResetModel()
+        self._source_items = new_source
+        self._items = new_visible if new_visible is not None else list(self.visible_items(new_source))
+        if single_reindex is None:
+            self._rebuild_source_index()
+            self._rebuild_row_index()
+        else:
+            old_key, new_key, old_source, new_source_row, old_row, new_row = single_reindex
+            self._source_positions = self._renamed_index_positions(
+                self._source_positions, old_key, new_key, old_source,
+                new_source_row, source=True,
+            )
+            self._row_by_key = self._renamed_index_positions(
+                self._row_by_key, old_key, new_key, old_row, new_row,
+                source=False,
+            )
+            self._unfiltered_view = None
+        self.endResetModel()
+        return True
+
+    @staticmethod
+    def _renamed_index_positions(
+        index: dict, old_key: str, new_key: str,
+        old_position: int | None, new_position: int | None,
+        *, source: bool,
+    ) -> dict:
+        shifted = {}
+        for key, value in index.items():
+            if key == old_key:
+                continue
+            position = value[0] if source else value
+            if old_position is not None and position > old_position:
+                position -= 1
+            if new_position is not None and position >= new_position:
+                position += 1
+            shifted[key] = [position] if source else position
+        if new_position is not None:
+            shifted[new_key] = [new_position] if source else new_position
+        return shifted
+
+    def _relocate_rating_caches(
+        self, replacements: tuple[tuple[str | Path, str | Path, int | None], ...],
+    ) -> None:
         for old, new, _rating in replacements:
             old_key = self._key(Path(old))
             new_key = self._key(Path(new))
@@ -824,17 +962,80 @@ class BrowserItemModel(QAbstractListModel):
                     for key in self._cut_keys
                 )
 
-        # A rating edit can both reorder rows and add/remove a row from the
-        # active predicate result.  Publish one reset rather than claiming a
-        # layout-only change while the row count changes.  Path-keyed image
-        # artifacts above remain intact across this visible-list reset.
-        self.beginResetModel()
-        self._source_items = new_source
-        self._rebuild_source_index()
-        self._items = list(self.visible_items(new_source))
-        self._rebuild_row_index()
-        self.endResetModel()
-        return True
+    def _apply_stable_rating_batch(
+        self, replacement_by_key: dict[str, tuple[Path, int | None]],
+    ) -> list[int] | None:
+        updates: dict[str, BrowserItem] = {}
+        for old_key, (new_path, rating) in replacement_by_key.items():
+            positions = self._source_positions.get(old_key, ())
+            new_key = self._key(new_path)
+            if len(positions) != 1 or (new_key != old_key and new_key in self._source_positions):
+                return None
+            updates[old_key] = replace(
+                self._source_items[positions[0]], path=new_path,
+                display_name=zippla_display_name(new_path), rating=rating,
+            )
+        if len({self._key(item.path) for item in updates.values()}) != len(updates):
+            return None
+
+        def updated(item: BrowserItem) -> BrowserItem:
+            return updates.get(self._key(item.path), item)
+
+        for old_key, item in updates.items():
+            position = self._source_positions[old_key][0]
+            neighbors = [updated(value) for value in self._source_items[
+                max(0, position - 1):position + 2
+            ]]
+            if self._sort_policy.sorted_items(neighbors) != neighbors:
+                return None
+            row = self._row_by_key.get(old_key)
+            if self._filter_state.matches(item) != (row is not None):
+                return None
+            if row is not None:
+                neighbors = [updated(value) for value in self._items[
+                    max(0, row - 1):row + 2
+                ]]
+                if self._sort_policy.sorted_items(neighbors) != neighbors:
+                    return None
+
+        changed_rows: list[int] = []
+        for old_key, item in updates.items():
+            position = self._source_positions.pop(old_key)[0]
+            new_key = self._key(item.path)
+            self._source_items[position] = item
+            self._source_positions[new_key] = [position]
+            row = self._row_by_key.pop(old_key, None)
+            if row is not None:
+                self._items[row] = item
+                self._row_by_key[new_key] = row
+                changed_rows.append(row)
+            if self._unfiltered_view is not None:
+                saved_items, saved_rows = self._unfiltered_view
+                saved_row = saved_rows.pop(old_key, None)
+                if saved_row is not None:
+                    saved_items[saved_row] = item
+                    saved_rows[new_key] = saved_row
+        return changed_rows
+
+    def _rename_keeps_order(
+        self, items: list[BrowserItem], position: int, replacement: BrowserItem,
+    ) -> bool:
+        neighbors = list(items[max(0, position - 1):position])
+        neighbors.append(replacement)
+        neighbors.extend(items[position + 1:position + 2])
+        return self._sort_policy.sorted_items(neighbors) == neighbors
+
+    def _rename_insertion_index(
+        self, items: list[BrowserItem], item: BrowserItem,
+    ) -> int:
+        low, high = 0, len(items)
+        while low < high:
+            middle = (low + high) // 2
+            if self._sort_policy.sorted_items((items[middle], item))[0] is items[middle]:
+                low = middle + 1
+            else:
+                high = middle
+        return low
 
     @staticmethod
     def _move_cache_key(cache: dict, old_key: str, new_key: str) -> None:

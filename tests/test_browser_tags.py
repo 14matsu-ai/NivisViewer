@@ -4,7 +4,8 @@ from unittest.mock import Mock
 import pytest
 from PySide6.QtCore import Qt, QRect, QItemSelectionModel
 from PySide6.QtGui import QImage, QPainter, QColor
-from PySide6.QtWidgets import QDialog, QStyleOptionViewItem, QMessageBox
+from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QStyleOptionViewItem, QMessageBox
+from PySide6.QtTest import QTest
 
 from app.browser_filter import BrowserFilterState
 from app.browser_model import BrowserItem, BrowserItemKind
@@ -73,6 +74,34 @@ def test_tristate_draft_and_unknown_tags(qapp):
     assert edited_tags(filename_tags(paths[0]), dialog.changes()) == ('未登録', '新')
     dialog.reject()
     assert dialog.result() == QDialog.DialogCode.Rejected
+
+
+def test_item_tags_apply_first_default_enter_and_escape_cancel(qapp):
+    path = 'a {zpi$t=旧}.zip'
+    dialog = ItemTagsDialog((path,), REGISTRY)
+    dialog.show()
+    qapp.processEvents()
+    apply_button = dialog.buttons.button(QDialogButtonBox.StandardButton.Apply)
+    cancel_button = dialog.buttons.button(QDialogButtonBox.StandardButton.Cancel)
+    layout = dialog.buttons.layout()
+    try:
+        assert layout.indexOf(apply_button) < layout.indexOf(cancel_button)
+        assert apply_button.isDefault() and not cancel_button.isDefault()
+        assert QApplication.focusWidget() is apply_button
+        assert dialog.checks['旧'].checkState() == Qt.CheckState.Checked
+        QTest.keyClick(dialog, Qt.Key.Key_Return)
+        assert dialog.result() == QDialog.DialogCode.Accepted
+    finally:
+        dialog.close()
+
+    cancel_dialog = ItemTagsDialog((path,), REGISTRY)
+    cancel_dialog.show()
+    qapp.processEvents()
+    try:
+        QTest.keyClick(cancel_dialog, Qt.Key.Key_Escape)
+        assert cancel_dialog.result() == QDialog.DialogCode.Rejected
+    finally:
+        cancel_dialog.close()
 
 
 def test_registry_rename_delete_reregister_has_no_history(qapp):

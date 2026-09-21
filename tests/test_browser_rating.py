@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -206,6 +207,97 @@ def test_rating_model_relocation_retains_thumbnail_and_dimensions(tmp_path: Path
     assert model.data(index, model.RatingRole) == 4
     assert model.data(index, model.ThumbnailImageRole).cacheKey() == old_cache_key
     assert model.image_dimensions(new) == (4000, 3000)
+
+
+def test_single_tag_rename_keeps_model_and_thumbnail_without_reset(tmp_path: Path) -> None:
+    old = tmp_path / "b.png"
+    new = tmp_path / "b {zpi$t=Tagged}.png"
+    model = BrowserItemModel()
+    model.set_items([_item(tmp_path / name, None) for name in ("a.png", "b.png", "c.png")])
+    image = QImage(8, 8, QImage.Format.Format_ARGB32)
+    image.fill(0xFF336699)
+    model.set_thumbnail_image(old, image)
+    resets: list[None] = []
+    changed: list[None] = []
+    model.modelReset.connect(lambda: resets.append(None))
+    model.dataChanged.connect(lambda *_: changed.append(None))
+
+    assert model.apply_rating_renames(((old, new, None),))
+    assert not resets and len(changed) == 1
+    assert model.row_for_path(new) == 1
+    assert model.row_for_path(old) == -1
+    assert model.data(model.index(1, 0), model.ThumbnailImageRole).cacheKey() == image.cacheKey()
+
+
+def test_tag_rename_that_changes_filter_membership_resets_model(tmp_path: Path) -> None:
+    old = tmp_path / "b.png"
+    new = tmp_path / "b {zpi$t=Tagged}.png"
+    model = BrowserItemModel()
+    model.set_items([_item(old, None)])
+    model.configure_filter(BrowserFilterState.normalized(include_tags=("Tagged",)))
+    resets: list[None] = []
+    model.modelReset.connect(lambda: resets.append(None))
+
+    assert model.apply_rating_renames(((old, new, None),))
+    assert resets and model.row_for_path(new) == 0
+
+
+def test_single_tag_rename_reorders_tied_names_and_updates_indices(tmp_path: Path) -> None:
+    old = tmp_path / "book {zpi$t=A}.png"
+    middle = tmp_path / "book {zpi$t=B}.png"
+    new = tmp_path / "book {zpi$t=Z}.png"
+    model = BrowserItemModel()
+    model.set_items([
+        replace(_item(old, None), display_name="book.png"),
+        replace(_item(middle, None), display_name="book.png"),
+    ])
+
+    assert model.apply_rating_renames(((old, new, None),))
+    assert [item.path for item in model.source_items] == [middle, new]
+    assert [item.path for item in model.items] == [middle, new]
+    assert model.row_for_path(old) == -1
+    assert model.row_for_path(middle) == 0
+    assert model.row_for_path(new) == 1
+    assert model.apply_rating_renames(((new, old, None),))
+    assert [item.path for item in model.source_items] == [old, middle]
+    assert model.row_for_path(old) == 0
+    assert model.row_for_path(middle) == 1
+
+
+def test_stable_multitag_rename_updates_rows_without_model_reset(tmp_path: Path) -> None:
+    old = [tmp_path / f"book-{number:02}.png" for number in range(3)]
+    new = [tmp_path / f"book-{number:02} {{zpi$t=Tagged}}.png" for number in range(3)]
+    model = BrowserItemModel()
+    model.set_items([_item(path, None) for path in old])
+    resets: list[None] = []
+    model.modelReset.connect(lambda: resets.append(None))
+
+    assert model.apply_rating_renames(tuple(
+        (source, destination, None) for source, destination in zip(old, new)
+    ))
+    assert not resets
+    assert [item.path for item in model.items] == new
+    assert all(model.row_for_path(path) == index for index, path in enumerate(new))
+
+
+def test_multitag_rename_with_filter_membership_change_rebuilds_visible_rows(
+    tmp_path: Path,
+) -> None:
+    old = [tmp_path / f"book-{number:02}.png" for number in range(3)]
+    new = [tmp_path / f"book-{number:02} {{zpi$t=Tagged}}.png" for number in range(2)]
+    model = BrowserItemModel()
+    model.set_items([_item(path, None) for path in old])
+    model.configure_filter(BrowserFilterState.normalized(exclude_tags=("Tagged",)))
+    resets: list[None] = []
+    model.modelReset.connect(lambda: resets.append(None))
+
+    assert model.apply_rating_renames(tuple(
+        (source, destination, None) for source, destination in zip(old[:2], new)
+    ))
+    assert resets
+    assert [item.path for item in model.source_items] == [new[0], new[1], old[2]]
+    assert [item.path for item in model.items] == [old[2]]
+    assert all(model.row_for_path(path) == -1 for path in old[:2])
 
 
 def test_rating_hit_test_maps_thumbnail_overlay_to_five_stars(qapp) -> None:
