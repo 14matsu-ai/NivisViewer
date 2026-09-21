@@ -8347,3 +8347,51 @@ in this phase. Detailed comparison of ZipPla, unchanged Nivis, Hybrid and new
 separate maintenance/read designs, limitations and fresh-process results are in
 BROWSER_WARM_STARTUP_INVESTIGATION.md. Further concurrency/structural work waits
 for review; the overall TODO19 issue is not declared universally resolved.
+
+## 2026-09-22 Browser first-thumbnail scan hot path
+
+Reference: `himamon/ZipPlaFork` at fixed revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, AGPL-3.0-or-later,
+`source/ZipPla/CatalogForm.cs`: `bwMakePreviewPrepare_DoWork` and
+`getDirectoryItemsInfo` enumerate and prepare the folder before catalog
+publication; `ThumbViewer.PaintPart` subsequently requests visible rows and
+roughly one row of margin through `ThumbViewerItem.LoadAsync`'s single
+`SemaphoreSlim(1, 1)`. It does not publish the first thumbnail during folder
+enumeration. Its `BackgroundMultiWorker` job is not evidence for parallel
+thumbnail decoding in this path. No ZipPlaFork code or processing structure
+was copied or ported for this change; existing copyright and AGPL notices in
+`licenses/ZipPlaFork/About.txt` and `licenses/ZipPlaFork/AGPL.txt` remain.
+
+NivisViewer's `app/browser_scanner.py`, `scan_directory` prepares the full
+sorted `BrowserItem` list before the model publishes initial rows, then
+`app/browser_window.py` requests bounded visible thumbnails after first paint.
+The unchanged alternative retained repeated `Path` construction for each
+accepted entry. A small Nivis-specific hot-path change in
+`scan_entry_from_dir_entry` now extracts the filename suffix once, parses
+display/rating metadata from the filename rather than its full path, and
+normalizes the resulting scan path with `os.path.abspath`. Hidden/system and
+unsupported policies, metadata fields, sort policy, cancellation/generation
+checks, and thumbnail identity remain on the existing paths. Trailing-dot
+suffix handling matches `Path.suffix`. No worker count or paint ordering
+changed.
+
+Fresh-process Windows offscreen synthetic saved-cache A/B (existing 1k and
+10k mixed-format fixtures, same fixture and profile for each pair; old method
+loaded from `HEAD` into the probe, no app/native input):
+
+| Entries / cache | Old initial model / first ready | New initial model / first ready | Observation |
+| --- | ---: | ---: | --- |
+| 1k / saved | 88.5 / 164.7 ms | 89.3 / 164.3 ms | No material gain. |
+| 1k / new profile | 26.2 / 239.0 ms | 22.8 / 241.2 ms | Thumbnail generation dominates. |
+| 10k / saved | 316.3 / 407.1 ms | 259.6 / 350.6 ms | About 56 ms earlier first saved thumbnail. |
+| 10k / saved, repeated pair | 298.4 / 389.3 ms | 255.7 / 345.0 ms | About 44 ms earlier. |
+| 10k / new profile | 235.0 / 463.6 ms | 177.2 / 409.8 ms | About 54 ms earlier despite generation. |
+
+All saved runs reported disk hits and no regenerated thumbnails. Cold runs used
+temporary profiles and generated 24 thumbnails; they were not cold OS-file-cache
+runs. The 10k effect tracks initial model publication rather than cache work.
+The prior stage trace placed list paint near 341 ms and visible request near
+356 ms, with deferred tree sync about 1.4 ms. Two post-paint zero timers may
+add scheduling delay, but that trace does not establish a safe benefit from
+changing paint/request order; they remain unchanged. These measurements are
+synthetic offscreen timing, not native Windows perceptual validation.

@@ -156,6 +156,9 @@ def scan_entry_from_dir_entry(
         entry_stat = None
     hidden, system = filesystem_visibility_flags(name, attributes)
 
+    suffix = os.path.splitext(name)[1]
+    if suffix == ".":
+        suffix = ""  # pathlib.Path.suffix treats a trailing dot as no extension.
     try:
         if entry.is_dir(follow_symlinks=False):
             item_kind = "folder"
@@ -163,10 +166,10 @@ def scan_entry_from_dir_entry(
             supported = True
             is_directory = True
         elif entry.is_file(follow_symlinks=False):
-            suffix = Path(name).suffix.lower()
-            if suffix in ARCHIVE_EXTENSIONS:
+            normalized_suffix = suffix.lower()
+            if normalized_suffix in ARCHIVE_EXTENSIONS:
                 if (
-                    suffix in EXTERNAL_ARCHIVE_EXTENSIONS
+                    normalized_suffix in EXTERNAL_ARCHIVE_EXTENSIONS
                     and not is_supported_archive_candidate(name)
                 ):
                     item_kind = "other"
@@ -176,19 +179,19 @@ def scan_entry_from_dir_entry(
                     item_kind = "archive"
                     preview_kind = "archive"
                     supported = True
-            elif suffix in SUPPORTED_EXTENSIONS:
+            elif normalized_suffix in SUPPORTED_EXTENSIONS:
                 item_kind = "image"
                 preview_kind = "image"
                 supported = True
-            elif suffix in PDF_EXTENSIONS:
+            elif normalized_suffix in PDF_EXTENSIONS:
                 item_kind = "pdf"
                 preview_kind = "pdf"
                 supported = True
-            elif suffix in _TEXT_PREVIEW_EXTENSIONS:
+            elif normalized_suffix in _TEXT_PREVIEW_EXTENSIONS:
                 item_kind = "other"
                 preview_kind = "text"
                 supported = False
-            elif suffix in _VIDEO_PREVIEW_EXTENSIONS:
+            elif normalized_suffix in _VIDEO_PREVIEW_EXTENSIONS:
                 item_kind = "other"
                 preview_kind = "video"
                 supported = False
@@ -214,9 +217,11 @@ def scan_entry_from_dir_entry(
             entry_stat = entry.stat(follow_symlinks=False)
         except OSError:
             entry_stat = None
-    filename_metadata = ZipPlaFilenameMetadata.parse(entry.path)
+    # Only the filename is needed for display/rating metadata here. Keep the
+    # absolute path once for the scan entry consumed by the model and cache.
+    filename_metadata = ZipPlaFilenameMetadata.parse(name)
     return BrowserScanEntry(
-        path=str(Path(entry.path).absolute()),
+        path=os.path.abspath(entry.path),
         display_name=filename_metadata.display_name,
         item_kind=item_kind,
         modified_time_ns=(
@@ -227,7 +232,7 @@ def scan_entry_from_dir_entry(
             if item_kind == "folder" or entry_stat is None
             else entry_stat.st_size
         ),
-        extension=Path(name).suffix.casefold(),
+        extension=suffix.casefold(),
         hidden=hidden,
         system=system,
         openable_by_nivisviewer=supported,
