@@ -113,6 +113,8 @@ from .browser_item_delegate import (
 )
 from .browser_icon_size import (
     ICON_SIZE_SETTING_SPECS,
+    ICON_POSITION_SETTING_KEYS,
+    normalize_browser_icon_margin,
     normalize_browser_icon_size_custom_percent,
     normalize_browser_icon_size_preset,
 )
@@ -825,6 +827,8 @@ class BrowserWindow(QMainWindow):
         self.browser_wheel_scroll_mode = str(
             self.settings.get("browser_wheel_scroll_mode", "system")
         )
+        for key in ICON_POSITION_SETTING_KEYS:
+            setattr(self, key, normalize_browser_icon_margin(self.settings.get(key, -1)))
         self.browser_wheel_scroll_custom_rows = int(
             self.settings.get("browser_wheel_scroll_custom_rows", 3)
         )
@@ -4028,6 +4032,7 @@ class BrowserWindow(QMainWindow):
 
     def _browser_icon_delegate_options(self) -> dict[str, object]:
         return {
+            **{key.removeprefix("browser_"): getattr(self, key) for key in ICON_POSITION_SETTING_KEYS},
             "center_folder_icon_size": self.browser_center_folder_icon_size,
             "center_folder_icon_custom_percent": self.browser_center_folder_icon_custom_percent,
             "center_file_icon_size": self.browser_center_file_icon_size,
@@ -4063,8 +4068,12 @@ class BrowserWindow(QMainWindow):
             for key in spec[:2]
             if key in changed
         }
+        changed_keys.update(set(ICON_POSITION_SETTING_KEYS).intersection(changed))
         if not changed_keys:
             return
+        for key in ICON_POSITION_SETTING_KEYS:
+            if key in changed:
+                setattr(self, key, normalize_browser_icon_margin(changed[key]))
         for key, custom_key, _label in ICON_SIZE_SETTING_SPECS:
             attr = key
             if key in changed:

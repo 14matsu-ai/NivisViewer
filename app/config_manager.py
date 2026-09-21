@@ -26,6 +26,8 @@ from .browser_icon_size import (
     BROWSER_ICON_SIZE_DEFAULT_CUSTOM_PERCENT,
     BROWSER_ICON_SIZE_DEFAULT_PRESET,
     ICON_SIZE_SETTING_SPECS,
+    ICON_POSITION_SETTING_KEYS,
+    normalize_browser_icon_margin,
     normalize_browser_icon_size_custom_percent,
     normalize_browser_icon_size_preset,
 )
@@ -129,6 +131,7 @@ class ConfigManager(QObject):
         "browser_thumbnail_display_mode": "fit",
         "browser_folder_fallback_background": "auto",
         "browser_file_fallback_background": "auto",
+        **{key: -1 for key in ICON_POSITION_SETTING_KEYS},
         **{
             key: BROWSER_ICON_SIZE_DEFAULT_PRESET
             for key, _custom_key, _label in ICON_SIZE_SETTING_SPECS
@@ -954,6 +957,8 @@ class ConfigManager(QObject):
             normalized[custom_key] = normalize_browser_icon_size_custom_percent(
                 normalized.get(custom_key)
             )
+        for key in ICON_POSITION_SETTING_KEYS:
+            normalized[key] = normalize_browser_icon_margin(normalized.get(key, -1))
         return normalized
 
     @classmethod

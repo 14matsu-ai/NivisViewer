@@ -27,6 +27,27 @@ def make_config(tmp_path: Path) -> ConfigManager:
     return config
 
 
+def test_badge_position_settings_roundtrip_and_browser_reset(tmp_path, qapp):
+    config = make_config(tmp_path)
+    dialog = SettingsDialog(config)
+    left = 'browser_badge_icon_left_margin'
+    bottom = 'browser_badge_icon_bottom_margin'
+    assert dialog.browser_icon_margin_spins[left].value() == -1
+    assert dialog.browser_icon_margin_spins[bottom].value() == -1
+    dialog.browser_icon_margin_spins[left].setValue(12)
+    dialog.browser_icon_margin_spins[bottom].setValue(10)
+    values = dialog.values()
+    config.apply({left: values[left], bottom: values[bottom]}, save=True)
+    reopened = ConfigManager(config.path)
+    reopened.load()
+    assert reopened.get(left) == 12
+    assert reopened.get(bottom) == 10
+    dialog._reset_browser_scope()
+    assert dialog.values()[left] == -1
+    assert dialog.values()[bottom] == -1
+    dialog.close()
+
+
 def flush_deferred_deletes(qapp: QApplication) -> None:
     qapp.processEvents()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

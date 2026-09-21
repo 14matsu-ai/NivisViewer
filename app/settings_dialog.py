@@ -80,6 +80,8 @@ from .browser_icon_size import (
     BROWSER_ICON_SIZE_CUSTOM_MIN_PERCENT,
     BROWSER_ICON_SIZE_PRESETS,
     ICON_SIZE_SETTING_SPECS,
+    ICON_POSITION_SETTING_KEYS,
+    normalize_browser_icon_margin,
     normalize_browser_icon_size_custom_percent,
 )
 from .config_manager import ConfigManager
@@ -1156,6 +1158,8 @@ class SettingsDialog(QDialog):
 
     def _reset_browser_scope(self) -> None:
         defaults = ConfigManager.DEFAULTS
+        for key, spin in self.browser_icon_margin_spins.items():
+            spin.setValue(int(defaults[key]))
         self.thumbnail_size_spin.setValue(int(defaults["thumbnail_size"]))
         self._select_data(self.thumbnail_frame_ratio_combo, defaults["thumbnail_frame_ratio"])
         self._select_data(self.thumbnail_crop_mode_combo, defaults["thumbnail_crop_mode"])
@@ -2588,7 +2592,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(list_group)
         layout.addWidget(cache_group)
 
-        icon_size_group = QGroupBox(tr('ファイル種別アイコンの大きさ'), tab)
+        icon_size_group = QGroupBox(tr('ファイル種別アイコン'), tab)
         icon_size_form = QFormLayout(icon_size_group)
         self.browser_icon_size_combos: dict[str, QComboBox] = {}
         self.browser_icon_size_custom_spins: dict[str, QSpinBox] = {}
@@ -2623,6 +2627,30 @@ class SettingsDialog(QDialog):
                 spin.setEnabled(combo.itemData(index) == "custom")
 
             combo.currentIndexChanged.connect(sync_custom_spin)
+        self.browser_icon_margin_spins: dict[str, QSpinBox] = {}
+        for key, label in zip(ICON_POSITION_SETTING_KEYS, ('左下アイコン：左端から', '左下アイコン：下端から')):
+            row = QWidget(icon_size_group)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            spin = QSpinBox(row)
+            spin.setRange(-1, 128)
+            spin.setSpecialValueText(tr('自動（既定の位置）'))
+            spin.setSuffix(' px')
+            spin.setToolTip(tr('サムネイル枠の端から、見えるアイコンまでの距離です。\n画面倍率に応じて拡大されます。自動では従来の位置を保ちます。'))
+            self.browser_icon_margin_spins[key] = spin
+            reset_button = QPushButton(tr('既定に戻す'), row)
+            reset_button.setObjectName(f'{key}_reset')
+            reset_button.clicked.connect(
+                lambda _checked=False, editor=spin: editor.setValue(-1)
+            )
+            spin.valueChanged.connect(
+                lambda value, button=reset_button: button.setEnabled(value != -1)
+            )
+            reset_button.setEnabled(spin.value() != -1)
+            row_layout.addWidget(spin, 1)
+            row_layout.addWidget(reset_button)
+            icon_size_form.addRow(tr(label), row)
         icon_size_note = QLabel(
             tr('中（100%）は現在の表示サイズです。中央と左下、フォルダとそれ以外を個別に設定できます。'),
             icon_size_group,
@@ -2850,6 +2878,8 @@ class SettingsDialog(QDialog):
         return tab
 
     def load_current_values(self) -> None:
+        for key, spin in self.browser_icon_margin_spins.items():
+            spin.setValue(normalize_browser_icon_margin(self.config.get(key, -1)))
         self.mouse_side_buttons_folder_navigation_checkbox.setChecked(
             bool(self.config.get("mouse_side_buttons_folder_navigation", False))
         )
@@ -3625,6 +3655,7 @@ class SettingsDialog(QDialog):
             ),
             "fullscreen_ui_hide_delay_ms": self.fullscreen_hide_delay_spin.value(),
             "thumbnail_size": self.thumbnail_size_spin.value(),
+            **{key: spin.value() for key, spin in self.browser_icon_margin_spins.items()},
             "thumbnail_frame_ratio": str(
                 self.thumbnail_frame_ratio_combo.currentData()
             ),

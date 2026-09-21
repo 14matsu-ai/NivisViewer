@@ -21,5 +21,5 @@
 - Viewer性能評価は実機の体感を最優先とし、offscreen Qt、fake、mock、temp directoryによる再現テストとベンチマークを補助証拠として使う。
 - 実アプリ起動、native入力、外部アプリ起動を行わない。
 - 変更後は構文チェック、テスト、同一大画像条件での順送り・逆方向・往復・高速連続入力のoffscreen評価を実行する。
-- コミット／Pushを行わない。
+- ユーザーが明示的に指示したコミット／Pushを許可する。以降も同様とし、指示のないコミット／Pushは行わない。
 - `git reset`、`git restore`、`git checkout`、`git stash`、`git clean`を行わない。

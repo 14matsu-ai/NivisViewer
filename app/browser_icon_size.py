@@ -11,6 +11,17 @@ BROWSER_ICON_SIZE_DEFAULT_PRESET = "medium"
 BROWSER_ICON_SIZE_DEFAULT_CUSTOM_PERCENT = 100
 BROWSER_ICON_SIZE_CUSTOM_MIN_PERCENT = 25
 BROWSER_ICON_SIZE_CUSTOM_MAX_PERCENT = 300
+ICON_POSITION_SETTING_KEYS = (
+    "browser_badge_icon_left_margin",
+    "browser_badge_icon_bottom_margin",
+)
+
+
+def normalize_browser_icon_margin(value: object) -> int:
+    try:
+        return max(-1, min(128, int(value)))
+    except (ValueError, TypeError):
+        return -1
 
 
 ICON_SIZE_SETTING_SPECS = (
