@@ -2,7 +2,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
-from PySide6.QtCore import Qt, QRect, QItemSelectionModel
+from PySide6.QtCore import Qt, QRect, QEvent, QObject, QItemSelectionModel
 from PySide6.QtGui import QImage, QPainter, QColor
 from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QStyleOptionViewItem, QMessageBox
 from PySide6.QtTest import QTest
@@ -158,6 +158,56 @@ def library(tmp_path, qapp):
 def load(browser, root):
     browser.set_current_folder(root)
     assert browser.wait_for_scan()
+
+
+def test_single_zip_tag_badge_paints_before_metadata_relocation(library, qapp, monkeypatch):
+    _, browser, root = library
+    source = root / '本.cbz'
+    write_archive(source)
+    load(browser, root)
+    browser.metadata_store.add_browser_bookmark(str(source))
+    browser.show()
+    browser.list_view.setCurrentIndex(browser.item_model.index(0, 0))
+    assert wait_until(qapp, lambda: browser.thumbnail_provider.pending_count == 0, timeout=5)
+    target = ZipPlaFilenameMetadata.parse(source).with_tag_changes({'新': True}).serialized_path()
+
+    class PaintWatch(QObject):
+        def __init__(self):
+            super().__init__()
+            self.count = 0
+            self.painted_target = False
+
+        def eventFilter(self, watched, event):
+            if event.type() == QEvent.Type.Paint:
+                self.count += 1
+                row = browser.item_model.row_for_path(target)
+                if row >= 0:
+                    rect = browser.list_view.visualRect(browser.item_model.index(row, 0))
+                    self.painted_target |= event.region().intersects(rect)
+            return False
+
+    watch = PaintWatch()
+    browser.list_view.viewport().installEventFilter(watch)
+    original_relocate = browser.metadata_store.relocate_item
+
+    def relocate_after_paint(old_path, new_path):
+        assert watch.count > 0
+        assert watch.painted_target
+        return original_relocate(old_path, new_path)
+
+    # Drain show/selection paints so only the tag operation can satisfy the
+    # assertion while set_tags_for_paths blocks the event loop.
+    for _ in range(3):
+        qapp.processEvents()
+    watch.count = 0
+    watch.painted_target = False
+    with monkeypatch.context() as edits:
+        edits.setattr(browser.image_detail_probe, 'close',
+                      lambda: pytest.fail('ZIP rename must not wait for image detail probe'))
+        edits.setattr(browser.metadata_store, 'relocate_item', relocate_after_paint)
+        assert browser.set_tags_for_paths((str(source),), {'新': True})
+    assert target.exists() and not source.exists()
+    assert browser.metadata_store.is_browser_bookmarked(str(target))
 
 
 @pytest.mark.parametrize('kind', ['image', 'archive', 'folder'])
