@@ -12,7 +12,7 @@ from typing import Any
 from PySide6.QtCore import QObject, Signal
 from .browser_sort import normalize_browser_random_seed, normalize_browser_sort_key
 from .thumbnail_render import THUMBNAIL_ENCODER_QUALITY, normalize_thumbnail_webp_quality
-from .i18n import normalize_ui_language
+from .i18n import detect_windows_ui_language, normalize_ui_language
 
 from .browser_wheel_scroll import (
     normalize_browser_wheel_custom_rows,
@@ -288,6 +288,10 @@ class ConfigManager(QObject):
     def load(self) -> dict[str, Any]:
         defaults = deepcopy(self.DEFAULTS)
         if not self.path.exists():
+            # A truly new profile follows the Windows display language once.
+            # Existing profiles that predate this setting keep the historical
+            # Japanese default through the merged DEFAULTS path below.
+            defaults["ui_language"] = detect_windows_ui_language()
             self._replace_data(defaults)
             return self.data
 

@@ -82,20 +82,14 @@ def show_shortcuts_help(parent: QWidget) -> None:
     text_edit.setLineWrapMode(QTextBrowser.LineWrapMode.NoWrap)
     browser_heading = html_text(f"[Browser] {tr('Browser ショートカット')}")
     viewer_heading = html_text(f"[Viewer] {tr('Viewer ショートカット')}")
-    body_css = "font-size: 10pt;"
     heading_css = "font-size: 14pt; font-weight: 700; margin: 8px 0 4px 0;"
-    body_lines = "<br>".join(
-        f"<div style=\"{body_css}\">{line or '&nbsp;'}</div>"
-        for line in browser_body
-    )
-    viewer_lines = "<br>".join(
-        f"<div style=\"{body_css}\">{line or '&nbsp;'}</div>"
-        for line in viewer_body
-    )
+    body_lines = "".join(f"<div>{line or '&nbsp;'}</div>" for line in browser_body)
+    viewer_lines = "".join(f"<div>{line or '&nbsp;'}</div>" for line in viewer_body)
     text_edit.setHtml(
         "<html><body>"
         f"<h2 style=\"{heading_css}\"><b>{browser_heading}</b></h2>"
         f"{body_lines}"
+        "<div>&nbsp;</div>"
         f"<h2 style=\"{heading_css}\"><b>{viewer_heading}</b></h2>"
         f"{viewer_lines}"
         "</body></html>"

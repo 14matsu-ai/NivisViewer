@@ -29,6 +29,7 @@ from app.settings_dialog import SettingsDialog
 from app.thumbnail_provider import BrowserThumbnailProvider
 from app.thumbnail_render import FRAME_RATIOS, CROP_MODES, BROWSER_THUMBNAIL_DISPLAY_MODES
 from app.translations_en import ENGLISH
+from app.translations_zh import TRADITIONAL_CHINESE, SIMPLIFIED_CHINESE
 from app.viewer_commands import COMMAND_CHOICES
 from app.viewer_memory_policy import VIEWER_MEMORY_MODE_LABELS
 from app.viewer_render import DOWNSCALE_ALGORITHM_LABELS, UPSCALE_ALGORITHM_LABELS
@@ -86,6 +87,13 @@ def test_catalog_covers_explicit_calls_and_preserves_format_contracts():
                 assert sorted(expected) == sorted(translated), source
     assert len(sources) > 700
     assert all(value and not JAPANESE.search(value) for value in ENGLISH.values())
+    for catalog in (SIMPLIFIED_CHINESE, TRADITIONAL_CHINESE):
+        assert set(catalog) == set(ENGLISH)
+        assert all(value and not re.search(r"[ぁ-ゖァ-ヺ]", value) for value in catalog.values())
+        for source, translated in catalog.items():
+            expected = sorted(field for _, field, _, _ in formatter.parse(ENGLISH[source]) if field)
+            actual = sorted(field for _, field, _, _ in formatter.parse(translated) if field)
+            assert actual == expected, source
     static_labels = [label for label, *_ in BROWSER_SORT_CHOICES]
     static_labels += list(BROWSER_DISPLAY_DENSITY_LABELS.values())
     static_labels += [label for _, label in FRAME_RATIOS.values()]
@@ -114,7 +122,10 @@ def test_apply_cancel_ok_and_restart_boundary(tmp_path, qapp):
     assert config.get("ui_language") == "ja"
     dialog = SettingsDialog(config)
     assert [(dialog.ui_language_combo.itemText(i), dialog.ui_language_combo.itemData(i))
-            for i in range(dialog.ui_language_combo.count())] == [("日本語", "ja"), ("English", "en")]
+            for i in range(dialog.ui_language_combo.count())] == [
+                ("日本語", "ja"), ("English", "en"),
+                ("简体中文", "zh-Hans"), ("繁體中文", "zh-Hant"),
+            ]
     dialog.ui_language_combo.setCurrentIndex(1)
     dialog.apply_settings()
     assert ConfigManager(config.path).load()["ui_language"] == "en"

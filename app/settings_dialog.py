@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .i18n import active_ui_language, tr
+from .i18n import UI_LANGUAGE_CHOICES, active_ui_language, tr
 
 
 from collections.abc import Callable
@@ -1529,10 +1529,15 @@ class SettingsDialog(QDialog):
         form = QFormLayout(tab)
         self.ui_language_combo = QComboBox(tab)
         self.ui_language_combo.setObjectName("ui_language")
-        self.ui_language_combo.addItem("日本語", "ja")
-        self.ui_language_combo.addItem("English", "en")
+        for label, language in UI_LANGUAGE_CHOICES:
+            self.ui_language_combo.addItem(label, language)
         # Intentionally bilingual so this control is discoverable in either UI.
-        self.ui_language_label = QLabel("表示言語 / Language", tab)
+        language_label = "表示言語 / Language"
+        if active_ui_language() == "zh-Hans":
+            language_label = "显示语言 / Language"
+        elif active_ui_language() == "zh-Hant":
+            language_label = "顯示語言 / Language"
+        self.ui_language_label = QLabel(language_label, tab)
         self.ui_language_label.setBuddy(self.ui_language_combo)
         form.addRow(self.ui_language_label, self.ui_language_combo)
         self.ui_language_restart_note = QLabel(
