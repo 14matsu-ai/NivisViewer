@@ -1,5 +1,20 @@
 # NivisViewer
 
+[日本語](README.md) | [English](README.en.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md)
+
+## 目次
+
+- [概要](#overview)
+- [Windows x64ポータブル版](#portable)
+- [対応入力形式](#formats)
+- [動作環境](#requirements)
+- [セットアップと起動](#setup)
+- [Explorerからのドロップ確認](#drop)
+- [ライセンス](#license)
+
+<a id="overview"></a>
+## 概要
+
 NivisViewerは、Windows向けの漫画・画像ビューアです。ZipPlaの操作感や挙動を参考にしつつ、ソースコードは流用せず独自に実装しています。
 
 お気に入りフォルダと同期可能なフォルダツリー、固定セルのサムネイル一覧を持つBrowserWindow、本を表示する独立したViewerWindow、基本設定画面、見開き密着表示、ポータブルなサムネイルキャッシュ、フォルダ・単体画像・ZIP/CBZ・RAR/7z系書庫・PDFの読み込み、自然順ソート、非同期画像読み込みなどを実装しています。ViewerWindowではマウスの戻る／進むボタンによる前後の本への移動、設定可能な右クリックドラッグジェスチャー、全画面での画面端UI表示も利用できます。
@@ -7,6 +22,7 @@ NivisViewerは、Windows向けの漫画・画像ビューアです。ZipPlaの�
 Nivis はラテン語で「雪」を意味する nix, nivis に由来します。\
 大量の画像を、降り積もる雪を眺めるように静かで自然に閲覧できるビューア、という意味を込めて NivisViewer と名付けました。
 
+<a id="portable"></a>
 ## Windows x64ポータブル版
 
 配布ZIPを任意の書き込み可能なフォルダへ展開し、`NivisViewer.exe`を起動します。Pythonの別途インストールは不要です。標準配布はPyInstaller one-folder形式で、`portable.flag`がexeの隣にあると`config.json`と`data/`（履歴DB、サムネイルキャッシュ、ログ）も同じポータブルフォルダへ保存します。カレントディレクトリや閲覧中の画像フォルダは保存先に使いません。
@@ -19,6 +35,7 @@ Windows連携は設定画面で利用者が明示的に登録した場合だけ�
 
 コード署名はまだ行っていないため、ダウンロードした配布物でSmartScreen警告が表示される可能性があります。不具合報告時はViewerの「ヘルプ」から診断情報をコピーできます。ログは`data\logs\NivisViewer.log`に保存され、外部へ自動送信されません。
 
+<a id="formats"></a>
 ## 対応入力形式
 
 - フォルダ
@@ -37,11 +54,13 @@ NivisViewerはWinRARや7-Zipを自動ダウンロード・自動インストー�
 
 PDFは読み取り専用で扱い、通常ページと注釈を表示します。編集、テキスト検索・選択、リンク操作、目次UI、フォーム入力、JavaScript、XFAには対応していません。PDFの100%表示は96 logical DPI相当です。高DPI画面ではdevice pixel ratioをレンダー解像度へ反映し、リサイズやズームの停止から約180ms後に表示先サイズへ再レンダーします。
 
+<a id="requirements"></a>
 ## 動作環境
 
 - Windows
 - Python 3.11以上
 
+<a id="setup"></a>
 ## セットアップと起動
 
 PowerShellでリポジトリのルートへ移動し、依存関係をインストールします。
@@ -71,13 +90,15 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
+<a id="drop"></a>
 ## Windows ExplorerからBrowser中央へのドロップ確認
 
 NivisViewerを管理者権限ではなく通常ユーザーとして起動し、ExplorerからBrowser中央の項目上と空白上へファイルをドロップします。cursorが受理表示になり、ファイルの親フォルダを表示して対象を選択・中央表示し、Viewerを開かないことを確認します。フォルダをドロップした場合はそのフォルダを表示します。複数ファイルでは同じ親の項目を選択し、別の親にある項目は件数だけを通知します。HTTP／HTTPS URLは受理しません。
 
 Browser中央へのExplorer dropはコピー／移動ではなく「場所を表示」です。NivisViewer内の項目をフォルダ項目、フォルダツリー、お気に入りへdropした場合だけ、既存のコピー／移動操作になります。
 
-## License
+<a id="license"></a>
+## ライセンス
 
 NivisViewerの現在のプロジェクトライセンスは **GNU AGPL version 3 or later
 (`AGPL-3.0-or-later`)** です。[LICENSE](LICENSE)に正式本文、
