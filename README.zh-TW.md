@@ -44,7 +44,7 @@ NivisViewer 的名稱源自拉丁語中表示「雪」的 *nix, nivis*。\
 - RAR / CBR（使用使用者環境中的 WinRAR 或 7-Zip）
 - 7z / CB7（使用受支援的 WinRAR 命令列設定或使用者環境中的 7-Zip）
 - PDF（使用 pypdfium2 v5／PDFium）
-- 圖片：JPEG、PNG、WebP、BMP、GIF、TIFF、ICO
+- 圖片：JPEG、PNG、WebP、AVIF、JPEG XL（JXL）、BMP、GIF、TIFF、ICO
 
 閱讀 RAR／7z／CBR／CB7 時，程式會從 Windows 檔案關聯、標準安裝位置、PATH，或「設定 → 壓縮檔」中指定的 WinRAR／7-Zip 路徑選擇已識別的外部命令列工具。如果使用者安裝的 WinRAR 附有受支援的官方主控台工具，僅為閱讀 RAR／CBR 無須另裝 7-Zip。程式不會啟動未知的檔案關聯應用程式，也不會將其交給 ShellExecute。
 
