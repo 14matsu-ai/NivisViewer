@@ -1065,6 +1065,15 @@ ENGLISH.update({
     for order in ("昇順", "降順")
 })
 
+ENGLISH.update({
+    '左下アイコン：左端から': 'Lower-left icon: from left edge',
+    'ファイル種別アイコン': 'File type icons',
+    '左下アイコン：下端から': 'Lower-left icon: from bottom edge',
+    '自動（既定の位置）': 'Auto (default position)',
+    'サムネイル枠の端から、見えるアイコンまでの距離です。\n画面倍率に応じて拡大されます。自動では従来の位置を保ちます。': 'Distance from the thumbnail frame edge to the visible icon.\nScales with display scaling. Auto preserves the original position.',
+    'ドライブを選択': 'Select a drive',
+})
+
 ENGLISH_DISAMBIGUATED = {
     ("縮小", "resampling"): "Downscaling",
     ("拡大", "resampling"): "Upscaling",

@@ -15,6 +15,7 @@ from .browser_icon_size import (
     browser_icon_size_scale,
     normalize_browser_icon_size_custom_percent,
     normalize_browser_icon_size_preset,
+    normalize_browser_icon_margin,
 )
 from .browser_sort import BrowserDisplayDensity
 from .shell_icon_provider import ShellAssociatedIconProvider
@@ -64,6 +65,7 @@ BROWSER_FILE_FALLBACK_DEFAULT_COLOR = "#c1c1c1"
 BROWSER_PLACEHOLDER_ICON_MAX_RATIO = 0.50
 BROWSER_DISPLAY_SURFACE_CACHE_MAX_ITEMS = 96
 BROWSER_DISPLAY_SURFACE_CACHE_MAX_BYTES = 32 * 1024 * 1024
+BROWSER_BADGE_INSET_CACHE_MAX_ITEMS = 192
 
 
 @dataclass(frozen=True)
@@ -509,6 +511,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
         badge_file_icon_size: str = BROWSER_ICON_SIZE_DEFAULT_PRESET,
         badge_file_icon_custom_percent: int = BROWSER_ICON_SIZE_DEFAULT_CUSTOM_PERCENT,
         shell_icon_provider: ShellAssociatedIconProvider | None = None,
+        badge_icon_left_margin: int = -1,
+        badge_icon_bottom_margin: int = -1,
     ) -> None:
         super().__init__(parent)
         self.thumbnail_size = int(thumbnail_size)
@@ -563,6 +567,14 @@ class BrowserItemDelegate(QStyledItemDelegate):
             shell_icon_provider or ShellAssociatedIconProvider()
         )
         self._display_surface_cache = BrowserDisplaySurfaceCache()
+        self.badge_icon_left_margin = normalize_browser_icon_margin(badge_icon_left_margin)
+        self.badge_icon_bottom_margin = normalize_browser_icon_margin(badge_icon_bottom_margin)
+        self._badge_inset_cache: OrderedDict[
+            tuple[str, int, int], tuple[int, int]
+        ] = OrderedDict()
+        self._badge_reference_cache: OrderedDict[
+            tuple[str, int, float], tuple[int, int, int, int]
+        ] = OrderedDict()
 
     @property
     def profile(self) -> BrowserGridProfile:
@@ -639,6 +651,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
         badge_folder_icon_custom_percent: int | None = None,
         badge_file_icon_size: str | None = None,
         badge_file_icon_custom_percent: int | None = None,
+        badge_icon_left_margin: int | None = None,
+        badge_icon_bottom_margin: int | None = None,
     ) -> None:
         previous_surface_geometry = (
             self.thumbnail_size,
@@ -649,6 +663,10 @@ class BrowserItemDelegate(QStyledItemDelegate):
         self.density = density
         if frame_ratio_id is not None:
             self.frame_ratio_id = frame_ratio_id
+        if badge_icon_left_margin is not None:
+            self.badge_icon_left_margin = normalize_browser_icon_margin(badge_icon_left_margin)
+        if badge_icon_bottom_margin is not None:
+            self.badge_icon_bottom_margin = normalize_browser_icon_margin(badge_icon_bottom_margin)
         if thumbnail_display_mode is not None:
             self.thumbnail_display_mode = (
                 thumbnail_display_mode
@@ -1079,7 +1097,13 @@ class BrowserItemDelegate(QStyledItemDelegate):
             getattr(self, f"{prefix}_icon_custom_percent"),
         )
 
-    def _type_badge_size(self, thumbnail_rect: QRect, item: BrowserItem) -> int:
+    def _type_badge_size(
+        self,
+        thumbnail_rect: QRect,
+        item: BrowserItem,
+        *,
+        scale: float | None = None,
+    ) -> int:
         badge_sizes = {
             BrowserDisplayDensity.EXTRA_COMPACT: 14,
             BrowserDisplayDensity.COMPACT: 16,
@@ -1089,7 +1113,9 @@ class BrowserItemDelegate(QStyledItemDelegate):
             BrowserDisplayDensity.LARGE: 22,
         }
         base_size = badge_sizes[self.density]
-        size = round(base_size * self._icon_scale(item, badge=True))
+        size = round(
+            base_size * (self._icon_scale(item, badge=True) if scale is None else scale)
+        )
         cell_cap = min(
             max(8, thumbnail_rect.width() - 4),
             max(8, thumbnail_rect.height() - 3),
@@ -1097,10 +1123,17 @@ class BrowserItemDelegate(QStyledItemDelegate):
         return max(8, min(cell_cap, size))
 
     def _type_badge_rect(self, thumbnail_rect: QRect, item: BrowserItem) -> QRect:
-        return type_badge_rect(
+        rect = type_badge_rect(
             thumbnail_rect,
             self._type_badge_size(thumbnail_rect, item),
         )
+        if self.badge_icon_left_margin >= 0:
+            margin = min(self.badge_icon_left_margin, max(0, thumbnail_rect.width() - rect.width()))
+            rect.moveLeft(thumbnail_rect.left() + margin)
+        if self.badge_icon_bottom_margin >= 0:
+            margin = min(self.badge_icon_bottom_margin, max(0, thumbnail_rect.height() - rect.height()))
+            rect.moveBottom(thumbnail_rect.bottom() - margin)
+        return rect
 
     def _paint_tags(self, painter, option, rect, item) -> None:
         from .browser_tags import filename_tags
@@ -1241,11 +1274,117 @@ class BrowserItemDelegate(QStyledItemDelegate):
         image = self._association_image(item, badge_size, dpr)
         if image.isNull():
             return
-        painter.drawImage(
-            badge_target,
-            image,
-            QRectF(0, 0, image.width(), image.height()),
+        base_size = self._type_badge_size(thumbnail_rect, item, scale=1.0)
+        custom_left = self.badge_icon_left_margin >= 0
+        custom_bottom = self.badge_icon_bottom_margin >= 0
+        if badge_size != base_size or custom_left or custom_bottom:
+            # Preserve the old medium-preset position. Only compensate for the
+            # difference in visible margins when the icon size changes.
+            reference = self._badge_reference_insets(item, base_size, dpr)
+            if reference is not None:
+                ref_width, ref_height, ref_left, ref_bottom = reference
+                left_inset, bottom_inset = self._badge_visible_insets(item, image)
+                ref_badge = type_badge_rect(thumbnail_rect, base_size)
+                ref_target = snap_logical_rect_to_physical_pixels(
+                    QRectF(ref_badge), dpr
+                )
+                current_left = round(
+                    left_inset * badge_target.width() * dpr / image.width()
+                )
+                current_bottom = round(
+                    bottom_inset * badge_target.height() * dpr / image.height()
+                )
+                original_left = round(
+                    ref_left * ref_target.width() * dpr / ref_width
+                )
+                original_bottom = round(
+                    ref_bottom * ref_target.height() * dpr / ref_height
+                )
+                if custom_left:
+                    original_left = 0
+                if custom_bottom:
+                    original_bottom = 0
+                badge_target.translate(
+                    (original_left - current_left) / dpr,
+                    (current_bottom - original_bottom) / dpr,
+                )
+        painter.save()
+        try:
+            painter.setClipRect(thumbnail_rect, Qt.ClipOperation.IntersectClip)
+            painter.drawImage(
+                badge_target,
+                image,
+                QRectF(0, 0, image.width(), image.height()),
+            )
+        finally:
+            painter.restore()
+
+    def _badge_reference_insets(
+        self, item: BrowserItem, base_size: int, dpr: float
+    ) -> tuple[int, int, int, int] | None:
+        association = self._badge_association(item)
+        key = (association, base_size, dpr)
+        cached = self._badge_reference_cache.get(key)
+        if cached is not None:
+            self._badge_reference_cache.move_to_end(key)
+            return cached
+        image = self._association_image(item, base_size, dpr)
+        if image.isNull():
+            return None
+        left, bottom = self._badge_visible_insets(item, image)
+        result = (image.width(), image.height(), left, bottom)
+        self._badge_reference_cache[key] = result
+        if len(self._badge_reference_cache) > BROWSER_BADGE_INSET_CACHE_MAX_ITEMS:
+            self._badge_reference_cache.popitem(last=False)
+        return result
+
+    @staticmethod
+    def _badge_association(item: BrowserItem) -> str:
+        return (
+            "folder"
+            if item.kind is BrowserItemKind.FOLDER
+            else item.path.suffix.casefold()
         )
+
+    def _badge_visible_insets(self, item: BrowserItem, image: QImage) -> tuple[int, int]:
+        # Shell icons are cached per file association and physical size. Their
+        # transparent margins vary with size, so anchor the painted shape rather
+        # than the square image while keeping the requested icon scale intact.
+        association = self._badge_association(item)
+        key = (association, image.width(), image.height())
+        cached = self._badge_inset_cache.get(key)
+        if cached is not None:
+            self._badge_inset_cache.move_to_end(key)
+            return cached
+
+        # Ignore faint shadow pixels when choosing the visible edge.
+        def visible(x: int, y: int) -> bool:
+            return image.pixelColor(x, y).alpha() >= 16
+
+        left = next(
+            (
+                x
+                for x in range(image.width())
+                if any(visible(x, y) for y in range(image.height()))
+            ),
+            0,
+        )
+        bottom = next(
+            (
+                offset
+                for offset in range(image.height())
+                if any(
+                    visible(x, image.height() - 1 - offset)
+                    for x in range(image.width())
+                )
+            ),
+            0,
+        )
+        result = (left, bottom)
+        self._badge_inset_cache[key] = result
+        if len(self._badge_inset_cache) > BROWSER_BADGE_INSET_CACHE_MAX_ITEMS:
+            self._badge_inset_cache.popitem(last=False)
+        return result
 
     def _association_image(
         self,

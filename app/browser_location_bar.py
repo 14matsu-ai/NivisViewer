@@ -12,6 +12,7 @@ from threading import Event
 
 from natsort import natsort_keygen, ns
 from PySide6.QtCore import (
+    QDir,
     QEvent,
     QObject,
     QPoint,
@@ -387,6 +388,7 @@ class BrowserLocationBreadcrumb(QWidget):
         self._segments: tuple[LocationSegment, ...] = ()
         self._separator_buttons: dict[str, QToolButton] = {}
         self._last_width = -1
+        self._drive_popup: BrowserLocationListPopup | None = None
         self._layout = QHBoxLayout(self)
         self._layout.setContentsMargins(2, 0, 2, 0)
         self._layout.setSpacing(0)
@@ -432,6 +434,8 @@ class BrowserLocationBreadcrumb(QWidget):
         super().mousePressEvent(event)
 
     def _clear_layout(self) -> None:
+        if self._drive_popup is not None:
+            self._drive_popup.close()
         self._separator_buttons.clear()
         while self._layout.count():
             item = self._layout.takeAt(0)
@@ -447,7 +451,14 @@ class BrowserLocationBreadcrumb(QWidget):
             return
 
         metrics = self.fontMetrics()
-        available = max(80, self.width() - 8)
+        separator_width = max(18, metrics.horizontalAdvance("›") + 10)
+        drive_button = QToolButton(self)
+        drive_button.setObjectName("browser_location_drives")
+        drive_button.setText("›")
+        drive_button.setToolTip(tr('ドライブを選択'))
+        drive_button.clicked.connect(lambda: self._show_drives(drive_button))
+        self._layout.addWidget(drive_button)
+        available = max(60, self.width() - 8 - separator_width)
         widths = [
             min(230, metrics.horizontalAdvance(item.label) + 22)
             for item in self._segments
@@ -530,6 +541,41 @@ class BrowserLocationBreadcrumb(QWidget):
             self._layout.addWidget(separator)
 
         self._layout.addStretch(1)
+
+    def _show_drives(self, anchor: QToolButton) -> None:
+        if self._drive_popup is not None:
+            self._drive_popup.close()
+            return
+        current_root = self._segments[0].path.casefold() if self._segments else ""
+        # Enumerate roots only: do not query volume labels, capacity or readiness
+        # here, since an unavailable network/removable drive may block those calls.
+        entries = tuple(
+            LocationPopupEntry(
+                drive.absoluteFilePath().rstrip('\\/') or drive.absoluteFilePath(),
+                drive.absoluteFilePath(),
+                drive.absoluteFilePath(),
+                current=os.path.normpath(drive.absoluteFilePath()).casefold()
+                == os.path.normpath(current_root).casefold(),
+            )
+            for drive in QDir.drives()
+        )
+        if not entries:
+            return
+        popup = BrowserLocationListPopup(entries, self)
+        self._drive_popup = popup
+        popup.entryActivated.connect(lambda entry: self.locationActivated.emit(str(entry.value)))
+        popup.closed.connect(self._release_drive_popup)
+        popup.show_for(anchor)
+
+    def _release_drive_popup(self, popup: BrowserLocationListPopup) -> None:
+        if self._drive_popup is popup:
+            self._drive_popup = None
+        popup.deleteLater()
+
+    def hideEvent(self, event: QHideEvent) -> None:  # noqa: N802
+        if self._drive_popup is not None:
+            self._drive_popup.close()
+        super().hideEvent(event)
 
 
 __all__ = [

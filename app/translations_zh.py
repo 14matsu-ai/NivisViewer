@@ -23,8 +23,24 @@ def _complete_catalog(*parts: dict[str, str]) -> dict[str, str]:
     return catalog
 
 
-SIMPLIFIED_CHINESE = _complete_catalog(_S1, _S2, _S3, _S4)
-TRADITIONAL_CHINESE = _complete_catalog(_T1, _T2, _T3, _T4)
+_ICON_LOCATION_SIMPLIFIED = {
+    'ファイル種別アイコン': '文件类型图标',
+    '左下アイコン：左端から': '左下角图标：距左边缘',
+    '左下アイコン：下端から': '左下角图标：距下边缘',
+    '自動（既定の位置）': '自动（默认位置）',
+    'サムネイル枠の端から、見えるアイコンまでの距離です。\n画面倍率に応じて拡大されます。自動では従来の位置を保ちます。': '缩略图边框边缘到可见图标的距离。\n随显示缩放比例调整。自动时保留原来的位置。',
+    'ドライブを選択': '选择驱动器',
+}
+_ICON_LOCATION_TRADITIONAL = {
+    'ファイル種別アイコン': '檔案類型圖示',
+    '左下アイコン：左端から': '左下角圖示：距左邊緣',
+    '左下アイコン：下端から': '左下角圖示：距下邊緣',
+    '自動（既定の位置）': '自動（預設位置）',
+    'サムネイル枠の端から、見えるアイコンまでの距離です。\n画面倍率に応じて拡大されます。自動では従来の位置を保ちます。': '縮圖邊框邊緣到可見圖示的距離。\n隨顯示縮放比例調整。自動時保留原來的位置。',
+    'ドライブを選択': '選擇磁碟機',
+}
+SIMPLIFIED_CHINESE = _complete_catalog(_S1, _S2, _S3, _S4, _ICON_LOCATION_SIMPLIFIED)
+TRADITIONAL_CHINESE = _complete_catalog(_T1, _T2, _T3, _T4, _ICON_LOCATION_TRADITIONAL)
 
 SIMPLIFIED_CHINESE_DISAMBIGUATED = {
     ("縮小", "resampling"): "缩小采样",

@@ -25,7 +25,7 @@ from app.browser_thumbnail_scheduler import ThumbnailPriority
 from app.browser_window import BrowserWindow
 from app.config_manager import ConfigManager
 from app.thumbnail_provider import BrowserThumbnailProvider
-from app.thumbnail_render import ThumbnailRenderSpec
+from app.thumbnail_render import ThumbnailRenderSpec, snap_logical_rect_to_physical_pixels
 
 
 class RecordingThumbnailProvider(BrowserThumbnailProvider):
@@ -659,6 +659,112 @@ def test_file_type_icon_size_presets_scale_center_and_badge_independently(
     assert frame.contains(file_badge)
 
 
+@pytest.mark.parametrize("kind, name, setting", [
+    (BrowserItemKind.FOLDER, "folder", "badge_folder_icon_size"),
+    (BrowserItemKind.IMAGE, "page.jpg", "badge_file_icon_size"),
+])
+@pytest.mark.parametrize("dpr", [1.0, 1.25, 1.5, 2.0])
+def test_badge_visible_lower_left_stays_put_when_size_changes(
+    qapp,
+    tmp_path: Path,
+    kind: BrowserItemKind,
+    name: str,
+    setting: str,
+    dpr: float,
+) -> None:
+    item = make_item(tmp_path / name, kind)
+    thumbnail = QRect(12, 9, 80, 80)
+    visible_corners = []
+    for preset in ("small", "medium", "large"):
+        delegate = BrowserItemDelegate(
+            shell_icon_provider=AlphaShellIconProvider(),
+            **{setting: preset},
+        )
+        canvas = QImage(
+            round(110 * dpr),
+            round(105 * dpr),
+            QImage.Format.Format_ARGB32_Premultiplied,
+        )
+        canvas.setDevicePixelRatio(dpr)
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        delegate._paint_type_icon(painter, thumbnail, item)
+        painter.end()
+        colored = [
+            (x, y)
+            for y in range(canvas.height())
+            for x in range(canvas.width())
+            if canvas.pixelColor(x, y).alpha() >= 16
+        ]
+        assert colored
+        visible_corners.append((min(x for x, _ in colored), max(y for _, y in colored)))
+
+    assert max(x for x, _ in visible_corners) - min(x for x, _ in visible_corners) <= 1
+    assert max(y for _, y in visible_corners) - min(y for _, y in visible_corners) <= 1
+
+    # The medium preset must retain its old placement, including the icon's
+    # own transparent margin, rather than being pulled flush to the frame.
+    reference_image = AlphaShellIconProvider().image_for(
+        item, logical_size=18, device_pixel_ratio=dpr
+    )
+    reference_canvas = QImage(
+        round(110 * dpr),
+        round(105 * dpr),
+        QImage.Format.Format_ARGB32_Premultiplied,
+    )
+    reference_canvas.setDevicePixelRatio(dpr)
+    reference_canvas.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(reference_canvas)
+    painter.drawImage(
+        snap_logical_rect_to_physical_pixels(
+            QRectF(type_badge_rect(thumbnail, 18)), dpr
+        ),
+        reference_image,
+        QRectF(0, 0, reference_image.width(), reference_image.height()),
+    )
+    painter.end()
+    reference_pixels = [
+        (x, y)
+        for y in range(reference_canvas.height())
+        for x in range(reference_canvas.width())
+        if reference_canvas.pixelColor(x, y).alpha() >= 16
+    ]
+    assert visible_corners[1] == (
+        min(x for x, _ in reference_pixels),
+        max(y for _, y in reference_pixels),
+    )
+
+
+@pytest.mark.parametrize("dpr", [1.0, 1.25, 1.5, 2.0])
+@pytest.mark.parametrize("left,bottom", [(0, 0), (12, 10), (12, -1), (-1, 10), (128, 128)])
+def test_custom_badge_margins_anchor_visible_shape_at_all_sizes(qapp, tmp_path, dpr, left, bottom):
+    item = make_item(tmp_path / 'page.jpg', BrowserItemKind.IMAGE)
+    frame = QRect(12, 9, 100, 100)
+    for preset in ('small', 'medium', 'large', 'custom'):
+        delegate = BrowserItemDelegate(
+            shell_icon_provider=AlphaShellIconProvider(),
+            badge_file_icon_size=preset,
+            badge_file_icon_custom_percent=300,
+            badge_icon_left_margin=left,
+            badge_icon_bottom_margin=bottom,
+        )
+        canvas = QImage(round(130*dpr), round(130*dpr), QImage.Format.Format_ARGB32_Premultiplied)
+        canvas.setDevicePixelRatio(dpr)
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        delegate._paint_type_icon(painter, frame, item)
+        painter.end()
+        pixels = [(x, y) for y in range(canvas.height()) for x in range(canvas.width())
+                  if canvas.pixelColor(x, y).alpha() >= 16]
+        size = delegate._type_badge_size(frame, item)
+        if left >= 0:
+            expected_left = frame.left() + min(left, frame.width() - size)
+            assert abs(min(x for x, _ in pixels) - round(expected_left*dpr)) <= 1
+        if bottom >= 0:
+            expected_bottom = frame.bottom() + 1 - min(bottom, frame.height() - size)
+            assert abs(max(y for _, y in pixels) - (round(expected_bottom*dpr)-1)) <= 1
+
+
 @pytest.mark.parametrize("dpr", [1.0, 1.25, 1.5, 2.0])
 def test_custom_large_badge_keeps_tag_color_pixels_clear(
     tmp_path: Path,
@@ -945,6 +1051,8 @@ def test_file_type_icon_size_change_repaints_without_scan_or_thumbnail_requests(
             "browser_center_folder_icon_size": "large",
             "browser_badge_folder_icon_size": "custom",
             "browser_badge_folder_icon_custom_percent": 210,
+            "browser_badge_icon_left_margin": 12,
+            "browser_badge_icon_bottom_margin": 10,
         }
     )
     qapp.processEvents()
@@ -952,6 +1060,8 @@ def test_file_type_icon_size_change_repaints_without_scan_or_thumbnail_requests(
     assert window.item_delegate.center_folder_icon_size == "large"
     assert window.item_delegate.badge_folder_icon_size == "custom"
     assert window.item_delegate.badge_folder_icon_custom_percent == 210
+    assert window.item_delegate.badge_icon_left_margin == 12
+    assert window.item_delegate.badge_icon_bottom_margin == 10
     assert provider.generation == thumbnail_generation
     assert window._scan_generation == scan_generation
     assert provider.requests == []

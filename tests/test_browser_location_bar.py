@@ -32,6 +32,43 @@ def test_location_segments_preserve_drive_unc_and_japanese_paths() -> None:
     assert unc[-1].path == r"\\server\share\漫画\本"
 
 
+def test_drive_selector_navigation_current_drive_and_narrow_bar(qapp, monkeypatch):
+    from PySide6.QtCore import QFileInfo
+    from app.browser_location_bar import QDir
+
+    monkeypatch.setattr(QDir, 'drives', lambda: [QFileInfo('C:/'), QFileInfo('D:/')])
+    breadcrumb = BrowserLocationBreadcrumb()
+    breadcrumb.resize(180, 30)
+    breadcrumb.set_location('C:/one/two/three')
+    activated = []
+    breadcrumb.locationActivated.connect(activated.append)
+    breadcrumb.show()
+    qapp.processEvents()
+    button = breadcrumb.findChild(QToolButton, 'browser_location_drives')
+    assert button is not None and button.isVisibleTo(breadcrumb)
+    assert breadcrumb._layout.itemAt(0).widget() is button
+    QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+    popup = breadcrumb._drive_popup
+    assert popup is not None and popup.entry_count == 2
+    assert popup.list_widget.currentRow() == 0
+    assert popup.list_widget.item(0).font().bold()
+    QTest.keyClick(popup.list_widget, Qt.Key.Key_Down)
+    QTest.keyClick(popup.list_widget, Qt.Key.Key_Return)
+    assert activated == ['D:/']
+    assert breadcrumb._drive_popup is None
+    QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+    assert breadcrumb._drive_popup is not None
+    QTest.keyClick(breadcrumb._drive_popup.list_widget, Qt.Key.Key_Escape)
+    assert breadcrumb._drive_popup is None
+    assert activated == ['D:/']
+    monkeypatch.setattr(QDir, 'drives', lambda: [QFileInfo('C:/'), QFileInfo('E:/')])
+    QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+    assert breadcrumb._drive_popup.list_widget.item(1).text() == 'E:'
+    breadcrumb.set_location(r'\\server\share\books')
+    assert breadcrumb._drive_popup is None
+    breadcrumb.close()
+
+
 def test_child_directory_listing_is_natural_and_respects_visibility(
     tmp_path: Path,
 ) -> None:
