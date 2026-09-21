@@ -117,6 +117,7 @@ from .browser_icon_size import (
     normalize_browser_icon_size_preset,
 )
 from .browser_navigation import BrowserLocation, BrowserNavigationHistory
+from .shortcut_catalog import canonical_key, normalize_shortcut_bindings
 from .browser_scanner import (
     DEFAULT_SCAN_BATCH_SIZE,
     BrowserDirectoryScanner,
@@ -143,7 +144,7 @@ from .browser_sort import (
 )
 from .browser_filter import BrowserFilterState, RatingFilterMode
 from .browser_rating_filter_widget import BrowserRatingFilterWidget
-from .browser_tag_quick_filters import BrowserTagQuickFilterStrip
+from .browser_tag_quick_filters import BrowserTagQuickFilterStrip, TagFilterMenuButton
 from .browser_search_history import BrowserSearchHistory
 from .browser_image_detail import (
     BrowserImageDetailProbe,
@@ -215,6 +216,28 @@ from .system_file_opener import SystemFileOpener
 from .windows_filename import (
     generate_numbered_name,
     validate_windows_filename,
+)
+
+
+BROWSER_SHORTCUT_RUNTIME_IDS = frozenset(
+    {
+        "browser_back",
+        "browser_forward",
+        "browser_up",
+        "browser_refresh",
+        "browser_focus_address",
+        "browser_rename",
+        "browser_delete",
+        "browser_copy",
+        "browser_cut",
+        "browser_paste",
+        "browser_new_folder",
+        "browser_toggle_folder_bookmark",
+        "browser_backspace",
+        "browser_cancel",
+        "browser_clear_filters",
+        "browser_open_selection",
+    }
 )
 
 
@@ -989,6 +1012,13 @@ class BrowserWindow(QMainWindow):
             self._flush_directory_changes
         )
         self._build_ui()
+        self.shortcut_bindings = normalize_shortcut_bindings(
+            self.settings.get("shortcut_bindings")
+        ).get("browser", {})
+        self.browser_cancel_clears_filters = bool(
+            self.settings.get("browser_cancel_clears_filters", True)
+        )
+        self._apply_browser_shortcuts()
         application = QApplication.instance()
         if application is not None:
             # Side-button events can target a viewport child or delegate
@@ -4047,6 +4077,16 @@ class BrowserWindow(QMainWindow):
         self.list_view.viewport().update()
 
     def apply_settings(self, changed: dict[str, object]) -> None:
+        if "shortcut_bindings" in changed:
+            self.shortcut_bindings = normalize_shortcut_bindings(
+                changed["shortcut_bindings"]
+            ).get("browser", {})
+            self._apply_browser_shortcuts()
+        if "browser_cancel_clears_filters" in changed:
+            self.browser_cancel_clears_filters = bool(
+                changed["browser_cancel_clears_filters"]
+            )
+            self._apply_browser_shortcuts()
         if "browser_tag_grouped" in changed:
             self.browser_tag_grouped = bool(changed["browser_tag_grouped"])
             self._rebuild_tag_menu()
@@ -4500,6 +4540,14 @@ class BrowserWindow(QMainWindow):
                 normalize_browser_folder_snapshot_cache_max_entries(
                     changed["browser_folder_snapshot_cache_max_entries"]
                 )
+            )
+        if (
+            "browser_folder_snapshot_cache_enabled" in changed
+            or "browser_folder_snapshot_cache_max_entries" in changed
+        ):
+            self.item_model.configure_filter_restore_cache(
+                enabled=self.folder_snapshot_cache.enabled,
+                max_entries=self.folder_snapshot_cache.max_entries,
             )
         if "thumbnail_webp_quality" in changed or "thumbnail_preserve_alpha" in changed:
             self.thumbnail_webp_quality = normalize_thumbnail_webp_quality(
@@ -5360,8 +5408,10 @@ class BrowserWindow(QMainWindow):
 
     def edit_tag_filter(self) -> None:
         from .browser_tag_dialogs import TagFilterDialog
+        previous_focus = QApplication.focusWidget()
         dialog = TagFilterDialog(self.browser_filter_state, self.config.get('browser_tag_registry', []), self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if accepted:
             self._browser_search_timer.stop()
             self._set_browser_filter(BrowserFilterState.normalized(
                 search_text=self.browser_search_edit.text(),
@@ -5369,6 +5419,18 @@ class BrowserWindow(QMainWindow):
                 rating_reference=self.browser_filter_state.rating_reference,
                 **dialog.filter_values(),
             ))
+        if self.isVisible() and QApplication.activeModalWidget() is None:
+            target = (
+                previous_focus
+                if isinstance(previous_focus, QWidget)
+                and previous_focus.isVisible()
+                and self.isAncestorOf(previous_focus)
+                and not self._is_browser_editing_surface(previous_focus)
+                else getattr(self, "tag_button", None)
+            )
+            if isinstance(target, QWidget):
+                self.activateWindow()
+                target.setFocus(Qt.FocusReason.PopupFocusReason)
 
     @staticmethod
     def _format_file_size(size: int | None) -> str:
@@ -5713,23 +5775,181 @@ class BrowserWindow(QMainWindow):
                 return True
         return False
 
+    def _browser_shortcut_has(self, action_id: str, event: QKeyEvent) -> bool:
+        combined = int(event.key()) | int(event.modifiers().value)
+        sequence = canonical_key(QKeySequence(combined))
+        return sequence in {
+            canonical_key(value)
+            for value in self.shortcut_bindings.get(action_id, [])
+        }
+
+    def _apply_browser_shortcuts(self) -> None:
+        for shortcut in getattr(self, "_browser_dynamic_shortcuts", []):
+            shortcut.setKey(QKeySequence())
+            shortcut.deleteLater()
+        self._browser_dynamic_shortcuts: list[QShortcut] = []
+        shortcut_map = {
+            "browser_focus_address": "focus_address_shortcut",
+            "browser_rename": "rename_shortcut",
+            "browser_delete": "recycle_shortcut",
+            "browser_copy": "copy_shortcut",
+            "browser_cut": "cut_shortcut",
+            "browser_paste": "paste_shortcut",
+            "browser_new_folder": "new_folder_shortcut",
+            "browser_toggle_folder_bookmark": "toggle_folder_bookmark_shortcut",
+            "browser_cancel": "clear_browser_search_shortcut",
+            "browser_clear_filters": "clear_filters_shortcut",
+        }
+        shortcut_handlers = {
+            "browser_focus_address": self.focus_address_bar,
+            "browser_rename": self.rename_selected_item,
+            "browser_delete": self.move_selected_to_recycle_bin,
+            "browser_copy": self.copy_selected_items,
+            "browser_cut": self.cut_selected_items,
+            "browser_paste": self.paste_items,
+            "browser_new_folder": self.create_new_folder,
+            "browser_toggle_folder_bookmark": self.toggle_current_folder_bookmark,
+            "browser_cancel": self._handle_browser_cancel_shortcut,
+            "browser_clear_filters": self._handle_browser_clear_filters_shortcut,
+        }
+        for action_id, attribute in shortcut_map.items():
+            shortcut = getattr(self, attribute, None)
+            values = self.shortcut_bindings.get(action_id, [])
+            if action_id == "browser_clear_filters" and self.browser_cancel_clears_filters:
+                values = []
+            if shortcut is not None:
+                shortcut.setKey(QKeySequence(values[0]) if values else QKeySequence())
+                handler = shortcut_handlers[action_id]
+                for value in values[1:]:
+                    extra = QShortcut(QKeySequence(value), shortcut.parent())
+                    extra.setContext(shortcut.context())
+                    extra.activated.connect(handler)
+                    self._browser_dynamic_shortcuts.append(extra)
+        action_map = {
+            "browser_back": getattr(self, "back_action", None),
+            "browser_forward": getattr(self, "forward_action", None),
+            "browser_up": getattr(self, "up_action", None),
+            "browser_refresh": getattr(self, "refresh_action", None),
+        }
+        for action_id, action in action_map.items():
+            if action is not None:
+                action.setShortcuts([
+                    QKeySequence(value)
+                    for value in self.shortcut_bindings.get(action_id, [])
+                ])
+
+    @staticmethod
+    def _is_browser_editing_surface(watched: object) -> bool:
+        current = watched
+        while isinstance(current, QWidget):
+            if isinstance(
+                current,
+                (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox),
+            ):
+                return True
+            if isinstance(current, QComboBox) and current.isEditable():
+                return True
+            current = current.parentWidget()
+        return False
+
+    def _is_browser_cancel_surface(self, watched: object) -> bool:
+        if self._is_browser_editing_surface(watched):
+            return False
+        return self._is_browser_cancel_command_surface(watched)
+
+    def _is_browser_cancel_command_surface(self, watched: object) -> bool:
+        """Return whether a non-editing widget belongs to this Browser window."""
+
+        # A child QDialog can have this Browser as its parent while still
+        # owning an independent keyboard context.
+        return isinstance(watched, QWidget) and watched.window() is self
+
+    def _browser_list_view_owns_cancel(self) -> bool:
+        checker = getattr(self.list_view, "has_active_interaction", None)
+        return bool(checker()) if callable(checker) else False
+
+    def _handle_browser_cancel_shortcut(self, watched: object | None = None) -> bool:
+        focus = QApplication.focusWidget()
+        if (
+            QApplication.activeModalWidget() is not None
+            or QApplication.activePopupWidget() is not None
+            or not self._is_browser_cancel_command_surface(watched or focus)
+        ):
+            return False
+        if (
+            self._is_browser_editing_surface(watched)
+            or (
+                self._is_browser_editing_surface(focus)
+                and focus is not self.browser_search_edit
+            )
+        ):
+            return False
+        in_browser_context = self._is_browser_cancel_surface(watched) or self._is_browser_cancel_surface(focus)
+        if in_browser_context and self.list_view.cancel_interaction():
+            return True
+        if (
+            self.browser_cancel_clears_filters
+            and (
+                self.browser_search_edit.text()
+                or self.browser_filter_state != BrowserFilterState.normalized()
+            )
+        ):
+            self.clear_browser_filters()
+            return True
+        if in_browser_context and self._clipboard_paths:
+            self.clear_file_clipboard()
+            self._show_temporary_status(tr('切り取り／コピー候補を解除しました'))
+            return True
+        return False
+
+    def _handle_browser_clear_filters_shortcut(self) -> bool:
+        if self.browser_cancel_clears_filters:
+            return False
+        focus = QApplication.focusWidget()
+        if (
+            QApplication.activeModalWidget() is not None
+            or QApplication.activePopupWidget() is not None
+            or self._is_browser_editing_surface(focus)
+        ):
+            return False
+        self.clear_browser_filters()
+        return True
+
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
         extra_button_result = self._handle_extra_button_event(watched, event)
         if extra_button_result is not None:
             return extra_button_result
         if (
-            watched in (self.list_view, self.list_view.viewport(), getattr(self, 'rating_filter_widget', None))
+            self._is_browser_cancel_command_surface(watched)
             and event.type() == QEvent.Type.KeyPress
             and isinstance(event, QKeyEvent)
-            and event.key() == Qt.Key.Key_Escape
-            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and self._browser_shortcut_has("browser_cancel", event)
             and QApplication.activeModalWidget() is None
             and QApplication.activePopupWidget() is None
-            and (self.browser_search_edit.text()
-                 or self.browser_filter_state != BrowserFilterState.normalized())
+            and not self._is_browser_editing_surface(watched)
+            and not self._is_browser_editing_surface(QApplication.focusWidget())
         ):
-            self.clear_browser_filters()
-            return True
+            if self._handle_browser_cancel_shortcut(watched):
+                return True
+        if (
+            watched in (self.list_view, self.list_view.viewport())
+            and event.type() == QEvent.Type.KeyPress
+            and isinstance(event, QKeyEvent)
+        ):
+            if self._browser_shortcut_has("browser_open_selection", event):
+                index = self.list_view.currentIndex()
+                if index.isValid():
+                    self.open_item(index)
+                return True
+            if (
+                event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and not self._browser_shortcut_has(
+                    "browser_open_selection", event
+                )
+            ):
+                # QListView's built-in activation would otherwise keep the
+                # default Return binding alive after it was unassigned.
+                return True
         if (
             watched in (self.list_view, self.list_view.viewport())
             and isinstance(event, QContextMenuEvent)
@@ -5808,22 +6028,10 @@ class BrowserWindow(QMainWindow):
                 self.list_view.setFocus(Qt.FocusReason.ShortcutFocusReason)
                 return True
         if (
-            watched is not self.address_bar
-            and event.type() == QEvent.Type.KeyPress
-            and isinstance(event, QKeyEvent)
-            and event.key() == Qt.Key.Key_Escape
-            and watched in (self.list_view, self.list_view.viewport())
-            and bool(self._clipboard_paths)
-        ):
-            self.clear_file_clipboard()
-            self._show_temporary_status(tr('切り取り／コピー候補を解除しました'))
-            return True
-        if (
             self._is_browser_history_key_surface(watched)
             and event.type() == QEvent.Type.KeyPress
             and isinstance(event, QKeyEvent)
-            and event.key() == Qt.Key.Key_Backspace
-            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and self._browser_shortcut_has("browser_backspace", event)
         ):
             self.go_back()
             return True
@@ -5831,8 +6039,7 @@ class BrowserWindow(QMainWindow):
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
         if (
-            event.key() == Qt.Key.Key_Backspace
-            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            self._browser_shortcut_has("browser_backspace", event)
             and self._is_browser_history_key_surface(
                 QApplication.focusWidget()
             )
@@ -5981,6 +6188,10 @@ class BrowserWindow(QMainWindow):
         self._apply_sidebar_layout()
 
         self.item_model = BrowserItemModel(self)
+        self.item_model.configure_filter_restore_cache(
+            enabled=self.folder_snapshot_cache.enabled,
+            max_entries=self.folder_snapshot_cache.max_entries,
+        )
         self.item_model.configure_sort(
             self.browser_sort_key,
             self.browser_sort_order,
@@ -6348,11 +6559,17 @@ class BrowserWindow(QMainWindow):
             Qt.ShortcutContext.WidgetShortcut
         )
         self.clear_browser_search_shortcut.activated.connect(
-            self.clear_browser_filters
+            self._handle_browser_cancel_shortcut
+        )
+        self.clear_filters_shortcut = QShortcut(QKeySequence(), self)
+        self.clear_filters_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.clear_filters_shortcut.activated.connect(
+            self._handle_browser_clear_filters_shortcut
         )
         self.rating_filter_widget.installEventFilter(self)
-        self.tag_button = QToolButton(self)
+        self.tag_button = TagFilterMenuButton(self)
         self.tag_button.setText(tr('タグ'))
+        self.tag_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.tag_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.tag_menu = QMenu(self.tag_button)
         self.tag_button.setMenu(self.tag_menu)

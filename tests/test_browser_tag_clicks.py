@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialogButtonBox, QLineEdit, QMenu, QPushButton
+from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QLineEdit, QMenu, QPushButton
 
 from app.browser_filter import BrowserFilterState
 from app.browser_tag_quick_filters import BrowserTagQuickFilterStrip
@@ -571,6 +571,32 @@ def test_filter_and_registry_lifecycle_real_events(library, qapp):
     assert not errors, errors
     assert [entry['name'] for entry in controller.config.get('browser_tag_registry')] == ['新', '旧']
     assert path.exists() and filename_tags(str(path)) == ('旧',)
+
+
+def test_tag_filter_dialog_apply_order_focus_and_escape(qapp):
+    def make_dialog():
+        dialog = TagFilterDialog(
+            BrowserFilterState(),
+            [{'name': '旧', 'color': '#ff8080'}],
+        )
+        dialog.show()
+        qapp.processEvents()
+        return dialog
+
+    dialog = make_dialog()
+    apply_button = dialog.buttons.button(QDialogButtonBox.StandardButton.Apply)
+    cancel_button = dialog.buttons.button(QDialogButtonBox.StandardButton.Cancel)
+    assert apply_button.geometry().x() < cancel_button.geometry().x()
+    assert apply_button.isDefault()
+    assert QApplication.focusWidget() is apply_button
+    dialog.controls['旧'].setCurrentIndex(1)
+    QTest.keyClick(dialog, Qt.Key.Key_Return)
+    assert dialog.result() == QDialog.DialogCode.Accepted
+    assert dialog.filter_values()['include_tags'] == ('旧',)
+
+    dialog = make_dialog()
+    QTest.keyClick(dialog, Qt.Key.Key_Escape)
+    assert dialog.result() == QDialog.DialogCode.Rejected
 
 
 @pytest.mark.parametrize('dpi', [1, 1.25, 1.5, 2])

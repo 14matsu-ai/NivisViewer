@@ -4,10 +4,12 @@ from .i18n import active_ui_language, tr
 
 
 from collections.abc import Callable
+from copy import deepcopy
 import logging
 from pathlib import Path
 
 from PySide6.QtCore import (
+    QEvent,
     QObject,
     QRunnable,
     QSize,
@@ -19,6 +21,8 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QColor,
     QGuiApplication,
+    QFontMetrics,
+    QKeyEvent,
     QKeySequence,
     QPainter,
     QPalette,
@@ -88,9 +92,13 @@ from .thumbnail_render import (
 )
 from .seven_zip_locator import SevenZipInfo, SevenZipLocator
 from .viewer_commands import COMMAND_CHOICES
-from .viewer_close_shortcut import (
-    normalize_viewer_close_shortcut,
-    viewer_close_shortcut_conflict,
+from .shortcut_catalog import (
+    SPECS_BY_SCOPE,
+    SHORTCUT_SPECS,
+    ShortcutSpec,
+    canonical_key,
+    default_shortcut_bindings,
+    normalize_shortcut_bindings,
 )
 from .viewer_memory_policy import VIEWER_MEMORY_MODE_LABELS
 from .viewer_render import (
@@ -105,11 +113,15 @@ _LOGGER = logging.getLogger(__name__)
 _FOLDER_SNAPSHOT_CACHE_TOOLTIP_TEXT = (
     'ファイル数の多いフォルダの再表示を高速化します。\n'
     '前回の一覧をメモリから先に表示し、あとで変更を確認します。\n'
+    '保存した一覧を使い、検索・タグ・レートの絞り込みと解除も高速化します。\n'
     'HDDや大量ファイルのフォルダで特に効果的です。'
 )
 _FOLDER_SNAPSHOT_CACHE_HELP_TEXT = (
     'この設定は、ファイル数の多いフォルダを戻る・進むなどで再表示するときの待ち時間を短くするためのものです。'
     'HDDや大量ファイルのフォルダで特に効果的です。\n\n'
+    '保存した一覧と並び順を再利用して、検索・タグ・レートの絞り込みと解除も高速化します。'
+    'タグ・レートの変更やファイルの移動・追加・削除は一覧へ反映します。'
+    '一覧が保存上限を超える場合や更新中は、通常の処理を使います。\n\n'
     '画像サムネイルではなく、フォルダ一覧のメタデータだけを現在のセッション中メモリに一時保存します。'
     '戻る・進むなどでは前回の一覧を先に表示し、バックグラウンドで追加・削除・変更を確認します。'
     '上限に達すると古い一覧から解放します。無効にすると保存しません。場所の履歴件数とは別の設定です。'
@@ -281,6 +293,280 @@ class _FFmpegProbeWorker(QRunnable):
 _RETIRED_SETTINGS_DIALOGS: set[QDialog] = set()
 
 
+TAB_SETTING_KEYS: dict[str, tuple[str, ...]] = {
+    "shortcuts_browser": ("shortcut_bindings", "browser_cancel_clears_filters"),
+    "shortcuts_viewer": ("shortcut_bindings", "viewer_slideshow_chord_enabled"),
+    "viewer": (
+        "open_viewer_behavior", "bring_viewer_to_front_on_open", "loop_book_navigation",
+        "join_spread_pages", "gap", "single_first_page", "treat_wide_image_as_single",
+        "book_open_position", "viewer_canvas_click_direction", "viewer_canvas_left_click_action",
+        "viewer_slider_wheel_single_page_enabled", "magnifier_allow_outside_image",
+        "viewer_prefetch_preset", "viewer_prefetch_direction_priority_enabled",
+        "viewer_memory_mode", "viewer_downscale_algorithm", "viewer_upscale_algorithm",
+        "magnifier_downscale_algorithm", "magnifier_upscale_algorithm",
+        "viewer_prefetch_image_forward_units", "viewer_prefetch_image_backward_units",
+        "viewer_prefetch_pdf_forward_units", "viewer_prefetch_pdf_backward_units",
+        "hide_ui_in_fullscreen", "hide_cursor_in_fullscreen", "fullscreen_auto_reveal_ui",
+        "fullscreen_top_edge_trigger_px", "fullscreen_bottom_edge_trigger_px",
+        "fullscreen_ui_hide_delay_ms",
+    ),
+    "browser": (
+        "thumbnail_size", "thumbnail_frame_ratio", "thumbnail_crop_mode",
+        "browser_thumbnail_display_mode", "browser_folder_fallback_background", "browser_file_fallback_background",
+        "browser_display_density", "browser_item_spacing_x", "browser_item_spacing_y", "browser_cell_padding",
+        "browser_sort_key", "browser_sort_order", "browser_random_seed", "browser_folders_first",
+        "browser_location_history_limit", "browser_search_history_limit", "browser_tag_grouped",
+        "browser_filename_display", "browser_filename_elide_mode", "browser_filename_font_size",
+        "browser_filename_show_extension", "browser_filename_gap", "browser_filename_padding_y",
+        "browser_show_hidden_items", "browser_show_unsupported_files", "browser_show_system_items",
+        "browser_folder_snapshot_cache_enabled", "browser_folder_snapshot_cache_max_entries",
+        "browser_sidebar_layout", "folder_tree_sync_mode", "folder_tree_collapse_unrelated",
+        "folder_tree_focus_rebase", "folder_tree_context_ancestor_levels", "favorite_row_padding_y",
+        "favorite_row_spacing", "favorite_icon_size", "browser_preserve_search_for_viewer_roundtrip",
+        "browser_center_folder_icon_size", "browser_center_folder_icon_custom_percent",
+        "browser_center_file_icon_size", "browser_center_file_icon_custom_percent",
+        "browser_badge_folder_icon_size", "browser_badge_folder_icon_custom_percent",
+        "browser_badge_file_icon_size", "browser_badge_file_icon_custom_percent",
+        "thumbnail_disk_cache_enabled", "thumbnail_cache_limit_mb", "thumbnail_cache_max_unused_days",
+        "thumbnail_quality_mode", "thumbnail_webp_quality", "thumbnail_preserve_alpha",
+        "thumbnail_cache_max_edge", "text_preview_enabled", "video_thumbnail_enabled",
+        "video_thumbnail_backend", "video_thumbnail_frame_mode", "video_thumbnail_shell_placeholder",
+        "ffmpeg_executable", "browser_external_drop_behavior",
+    ),
+    "file": (
+        "file_operation_delete_confirm_focus_yes", "file_operation_delete_skip_confirmation",
+    ),
+    "archive": ("archive_backend_preference", "winrar_executable", "seven_zip_executable"),
+    "mouse": (
+        "mouse_gestures_enabled", "mouse_gesture_show_trail", "mouse_gesture_min_distance",
+        "mouse_gesture_bindings", "browser_folder_gestures_enabled", "browser_wheel_scroll_mode",
+        "browser_wheel_scroll_custom_rows", "mouse_back_button_action", "mouse_forward_button_action",
+        "mouse_side_buttons_folder_navigation",
+    ),
+}
+
+
+class _SingleShortcutEdit(QKeySequenceEdit):
+    """Capture one simultaneous combination and reject multi-step values."""
+
+    _MODIFIER_KEYS = frozenset(
+        {
+            Qt.Key.Key_Shift,
+            Qt.Key.Key_Control,
+            Qt.Key.Key_Alt,
+            Qt.Key.Key_Meta,
+        }
+    )
+
+    modifier_only_rejected = Signal()
+    shortcut_input_started = Signal()
+    shortcut_focus_left = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        self.rejected_multi_step = False
+        self._modifier_gesture_started = False
+        self._modifier_gesture_has_normal = False
+        self._pressed_modifiers: set[Qt.Key] = set()
+        super().__init__(parent)
+
+    def setKeySequence(self, sequence: QKeySequence) -> None:  # noqa: N802
+        candidate = QKeySequence(sequence)
+        if candidate.count() > 1:
+            self.rejected_multi_step = True
+            self.keySequenceChanged.emit(self.keySequence())
+            return
+        self.rejected_multi_step = False
+        QKeySequenceEdit.setKeySequence(self, candidate)
+
+    @classmethod
+    def _sequence_text(
+        cls,
+        event: QKeyEvent,
+        held_modifiers: set[Qt.Key] | None = None,
+    ) -> str:
+        if event.key() in cls._MODIFIER_KEYS:
+            return ""
+        modifiers = int(event.modifiers().value)
+        for key in held_modifiers or ():
+            modifiers |= int(
+                {
+                    Qt.Key.Key_Control: Qt.KeyboardModifier.ControlModifier,
+                    Qt.Key.Key_Shift: Qt.KeyboardModifier.ShiftModifier,
+                    Qt.Key.Key_Alt: Qt.KeyboardModifier.AltModifier,
+                    Qt.Key.Key_Meta: Qt.KeyboardModifier.MetaModifier,
+                }[key].value
+            )
+        combined = int(event.key()) | modifiers
+        return canonical_key(QKeySequence(combined))
+
+    def event(self, event: QEvent) -> bool:  # type: ignore[override]
+        if event.type() == QEvent.Type.ShortcutOverride and isinstance(event, QKeyEvent):
+            if event.key() in self._MODIFIER_KEYS or self._sequence_text(event):
+                event.accept()
+                return True
+        return super().event(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
+        self.shortcut_input_started.emit()
+        if event.key() in self._MODIFIER_KEYS:
+            if not self._modifier_gesture_started:
+                self._modifier_gesture_started = True
+                self._modifier_gesture_has_normal = False
+                self._pressed_modifiers.clear()
+            self._pressed_modifiers.add(event.key())
+            event.accept()
+            return
+        if self._modifier_gesture_started:
+            self._modifier_gesture_has_normal = True
+            sequence = self._sequence_text(event, self._pressed_modifiers)
+            if sequence:
+                QKeySequenceEdit.setKeySequence(self, QKeySequence(sequence))
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
+        if event.key() in self._MODIFIER_KEYS:
+            self._pressed_modifiers.discard(event.key())
+            if self._modifier_gesture_started and not self._pressed_modifiers:
+                if not self._modifier_gesture_has_normal:
+                    self.modifier_only_rejected.emit()
+                self._modifier_gesture_started = False
+                self._modifier_gesture_has_normal = False
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+    def focusOutEvent(self, event: QEvent) -> None:  # type: ignore[override]
+        self._pressed_modifiers.clear()
+        self._modifier_gesture_started = False
+        self._modifier_gesture_has_normal = False
+        self.shortcut_focus_left.emit()
+        super().focusOutEvent(event)
+
+
+class _ShortcutSearchEdit(QLineEdit):
+    """Capture one portable key combination as the shortcut search query."""
+
+    _MODIFIER_KEYS = frozenset(
+        {
+            Qt.Key.Key_Shift,
+            Qt.Key.Key_Control,
+            Qt.Key.Key_Alt,
+            Qt.Key.Key_Meta,
+        }
+    )
+
+    _MODIFIER_LABELS = {
+        Qt.Key.Key_Control: "Ctrl",
+        Qt.Key.Key_Shift: "Shift",
+        Qt.Key.Key_Alt: "Alt",
+        Qt.Key.Key_Meta: "Meta",
+    }
+    _MODIFIER_ORDER = (
+        Qt.Key.Key_Control,
+        Qt.Key.Key_Shift,
+        Qt.Key.Key_Alt,
+        Qt.Key.Key_Meta,
+    )
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        self._modifier_gesture_started = False
+        self._modifier_gesture_has_normal = False
+        self._pressed_modifiers: set[Qt.Key] = set()
+        self._modifier_gesture_keys: set[Qt.Key] = set()
+        super().__init__(parent)
+
+    @classmethod
+    def _sequence_text(
+        cls,
+        event: QKeyEvent,
+        held_modifiers: set[Qt.Key] | None = None,
+    ) -> str:
+        if event.key() in cls._MODIFIER_KEYS:
+            return ""
+        modifiers = int(event.modifiers().value)
+        for key in held_modifiers or ():
+            modifiers |= int(
+                {
+                    Qt.Key.Key_Control: Qt.KeyboardModifier.ControlModifier,
+                    Qt.Key.Key_Shift: Qt.KeyboardModifier.ShiftModifier,
+                    Qt.Key.Key_Alt: Qt.KeyboardModifier.AltModifier,
+                    Qt.Key.Key_Meta: Qt.KeyboardModifier.MetaModifier,
+                }[key].value
+            )
+        combined = int(event.key()) | modifiers
+        sequence = QKeySequence(combined)
+        return canonical_key(sequence)
+
+    def event(self, event: QEvent) -> bool:  # type: ignore[override]
+        if event.type() == QEvent.Type.ShortcutOverride and isinstance(event, QKeyEvent):
+            # Claim the candidate so the parent SettingsDialog does not run a
+            # dialog shortcut before the search field sees the KeyPress.
+            if event.key() in self._MODIFIER_KEYS or self._sequence_text(event):
+                event.accept()
+                return True
+        return super().event(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
+        if event.key() in self._MODIFIER_KEYS:
+            if not self._modifier_gesture_started:
+                self._modifier_gesture_started = True
+                self._modifier_gesture_has_normal = False
+                self._pressed_modifiers.clear()
+                self._modifier_gesture_keys.clear()
+            self._pressed_modifiers.add(event.key())
+            self._modifier_gesture_keys.add(event.key())
+            event.accept()
+            return
+        sequence = self._sequence_text(
+            event,
+            self._pressed_modifiers if self._modifier_gesture_started else None,
+        )
+        if sequence:
+            if self._modifier_gesture_started:
+                self._modifier_gesture_has_normal = True
+            self.setText(sequence)
+            self.selectAll()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
+        if event.key() in self._MODIFIER_KEYS:
+            self._pressed_modifiers.discard(event.key())
+            if self._modifier_gesture_started and not self._pressed_modifiers:
+                if not self._modifier_gesture_has_normal:
+                    query = "+".join(
+                        self._MODIFIER_LABELS[key]
+                        for key in self._MODIFIER_ORDER
+                        if key in self._modifier_gesture_keys
+                    )
+                    self.setText(query)
+                    self.selectAll()
+                self._modifier_gesture_started = False
+                self._modifier_gesture_has_normal = False
+                self._modifier_gesture_keys.clear()
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+    def focusOutEvent(self, event: QEvent) -> None:  # type: ignore[override]
+        self._pressed_modifiers.clear()
+        self._modifier_gesture_started = False
+        self._modifier_gesture_has_normal = False
+        self._modifier_gesture_keys.clear()
+        super().focusOutEvent(event)
+
+
+class _ShortcutPage(QWidget):
+    resized = Signal()
+
+    def resizeEvent(self, event: QEvent) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self.resized.emit()
+
+
 class SettingsDialog(QDialog):
     settings_applied = Signal(object)
     cache_clear_requested = Signal()
@@ -362,6 +648,10 @@ class SettingsDialog(QDialog):
             self._scrollable_tab(self._build_windows_tab()),
             tr('Windows連携'),
         )
+        self.tabs.addTab(
+            self._build_shortcuts_tab(),
+            tr('ショートカット'),
+        )
         self.tabs.addTab(self._scrollable_tab(self._build_general_tab()), tr('一般'))
 
         self.button_box = QDialogButtonBox(
@@ -398,6 +688,841 @@ class SettingsDialog(QDialog):
         scroll.setWidget(content)
         self._scroll_areas.append(scroll)
         return scroll
+
+    def _build_shortcuts_tab(self) -> QWidget:
+        tab = QWidget(self)
+        tab.setObjectName("shortcuts_tab")
+        layout = QVBoxLayout(tab)
+        search_row = QHBoxLayout()
+        search_row.setContentsMargins(0, 0, 0, 0)
+        self.shortcut_search_edit = _ShortcutSearchEdit(tab)
+        self.shortcut_search_edit.setObjectName("shortcut_search")
+        self.shortcut_search_edit.setPlaceholderText(
+            tr("キーの組み合わせで検索（1つのキーまたは同時押し）")
+        )
+        self.shortcut_search_edit.setToolTip(
+            tr("キーの組み合わせを入力すると、そのキーを割り当てた機能を表示します。")
+        )
+        search_row.addWidget(self.shortcut_search_edit, 1)
+        self.shortcut_search_clear_button = QToolButton(tab)
+        self.shortcut_search_clear_button.setObjectName("shortcut_search_clear")
+        self.shortcut_search_clear_button.setText("×")
+        self.shortcut_search_clear_button.setAutoRaise(True)
+        self.shortcut_search_clear_button.setToolTip(tr("検索をクリア"))
+        self.shortcut_search_clear_button.clicked.connect(
+            self._clear_shortcut_search
+        )
+        search_row.addWidget(self.shortcut_search_clear_button)
+        layout.addLayout(search_row)
+        self.shortcut_tabs = QTabWidget(tab)
+        self.shortcut_scope_scrolls: dict[str, QScrollArea] = {}
+        self.shortcut_editors: dict[tuple[str, str], list[QKeySequenceEdit]] = {}
+        self._shortcut_extra_bindings: dict[tuple[str, str], list[str]] = {}
+        self.shortcut_rows: dict[tuple[str, str], QWidget] = {}
+        self.shortcut_labels: dict[tuple[str, str], QLabel] = {}
+        self.shortcut_move_buttons: dict[tuple[str, str], QPushButton] = {}
+        self.shortcut_reset_buttons: dict[tuple[str, str], QPushButton] = {}
+        self._shortcut_pages: dict[str, _ShortcutPage] = {}
+        self._shortcut_modifier_warning: tuple[str, str] | None = None
+        self._shortcut_last_edited: tuple[str, str] | None = None
+        self.shortcut_status = QLabel(tab)
+        self.shortcut_status.setObjectName("shortcut_status")
+        self.shortcut_status.setStyleSheet("color: #ff262a;")
+        self.shortcut_status.setWordWrap(True)
+        self.shortcut_status.hide()
+        button_metrics = QFontMetrics(self.font())
+        shortcut_button_group_width = max(
+            96,
+            button_metrics.horizontalAdvance(tr("既定に戻す")) + 20,
+            button_metrics.horizontalAdvance(tr("競合を移動")) + 20,
+        )
+        for scope, title in (("browser", "Browser"), ("viewer", "Viewer")):
+            page = _ShortcutPage(self.shortcut_tabs)
+            page.resized.connect(self._position_shortcut_move_buttons)
+            page.installEventFilter(self)
+            self._shortcut_pages[scope] = page
+            page_policy = page.sizePolicy()
+            page_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+            page.setSizePolicy(page_policy)
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(8, 8, 8, 8)
+            for spec in SPECS_BY_SCOPE[scope]:
+                row = QWidget(page)
+                row.setObjectName(f"shortcut_row_{scope}_{spec.action_id}")
+                row_layout = QFormLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setHorizontalSpacing(8)
+                row_layout.setVerticalSpacing(4)
+                row_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+                label = QLabel(tr(spec.label), row)
+                label.setObjectName(f"shortcut_label_{scope}_{spec.action_id}")
+                label.setWordWrap(True)
+                label.setSizePolicy(
+                    QSizePolicy.Policy.Preferred,
+                    QSizePolicy.Policy.Minimum,
+                )
+                if scope == "browser" and spec.action_id == "browser_cancel":
+                    label.setToolTip(
+                        tr("選択操作を先に解除し、次に絞り込み、最後にコピー／切り取り候補を解除します。")
+                    )
+                    row.setToolTip(label.toolTip())
+                if scope == "browser" and spec.action_id == "browser_toggle_folder_bookmark":
+                    label.setToolTip(
+                        tr("右クリックした項目ではなく、現在開いているフォルダをお気に入りに登録／解除します。")
+                    )
+                    row.setToolTip(label.toolTip())
+                label.setMinimumWidth(120)
+                editor_block = QWidget(row)
+                editor_block.setObjectName(
+                    f"shortcut_editor_block_{scope}_{spec.action_id}"
+                )
+                editor_block.installEventFilter(self)
+                editor_block.setMinimumHeight(38)
+                is_browser_cancel = (
+                    scope == "browser" and spec.action_id == "browser_cancel"
+                )
+                if is_browser_cancel:
+                    editor_layout = QVBoxLayout(editor_block)
+                    editor_layout.setContentsMargins(0, 0, 0, 0)
+                    editor_layout.setSpacing(4)
+                    self.browser_cancel_filter_option_row = QWidget(editor_block)
+                    option_layout = QHBoxLayout(
+                        self.browser_cancel_filter_option_row
+                    )
+                    option_layout.setContentsMargins(0, 0, 0, 0)
+                    self.browser_cancel_clears_filters_checkbox = QCheckBox(
+                        tr("検索・評価・タグ絞り込みを解除も含める"),
+                        self.browser_cancel_filter_option_row,
+                    )
+                    self.browser_cancel_clears_filters_checkbox.setObjectName(
+                        "browser_cancel_clears_filters"
+                    )
+                    self.browser_cancel_clears_filters_checkbox.setChecked(True)
+                    self.browser_cancel_clears_filters_checkbox.toggled.connect(
+                        self._sync_browser_cancel_filter_controls
+                    )
+                    option_layout.addWidget(
+                        self.browser_cancel_clears_filters_checkbox
+                    )
+                    option_layout.addStretch(1)
+                    editor_layout.addWidget(self.browser_cancel_filter_option_row)
+                    editor_row = QWidget(editor_block)
+                    editor_row_layout = QHBoxLayout(editor_row)
+                    editor_row_layout.setContentsMargins(0, 0, 0, 0)
+                    editor_row_layout.setSpacing(4)
+                    editor_layout.addWidget(editor_row)
+                    shortcut_controls_layout = editor_row_layout
+                else:
+                    editor_layout = QHBoxLayout(editor_block)
+                    editor_layout.setContentsMargins(0, 0, 0, 0)
+                    editor_layout.setSpacing(4)
+                    shortcut_controls_layout = editor_layout
+                editors: list[QKeySequenceEdit] = []
+                editor_minimum_width = self._shortcut_editor_minimum_width()
+                for index in range(3):
+                    editor = _SingleShortcutEdit(row)
+                    editor.setObjectName(
+                        f"shortcut_edit_{scope}_{spec.action_id}_{index}"
+                    )
+                    editor.setMaximumSequenceLength(1)
+                    editor.setMinimumWidth(editor_minimum_width)
+                    editor.setSizePolicy(
+                        QSizePolicy.Policy.Expanding,
+                        QSizePolicy.Policy.Fixed,
+                    )
+                    editor.setToolTip(tr("空欄は未割り当て。1つのキーまたは同時押しのみ。"))
+                    editor.keySequenceChanged.connect(
+                        lambda _sequence, current_scope=scope, action_id=spec.action_id:
+                        self._on_shortcut_editor_changed(current_scope, action_id)
+                    )
+                    editor.shortcut_input_started.connect(
+                        lambda current_scope=scope, action_id=spec.action_id:
+                        self._on_shortcut_editor_input_started(current_scope, action_id)
+                    )
+                    editor.modifier_only_rejected.connect(
+                        lambda current_scope=scope, action_id=spec.action_id:
+                        self._on_shortcut_modifier_only_rejected(current_scope, action_id)
+                    )
+                    editor.shortcut_focus_left.connect(
+                        lambda current_scope=scope, action_id=spec.action_id:
+                        self._on_shortcut_editor_focus_left(current_scope, action_id)
+                    )
+                    shortcut_controls_layout.addWidget(editor, 1)
+                    editors.append(editor)
+                button_group = QWidget(editor_block)
+                button_layout = QVBoxLayout(button_group)
+                button_layout.setContentsMargins(0, 0, 0, 0)
+                button_layout.setSpacing(0)
+                button_group.setFixedWidth(shortcut_button_group_width)
+                reset_action = QPushButton(tr("既定に戻す"), button_group)
+                reset_action.setObjectName(
+                    f"shortcut_reset_{scope}_{spec.action_id}"
+                )
+                reset_action.clicked.connect(
+                    lambda _checked=False, current_scope=scope, action_id=spec.action_id:
+                    self._reset_shortcut_action(current_scope, action_id)
+                )
+                button_layout.addWidget(reset_action)
+                move_button = QPushButton(tr("競合を移動"), button_group)
+                move_button.setObjectName(
+                    f"shortcut_move_{scope}_{spec.action_id}"
+                )
+                move_button.clicked.connect(
+                    lambda _checked=False, current_scope=scope, action_id=spec.action_id:
+                    self._move_shortcut_conflicts(current_scope, action_id)
+                )
+                move_button.setEnabled(False)
+                move_button.setVisible(True)
+                shortcut_controls_layout.addWidget(
+                    button_group, 0, Qt.AlignmentFlag.AlignVCenter
+                )
+                move_button.setParent(page)
+                move_button.raise_()
+                row_layout.addRow(label, editor_block)
+                row_layout.setAlignment(editor_block, Qt.AlignmentFlag.AlignVCenter)
+                page_layout.addWidget(row)
+                self.shortcut_editors[(scope, spec.action_id)] = editors
+                self.shortcut_rows[(scope, spec.action_id)] = row
+                self.shortcut_labels[(scope, spec.action_id)] = label
+                self.shortcut_move_buttons[(scope, spec.action_id)] = move_button
+                self.shortcut_reset_buttons[(scope, spec.action_id)] = reset_action
+            # Move buttons sit in the following label band.  Reserve that
+            # same band after the final row so the tab extras/footer remain
+            # clear without increasing every shortcut row.
+            page_layout.addSpacing(28)
+            if scope == "viewer":
+                self.viewer_slideshow_chord_checkbox = QCheckBox(
+                    tr("数字キー＋Sでスライドショーを開始"), page
+                )
+                self.viewer_slideshow_chord_checkbox.setObjectName(
+                    "viewer_slideshow_chord_enabled"
+                )
+                self.viewer_slideshow_chord_checkbox.toggled.connect(
+                    self._sync_shortcut_status
+                )
+                page_layout.addWidget(self.viewer_slideshow_chord_checkbox)
+                note = QLabel(
+                    tr("有効時は未修飾の1〜9とSをこの機能が予約します。Ctrl付きは利用できます。"),
+                    page,
+                )
+                note.setWordWrap(True)
+                page_layout.addWidget(note)
+            reset = QPushButton(tr("このタブのすべての設定を既定に戻す"), page)
+            reset.setObjectName(f"reset_shortcuts_{scope}")
+            reset.clicked.connect(
+                lambda _checked=False, current_scope=scope:
+                self._reset_tab_draft(f"shortcuts_{current_scope}")
+            )
+            page_layout.addWidget(reset)
+            page_layout.addStretch(1)
+            scope_scroll = QScrollArea(self.shortcut_tabs)
+            scope_scroll.setObjectName(f"shortcut_scope_scroll_{scope}")
+            scope_scroll.setWidgetResizable(True)
+            scope_scroll.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            scope_scroll.setWidget(page)
+            self.shortcut_scope_scrolls[scope] = scope_scroll
+            self.shortcut_tabs.addTab(scope_scroll, title)
+        self._position_shortcut_move_buttons()
+        layout.addWidget(self.shortcut_tabs, 1)
+        layout.addWidget(self.shortcut_status)
+        self.shortcut_search_edit.textChanged.connect(self._filter_shortcut_rows)
+        return tab
+
+    def showEvent(self, event: QEvent) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._position_shortcut_move_buttons()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
+        if isinstance(watched, _ShortcutPage) and event.type() == QEvent.Type.LayoutRequest:
+            self._position_shortcut_move_buttons()
+        elif (
+            isinstance(watched, QWidget)
+            and watched.objectName().startswith("shortcut_editor_block_")
+            and event.type() == QEvent.Type.Resize
+        ):
+            self._position_shortcut_move_buttons()
+        return super().eventFilter(watched, event)
+
+    def _position_shortcut_move_buttons(self) -> None:
+        for (scope, action_id), move_button in self.shortcut_move_buttons.items():
+            page = self._shortcut_pages.get(scope)
+            row = self.shortcut_rows.get((scope, action_id))
+            reset_button = self.shortcut_reset_buttons.get((scope, action_id))
+            if page is None or row is None or reset_button is None:
+                continue
+            if row.isHidden():
+                move_button.hide()
+                continue
+            top_left = reset_button.mapTo(page, reset_button.rect().bottomLeft())
+            move_button.setGeometry(
+                top_left.x(),
+                top_left.y(),
+                reset_button.width(),
+                reset_button.height(),
+            )
+            move_button.show()
+
+    def _shortcut_editor_minimum_width(self) -> int:
+        metrics = QFontMetrics(self.font())
+        longest = max(
+            metrics.horizontalAdvance("Ctrl+Shift+PageDown"),
+            metrics.horizontalAdvance("Ctrl+Alt+Shift+W"),
+        )
+        # Keep the three columns usable in a compact settings window.  The
+        # editor itself can scroll horizontally when a larger key name does
+        # not fit; letting the minimum grow with a fallback font makes the
+        # whole row wider than the visible shortcut page and clips the reset
+        # column.
+        return max(112, min(longest + 24, 136))
+
+    def _on_shortcut_editor_changed(self, scope: str, action_id: str) -> None:
+        self._sync_shortcut_status(scope, action_id)
+        self._update_shortcut_editor_tooltips(scope, action_id)
+        self._filter_shortcut_rows(self.shortcut_search_edit.text())
+
+    def _sync_browser_cancel_filter_controls(self, *_args: object) -> None:
+        enabled = not self.browser_cancel_clears_filters_checkbox.isChecked()
+        key = ("browser", "browser_clear_filters")
+        for editor in self.shortcut_editors.get(key, ()):
+            editor.setEnabled(enabled)
+        label = self.shortcut_labels.get(key)
+        if label is not None:
+            label.setEnabled(enabled)
+        reset_button = self.shortcut_reset_buttons.get(key)
+        if reset_button is not None:
+            reset_button.setEnabled(enabled)
+        move_button = self.shortcut_move_buttons.get(key)
+        if move_button is not None:
+            move_button.setEnabled(enabled and move_button.isEnabled())
+        self._sync_shortcut_status()
+
+    def _on_shortcut_editor_input_started(self, scope: str, action_id: str) -> None:
+        if self._shortcut_modifier_warning is None:
+            return
+        self._shortcut_modifier_warning = None
+        self._sync_shortcut_status(scope, action_id)
+
+    def _on_shortcut_modifier_only_rejected(self, scope: str, action_id: str) -> None:
+        self._shortcut_modifier_warning = (scope, action_id)
+        self._sync_shortcut_status(scope, action_id)
+
+    def _on_shortcut_editor_focus_left(self, scope: str, action_id: str) -> None:
+        if self._shortcut_modifier_warning is None:
+            return
+        self._shortcut_modifier_warning = None
+        self._sync_shortcut_status(scope, action_id)
+
+    def _clear_shortcut_search(self) -> None:
+        self.shortcut_search_edit.clear()
+        self.shortcut_search_edit.setFocus(Qt.FocusReason.MouseFocusReason)
+
+    def _update_shortcut_editor_tooltips(self, scope: str, action_id: str) -> None:
+        editors = self.shortcut_editors[(scope, action_id)]
+        keys = [
+            canonical_key(editor.keySequence())
+            for editor in editors
+            if canonical_key(editor.keySequence())
+        ]
+        keys.extend(self._shortcut_extra_bindings.get((scope, action_id), ()))
+        suffix = ", ".join(keys)
+        tooltip = tr("空欄は未割り当て。1つのキーまたは同時押しのみ。")
+        if suffix:
+            tooltip = f"{tooltip}\n{suffix}"
+        for editor in editors:
+            editor.setToolTip(tooltip)
+
+    def _make_tab_reset_button(self, scope: str, parent: QWidget) -> QPushButton:
+        button = QPushButton(tr("このタブのすべての設定を既定に戻す"), parent)
+        button.setObjectName(f"reset_{scope}_tab")
+        button.clicked.connect(
+            lambda _checked=False, current_scope=scope:
+            self._reset_tab_draft(current_scope)
+        )
+        return button
+
+    def _reset_tab_draft(self, scope: str) -> None:
+        """Reset only the selected tab's draft controls.
+
+        This intentionally writes widgets directly.  Replacing ``config.data``
+        and reloading the whole dialog would discard unrelated invalid draft
+        shortcuts and would also run cache/registration probes.
+        """
+        if scope == "shortcuts_browser":
+            self._reset_shortcut_scope("browser")
+        elif scope == "shortcuts_viewer":
+            self._reset_shortcut_scope("viewer")
+            self.viewer_slideshow_chord_checkbox.setChecked(
+                bool(ConfigManager.DEFAULTS["viewer_slideshow_chord_enabled"])
+            )
+            self._sync_shortcut_status()
+        elif scope == "viewer":
+            self._reset_viewer_scope()
+        elif scope == "browser":
+            self._reset_browser_scope()
+        elif scope == "file":
+            self.delete_confirm_focus_yes_checkbox.setChecked(
+                bool(ConfigManager.DEFAULTS["file_operation_delete_confirm_focus_yes"])
+            )
+            self.delete_skip_confirmation_checkbox.setChecked(
+                bool(ConfigManager.DEFAULTS["file_operation_delete_skip_confirmation"])
+            )
+            self._sync_delete_confirmation_controls()
+        elif scope == "archive":
+            self._select_data(
+                self.archive_backend_combo,
+                ConfigManager.DEFAULTS["archive_backend_preference"],
+            )
+            self.winrar_path_edit.setText(str(ConfigManager.DEFAULTS["winrar_executable"] or ""))
+            self.seven_zip_path_edit.setText(str(ConfigManager.DEFAULTS["seven_zip_executable"] or ""))
+        elif scope == "mouse":
+            self._reset_mouse_scope()
+
+    def _reset_shortcut_scope(self, scope: str) -> None:
+        defaults = ConfigManager.DEFAULTS["shortcut_bindings"].get(scope, {})
+        for (editor_scope, action_id), editors in self.shortcut_editors.items():
+            if editor_scope != scope:
+                continue
+            self._shortcut_extra_bindings.pop((editor_scope, action_id), None)
+            values = defaults.get(action_id, ())
+            for index, editor in enumerate(editors):
+                editor.setKeySequence(
+                    QKeySequence(values[index])
+                    if index < len(values)
+                    else QKeySequence()
+                )
+        if scope == "browser":
+            self.browser_cancel_clears_filters_checkbox.setChecked(
+                bool(ConfigManager.DEFAULTS["browser_cancel_clears_filters"])
+            )
+            self._sync_browser_cancel_filter_controls()
+        self._sync_shortcut_status()
+
+    def _reset_viewer_scope(self) -> None:
+        defaults = ConfigManager.DEFAULTS
+        self._select_data(self.open_behavior_combo, defaults["open_viewer_behavior"])
+        self.bring_to_front_checkbox.setChecked(bool(defaults["bring_viewer_to_front_on_open"]))
+        self.loop_navigation_checkbox.setChecked(bool(defaults["loop_book_navigation"]))
+        self.join_spread_checkbox.setChecked(bool(defaults["join_spread_pages"]))
+        self.gap_spin.setValue(int(defaults["gap"]))
+        self.single_first_checkbox.setChecked(bool(defaults["single_first_page"]))
+        self.wide_single_checkbox.setChecked(bool(defaults["treat_wide_image_as_single"]))
+        self._select_data(self.book_open_position_combo, defaults["book_open_position"])
+        self._select_data(self.viewer_canvas_click_direction_combo, defaults["viewer_canvas_click_direction"])
+        self._select_data(self.viewer_canvas_left_click_combo, defaults["viewer_canvas_left_click_action"])
+        self.viewer_slider_wheel_single_page_checkbox.setChecked(
+            bool(defaults["viewer_slider_wheel_single_page_enabled"])
+        )
+        self.magnifier_allow_outside_image_checkbox.setChecked(
+            bool(defaults["magnifier_allow_outside_image"])
+        )
+        self._custom_prefetch_values = {
+            "image_forward_units": int(defaults["viewer_prefetch_image_forward_units"]),
+            "image_backward_units": int(defaults["viewer_prefetch_image_backward_units"]),
+            "pdf_forward_units": int(defaults["viewer_prefetch_pdf_forward_units"]),
+            "pdf_backward_units": int(defaults["viewer_prefetch_pdf_backward_units"]),
+        }
+        self._select_data(self.prefetch_preset_combo, defaults["viewer_prefetch_preset"])
+        self._select_data(self.viewer_memory_mode_combo, defaults["viewer_memory_mode"])
+        self._select_data(self.viewer_downscale_algorithm_combo, defaults["viewer_downscale_algorithm"])
+        self._select_data(self.viewer_upscale_algorithm_combo, defaults["viewer_upscale_algorithm"])
+        self._select_data(self.magnifier_downscale_algorithm_combo, defaults["magnifier_downscale_algorithm"])
+        self._select_data(self.magnifier_upscale_algorithm_combo, defaults["magnifier_upscale_algorithm"])
+        self.prefetch_direction_priority_checkbox.setChecked(
+            bool(defaults["viewer_prefetch_direction_priority_enabled"])
+        )
+        self._on_prefetch_preset_changed(self.prefetch_preset_combo.currentIndex())
+        self.fullscreen_hide_ui_checkbox.setChecked(bool(defaults["hide_ui_in_fullscreen"]))
+        self.fullscreen_hide_cursor_checkbox.setChecked(bool(defaults["hide_cursor_in_fullscreen"]))
+        self.fullscreen_auto_reveal_checkbox.setChecked(bool(defaults["fullscreen_auto_reveal_ui"]))
+        self.fullscreen_top_edge_trigger_spin.setValue(int(defaults["fullscreen_top_edge_trigger_px"]))
+        self.fullscreen_bottom_edge_trigger_spin.setValue(int(defaults["fullscreen_bottom_edge_trigger_px"]))
+        self.fullscreen_hide_delay_spin.setValue(int(defaults["fullscreen_ui_hide_delay_ms"]))
+        self._sync_gap_enabled(self.join_spread_checkbox.isChecked())
+
+    def _reset_browser_scope(self) -> None:
+        defaults = ConfigManager.DEFAULTS
+        self.thumbnail_size_spin.setValue(int(defaults["thumbnail_size"]))
+        self._select_data(self.thumbnail_frame_ratio_combo, defaults["thumbnail_frame_ratio"])
+        self._select_data(self.thumbnail_crop_mode_combo, defaults["thumbnail_crop_mode"])
+        self._select_data(self.browser_thumbnail_display_mode_combo, defaults["browser_thumbnail_display_mode"])
+        for key, editor in self._fallback_background_editors.items():
+            editor.load_value(str(defaults[key]))
+        for key, custom_key, _label in ICON_SIZE_SETTING_SPECS:
+            self._select_data(self.browser_icon_size_combos[key], defaults[key])
+            self.browser_icon_size_custom_spins[custom_key].setValue(int(defaults[custom_key]))
+            self.browser_icon_size_custom_spins[custom_key].setEnabled(
+                self.browser_icon_size_combos[key].currentData() == "custom"
+            )
+        self._select_data(self.thumbnail_quality_mode_combo, defaults["thumbnail_quality_mode"])
+        self.thumbnail_webp_quality_spin.setValue(int(defaults["thumbnail_webp_quality"]))
+        self.thumbnail_preserve_alpha_checkbox.setChecked(bool(defaults["thumbnail_preserve_alpha"]))
+        self.thumbnail_cache_max_edge_spin.setValue(int(defaults["thumbnail_cache_max_edge"]))
+        self._select_data(self.browser_display_density_combo, defaults["browser_display_density"])
+        self._select_data(self.browser_filename_display_combo, defaults["browser_filename_display"])
+        self.browser_filename_gap_spin.setValue(int(defaults["browser_filename_gap"]))
+        self.browser_filename_padding_y_spin.setValue(int(defaults["browser_filename_padding_y"]))
+        self.browser_tag_grouped_checkbox.setChecked(bool(defaults["browser_tag_grouped"]))
+        self.browser_filename_extension_checkbox.setChecked(bool(defaults["browser_filename_show_extension"]))
+        self._select_data(self.browser_filename_elide_combo, defaults["browser_filename_elide_mode"])
+        self._select_data(self.browser_filename_font_size_combo, defaults["browser_filename_font_size"])
+        self.browser_show_hidden_checkbox.setChecked(bool(defaults["browser_show_hidden_items"]))
+        self.browser_show_unsupported_checkbox.setChecked(bool(defaults["browser_show_unsupported_files"]))
+        self.browser_show_system_checkbox.setChecked(bool(defaults["browser_show_system_items"]))
+        self.browser_folder_snapshot_cache_checkbox.setChecked(bool(defaults["browser_folder_snapshot_cache_enabled"]))
+        self._select_data(
+            self.browser_folder_snapshot_cache_max_entries_combo,
+            defaults["browser_folder_snapshot_cache_max_entries"],
+        )
+        self._sync_browser_folder_snapshot_cache_controls()
+        self._browser_random_seed = defaults["browser_random_seed"]
+        self._browser_random_sort_order = defaults["browser_sort_order"]
+        self.browser_sort_key_combo.setCurrentIndex(
+            browser_sort_choice_index(defaults["browser_sort_key"], defaults["browser_sort_order"])
+        )
+        self.browser_folders_first_checkbox.setChecked(bool(defaults["browser_folders_first"]))
+        self.browser_location_history_limit_spin.setValue(int(defaults["browser_location_history_limit"]))
+        self.browser_search_history_limit_spin.setValue(int(defaults["browser_search_history_limit"]))
+        self.browser_preserve_search_for_viewer_roundtrip_checkbox.setChecked(
+            bool(defaults["browser_preserve_search_for_viewer_roundtrip"])
+        )
+        self.browser_item_spacing_x_spin.setValue(int(defaults["browser_item_spacing_x"]))
+        self.browser_item_spacing_y_spin.setValue(int(defaults["browser_item_spacing_y"]))
+        self.browser_cell_padding_spin.setValue(int(defaults["browser_cell_padding"]))
+        self._select_data(self.browser_sidebar_layout_combo, defaults["browser_sidebar_layout"])
+        self._select_data(self.folder_tree_sync_mode_combo, defaults["folder_tree_sync_mode"])
+        self.folder_tree_collapse_checkbox.setChecked(bool(defaults["folder_tree_collapse_unrelated"]))
+        self.folder_tree_focus_rebase_checkbox.setChecked(bool(defaults["folder_tree_focus_rebase"]))
+        self.folder_tree_ancestor_levels_spin.setValue(int(defaults["folder_tree_context_ancestor_levels"]))
+        self.favorite_row_padding_spin.setValue(int(defaults["favorite_row_padding_y"]))
+        self.favorite_row_spacing_spin.setValue(int(defaults["favorite_row_spacing"]))
+        self.favorite_icon_size_spin.setValue(int(defaults["favorite_icon_size"]))
+        self.disk_cache_checkbox.setChecked(bool(defaults["thumbnail_disk_cache_enabled"]))
+        self.cache_limit_spin.setValue(int(defaults["thumbnail_cache_limit_mb"]))
+        unused_days = int(defaults["thumbnail_cache_max_unused_days"])
+        index = self.cache_unused_days_combo.findData(unused_days)
+        self.cache_unused_days_combo.setCurrentIndex(max(0, index))
+        self.cache_unused_days_spin.setValue(max(7, unused_days or 90))
+        self.cache_unused_days_spin.setEnabled(int(self.cache_unused_days_combo.currentData()) == -1)
+        self.text_preview_checkbox.setChecked(bool(defaults["text_preview_enabled"]))
+        self.video_thumbnail_checkbox.setChecked(bool(defaults["video_thumbnail_enabled"]))
+        self._select_data(self.video_thumbnail_backend_combo, defaults["video_thumbnail_backend"])
+        self._select_data(self.video_thumbnail_frame_mode_combo, defaults["video_thumbnail_frame_mode"])
+        self.video_thumbnail_shell_placeholder_checkbox.setChecked(bool(defaults["video_thumbnail_shell_placeholder"]))
+        self.ffmpeg_path_edit.setText(str(defaults["ffmpeg_executable"] or ""))
+        self._select_data(self.browser_external_drop_combo, defaults["browser_external_drop_behavior"])
+        self._sync_browser_filename_controls()
+
+    def _reset_mouse_scope(self) -> None:
+        defaults = ConfigManager.DEFAULTS
+        self.mouse_gestures_checkbox.setChecked(bool(defaults["mouse_gestures_enabled"]))
+        self.mouse_gesture_trail_checkbox.setChecked(bool(defaults["mouse_gesture_show_trail"]))
+        self.mouse_gesture_distance_spin.setValue(int(defaults["mouse_gesture_min_distance"]))
+        bindings = defaults["mouse_gesture_bindings"]
+        self._gesture_bindings_base = deepcopy(bindings)
+        self._select_command(self.gesture_down_combo, bindings.get("D", ""))
+        self._select_command(self.gesture_up_combo, bindings.get("U", ""))
+        self._select_command(self.gesture_left_combo, bindings.get("L", ""))
+        self._select_command(self.gesture_right_combo, bindings.get("R", ""))
+        self.browser_folder_gestures_checkbox.setChecked(bool(defaults["browser_folder_gestures_enabled"]))
+        self._select_data(self.browser_wheel_scroll_mode_combo, defaults["browser_wheel_scroll_mode"])
+        self.browser_wheel_scroll_custom_spin.setValue(int(defaults["browser_wheel_scroll_custom_rows"]))
+        self._select_command(self.mouse_back_action_combo, defaults["mouse_back_button_action"])
+        self._select_command(self.mouse_forward_action_combo, defaults["mouse_forward_button_action"])
+        self.mouse_side_buttons_folder_navigation_checkbox.setChecked(
+            bool(defaults["mouse_side_buttons_folder_navigation"])
+        )
+        self._sync_browser_wheel_scroll_controls()
+        self._sync_gesture_controls(self.mouse_gestures_checkbox.isChecked())
+
+    def _reset_shortcut_action(self, scope: str, action_id: str) -> None:
+        spec = next(
+            (
+                candidate
+                for candidate in SPECS_BY_SCOPE.get(scope, ())
+                if candidate.action_id == action_id
+            ),
+            None,
+        )
+        editors = self.shortcut_editors.get((scope, action_id), ())
+        if spec is None:
+            return
+        self._shortcut_extra_bindings.pop((scope, action_id), None)
+        for index, editor in enumerate(editors):
+            editor.setKeySequence(
+                QKeySequence(spec.defaults[index])
+                if index < len(spec.defaults)
+                else QKeySequence()
+            )
+        self._sync_shortcut_status()
+
+    def _shortcut_values_from_ui(self) -> dict[str, dict[str, list[str]]]:
+        result = default_shortcut_bindings()
+        for (scope, action_id), editors in self.shortcut_editors.items():
+            values: list[str] = []
+            for editor in editors:
+                value = canonical_key(editor.keySequence())
+                if value and value not in values:
+                    values.append(value)
+            for value in self._shortcut_extra_bindings.get((scope, action_id), ()):
+                if value and value not in values:
+                    values.append(value)
+            result[scope][action_id] = values
+        return normalize_shortcut_bindings(result)
+
+    def _shortcut_conflicts(self) -> list[tuple[str, str, str, str]]:
+        bindings = self._shortcut_values_from_ui()
+        conflicts: list[tuple[str, str, str, str]] = []
+        for scope, specs in SPECS_BY_SCOPE.items():
+            owners: dict[str, str] = {}
+            for spec in specs:
+                if (
+                    scope == "browser"
+                    and spec.action_id == "browser_clear_filters"
+                    and self.browser_cancel_clears_filters_checkbox.isChecked()
+                ):
+                    continue
+                for sequence in bindings[scope].get(spec.action_id, []):
+                    old = owners.get(sequence)
+                    if old is not None and old != spec.action_id:
+                        conflicts.append((scope, old, spec.action_id, sequence))
+                    else:
+                        owners[sequence] = spec.action_id
+        if self.viewer_slideshow_chord_checkbox.isChecked():
+            reserved = {str(index) for index in range(1, 10)} | {"S"}
+            for action_id, values in bindings["viewer"].items():
+                for sequence in values:
+                    if action_id == "viewer_slideshow_toggle" and sequence == "S":
+                        continue
+                    if sequence in reserved:
+                        conflicts.append(("viewer", "slideshow_chord", action_id, sequence))
+        return conflicts
+
+    @staticmethod
+    def _shortcut_spec(scope: str, action_id: str) -> ShortcutSpec | None:
+        return next(
+            (
+                spec
+                for spec in SPECS_BY_SCOPE.get(scope, ())
+                if spec.action_id == action_id
+            ),
+            None,
+        )
+
+    def _move_shortcut_conflicts(self, scope: str, action_id: str) -> None:
+        target_values = set(
+            self._shortcut_values_from_ui().get(scope, {}).get(action_id, [])
+        )
+        for (other_scope, other_id), editors in self.shortcut_editors.items():
+            if other_scope != scope or other_id == action_id:
+                continue
+            for editor in editors:
+                if canonical_key(editor.keySequence()) in target_values:
+                    editor.clear()
+        self._sync_shortcut_status()
+
+    def _sync_shortcut_status(self, *args) -> bool:
+        if len(args) >= 2 and isinstance(args[0], str) and isinstance(args[1], str):
+            self._shortcut_last_edited = (args[0], args[1])
+        if any(
+            getattr(editor, "rejected_multi_step", False)
+            for editors in self.shortcut_editors.values()
+            for editor in editors
+        ):
+            self.shortcut_status.setText(
+                tr("ショートカットは1つのキーまたは同時押しで指定してください")
+            )
+            self.shortcut_status.show()
+            return False
+        if any(
+            editor.keySequence().count() > 1
+            for editors in self.shortcut_editors.values()
+            for editor in editors
+        ):
+            self.shortcut_status.setText(
+                tr("ショートカットは1つのキーまたは同時押しで指定してください")
+            )
+            self.shortcut_status.show()
+            return False
+        conflicts = self._shortcut_conflicts()
+        for key, button in self.shortcut_move_buttons.items():
+            button.setEnabled(False)
+            row = self.shortcut_rows.get(key)
+            button.setVisible(row is None or not row.isHidden())
+        clear_filters_enabled = not self.browser_cancel_clears_filters_checkbox.isChecked()
+        for editor in self.shortcut_editors.get(("browser", "browser_clear_filters"), ()):
+            editor.setEnabled(clear_filters_enabled)
+        clear_filters_label = self.shortcut_labels.get(
+            ("browser", "browser_clear_filters")
+        )
+        if clear_filters_label is not None:
+            clear_filters_label.setEnabled(clear_filters_enabled)
+        reset_button = self.shortcut_reset_buttons.get(("browser", "browser_clear_filters"))
+        if reset_button is not None:
+            reset_button.setEnabled(clear_filters_enabled)
+        self._position_shortcut_move_buttons()
+        if conflicts:
+            scope, old, new, sequence = conflicts[0]
+            edited = self._shortcut_last_edited
+            if old == "slideshow_chord":
+                owner = self._shortcut_spec(scope, new)
+                message = tr(
+                    "数字キー＋Sのスライドショー機能が予約しているキーです。機能を無効にするか、割り当てを変更してください: {p0}（{p1}）",
+                    p0=sequence,
+                    p1=tr(owner.label) if owner is not None else new,
+                )
+            else:
+                target = edited if edited in {
+                    (scope, old), (scope, new)
+                } else (scope, new)
+                move_button = self.shortcut_move_buttons.get(target)
+                if move_button is not None and (
+                    target != ("browser", "browser_clear_filters")
+                    or clear_filters_enabled
+                ):
+                    move_button.setEnabled(True)
+                old_spec = self._shortcut_spec(scope, old)
+                new_spec = self._shortcut_spec(scope, new)
+                message = tr(
+                    "同じショートカットが複数の機能に割り当てられています: {p0}（{p1} / {p2}）",
+                    p0=sequence,
+                    p1=tr(old_spec.label) if old_spec is not None else old,
+                    p2=tr(new_spec.label) if new_spec is not None else new,
+                )
+            if self._shortcut_modifier_warning is not None:
+                message = tr(
+                    "Ctrl・Shift・Altだけでは登録できません。ほかのキーと組み合わせてください"
+                )
+            self.shortcut_status.setText(message)
+            self.shortcut_status.show()
+            return False
+        if self._shortcut_modifier_warning is not None:
+            self.shortcut_status.setText(
+                tr(
+                    "Ctrl・Shift・Altだけでは登録できません。ほかのキーと組み合わせてください"
+                )
+            )
+            self.shortcut_status.show()
+            return True
+        extra_count = sum(
+            len(values)
+            for values in self._shortcut_extra_bindings.values()
+        )
+        if extra_count:
+            self.shortcut_status.setText(
+                tr(
+                    "3欄を超える保存済みショートカットも保持します: {p0}件",
+                    p0=extra_count,
+                )
+            )
+            self.shortcut_status.show()
+            return True
+        self.shortcut_status.clear()
+        self.shortcut_status.hide()
+        return True
+
+    def _filter_shortcut_rows(self, text: str) -> None:
+        needle = str(text).strip()
+        for (scope, action_id), row in self.shortcut_rows.items():
+            spec = next(
+                item for item in SHORTCUT_SPECS if item.scope == scope and item.action_id == action_id
+            )
+            if not needle:
+                row.setVisible(True)
+                continue
+            translated_label = tr(spec.label).casefold()
+            if needle.casefold() in translated_label:
+                row.setVisible(True)
+                continue
+            keys = [
+                canonical_key(editor.keySequence())
+                for editor in self.shortcut_editors[(scope, action_id)]
+            ]
+            keys.extend(self._shortcut_extra_bindings.get((scope, action_id), ()))
+            row.setVisible(self._shortcut_key_query_matches(needle, keys))
+        cancel_row = self.shortcut_rows.get(("browser", "browser_cancel"))
+        if cancel_row is not None:
+            self.browser_cancel_filter_option_row.setVisible(
+                not needle or not cancel_row.isHidden()
+            )
+        self._position_shortcut_move_buttons()
+
+    @staticmethod
+    def _shortcut_key_query_matches(query: str, keys: list[str]) -> bool:
+        aliases = {
+            "pagedown": "pgdown",
+            "pageup": "pgup",
+            "escape": "esc",
+        }
+
+        def normalize_token(token: str) -> str:
+            lowered = token.strip().casefold()
+            return aliases.get(lowered, lowered)
+
+        normalized_query = query.strip().casefold()
+        if not normalized_query:
+            return True
+        if "+" in query:
+            normalized_sequence = canonical_key(query)
+            query_tokens = tuple(
+                normalize_token(token) for token in query.split("+") if token.strip()
+            )
+            modifier_tokens = {"ctrl", "shift", "alt", "meta", "win", "cmd"}
+            if query_tokens and set(query_tokens).issubset(modifier_tokens):
+                return any(
+                    set(
+                        normalize_token(token)
+                        for token in key.split("+")
+                        if token.strip()
+                    ).issuperset(query_tokens)
+                    for key in keys
+                    if key
+                )
+            return any(
+                (
+                    normalized_sequence
+                    and key.casefold() == normalized_sequence.casefold()
+                )
+                or tuple(normalize_token(token) for token in key.split("+") if token.strip())
+                == query_tokens
+                for key in keys
+                if key
+            )
+        return any(
+            normalize_token(normalized_query) in {
+                normalize_token(token)
+                for token in key.split("+")
+                if token.strip()
+            }
+            for key in keys
+            if key
+        )
+
+    def _load_shortcut_controls(self) -> None:
+        bindings = normalize_shortcut_bindings(self.config.get("shortcut_bindings"))
+        for (scope, action_id), editors in self.shortcut_editors.items():
+            values = bindings.get(scope, {}).get(action_id, [])
+            self._shortcut_extra_bindings[(scope, action_id)] = list(values[3:])
+            for index, editor in enumerate(editors):
+                editor.blockSignals(True)
+                editor.setKeySequence(QKeySequence(values[index]) if index < len(values) else QKeySequence())
+                editor.blockSignals(False)
+            self._update_shortcut_editor_tooltips(scope, action_id)
+        self.viewer_slideshow_chord_checkbox.blockSignals(True)
+        self.viewer_slideshow_chord_checkbox.setChecked(
+            bool(self.config.get("viewer_slideshow_chord_enabled", True))
+        )
+        self.viewer_slideshow_chord_checkbox.blockSignals(False)
+        self.browser_cancel_clears_filters_checkbox.blockSignals(True)
+        self.browser_cancel_clears_filters_checkbox.setChecked(
+            bool(self.config.get("browser_cancel_clears_filters", True))
+        )
+        self.browser_cancel_clears_filters_checkbox.blockSignals(False)
+        self._sync_browser_cancel_filter_controls()
+        self.viewer_close_shortcut_edit = self.shortcut_editors[("viewer", "viewer_close")][0]
+        self.viewer_close_shortcut_status = self.shortcut_status
+        self._sync_shortcut_status()
 
     def _build_general_tab(self) -> QWidget:
         tab = QWidget(self)
@@ -501,43 +1626,6 @@ class SettingsDialog(QDialog):
             "reuse_or_create",
         )
         behavior_form.addRow(tr('ファイルを開く方法:'), self.open_behavior_combo)
-        close_shortcut_row = QWidget(behavior_group)
-        close_shortcut_layout = QHBoxLayout(close_shortcut_row)
-        close_shortcut_layout.setContentsMargins(0, 0, 0, 0)
-        self.viewer_close_shortcut_edit = QKeySequenceEdit(close_shortcut_row)
-        self.viewer_close_shortcut_edit.setObjectName(
-            "viewer_close_shortcut_edit"
-        )
-        close_shortcut_layout.addWidget(self.viewer_close_shortcut_edit, 1)
-        self.viewer_close_shortcut_clear_button = QPushButton(
-            tr('割り当てなし'),
-            close_shortcut_row,
-        )
-        self.viewer_close_shortcut_clear_button.setObjectName(
-            "viewer_close_shortcut_clear_button"
-        )
-        close_shortcut_layout.addWidget(self.viewer_close_shortcut_clear_button)
-        behavior_form.addRow(
-            tr('Viewerを閉じるキー:'),
-            close_shortcut_row,
-        )
-        self.viewer_close_shortcut_status = QLabel(behavior_group)
-        self.viewer_close_shortcut_status.setWordWrap(True)
-        self.viewer_close_shortcut_status.setStyleSheet("color: #c62828;")
-        self.viewer_close_shortcut_status.hide()
-        behavior_form.addRow("", self.viewer_close_shortcut_status)
-        self.viewer_close_shortcut_note = QLabel(
-            tr('Escは一時状態の解除専用です。割り当てなしにするとキーでViewerを閉じません。'),
-            behavior_group,
-        )
-        self.viewer_close_shortcut_note.setWordWrap(True)
-        behavior_form.addRow("", self.viewer_close_shortcut_note)
-        self.viewer_close_shortcut_edit.keySequenceChanged.connect(
-            lambda _sequence: self._sync_viewer_close_shortcut_status()
-        )
-        self.viewer_close_shortcut_clear_button.clicked.connect(
-            self.viewer_close_shortcut_edit.clear
-        )
         self.bring_to_front_checkbox = QCheckBox(
             tr('本を開いたときViewerWindowを一度だけ前面へ出す'),
             behavior_group,
@@ -791,6 +1879,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(resampling_group)
         layout.addWidget(prefetch_group)
         layout.addWidget(fullscreen_group)
+        layout.addWidget(self._make_tab_reset_button("viewer", tab))
         layout.addStretch(1)
         return tab
 
@@ -873,6 +1962,7 @@ class SettingsDialog(QDialog):
         note.setWordWrap(True)
         form.addRow(note)
         layout.addWidget(group)
+        layout.addWidget(self._make_tab_reset_button("archive", tab))
         layout.addStretch(1)
         return tab
 
@@ -957,6 +2047,7 @@ class SettingsDialog(QDialog):
         recycle_note.setWordWrap(True)
         file_operation_layout.addWidget(recycle_note)
         layout.addWidget(self.file_operation_group)
+        layout.addWidget(self._make_tab_reset_button("file", tab))
         layout.addStretch(1)
         return tab
 
@@ -1644,6 +2735,7 @@ class SettingsDialog(QDialog):
         tree_focus_note.setWordWrap(True)
         sidebar_form.addRow(tree_focus_note)
         layout.addWidget(sidebar_group)
+        layout.addWidget(self._make_tab_reset_button("browser", tab))
         layout.addStretch(1)
         return tab
 
@@ -1672,8 +2764,12 @@ class SettingsDialog(QDialog):
         gesture_form.addRow(tr('認識最小距離:'), self.mouse_gesture_distance_spin)
         self.gesture_down_combo = self._command_combo(gesture_group)
         self.gesture_up_combo = self._command_combo(gesture_group)
+        self.gesture_left_combo = self._command_combo(gesture_group)
+        self.gesture_right_combo = self._command_combo(gesture_group)
         gesture_form.addRow(tr('下へドラッグ (D):'), self.gesture_down_combo)
         gesture_form.addRow(tr('上へドラッグ (U):'), self.gesture_up_combo)
+        gesture_form.addRow(tr('左へドラッグ (L):'), self.gesture_left_combo)
+        gesture_form.addRow(tr('右へドラッグ (R):'), self.gesture_right_combo)
 
         browser_gesture_group = QGroupBox(
             tr('Browserサムネイル一覧領域'),
@@ -1706,6 +2802,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(gesture_group)
         layout.addWidget(browser_gesture_group)
         layout.addWidget(button_group)
+        layout.addWidget(self._make_tab_reset_button("mouse", tab))
         layout.addStretch(1)
         return tab
 
@@ -1722,14 +2819,7 @@ class SettingsDialog(QDialog):
         behavior = str(self.config.get("open_viewer_behavior", "reuse_or_create"))
         index = self.open_behavior_combo.findData(behavior)
         self.open_behavior_combo.setCurrentIndex(max(0, index))
-        self.viewer_close_shortcut_edit.setKeySequence(
-            QKeySequence(
-                normalize_viewer_close_shortcut(
-                    self.config.get("viewer_close_shortcut")
-                )
-            )
-        )
-        self._sync_viewer_close_shortcut_status()
+        self._load_shortcut_controls()
         self.bring_to_front_checkbox.setChecked(
             bool(self.config.get("bring_viewer_to_front_on_open", True))
         )
@@ -2107,6 +3197,14 @@ class SettingsDialog(QDialog):
             self._gesture_bindings_base.get("U", ""),
         )
         self._select_command(
+            self.gesture_left_combo,
+            self._gesture_bindings_base.get("L", ""),
+        )
+        self._select_command(
+            self.gesture_right_combo,
+            self._gesture_bindings_base.get("R", ""),
+        )
+        self._select_command(
             self.mouse_back_action_combo,
             self.config.get("mouse_back_button_action", ""),
         )
@@ -2375,33 +3473,16 @@ class SettingsDialog(QDialog):
         }
 
     def _sync_viewer_close_shortcut_status(self) -> bool:
-        raw_sequence = self.viewer_close_shortcut_edit.keySequence()
-        if raw_sequence.count() > 1:
-            self.viewer_close_shortcut_status.setText(
-                tr('Viewerを閉じるキーは1つのキー組み合わせで指定してください')
-            )
-            self.viewer_close_shortcut_status.show()
-            return False
-        sequence = normalize_viewer_close_shortcut(raw_sequence, default="")
-        conflict = viewer_close_shortcut_conflict(sequence)
-        if conflict:
-            self.viewer_close_shortcut_status.setText(
-                tr(
-                    'このキーは既存のViewerショートカットと重複しています: {p0}',
-                    p0=conflict,
-                )
-            )
-            self.viewer_close_shortcut_status.show()
-            return False
-        self.viewer_close_shortcut_status.clear()
-        self.viewer_close_shortcut_status.hide()
-        return True
+        return self._sync_shortcut_status()
 
     def values(self) -> dict[str, object]:
+        shortcut_values = self._shortcut_values_from_ui()
         bindings = dict(self._gesture_bindings_base)
         for pattern, combo in (
             ("D", self.gesture_down_combo),
             ("U", self.gesture_up_combo),
+            ("L", self.gesture_left_combo),
+            ("R", self.gesture_right_combo),
         ):
             command = str(combo.currentData() or "")
             if command:
@@ -2415,10 +3496,16 @@ class SettingsDialog(QDialog):
         return {
             "ui_language": self.ui_language_combo.currentData(),
             "open_viewer_behavior": self.open_behavior_combo.currentData(),
-            "viewer_close_shortcut": normalize_viewer_close_shortcut(
-                self.viewer_close_shortcut_edit.keySequence(),
-                default="",
+            "shortcut_bindings": shortcut_values,
+            "browser_cancel_clears_filters": (
+                self.browser_cancel_clears_filters_checkbox.isChecked()
             ),
+            "viewer_close_shortcut": (
+                shortcut_values["viewer"].get("viewer_close", [""])[0]
+                if shortcut_values["viewer"].get("viewer_close", [])
+                else ""
+            ),
+            "viewer_slideshow_chord_enabled": self.viewer_slideshow_chord_checkbox.isChecked(),
             "bring_viewer_to_front_on_open": self.bring_to_front_checkbox.isChecked(),
             "file_operation_delete_confirm_focus_yes": (
                 self.delete_confirm_focus_yes_checkbox.isChecked()
@@ -3128,6 +4215,8 @@ class SettingsDialog(QDialog):
             self.mouse_gesture_distance_spin,
             self.gesture_down_combo,
             self.gesture_up_combo,
+            self.gesture_left_combo,
+            self.gesture_right_combo,
         ):
             widget.setEnabled(enabled)
 

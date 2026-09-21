@@ -763,7 +763,8 @@ def test_viewer_close_shortcut_round_trip_disable_and_conflict_warning(
         assert changed["viewer_close_shortcut"] == modified
         assert config.get("viewer_close_shortcut") == modified
 
-    dialog.viewer_close_shortcut_edit.clear()
+    for editor in dialog.shortcut_editors[("viewer", "viewer_close")]:
+        editor.clear()
     assert dialog.viewer_close_shortcut_status.isHidden()
     changed = dialog.apply_settings()
     assert changed["viewer_close_shortcut"] == ""

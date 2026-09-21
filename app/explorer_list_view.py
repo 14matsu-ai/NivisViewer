@@ -292,21 +292,6 @@ class ExplorerListView(QListView):
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
         if (
-            event.key() == Qt.Key.Key_Escape
-            and self._folder_gesture_recognizer.active
-        ):
-            self._cancel_folder_gesture()
-            event.accept()
-            return
-        if (
-            event.key() == Qt.Key.Key_Escape
-            and self.pointer_controller.state is not BrowserPointerState.IDLE
-        ):
-            self._hide_rubber_band()
-            self.pointer_controller.cancel()
-            event.accept()
-            return
-        if (
             event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}
             and event.modifiers() == Qt.KeyboardModifier.NoModifier
             and self.currentIndex().isValid()
@@ -590,6 +575,34 @@ class ExplorerListView(QListView):
             self._folder_gesture_right_button_down
             and bool(self._folder_gesture_recognizer.pattern)
         )
+
+    def has_active_interaction(self) -> bool:
+        """Return whether a pointer or folder-gesture sequence can be cancelled."""
+
+        if (
+            self._folder_gesture_right_button_down
+            or self._folder_gesture_recognizer.active
+            or self._folder_gesture_trail
+        ):
+            return True
+        return self.pointer_controller.state in {
+            BrowserPointerState.PRESSED_ON_ITEM,
+            BrowserPointerState.PRESSED_ON_EMPTY,
+            BrowserPointerState.FILE_DRAGGING,
+            BrowserPointerState.RUBBER_BAND_SELECTING,
+        }
+
+    def cancel_interaction(self) -> bool:
+        """Cancel the current pointer/gesture sequence without changing app state."""
+
+        if not self.has_active_interaction():
+            return False
+        self._cancel_folder_gesture()
+        if self.pointer_controller.state is not BrowserPointerState.IDLE:
+            self._hide_rubber_band()
+            self.pointer_controller.cancel()
+            self._drag_started = False
+        return True
 
     @property
     def folder_gesture_trail(self) -> tuple[QPoint, ...]:

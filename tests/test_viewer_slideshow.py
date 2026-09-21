@@ -5,7 +5,14 @@ from PIL import Image
 from PySide6.QtCore import QEvent, QTimer, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QInputDialog, QLineEdit, QTextEdit, QSpinBox
+from PySide6.QtWidgets import (
+    QApplication,
+    QDoubleSpinBox,
+    QInputDialog,
+    QLineEdit,
+    QTextEdit,
+    QSpinBox,
+)
 
 from app.config_manager import ConfigManager
 from app.viewer_window import ViewerWindow
@@ -86,7 +93,7 @@ def test_focus_loss_clears_held_state(window, kind):
     assert window.slideshow_timer.interval() == 20000
 
 
-@pytest.mark.parametrize('editor_type', [QLineEdit, QTextEdit, QSpinBox])
+@pytest.mark.parametrize('editor_type', [QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox])
 def test_editable_fields_do_not_trigger(window, qapp, editor_type):
     editor = editor_type(window)
     editor.show()
@@ -121,6 +128,30 @@ def test_shift_s_enter_starts_and_cancel_preserves_interval(window, qapp):
     assert not window.slideshow_timer.isActive()
 
 
+def test_custom_slideshow_interval_accepts_multidigit_typing_and_persists(window, qapp):
+    def accept_dialog():
+        dialog = QApplication.activeModalWidget()
+        assert isinstance(dialog, QInputDialog)
+        spin = dialog.findChild(QDoubleSpinBox)
+        assert spin is not None
+        editor = spin.lineEdit()
+        editor.selectAll()
+        QTest.keyClicks(editor, '12')
+        assert spin.value() == 12.0
+        editor.selectAll()
+        QTest.keyClicks(editor, '180')
+        assert spin.value() == 180.0
+        spin.stepDown()
+        spin.stepUp()
+        assert spin.value() == 180.0
+        QTest.keyClick(dialog, Qt.Key.Key_Return)
+
+    QTimer.singleShot(0, accept_dialog)
+    QTest.keyClick(window.viewer, Qt.Key.Key_S, Qt.KeyboardModifier.ShiftModifier)
+    assert window.slideshow_timer.interval() == 180000
+    assert window.config.get('slideshow_interval_ms') == 180000
+
+
 def test_menu_presets_persist_and_custom_cancel_restores_check(window, monkeypatch):
     window.slideshow_repeat_action.trigger()
     assert window.config.get('slideshow_repeat') is True
@@ -150,7 +181,7 @@ def test_shared_interval_update(window):
     assert window.slideshow_interval_actions[10].isChecked()
 
 
-@pytest.mark.parametrize('interval, expected', [(None, 3000), (-1, 500), (90000, 60000), (2500, 2500)])
+@pytest.mark.parametrize('interval, expected', [(None, 3000), (-1, 500), (700000, 600000), (2500, 2500)])
 def test_slideshow_config_defaults_normalization_and_roundtrip(tmp_path, interval, expected):
     config = ConfigManager(tmp_path / 'config.json')
     config.load()

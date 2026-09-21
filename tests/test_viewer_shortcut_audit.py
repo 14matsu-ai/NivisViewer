@@ -3,18 +3,26 @@ from zipfile import ZipFile
 
 from PIL import Image
 import pytest
-from PySide6.QtCore import QPoint, QPointF, Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence, QPixmap, QShortcut, QWheelEvent
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt, QTimer
+from PySide6.QtGui import QAction, QKeyEvent, QKeySequence, QPixmap, QShortcut, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QFileDialog,
     QInputDialog,
     QLineEdit,
     QMessageBox,
+    QPushButton,
 )
 
-from tests.test_application_controller import make_controller, close_controller, finish_viewer_open, wait_until
+from tests.test_application_controller import (
+    make_controller,
+    close_controller,
+    finish_viewer_open,
+    wait_until,
+    write_image,
+)
 
 
 @pytest.fixture
@@ -326,6 +334,58 @@ def test_edit_field_owns_letters_and_copy(book, qapp):
         edit.close()
 
 
+def test_reassigned_close_key_preserves_native_editor_commands(book, qapp):
+    window, _ = book
+    window.config.apply({
+        "shortcut_bindings": {"viewer": {"viewer_close": ["Ctrl+A"]}},
+    })
+    edit = QLineEdit(window)
+    edit.setText('alpha beta')
+    edit.show()
+    edit.setFocus()
+    qapp.processEvents()
+    try:
+        QTest.keyClick(edit, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+        assert edit.selectedText() == 'alpha beta'
+        QTest.keyClick(edit, Qt.Key.Key_Backspace)
+        assert edit.text() == ''
+        edit.setText('alpha beta')
+        edit.setCursorPosition(len(edit.text()))
+        QTest.keyClick(edit, Qt.Key.Key_X)
+        assert edit.text().endswith('x')
+        edit.selectAll()
+        QTest.keyClick(edit, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+        edit.clear()
+        QTest.keyClick(edit, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+        assert edit.text() == 'alpha betax'
+    finally:
+        edit.close()
+
+
+def test_modal_enter_and_escape_remain_native(book, qapp):
+    window, _ = book
+    dialog = QDialog(window)
+    dialog.setModal(True)
+    button = QPushButton('OK', dialog)
+    button.setDefault(True)
+    clicked = []
+    button.clicked.connect(lambda: clicked.append(True))
+    dialog.show()
+    button.setFocus()
+    qapp.processEvents()
+    try:
+        QTest.keyClick(button, Qt.Key.Key_Return)
+        assert clicked == [True]
+        dialog.show()
+        dialog.activateWindow()
+        button.setFocus()
+        qapp.processEvents()
+        QTest.keyClick(button, Qt.Key.Key_Escape)
+        assert not dialog.isVisible()
+    finally:
+        dialog.close()
+
+
 def test_viewer_close_key_default_is_ctrl_w_and_escape_only_cancels_state(
     book,
     qapp,
@@ -365,13 +425,24 @@ def test_viewer_close_key_applies_immediately_and_can_be_disabled(book, qapp):
     )
     assert requests == [window]
 
+    window.config.apply({
+        "shortcut_bindings": {
+            "viewer": {"viewer_close": ["Ctrl+Shift+Q"]},
+        },
+    })
+    QTest.keyClick(window.viewer, Qt.Key.Key_W, Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+    QTest.keyClick(window.viewer, Qt.Key.Key_Q, Qt.KeyboardModifier.ControlModifier)
+    assert requests == [window]
+    QTest.keyClick(window.viewer, Qt.Key.Key_Q, Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+    assert requests == [window, window]
+
     window.config.apply({"viewer_close_shortcut": ""})
     QTest.keyClick(
         window.viewer,
         Qt.Key.Key_W,
         Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier,
     )
-    assert requests == [window]
+    assert requests == [window, window]
 
 
 def test_viewer_close_key_does_not_fire_in_text_or_modal_input(book, qapp):
@@ -383,11 +454,8 @@ def test_viewer_close_key_does_not_fire_in_text_or_modal_input(book, qapp):
     edit.show()
     edit.setFocus()
     qapp.processEvents()
-    QTest.keyClick(
-        edit,
-        Qt.Key.Key_W,
-        Qt.KeyboardModifier.ControlModifier,
-    )
+    for keycode in (Qt.Key.Key_W, Qt.Key.Key_Q):
+        QTest.keyClick(edit, keycode, Qt.KeyboardModifier.ControlModifier)
     assert requests == []
     edit.close()
 
@@ -398,10 +466,207 @@ def test_viewer_close_key_does_not_fire_in_text_or_modal_input(book, qapp):
     dialog.show()
     modal_edit.setFocus()
     qapp.processEvents()
-    QTest.keyClick(
-        modal_edit,
-        Qt.Key.Key_W,
-        Qt.KeyboardModifier.ControlModifier,
-    )
+    for keycode in (Qt.Key.Key_W, Qt.Key.Key_Q):
+        QTest.keyClick(modal_edit, keycode, Qt.KeyboardModifier.ControlModifier)
     assert requests == []
+    dialog.close()
+
+
+def test_rotation_and_close_aliases_use_real_key_events(book, qapp):
+    window, _ = book
+    window.viewer.setFocus()
+    requests = []
+    window.set_close_request_handler(lambda target: requests.append(target))
+
+    assert window.viewer_rotate_left_action.isEnabled()
+    assert window.viewer_rotate_right_action.isEnabled()
+    assert window.viewer_quit_action.isEnabled()
+    assert window.viewer_rotate_left_action.shortcut().toString() == 'Ctrl+Left'
+    assert window.viewer_rotate_right_action.shortcut().toString() == 'Ctrl+Right'
+    assert [
+        sequence.toString(QKeySequence.SequenceFormat.PortableText)
+        for sequence in window.viewer_close_action.shortcuts()
+    ] == ['Ctrl+W', 'Ctrl+Q']
+
+    QTest.keyClick(window.viewer, Qt.Key.Key_Left, Qt.KeyboardModifier.ControlModifier)
+    assert window.rotation_angle == 270
+    QTest.keyClick(window.viewer, Qt.Key.Key_Right, Qt.KeyboardModifier.ControlModifier)
+    assert window.rotation_angle == 0
+
+    # Both aliases reach the same per-window close request.
+    QTest.keyClick(window.viewer, Qt.Key.Key_Q, Qt.KeyboardModifier.ControlModifier)
+    QTest.keyClick(window.viewer, Qt.Key.Key_W, Qt.KeyboardModifier.ControlModifier)
+    assert requests == [window, window]
+
+
+@pytest.mark.parametrize('fit_mode', ['fit_window', 'manual_zoom'])
+def test_rotation_chords_reach_the_action_after_fit_and_pan_state(book, qapp, fit_mode):
+    window, _ = book
+    window.rotation_angle = 0
+    window.viewer.set_rotation_angle(0)
+    if fit_mode == 'manual_zoom':
+        window.viewer.set_manual_zoom(2.0)
+        qapp.processEvents()
+        QTest.keyClick(window.viewer, Qt.Key.Key_Right)
+        assert window.model.current_index == 0
+    window.viewer.setFocus()
+    QTest.keyClick(window.viewer, Qt.Key.Key_Left, Qt.KeyboardModifier.ControlModifier)
+    assert window.rotation_angle == 270
+    QTest.keyClick(window.viewer, Qt.Key.Key_Right, Qt.KeyboardModifier.ControlModifier)
+    assert window.rotation_angle == 0
+
+
+def test_open_reload_and_reset_rotation_use_real_key_events(book, qapp, monkeypatch):
+    window, _ = book
+    window.viewer.setFocus()
+    open_calls = []
+    monkeypatch.setattr(
+        QFileDialog,
+        'getOpenFileName',
+        lambda *args: (open_calls.append(args) or ('', '')),
+    )
+    monkeypatch.setattr(
+        QFileDialog,
+        'getExistingDirectory',
+        lambda *args: (open_calls.append(args) or ''),
+    )
+    QTest.keyClick(window.viewer, Qt.Key.Key_O, Qt.KeyboardModifier.ControlModifier)
+    assert len(open_calls) == 2
+
+    reload_calls = []
+
+    def fake_open(path, **kwargs):
+        reload_calls.append((path, kwargs))
+        return True
+
+    monkeypatch.setattr(window, 'open_path', fake_open)
+    QTest.keyClick(window.viewer, Qt.Key.Key_F5)
+    assert reload_calls and reload_calls[0][0] == window._opened_path
+    assert reload_calls[0][1]['preserve_current_page'] is True
+
+    window.rotation_angle = 90
+    window.viewer.set_rotation_angle(90)
+    QTest.keyClick(window.viewer, Qt.Key.Key_0, Qt.KeyboardModifier.ControlModifier)
+    assert window.rotation_angle == 0
+
+
+def test_rotation_chords_work_from_slider_and_page_list_focus(book, qapp):
+    window, _ = book
+    window.page_list_dock.show()
+    for control in (window.slider, window.page_list):
+        window.rotation_angle = 0
+        window.viewer.set_rotation_angle(0)
+        control.setFocus()
+        qapp.processEvents()
+        QTest.keyClick(control, Qt.Key.Key_Left, Qt.KeyboardModifier.ControlModifier)
+        assert window.rotation_angle == 270
+
+
+def test_rotation_chords_do_not_steal_editor_or_modal_focus(book, qapp):
+    window, _ = book
+    edit = QLineEdit(window)
+    edit.setText('alpha beta')
+    edit.setCursorPosition(len(edit.text()))
+    edit.show()
+    edit.setFocus()
+    qapp.processEvents()
+    QTest.keyClick(edit, Qt.Key.Key_Left, Qt.KeyboardModifier.ControlModifier)
+    assert window.rotation_angle == 0
+    assert edit.cursorPosition() < len(edit.text())
+    edit.close()
+
+    dialog = QDialog(window)
+    dialog.setModal(True)
+    button = QPushButton('OK', dialog)
+    dialog.show()
+    dialog.activateWindow()
+    button.setFocus()
+    qapp.processEvents()
+    QTest.keyClick(button, Qt.Key.Key_Right, Qt.KeyboardModifier.ControlModifier)
+    assert window.rotation_angle == 0
+    dialog.close()
+
+
+def test_close_aliases_are_window_local_through_the_controller(tmp_path, qapp):
+    first_path = tmp_path / 'first.png'
+    second_path = tmp_path / 'second.png'
+    write_image(first_path)
+    write_image(second_path)
+    controller = make_controller(tmp_path / 'profile', qapp)
+    try:
+        first = controller.open_path(first_path, open_in_new_window=True)
+        second = controller.open_path(second_path, open_in_new_window=True)
+        finish_viewer_open(qapp, first)
+        finish_viewer_open(qapp, second)
+        first.show()
+        first.activateWindow()
+        first.viewer.setFocus()
+        qapp.processEvents()
+        QTest.keyClick(first.viewer, Qt.Key.Key_Left, Qt.KeyboardModifier.ControlModifier)
+        assert first.rotation_angle == 270
+        assert second.rotation_angle == 0
+
+        QTest.keyClick(first.viewer, Qt.Key.Key_Q, Qt.KeyboardModifier.ControlModifier)
+        assert wait_until(qapp, lambda: controller.viewer_windows == (second,))
+        second.show()
+        second.activateWindow()
+        second.viewer.setFocus()
+        qapp.processEvents()
+        QTest.keyClick(second.viewer, Qt.Key.Key_W, Qt.KeyboardModifier.ControlModifier)
+        assert wait_until(qapp, lambda: controller.viewer_windows == ())
+    finally:
+        close_controller(controller, qapp)
+
+
+def test_remapped_viewer_actions_remove_old_key_and_keep_focus_safety(book, qapp):
+    window, _ = book
+    window.config.apply(
+        {
+            "shortcut_bindings": {
+                "viewer": {
+                    "viewer_toggle_spread": ["T"],
+                    "viewer_next_page": ["N"],
+                }
+            }
+        }
+    )
+    window.viewer.setFocus()
+    assert window.shortcut_bindings["viewer_next_page"] == ["N"]
+    assert window.view_mode == "single"
+    QTest.keyClick(window.viewer, Qt.Key.Key_D)
+    assert window.view_mode == "single"
+    QTest.keyPress(window.viewer, Qt.Key.Key_N)
+    QTest.keyRelease(window.viewer, Qt.Key.Key_N)
+    settle(qapp, window, 1)
+    repeat = QKeyEvent(
+        QEvent.Type.KeyPress,
+        Qt.Key.Key_N,
+        Qt.KeyboardModifier.NoModifier,
+        "n",
+        True,
+        1,
+    )
+    QApplication.sendEvent(window.viewer, repeat)
+    settle(qapp, window, 2)
+    QTest.keyClick(window.viewer, Qt.Key.Key_Right)
+    assert window.model.current_index == 2
+    QTest.keyClick(window.viewer, Qt.Key.Key_T)
+    assert window.view_mode == "spread"
+
+    edit = QLineEdit(window)
+    edit.show()
+    edit.setFocus()
+    qapp.processEvents()
+    QTest.keyClick(edit, Qt.Key.Key_T)
+    assert window.view_mode == "spread"
+    edit.close()
+
+    dialog = QDialog(window)
+    dialog.setModal(True)
+    modal_edit = QLineEdit(dialog)
+    dialog.show()
+    modal_edit.setFocus()
+    qapp.processEvents()
+    QTest.keyClick(modal_edit, Qt.Key.Key_T)
+    assert window.view_mode == "spread"
     dialog.close()

@@ -31,10 +31,17 @@ from .browser_icon_size import (
 )
 from .viewer_commands import normalize_viewer_command
 from .viewer_close_shortcut import normalize_viewer_close_shortcut
+from .shortcut_catalog import (
+    default_shortcut_bindings,
+    normalize_shortcut_bindings,
+)
 from .viewer_memory_policy import (
     normalize_viewer_memory_mode,
     viewer_memory_mode_from_legacy_mib,
 )
+
+SLIDESHOW_INTERVAL_MIN_MS = 500
+SLIDESHOW_INTERVAL_MAX_MS = 600_000
 
 
 class ConfigManager(QObject):
@@ -205,6 +212,9 @@ class ConfigManager(QObject):
             "U": "toggle_fullscreen",
         },
         "viewer_close_shortcut": "Ctrl+W",
+        "shortcut_bindings": default_shortcut_bindings(),
+        "browser_cancel_clears_filters": True,
+        "viewer_slideshow_chord_enabled": True,
         "browser_folder_gestures_enabled": True,
         "mouse_back_button_action": "previous_book",
         "mouse_forward_button_action": "next_book",
@@ -291,6 +301,28 @@ class ConfigManager(QObject):
         if isinstance(loaded, dict):
             loaded = self._migrate_browser_item_spacing(loaded)
             loaded = self._migrate_legacy_resampling_settings(loaded)
+            raw_shortcuts = loaded.get("shortcut_bindings")
+            has_new_close = (
+                isinstance(raw_shortcuts, dict)
+                and isinstance(raw_shortcuts.get("viewer"), dict)
+                and "viewer_close" in raw_shortcuts["viewer"]
+            )
+            if "shortcut_bindings" not in loaded or (
+                "viewer_close_shortcut" in loaded and not has_new_close
+            ):
+                migrated_shortcuts = (
+                    deepcopy(raw_shortcuts)
+                    if isinstance(raw_shortcuts, dict)
+                    else default_shortcut_bindings()
+                )
+                if "viewer_close_shortcut" in loaded and not has_new_close:
+                    legacy_close = normalize_viewer_close_shortcut(
+                        loaded.get("viewer_close_shortcut")
+                    )
+                    migrated_shortcuts.setdefault("viewer", {})[
+                        "viewer_close"
+                    ] = [] if legacy_close == "" else [legacy_close]
+                loaded["shortcut_bindings"] = migrated_shortcuts
             if "viewer_memory_mode" not in loaded:
                 preset = str(loaded.get("viewer_prefetch_preset", "standard"))
                 if self._LEGACY_VIEWER_CACHE_MEMORY_KEY in loaded:
@@ -356,6 +388,30 @@ class ConfigManager(QObject):
         self.apply({key: value})
 
     def apply(self, updates: dict[str, Any], *, save: bool = False) -> dict[str, Any]:
+        if "viewer_close_shortcut" in updates:
+            raw_shortcuts = updates.get("shortcut_bindings")
+            has_new_close = (
+                isinstance(raw_shortcuts, dict)
+                and isinstance(raw_shortcuts.get("viewer"), dict)
+                and "viewer_close" in raw_shortcuts["viewer"]
+            )
+        else:
+            raw_shortcuts = None
+            has_new_close = True
+        if "viewer_close_shortcut" in updates and not has_new_close:
+            updates = dict(updates)
+            shortcut_bindings = normalize_shortcut_bindings(
+                raw_shortcuts
+                if raw_shortcuts is not None
+                else self.data.get("shortcut_bindings")
+            )
+            legacy_close = normalize_viewer_close_shortcut(
+                updates.get("viewer_close_shortcut")
+            )
+            shortcut_bindings["viewer"]["viewer_close"] = (
+                [] if legacy_close == "" else [legacy_close]
+            )
+            updates["shortcut_bindings"] = shortcut_bindings
         merged = deepcopy(self.data)
         merged.update(self._migrate_browser_item_spacing(updates))
         merged.pop(self._LEGACY_VIEWER_CACHE_MEMORY_KEY, None)
@@ -773,7 +829,10 @@ class ConfigManager(QObject):
             else 2.0
         )
         normalized["slideshow_interval_ms"] = cls._clamped_int(
-            normalized.get("slideshow_interval_ms"), default=3000, minimum=500, maximum=60000,
+            normalized.get("slideshow_interval_ms"),
+            default=3000,
+            minimum=SLIDESHOW_INTERVAL_MIN_MS,
+            maximum=SLIDESHOW_INTERVAL_MAX_MS,
         )
         for key in (
             "bring_viewer_to_front_on_open",
@@ -794,6 +853,7 @@ class ConfigManager(QObject):
             "thumbnail_disk_cache_enabled",
             "pdf_render_annotations",
             "viewer_prefetch_direction_priority_enabled",
+            "browser_cancel_clears_filters",
         ):
             if not isinstance(normalized.get(key), bool):
                 normalized[key] = cls.DEFAULTS[key]
@@ -812,7 +872,11 @@ class ConfigManager(QObject):
                     and re.fullmatch(r"[UDLR]{1,8}", raw_pattern)
                 ):
                     command = normalize_viewer_command(raw_command)
-                    if command:
+                    if command or (
+                        raw_pattern in {"L", "R"}
+                        and isinstance(raw_command, str)
+                        and not raw_command.strip()
+                    ):
                         bindings[raw_pattern] = command
         normalized["mouse_gesture_bindings"] = bindings
         for key in ("mouse_back_button_action", "mouse_forward_button_action"):
@@ -820,6 +884,17 @@ class ConfigManager(QObject):
         normalized["viewer_close_shortcut"] = normalize_viewer_close_shortcut(
             normalized.get("viewer_close_shortcut")
         )
+        normalized["shortcut_bindings"] = normalize_shortcut_bindings(
+            normalized.get("shortcut_bindings")
+        )
+        close_bindings = normalized["shortcut_bindings"]["viewer"].get(
+            "viewer_close", []
+        )
+        normalized["viewer_close_shortcut"] = (
+            close_bindings[0] if close_bindings else ""
+        )
+        if not isinstance(normalized.get("viewer_slideshow_chord_enabled"), bool):
+            normalized["viewer_slideshow_chord_enabled"] = True
         normalized["gap"] = cls._clamped_int(
             normalized.get("gap"),
             default=int(cls.DEFAULTS["gap"]),
