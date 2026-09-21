@@ -44,7 +44,7 @@ Windows連携は設定画面で利用者が明示的に登録した場合だけ�
 - RAR / CBR（利用者環境のWinRARまたは7-Zipを使用）
 - 7z / CB7（利用者環境の対応済みWinRAR CLI構成または7-Zipを使用）
 - PDF（pypdfium2 v5／PDFiumを使用）
-- 画像: JPEG、PNG、WebP、BMP、GIF、TIFF、ICO
+- 画像: JPEG、PNG、WebP、AVIF、JPEG XL（JXL）、BMP、GIF、TIFF、ICO
 
 RAR／7z／CBR／CB7は、Windowsのファイル関連付け、標準インストール先、PATH、または設定画面の「書庫」タブで指定したWinRAR／7-Zipから、認識済みの外部CLIだけを選んで閲覧します。WinRAR利用者は、対応する公式コンソールCLIが同梱されていればRAR／CBR閲覧のためだけに7-Zipを追加導入する必要はありません。未知の関連付けアプリを起動したり、ShellExecuteへ渡したりしません。
 
