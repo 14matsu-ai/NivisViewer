@@ -41,6 +41,20 @@ def test_relocate_file_preserves_history_bookmark_progress_rating_and_tags(
     store.close()
 
 
+def test_relocate_item_only_changes_exact_path(tmp_path: Path) -> None:
+    old = tmp_path / "old.cbz"
+    new = tmp_path / "new.cbz"
+    descendant = old / "nested.cbz"
+    store = MetadataStore(tmp_path / "metadata.sqlite3")
+    store.set_tags(str(old), ["book"])
+    store.set_tags(str(descendant), ["nested"])
+
+    assert store.relocate_item(str(old), str(new))
+    assert store.get_tags(str(new)) == ["book"]
+    assert store.get_tags(str(descendant)) == ["nested"]
+    store.close()
+
+
 def test_relocate_folder_prefix_updates_descendants(tmp_path: Path) -> None:
     old_root = tmp_path / "旧フォルダ"
     new_root = tmp_path / "新フォルダ"

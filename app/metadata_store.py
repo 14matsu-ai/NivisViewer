@@ -619,7 +619,7 @@ class MetadataStore(QObject):
         return [str(row[0]) for row in rows]
 
     def relocate_item(self, old_path: str, new_path: str) -> bool:
-        return self.relocate_tree(old_path, new_path)
+        return self.relocate_tree(old_path, new_path, include_descendants=False)
 
     def reset_content_metadata_for_path(self, path: str) -> bool:
         """Reset content identity while preserving path-oriented bookmarks."""
@@ -728,7 +728,9 @@ class MetadataStore(QObject):
         self.metadata_changed.emit(destination_display)
         return True
 
-    def relocate_tree(self, old_root: str, new_root: str) -> bool:
+    def relocate_tree(
+        self, old_root: str, new_root: str, *, include_descendants: bool = True,
+    ) -> bool:
         old_display = self.display_path(old_root)
         new_display = self.display_path(new_root)
         old_key = self.normalize_path(old_display)
@@ -740,18 +742,31 @@ class MetadataStore(QObject):
             try:
                 self._flush_pending_locked()
                 self._connection.commit()
-                rows = self._connection.execute(
-                    """
-                    SELECT id, normalized_path, display_path
-                      FROM library_items
-                     ORDER BY LENGTH(normalized_path)
-                    """
-                ).fetchall()
-                affected = [
-                    (int(row[0]), str(row[1]), str(row[2]))
-                    for row in rows
-                    if self._path_is_within(str(row[1]), old_key)
-                ]
+                if include_descendants:
+                    rows = self._connection.execute(
+                        """
+                        SELECT id, normalized_path, display_path
+                          FROM library_items
+                         ORDER BY LENGTH(normalized_path)
+                        """
+                    ).fetchall()
+                    affected = [
+                        (int(row[0]), str(row[1]), str(row[2]))
+                        for row in rows
+                        if self._path_is_within(str(row[1]), old_key)
+                    ]
+                else:
+                    row = self._connection.execute(
+                        """
+                        SELECT id, normalized_path, display_path
+                          FROM library_items
+                         WHERE normalized_path = ?
+                        """,
+                        (old_key,),
+                    ).fetchone()
+                    affected = [] if row is None else [
+                        (int(row[0]), str(row[1]), str(row[2]))
+                    ]
                 if not affected:
                     return True
                 with self._connection:

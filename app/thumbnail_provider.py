@@ -268,6 +268,11 @@ class BrowserThumbnailProvider(QObject):
     def generation(self) -> int:
         return self._generation
 
+    @property
+    def has_failed_requests(self) -> bool:
+        with self._failure_lock:
+            return bool(self._failed)
+
     def begin_generation(self, *, retry_failed: bool = False) -> int:
         self._generation += 1
         self._active_request_tokens.clear()

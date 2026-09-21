@@ -1350,7 +1350,9 @@ class BrowserWindow(QMainWindow):
             # A completed write can release a sharing lock without changing
             # listing metadata. Retry failed previews once per coalesced event.
             filesystem_change = pending.navigation_source == "filesystem_watch"
-            if tuple(items) != self.item_model.source_items or filesystem_change:
+            listing_changed = tuple(items) != self.item_model.source_items
+            retry_failed = filesystem_change and self.thumbnail_provider.has_failed_requests
+            if listing_changed:
                 self._generation = self.thumbnail_provider.begin_generation(
                     retry_failed=filesystem_change,
                 )
@@ -1367,12 +1369,20 @@ class BrowserWindow(QMainWindow):
                     pending.restore_location,
                     update_status=False,
                 )
+            elif retry_failed:
+                # A finished external write may make a previously failed
+                # thumbnail readable even when listing metadata is unchanged.
+                # Retry it without resetting an identical model.
+                self._generation = self.thumbnail_provider.begin_generation(
+                    retry_failed=True,
+                )
             # A snapshot history restore can reach this refresh completion
             # before its first-paint callback runs.  That callback is fenced
             # by the newer scan generation, so explicitly re-arm the bounded
             # visible-range request here. Compatible memory/disk thumbnails
             # remain provider cache hits; only missing visible work starts.
-            self._schedule_thumbnail_requests(0)
+            if listing_changed or retry_failed or not filesystem_change:
+                self._schedule_thumbnail_requests(0)
         else:
             pending.buffered_entries.clear()
             self._commit_pending_scan(pending)
@@ -5272,7 +5282,7 @@ class BrowserWindow(QMainWindow):
             new_path = str(result.destination_path)
             batch.replacements.append((old_path, new_path, result.rating))
             if self.metadata_store is not None:
-                self.metadata_store.relocate_tree(old_path, new_path)
+                self.metadata_store.relocate_item(old_path, new_path)
             self.navigation_history.relocate_tree(old_path, new_path)
 
         if batch.pending_folders:

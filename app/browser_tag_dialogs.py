@@ -229,6 +229,7 @@ class TagManagerDialog(QDialog):
 class ItemTagsDialog(QDialog):
     def __init__(self, paths, registry, parent=None):
         super().__init__(parent)
+        self._initial_focus_pending = True
         self.setWindowTitle(tr('選択項目のタグ'))
         self.resize(500, 420)
         layout = QVBoxLayout(self)
@@ -253,9 +254,26 @@ class ItemTagsDialog(QDialog):
             self.checks[name] = check
         layout.addWidget(self.table)
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel, parent=self)
-        self.buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self.accept)
+        apply_button = self.buttons.button(QDialogButtonBox.StandardButton.Apply)
+        cancel_button = self.buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        button_layout = self.buttons.layout()
+        button_layout.removeWidget(apply_button)
+        button_layout.removeWidget(cancel_button)
+        button_layout.addWidget(apply_button)
+        button_layout.addWidget(cancel_button)
+        apply_button.setDefault(True)
+        cancel_button.setDefault(False)
+        apply_button.clicked.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._initial_focus_pending:
+            self._initial_focus_pending = False
+            self.buttons.button(
+                QDialogButtonBox.StandardButton.Apply
+            ).setFocus(Qt.FocusReason.OtherFocusReason)
 
     def changes(self):
         return {name: True if check.checkState() == Qt.CheckState.Checked else
