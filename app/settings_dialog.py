@@ -471,11 +471,24 @@ class _ShortcutSearchEdit(QLineEdit):
     )
 
     def __init__(self, parent: QWidget | None = None) -> None:
+        self._captured_key_query = False
         self._modifier_gesture_started = False
         self._modifier_gesture_has_normal = False
         self._pressed_modifiers: set[Qt.Key] = set()
         self._modifier_gesture_keys: set[Qt.Key] = set()
         super().__init__(parent)
+        self.textEdited.connect(self._clear_key_capture)
+
+    def _clear_key_capture(self, _text: str) -> None:
+        self._captured_key_query = False
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        self._captured_key_query = False
+        super().setText(text)
+
+    def _set_captured_query(self, text: str) -> None:
+        self._captured_key_query = True
+        super().setText(text)
 
     @classmethod
     def _sequence_text(
@@ -526,7 +539,7 @@ class _ShortcutSearchEdit(QLineEdit):
         if sequence:
             if self._modifier_gesture_started:
                 self._modifier_gesture_has_normal = True
-            self.setText(sequence)
+            self._set_captured_query(sequence)
             self.selectAll()
             event.accept()
             return
@@ -542,7 +555,7 @@ class _ShortcutSearchEdit(QLineEdit):
                         for key in self._MODIFIER_ORDER
                         if key in self._modifier_gesture_keys
                     )
-                    self.setText(query)
+                    self._set_captured_query(query)
                     self.selectAll()
                 self._modifier_gesture_started = False
                 self._modifier_gesture_has_normal = False
@@ -1317,10 +1330,21 @@ class SettingsDialog(QDialog):
         for (other_scope, other_id), editors in self.shortcut_editors.items():
             if other_scope != scope or other_id == action_id:
                 continue
+            changed = False
             for editor in editors:
                 if canonical_key(editor.keySequence()) in target_values:
                     editor.clear()
+                    changed = True
+            key = (other_scope, other_id)
+            extras = self._shortcut_extra_bindings.get(key, [])
+            retained = [value for value in extras if value not in target_values]
+            if len(retained) != len(extras):
+                self._shortcut_extra_bindings[key] = retained
+                changed = True
+            if changed:
+                self._update_shortcut_editor_tooltips(other_scope, other_id)
         self._sync_shortcut_status()
+        self._filter_shortcut_rows(self.shortcut_search_edit.text())
 
     def _sync_shortcut_status(self, *args) -> bool:
         if len(args) >= 2 and isinstance(args[0], str) and isinstance(args[1], str):
@@ -1424,6 +1448,20 @@ class SettingsDialog(QDialog):
 
     def _filter_shortcut_rows(self, text: str) -> None:
         needle = str(text).strip()
+        all_keys = [
+            key
+            for scope_action, editors in self.shortcut_editors.items()
+            for key in (
+                *[canonical_key(editor.keySequence()) for editor in editors],
+                *self._shortcut_extra_bindings.get(scope_action, ()),
+            )
+            if key
+        ]
+        key_only = bool(needle) and (
+            self.shortcut_search_edit._captured_key_query
+            or (len(needle) == 1 and needle.isalnum())
+            or self._shortcut_key_query_matches(needle, all_keys)
+        )
         for (scope, action_id), row in self.shortcut_rows.items():
             spec = next(
                 item for item in SHORTCUT_SPECS if item.scope == scope and item.action_id == action_id
@@ -1432,7 +1470,7 @@ class SettingsDialog(QDialog):
                 row.setVisible(True)
                 continue
             translated_label = tr(spec.label).casefold()
-            if needle.casefold() in translated_label:
+            if not key_only and needle.casefold() in translated_label:
                 row.setVisible(True)
                 continue
             keys = [
