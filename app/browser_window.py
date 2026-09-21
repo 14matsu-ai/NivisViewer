@@ -5919,11 +5919,15 @@ class BrowserWindow(QMainWindow):
         extra_button_result = self._handle_extra_button_event(watched, event)
         if extra_button_result is not None:
             return extra_button_result
+        key_event = (
+            event
+            if event.type() == QEvent.Type.KeyPress and isinstance(event, QKeyEvent)
+            else None
+        )
         if (
-            self._is_browser_cancel_command_surface(watched)
-            and event.type() == QEvent.Type.KeyPress
-            and isinstance(event, QKeyEvent)
-            and self._browser_shortcut_has("browser_cancel", event)
+            key_event is not None
+            and self._is_browser_cancel_command_surface(watched)
+            and self._browser_shortcut_has("browser_cancel", key_event)
             and QApplication.activeModalWidget() is None
             and QApplication.activePopupWidget() is None
             and not self._is_browser_editing_surface(watched)
@@ -5933,18 +5937,17 @@ class BrowserWindow(QMainWindow):
                 return True
         if (
             watched in (self.list_view, self.list_view.viewport())
-            and event.type() == QEvent.Type.KeyPress
-            and isinstance(event, QKeyEvent)
+            and key_event is not None
         ):
-            if self._browser_shortcut_has("browser_open_selection", event):
+            if self._browser_shortcut_has("browser_open_selection", key_event):
                 index = self.list_view.currentIndex()
                 if index.isValid():
                     self.open_item(index)
                 return True
             if (
-                event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                key_event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
                 and not self._browser_shortcut_has(
-                    "browser_open_selection", event
+                    "browser_open_selection", key_event
                 )
             ):
                 # QListView's built-in activation would otherwise keep the
@@ -6028,10 +6031,9 @@ class BrowserWindow(QMainWindow):
                 self.list_view.setFocus(Qt.FocusReason.ShortcutFocusReason)
                 return True
         if (
-            self._is_browser_history_key_surface(watched)
-            and event.type() == QEvent.Type.KeyPress
-            and isinstance(event, QKeyEvent)
-            and self._browser_shortcut_has("browser_backspace", event)
+            key_event is not None
+            and self._is_browser_history_key_surface(watched)
+            and self._browser_shortcut_has("browser_backspace", key_event)
         ):
             self.go_back()
             return True

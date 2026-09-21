@@ -1680,6 +1680,25 @@ def test_backspace_history_is_limited_to_browser_navigation_surfaces(
     qapp.processEvents()
 
 
+def test_non_key_events_skip_browser_keyboard_surface_checks(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    root = tmp_path / "images"
+    root.mkdir()
+    window = make_window(tmp_path, root, qapp)
+    with (
+        patch.object(window, "_is_browser_history_key_surface") as history_surface,
+        patch.object(window, "_is_browser_cancel_command_surface") as cancel_surface,
+    ):
+        for event_type in (QEvent.Type.LayoutRequest, QEvent.Type.Show):
+            window.eventFilter(window.list_view, QEvent(event_type))
+        history_surface.assert_not_called()
+        cancel_surface.assert_not_called()
+    window.close()
+    qapp.processEvents()
+
+
 def test_extra_buttons_on_child_fire_once_on_press_and_do_not_mix_actions(
     tmp_path: Path,
     qapp: QApplication,

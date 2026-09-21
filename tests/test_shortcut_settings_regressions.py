@@ -11,7 +11,7 @@ from PySide6.QtTest import QTest
 from app.config_manager import ConfigManager
 from app.i18n import install_ui_language, tr
 from app.settings_dialog import SettingsDialog
-from app.shortcut_catalog import normalize_shortcut_bindings
+from app.shortcut_catalog import canonical_key, normalize_shortcut_bindings
 from tests.test_application_controller import (
     close_controller,
     finish_viewer_open,
@@ -308,6 +308,64 @@ def test_shortcut_search_uses_visible_labels_and_key_tokens(
     finally:
         dialog.reject()
         install_ui_language("ja")
+
+
+@pytest.mark.parametrize("language", ["ja", "en", "zh-Hans", "zh-Hant"])
+def test_captured_shortcut_key_search_ignores_action_labels(
+    tmp_path: Path, qapp, language: str,
+) -> None:
+    install_ui_language(language)
+    dialog = SettingsDialog(make_config(tmp_path))
+    search = dialog.shortcut_search_edit
+    try:
+        for key, query in ((Qt.Key.Key_F, "F"), (Qt.Key.Key_S, "S")):
+            QTest.keyClick(search, key)
+            assert search.text() == query
+            for scope_action, row in dialog.shortcut_rows.items():
+                editors = dialog.shortcut_editors[scope_action]
+                keys = [canonical_key(editor.keySequence()) for editor in editors]
+                keys.extend(dialog._shortcut_extra_bindings.get(scope_action, ()))
+                assert not row.isHidden() == dialog._shortcut_key_query_matches(query, keys), scope_action
+        assert dialog.shortcut_rows[("viewer", "viewer_first_page")].isHidden()
+    finally:
+        dialog.reject()
+        install_ui_language("ja")
+
+
+def test_move_conflict_clears_preserved_extra_only_in_same_scope_and_saves(
+    tmp_path: Path, qapp,
+) -> None:
+    config = make_config(tmp_path)
+    config.apply({"shortcut_bindings": {
+        "viewer": {"viewer_close": ["Ctrl+W", "Ctrl+Q", "F11", "F12"]},
+        "browser": {"browser_back": ["Alt+Left", "F12"]},
+    }})
+    dialog = SettingsDialog(config)
+    try:
+        dialog.shortcut_editors[("viewer", "viewer_page_info")][0].setKeySequence(
+            QKeySequence("F12")
+        )
+        assert dialog._shortcut_conflicts()
+        dialog.shortcut_search_edit.setText("F12")
+        assert not dialog.shortcut_rows[("viewer", "viewer_close")].isHidden()
+        dialog._move_shortcut_conflicts("viewer", "viewer_page_info")
+        assert not dialog._shortcut_conflicts()
+        assert dialog.shortcut_rows[("viewer", "viewer_close")].isHidden()
+        assert not dialog.shortcut_rows[("viewer", "viewer_page_info")].isHidden()
+        values = dialog.values()["shortcut_bindings"]
+        assert values["viewer"]["viewer_close"] == ["Ctrl+W", "Ctrl+Q", "F11"]
+        assert values["viewer"]["viewer_page_info"] == ["F12"]
+        assert values["browser"]["browser_back"] == ["Alt+Left", "F12"]
+        assert "F12" not in dialog.shortcut_editors[("viewer", "viewer_close")][0].toolTip()
+        dialog.apply_settings()
+        reloaded = ConfigManager(config.path)
+        reloaded.load()
+        saved = reloaded.get("shortcut_bindings")
+        assert saved["viewer"]["viewer_close"] == ["Ctrl+W", "Ctrl+Q", "F11"]
+        assert saved["viewer"]["viewer_page_info"] == ["F12"]
+        assert saved["browser"]["browser_back"] == ["Alt+Left", "F12"]
+    finally:
+        dialog.reject()
 
 
 def test_file_reset_does_not_reset_browser_cache_draft(tmp_path: Path, qapp) -> None:

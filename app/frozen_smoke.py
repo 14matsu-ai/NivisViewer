@@ -8,6 +8,7 @@ from pathlib import Path
 from PIL import Image
 from PySide6.QtWidgets import QApplication
 
+from . import pillow_plugins  # noqa: F401 - register the bundled JPEG XL codec
 from .app_paths import AppPaths
 from .application_controller import ApplicationController
 from .config_manager import ConfigManager
@@ -35,6 +36,7 @@ def run_frozen_smoke(
         "gif": False,
         "tiff": False,
         "ico": False,
+        "jxl": False,
         "zip": False,
         "pdf": False,
         "metadata": False,
@@ -60,6 +62,7 @@ def run_frozen_smoke(
                 (".gif", "GIF"),
                 (".tiff", "TIFF"),
                 (".ico", "ICO"),
+                (".jxl", "JXL"),
             ):
                 path = images / f"日本語 image{extension}"
                 size = (32, 32) if extension == ".ico" else (24, 32)
