@@ -78,7 +78,7 @@ from .image_source import (
     create_image_source,
 )
 from .metadata_store import MetadataStore
-from .page_model import DisplaySpread
+from .page_model import DisplaySpread, PageModel
 from .pdf_backend import PageRenderSpec
 from .pdf_image_source import PdfImageSource
 from .path_availability import (
@@ -96,7 +96,7 @@ from .raster_book_runtime import (
     RasterRenderSpec,
     RasterRequest,
 )
-from .raster_warmup_planner import RasterBookTopology, RasterWarmupPlan
+from .raster_warmup_planner import RasterWarmupPlan
 from . import viewer_commands as commands
 from .viewer_page_list_runtime import (
     ViewerPageListModel,
@@ -156,6 +156,62 @@ _DISPLAY_DEMAND_IDLE_GRACE_MS = 16
 _RASTER_PAINT_FALLBACK_MS = 250
 _RASTER_VIEWPORT_DEBOUNCE_MS = 120
 _ZIP_RUNTIME_BROWSER_RESUME_GRACE_MS = 500
+_PAGE_LIST_MAX_AHEAD_ROWS = 96
+_PAGE_LIST_MAX_REAR_ROWS = 48
+
+
+class _PageModelRasterTopology:
+    """Live O(1)-storage view of PageModel's indexed display boundaries."""
+
+    def __init__(
+        self,
+        model: PageModel,
+        unit_factory: Callable[..., RasterDisplayUnit],
+    ) -> None:
+        self.model = model
+        self.unit_factory = unit_factory
+
+    def __len__(self) -> int:
+        return self.model.display_unit_count
+
+    def _spread(self, ordinal: int) -> DisplaySpread:
+        start = self.model.display_unit_start_at_ordinal(ordinal)
+        return self.model.spread_at(start)
+
+    def unit_at(self, ordinal: int) -> RasterDisplayUnit:
+        spread = self._spread(ordinal)
+        return self.unit_factory(
+            tuple(slot.page_index for slot in spread.slots),
+            start_index=spread.start_index,
+            is_single=spread.is_single,
+        )
+
+    def identity_at(self, ordinal: int) -> tuple[tuple[int, str], ...]:
+        return tuple(
+            (slot.page_index, slot.image_id)
+            for slot in self._spread(ordinal).slots
+        )
+
+    def page_indexes_at(self, ordinal: int) -> tuple[int, ...]:
+        return tuple(slot.page_index for slot in self._spread(ordinal).slots)
+
+    def ordinal_for_identity(
+        self,
+        identity: tuple[tuple[int, str], ...],
+    ) -> int | None:
+        if not identity:
+            return None
+        try:
+            page_index = int(identity[0][0])
+        except (TypeError, ValueError, IndexError):
+            return None
+        ordinal = self.model.display_unit_ordinal_for_page(page_index)
+        return ordinal if ordinal is not None and self.identity_at(ordinal) == identity else None
+
+    def ordinal_for_page(self, page_index: int) -> int | None:
+        return self.model.display_unit_ordinal_for_page(page_index)
+
+
 class ViewerWindow(QMainWindow):
     activated = Signal(object)
     closing = Signal(object)
@@ -534,11 +590,8 @@ class ViewerWindow(QMainWindow):
         # tests.  The owner is now the shared RasterBookRuntime used by ZIP and
         # folder-backed books alike.
         self._zip_runtime: RasterBookRuntime | None = None
-        self._raster_topology_cache_key: tuple[int, int, int] | None = None
-        self._raster_topology: RasterBookTopology[
-            RasterDisplayUnit,
-            tuple[tuple[int, str], ...],
-        ] | None = None
+        self._raster_topology_cache_key: tuple[int, int] | None = None
+        self._raster_topology: _PageModelRasterTopology | None = None
         self._zip_runtime_current_frame_serial = 0
         self._zip_runtime_last_painted_serial = 0
         self._pending_zip_runtime_request: RasterRequest | None = None
@@ -853,14 +906,10 @@ class ViewerWindow(QMainWindow):
         self.slider.focusedPageRequested.connect(self._on_slider_changed)
         self.slider.wheelInputObserved.connect(self._observe_wheel_input)
         self.slider.nextSinglePageRequested.connect(
-            lambda: self.page_navigation.next_single_page(
-                input_kind=NavigationInputKind.WHEEL
-            )
+            lambda: self.next_one_page(input_kind=NavigationInputKind.WHEEL)
         )
         self.slider.previousSinglePageRequested.connect(
-            lambda: self.page_navigation.previous_single_page(
-                input_kind=NavigationInputKind.WHEEL
-            )
+            lambda: self.previous_one_page(input_kind=NavigationInputKind.WHEEL)
         )
         self.slider.nextDisplayUnitRequested.connect(
             lambda: self.next_page(input_kind=NavigationInputKind.WHEEL)
@@ -3408,6 +3457,12 @@ class ViewerWindow(QMainWindow):
             except (RuntimeError, TypeError):
                 pass
             try:
+                previous.layoutMetadataReady.disconnect(
+                    self._on_raster_layout_metadata
+                )
+            except (RuntimeError, TypeError):
+                pass
+            try:
                 previous.idle.disconnect(self._on_raster_runtime_idle)
             except (RuntimeError, TypeError):
                 pass
@@ -3426,7 +3481,93 @@ class ViewerWindow(QMainWindow):
             self._zip_runtime.frameReady.connect(
                 self._on_zip_runtime_frame_ready
             )
+            self._zip_runtime.layoutMetadataReady.connect(
+                self._on_raster_layout_metadata
+            )
             self._zip_runtime.idle.connect(self._on_raster_runtime_idle)
+
+    @Slot(object)
+    def _on_raster_layout_metadata(self, metadata: object) -> None:
+        from .raster_layout_metadata import RasterLayoutMetadata
+
+        if (
+            not isinstance(metadata, RasterLayoutMetadata)
+            or self._shutdown_prepared
+        ):
+            return
+        runtime = self._zip_runtime
+        source = self.book_session.source
+        if (
+            runtime is None
+            or runtime is not self.book_session.viewer_runtime
+            or runtime.source is not source
+            or metadata.source_epoch != self.book_session.generation
+            or metadata.source_identity != id(source)
+        ):
+            return
+        sizes = tuple(
+            (index, size)
+            for index, image_id, size in metadata.observations
+            if size is not None and self.model.image_id_at(index) == image_id
+        )
+        if not self.model.set_image_sizes(sizes, preserve_position=True):
+            return
+        if (
+            not self._zip_runtime_active
+            or self.presentation_state.replacement_open_pending
+            or not self.model.total_pages
+        ):
+            return
+        requested = self.presentation_state.requested
+        if requested is None:
+            return
+        spread = self.model.spread_at()
+        focused = self.model.focused_index
+        if focused not in {slot.page_index for slot in spread.slots}:
+            self.model.go_to_index(focused)
+            spread = self.model.spread_at()
+        identity = tuple(
+            (slot.page_index, slot.image_id) for slot in spread.slots
+        )
+        requested_identity = tuple(
+            (page.index, page.image_id) for page in requested.unit.pages
+        )
+        if identity != requested_identity:
+            had_timer = self._zip_runtime_request_timer.isActive()
+            remaining = self._zip_runtime_request_timer.remainingTime()
+            input_kind = self._pending_raster_input_kind
+            repeat_key = self._pending_raster_repeat_key
+            displayed = self.presentation_state.displayed
+            self._refresh_view(
+                navigation=(
+                    PresentationNavigation.REFRESH
+                    if displayed is not None
+                    and displayed.token == requested.token
+                    else requested.navigation
+                ),
+                input_kind=input_kind or NavigationInputKind.REFRESH,
+                repeat_key=repeat_key,
+            )
+            if (
+                had_timer
+                and remaining >= 0
+                and self._zip_runtime_request_timer.isActive()
+            ):
+                self._zip_runtime_request_timer.start(
+                    min(
+                        remaining,
+                        max(0, self._zip_runtime_request_timer.remainingTime()),
+                    )
+                )
+            return
+        request = self._zip_runtime_request(spread)
+        if request is not None and runtime.refresh_work_order(request):
+            pending = self._pending_zip_runtime_request
+            if (
+                pending is not None
+                and pending.request_id == request.request_id
+            ):
+                self._pending_zip_runtime_request = request
 
     def _zip_display_unit(
         self,
@@ -3456,54 +3597,24 @@ class ViewerWindow(QMainWindow):
     def _raster_book_topology(
         self,
         source: ZipImageSource | FolderImageSource | SevenZipImageSource,
-    ) -> RasterBookTopology[
-        RasterDisplayUnit,
-        tuple[tuple[int, str], ...],
-    ]:
-        """Return the immutable display-unit topology for this layout.
+    ) -> _PageModelRasterTopology:
+        """Expose canonical boundaries without materializing the full book.
 
-        Page turns only create a small current-centered ``RasterWarmupPlan``.
-        The O(book pages) boundary walk is paid once per source/layout
-        revision, including a revision caused by lazy wide-page discovery.
+        PageModel's indexed boundaries provide ordinal lookups and local
+        metadata updates. The plan constructs only requested display units.
         """
 
         cache_key = (
             int(self.book_session.generation),
             id(source),
-            int(self.model.topology_revision),
         )
         cached = self._raster_topology
         if self._raster_topology_cache_key == cache_key and cached is not None:
             return cached
 
-        units: list[RasterDisplayUnit] = []
-        visited_starts: set[int] = set()
-        start = 0
-        total_pages = self.model.total_pages
-        while 0 <= start < total_pages and start not in visited_starts:
-            visited_starts.add(start)
-            spread = self.model.spread_at(start)
-            indexes = tuple(slot.page_index for slot in spread.slots)
-            if indexes:
-                units.append(
-                    self._zip_display_unit(
-                        indexes,
-                        start_index=spread.start_index,
-                        is_single=spread.is_single,
-                    )
-                )
-            next_start = self.model.next_index_from(start)
-            if next_start == start:
-                break
-            start = next_start
-
-        topology = RasterBookTopology(
-            units,
-            identity_of=lambda unit: unit.identity,
-            page_indexes_of=lambda unit: (
-                page.page_index for page in unit.pages
-            ),
-            page_count=total_pages,
+        topology = _PageModelRasterTopology(
+            self.model,
+            self._zip_display_unit,
         )
         self._raster_topology_cache_key = cache_key
         self._raster_topology = topology
@@ -3551,6 +3662,14 @@ class ViewerWindow(QMainWindow):
             # Raster warm-up is governed by memory, not the legacy prefetch
             # preset/count controls used by PDF and the retained old pipeline.
             background_enabled=not source_interactive,
+            nearby_units=(
+                self._zip_display_unit(
+                    tuple(slot.page_index for slot in candidate.slots),
+                    start_index=candidate.start_index,
+                    is_single=candidate.is_single,
+                )
+                for candidate in self.model.prefetch_spreads(direction=direction)
+            ),
         )
 
         render_spec = RasterRenderSpec(
@@ -3586,6 +3705,11 @@ class ViewerWindow(QMainWindow):
             warmup_plan,
             render_spec,
             navigation_direction=direction,
+            resolve_layout_metadata=(
+                isinstance(source, FolderImageSource)
+                and self.view_mode == "spread"
+                and self.treat_wide_image_as_single
+            ),
         )
 
     def _activate_zip_runtime(self) -> None:
@@ -3724,21 +3848,21 @@ class ViewerWindow(QMainWindow):
             # request merely because this pending serial is obsolete.
             return
         if runtime.release_staged(request):
-            self._paint_ready_transit_frame_after_cold_dispatch(request)
+            self._queue_ready_transit_frame_after_cold_dispatch(request)
             return
         self._fail_raster_runtime_request(runtime)
 
-    def _paint_ready_transit_frame_after_cold_dispatch(
+    def _queue_ready_transit_frame_after_cold_dispatch(
         self,
         request: RasterRequest,
     ) -> bool:
-        """Let one legitimate ready transit frame reach the screen.
+        """Post an update for a legitimate committed transit frame.
 
         Decode priority is already settled by ``runtime.request`` before this
         method runs.  PresentationState remains the semantic authority: only
         its most recently committed frame may paint, and only while a distinct
-        cold request from the same book is pending.  No frame queue, timer or
-        placeholder path is introduced.
+        cold request from the same book is pending. Qt may coalesce paints;
+        no frame queue, timer or placeholder path is introduced.
         """
 
         displayed = self.presentation_state.displayed
@@ -3753,7 +3877,7 @@ class ViewerWindow(QMainWindow):
             != displayed.unit.page_indexes
         ):
             return False
-        return self.viewer.paint_pending_committed_frame()
+        return self.viewer.queue_pending_committed_frame_paint()
 
     def _finish_wheel_navigation(self) -> None:
         self._navigation_admission.finish_wheel()
@@ -3836,6 +3960,7 @@ class ViewerWindow(QMainWindow):
         by_logical_page: dict[int, list[object]] = {}
         for page in frame.pages:
             by_logical_page.setdefault(page.page_index, []).append(page)
+        discovered_sizes: list[tuple[int, tuple[int, int]]] = []
         for page_index, outputs in by_logical_page.items():
             if len(outputs) == 1:
                 logical_size = outputs[0].original_size
@@ -3844,7 +3969,8 @@ class ViewerWindow(QMainWindow):
                     sum(output.original_size[0] for output in outputs),
                     max(output.original_size[1] for output in outputs),
                 )
-            self.model.set_image_size(page_index, logical_size)
+            discovered_sizes.append((page_index, logical_size))
+        self.model.set_image_sizes(discovered_sizes)
         spread = self.model.spread_at()
         if tuple(
             (slot.page_index, slot.image_id) for slot in spread.slots
@@ -4268,18 +4394,25 @@ class ViewerWindow(QMainWindow):
                     )
                     return
                 self._clear_pending_raster_navigation(reset_policy=False)
-                if runtime.request(zip_request):
+                accepted = (
+                    runtime.request(
+                        zip_request,
+                        preserve_started_compatible=True,
+                    )
+                    if input_kind is NavigationInputKind.WHEEL
+                    else runtime.request(zip_request)
+                )
+                if accepted:
+                    self._queue_ready_transit_frame_after_cold_dispatch(
+                        zip_request
+                    )
                     return
                 self._fail_raster_runtime_request(runtime)
                 return
-            # A ready transit frame may publish immediately, but a coalesced
-            # wheel/repeat sequence must keep background decode suspended.
-            # Otherwise its newly recentered warmup can start the next cold
-            # transit page before the final target has been admitted.
-            if (
-                input_kind is NavigationInputKind.WHEEL
-                or admission is NavigationAdmissionDecision.STAGE
-            ):
+            # A ready wheel frame publishes synchronously through request().
+            # Its recentered background order can continue in the available
+            # worker slot; a later cold target still preempts that work.
+            if admission is NavigationAdmissionDecision.STAGE:
                 self._stage_raster_runtime_request(
                     runtime,
                     zip_request,
@@ -4290,6 +4423,16 @@ class ViewerWindow(QMainWindow):
                 return
             self._clear_pending_raster_navigation(reset_policy=False)
             if runtime.request(zip_request):
+                if input_kind is NavigationInputKind.WHEEL:
+                    displayed = self.presentation_state.displayed
+                    if (
+                        displayed is not None
+                        and displayed.token.request_serial
+                        == zip_request.request_id
+                        and displayed.token.book.epoch
+                        == zip_request.source_epoch
+                    ):
+                        self.viewer.queue_pending_committed_frame_paint()
                 return
             self._fail_raster_runtime_request(runtime)
             return
@@ -6890,6 +7033,8 @@ class ViewerWindow(QMainWindow):
         *,
         input_kind: NavigationInputKind = NavigationInputKind.DISCRETE,
     ) -> None:
+        if self._hold_unready_wheel_advance(input_kind, 1):
+            return
         moved = self.page_navigation.next_display_unit(input_kind=input_kind)
         if not moved and self.auto_open_adjacent_book:
             self.open_next_book()
@@ -6899,6 +7044,8 @@ class ViewerWindow(QMainWindow):
         *,
         input_kind: NavigationInputKind = NavigationInputKind.DISCRETE,
     ) -> None:
+        if self._hold_unready_wheel_advance(input_kind, -1):
+            return
         moved = self.page_navigation.previous_display_unit(input_kind=input_kind)
         if not moved and self.auto_open_adjacent_book:
             self.open_previous_book()
@@ -6924,6 +7071,8 @@ class ViewerWindow(QMainWindow):
         *,
         input_kind: NavigationInputKind = NavigationInputKind.DISCRETE,
     ) -> None:
+        if self._hold_unready_wheel_advance(input_kind, 1):
+            return
         self.page_navigation.next_single_page(input_kind=input_kind)
 
     def previous_one_page(
@@ -6931,7 +7080,43 @@ class ViewerWindow(QMainWindow):
         *,
         input_kind: NavigationInputKind = NavigationInputKind.DISCRETE,
     ) -> None:
+        if self._hold_unready_wheel_advance(input_kind, -1):
+            return
         self.page_navigation.previous_single_page(input_kind=input_kind)
+
+    def _hold_unready_wheel_advance(
+        self,
+        input_kind: NavigationInputKind,
+        direction: int,
+    ) -> bool:
+        """Keep wheel position at one unready unit; allow reversal toward display.
+
+        Repeated notches are consumed, not queued for replay. A reverse notch
+        can return from the pending unit to the last complete frame. Direct
+        seek, commands and cached wheel turns keep their normal semantics.
+        """
+
+        if input_kind is not NavigationInputKind.WHEEL or not self._zip_runtime_active:
+            return False
+        requested = self.presentation_state.requested
+        displayed = self.presentation_state.displayed
+        if requested is None or (
+            displayed is not None and displayed.token == requested.token
+        ):
+            return False
+        if (
+            displayed is not None
+            and displayed.token.book == requested.token.book
+            and displayed.unit.identity == requested.unit.identity
+        ):
+            return False
+        if (
+            displayed is not None
+            and displayed.token.book == requested.token.book
+            and requested.direction == -direction
+        ):
+            return False
+        return True
 
     def go_to_page_dialog(self) -> None:
         if self.model.total_pages <= 0:

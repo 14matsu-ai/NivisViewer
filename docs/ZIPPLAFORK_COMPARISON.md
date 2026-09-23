@@ -3709,7 +3709,7 @@ displayed-page owner.
 | Runtime memory authority | New runtimes were initially seeded through the legacy `ImageCache` budget, then corrected by Window policy | `BookSession.set_viewer_runtime_memory_limits` owns explicit hard/soft byte values used both for construction and live updates. |
 | Persisted Raster memory setting | `viewer_memory_mode` coexisted with normalized/saved `viewer_cache_max_memory_mib` and prefetch presets still exposed a hidden memory field | `viewer_memory_mode` is the sole Raster memory authority. `viewer_cache_max_memory_mib` is accepted only for one-time migration when no explicit mode exists, is removed from normalized state and is never re-saved. A newer explicit mode wins. |
 | Legacy format settings | Raster and legacy meanings were entangled | `cache_size`, image/PDF forward/backward units and preset/direction controls remain for PDF, RAR/7z, custom/non-raster paths; their continued existence is not a Raster cache cap. |
-| PageList memory | Derived as one quarter of the main budget, clamped to 8--64 MiB | An explicit 64 MiB `ViewerPageListRuntime` QImage budget defines an independent virtual-thumbnail boundary; the runtime itself is not constructed until first paint. |
+| PageList memory | Derived as one quarter of the main budget, clamped to 8--64 MiB | An explicit 32 MiB `ViewerPageListRuntime` QImage budget defines an independent virtual-thumbnail boundary; the runtime itself is not constructed until first paint. |
 | Replacement cache destruction | Old Viewer/PageList runtime shutdown could clear a large ready cache during new-book GUI installation | `RasterBookRuntime.retire` and `ViewerPageListRuntime.retire` stop acceptance/cancel work but retain artifacts. `BookSession.release_retired_book_resources` performs final shutdown after the replacement paint. |
 | Failed/no-paint/rapid switch | Cleanup relied primarily on normal runtime idle/paint flow | Failed replacement keeps the active presentation. The bounded no-paint fallback schedules the same post-paint projections. `close_book` releases deferred owners, and a raster A -> raster B -> non-raster C chain releases them before C because no later raster paint exists. Running callbacks retain their source through the existing retired-source drain maps. |
 
@@ -8432,3 +8432,185 @@ The prior stage trace placed list paint near 341 ms and visible request near
 add scheduling delay, but that trace does not establish a safe benefit from
 changing paint/request order; they remain unchanged. These measurements are
 synthetic offscreen timing, not native Windows perceptual validation.
+
+## 2026-09-22 capacity-based cold Viewer wheel admission
+
+The fixed ZipPlaFork reference is `himamon/ZipPlaFork` revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, AGPL-3.0-or-later,
+`source/ZipPla/ViewerForm.cs` (`SetBackgroundMode`,
+`bmwLoadEachPage.SetWorksOrder`) and its wheel/shortcut navigation. The
+locally inspected `ViewerForm.cs` is byte-identical to that revision's Git
+object. Its worker order follows the current page, but an unready frontier
+can ignore later rapid navigation; it has no Nivis-style requested/displayed
+atomic contract. This change copies no ZipPlaFork code or structure. The
+existing notices at `licenses/ZipPlaFork/AGPL.txt` and `About.txt` remain.
+
+| Design | Decode can keep up | Decode is slower than input | Decision |
+| --- | --- | --- | --- |
+| ZipPlaFork | Work order follows the current ready frontier. | An unready frontier can drop transit input. | Preserve NivisViewer's latest-target semantics. |
+| Previous NivisViewer | After the first cold target, later wheel packets restart a trailing timer even when the worker is free. | Staging coalesces requests. | Retain generation/request-ID and ready-frame contracts. |
+| Hybrid (selected) | Every cold wheel target goes directly to the runtime; a free foreground slot starts it promptly. Ready hits publish and paint synchronously. | The single foreground slot owns a bounded current job; obsolete queued requests are replaced, while compatible already-started same-book work finishes into cache before the latest current runs. | Use actual worker capacity rather than a cadence threshold; latest request alone may publish. |
+| Independent decode job per packet | Starts each target promptly. | Builds obsolete work and can starve the final target. | Rejected. |
+
+The wheel policy no longer uses the earlier proposed 14/64 ms periodic gate.
+Synthetic 8 ms and 20 ms policy tests now both pass every cold request to the
+runtime. The runtime, not the input timer, coalesces under backpressure.
+`has_unfinished_tasks()` is not used as a capacity signal because it also
+counts background work and completed jobs awaiting GUI delivery. Ready wheel
+hits now use the same immediate runtime request path, publish their cached
+frame synchronously, and let background dispatch continue. These are offscreen behavioral checks,
+not native Windows perceptual latency measurements.
+
+### Ready-wheel prefetch continuation
+
+The fixed ZipPlaFork `ViewerForm.cs` `bmwLoadEachPage_EachRunWorkerCompleted`
+(5371), `SetNewResizedImage` (5451), `ReduceUsingMemory` (5470), and
+`SetBackgroundMode` (5558) keep one recentered background worker running
+until its memory condition stops it. NivisViewer retains its own book-scoped
+runtime, request/epoch fences, atomic ready-frame commit, decoded-source plus
+frame accounting, and current-over-background priority; no ZipPlaFork code or
+processing structure was copied in this change.
+
+| Design | Ready wheel with uncached upcoming folder pages | Evaluation |
+| --- | --- | --- |
+| ZipPlaFork | Recenter order and continue one worker until memory stops it. | Useful continuous behavior, but its publication contract differs from NivisViewer. |
+| Previous NivisViewer | Publish ready frame, suspend dispatch, restart a short wheel timer; an available worker can remain idle. | Protects rapid transit from speculative decode but delays useful prefetch. |
+| Hybrid (selected) | Publish ready frame via the existing `request()` path and continue recentered prefetch in the available single worker slot. A later cold current replaces unstarted work and follows a compatible already-started decode. | Preserves bounded work, latest target, budget admission, and stale-result fences without a wheel delay. |
+| New multiworker design | Decode multiple speculative pages concurrently. | No evidence it improves this bottleneck; extra contention and memory risk. |
+
+In a small offscreen image-folder probe (12 JPEGs, about 240 KB encoded each),
+idle opening populated all 12 ready pages under the 128 MiB hard / 112 MiB
+active soft setting. The previous ready-wheel path set
+`dispatch_suspended=True` with six ready pages and an idle worker despite
+ample headroom; after the wheel stopped all 12 became ready. A separate
+7 MiB hard / 5 MiB soft probe stopped at nine ready pages with three capacity
+skips, then repopulated all 12 after limits expanded. Those measurements
+separate the wheel gate from a genuine budget stop; they do not measure native
+Windows presentation latency or user images.
+
+### Started-work retention during wheel navigation
+
+The fixed source is `himamon/ZipPlaFork` revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, AGPL-3.0-or-later,
+`source/ZipPla/ViewerForm.cs` `SetBackgroundMode` and
+`bmwLoadEachPage_EachRunWorkerCompleted`, together with
+`source/ZipPla/GenerarClasses.cs` `SetWorksOrder`: a changed work order
+reprioritizes unstarted work while the running page finishes. NivisViewer's
+corresponding code is `app/zip_raster_book_runtime.py` `request` /
+`_adopt_request` / `_drive`, called for wheel navigation from
+`app/viewer_window.py`. This adopts the behavior, not source text or the
+WinForms worker structure. Existing ZipPlaFork copyright/AGPL notices and
+license text in `licenses/ZipPlaFork/AGPL.txt` and `About.txt` remain.
+
+| Design | Started compatible decode after a different cold wheel target | Assessment |
+| --- | --- | --- |
+| ZipPlaFork | Finish started work, then use changed work order. | Avoids throwing away a nearly finished read; ready-frontier navigation semantics differ. |
+| Previous NivisViewer | Cancel that work and start the newest current after cancellation. | Final-target priority is strong, but repeated input can discard useful reads. |
+| Hybrid (selected) | Keep one started job only if the book, epoch, render spec and topology remain compatible; replace unstarted work; after completion, schedule the latest current first. Publish only matching latest request. | Retains useful cache artifacts without a tick backlog; may delay the final page by one remaining decode. |
+| Independent multiworker design | Start a second job alongside the old one. | Deferred: worker/decoder/source concurrency and memory reservations need separate evaluation. |
+
+Non-wheel cold navigation retains previous preemption. Source switch,
+shutdown, incompatible render and memory-limit shrink still cancel running
+work. In the review's warm-OS-cache render benchmark with sixteen 750×1000
+synthetic pages, one/two concurrent jobs took median 195.30/116.18 ms for
+JPEG, 247.35/142.42 ms for PNG and 290.65/155.06 ms for WebP. These are
+throughput observations, not evidence for enabling two runtime workers or
+native Windows paint latency. The separate Folder runtime experiment with
+20 ms input and 25 ms artificial read delay retained five cache pages instead
+of one when started work finished, but both modes published only the final
+page. Retention alone does not guarantee visible intermediate pages; a ready
+wheel frame can also commit before Qt paints, so the Window now explicitly
+requests one synchronous paint of a matching committed ready wheel frame.
+
+### Folder-only two-worker trial
+
+The source comparison remains `himamon/ZipPlaFork` revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b` (AGPL-3.0-or-later),
+`source/ZipPla/ViewerForm.cs` `SetBackgroundMode` and
+`bmwLoadEachPage_EachRunWorkerCompleted`, and
+`source/ZipPla/GenerarClasses.cs` `SetWorksOrder`. The corresponding
+NivisViewer implementation is `app/zip_raster_book_runtime.py` scheduling,
+`app/image_work_coordinator.py` global lanes, and
+`app/image_source.py` Folder metadata cache. No ZipPlaFork code was copied
+for this trial; its license and notices remain under `licenses/ZipPlaFork/`.
+
+| Design | Assessment for image folders |
+| --- | --- |
+| ZipPlaFork | One running background worker is simple and bounds memory, but a cold target can wait for that worker. |
+| Previous NivisViewer | One current-first runtime worker and one shared Viewer lane provide the same bounded behavior with latest-request and epoch fences. |
+| Hybrid (selected) | Keep the existing cache, work order and publication contract; allow two Folder jobs, with a global general Viewer lane plus one Folder-only supplemental lane. Give cold current the next free slot, retain compatible started wheel jobs, replace unstarted requests and reserve memory through GUI result handling. ZIP/archive and Browser concurrency stay on their existing lanes. |
+| New design | A new scheduler or unbounded per-page jobs could overlap more work but would require a larger lifetime, memory and priority redesign without evidence of a better foreground result. |
+
+The standalone Folder constructor accepts `max_active_jobs=1` for A/B checks;
+`BookSession` uses two for Folder and one for ZIP/archive. The coordinator
+limits Folder Viewer execution to two across windows. In-flight reservations
+cover source and frame estimates, including a conservative allowance for
+unknown image dimensions; a worker still checks the exact display-unit cost
+after header probe. The Folder metadata cache now locks only short map
+accesses, keeping file reads and decoding outside the lock.
+
+A small offscreen A/B used 12 synthetic 750×1000 JPEG files (about 240 KB
+encoded each), a 128 MiB hard / 112 MiB active soft target, and warm OS
+cache. After the first frame, all 12 pages became ready in 93–125 ms with
+one worker and 47–94 ms with two across repeated runs; observed concurrent jobs
+were one and two, respectively. Retained cache was about 33.68 MiB. Cached
+forward, reverse, ping-pong and rapid request sequences completed in about
+0.4–1.1 ms per sequence in these probes; that is request cost, not paint latency.
+With 50 ms artificial reads occupying background slots, a cold final target
+took about 69–72 ms with one worker and 69–76 ms with two. Thus the trial
+improves warm-up throughput under this condition but does not promise lower
+foreground latency or eliminate skipped visible frames. Unknown-size large
+background units can be deferred or skipped under the conservative allowance;
+the next request or budget change retries capacity skips. No personal images
+or native-window perceptual measurements were used.
+
+### One-worker wheel readiness and queued paint (current direction)
+
+The Folder-only two-worker trial above is deferred. Normal `BookSession`
+construction now selects one Folder job, and the coordinator's Folder-only
+supplemental lane is disabled by default. Its explicit test override and
+reservation lifecycle fixes remain isolated for later comparison; they do not
+add a user setting or concurrent Folder execution in the normal application.
+
+The fixed reference is `himamon/ZipPlaFork` revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, AGPL-3.0-or-later:
+`source/ZipPla/GenerarClasses.cs` `BackgroundMultiWorker.SetWorksOrder`
+(around line 247) replaces the pending order while work runs;
+`source/ZipPla/ViewerForm.cs` `NextPage` (around 1903) and `PreviousPage`
+(around 1951) avoid advancing across missing resized content, and
+`movePageNatural` (around 9279) stops a multi-step advance at an unready
+frontier. `pbPaintInvalidate` (around 6644) posts `Invalidate(false)`.
+NivisViewer translates those behaviors in
+`app/zip_raster_book_runtime.py` request adoption,
+`app/viewer_window.py` wheel admission, and
+`app/viewer_widget.py` queued `update()`. No source text was copied; the
+existing ZipPlaFork AGPL text and notices remain in `licenses/ZipPlaFork/`.
+
+| Design | Navigation under a cold wheel burst | Paint and tradeoff |
+| --- | --- | --- |
+| ZipPlaFork | One worker finishes current work; `SetWorksOrder` changes what follows. `NextPage` and `PreviousPage` inspect readiness, with a guarded single-page backward exception. | `Invalidate(false)` queues a paint. Its page and spread representation differs from NivisViewer. |
+| Previous NivisViewer | Every cold notch advanced the requested model position, even while the first missing page was loading; a compatible started job still finished into cache. | Ready wheel transit forced `repaint()`, which could synchronously paint during input handling. |
+| Hybrid (selected) | One global Viewer job. A cold wheel notch can request one adjacent display unit; further same-direction notches while it is unready are consumed without replay. Reverse input can return toward the last complete frame. Ready hits and direct seeks retain their existing destination semantics. Started compatible work finishes; incompatible epoch/spec/book work still cancels. | Atomic ready commit remains immediate, while `update()` posts paint. Continuous warm-up begins after commit, independent of physical paint; paint acknowledgement retains its cache-ownership and side-effect role. |
+| New design | A separate input backlog or speculative multiworker window could keep a distant target. | More queue and state complexity, contrary to the bounded single-worker trial. |
+
+For multi-notch slider wheel packets, each notch passes through the same
+readiness guard, so a burst stops at the first cold display unit. Spread
+navigation uses the complete unit identity, and LTR/RTL both use logical
+next/previous rather than screen direction. A failed image commits a complete
+error frame, releasing the guard so the next wheel input can escape it. The
+guard applies to wheel navigation only; page selection and direct seek keep
+their destination behavior. Cached turns can commit on each input even if Qt
+coalesces multiple pending paints into one paint event. This change does not
+promise that every intermediate cached frame becomes visible.
+
+The same small 12-page synthetic Folder probe used for the preceding
+one-worker comparison was rerun offscreen with one worker, 20 ms scheduled
+wheel packets and `processEvents()` between packets. Before this change, its
+25 ms artificial-read case committed pages 1, 3 and 9; afterward it committed
+1 through 7 and consumed the remaining notches while their frontier was
+unready. Both runs eventually cached all 12 pages with no cancellation.
+At 12 ms artificial read delay and with every page already cached, the new
+path committed all requested pages 1 through 9. Cached commits can outnumber
+paint events because `update()` permits Qt to coalesce paints. The probe
+records decode starts/completions, ready-cache counts, presentation commits
+and paint events separately; it does not measure native Windows latency.

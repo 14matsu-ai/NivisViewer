@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Hashable, Iterable, Iterator
 from enum import Enum
+from itertools import islice
 from typing import Generic, TypeVar
 
 
@@ -104,6 +105,11 @@ class RasterWarmupPlan(Generic[UnitT, IdentityT]):
         "direction",
         "topology",
         "_anchor_ordinal",
+        "_nearby_units",
+        "_nearby_by_identity",
+        "_nearby_rank",
+        "_nearby_by_page",
+        "_nearby_page_rank",
     )
 
     def __init__(
@@ -115,6 +121,7 @@ class RasterWarmupPlan(Generic[UnitT, IdentityT]):
         page_indexes_of: Callable[[UnitT], Iterable[int]],
         direction: int,
         background_enabled: bool,
+        nearby_units: Iterable[UnitT] = (),
     ) -> None:
         self.topology = topology
         self.current = current
@@ -134,6 +141,30 @@ class RasterWarmupPlan(Generic[UnitT, IdentityT]):
                 if anchor is not None:
                     break
         self._anchor_ordinal = 0 if anchor is None else anchor
+        # A bounded request-local view of PageModel navigation; not another
+        # scheduler or a second full-book topology. Shared page->ordinal
+        # mappings remain canonical and cannot be overwritten by overlaps.
+        supplied = tuple(islice(nearby_units, 17))
+        if len(supplied) > 16:
+            raise ValueError("nearby raster units must be bounded to 16")
+        self._nearby_by_identity: dict[IdentityT, UnitT] = {}
+        self._nearby_by_page: dict[int, UnitT] = {}
+        self._nearby_page_rank: dict[int, int] = {}
+        for unit in supplied:
+            identity = identity_of(unit)
+            if identity == self.current_identity or identity in self._nearby_by_identity:
+                continue
+            indexes = tuple(dict.fromkeys(int(index) for index in page_indexes_of(unit)))
+            if not indexes:
+                raise ValueError("nearby raster units must contain a page")
+            self._nearby_by_identity[identity] = unit
+            for index in indexes:
+                self._nearby_by_page.setdefault(index, unit)
+                self._nearby_page_rank.setdefault(index, len(self._nearby_by_identity))
+        self._nearby_units = tuple(self._nearby_by_identity.values())
+        self._nearby_rank = {
+            identity: rank for rank, identity in enumerate(self._nearby_by_identity, 1)
+        }
 
     @property
     def anchor_ordinal(self) -> int:
@@ -141,117 +172,112 @@ class RasterWarmupPlan(Generic[UnitT, IdentityT]):
 
     @property
     def unit_count(self) -> int:
-        return len(self.topology)
+        extra = sum(self.topology.ordinal_for_identity(identity) is None
+                    for identity in self._nearby_by_identity)
+        return len(self.topology) + extra + int(
+            self.topology.ordinal_for_identity(self.current_identity) is None
+        )
 
     def contains_identity(self, identity: IdentityT) -> bool:
-        return identity == self.current_identity or (
-            self.topology.ordinal_for_identity(identity) is not None
+        return (
+            identity == self.current_identity
+            or identity in self._nearby_by_identity
+            or self.topology.ordinal_for_identity(identity) is not None
         )
 
     def unit_for_identity(self, identity: IdentityT) -> UnitT | None:
         if identity == self.current_identity:
             return self.current
+        nearby = self._nearby_by_identity.get(identity)
+        if nearby is not None:
+            return nearby
         ordinal = self.topology.ordinal_for_identity(identity)
         return None if ordinal is None else self.topology.unit_at(ordinal)
 
     def unit_for_page(self, page_index: int) -> UnitT | None:
         if int(page_index) in self.current_page_indexes:
             return self.current
+        nearby = self._nearby_by_page.get(int(page_index))
+        if nearby is not None:
+            return nearby
         ordinal = self.topology.ordinal_for_page(page_index)
         return None if ordinal is None else self.topology.unit_at(ordinal)
 
     def rank_for_identity(self, identity: IdentityT) -> int | None:
         if identity == self.current_identity:
             return 0
+        nearby_rank = self._nearby_rank.get(identity)
+        if nearby_rank is not None:
+            return nearby_rank
         ordinal = self.topology.ordinal_for_identity(identity)
         if ordinal is None:
             return None
-        return self._rank_for_ordinal(ordinal)
+        return len(self._nearby_units) + self._rank_for_ordinal(ordinal)
 
     def rank_for_page(self, page_index: int) -> int | None:
         if int(page_index) in self.current_page_indexes:
             return 0
+        nearby_rank = self._nearby_page_rank.get(int(page_index))
+        if nearby_rank is not None:
+            return nearby_rank
         ordinal = self.topology.ordinal_for_page(page_index)
         if ordinal is None:
             return None
-        return self._rank_for_ordinal(ordinal)
+        return len(self._nearby_units) + self._rank_for_ordinal(ordinal)
 
     def iter_background_units(self) -> Iterator[UnitT]:
         if not self.background_enabled or not len(self.topology):
             return
+        # Only PageModel-supplied real neighbors may overlap the current pages.
+        yield from self._nearby_units
         current_pages = frozenset(self.current_page_indexes)
         for ordinal in self._iter_background_ordinals():
             identity = self.topology.identity_at(ordinal)
-            if identity == self.current_identity:
+            if identity == self.current_identity or identity in self._nearby_by_identity:
                 continue
             if current_pages.intersection(self.topology.page_indexes_at(ordinal)):
                 continue
             yield self.topology.unit_at(ordinal)
 
     def startup_runway_units(
-        self,
-        *,
-        preferred_units: int = 4,
-        opposite_units: int = 1,
+        self, *, preferred_units: int = 4, opposite_units: int = 1,
     ) -> tuple[UnitT, ...]:
-        """Return a bounded current-centered display-unit runway.
-
-        This is a startup *minimum target*, not a cache ceiling.  Units are
-        complete topology entries, so a two-page spread consumes one slot and
-        a split/wide unit is never counted from a half-finished source page.
-        The normal book-wide iterator remains independent and follows this
-        runway without a scheduler gap, skipping artifacts already completed
-        by it.
-        """
-
+        """Bounded real neighbors followed by the canonical priority band."""
         return tuple(
-            self.topology.unit_at(ordinal)
-            for ordinal in self._priority_band_ordinals(
-                preferred_units=preferred_units,
-                opposite_units=opposite_units,
-            )
+            unit for identity in self.priority_band_identities(
+                preferred_units=preferred_units, opposite_units=opposite_units,
+            ) if (unit := self.unit_for_identity(identity)) is not None
         )
 
     def priority_band_identities(
-        self,
-        *,
-        preferred_units: int = 4,
-        opposite_units: int = 1,
+        self, *, preferred_units: int = 4, opposite_units: int = 1,
     ) -> tuple[IdentityT, ...]:
-        """Return the complete display units in the urgent work-order band.
-
-        The band affects scheduling only. Cache residency remains governed by
-        the combined source/frame byte budget owned by the runtime.
-        """
-
-        return tuple(
+        """The same bounded unit identities used by admission and retention."""
+        if not self.background_enabled:
+            return ()
+        canonical = (
             self.topology.identity_at(ordinal)
             for ordinal in self._priority_band_ordinals(
-                preferred_units=preferred_units,
-                opposite_units=opposite_units,
+                preferred_units=preferred_units, opposite_units=opposite_units,
             )
         )
+        return tuple(dict.fromkeys((*self._nearby_by_identity, *canonical)))
 
     def iter_continuous_units(
-        self,
-        *,
-        preferred_units: int = 4,
-        opposite_units: int = 1,
+        self, *, preferred_units: int = 4, opposite_units: int = 1,
     ) -> Iterator[UnitT]:
-        """Yield the priority band and remaining book as one work order."""
-
+        """One work order: actual near navigation units, then canonical distance."""
         if not self.background_enabled or not len(self.topology):
             return
-        priority_ordinals = self._priority_band_ordinals(
-            preferred_units=preferred_units,
-            opposite_units=opposite_units,
+        priority = self.priority_band_identities(
+            preferred_units=preferred_units, opposite_units=opposite_units,
         )
-        emitted = {
-            self.topology.identity_at(ordinal) for ordinal in priority_ordinals
-        }
+        emitted = set(priority)
+        for identity in priority:
+            unit = self.unit_for_identity(identity)
+            if unit is not None:
+                yield unit
         current_pages = frozenset(self.current_page_indexes)
-        for ordinal in priority_ordinals:
-            yield self.topology.unit_at(ordinal)
         for ordinal in self._iter_background_ordinals():
             identity = self.topology.identity_at(ordinal)
             if identity in emitted or identity == self.current_identity:
@@ -416,7 +442,7 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
     @property
     def unprocessed_hint(self) -> int:
         visited = sum(
-            self._plan.topology.ordinal_for_identity(identity) is not None
+            self._plan.contains_identity(identity)
             for identity in self._visited_identities
         )
         return max(
@@ -566,13 +592,7 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
         )
 
     def _mark_current_visited(self) -> None:
-        if (
-            self._plan.topology.ordinal_for_identity(
-                self._plan.current_identity
-            )
-            is not None
-        ):
-            self._visited_identities.add(self._plan.current_identity)
+        self._visited_identities.add(self._plan.current_identity)
 
 
 __all__ = [

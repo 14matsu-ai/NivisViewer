@@ -439,6 +439,78 @@ def test_zip_generic_header_probe_reads_non_jpeg_dimensions(
         source.close()
 
 
+def test_folder_header_probe_avoids_pillow_sniffing_for_common_formats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "page.png"
+    with Image.new("RGB", (321, 654), "navy") as image:
+        image.save(image_path, "PNG")
+    source = FolderImageSource(tmp_path)
+
+    monkeypatch.setattr(
+        Image,
+        "open",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Qt header probing must not enter Pillow's generic plugin scan"
+        ),
+    )
+
+    assert source.probe_image_size(str(image_path)) == (321, 654)
+
+
+def test_folder_decode_limits_malformed_png_to_its_decoder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "broken.png"
+    image_path.write_bytes(b"broken image")
+    source = FolderImageSource(tmp_path)
+    original_open = Image.open
+    formats: list[tuple[str, ...] | None] = []
+
+    def record_formats(*args, **kwargs):
+        formats.append(kwargs.get("formats"))
+        return original_open(*args, **kwargs)
+
+    monkeypatch.setattr(Image, "open", record_formats)
+
+    with pytest.raises(ImageSourceError):
+        source.open_image(str(image_path))
+
+    assert formats == [("PNG",)]
+
+
+def test_folder_decode_recognizes_a_common_mislabeled_image(
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "jpeg_named_png.png"
+    with Image.new("RGB", (13, 17), "navy") as image:
+        image.save(image_path, "JPEG")
+    source = FolderImageSource(tmp_path)
+
+    with source.open_image(str(image_path)) as decoded:
+        assert decoded.size == (13, 17)
+        red, green, blue = decoded.getpixel((0, 0))
+        assert blue > red and blue > green
+
+
+def test_folder_header_probe_swaps_exif_rotated_axes_and_rejects_bad_headers(
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "rotated.jpg"
+    exif = Image.Exif()
+    exif[274] = 6
+    with Image.new("RGB", (1200, 800), "white") as image:
+        image.save(image_path, "JPEG", exif=exif)
+    broken_path = tmp_path / "broken.png"
+    broken_path.write_bytes(b"broken image")
+    source = FolderImageSource(tmp_path)
+
+    assert source.probe_image_size(str(image_path)) == (800, 1200)
+    assert source.probe_image_size(str(broken_path)) is None
+
+
 def test_zip_streamed_jpeg_applies_exif_axis_swap(
     tmp_path: Path,
 ) -> None:

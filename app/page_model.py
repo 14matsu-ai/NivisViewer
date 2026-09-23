@@ -3,7 +3,9 @@ from __future__ import annotations
 from .i18n import tr
 
 
+from array import array
 from dataclasses import dataclass
+from typing import Iterable
 
 from PIL import Image
 
@@ -23,6 +25,35 @@ class DisplaySpread:
     is_single: bool
 
 
+class _SpreadStartIndexView:
+    """Compatibility view over lazy, indexed spread boundaries."""
+
+    __slots__ = ("_model",)
+
+    def __init__(self, model: PageModel) -> None:
+        self._model = model
+
+    def __len__(self) -> int:
+        return self._model.total_pages
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return tuple(
+                self._model.spread_start_for_index(value)
+                for value in range(*index.indices(len(self)))
+            )
+        value = int(index)
+        if value < 0:
+            value += len(self)
+        if not 0 <= value < len(self):
+            raise IndexError(value)
+        return self._model.spread_start_for_index(value)
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self._model.spread_start_for_index(index)
+
+
 class PageModel:
     def __init__(self) -> None:
         self.source: ImageSource | None = None
@@ -33,7 +64,13 @@ class PageModel:
         self.single_first_page = True
         self.treat_wide_image_as_single = True
         self._size_cache: dict[int, tuple[int, int] | None] = {}
-        self._spread_start_by_index: list[int] = []
+        self._spread_start_by_index = _SpreadStartIndexView(self)
+        self._spread_tree_base = 1
+        self._spread_out_zero = bytearray(2)
+        self._spread_out_one = bytearray(2)
+        self._spread_count_zero = array("I", [0, 0])
+        self._spread_count_one = array("I", [0, 0])
+        self._spread_start_count = 0
         self._focused_page_identity: str | None = None
         self._sliding_spread = False
         self._topology_revision = 0
@@ -110,10 +147,9 @@ class PageModel:
         self.image_ids = []
         self.current_index = 0
         self._size_cache.clear()
-        self._spread_start_by_index = []
         self._focused_page_identity = None
         self._sliding_spread = False
-        self._topology_revision += 1
+        self._rebuild_spread_boundaries()
 
     def update_options(
         self,
@@ -202,13 +238,45 @@ class PageModel:
 
     def set_image_size(self, index: int, size: tuple[int, int] | None) -> bool:
         previous = self.current_index
-        if 0 <= index < self.total_pages:
-            if index in self._size_cache and self._size_cache[index] == size:
-                return False
-            was_wide = self._cached_size_is_wide(index)
-            self._size_cache[index] = size
-            if was_wide != self._cached_size_is_wide(index):
-                self._rebuild_spread_boundaries()
+        self.set_image_sizes(((index, size),))
+        return previous != self.current_index
+
+    def set_image_sizes(
+        self,
+        sizes: Iterable[tuple[int, tuple[int, int] | None]],
+        *,
+        preserve_position: bool = False,
+    ) -> bool:
+        """Apply a metadata batch with one topology update at most.
+
+        The size cache remains the source of truth. A batch can refresh frozen
+        raster descriptors without changing page/history/progress position.
+        """
+
+        changes = {
+            int(index): size
+            for index, size in dict(sizes).items()
+            if 0 <= int(index) < self.total_pages
+            and (
+                int(index) not in self._size_cache
+                or self._size_cache[int(index)] != size
+            )
+        }
+        if not changes:
+            return False
+        changed_boundaries = tuple(
+            index
+            for index, size in changes.items()
+            if self._cached_size_is_wide(index)
+            != (self.treat_wide_image_as_single and self._size_is_wide(size))
+        )
+        self._size_cache.update(changes)
+        if changed_boundaries and self.view_mode == "spread":
+            for index in changed_boundaries:
+                self._set_spread_leaf(index)
+            self._topology_revision += 1
+            self._spread_start_count = int(self._spread_count_zero[1])
+        if not preserve_position:
             focused = self.focused_index
             if focused >= 0:
                 self.current_index = (
@@ -216,7 +284,7 @@ class PageModel:
                     if self._sliding_spread
                     else self.spread_start_for_index(focused)
                 )
-        return previous != self.current_index
+        return True
 
     def is_wide_image(self, index: int) -> bool:
         if not self.treat_wide_image_as_single:
@@ -246,36 +314,153 @@ class PageModel:
     def spread_start_for_index(self, target_index: int) -> int:
         if self.total_pages == 0:
             return 0
-        target_index = max(0, min(target_index, self.total_pages - 1))
-        if len(self._spread_start_by_index) != self.total_pages:
-            self._rebuild_spread_boundaries()
-        return self._spread_start_by_index[target_index]
+        target = max(0, min(int(target_index), self.total_pages - 1))
+        if self.is_single_at(target):
+            return target
+        phase, _count = self._spread_prefix(target)
+        return target - 1 if phase else target
+
+    @property
+    def display_unit_count(self) -> int:
+        return self._spread_start_count
+
+    def display_unit_start_at_ordinal(self, ordinal: int) -> int:
+        """Resolve a canonical display-unit ordinal in logarithmic time."""
+        target = int(ordinal)
+        if not 0 <= target < self._spread_start_count:
+            raise IndexError(target)
+        node = 1
+        phase = 0
+        while node < self._spread_tree_base:
+            left = node * 2
+            left_count = (
+                self._spread_count_one[left]
+                if phase
+                else self._spread_count_zero[left]
+            )
+            if target < left_count:
+                node = left
+                continue
+            target -= left_count
+            phase = (
+                self._spread_out_one[left]
+                if phase
+                else self._spread_out_zero[left]
+            )
+            node = left + 1
+        return node - self._spread_tree_base
+
+    def display_unit_ordinal_for_page(self, page_index: int) -> int | None:
+        if not 0 <= int(page_index) < self.total_pages:
+            return None
+        start = self.spread_start_for_index(int(page_index))
+        _phase, count = self._spread_prefix(start)
+        return count
+
+    def _spread_prefix(self, stop: int) -> tuple[int, int]:
+        """Return pairing phase and unit count after pages in [0, stop)."""
+
+        left = self._spread_tree_base
+        right = left + max(0, min(int(stop), self.total_pages))
+        left_nodes: list[int] = []
+        right_nodes: list[int] = []
+        while left < right:
+            if left & 1:
+                left_nodes.append(left)
+                left += 1
+            if right & 1:
+                right -= 1
+                right_nodes.append(right)
+            left //= 2
+            right //= 2
+        phase = 0
+        count = 0
+        for node in (*left_nodes, *reversed(right_nodes)):
+            if phase:
+                count += self._spread_count_one[node]
+                phase = self._spread_out_one[node]
+            else:
+                count += self._spread_count_zero[node]
+                phase = self._spread_out_zero[node]
+        return int(phase), int(count)
+
+    def _set_spread_leaf(self, index: int) -> None:
+        node = self._spread_tree_base + index
+        if self.is_single_at(index):
+            self._spread_out_zero[node] = 0
+            self._spread_out_one[node] = 0
+            self._spread_count_zero[node] = 1
+            self._spread_count_one[node] = 1
+        else:
+            self._spread_out_zero[node] = 1
+            self._spread_out_one[node] = 0
+            self._spread_count_zero[node] = 1
+            self._spread_count_one[node] = 0
+        node //= 2
+        while node:
+            self._combine_spread_node(node)
+            node //= 2
+
+    def _combine_spread_node(self, node: int) -> None:
+        left = node * 2
+        right = left + 1
+        for phase in (0, 1):
+            left_phase = (
+                self._spread_out_one[left]
+                if phase
+                else self._spread_out_zero[left]
+            )
+            left_count = (
+                self._spread_count_one[left]
+                if phase
+                else self._spread_count_zero[left]
+            )
+            right_phase = (
+                self._spread_out_one[right]
+                if left_phase
+                else self._spread_out_zero[right]
+            )
+            right_count = (
+                self._spread_count_one[right]
+                if left_phase
+                else self._spread_count_zero[right]
+            )
+            if phase:
+                self._spread_out_one[node] = right_phase
+                self._spread_count_one[node] = left_count + right_count
+            else:
+                self._spread_out_zero[node] = right_phase
+                self._spread_count_zero[node] = left_count + right_count
 
     def _rebuild_spread_boundaries(self) -> None:
         self._topology_revision += 1
         total = self.total_pages
-        if total == 0:
-            self._spread_start_by_index = []
-            return
-        if self.view_mode == "single":
-            self._spread_start_by_index = list(range(total))
-            return
-
-        boundaries = [0] * total
-        start = 0
-        while start < total:
-            unit_length = 1
-            if (
-                not self.is_single_at(start)
-                and start + 1 < total
-                and not self.is_wide_image(start + 1)
-            ):
-                unit_length = 2
-            stop = min(total, start + unit_length)
-            for page_index in range(start, stop):
-                boundaries[page_index] = start
-            start = stop
-        self._spread_start_by_index = boundaries
+        base = 1
+        while base < total:
+            base <<= 1
+        self._spread_tree_base = base
+        size = base * 2
+        self._spread_out_zero = bytearray(size)
+        self._spread_out_one = bytearray(size)
+        self._spread_count_zero = array("I", [0]) * size
+        self._spread_count_one = array("I", [0]) * size
+        for index in range(total):
+            node = base + index
+            if self.is_single_at(index):
+                self._spread_count_zero[node] = 1
+                self._spread_count_one[node] = 1
+            else:
+                self._spread_out_zero[node] = 1
+                self._spread_count_zero[node] = 1
+        for index in range(total, base):
+            node = base + index
+            self._spread_out_zero[node] = 0
+            self._spread_out_one[node] = 1
+        for node in range(base - 1, 0, -1):
+            self._combine_spread_node(node)
+        self._spread_start_count = (
+            int(self._spread_count_zero[1]) if total else 0
+        )
 
     def spread_at(self, start_index: int | None = None) -> DisplaySpread:
         if self.total_pages == 0:
@@ -338,6 +523,81 @@ class PageModel:
         if start_index <= 0:
             return 0
         return self.spread_start_for_index(start_index - 1)
+
+    def prefetch_spreads(
+        self,
+        *,
+        direction: int = 1,
+        preferred_units: int = 4,
+        opposite_units: int = 1,
+    ) -> tuple[DisplaySpread, ...]:
+        """Preview bounded real navigation edges without moving this model.
+
+        Keep canonical book boundaries unchanged. Include normal forward/back
+        edges and the immediate one-page edges, even when they overlap current
+        pages or start on the other spread parity. Lazy raster sources do not
+        perform header/decode I/O here; unknown geometry is reconciled by the
+        existing runtime metadata phase before preparing final pixels.
+        """
+
+        if not self.total_pages:
+            return ()
+        step = -1 if int(direction) < 0 else 1
+        forward_count = max(0, min(4, int(preferred_units)))
+        reverse_count = max(0, min(4, int(opposite_units)))
+        current = self.spread_at()
+        seen = {tuple((slot.page_index, slot.image_id) for slot in current.slots)}
+        result: list[DisplaySpread] = []
+
+        def append_at(index: int) -> None:
+            spread = self.spread_at(index)
+            identity = tuple((slot.page_index, slot.image_id) for slot in spread.slots)
+            if spread.slots and identity not in seen:
+                seen.add(identity)
+                result.append(spread)
+
+        def normal_edges(sign: int, count: int) -> list[int]:
+            index, sliding = self.current_index, self._sliding_spread
+            edges: list[int] = []
+            for _ in range(count):
+                target = (
+                    self.next_index_from(index) if sign > 0
+                    else self.previous_index_from(index, preserve_alignment=sliding)
+                )
+                if target == index:
+                    break
+                index = target
+                if sliding:
+                    sliding = self._uses_shifted_spread_anchor(index)
+                edges.append(index)
+            return edges
+
+        preferred = normal_edges(step, forward_count)
+        opposite = normal_edges(-step, reverse_count)
+        # The immediate normal forward/reverse units retain ranks 1 and 2.
+        if preferred:
+            append_at(preferred[0])
+        if opposite:
+            append_at(opposite[0])
+        # Resolve a focus on either current slot in O(1); focused_index's
+        # generic source lookup can scan the whole book for the second slot.
+        focused = next(
+            (slot.page_index for slot in current.slots
+             if self.page_identity(slot.page_index) == self._focused_page_identity),
+            None,
+        )
+        if focused is None:
+            focused = self.focused_index
+        for sign in (step, -step):
+            target = focused + sign
+            if 0 <= target < self.total_pages:
+                append_at(target)
+        for distance in range(1, max(len(preferred), len(opposite))):
+            if distance < len(preferred):
+                append_at(preferred[distance])
+            if distance < len(opposite):
+                append_at(opposite[distance])
+        return tuple(result)
 
     def _uses_shifted_spread_anchor(self, index: int) -> bool:
         return bool(

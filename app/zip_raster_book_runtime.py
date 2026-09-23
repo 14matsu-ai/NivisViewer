@@ -34,6 +34,12 @@ from PySide6.QtGui import QImage, QPixmap
 from .archive_backend import ArchiveErrorCode
 from .image_source import ImageSource, ImageSourceError, ZipImageSource
 from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
+from .raster_layout_metadata import (
+    LAYOUT_METADATA_BATCH_PAGES,
+    RasterLayoutMetadata,
+    probe_layout_metadata,
+    select_layout_metadata_pages,
+)
 from .raster_admission_policy import (
     RasterAdmissionAction,
     RasterAdmissionDecision,
@@ -515,13 +521,15 @@ def _requires_exact_prefetch_admission(
     *,
     has_cached_source: bool,
 ) -> bool:
-    if has_cached_source or page.known_size is not None:
-        return False
-    suffix = Path(page.image_id).suffix.casefold()
-    return suffix not in _JPEG_SUFFIXES or (
-        decoder_maximum is not None
-        and sum(value is None for value in decoder_maximum) == 1
-    )
+    """Route every unknown logical geometry through worker confirmation.
+
+    Cached pixels can provide dimensions without I/O, but do not make an
+    unknown page descriptor safe for GUI-side frame estimation. The worker
+    resolves cached/known dimensions first and probes only when needed.
+    """
+
+    del decoder_maximum, has_cached_source
+    return page.known_size is None
 
 
 @dataclass(frozen=True)
@@ -535,6 +543,7 @@ class ZipRasterRequest:
     ]
     render_spec: ZipRasterRenderSpec
     navigation_direction: int = 0
+    resolve_layout_metadata: bool = False
 
     def __post_init__(self) -> None:
         if self.warmup_plan.current_identity != self.current.identity:
@@ -599,6 +608,8 @@ class ZipRasterRuntimeMetrics:
     compatible_old_results: int = 0
     prefetch_admission_stops: int = 0
     oversized_prefetch_skips: int = 0
+    layout_metadata_jobs: int = 0
+    layout_metadata_pages: int = 0
 
 
 @dataclass(frozen=True)
@@ -665,6 +676,7 @@ class _JobResult:
     admission_declined: bool
     oversized_prefetch: bool
     completed_at: float
+    layout_metadata: RasterLayoutMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -1591,6 +1603,7 @@ class _ZipRasterUnitJob(QRunnable):
         source: ImageSource,
         unit: ZipRasterDisplayUnit,
         cached_sources: dict[str, _CachedSource] | None = None,
+        layout_metadata_pages: tuple[ZipRasterPage, ...] = (),
         prefetch_budget_bytes: int | None = None,
         prefetch_hard_limit_bytes: int | None = None,
     ) -> None:
@@ -1600,6 +1613,7 @@ class _ZipRasterUnitJob(QRunnable):
         self.key = key
         self.source = source
         self.unit = unit
+        self.layout_metadata_pages = tuple(layout_metadata_pages)
         self.cached_sources = dict(cached_sources or {})
         self.prefetch_budget_bytes = (
             None
@@ -1611,12 +1625,14 @@ class _ZipRasterUnitJob(QRunnable):
             if prefetch_hard_limit_bytes is None
             else max(1, int(prefetch_hard_limit_bytes))
         )
+        self.confirmed_required_bytes: int | None = None
         self.signals = _JobSignals()
         self.cancelled = Event()
         self.admission_declined = False
         self.oversized_prefetch = False
         self.started = Event()
         self.finished = Event()
+        self.source_decode_started = Event()
         self._token_lock = Lock()
         self._request_id = int(request_id)
 
@@ -1654,13 +1670,23 @@ class _ZipRasterUnitJob(QRunnable):
                 )
             return already_declined
 
+    def resize_prefetch_budget(self, byte_budget: int, hard_limit: int) -> int | None:
+        """Apply a smaller live reservation and return confirmed artifact cost."""
+
+        with self._token_lock:
+            if self.prefetch_budget_bytes is not None:
+                self.prefetch_budget_bytes = max(0, int(byte_budget))
+            if self.prefetch_hard_limit_bytes is not None:
+                self.prefetch_hard_limit_bytes = max(1, int(hard_limit))
+            return self.confirmed_required_bytes
+
     def cancel(self) -> bool:
         if self.cancelled.is_set():
             return False
         self.cancelled.set()
         cancel_image_request = getattr(self.source, "cancel_image_request", None)
         if callable(cancel_image_request):
-            for page in self.unit.pages:
+            for page in (*self.unit.pages, *self.layout_metadata_pages):
                 try:
                     cancel_image_request(page.image_id)
                 except Exception:
@@ -1675,9 +1701,29 @@ class _ZipRasterUnitJob(QRunnable):
     def run(self) -> None:
         self.started.set()
         pages: tuple[_RenderedPage, ...] = ()
+        metadata = (
+            RasterLayoutMetadata(
+                self.key.source_epoch,
+                self.key.source_identity,
+                (),
+            )
+            if self.layout_metadata_pages
+            else None
+        )
         try:
             if not self.cancelled.is_set():
-                pages = self._render_unit()
+                if self.layout_metadata_pages:
+                    metadata = RasterLayoutMetadata(
+                        self.key.source_epoch,
+                        self.key.source_identity,
+                        probe_layout_metadata(
+                            self.layout_metadata_pages,
+                            self.source.probe_image_size,
+                            self.cancelled,
+                        ),
+                    )
+                else:
+                    pages = self._render_unit()
         except Exception as exc:  # pragma: no cover - defensive worker wall
             if not self.cancelled.is_set():
                 message = str(exc) or exc.__class__.__name__
@@ -1709,6 +1755,7 @@ class _ZipRasterUnitJob(QRunnable):
             self.admission_declined,
             self.oversized_prefetch,
             monotonic(),
+            layout_metadata=metadata,
         )
         # Worker completion and GUI-result drainage are separate lifetime
         # phases.  Mark native/Pillow/source access finished before queuing the
@@ -1882,6 +1929,7 @@ class _ZipRasterUnitJob(QRunnable):
                 # second payload materialization through Pillow, this lets an
                 # archive source reject a malformed declared-JPEG before the
                 # generic fallback reopens the same entry.
+                self.source_decode_started.set()
                 compatible = self.source.open_compatible_jpeg_at_most(
                     page.image_id,
                     decoder_maximum or (None, None),
@@ -1923,6 +1971,7 @@ class _ZipRasterUnitJob(QRunnable):
                 and spec.adjustments == (1.0, 1.0, 1.0)
                 and suffix == ".webp"
             ):
+                self.source_decode_started.set()
                 qimage = self.source.open_qimage(page.image_id)
                 if qimage is not None and not qimage.isNull():
                     original_size = (qimage.width(), qimage.height())
@@ -1933,6 +1982,42 @@ class _ZipRasterUnitJob(QRunnable):
             ):
                 qimage = self._adjust_qimage(qimage, spec.adjustments)
             if qimage is None or qimage.isNull():
+                if suffix in _JPEG_SUFFIXES and decoder_maximum is not None:
+                    logical_size = original_size or page.known_size
+                    if logical_size is None:
+                        try:
+                            logical_size = self.source.probe_jpeg_size(
+                                page.image_id
+                            )
+                        except Exception:
+                            logical_size = None
+                    if logical_size is None or len(logical_size) != 2:
+                        raise ImageSourceError(
+                            tr('JPEGの縮小読み込みに失敗し、安全な元画像サイズを確認できません。'),
+                            code="unsafe_scaled_decode_fallback",
+                        )
+                    logical_size = (
+                        max(1, int(logical_size[0])),
+                        max(1, int(logical_size[1])),
+                    )
+                    compatible_size = self.source.estimate_compatible_jpeg_size(
+                        logical_size,
+                        decoder_maximum,
+                    )
+                    # A native JPEG reduction tier can be up to twice the
+                    # requested edge on a bounded axis. Do not turn a failed
+                    # scaled decode into an arbitrarily larger full raster.
+                    if any(
+                        maximum is not None
+                        and logical_size[axis]
+                        > max(1, int(compatible_size[axis])) * 2
+                        for axis, maximum in enumerate(decoder_maximum)
+                    ):
+                        raise ImageSourceError(
+                            tr('画像が大きすぎるため、安全な縮小読み込みに失敗しました。'),
+                            code="unsafe_scaled_decode_fallback",
+                        )
+                self.source_decode_started.set()
                 image = self.source.open_image(page.image_id)
                 adjusted: Image.Image | None = None
                 try:
@@ -1998,107 +2083,122 @@ class _ZipRasterUnitJob(QRunnable):
             )
 
     def _admit_unknown_prefetch_unit(self) -> bool:
-        """Probe and budget an unindexed prefetch as one complete unit.
+        """Confirm geometry, then budget missing sources and the final frame.
 
-        GUI-side admission deliberately uses a bounded provisional aspect ratio
-        (or a book-local observed size) so ordinary lazy books can prefetch
-        without eager header I/O.  Once the work reaches this worker, probe any
-        unknown source whose retained raster cannot be bounded exactly, then
-        calculate every missing source plus the complete layout-dependent frame
-        before any pixel decode.  A per-page comparison could admit an
-        over-budget spread, and decoder bounds cannot estimate a fit-width or
-        fit-height frame because layout may upscale it.
+        This retained-pixel estimate does not bound decoder RSS, compressed
+        payloads, scratch buffers, or QPixmap allocations. Header reads use the
+        existing worker/source APIs; the completed artifact is replanned
+        against the live combined cache budget before publication.
         """
 
         with self._token_lock:
             if self.prefetch_budget_bytes is None:
                 return True
+        if self.cancelled.is_set():
+            return False
 
-        candidates: list[
-            tuple[ZipRasterPage, DecoderMaximumSize | None, str]
-        ] = []
-        needs_exact_prefetch_admission = False
+        resolved_pages: list[ZipRasterPage] = []
         for page in self.unit.pages:
-            suffix = Path(page.image_id).suffix.casefold()
-            decoder_maximum = _decoder_maximum_for_page(
-                self.key.render_spec,
-                self.unit,
-                page,
+            if self.cancelled.is_set():
+                return False
+            cached = self.cached_sources.get(page.image_id)
+            logical_size = (
+                cached.original_size if cached is not None else page.known_size
             )
-            candidates.append((page, decoder_maximum, suffix))
-            if _requires_exact_prefetch_admission(
-                page,
-                decoder_maximum,
-                has_cached_source=page.image_id in self.cached_sources,
-            ):
-                needs_exact_prefetch_admission = True
-        if not needs_exact_prefetch_admission:
-            return True
+            if logical_size is None:
+                try:
+                    probe = (
+                        self.source.probe_jpeg_size
+                        if Path(page.image_id).suffix.casefold() in _JPEG_SUFFIXES
+                        else self.source.probe_image_size
+                    )
+                    logical_size = probe(page.image_id)
+                except Exception:
+                    logical_size = None
+            if self.cancelled.is_set():
+                return False
+            try:
+                if logical_size is None or len(logical_size) != 2:
+                    return self._decline_prefetch_if_still_bounded()
+                logical_size = (int(logical_size[0]), int(logical_size[1]))
+                if min(logical_size) <= 0:
+                    return self._decline_prefetch_if_still_bounded()
+            except (TypeError, ValueError, OverflowError):
+                return self._decline_prefetch_if_still_bounded()
+            resolved_pages.append(replace(page, known_size=logical_size))
 
+        # Keep identity and slot semantics while giving admission and decode
+        # the same resolved dimensions. PageModel remains the layout authority.
+        resolved_unit = replace(self.unit, pages=tuple(resolved_pages))
         logical_sizes: list[tuple[int, int]] = []
         source_sizes: list[tuple[int, int]] = []
         missing_source_bytes = 0
-        for page, decoder_maximum, suffix in candidates:
+        incompatible_cached_ids: list[str] = []
+        for page in resolved_unit.pages:
+            if self.cancelled.is_set():
+                return False
+            logical_size = page.known_size
+            assert logical_size is not None
+            logical_sizes.append(logical_size)
+            decoder_maximum = _decoder_maximum_for_page(
+                self.key.render_spec,
+                resolved_unit,
+                page,
+            )
             cached = self.cached_sources.get(page.image_id)
-            if cached is not None:
-                logical_sizes.append(cached.original_size)
+            if cached is not None and _qimage_satisfies_source_requirement(
+                cached.qimage,
+                logical_size,
+                decoder_maximum,
+            ):
                 source_sizes.append(
                     (cached.qimage.width(), cached.qimage.height())
                 )
                 continue
-            logical_size = page.known_size
-            if logical_size is None:
-                try:
-                    logical_size = (
-                        self.source.probe_jpeg_size(page.image_id)
-                        if suffix in _JPEG_SUFFIXES
-                        else self.source.probe_image_size(page.image_id)
-                    )
-                except Exception:
-                    logical_size = None
-            if logical_size is None or self.cancelled.is_set():
-                return self._decline_prefetch_if_still_bounded()
-            logical_size = (
-                max(1, int(logical_size[0])),
-                max(1, int(logical_size[1])),
-            )
-            logical_sizes.append(logical_size)
-            if suffix in _JPEG_SUFFIXES and decoder_maximum is not None:
-                source_width, source_height = (
-                    self.source.estimate_compatible_jpeg_size(
-                        logical_size,
-                        decoder_maximum,
-                    )
+            if cached is not None:
+                # A provisional bound can resolve to a different native JPEG
+                # tier. Do not silently reuse the undersized source.
+                incompatible_cached_ids.append(page.image_id)
+            if (
+                Path(page.image_id).suffix.casefold() in _JPEG_SUFFIXES
+                and decoder_maximum is not None
+            ):
+                source_size = self.source.estimate_compatible_jpeg_size(
+                    logical_size,
+                    decoder_maximum,
                 )
             else:
-                source_width, source_height = logical_size
-            missing_source_bytes += (
-                max(1, source_width) * max(1, source_height) * 4
+                source_size = logical_size
+            source_width, source_height = (
+                max(1, int(source_size[0])),
+                max(1, int(source_size[1])),
             )
-            source_sizes.append(
-                (max(1, source_width), max(1, source_height))
-            )
+            missing_source_bytes += source_width * source_height * 4
+            source_sizes.append((source_width, source_height))
 
         frame_bytes = _display_frame_bytes_for_sizes(
-            self.unit,
+            resolved_unit,
             self.key.render_spec,
             tuple(logical_sizes),
             source_sizes=tuple(source_sizes),
         )
         required_bytes = missing_source_bytes + frame_bytes
         with self._token_lock:
+            if self.cancelled.is_set():
+                return False
+            self.confirmed_required_bytes = required_bytes
             budget = self.prefetch_budget_bytes
-            if budget is None:
-                return True
-            if required_bytes <= budget:
-                return True
-            if not self.cancelled.is_set():
+            if budget is not None and required_bytes > budget:
                 self.admission_declined = True
                 hard_limit = self.prefetch_hard_limit_bytes
                 self.oversized_prefetch = bool(
                     hard_limit is not None and required_bytes > hard_limit
                 )
-        return False
+                return False
+            self.unit = resolved_unit
+            for image_id in incompatible_cached_ids:
+                self.cached_sources.pop(image_id, None)
+        return True
 
     def _decline_prefetch_if_still_bounded(self) -> bool:
         with self._token_lock:
@@ -2259,6 +2359,7 @@ class RasterBookRuntime(QObject):
 
     frameReady = Signal(object)
     artifactReady = Signal(object)
+    layoutMetadataReady = Signal(object)
     idle = Signal(object)
 
     def __init__(
@@ -2270,6 +2371,7 @@ class RasterBookRuntime(QObject):
         image_work_coordinator: ImageWorkCoordinator | None = None,
         cache_byte_budget: int = _DEFAULT_CACHE_BYTES,
         cache_soft_target_bytes: int | None = None,
+        max_active_jobs: int = 1,
     ) -> None:
         if not isinstance(source, self._source_type):
             raise TypeError(
@@ -2281,7 +2383,8 @@ class RasterBookRuntime(QObject):
         self._source_identity = id(source)
         self._coordinator = image_work_coordinator
         self._thread_pool = QThreadPool(self)
-        self._thread_pool.setMaxThreadCount(1)
+        self._max_active_jobs = max(1, min(2, int(max_active_jobs)))
+        self._thread_pool.setMaxThreadCount(self._max_active_jobs)
         self._accepting_requests = True
         self._shutdown_complete = False
         self._serial = 0
@@ -2299,9 +2402,15 @@ class RasterBookRuntime(QObject):
         self._source_hydration_key: _UnitKey | None = None
         self._source_hydration_frame: _CachedFrame | None = None
         self._active_job: _ZipRasterUnitJob | None = None
+        self._secondary_job: _ZipRasterUnitJob | None = None
         self._jobs: set[_ZipRasterUnitJob] = set()
+        self._inflight_reservations: dict[_ZipRasterUnitJob, int] = {}
+        self._processing_completion = False
         self._pending_completion_keys: set[_UnitKey] = set()
         self._failed_prefetch: set[_UnitKey] = set()
+        # Failed header attempts are suppressed per book; successful dimensions
+        # live in PageModel and the source metadata cache.
+        self._layout_metadata_attempted: set[str] = set()
         # Admission rejection is capacity state, not a broken page.  Keep it
         # separate so a later budget increase can retry the same paint-
         # released work order without also looping terminal/start failures.
@@ -2324,6 +2433,10 @@ class RasterBookRuntime(QObject):
         self._frame_store = _ZipRasterFrameStore()
         self._source_store = _ZipRasterSourceStore()
         self._metrics = ZipRasterRuntimeMetrics()
+        if self._coordinator is not None and self._max_active_jobs > 1:
+            self._coordinator.folder_viewer_capacity_available.connect(
+                self._drive, Qt.ConnectionType.QueuedConnection
+            )
 
     @property
     def metrics(self) -> ZipRasterRuntimeMetrics:
@@ -2331,10 +2444,27 @@ class RasterBookRuntime(QObject):
 
     @property
     def active_job_count(self) -> int:
-        return int(
-            self._active_job is not None
-            and not self._active_job.finished.is_set()
+        return sum(
+            not job.finished.is_set()
+            for job in self._active_slots()
         )
+
+    def _active_slots(self) -> tuple[_ZipRasterUnitJob, ...]:
+        return tuple(
+            job for job in (self._active_job, self._secondary_job)
+            if job is not None
+        )
+
+    def _free_slot_available(self) -> bool:
+        return self._active_job is None or (
+            self._max_active_jobs > 1 and self._secondary_job is None
+        )
+
+    def _remove_active_slot(self, job: _ZipRasterUnitJob) -> None:
+        if self._active_job is job:
+            self._active_job = None
+        if self._secondary_job is job:
+            self._secondary_job = None
 
     @property
     def cached_page_indexes(self) -> tuple[int, ...]:
@@ -2427,6 +2557,10 @@ class RasterBookRuntime(QObject):
             "hard_limit_bytes": self._cache_byte_budget,
             "soft_target_bytes": self._cache_soft_target_bytes,
             "cache_used_bytes": self.cache_bytes,
+            "inflight_reservation_bytes": sum(
+                self._inflight_reservations.values()
+            ),
+            "active_job_count": self.active_job_count,
             "cache_over_hard_bytes": max(
                 0,
                 self.cache_bytes - self._cache_byte_budget,
@@ -2526,13 +2660,48 @@ class RasterBookRuntime(QObject):
             or self._cache_soft_target_bytes < previous_soft_target
         )
         if limits_shrunk:
-            active = self._active_job
-            if active is not None and active.key != self._current_key:
+            for active in self._active_slots():
+                if active.key == self._current_key:
+                    continue
                 # A background worker carries a snapshot of its admission
                 # budget.  Invalidate that snapshot immediately; otherwise a
                 # live 32-GiB -> minimal change could still publish work that
                 # the newly authoritative budget would never start.
-                self._cancel_active_job()
+                new_budget = self._prefetch_worker_budget(
+                    active.key,
+                    excluding_job=active,
+                )
+                confirmed_cost = active.resize_prefetch_budget(
+                    new_budget,
+                    self._cache_byte_budget,
+                )
+                if (
+                    confirmed_cost is not None
+                    and confirmed_cost <= new_budget
+                ):
+                    # A header-confirmed unit still fits the live budget,
+                    # including lower-rank artifacts it may replace. Keep its
+                    # started decode instead of throwing away useful pixels.
+                    self._inflight_reservations[active] = max(1, new_budget)
+                    continue
+                if (
+                    active.source_decode_started.is_set()
+                    or confirmed_cost is not None
+                ):
+                    # A started decode that cannot fit the new reservation is
+                    # suppressed until capacity expands or it becomes current;
+                    # otherwise cancellation could make us decode it twice.
+                    self._failed_prefetch.add(active.key)
+                    self._admission_declined_prefetch.add(active.key)
+                    planner = self._warmup_planner
+                    if planner is not None:
+                        planner.mark_capacity_skip(active.key.unit_identity)
+                else:
+                    # Header-only probes are cheap to repeat. If the shrink
+                    # interrupts one before pixel decode, retry under the new
+                    # reservation after the probe unwinds.
+                    self._capacity_retry_after_completion.add(active.key)
+                self._cancel_job(active)
         self._enforce_combined_budget(
             limit_bytes=(
                 self._cache_soft_target_bytes
@@ -2572,15 +2741,18 @@ class RasterBookRuntime(QObject):
         # priority.  Merely raising the pressure target must not throw away an
         # unrelated far decode already in flight: that converts gradual Auto
         # recovery into duplicate work every five-second pressure sample.
-        active = self._active_job
-        if active is not None and active.key != self._current_key:
+        retry_ranks = tuple(
+            rank
+            for key in retry_keys
+            if (rank := self._background_rank(key)) is not None
+        )
+        earliest_retry_rank = min(retry_ranks, default=None)
+        expandable_jobs = tuple(
+            active for active in self._active_slots()
+            if active.key != self._current_key
+        )
+        for index, active in enumerate(expandable_jobs):
             active_rank = self._background_rank(active.key)
-            retry_ranks = tuple(
-                rank
-                for key in retry_keys
-                if (rank := self._background_rank(key)) is not None
-            )
-            earliest_retry_rank = min(retry_ranks, default=None)
             should_reprioritize = active_rank is None or (
                 earliest_retry_rank is not None
                 and earliest_retry_rank < active_rank
@@ -2590,10 +2762,32 @@ class RasterBookRuntime(QObject):
             )
             if replaced_queued:
                 self._bump("queued_job_replacements")
-            elif active.expand_prefetch_budget(
-                self._prefetch_worker_budget(active.key)
-            ):
+                continue
+            new_budget = self._prefetch_worker_budget(
+                active.key, excluding_job=active
+            )
+            if len(expandable_jobs) > 1:
+                rank = self._admission_rank(active.key)
+                if rank is not None:
+                    target = self._admission_policy.target_for_rank(rank)
+                    unreserved = max(
+                        0,
+                        target - self.cache_bytes
+                        - sum(self._inflight_reservations.values()),
+                    )
+                    remaining = len(expandable_jobs) - index
+                    new_budget = min(
+                        new_budget,
+                        self._inflight_reservations.get(active, 0)
+                        + unreserved // remaining,
+                    )
+            if active.expand_prefetch_budget(new_budget):
                 self._capacity_retry_after_completion.add(active.key)
+            if active.prefetch_budget_bytes is not None:
+                self._inflight_reservations[active] = max(
+                    self._inflight_reservations.get(active, 0),
+                    active.prefetch_budget_bytes,
+                )
         self._drive()
 
     def has_cached_current(self, request: ZipRasterRequest) -> bool:
@@ -2678,6 +2872,28 @@ class RasterBookRuntime(QObject):
             self._publish_frame(request, frame, True)
         return True
 
+    def refresh_work_order(self, request: ZipRasterRequest) -> bool:
+        """Refresh same-unit metadata without opening a staged input gate."""
+
+        previous = self._current_request
+        if (
+            not self._accepting_requests
+            or previous is None
+            or request.source_epoch != self.source_epoch
+            or request.request_id != previous.request_id
+            or self._key_for(request.current, request.render_spec) != self._current_key
+        ):
+            return False
+        was_published = self._published_request is previous
+        self._adopt_request(
+            request,
+            suspend_dispatch=self._dispatch_suspended,
+        )
+        if was_published:
+            self._published_request = request
+        self._drive()
+        return True
+
     def release_staged(self, request: ZipRasterRequest) -> bool:
         """Open the worker gate for the exact latest staged navigation.
 
@@ -2705,7 +2921,12 @@ class RasterBookRuntime(QObject):
         self._drive()
         return True
 
-    def request(self, request: ZipRasterRequest) -> bool:
+    def request(
+        self,
+        request: ZipRasterRequest,
+        *,
+        preserve_started_compatible: bool = False,
+    ) -> bool:
         if (
             not self._accepting_requests
             or request.source_epoch != self.source_epoch
@@ -2718,7 +2939,11 @@ class RasterBookRuntime(QObject):
             # input time, so admission only opens the current-job gate.
             self._dispatch_suspended = False
         else:
-            self._adopt_request(request, suspend_dispatch=False)
+            self._adopt_request(
+                request,
+                suspend_dispatch=False,
+                preserve_started_compatible=preserve_started_compatible,
+            )
         current_key = self._current_key
         if current_key is None:
             return False
@@ -2736,6 +2961,7 @@ class RasterBookRuntime(QObject):
         request: ZipRasterRequest,
         *,
         suspend_dispatch: bool,
+        preserve_started_compatible: bool = False,
     ) -> None:
         current_key = self._key_for(request.current, request.render_spec)
         if (
@@ -2804,8 +3030,7 @@ class RasterBookRuntime(QObject):
                 planner.discard_capacity_skip(declined_key.unit_identity)
 
         self._release_finished_active_slot()
-        active = self._active_job
-        if active is not None:
+        for active in self._active_slots():
             active_cancelled = active.cancelled.is_set()
             current_is_ready_or_pending = (
                 current_key in self._frame_store
@@ -2816,14 +3041,13 @@ class RasterBookRuntime(QObject):
             elif (
                 not active_cancelled
                 and self._active_job_is_artifact_compatible(active, request)
-                and current_is_ready_or_pending
+                and (current_is_ready_or_pending or preserve_started_compatible)
             ):
-                # Preserve compatible book work when the new presentation is
-                # already ready (or its completed artifact is queued for GUI
-                # publication): it cannot add latency to that request.  A
-                # cold interactive target instead cancels unrelated warmup so
-                # its read/decode can take the sole archive lane as soon as
-                # the cooperative cancellation boundary is reached.
+                # Ready navigation can keep compatible book work. Wheel
+                # navigation also lets an already-started compatible decode
+                # finish as a cache artifact: dropping that work on every
+                # cold tick makes moderate scrolling appear to skip pages.
+                # Unstarted work is still replaced by the newest current.
                 if self._take_unstarted_job(active):
                     self._bump("queued_job_replacements")
                 else:
@@ -2834,7 +3058,7 @@ class RasterBookRuntime(QObject):
                     active.adopt_request(request.request_id)
                     self._bump("running_job_adoptions")
             else:
-                self._cancel_active_job()
+                self._cancel_job(active)
 
     def _active_job_is_artifact_compatible(
         self,
@@ -2852,18 +3076,17 @@ class RasterBookRuntime(QObject):
         )
 
     def _release_finished_active_slot(self) -> bool:
-        active = self._active_job
-        if active is None or not active.finished.is_set():
-            return False
-        # QRunnable ownership ended before its queued GUI result was drained.
-        # Free the one-worker scheduling slot now, while a key ledger prevents
-        # a duplicate decode of that pending artifact. This lets a different
-        # final cold target start before the old page's QPixmap upload and
-        # presentation callback.
-        self._active_job = None
-        self._pending_completion_keys.add(active.key)
-        self._bump("finished_job_slot_releases")
-        return True
+        released = False
+        for active in self._active_slots():
+            if not active.finished.is_set():
+                continue
+            # The worker finished before its queued GUI result was drained.
+            # Free the execution slot while the key ledger prevents duplicates.
+            self._remove_active_slot(active)
+            self._pending_completion_keys.add(active.key)
+            self._bump("finished_job_slot_releases")
+            released = True
+        return released
 
     def _take_unstarted_job(self, job: _ZipRasterUnitJob) -> bool:
         """Replace queued work without first poisoning a possible runner."""
@@ -2874,8 +3097,8 @@ class RasterBookRuntime(QObject):
             return False
         job.mark_removed_before_start()
         self._jobs.discard(job)
-        if self._active_job is job:
-            self._active_job = None
+        self._inflight_reservations.pop(job, None)
+        self._remove_active_slot(job)
         self._emit_idle_if_needed()
         return True
 
@@ -2940,7 +3163,7 @@ class RasterBookRuntime(QObject):
         self._enforce_combined_budget()
         # Paint transfers displayed ownership and may free the preceding
         # frame.  It is deliberately not a raster scheduling release; the
-        # continuous one-worker planner was activated by the first accepted
+        # continuous bounded planner was activated by the first accepted
         # complete commit.
         planner = self._warmup_planner
         if (
@@ -2986,7 +3209,7 @@ class RasterBookRuntime(QObject):
 
         A failed replacement resumes the same runtime.  Preserve its planner,
         completed artifacts, scan/admission ledger and displayed retention;
-        only stop publication and the sole active worker.  A successful
+        only stop publication and active workers.  A successful
         replacement subsequently retires this runtime through the normal
         book-lifetime shutdown boundary.
         """
@@ -3064,6 +3287,10 @@ class RasterBookRuntime(QObject):
         return not self._jobs
 
     def _drive(self) -> None:
+        # Result handling may publish, evict and update the planner. Dispatch
+        # after its reservation transfers into the cache, not midway through.
+        if self._processing_completion:
+            return
         request = self._current_request
         planner = self._warmup_planner
         if (
@@ -3072,15 +3299,19 @@ class RasterBookRuntime(QObject):
             or self._current_key is None
             or planner is None
             or self._dispatch_suspended
-            or self._active_job is not None
         ):
             return
+        self._release_finished_active_slot()
         if self._current_key not in self._frame_store:
-            if self._has_pending_completion(self._current_key):
+            if (
+                self._has_pending_completion(self._current_key)
+                or any(job.key == self._current_key for job in self._active_slots())
+            ):
                 return
-            self._submit(self._current_key, ImageWorkPriority.VIEWER_CURRENT)
+            if self._free_slot_available():
+                self._submit(self._current_key, ImageWorkPriority.VIEWER_CURRENT)
             return
-        while True:
+        while self._free_slot_available():
             unit = planner.next_candidate(
                 identity_of=lambda candidate: candidate.identity,
                 is_ready=lambda candidate: (
@@ -3089,6 +3320,7 @@ class RasterBookRuntime(QObject):
                     )
                     in self._frame_store
                     or self._has_pending_completion(key)
+                    or any(job.key == key for job in self._active_slots())
                 ),
                 is_terminal_failure=lambda candidate: (
                     self._key_for(candidate, request.render_spec)
@@ -3098,11 +3330,20 @@ class RasterBookRuntime(QObject):
             if unit is None:
                 return
             key = self._key_for(unit, request.render_spec)
-            decision = self._prefetch_admission_decision(key)
-            if not decision.admitted:
+            metadata_pages = self._layout_metadata_pages_for(key)
+            decision = (
+                None
+                if metadata_pages
+                else self._prefetch_admission_decision(key)
+            )
+            if decision is not None and not decision.admitted:
+                if self._inflight_reservations:
+                    planner.recenter(request.warmup_plan)
+                    return
                 if (
                     decision.action is RasterAdmissionAction.SOFT_TARGET_REACHED
-                    and self.cache_bytes >= decision.target_bytes
+                    and self.cache_bytes + sum(self._inflight_reservations.values())
+                    >= decision.target_bytes
                 ):
                     planner.stop_for_soft_target()
                     return
@@ -3132,8 +3373,13 @@ class RasterBookRuntime(QObject):
                 )
                 else ImageWorkPriority.VIEWER_PREVIOUS
             )
-            self._submit(key, priority)
-            return
+            if not self._submit(
+                key,
+                priority,
+                layout_metadata_pages=metadata_pages,
+            ):
+                planner.recenter(request.warmup_plan)
+                return
 
     def _has_pending_completion(self, key: _UnitKey) -> bool:
         if key in self._pending_completion_keys:
@@ -3181,6 +3427,29 @@ class RasterBookRuntime(QObject):
             return None
         return request.warmup_plan.unit_for_identity(key.unit_identity)
 
+    def _layout_metadata_pages_for(
+        self,
+        key: _UnitKey,
+    ) -> tuple[ZipRasterPage, ...]:
+        request = self._current_request
+        unit = self._unit_for_key(key)
+        if request is None or unit is None or not request.resolve_layout_metadata:
+            return ()
+        return select_layout_metadata_pages(
+            unit,
+            request.warmup_plan,
+            self._layout_metadata_attempted,
+            maximum_pages=(
+                len(unit.pages)
+                if key == self._current_key
+                else LAYOUT_METADATA_BATCH_PAGES
+            ),
+            # Resolve just the visible spread before painting. Neighbor
+            # headers are useful for admission, but must not delay the first
+            # current-unit decode on a cold book.
+            include_nearby=key != self._current_key,
+        )
+
     def _prefetch_admission_decision(
         self,
         key: _UnitKey,
@@ -3198,13 +3467,14 @@ class RasterBookRuntime(QObject):
         """
         rank = self._background_rank(key)
         admission_rank = self._admission_rank(key)
+        reserved_bytes = sum(self._inflight_reservations.values())
         if (
             not self._frame_store.can_admit_prefetch(key)
             or rank is None
             or admission_rank is None
         ):
             return self._admission_policy.decide_background(
-                retained_bytes=self.cache_bytes,
+                retained_bytes=self.cache_bytes + reserved_bytes,
                 estimated_bytes=self._cache_byte_budget + 1,
                 reclaimable_lower_rank_bytes=0,
                 rank=self._admission_policy.minimum_protected_rank + 1,
@@ -3212,7 +3482,7 @@ class RasterBookRuntime(QObject):
         unit = self._unit_for_key(key)
         if unit is None:
             return self._admission_policy.decide_background(
-                retained_bytes=self.cache_bytes,
+                retained_bytes=self.cache_bytes + reserved_bytes,
                 estimated_bytes=self._cache_byte_budget + 1,
                 reclaimable_lower_rank_bytes=0,
                 rank=admission_rank,
@@ -3229,6 +3499,9 @@ class RasterBookRuntime(QObject):
         ) + sum(
             size for _candidate, size, _retention in frame_candidates
         )
+        if reserved_bytes:
+            # Concurrent jobs cannot both reserve the same reclaim candidate.
+            reclaimable_bytes = 0
         requires_exact_worker_admission = any(
             _requires_exact_prefetch_admission(
                 page,
@@ -3249,7 +3522,7 @@ class RasterBookRuntime(QObject):
             # Prove only rank/unit replaceability here; the worker compares its
             # exact header cost against free + strictly lower-rank allowance.
             return self._admission_policy.decide_background(
-                retained_bytes=self.cache_bytes,
+                retained_bytes=self.cache_bytes + reserved_bytes,
                 estimated_bytes=None,
                 reclaimable_lower_rank_bytes=reclaimable_bytes,
                 rank=admission_rank,
@@ -3265,7 +3538,7 @@ class RasterBookRuntime(QObject):
         )
         required_bytes = source_bytes + frame_bytes
         return self._admission_policy.decide_background(
-            retained_bytes=self.cache_bytes,
+            retained_bytes=self.cache_bytes + reserved_bytes,
             estimated_bytes=required_bytes,
             reclaimable_lower_rank_bytes=reclaimable_bytes,
             rank=admission_rank,
@@ -3322,7 +3595,12 @@ class RasterBookRuntime(QObject):
             return None
         return tuple(selected_sources), tuple(selected_frames)
 
-    def _prefetch_worker_budget(self, key: _UnitKey) -> int:
+    def _prefetch_worker_budget(
+        self,
+        key: _UnitKey,
+        *,
+        excluding_job: _ZipRasterUnitJob | None = None,
+    ) -> int:
         """Return free bytes plus every strictly lower-rank reservation."""
 
         unit = self._unit_for_key(key)
@@ -3330,7 +3608,13 @@ class RasterBookRuntime(QObject):
         if unit is None or rank is None:
             return 0
         target = self._admission_policy.target_for_rank(rank)
-        free = max(0, target - self.cache_bytes)
+        reserved_bytes = sum(
+            size for job, size in self._inflight_reservations.items()
+            if job is not excluding_job
+        )
+        free = max(0, target - self.cache_bytes - reserved_bytes)
+        if reserved_bytes:
+            return free
         source_allowance = sum(
             size
             for _candidate, size, _rank in (
@@ -3535,13 +3819,24 @@ class RasterBookRuntime(QObject):
             )
         return max(1, viewport_bytes, observed, source_floor)
 
-    def _submit(self, key: _UnitKey, priority: ImageWorkPriority) -> None:
+    def _submit(
+        self,
+        key: _UnitKey,
+        priority: ImageWorkPriority,
+        *,
+        layout_metadata_pages: tuple[ZipRasterPage, ...] | None = None,
+    ) -> bool:
         request = self._current_request
         unit = self._unit_for_key(key)
-        if request is None or unit is None:
-            return
+        if request is None or unit is None or not self._free_slot_available():
+            return False
+        metadata_pages = (
+            self._layout_metadata_pages_for(key)
+            if layout_metadata_pages is None
+            else tuple(layout_metadata_pages)
+        )
         cached_sources: dict[str, _CachedSource] = {}
-        for page in unit.pages:
+        for page in (() if metadata_pages else unit.pages):
             cached = self._source_store.find(
                 page,
                 key.render_spec,
@@ -3553,6 +3848,36 @@ class RasterBookRuntime(QObject):
                 continue
             cached_sources[page.image_id] = cached
             self._bump("source_cache_hits")
+        source_estimate = (
+            0
+            if metadata_pages
+            else self._estimated_missing_source_bytes(unit, key.render_spec)
+        )
+        reservation = (
+            0
+            if metadata_pages
+            else source_estimate + self._estimated_frame_bytes(
+                unit, key.render_spec, source_bytes=source_estimate
+            )
+        )
+        unknown_cost = not metadata_pages and any(
+            page.known_size is None for page in unit.pages
+        )
+        if unknown_cost and self._max_active_jobs > 1:
+            available = max(
+                1,
+                self._cache_soft_target_bytes - self.cache_bytes
+                - sum(self._inflight_reservations.values()),
+            )
+            # Allow ordinary lazy Folder pages to run concurrently without
+            # granting either unknown page the other's whole free budget.
+            reservation = max(reservation, available // 3)
+        worker_budget = (
+            None if key == self._current_key or metadata_pages
+            else self._prefetch_worker_budget(key)
+        )
+        if unknown_cost and self._max_active_jobs > 1 and worker_budget is not None:
+            worker_budget = min(worker_budget, reservation)
         self._serial += 1
         job = _ZipRasterUnitJob(
             serial=self._serial,
@@ -3561,14 +3886,11 @@ class RasterBookRuntime(QObject):
             source=self.source,
             unit=unit,
             cached_sources=cached_sources,
-            prefetch_budget_bytes=(
-                None
-                if key == self._current_key
-                else self._prefetch_worker_budget(key)
-            ),
+            layout_metadata_pages=metadata_pages,
+            prefetch_budget_bytes=worker_budget,
             prefetch_hard_limit_bytes=(
                 None
-                if key == self._current_key
+                if key == self._current_key or metadata_pages
                 else self._cache_byte_budget
             ),
         )
@@ -3576,19 +3898,32 @@ class RasterBookRuntime(QObject):
             self._on_job_completed,
             Qt.ConnectionType.QueuedConnection,
         )
-        self._active_job = job
+        if self._active_job is None:
+            self._active_job = job
+        else:
+            self._secondary_job = job
         self._jobs.add(job)
+        self._inflight_reservations[job] = max(1, reservation)
         if self._coordinator is not None:
-            started = self._coordinator.start_viewer(job, int(priority))
+            started = (
+                self._coordinator.start_folder_viewer(job, int(priority))
+                if self._max_active_jobs > 1
+                else self._coordinator.start_viewer(job, int(priority))
+            )
         else:
             self._thread_pool.start(job, int(priority))
             started = True
         if started:
             self._bump("jobs_submitted")
-            return
+            if metadata_pages:
+                self._bump("layout_metadata_jobs")
+            return True
         job.mark_removed_before_start()
         self._jobs.discard(job)
-        self._active_job = None
+        self._inflight_reservations.pop(job, None)
+        self._remove_active_slot(job)
+        if started is None:
+            return False
         if key == self._current_key:
             self._publish_start_failure(
                 request,
@@ -3599,6 +3934,7 @@ class RasterBookRuntime(QObject):
         else:
             self._failed_prefetch.add(key)
         self._emit_idle_if_needed()
+        return False
 
     def _publish_start_failure(
         self,
@@ -3657,16 +3993,18 @@ class RasterBookRuntime(QObject):
             self._publish_frame(request, cached, False)
 
     def _cancel_active_job(self) -> None:
-        job = self._active_job
-        if job is None:
-            return
+        for job in self._active_slots():
+            self._cancel_job(job)
+
+    def _cancel_job(self, job: _ZipRasterUnitJob) -> None:
         if job.cancel():
             self._bump("cancel_requests")
         if not self._try_take(job):
             return
         job.mark_removed_before_start()
         self._jobs.discard(job)
-        self._active_job = None
+        self._inflight_reservations.pop(job, None)
+        self._remove_active_slot(job)
         self._emit_idle_if_needed()
 
     def _try_take(self, job: _ZipRasterUnitJob) -> bool:
@@ -3679,15 +4017,52 @@ class RasterBookRuntime(QObject):
 
     @Slot(object)
     def _on_job_completed(self, result: _JobResult) -> None:
+        owned = next(
+            (job for job in self._jobs if job.serial == result.serial), None
+        )
+        try:
+            self._processing_completion = True
+            self._process_job_completed(result)
+        finally:
+            if owned is not None:
+                self._inflight_reservations.pop(owned, None)
+            self._processing_completion = False
+            self._drive()
+
+    def _process_job_completed(self, result: _JobResult) -> None:
         self._bump("queued_callbacks")
         self._pending_completion_keys.discard(result.key)
-        active = self._active_job
-        if active is not None and active.serial == result.serial:
-            self._active_job = None
+        for active in self._active_slots():
+            if active.serial == result.serial:
+                self._remove_active_slot(active)
+                break
         for job in tuple(self._jobs):
             if job.serial == result.serial:
                 self._jobs.discard(job)
                 break
+        metadata = result.layout_metadata
+        if metadata is not None:
+            self._capacity_retry_after_completion.discard(result.key)
+            if (
+                self._accepting_requests
+                and self._current_request is not None
+                and metadata.source_epoch == self.source_epoch
+                and metadata.source_identity == self._source_identity
+            ):
+                self._layout_metadata_attempted.update(
+                    image_id
+                    for _index, image_id, _size in metadata.observations
+                )
+                self._bump(
+                    "layout_metadata_pages",
+                    len(metadata.observations),
+                )
+                planner = self._warmup_planner
+                if planner is not None:
+                    planner.recenter(planner.plan)
+                self.layoutMetadataReady.emit(metadata)
+            self._emit_idle_if_needed()
+            return
         if not self._result_is_artifact_compatible(result):
             self._capacity_retry_after_completion.discard(result.key)
             self._bump("stale_results")
@@ -4098,7 +4473,7 @@ class RasterBookRuntime(QObject):
             self._bump("cache_evictions", frame_evicted)
 
     def _emit_idle_if_needed(self) -> None:
-        if self._active_job is None and not self.has_unfinished_tasks():
+        if not self._active_slots() and not self.has_unfinished_tasks():
             self.idle.emit(self)
 
     def _bump(self, field: str, amount: int = 1) -> None:
