@@ -138,6 +138,15 @@ class FileOperationPlanner:
         *,
         cancelled: Event | None = None,
     ) -> FileOperationPlan:
+        if request.operation is FileOperationKind.UNDO:
+            stopped = bool(cancelled is not None and cancelled.is_set())
+            return FileOperationPlan(
+                operation_id=request.operation_id or str(request.request_id),
+                request_id=request.request_id, operation=request.operation,
+                source_paths=request.source_paths, destination_directory=None,
+                total_items=len(request.undo_entries),
+                state=FileOperationState.CANCELLED if stopped else FileOperationState.READY,
+            )
         cancel = cancelled or Event()
         operation_id = request.operation_id or str(request.request_id or uuid.uuid4())
         sources = self._prepare_sources(request.source_paths)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from PySide6.QtCore import QObject, Signal, Slot
 
 from .file_operation_service import (
@@ -34,6 +36,7 @@ class FileOperationCoordinator(QObject):
     ) -> None:
         super().__init__(parent)
         self.metadata_store = metadata_store
+        self._undo_entries = ()
         self.queue = queue
         self.executor = (
             None if queue is not None else (executor or FileOperationExecutor(service))
@@ -59,6 +62,17 @@ class FileOperationCoordinator(QObject):
 
     def execute(self, request: FileOperationRequest) -> bool:
         backend = self.queue or self.executor
+        if request.operation is FileOperationKind.UNDO:
+            entries = self._undo_entries
+            if (self.busy or not entries
+                    or request.source_paths != tuple(entry.path for entry in entries)):
+                return False
+            request = replace(request, undo_entries=entries)
+            self._undo_entries = ()
+            accepted = bool(backend and backend.execute(request))
+            if not accepted:
+                self._undo_entries = entries
+            return accepted
         return bool(backend and backend.execute(request))
 
     def cancel(self) -> None:
@@ -77,6 +91,8 @@ class FileOperationCoordinator(QObject):
 
     @Slot(object)
     def _on_completed(self, result: FileOperationResult) -> None:
+        # Unsupported and undo operations deliberately clear the one-step journal.
+        self._undo_entries = result.undo_entries if result.operation is not FileOperationKind.UNDO else ()
         if self.metadata_store is not None:
             for item in result.effective_items:
                 operation = item.operation or result.operation
@@ -114,3 +130,10 @@ class FileOperationCoordinator(QObject):
                         item.destination_path,
                     )
         self.operation_completed.emit(result)
+
+    @property
+    def undo_entries(self):
+        return self._undo_entries
+
+    def invalidate_undo(self) -> None:
+        self._undo_entries = ()

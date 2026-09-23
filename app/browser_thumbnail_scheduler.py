@@ -6,6 +6,7 @@ from math import ceil
 
 
 class ThumbnailPriority(IntEnum):
+    BACKGROUND = -1
     PREFETCH = 0
     READ_AHEAD = 1
     SELECTED = 2

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .browser_workflow_policy import WORKFLOW_DEFAULTS, normalize_workflow_settings
+
 from .i18n import tr
 
 
@@ -102,6 +104,7 @@ class ConfigManager(QObject):
     }
 
     DEFAULTS: dict[str, Any] = {
+        **WORKFLOW_DEFAULTS,
         "ui_language": "ja",
         "last_open_path": "",
         "recent_paths": [],
@@ -460,6 +463,7 @@ class ConfigManager(QObject):
     @classmethod
     def _normalize(cls, values: dict[str, Any]) -> dict[str, Any]:
         normalized = values
+        normalized.update(normalize_workflow_settings(values))
         from .browser_tags import normalize_tag_registry
         normalized['browser_tag_registry'] = normalize_tag_registry(normalized.get('browser_tag_registry'))
         normalized["ui_language"] = normalize_ui_language(normalized.get("ui_language"))

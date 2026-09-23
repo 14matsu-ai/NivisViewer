@@ -23,6 +23,8 @@ class ShortcutSpec:
 
 SHORTCUT_SPECS: tuple[ShortcutSpec, ...] = (
     # Browser navigation and item operations.
+    ShortcutSpec("browser_focus_search", "browser", "検索欄へ移動", ("Ctrl+F",)),
+    ShortcutSpec("browser_undo", "browser", "直前のファイル操作を元に戻す", ("Ctrl+Z",)),
     ShortcutSpec("browser_back", "browser", "戻る", ("Alt+Left",)),
     ShortcutSpec("browser_forward", "browser", "進む", ("Alt+Right",)),
     ShortcutSpec("browser_up", "browser", "上へ", ("Alt+Up",)),
@@ -135,6 +137,14 @@ def normalize_shortcut_bindings(value: object) -> dict[str, dict[str, list[str]]
                 result[scope][spec.action_id] = normalize_binding_list(
                     raw_scope[spec.action_id], ()
                 )
+        if scope == "browser":
+            # Newly introduced defaults must not steal existing custom keys.
+            for introduced in ("browser_focus_search", "browser_undo"):
+                if introduced not in raw_scope:
+                    occupied = {key for action, keys in raw_scope.items()
+                                if action != introduced
+                                for key in normalize_binding_list(keys)}
+                    result[scope][introduced] = [key for key in result[scope][introduced] if key not in occupied]
         if scope == "viewer" and "viewer_quit" in raw_scope:
             # ``viewer_quit`` was the old label for the same per-window close
             # request. Preserve a saved binding while presenting one action.

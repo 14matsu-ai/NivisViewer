@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .file_operation_undo import FileUndoEntry, make_undo_entries, run_undo
+
 from .i18n import tr
 
 
@@ -36,6 +38,8 @@ class FileOperationKind(str, Enum):
     RECYCLE = "recycle"
     CREATE_DIRECTORY = "create_directory"
     CREATE_ZIP = "create_zip"
+
+    UNDO = "undo"
 
 
 class FileCollisionPolicy(str, Enum):
@@ -105,6 +109,8 @@ class FileOperationRequest:
     planned_total_bytes: int = 0
     planned_item_bytes: tuple[tuple[str, int], ...] = ()
 
+    undo_entries: tuple[FileUndoEntry, ...] = ()
+
 
 @dataclass(frozen=True)
 class FileOperationItemResult:
@@ -170,6 +176,8 @@ class FileOperationResult:
         for item in self.items:
             items.extend(item.leaf_results())
         return tuple(items)
+
+    undo_entries: tuple[FileUndoEntry, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -272,7 +280,7 @@ class FileOperationService:
         self.file_copier = ChunkedFileCopier()
         self._byte_progress: Callable[[int], None] | None = None
 
-    def execute(
+    def _execute_request(
         self,
         request: FileOperationRequest,
         *,
@@ -2192,3 +2200,14 @@ class FileOperationService:
             artifact_paths=artifact_paths,
             cleanup_errors=cleanup_errors,
         )
+
+    def execute(self, request, *, cancelled=None, progress=None):
+        if request.operation is FileOperationKind.UNDO:
+            return run_undo(self, request, cancelled, progress)
+        result = self._execute_request(request, cancelled=cancelled, progress=progress)
+        try:
+            entries = make_undo_entries(result)
+        except Exception:
+            _LOG.exception("Undo receipt unavailable after completed operation")
+            entries = ()
+        return replace(result, undo_entries=entries)

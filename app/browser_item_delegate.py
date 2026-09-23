@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .browser_workflow_policy import SelectionAppearance
+
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -483,6 +485,8 @@ def elided_title_lines(
 
 
 class BrowserItemDelegate(QStyledItemDelegate):
+    selection_appearance = SelectionAppearance()
+
     def __init__(
         self,
         parent=None,
@@ -1041,7 +1045,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
         font.setPointSize(self.effective_filename_font_size)
         painter.setFont(font)
         painter.setPen(
-            option.palette.highlightedText().color()
+            self._selection_text_color(option)
             if option.state & QStyle.StateFlag.State_Selected
             else option.palette.text().color()
         )
@@ -1054,8 +1058,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
         )
         preserve_extension = self.show_filename_extension and not is_folder
         if option.state & QStyle.StateFlag.State_Selected:
-            selected_background = option.palette.highlight().color()
-            selected_background.setAlpha(96)
+            selected_background = self._selection_color(option)
+            selected_background.setAlpha(self.selection_appearance.alpha)
             painter.fillRect(title_rect.adjusted(-2, 0, 2, 0), selected_background)
         lines = (
             (
@@ -1427,8 +1431,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
             "!",
         )
 
-    @staticmethod
     def _paint_interaction_frame(
+        self,
         painter: QPainter,
         option: QStyleOptionViewItem,
         selection_rect: QRect,
@@ -1442,9 +1446,11 @@ class BrowserItemDelegate(QStyledItemDelegate):
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
         focused = bool(option.state & QStyle.StateFlag.State_HasFocus)
         if selected:
-            painter.setPen(QPen(option.palette.highlight().color(), 2))
+            painter.setPen(QPen(self._selection_color(option), self.selection_appearance.border_width))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(snapped(selection_rect))
+            inset = max(0.0, (self.selection_appearance.border_width - 2) / 2)
+            target = snap_logical_rect_to_physical_pixels(QRectF(selection_rect).adjusted(inset, inset, -inset, -inset), dpr)
+            painter.drawRect(target)
         elif hovered:
             color = option.palette.highlight().color()
             color.setAlpha(170)
@@ -1455,3 +1461,17 @@ class BrowserItemDelegate(QStyledItemDelegate):
             painter.setPen(QPen(option.palette.highlightedText().color(), 1))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(snapped(selection_rect.adjusted(3, 3, -3, -3)))
+
+    def _selection_color(self, option) -> QColor:
+        value = self.selection_appearance.color
+        return QColor(option.palette.highlight().color()) if value == "auto" else QColor(value)
+
+    def _selection_text_color(self, option) -> QColor:
+        base = option.palette.base().color()
+        selected = self._selection_color(option)
+        alpha = self.selection_appearance.alpha / 255.0
+        channels = [(1-alpha)*getattr(base, c)()+alpha*getattr(selected, c)()
+                    for c in ("redF", "greenF", "blueF")]
+        linear = [c / 12.92 if c <= .04045 else ((c + .055) / 1.055)**2.4 for c in channels]
+        light = sum(c*w for c,w in zip(linear, (.2126,.7152,.0722)))
+        return QColor("#000000" if light > .179 else "#ffffff")
