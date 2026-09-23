@@ -8,7 +8,7 @@ from time import monotonic
 
 import pytest
 from PIL import Image
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
@@ -21,6 +21,10 @@ from app.image_cache import CachedImage
 from app.image_source import ImageSource, ImageSourceError, ZipImageSource
 from app import viewer_commands as commands
 from app.viewer_window import ViewerWindow
+from app.viewer_page_list_runtime import (
+    ViewerPageListRuntime,
+    ViewerPageThumbnailSpec,
+)
 
 
 def write_image(path: Path) -> None:
@@ -208,6 +212,7 @@ def test_page_list_virtualizes_rows_and_loads_only_the_visible_frontier(
 
     runtime = session.page_list_runtime
     assert runtime is not None
+    assert runtime._cache_budget == 32 * 1024 * 1024
     assert window.page_list_model.rowCount() == 0
     assert not runtime.visible
     assert not runtime.has_unfinished_tasks()
@@ -231,8 +236,10 @@ def test_page_list_virtualizes_rows_and_loads_only_the_visible_frontier(
             for index in runtime.desired_pages
         }
     )
-    assert runtime.cached_pages
-    first_cached = runtime.cached_pages[0]
+    visible_cached = set(runtime.cached_pages) & set(runtime.visible_pages)
+    assert visible_cached
+    assert set(window.page_list_model._thumbnails) <= set(runtime.visible_pages)
+    first_cached = next(iter(visible_cached))
     row = window.page_list_model.row_for_page(first_cached)
     icon = window.page_list_model.data(
         window.page_list_model.index(row, 0),
@@ -240,6 +247,7 @@ def test_page_list_virtualizes_rows_and_loads_only_the_visible_frontier(
     )
     assert icon is not None and not icon.isNull()
 
+    retained_cache = runtime.cached_pages
     window.set_page_list_visible(False)
     deadline = monotonic() + 3
     while runtime.has_unfinished_tasks() and monotonic() < deadline:
@@ -248,7 +256,8 @@ def test_page_list_virtualizes_rows_and_loads_only_the_visible_frontier(
     qapp.processEvents()
     assert window.page_list_model.rowCount() == 0
     assert runtime.desired_pages == ()
-    assert runtime.cached_pages == ()
+    assert runtime.cached_pages == retained_cache
+    assert 0 < runtime.cache_bytes <= 32 * 1024 * 1024
     assert source.forks[0].closed
     window.close()
     qapp.processEvents()
@@ -329,6 +338,88 @@ def test_page_list_switches_with_first_committed_replacement_frame(
         assert window._staged_page_list_runtime is None
         assert window.page_list_model.rowCount() == 0
     finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_page_list_filtered_resize_and_scroll_direction_set_read_ahead(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    image_ids = tuple(f"folder/page-{index:04d}.jpg" for index in range(500))
+    source = ControlledZipSource(tmp_path / "catalog.zip", pages=len(image_ids))
+    source.ids = list(image_ids)
+    runtime = ViewerPageListRuntime(source, image_ids, 731)
+    runtime.set_paused(True)
+    config = make_config(tmp_path)
+    config.apply({"show_page_list": True}, save=False)
+    window = ViewerWindow(config_manager=config)
+    window.resize(620, 480)
+    window.show()
+    try:
+        qapp.processEvents()
+        window._activate_page_list_runtime(runtime)
+        qapp.processEvents()
+        window._update_page_list_visible_work()
+        initial_visible_count = len(runtime.visible_pages)
+        assert initial_visible_count > 0
+
+        window.page_list_filter.setText("page-02")
+        window._apply_page_list_filter()
+        qapp.processEvents()
+        window._update_page_list_visible_work()
+        filtered_pages = {
+            window.page_list_model.page_index_at(row)
+            for row in range(window.page_list_model.rowCount())
+        }
+        assert len(filtered_pages) == 100
+        assert set(runtime.desired_pages) <= filtered_pages
+
+        window.resize(620, 900)
+        qapp.processEvents()
+        window._update_page_list_visible_work()
+        assert len(runtime.visible_pages) >= initial_visible_count
+
+        window.page_list_filter.clear()
+        window._apply_page_list_filter()
+        qapp.processEvents()
+        window._update_page_list_visible_work()
+        scroll_bar = window.page_list.verticalScrollBar()
+        scroll_bar.setValue(min(scroll_bar.maximum(), 200))
+        qapp.processEvents()
+        window._update_page_list_visible_work()
+        first_visible = window.page_list.indexAt(
+            QPoint(1, 1)
+        ).row()
+        visible_end = window.page_list.indexAt(
+            QPoint(1, max(1, window.page_list.viewport().height() - 2))
+        ).row()
+        assert first_visible >= 0 and visible_end >= first_visible
+        assert window.page_list_model.row_for_page(
+            runtime.desired_pages[len(runtime.visible_pages)]
+        ) > visible_end
+
+        scroll_bar.setValue(max(0, scroll_bar.value() - 30))
+        qapp.processEvents()
+        window._update_page_list_visible_work()
+        first_visible = window.page_list.indexAt(QPoint(1, 1)).row()
+        next_ahead_row = window.page_list_model.row_for_page(
+            runtime.desired_pages[len(runtime.visible_pages)]
+        )
+        assert first_visible >= 0
+        assert next_ahead_row < first_visible
+
+        # A dock hide stops work; the runtime owns the bounded cache while the
+        # model drops GUI icons.  No decode is started while paused/hidden.
+        window.page_list_dock.hide()
+        qapp.processEvents()
+        assert not runtime.visible
+        assert runtime.desired_pages == ()
+        assert source.read_calls == []
+    finally:
+        window._activate_page_list_runtime(None)
+        runtime.set_paused(False)
+        assert runtime.shutdown(wait_msecs=3000)
         window.close()
         qapp.processEvents()
 

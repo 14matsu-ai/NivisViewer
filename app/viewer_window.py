@@ -764,6 +764,9 @@ class ViewerWindow(QMainWindow):
         self.setStatusBar(self.status)
 
         self._updating_page_list_selection = False
+        self._page_list_work_identity: tuple[int, str] | None = None
+        self._page_list_anchor_row: int | None = None
+        self._page_list_scroll_direction = 1
         self.page_list_filter = QLineEdit(self)
         self.page_list_filter.setPlaceholderText(tr('ページ名で絞り込み'))
         self.page_list_filter.textChanged.connect(
@@ -3211,11 +3214,26 @@ class ViewerWindow(QMainWindow):
 
         runtime.set_visible(True)
         viewport = self.page_list.viewport()
+        identity = (
+            self.page_list_model.book_epoch,
+            self.page_list_filter.text().strip().casefold(),
+        )
+        if identity != self._page_list_work_identity:
+            self._page_list_work_identity = identity
+            self._page_list_anchor_row = None
+            self._page_list_scroll_direction = 1
         top_index = self.page_list.indexAt(QPoint(1, 1))
         bottom_index = self.page_list.indexAt(
             QPoint(1, max(1, viewport.height() - 2))
         )
-        top_row = top_index.row() if top_index.isValid() else 0
+        current_index = self.page_list.currentIndex()
+        top_row = (
+            top_index.row()
+            if top_index.isValid()
+            else current_index.row()
+            if current_index.isValid()
+            else self.page_list.verticalScrollBar().value()
+        )
         if bottom_index.isValid():
             bottom_row = bottom_index.row()
         else:
@@ -3227,21 +3245,75 @@ class ViewerWindow(QMainWindow):
                 count - 1,
                 top_row + max(1, viewport.height() // item_extent),
             )
-        first = max(0, min(top_row, bottom_row) - 2)
-        last = min(count - 1, max(top_row, bottom_row) + 2)
-        ordered = [
+        first_visible = max(0, min(top_row, bottom_row))
+        last_visible = min(count - 1, max(top_row, bottom_row))
+        if self._page_list_anchor_row is not None:
+            if first_visible > self._page_list_anchor_row:
+                self._page_list_scroll_direction = 1
+            elif first_visible < self._page_list_anchor_row:
+                self._page_list_scroll_direction = -1
+        self._page_list_anchor_row = first_visible
+
+        visible_rows = list(range(first_visible, last_visible + 1))
+        visible_pages = [
             page_index
-            for row in range(first, last + 1)
+            for row in visible_rows
             if (page_index := self.page_list_model.page_index_at(row))
             is not None
         ]
         displayed_page = self.presentation_state.displayed_page
-        if displayed_page in ordered:
-            ordered.remove(displayed_page)
-            ordered.insert(0, displayed_page)
-        desired = tuple(ordered)
-        self.page_list_model.retain_thumbnails(desired)
-        runtime.request_visible_pages(desired, self._page_thumbnail_spec())
+        if displayed_page in visible_pages:
+            visible_pages.remove(displayed_page)
+            visible_pages.insert(0, displayed_page)
+
+        # Read one viewport in the current scroll direction and at most half a
+        # viewport behind it.  The fixed caps keep a very large dock from
+        # turning this into an all-pages queue.  Rows, not source page numbers,
+        # define the window so filtered lists keep the same scroll behavior.
+        viewport_rows = max(1, len(visible_rows))
+        ahead_count = min(viewport_rows, _PAGE_LIST_MAX_AHEAD_ROWS)
+        rear_count = min((viewport_rows + 1) // 2, _PAGE_LIST_MAX_REAR_ROWS)
+        if self._page_list_scroll_direction > 0:
+            ahead_rows = range(
+                last_visible + 1,
+                min(count, last_visible + 1 + ahead_count),
+            )
+            rear_rows = range(
+                first_visible - 1,
+                max(-1, first_visible - rear_count - 1),
+                -1,
+            )
+        else:
+            ahead_rows = range(
+                first_visible - 1,
+                max(-1, first_visible - ahead_count - 1),
+                -1,
+            )
+            rear_rows = range(
+                last_visible + 1,
+                min(count, last_visible + 1 + rear_count),
+            )
+
+        def mapped_pages(rows) -> list[int]:
+            return [
+                page_index
+                for row in rows
+                if (page_index := self.page_list_model.page_index_at(row))
+                is not None
+            ]
+
+        desired = tuple(
+            visible_pages + mapped_pages(ahead_rows) + mapped_pages(rear_rows)
+        )
+        # QPixmap/QIcon ownership stays with currently visible rows.  Ahead
+        # images remain in the runtime's byte-bounded QImage LRU and are
+        # republished from there when those rows become visible.
+        self.page_list_model.retain_thumbnails(visible_pages)
+        runtime.request_visible_pages(
+            desired,
+            self._page_thumbnail_spec(),
+            visible_count=len(visible_pages),
+        )
 
     @Slot(object)
     def _on_page_list_thumbnail_ready(self, result: object) -> None:
@@ -3253,7 +3325,7 @@ class ViewerWindow(QMainWindow):
             or result.source_epoch != runtime.source_epoch
             or result.source_epoch != self.page_list_model.book_epoch
             or result.spec != self._page_thumbnail_spec()
-            or result.page_index not in runtime.desired_pages
+            or result.page_index not in runtime.visible_pages
             or not self.page_list_dock.isVisible()
             or result.qimage is None
             or result.qimage.isNull()
