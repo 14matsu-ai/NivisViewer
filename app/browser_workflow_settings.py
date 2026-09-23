@@ -1,6 +1,7 @@
 """Browser preferences, with one existing ConfigManager as persistence owner."""
 from __future__ import annotations
 
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QPushButton, QSpinBox, QWidget, QToolTip)
@@ -32,6 +33,28 @@ class BrowserWorkflowSettings(QGroupBox):
                          "画像・フォルダ・書庫・PDFが対象です。"), self)
         note.setWordWrap(True)
         form.addRow(note)
+        self.memory_mode = QComboBox(self)
+        for label, value in (
+            ("自動（必要量と空きメモリに追従）", "auto"),
+            ("128 MiB", "128"), ("256 MiB", "256"),
+            ("512 MiB", "512"), ("1 GiB", "1024"),
+            ("2 GiB", "2048"),
+        ):
+            self.memory_mode.addItem(tr(label), value)
+        self.memory_status = QLabel(self)
+        self.memory_status.setWordWrap(True)
+        self.memory_status.setObjectName("browser_thumbnail_memory_status")
+        memory_note = QLabel(tr(
+            "BrowserのサムネイルRAMキャッシュ上限です。実際の使用量は表示範囲や空きメモリに応じて調整されます。"
+            "この値はBrowserのプロバイダーキャッシュだけを対象とし、表示中の画像やViewerなどの使用量は含みません。"
+        ), self)
+        memory_note.setWordWrap(True)
+        form.addRow(tr("サムネイルのメモリ上限:"), self.memory_mode)
+        form.addRow(self.memory_status)
+        form.addRow(memory_note)
+        self._memory_status_timer = QTimer(self)
+        self._memory_status_timer.setInterval(1000)
+        self._memory_status_timer.timeout.connect(self._refresh_memory_status)
         self.opacity = QSpinBox(self)
         self.opacity.setRange(0, 100)
         self.opacity.setSuffix(" %")
@@ -103,6 +126,9 @@ class BrowserWorkflowSettings(QGroupBox):
 
     def load(self, settings) -> None:
         values = normalize_workflow_settings(settings)
+        self.memory_mode.setCurrentIndex(
+            self.memory_mode.findData(values["browser_thumbnail_memory_mode"])
+        )
         screens = int(values["browser_thumbnail_background_screens"])
         mode = "unlimited" if screens < 0 else "visible" if screens == 0 else "bounded"
         self.mode.setCurrentIndex(self.mode.findData(mode))
@@ -121,11 +147,13 @@ class BrowserWorkflowSettings(QGroupBox):
             self._color = color
         self.color_button.setText(self._color)
         self.color_button.setEnabled(color != "auto")
+        self._refresh_memory_status()
 
     def values(self) -> dict[str, object]:
         mode = self.mode.currentData()
         return normalize_workflow_settings({
             "browser_thumbnail_background_screens": -1 if mode == "unlimited" else 0 if mode == "visible" else self.screens.value(),
+            "browser_thumbnail_memory_mode": self.memory_mode.currentData(),
             "browser_selection_filename_opacity": self.opacity.value(),
             "browser_selection_border_width": self.border_width_spin.value(),
             "browser_selection_color": "auto" if self.automatic.isChecked() else self._color,
@@ -136,6 +164,42 @@ class BrowserWorkflowSettings(QGroupBox):
                 self.rounded_selection_frame.isChecked()
             ),
         })
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._refresh_memory_status()
+        self._memory_status_timer.start()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        self._memory_status_timer.stop()
+        super().hideEvent(event)
+
+    def _refresh_memory_status(self) -> None:
+        widget = self.parentWidget()
+        provider = None
+        while widget is not None:
+            provider = getattr(widget, "thumbnail_provider", None)
+            if provider is not None:
+                break
+            widget = widget.parentWidget()
+        diagnostics = getattr(provider, "browser_memory_diagnostics", None)
+        if not callable(diagnostics):
+            self.memory_status.setText(tr("現在のBrowserキャッシュ使用量を取得できません。"))
+            return
+        state = diagnostics()
+        used = int(state.get("bytes", 0)) / (1024 * 1024)
+        limit = int(state.get("limit_bytes", 0)) / (1024 * 1024)
+        reason = str(state.get("reason", "ready"))
+        reason_text = {
+            "ready": "通常",
+            "headroom_limited": "空きメモリに合わせて制限中",
+            "recovering": "空きメモリの回復を確認中",
+            "fallback": "安全側の既定値を使用中",
+        }.get(reason, reason)
+        self.memory_status.setText(tr(
+            "Browserプロバイダーキャッシュ: {used:.0f} / {limit:.0f} MiB（{state}）",
+            used=used, limit=limit, state=reason_text,
+        ))
 
 
 def gesture_help_row(checkbox, parent, button_class):

@@ -201,7 +201,8 @@ def test_workflow_settings_roundtrip(qapp):
     values={'browser_thumbnail_background_screens':-1,'browser_selection_filename_opacity':0,
             'browser_selection_border_width':9,'browser_selection_color':'#aabbcc',
             'browser_selection_text_color_auto_adjust':False,
-            'browser_selection_frame_rounded':True}
+            'browser_selection_frame_rounded':True,
+            'browser_thumbnail_memory_mode':'auto'}
     widget.load(values)
     assert widget.values()==values
     widget.load({})
@@ -888,11 +889,11 @@ def test_zero_background_screens_disables_browser_workflow(tmp_path, qapp):
 
 
 @pytest.mark.parametrize(
-    "screens,expected_generated",
-    [(3, 60), (-1, 160)],
+    "screens,expected_generated,expected_stop",
+    [(3, 60, "range-complete"), (-1, 60, "persistence-unavailable")],
 )
 def test_stale_folder_cache_does_not_truncate_configured_background_range(
-    tmp_path, qapp, screens, expected_generated
+    tmp_path, qapp, screens, expected_generated, expected_stop
 ):
     items = [
         BrowserItem(f"range-{row:03}.jpg", tmp_path / f"range-{row:03}.jpg",
@@ -958,7 +959,7 @@ def test_stale_folder_cache_does_not_truncate_configured_background_range(
         qapp.processEvents()
         provider.wait_for_done(20)
         qapp.processEvents()
-        if (workflow.stop_reason == "range-complete"
+        if (workflow.stop_reason == expected_stop
                 and provider.pending_count == 0
                 and provider.cache_statistics()["generated_background"]
                 >= expected_generated):
@@ -966,7 +967,7 @@ def test_stale_folder_cache_does_not_truncate_configured_background_range(
         time.sleep(0.002)
 
     stats = provider.cache_statistics()
-    assert workflow.stop_reason == "range-complete"
+    assert workflow.stop_reason == expected_stop
     assert stats["generated_background"] == expected_generated
     assert stats["background_self_evictions"] == 0
     assert stats["memory_cache_entries"] == 60

@@ -623,6 +623,28 @@ class BrowserItemModel(QAbstractListModel):
         )
         return True
 
+    @property
+    def thumbnail_image_bytes(self) -> int:
+        """Bytes held by model-owned thumbnail QImages (implicit sharing included)."""
+        return sum(int(image.sizeInBytes()) for image in self._thumbnail_images.values())
+
+    def retain_thumbnail_images(self, paths) -> int:
+        """Release model QImage references outside the current viewport.
+
+        Provider RAM remains the reusable cache; keeping every old model image
+        would pin evicted QImages as the user scrolls through a large folder.
+        """
+        retained = {self._key(Path(path)) for path in paths}
+        removed = 0
+        for key in tuple(self._thumbnail_images):
+            if key in retained:
+                continue
+            image = self._thumbnail_images.pop(key)
+            removed += int(image.sizeInBytes())
+            self._thumbnail_signatures.pop(key, None)
+            self._low_resolution_thumbnails.discard(key)
+        return removed
+
     def set_thumbnail_error(self, path: str | Path, message: str) -> bool:
         row = self.row_for_path(path)
         if row < 0:

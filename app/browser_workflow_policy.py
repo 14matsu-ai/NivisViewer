@@ -7,8 +7,11 @@ from itertools import chain
 import re
 from typing import Iterator, Mapping
 
+from .browser_thumbnail_memory_policy import normalize_memory_mode
+
 WORKFLOW_DEFAULTS = {
     "browser_thumbnail_background_screens": 3,
+    "browser_thumbnail_memory_mode": "auto",
     "browser_selection_filename_opacity": 38,
     "browser_selection_border_width": 2,
     "browser_selection_color": "auto",
@@ -47,6 +50,8 @@ def normalize_workflow_settings(values: Mapping[str, object]) -> dict[str, objec
             if isinstance(values.get("browser_selection_frame_rounded", False), bool)
             else False
         ),
+        "browser_thumbnail_memory_mode": normalize_memory_mode(
+            values.get("browser_thumbnail_memory_mode", "auto")),
     }
 
 

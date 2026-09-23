@@ -4044,6 +4044,9 @@ class BrowserWindow(QMainWindow):
         self._scan_batch_timer.stop()
         self._directory_change_timer.stop()
         self._save_window_state()
+        workflow = getattr(self, "_browser_workflow", None)
+        if workflow is not None:
+            workflow.shutdown()
         self.thumbnail_provider.close()
         if self._owns_archive_backend_registry:
             self.archive_backend_registry.close()
