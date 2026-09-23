@@ -5,7 +5,12 @@ from pathlib import Path
 from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QWheelEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QToolButton
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QStyleFactory,
+    QToolButton,
+)
 
 from app.browser_location_bar import (
     BrowserLocationBreadcrumb,
@@ -226,3 +231,167 @@ def test_location_popup_is_bounded_scrollable_and_keyboard_operable(
     QTest.keyClick(popup.list_widget, Qt.Key.Key_Escape)
     qapp.processEvents()
     assert not popup.isVisible()
+
+
+def test_compact_popup_rows_match_popup_height_and_remain_scrollable(
+    qapp: QApplication,
+) -> None:
+    entries = tuple(
+        LocationPopupEntry(f"検索候補 {index:02}", index)
+        for index in range(18)
+    ) + (
+        LocationPopupEntry("────────", None, enabled=False),
+        LocationPopupEntry("検索履歴を消去", "clear"),
+    )
+    style_names = ("windows11", "windowsvista", "Windows", "Fusion")
+    available_styles = set(QStyleFactory.keys())
+    assert set(style_names) <= available_styles
+    original_style_name = qapp.style().objectName()
+    try:
+        for style_name in style_names:
+            style = QStyleFactory.create(style_name)
+            assert style is not None
+            qapp.setStyle(style)
+            default_popup = BrowserLocationListPopup(entries, None)
+            compact_popup = BrowserLocationListPopup(
+                entries,
+                None,
+                compact_rows=True,
+            )
+            short_popup = BrowserLocationListPopup(
+                entries[:8] + entries[-2:],
+                None,
+                compact_rows=True,
+            )
+            activated: list[object] = []
+            compact_popup.entryActivated.connect(activated.append)
+            try:
+                default_popup.show_at(QPoint(20, 20))
+                compact_popup.show_at(QPoint(20, 20))
+                short_popup.show_at(QPoint(20, 20))
+                qapp.processEvents()
+
+                compact_row_height = compact_popup.list_widget.sizeHintForRow(0)
+                default_item_row_height = (
+                    default_popup.list_widget.sizeHintForRow(0)
+                )
+                assert compact_popup.compact_rows
+                assert compact_row_height <= default_item_row_height
+                assert compact_popup.height() < default_popup.height()
+                compact_first_rect = compact_popup.list_widget.visualItemRect(
+                    compact_popup.list_widget.item(0)
+                )
+                default_first_rect = default_popup.list_widget.visualItemRect(
+                    default_popup.list_widget.item(0)
+                )
+                assert compact_first_rect.height() <= default_first_rect.height()
+                if style_name == "windows11":
+                    assert compact_row_height < default_item_row_height
+                    assert compact_first_rect.height() < default_first_rect.height()
+                    assert compact_row_height <= (
+                        compact_popup.list_widget.fontMetrics().height()
+                    )
+                separator_row = compact_popup.entry_count - 2
+                separator_height = compact_popup.list_widget.sizeHintForRow(
+                    separator_row
+                )
+                assert 0 < separator_height < compact_row_height
+                assert {
+                    compact_popup.list_widget.sizeHintForRow(row)
+                    for row in range(compact_popup.entry_count)
+                    if row != separator_row
+                } == {compact_row_height}
+                margins = compact_popup.layout().contentsMargins()
+                vertical_chrome = (
+                    2 * compact_popup.frameWidth()
+                    + 2 * compact_popup.list_widget.frameWidth()
+                    + margins.top()
+                    + margins.bottom()
+                )
+                assert compact_popup.height() == (
+                    compact_popup.maximum_visible_rows * compact_row_height
+                    + vertical_chrome
+                )
+                assert compact_popup.list_widget.viewport().height() >= (
+                    compact_popup.maximum_visible_rows * compact_row_height
+                )
+                assert compact_popup.list_widget.verticalScrollBar().maximum() > 0
+                assert short_popup.list_widget.sizeHintForRow(8) == separator_height
+                assert short_popup.height() == (
+                    9 * compact_row_height + separator_height + vertical_chrome
+                )
+                separator_rect = short_popup.list_widget.visualItemRect(
+                    short_popup.list_widget.item(8)
+                )
+                viewport_image = short_popup.list_widget.viewport().grab().toImage()
+                line_color = viewport_image.pixelColor(
+                    20, separator_rect.center().y()
+                )
+                background_color = viewport_image.pixelColor(
+                    20, separator_rect.top()
+                )
+                assert abs(
+                    line_color.lightness() - background_color.lightness()
+                ) >= 50
+
+                separator = compact_popup.list_widget.item(
+                    compact_popup.entry_count - 2
+                )
+                assert not bool(separator.flags() & Qt.ItemFlag.ItemIsEnabled)
+                assert not bool(separator.flags() & Qt.ItemFlag.ItemIsSelectable)
+
+                last_item = compact_popup.list_widget.item(
+                    compact_popup.entry_count - 1
+                )
+                compact_popup.list_widget.scrollToItem(
+                    last_item,
+                    QAbstractItemView.ScrollHint.PositionAtBottom,
+                )
+                qapp.processEvents()
+                last_rect = compact_popup.list_widget.visualItemRect(last_item)
+                assert last_rect.height() == compact_row_height
+                assert last_rect.top() >= 0
+                assert last_rect.bottom() < (
+                    compact_popup.list_widget.viewport().height()
+                )
+
+                screen = QApplication.primaryScreen()
+                assert screen is not None
+                screen_geometry = screen.availableGeometry()
+                anchor_y = screen_geometry.bottom() - 2
+                compact_popup.show_at(
+                    QPoint(screen_geometry.left() + 20, anchor_y)
+                )
+                qapp.processEvents()
+                assert compact_popup.y() < anchor_y
+                assert compact_popup.geometry().bottom() <= (
+                    screen_geometry.bottom()
+                )
+
+                compact_popup.list_widget.setCurrentRow(
+                    compact_popup.entry_count - 1
+                )
+                QTest.keyClick(compact_popup.list_widget, Qt.Key.Key_Return)
+                qapp.processEvents()
+                assert activated[-1].value == "clear"
+                assert not compact_popup.isVisible()
+
+                compact_popup.show_at(QPoint(20, 20))
+                qapp.processEvents()
+                last_rect = compact_popup.list_widget.visualItemRect(last_item)
+                QTest.mouseClick(
+                    compact_popup.list_widget.viewport(),
+                    Qt.MouseButton.LeftButton,
+                    pos=last_rect.center(),
+                )
+                qapp.processEvents()
+                assert len(activated) == 2 and activated[-1].value == "clear"
+                assert not compact_popup.isVisible()
+            finally:
+                default_popup.close()
+                compact_popup.close()
+                short_popup.close()
+                qapp.processEvents()
+    finally:
+        qapp.setStyle(original_style_name)
+        qapp.processEvents()
