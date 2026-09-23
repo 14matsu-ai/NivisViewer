@@ -53,6 +53,96 @@ def test_save_reload_no_duplicate_and_unicode_path(tmp_path: Path) -> None:
     reopened.close()
 
 
+def test_foreground_put_does_not_prune_or_enumerate_unrelated_cache_entries(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cache = ThumbnailDiskCache(tmp_path / "cache")
+    sources = []
+    for index in range(40):
+        source = tmp_path / f"source-{index}.jpg"
+        write_image(source)
+        sources.append(source)
+        assert cache.put(make_item(source), 120, thumbnail(size=16))
+
+    unrelated = tmp_path / "new-visible.jpg"
+    write_image(unrelated)
+    calls = 0
+    original_is_file = Path.is_file
+
+    def counted_is_file(path: Path) -> bool:
+        nonlocal calls
+        calls += 1
+        return original_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", counted_is_file)
+    monkeypatch.setattr(
+        cache,
+        "prune",
+        lambda **_kwargs: pytest.fail("foreground put invoked global cleanup"),
+    )
+    assert cache.put(make_item(unrelated), 120, thumbnail(size=16))
+    assert calls <= 1  # At most the requested cache key is checked for an existing file.
+    assert cache.statistics()["entry_count"] == 41
+    cache.close()
+
+
+def test_incremental_statistics_triggers_survive_reopen_and_delete(tmp_path: Path) -> None:
+    cache_path = tmp_path / "cache"
+    cache = ThumbnailDiskCache(cache_path)
+    sources = []
+    for index in range(3):
+        source = tmp_path / f"stats-{index}.jpg"
+        write_image(source)
+        sources.append(source)
+        assert cache.put(make_item(source), 120, thumbnail(size=20))
+    with sqlite3.connect(cache.index_path) as connection:
+        count, total = connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(byte_size), 0) FROM entries"
+        ).fetchone()
+    assert cache.statistics()["entry_count"] == count == 3
+    assert cache.usage_bytes() == total
+    cache.close()
+
+    reopened = ThumbnailDiskCache(cache_path)
+    assert reopened.statistics()["entry_count"] == 3
+    assert reopened.usage_bytes() == total
+    assert reopened.clear_all()
+    assert reopened.statistics()["entry_count"] == 0
+    assert reopened.usage_bytes() == 0
+    reopened.close()
+
+
+def test_automatic_maintenance_scans_a_bounded_resumable_file_batch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import app.thumbnail_disk_cache as module
+
+    cache = ThumbnailDiskCache(tmp_path / "cache")
+    for index in range(13):
+        source = tmp_path / f"maintenance-{index}.jpg"
+        write_image(source)
+        assert cache.put(make_item(source), 120, thumbnail(size=16))
+    monkeypatch.setattr(module, "CACHE_MAINTENANCE_BATCH", 4)
+    calls = 0
+    original_is_file = Path.is_file
+
+    def counted_is_file(path: Path) -> bool:
+        nonlocal calls
+        calls += 1
+        return original_is_file(path)
+
+    monkeypatch.setattr(Path, "is_file", counted_is_file)
+    cache.cleanup_if_due(force=True)
+    assert calls <= 4
+    assert cache.maintenance_pending
+    cache.cleanup_if_due()
+    assert calls <= 8
+    assert cache.maintenance_pending
+    cache.close()
+
+
 def test_source_change_and_thumbnail_size_invalidate_entry(tmp_path: Path) -> None:
     source = tmp_path / "page.jpg"
     write_image(source)
@@ -289,8 +379,7 @@ def test_old_quality_transition_is_lazy_bounded_and_reuses_source_metadata(tmp_p
             maintenance.setattr(Image, "open", lambda *_a, **_k: pytest.fail("maintenance decoded pixels"))
             assert cache.cleanup_if_due(force=True) == 2
             assert len(set(cache.files_dir.iterdir()) & old_files) == 3
-            assert cache.cleanup_if_due() == 0  # Existing daily cadence.
-            assert cache.prune() == 2
+            assert cache.cleanup_if_due() == 2  # Resumes the bounded format batch.
             assert cache.prune() == 1
         assert not (set(cache.files_dir.iterdir()) & old_files)
         assert cache.get_page_count(items[0]) == 43

@@ -145,9 +145,14 @@ class BrowserWorkflowController(QObject):
         if self._memory_broker is None:
             return
         model = self.window.item_model
+        rows = tuple(int(row) for row in rows)
         token = self.window.thumbnail_render_spec.cache_token
         scope = []
-        visible_paths = []
+        retained_paths = []
+        try:
+            selection_model = self.window.list_view.selectionModel()
+        except (AttributeError, RuntimeError):
+            selection_model = None
         for row in rows:
             item = model.item_at(row)
             if (item is None or not item.can_generate_preview
@@ -155,8 +160,15 @@ class BrowserWorkflowController(QObject):
                                          BrowserItemKind.ARCHIVE, BrowserItemKind.PDF}):
                 continue
             scope.append((row, self._memory_identity(item, token)))
-            if first <= row <= last:
-                visible_paths.append(item.path)
+            try:
+                selected = bool(
+                    selection_model is not None
+                    and selection_model.isSelected(model.index(row, 0))
+                )
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                selected = False
+            if first <= row <= last or selected:
+                retained_paths.append(item.path)
         new_scope = tuple(scope)
         if new_scope != self._memory_scope:
             self._memory_attempted.intersection_update(identity for _row, identity in new_scope)
@@ -164,7 +176,7 @@ class BrowserWorkflowController(QObject):
             self._rebuild_memory_refill()
         retain_images = getattr(model, "retain_thumbnail_images", None)
         if callable(retain_images):
-            retain_images(visible_paths)
+            retain_images(retained_paths)
         near_bytes = frame_byte_estimate(self.window.thumbnail_render_spec) * len(scope)
         if near_bytes != self._memory_near_bytes:
             self._memory_near_bytes = near_bytes

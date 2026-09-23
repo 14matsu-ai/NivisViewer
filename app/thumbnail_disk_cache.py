@@ -27,6 +27,7 @@ from .thumbnail_render import (
 
 CACHE_SCHEMA_VERSION = 3
 OBSOLETE_FORMAT_PRUNE_BATCH = 128
+CACHE_MAINTENANCE_BATCH = 128
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,86 @@ class _Fingerprint:
     def key(self) -> str:
         payload = json.dumps(self.__dict__, ensure_ascii=False, sort_keys=True).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
+
+
+@dataclass(frozen=True)
+class ThumbnailSourceIdentity:
+    """Source and cover revision captured before a thumbnail is decoded."""
+
+    source_path: str
+    item_kind: str
+    source_size: int
+    source_mtime_ns: int
+    cover_path: str = ""
+    cover_size: int = 0
+    cover_mtime_ns: int = 0
+
+    @classmethod
+    def capture(
+        cls,
+        item: BrowserItem,
+        cover_path: str | Path | None = None,
+    ) -> ThumbnailSourceIdentity | None:
+        try:
+            source_info = item.path.stat()
+            source_size = int(source_info.st_size)
+            source_mtime_ns = int(source_info.st_mtime_ns)
+        except OSError:
+            return None
+        if (
+            (item.file_size is not None and item.file_size != source_size)
+            or (
+                item.modified_time_ns is not None
+                and item.modified_time_ns != source_mtime_ns
+            )
+        ):
+            return None
+
+        normalized_cover = ""
+        cover_size = 0
+        cover_mtime_ns = 0
+        if item.kind is BrowserItemKind.FOLDER:
+            if cover_path is None:
+                return None
+            cover = Path(cover_path)
+            try:
+                cover_info = cover.stat()
+                cover_size = int(cover_info.st_size)
+                cover_mtime_ns = int(cover_info.st_mtime_ns)
+            except OSError:
+                return None
+            normalized_cover = cls._normalize_path(cover)
+        elif cover_path is not None:
+            return None
+
+        return cls(
+            source_path=cls._normalize_path(item.path),
+            item_kind=item.kind.value,
+            source_size=source_size,
+            source_mtime_ns=source_mtime_ns,
+            cover_path=normalized_cover,
+            cover_size=cover_size,
+            cover_mtime_ns=cover_mtime_ns,
+        )
+
+    def matches(self, fingerprint: _Fingerprint) -> bool:
+        return (
+            self.source_path == fingerprint.source_path
+            and self.item_kind == fingerprint.item_kind
+            and self.source_size == fingerprint.source_size
+            and self.source_mtime_ns == fingerprint.source_mtime_ns
+            and self.cover_path == fingerprint.cover_path
+            and self.cover_size == fingerprint.cover_size
+            and self.cover_mtime_ns == fingerprint.cover_mtime_ns
+        )
+
+    @staticmethod
+    def _normalize_path(path: Path) -> str:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path.absolute()
+        return os.path.normcase(str(resolved))
 
 
 @dataclass(frozen=True)
@@ -88,6 +169,10 @@ class ThumbnailDiskCache:
         self._connection: sqlite3.Connection | None = None
         self._pending_accesses: dict[str, float] = {}
         self._saves_since_cleanup = 0
+        self._write_epoch = 0
+        self._entry_scan_cursor = ""
+        self._orphan_scanner = None
+        self._maintenance_pending = False
         self._cached_usage_bytes = 0
         self._cached_entry_count = 0
         self._cached_last_cleanup = 0.0
@@ -114,13 +199,14 @@ class ThumbnailDiskCache:
         return self._format_version_for_policy(self._encoding_policy)
 
     def set_encoder_quality(self, quality: int) -> None:
-        # Atomic policy scalar only: never wait for encoding/SQLite on the GUI
-        # thread. Workers own their immutable spec and snapshot their quality.
+        # Workers keep an immutable policy snapshot. Invalidate queued saves
+        # from the previous settings without changing already published rows.
         self._encoding_policy = replace(self._encoding_policy, quality=normalize_thumbnail_webp_quality(quality))
+        self.invalidate_pending_writes()
 
     def set_encoding_policy(self, policy: ThumbnailEncodingPolicy) -> None:
-        # One immutable assignment, without waiting for a worker's cache lock.
         self._encoding_policy = policy
+        self.invalidate_pending_writes()
 
     def _format_version_for_policy(self, policy: ThumbnailEncodingPolicy) -> str:
         return (
@@ -133,9 +219,23 @@ class ThumbnailDiskCache:
             if enabled and not self.enabled:
                 self.enabled = self._initialize()
             elif not enabled and self.enabled:
+                self._write_epoch += 1
                 self.flush_accesses()
+                if self._orphan_scanner is not None:
+                    self._orphan_scanner.close()
+                    self._orphan_scanner = None
                 self._close_connection()
                 self.enabled = False
+
+    @property
+    def write_epoch(self) -> int:
+        with self._lock:
+            return self._write_epoch
+
+    def invalidate_pending_writes(self) -> int:
+        with self._lock:
+            self._write_epoch += 1
+            return self._write_epoch
 
     def set_limit_mb(self, limit_mb: int) -> None:
         self.limit_bytes = max(128, min(4096, int(limit_mb))) * 1024 * 1024
@@ -347,47 +447,63 @@ class ThumbnailDiskCache:
         page_count: int | None = None,
         protected_thumbnail_sizes: set[int] | None = None,
         encoding_policy: ThumbnailEncodingPolicy | None = None,
+        expected_write_epoch: int | None = None,
+        expected_source_identity: ThumbnailSourceIdentity | None = None,
     ) -> bool:
+        if image is None or image.isNull():
+            return False
         with self._lock:
             if (
                 not self.enabled
                 or self._connection is None
-                or image is None
-                or image.isNull()
+                or (
+                    expected_write_epoch is not None
+                    and expected_write_epoch != self._write_epoch
+                )
             ):
                 return False
-            if isinstance(thumbnail_size, ThumbnailRenderSpec):
-                policy = thumbnail_size.encoding_policy
-                quality = thumbnail_size.encoder_quality
-                if type(quality) is not int or not 1 <= quality <= 100:
-                    return False
-                cache_token = thumbnail_size.cache_token
-                family_token = thumbnail_size.family_token
-                frame_width = max(1, image.width())
-                frame_height = max(1, image.height())
-            else:
-                policy = encoding_policy if encoding_policy is not None else self._encoding_policy
-                cache_token = int(thumbnail_size)
-                family_token = cache_token
-                frame_width = max(1, image.width())
-                frame_height = max(1, image.height())
-            fingerprint = self._fingerprint(
-                item,
-                cache_token,
-                Path(cover_path) if cover_path else None,
-                entry_path,
-                format_version=self._format_version_for_policy(policy),
-            )
-            if fingerprint is None:
+        if isinstance(thumbnail_size, ThumbnailRenderSpec):
+            policy = thumbnail_size.encoding_policy
+            quality = thumbnail_size.encoder_quality
+            if type(quality) is not int or not 1 <= quality <= 100:
                 return False
-            if page_count is None:
-                # Encoding quality does not invalidate source listing metadata.
-                page_count = self.get_page_count(item)
-            key = fingerprint.key
-            file_name = f"{key}.{self._extension}"
-            cache_file = self.files_dir / file_name
-            temporary = self.files_dir / f".{key}.{uuid.uuid4().hex}.tmp"
-            try:
+            cache_token = thumbnail_size.cache_token
+            family_token = thumbnail_size.family_token
+        else:
+            policy = encoding_policy if encoding_policy is not None else self._encoding_policy
+            cache_token = int(thumbnail_size)
+            family_token = cache_token
+        frame_width = max(1, image.width())
+        frame_height = max(1, image.height())
+        fingerprint = self._fingerprint(
+            item,
+            cache_token,
+            Path(cover_path) if cover_path else None,
+            entry_path,
+            format_version=self._format_version_for_policy(policy),
+        )
+        if fingerprint is None:
+            return False
+        if (
+            expected_source_identity is not None
+            and not expected_source_identity.matches(fingerprint)
+        ):
+            return False
+        key = fingerprint.key
+        file_name = f"{key}.{self._extension}"
+        cache_file = self.files_dir / file_name
+        temporary = self.files_dir / f".{key}.{uuid.uuid4().hex}.tmp"
+        try:
+            with self._lock:
+                if (
+                    not self.enabled
+                    or self._connection is None
+                    or (
+                        expected_write_epoch is not None
+                        and expected_write_epoch != self._write_epoch
+                    )
+                ):
+                    return False
                 existing = self._connection.execute(
                     "SELECT file_name FROM entries WHERE cache_key = ?",
                     (key,),
@@ -400,14 +516,54 @@ class ThumbnailDiskCache:
                         )
                         self._connection.commit()
                     return False
-                self.files_dir.mkdir(parents=True, exist_ok=True)
-                pil_image = policy.prepare_pixels(self._qimage_to_pil(image))
-                if self._encoder == "WEBP":
-                    pil_image.save(temporary, format="WEBP", **policy.webp_options())
-                else:
-                    pil_image.save(temporary, format="PNG", optimize=False)
+
+            if page_count is None:
+                # Metadata lookup is per source and happens outside the writer lock.
+                page_count = self.get_page_count(item)
+            self.files_dir.mkdir(parents=True, exist_ok=True)
+            pil_image = policy.prepare_pixels(self._qimage_to_pil(image))
+            if self._encoder == "WEBP":
+                pil_image.save(temporary, format="WEBP", **policy.webp_options())
+            else:
+                pil_image.save(temporary, format="PNG", optimize=False)
+            byte_size = temporary.stat().st_size
+            with self._lock:
+                if (
+                    not self.enabled
+                    or self._connection is None
+                    or (
+                        expected_write_epoch is not None
+                        and expected_write_epoch != self._write_epoch
+                    )
+                ):
+                    return False
+                current_fingerprint = self._fingerprint(
+                    item,
+                    cache_token,
+                    Path(cover_path) if cover_path else None,
+                    entry_path,
+                    format_version=self._format_version_for_policy(policy),
+                )
+                if current_fingerprint != fingerprint:
+                    return False
+                if (
+                    expected_source_identity is not None
+                    and not expected_source_identity.matches(current_fingerprint)
+                ):
+                    return False
+                existing = self._connection.execute(
+                    "SELECT file_name FROM entries WHERE cache_key = ?",
+                    (key,),
+                ).fetchone()
+                if existing is not None and cache_file.is_file():
+                    if page_count is not None:
+                        self._connection.execute(
+                            "UPDATE entries SET page_count = ? WHERE cache_key = ?",
+                            (max(0, int(page_count)), key),
+                        )
+                        self._connection.commit()
+                    return False
                 os.replace(temporary, cache_file)
-                byte_size = cache_file.stat().st_size
                 now = time.time()
                 self._connection.execute(
                     """
@@ -438,11 +594,7 @@ class ThumbnailDiskCache:
                         byte_size,
                         now,
                         now,
-                        (
-                            None
-                            if page_count is None
-                            else max(0, int(page_count))
-                        ),
+                        None if page_count is None else max(0, int(page_count)),
                     ),
                 )
                 self._enforce_source_caps(
@@ -455,20 +607,17 @@ class ThumbnailDiskCache:
                     protected_thumbnail_sizes=protected_thumbnail_sizes or set(),
                 )
                 self._connection.commit()
-                self._saves_since_cleanup += 1
-                if self._saves_since_cleanup >= self.cleanup_interval:
-                    self.prune(remove_orphans=True)
-                else:
-                    self._refresh_cached_statistics()
+                self._refresh_cached_statistics()
+                self._evict_global_capacity_locked(protected_key=key)
                 return True
-            except (OSError, sqlite3.DatabaseError, ValueError) as exc:
-                self.last_error = str(exc)
-                return False
-            finally:
-                try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    pass
+        except (OSError, sqlite3.DatabaseError, ValueError) as exc:
+            self.last_error = str(exc)
+            return False
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def get_page_count(self, item: BrowserItem) -> int | None:
         """Return valid cached thumbnail metadata without reading image data."""
@@ -567,16 +716,20 @@ class ThumbnailDiskCache:
             ).fetchone()
             last_cleanup = float(row[0]) if row is not None else 0.0
             now = time.time()
-            if not force and now - last_cleanup < 86400:
+            if (
+                not force
+                and not self._maintenance_pending
+                and now - last_cleanup < 86400
+            ):
                 return 0
             removed = self.prune(remove_orphans=True)
-            self._connection.execute(
-                "INSERT OR REPLACE INTO maintenance(key, value) VALUES (?, ?)",
-                ("last_cleanup", str(now)),
-            )
-            self._connection.commit()
-            self._cached_last_cleanup = now
-            self._refresh_cached_statistics()
+            if not self._maintenance_pending:
+                self._connection.execute(
+                    "INSERT OR REPLACE INTO maintenance(key, value) VALUES (?, ?)",
+                    ("last_cleanup", str(now)),
+                )
+                self._connection.commit()
+                self._cached_last_cleanup = now
             return removed
 
     def flush_accesses(self) -> None:
@@ -610,150 +763,184 @@ class ThumbnailDiskCache:
             self.flush_accesses()
             try:
                 removed = 0
-                # Retire obsolete payloads incrementally, even below the LRU
-                # byte cap. Never visit or regenerate their source folders.
+                connection = self._connection
+                batch = max(1, int(CACHE_MAINTENANCE_BATCH))
                 obsolete = self._connection.execute(
                     "SELECT cache_key, file_name FROM entries "
                     "WHERE format_version != ? ORDER BY last_used ASC LIMIT ?",
-                    (self.format_version, OBSOLETE_FORMAT_PRUNE_BATCH),
+                    (self.format_version, min(batch, OBSOLETE_FORMAT_PRUNE_BATCH) + 1),
                 ).fetchall()
-                self._remove_entries_without_commit(obsolete)
-                removed += len(obsolete)
+                obsolete_more = len(obsolete) > min(batch, OBSOLETE_FORMAT_PRUNE_BATCH)
+                obsolete_batch = obsolete[:min(batch, OBSOLETE_FORMAT_PRUNE_BATCH)]
+                self._remove_entries_without_commit(obsolete_batch)
+                removed += len(obsolete_batch)
                 days = (
                     self.max_unused_days
                     if max_unused_days is None
                     else self._normalize_unused_days(max_unused_days)
                 )
+                expired_more = False
                 if days:
                     cutoff = time.time() - days * 86400
                     expired = self._connection.execute(
-                        "SELECT cache_key, file_name FROM entries WHERE last_used < ?",
-                        (cutoff,),
+                        "SELECT cache_key, file_name FROM entries "
+                        "WHERE last_used < ? ORDER BY last_used ASC LIMIT ?",
+                        (cutoff, batch + 1),
                     ).fetchall()
-                    self._remove_entries_without_commit(expired)
-                    removed += len(expired)
-                rows = self._connection.execute(
-                    "SELECT cache_key, file_name, byte_size, last_used FROM entries "
-                    "ORDER BY last_used ASC"
+                    expired_more = len(expired) > batch
+                    expired_batch = expired[:batch]
+                    self._remove_entries_without_commit(expired_batch)
+                    removed += len(expired_batch)
+
+                cursor_row = connection.execute(
+                    "SELECT value FROM maintenance WHERE key = 'entry_scan_cursor'"
+                ).fetchone()
+                cursor = str(cursor_row[0]) if cursor_row else ""
+                scan_rows = connection.execute(
+                    "SELECT cache_key, file_name FROM entries "
+                    "WHERE cache_key > ? ORDER BY cache_key LIMIT ?",
+                    (cursor, batch + 1),
                 ).fetchall()
-                valid_rows: list[tuple[str, str, int, float]] = []
-                for key, file_name, byte_size, last_used in rows:
+                scan_more = len(scan_rows) > batch
+                scan_batch = scan_rows[:batch]
+                for key, file_name in scan_batch:
                     if not (self.files_dir / file_name).is_file():
-                        self._connection.execute(
-                            "DELETE FROM entries WHERE cache_key = ?",
-                            (key,),
-                        )
-                        removed += 1
-                    else:
-                        valid_rows.append((key, file_name, int(byte_size), float(last_used)))
-
-                if remove_orphans and self.files_dir.exists():
-                    known_files = {
-                        row[0]
-                        for row in self._connection.execute(
-                            "SELECT file_name FROM entries"
-                        ).fetchall()
-                    }
-                    for path in self.files_dir.iterdir():
-                        if not path.is_file() or path.name in known_files:
-                            continue
-                        try:
-                            path.unlink()
-                            removed += 1
-                        except OSError:
-                            continue
-
-                variants = self._connection.execute(
-                    """
-                    SELECT DISTINCT source_path, item_kind, entry_path, family_token
-                      FROM entries
-                     WHERE format_version = ?
-                    """,
-                    (self.format_version,),
-                ).fetchall()
-                for source_path, item_kind, entry_path, family_token in variants:
-                    cap_rows = self._connection.execute(
-                        """
-                        SELECT cache_key, file_name, thumbnail_size, last_used
-                          FROM entries
-                         WHERE source_path = ? AND item_kind = ? AND entry_path = ?
-                           AND family_token = ? AND format_version = ?
-                         ORDER BY last_used DESC
-                        """,
-                        (
-                            source_path,
-                            item_kind,
-                            entry_path,
-                            family_token,
-                            self.format_version,
-                        ),
-                    ).fetchall()
-                    removed += self._trim_rows(
-                        cap_rows,
-                        limit=2,
-                        current_key="",
-                        protected_thumbnail_sizes=set(),
-                    )
-
-                items = self._connection.execute(
-                    """
-                    SELECT DISTINCT source_path, item_kind, entry_path
-                      FROM entries
-                     WHERE format_version = ?
-                    """,
-                    (self.format_version,),
-                ).fetchall()
-                for source_path, item_kind, entry_path in items:
-                    cap_rows = self._connection.execute(
-                        """
-                        SELECT cache_key, file_name, thumbnail_size, last_used
-                          FROM entries
-                         WHERE source_path = ? AND item_kind = ? AND entry_path = ?
-                           AND format_version = ?
-                         ORDER BY last_used DESC
-                        """,
-                        (source_path, item_kind, entry_path, self.format_version),
-                    ).fetchall()
-                    removed += self._trim_rows(
-                        cap_rows,
-                        limit=4,
-                        current_key="",
-                        protected_thumbnail_sizes=set(),
-                    )
-
-                lru_rows = self._connection.execute(
-                    "SELECT cache_key, file_name, byte_size, last_used FROM entries "
-                    "ORDER BY last_used ASC"
-                ).fetchall()
-                total = sum(int(row[2]) for row in lru_rows)
-                target = int(self.limit_bytes * 0.9)
-                if total > self.limit_bytes:
-                    for key, file_name, byte_size, _last_used in lru_rows:
-                        if total <= target:
-                            break
                         try:
                             (self.files_dir / file_name).unlink(missing_ok=True)
                         except OSError:
-                            continue
-                        self._connection.execute(
-                            "DELETE FROM entries WHERE cache_key = ?",
-                            (key,),
+                            pass
+                        connection.execute(
+                            "DELETE FROM entries WHERE cache_key = ?", (key,)
                         )
-                        total -= int(byte_size)
                         removed += 1
+                next_cursor = str(scan_batch[-1][0]) if scan_more and scan_batch else ""
+                connection.execute(
+                    "INSERT OR REPLACE INTO maintenance(key, value) VALUES (?, ?)",
+                    ("entry_scan_cursor", next_cursor),
+                )
+                self._entry_scan_cursor = next_cursor
+
+                if remove_orphans:
+                    removed += self._prune_orphan_batch_locked(batch)
+
+                self._refresh_cached_statistics()
+                capacity_more = self._cached_usage_bytes > self.limit_bytes
+                if capacity_more:
+                    rows = connection.execute(
+                        "SELECT cache_key, file_name, byte_size FROM entries "
+                        "ORDER BY last_used ASC LIMIT ?",
+                        (batch + 1,),
+                    ).fetchall()
+                    target = int(self.limit_bytes * 0.9)
+                    total = self._cached_usage_bytes
+                    victims: list[tuple[str, str]] = []
+                    for key, file_name, byte_size in rows[:batch]:
+                        victims.append((str(key), str(file_name)))
+                        total -= max(0, int(byte_size))
+                        if total <= target:
+                            break
+                    self._remove_entries_without_commit(victims)
+                    removed += len(victims)
 
                 self._connection.commit()
-                self._saves_since_cleanup = 0
                 self._refresh_cached_statistics()
+                self._saves_since_cleanup = 0
+                self._maintenance_pending = bool(
+                    obsolete_more
+                    or expired_more
+                    or scan_more
+                    or (remove_orphans and self._orphan_scanner is not None)
+                    or self._cached_usage_bytes > self.limit_bytes
+                )
                 return removed
             except (OSError, sqlite3.DatabaseError) as exc:
                 self.last_error = str(exc)
                 return 0
 
+    @property
+    def maintenance_pending(self) -> bool:
+        with self._lock:
+            return self._maintenance_pending
+
+    def _prune_orphan_batch_locked(self, limit: int) -> int:
+        connection = self._connection
+        if connection is None or not self.files_dir.exists():
+            return 0
+        scanner = self._orphan_scanner
+        if scanner is None:
+            try:
+                scanner = os.scandir(self.files_dir)
+            except OSError:
+                return 0
+            self._orphan_scanner = scanner
+        removed = 0
+        try:
+            for _ in range(max(1, int(limit))):
+                try:
+                    entry = next(scanner)
+                except StopIteration:
+                    scanner.close()
+                    self._orphan_scanner = None
+                    break
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                known = connection.execute(
+                    "SELECT 1 FROM entries WHERE file_name = ? LIMIT 1",
+                    (entry.name,),
+                ).fetchone()
+                if known is not None:
+                    continue
+                try:
+                    (self.files_dir / entry.name).unlink()
+                    removed += 1
+                except OSError:
+                    continue
+        except OSError:
+            try:
+                scanner.close()
+            except OSError:
+                pass
+            self._orphan_scanner = None
+        return removed
+
+    def _evict_global_capacity_locked(self, *, protected_key: str) -> int:
+        """Evict a bounded oldest batch using trigger-maintained byte totals."""
+        connection = self._connection
+        if not self.enabled or connection is None:
+            return 0
+        if self._cached_usage_bytes <= self.limit_bytes:
+            return 0
+        target = int(self.limit_bytes * 0.9)
+        try:
+            rows = connection.execute(
+                "SELECT cache_key, file_name, byte_size FROM entries "
+                "WHERE cache_key != ? ORDER BY last_used ASC LIMIT 128",
+                (protected_key,),
+            ).fetchall()
+            if not rows:
+                # Keep a single thumbnail even when it is larger than the cap.
+                return 0
+            victims: list[tuple[str, str]] = []
+            total = self._cached_usage_bytes
+            for key, file_name, byte_size in rows:
+                victims.append((str(key), str(file_name)))
+                total -= max(0, int(byte_size))
+                if total <= target:
+                    break
+            self._remove_entries_without_commit(victims)
+            connection.commit()
+            self._refresh_cached_statistics()
+            self._maintenance_pending = self._cached_usage_bytes > self.limit_bytes
+            return len(victims)
+        except (OSError, sqlite3.DatabaseError) as exc:
+            self.last_error = str(exc)
+            return 0
+
     def clear_all(self) -> bool:
         with self._lock:
             if not self.enabled or self._connection is None:
                 return False
+            self._write_epoch += 1
             success = True
             try:
                 if self.files_dir.exists():
@@ -770,6 +957,11 @@ class ThumbnailDiskCache:
                 self._saves_since_cleanup = 0
                 self._cached_usage_bytes = 0
                 self._cached_entry_count = 0
+                self._entry_scan_cursor = ""
+                self._maintenance_pending = False
+                if self._orphan_scanner is not None:
+                    self._orphan_scanner.close()
+                    self._orphan_scanner = None
             except (OSError, sqlite3.DatabaseError) as exc:
                 self.last_error = str(exc)
                 return False
@@ -777,8 +969,12 @@ class ThumbnailDiskCache:
 
     def close(self) -> None:
         with self._lock:
+            self._write_epoch += 1
             if self.enabled:
                 self.flush_accesses()
+            if self._orphan_scanner is not None:
+                self._orphan_scanner.close()
+                self._orphan_scanner = None
             self._close_connection()
             self.enabled = False
 
@@ -802,6 +998,7 @@ class ThumbnailDiskCache:
             )
             if has_entries and user_version != CACHE_SCHEMA_VERSION:
                 self._connection.execute("DROP TABLE entries")
+                self._connection.execute("DROP TABLE IF EXISTS cache_statistics")
                 self._connection.execute("PRAGMA user_version=0")
                 self._connection.commit()
                 self._create_schema()
@@ -838,6 +1035,10 @@ class ThumbnailDiskCache:
 
     def _create_schema(self) -> None:
         assert self._connection is not None
+        stats_table_exists = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'cache_statistics'"
+        ).fetchone() is not None
         self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS entries (
@@ -888,6 +1089,44 @@ class ThumbnailDiskCache:
         self._connection.execute(
             "CREATE INDEX IF NOT EXISTS suitable_entries "
             "ON entries(source_path, item_kind, family_token, format_version)"
+        )
+        self._connection.execute(
+            "CREATE TABLE IF NOT EXISTS cache_statistics ("
+            "singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
+            "entry_count INTEGER NOT NULL, usage_bytes INTEGER NOT NULL)"
+        )
+        stats_row = self._connection.execute(
+            "SELECT entry_count, usage_bytes FROM cache_statistics WHERE singleton = 1"
+        ).fetchone()
+        if not stats_table_exists or stats_row is None:
+            count, total = self._connection.execute(
+                "SELECT COUNT(*), COALESCE(SUM(byte_size), 0) FROM entries"
+            ).fetchone()
+            self._connection.execute(
+                "INSERT OR REPLACE INTO cache_statistics "
+                "(singleton, entry_count, usage_bytes) VALUES (1, ?, ?)",
+                (max(0, int(count)), max(0, int(total))),
+            )
+        self._connection.execute("PRAGMA recursive_triggers=ON")
+        self._connection.executescript(
+            """
+            DROP TRIGGER IF EXISTS entries_stats_insert;
+            DROP TRIGGER IF EXISTS entries_stats_delete;
+            DROP TRIGGER IF EXISTS entries_stats_update;
+            CREATE TRIGGER entries_stats_insert AFTER INSERT ON entries BEGIN
+              UPDATE cache_statistics SET entry_count = entry_count + 1,
+                  usage_bytes = usage_bytes + NEW.byte_size WHERE singleton = 1;
+            END;
+            CREATE TRIGGER entries_stats_delete AFTER DELETE ON entries BEGIN
+              UPDATE cache_statistics SET entry_count = MAX(0, entry_count - 1),
+                  usage_bytes = MAX(0, usage_bytes - OLD.byte_size) WHERE singleton = 1;
+            END;
+            CREATE TRIGGER entries_stats_update AFTER UPDATE OF byte_size ON entries BEGIN
+              UPDATE cache_statistics SET
+                  usage_bytes = MAX(0, usage_bytes + NEW.byte_size - OLD.byte_size)
+                  WHERE singleton = 1;
+            END;
+            """
         )
         self._connection.execute(f"PRAGMA user_version={CACHE_SCHEMA_VERSION}")
         self._connection.commit()
@@ -940,14 +1179,15 @@ class ThumbnailDiskCache:
             self._cached_last_cleanup = 0.0
             return
         try:
-            count, total = self._connection.execute(
-                "SELECT COUNT(*), COALESCE(SUM(byte_size), 0) FROM entries"
+            stats = self._connection.execute(
+                "SELECT entry_count, usage_bytes FROM cache_statistics "
+                "WHERE singleton = 1"
             ).fetchone()
             cleanup = self._connection.execute(
                 "SELECT value FROM maintenance WHERE key = 'last_cleanup'"
             ).fetchone()
-            self._cached_entry_count = max(0, int(count))
-            self._cached_usage_bytes = max(0, int(total))
+            self._cached_entry_count = max(0, int(stats[0])) if stats else 0
+            self._cached_usage_bytes = max(0, int(stats[1])) if stats else 0
             self._cached_last_cleanup = (
                 float(cleanup[0]) if cleanup is not None else 0.0
             )
@@ -1086,7 +1326,7 @@ class ThumbnailDiskCache:
         source = self._stat_path(item.path)
         if source is None:
             return None
-        if item.kind is not BrowserItemKind.FOLDER and (
+        if (
             (item.file_size is not None and item.file_size != source[0])
             or (item.modified_time_ns is not None and item.modified_time_ns != source[1])
         ):

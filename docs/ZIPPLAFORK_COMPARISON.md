@@ -1,5 +1,24 @@
 # ZipPlaFork comparison record
 
+## 2026-09-24: Browser wheel-distance choice
+
+The supplied Browser scroll audit identifies the reference as the
+`CatalogForm.Designer.cs` menu in ZipPlaFork commit
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b` (AGPL-3.0-or-later): separate
+Tiny/Small/Normal/Large/Huge distance choices exist alongside separate 1/2/3
+line choices. The reference file is
+[CatalogForm.Designer.cs](https://github.com/himamon/ZipPlaFork/blob/07955f5267e2fb92d6fc6e40fde2507d8fb07b3b/source/ZipPla/CatalogForm.Designer.cs).
+The audit did not establish the distance handlers' exact arithmetic, and this
+change makes no claim of numeric compatibility.
+
+| Reference structure | NivisViewer mapping |
+| --- | --- |
+| `CatalogForm.Designer.cs`, `CatalogForm`: distinct distance presets and line-count presets | `app/browser_wheel_scroll.py`, `BrowserWheelScrollAccumulator`; `app/explorer_list_view.py`, `ExplorerListView.wheelEvent`: preserve system and row modes, add independent logical-pixel and viewport-percentage modes |
+
+Only the menu-design principle was adopted. No ZipPlaFork code, constants, or
+processing algorithm were copied or translated for wheel handling, so this
+change introduces no AGPL-derived code or additional license notice.
+
 ## 2026-09-19: tag click/menu/label correction after TODO18 feedback
 
 Freshly inspected local `../ZipPlaViewer` against repository

@@ -844,6 +844,12 @@ class BrowserWindow(QMainWindow):
         self.browser_wheel_scroll_custom_rows = int(
             self.settings.get("browser_wheel_scroll_custom_rows", 3)
         )
+        self.browser_wheel_scroll_fixed_pixels = float(
+            self.settings.get("browser_wheel_scroll_fixed_pixels", 96.0)
+        )
+        self.browser_wheel_scroll_viewport_percent = float(
+            self.settings.get("browser_wheel_scroll_viewport_percent", 50.0)
+        )
         self.thumbnail_quality_mode = str(
             self.settings.get("thumbnail_quality_mode", "auto")
         )
@@ -1554,6 +1560,7 @@ class BrowserWindow(QMainWindow):
             and not self._same_path(previous_path, pending.path)
         )
         if location_changed:
+            self.list_view.reset_wheel_scroll_remainder()
             self._replace_active_search_query(
                 "",
                 preserve_view_state=False,
@@ -4232,6 +4239,8 @@ class BrowserWindow(QMainWindow):
             {
                 "browser_wheel_scroll_mode",
                 "browser_wheel_scroll_custom_rows",
+                "browser_wheel_scroll_fixed_pixels",
+                "browser_wheel_scroll_viewport_percent",
             }.intersection(changed)
         )
         if wheel_settings_changed:
@@ -4247,9 +4256,23 @@ class BrowserWindow(QMainWindow):
                     self.browser_wheel_scroll_custom_rows,
                 )
             )
+            self.browser_wheel_scroll_fixed_pixels = float(
+                changed.get(
+                    "browser_wheel_scroll_fixed_pixels",
+                    self.browser_wheel_scroll_fixed_pixels,
+                )
+            )
+            self.browser_wheel_scroll_viewport_percent = float(
+                changed.get(
+                    "browser_wheel_scroll_viewport_percent",
+                    self.browser_wheel_scroll_viewport_percent,
+                )
+            )
             self.list_view.set_wheel_scroll_policy(
                 self.browser_wheel_scroll_mode,
                 self.browser_wheel_scroll_custom_rows,
+                self.browser_wheel_scroll_fixed_pixels,
+                self.browser_wheel_scroll_viewport_percent,
             )
         self._apply_fallback_background_settings(changed)
         self._apply_browser_icon_size_settings(changed)
@@ -6497,6 +6520,8 @@ class BrowserWindow(QMainWindow):
         self.list_view.set_wheel_scroll_policy(
             self.browser_wheel_scroll_mode,
             self.browser_wheel_scroll_custom_rows,
+            self.browser_wheel_scroll_fixed_pixels,
+            self.browser_wheel_scroll_viewport_percent,
         )
         self.list_view.setSelectionMode(QListView.SelectionMode.ExtendedSelection)
         self.list_view.setUniformItemSizes(True)
@@ -7496,9 +7521,13 @@ class BrowserWindow(QMainWindow):
             self.list_view.gridSize().height(),
             self.list_view.viewport().height() // 2,
         )
-        self._fast_scrolling = delta >= threshold or (
-            elapsed < 0.12 and delta > 0
+        fast_velocity = (
+            delta >= 8
+            and elapsed > 0
+            and elapsed < 0.12
+            and delta / elapsed >= threshold / 0.12
         )
+        self._fast_scrolling = delta >= threshold or fast_velocity
         self._last_scroll_value = int(value)
         self._last_scroll_time = now
         self._schedule_thumbnail_requests(0)

@@ -1098,12 +1098,23 @@ def test_failed_background_disk_write_stops_far_generation_after_one_item(
         def close(self):
             return None
 
-    items = [
-        BrowserItem(f"write-route-{row}.jpg", tmp_path / f"write-route-{row}.jpg",
-                    BrowserItemKind.IMAGE, float(row), file_size=1,
-                    modified_time_ns=row + 1)
-        for row in range(7)
-    ]
+    items = []
+    for row in range(7):
+        path = tmp_path / f"write-route-{row}.jpg"
+        # This fake decoder ignores source bytes, but save-queue admission now
+        # correctly requires an existing source revision to guard persistence.
+        path.write_bytes(f"synthetic source {row}".encode("ascii"))
+        stat = path.stat()
+        items.append(
+            BrowserItem(
+                path.name,
+                path,
+                BrowserItemKind.IMAGE,
+                stat.st_mtime,
+                file_size=stat.st_size,
+                modified_time_ns=stat.st_mtime_ns,
+            )
+        )
     decoded = []
     disk_cache = DiskCacheWithFailedFarWrite()
 
