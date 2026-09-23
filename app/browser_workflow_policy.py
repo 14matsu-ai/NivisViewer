@@ -151,6 +151,27 @@ class ThumbnailWarmupCursor:
         if 0 <= row < self.count:
             self._done[row] = 1
 
+    def reopen(self, rows) -> None:
+        """Requeue eligible rows whose current thumbnail is no longer ready.
+
+        This is intentionally separate from a plain recenter: far generation
+        progress stays done, while the caller can reopen only a small near band
+        after checking current provider RAM availability.
+        """
+        ordered = []
+        seen = set()
+        for value in rows:
+            row = int(value)
+            if row in seen or not self.eligible(row):
+                continue
+            seen.add(row)
+            self._done[row] = 0
+            ordered.append(row)
+        if ordered:
+            existing = [row for row in self._retry if row not in seen]
+            self._retry = deque([*ordered, *existing])
+            self.exhausted = False
+
     def invalidate(self, row: int) -> None:
         if not 0 <= row < self.count:
             return

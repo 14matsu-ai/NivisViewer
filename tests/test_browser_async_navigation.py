@@ -6,7 +6,9 @@ from threading import Event
 from time import monotonic
 
 import pytest
-from PySide6.QtCore import QEvent, QObject, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QTimer, Signal, QPoint, QPointF, Qt
+from PySide6.QtGui import QWheelEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from app.browser_model import (
@@ -1107,6 +1109,104 @@ def test_scroll_direction_recenters_bounded_read_ahead_without_queue_growth(
     assert sum(
         item[3] is ThumbnailPriority.BACKGROUND for item in provider.requests
     ) == 1
+    window.close()
+
+
+def test_synthetic_browser_scroll_inputs_recenter_the_workflow(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    provider = RecordingThumbnailProvider()
+    window, scanner = make_committed_window(tmp_path, qapp, provider=provider)
+    target = tmp_path / "synthetic-scroll-inputs"
+    target.mkdir()
+    assert window.navigate_to(target)
+    request = scanner.requests[-1]
+    entries = tuple(entry(target / f"{index:04d}.jpg") for index in range(1200))
+    scanner.batch_ready.emit(
+        BrowserScanBatch(request.path, request.generation, entries)
+    )
+    scanner.scan_completed.emit(
+        BrowserScanCompleted(request.path, request.generation, len(entries))
+    )
+    window._flush_pending_scan_batch()
+    window.resize(900, 650)
+    window.show()
+    qapp.processEvents()
+    window._first_paint_pending_generation = None
+    window._thumbnail_request_timer.stop()
+
+    view = window.list_view
+    scroll = view.verticalScrollBar()
+    assert scroll.maximum() > 100
+
+    def wheel_forward():
+        point = QPoint(10, 10)
+        view.wheelEvent(QWheelEvent(
+            QPointF(point), QPointF(view.viewport().mapToGlobal(point)),
+            QPoint(0, 0), QPoint(0, -120), Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.ScrollUpdate, False,
+        ))
+
+    def position_for_key(key):
+        visible = window._visible_row_range()
+        assert visible is not None
+        if key == Qt.Key.Key_Down:
+            row = visible[1]
+        else:
+            row = (visible[0] + visible[1]) // 2
+        view.setCurrentIndex(window.item_model.index(row, 0))
+        view.setFocus()
+        QTest.keyClick(view, key)
+
+    actions = (
+        ("wheel", wheel_forward, 1),
+        ("arrow-down", lambda: position_for_key(Qt.Key.Key_Down), 1),
+        ("page-down", lambda: position_for_key(Qt.Key.Key_PageDown), 1),
+        ("page-up", lambda: position_for_key(Qt.Key.Key_PageUp), -1),
+        ("home", lambda: position_for_key(Qt.Key.Key_Home), -1),
+        ("end", lambda: position_for_key(Qt.Key.Key_End), 1),
+        ("scrollbar-forward", lambda: scroll.setValue(scroll.value() + 100), 1),
+        ("scrollbar-reverse", lambda: scroll.setValue(scroll.value() - 100), -1),
+    )
+    for label, action, expected_direction in actions:
+        # Reset to a safe interior point, then let the tested input itself
+        # trigger the connected verticalScrollBar.valueChanged path.
+        window._scroll_idle_timer.stop()
+        window._thumbnail_request_timer.stop()
+        window._browser_workflow._timer.stop()
+        scroll.setValue(scroll.maximum() // 2)
+        qapp.processEvents()
+        window._scroll_idle_timer.stop()
+        window._on_scroll_idle()
+        window._last_scroll_value = scroll.value()
+        window._last_scroll_time = monotonic()
+        window._thumbnail_scroll_direction = expected_direction
+        window._fast_scrolling = False
+        before = scroll.value()
+
+        action()
+        qapp.processEvents()
+        after = scroll.value()
+        assert after != before, f"{label} did not move the Browser scrollbar"
+        assert window._thumbnail_scroll_direction == expected_direction
+
+        window._scroll_idle_timer.stop()
+        window._on_scroll_idle()
+        window._request_visible_thumbnails()
+        window._thumbnail_request_timer.stop()
+        window._browser_workflow._timer.stop()
+        window._browser_workflow._pump()
+        visible = window._visible_row_range()
+        assert visible is not None
+        assert window._browser_workflow._viewport[:3] == (
+            visible[0], visible[1], expected_direction
+        ), label
+        if provider._background_inflight is not None:
+            provider.finish_background()
+            qapp.processEvents()
+            window._browser_workflow._timer.stop()
+
     window.close()
 
 

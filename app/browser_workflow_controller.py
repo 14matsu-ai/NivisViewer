@@ -1,6 +1,8 @@
 """Browser-only glue; the existing operation and thumbnail lanes do the work."""
 from __future__ import annotations
 
+from math import ceil
+
 from PySide6.QtCore import QObject, QEvent, QTimer, Qt
 from PySide6.QtGui import QInputMethodEvent, QKeyEvent, QKeySequence
 from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
@@ -27,6 +29,10 @@ class BrowserWorkflowController(QObject):
         self._viewport = None
         self._cursor = None
         self._inflight = None
+        self._near_rows: set[int] = set()
+        self._next_rows: set[int] = set()
+        self._near_cache_blocked = False
+        self._stop_reason = "idle"
         self._ime_composing = False
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
@@ -60,6 +66,10 @@ class BrowserWorkflowController(QObject):
         self._context = None
         self._cursor = None
         self._inflight = None
+        self._near_rows.clear()
+        self._next_rows.clear()
+        self._near_cache_blocked = False
+        self._stop_reason = "model-changed"
         self.schedule_background()
 
     def _item_data_changed(self, top_left, bottom_right, roles=()) -> None:
@@ -74,6 +84,8 @@ class BrowserWorkflowController(QObject):
         last = min(self._cursor.count - 1, int(bottom_right.row()))
         for row in range(first, last + 1):
             self._cursor.invalidate(row)
+        self._viewport = None
+        self._near_cache_blocked = False
         self.schedule_background()
 
     def _resumed(self) -> None:
@@ -107,22 +119,172 @@ class BrowserWorkflowController(QObject):
         if viewport != self._viewport:
             self._cursor.recenter(*viewport)
             self._viewport = viewport
+            self._near_cache_blocked = False
+            self._update_cache_retention(first, last, viewport[2], viewport[3])
+            self._stop_reason = "recentered"
         return True
+
+    def recenter_cache_retention(self) -> None:
+        """Apply the latest viewport priority before visible requests enter LRU."""
+        if not self.window._shutdown_prepared:
+            previous = (self._context, self._viewport)
+            if not self._synchronize_cursor():
+                return
+            if previous == (self._context, self._viewport) and self._viewport is not None:
+                first, last, direction, screens = self._viewport
+                self._update_cache_retention(
+                    first, last, direction, screens, reopen_missing=False
+                )
+
+    def _update_cache_retention(
+        self,
+        first: int,
+        last: int,
+        direction: int,
+        screens: int,
+        *,
+        reopen_missing: bool = True,
+    ) -> None:
+        window = self.window
+        count = window.item_model.rowCount()
+        span = max(1, last - first + 1)
+        direction = -1 if int(direction) < 0 else 1
+        try:
+            selection_model = window.list_view.selectionModel()
+            selected_rows = sorted(
+                {index.row() for index in selection_model.selectedIndexes()}
+            )
+        except (AttributeError, RuntimeError):
+            selected_rows = []
+
+        retained: dict[int, int] = {}
+
+        def add_rows(rows, rank: int) -> None:
+            for row in rows:
+                if 0 <= row < count:
+                    retained[row] = min(rank, retained.get(row, rank))
+
+        near_rows: list[int] = []
+        next_rows: list[int] = []
+        safety_rows: list[int] = []
+        if screens != 0:
+            next_count = span
+            safety_count = ceil(span * 0.25)
+            if direction > 0:
+                next_rows = list(range(last + 1, min(count, last + 1 + next_count)))
+                safety_rows = list(range(first - 1, max(-1, first - 1 - safety_count), -1))
+            else:
+                next_rows = list(range(first - 1, max(-1, first - 1 - next_count), -1))
+                safety_rows = list(range(last + 1, min(count, last + 1 + safety_count)))
+            near_rows = next_rows + safety_rows
+        self._next_rows = set(next_rows)
+        self._near_rows = set(near_rows)
+
+        provider = window.thumbnail_provider
+        base_rows = set(range(first, last + 1)) | set(next_rows) | set(safety_rows)
+        selected_capacity = max(
+            0,
+            int(getattr(provider, "memory_cache_capacity_entries", 128))
+            - len(base_rows),
+        )
+        selected_outside = [row for row in selected_rows if row not in base_rows]
+        add_rows(selected_outside[:selected_capacity], 0)
+        add_rows(range(first, last + 1), 0)
+        add_rows(next_rows, 1)
+        add_rows(safety_rows, 2)
+
+        prioritize = getattr(provider, "set_cache_retention_priorities", None)
+        if callable(prioritize):
+            entries = []
+            for row, rank in retained.items():
+                item = window.item_model.item_at(row)
+                if item is not None and item.can_generate_preview:
+                    entries.append((item.path, item.thumbnail_revision, rank))
+            prioritize(entries)
+
+        has_memory = getattr(provider, "has_memory_thumbnail", None)
+        if reopen_missing and self._cursor is not None and callable(has_memory):
+            missing_near = []
+            for row in near_rows:
+                if not self._cursor.eligible(row):
+                    continue
+                item = window.item_model.item_at(row)
+                if (item is not None and item.can_generate_preview
+                        and item.kind in {BrowserItemKind.IMAGE, BrowserItemKind.FOLDER,
+                                          BrowserItemKind.ARCHIVE, BrowserItemKind.PDF}
+                        and not has_memory(item, window.thumbnail_render_spec)):
+                    missing_near.append(row)
+            self._cursor.reopen(missing_near)
+
+    def _next_band_ready_at_capacity(self) -> bool:
+        if not self._next_rows:
+            return False
+        window = self.window
+        provider = window.thumbnail_provider
+        has_memory = getattr(provider, "has_memory_thumbnail", None)
+        at_capacity = getattr(provider, "memory_cache_capacity_reached", None)
+        if not callable(has_memory) or at_capacity is None:
+            return False
+        evictable = bool(
+            getattr(provider, "memory_cache_has_evictable_entries", False)
+        )
+        disk_enabled = bool(
+            getattr(provider, "background_disk_cache_enabled", False)
+        )
+        required = []
+        for row in self._next_rows:
+            item = window.item_model.item_at(row)
+            if (item is not None and item.can_generate_preview
+                    and item.kind in {BrowserItemKind.IMAGE, BrowserItemKind.FOLDER,
+                                      BrowserItemKind.ARCHIVE, BrowserItemKind.PDF}):
+                required.append(item)
+        if not required or not all(
+            has_memory(item, window.thumbnail_render_spec) for item in required
+        ):
+            return False
+        # A full cache is not a reason to truncate the configured horizon if
+        # stale/distant entries can roll out, or if results can be persisted
+        # and consumed from disk. Stop only when the current+next band occupies
+        # all RAM and neither route can advance farther work.
+        return bool(at_capacity) and not evictable and not disk_enabled
+
+    @property
+    def stop_reason(self) -> str:
+        """Current one-shot scheduling state, useful for diagnostics/tests."""
+        return self._stop_reason
 
     def _pump(self) -> None:
         window = self.window
-        if (window._shutdown_prepared or window._fast_scrolling
-                or not window.isVisible()
-                or self.options["browser_thumbnail_background_screens"] == 0
-                or not self._synchronize_cursor()):
+        if window._shutdown_prepared:
+            self._stop_reason = "shutdown"
+            return
+        if window._fast_scrolling:
+            self._stop_reason = "fast-scroll-idle-boundary"
+            return
+        if not window.isVisible():
+            self._stop_reason = "browser-hidden"
+            return
+        if not self._synchronize_cursor():
+            self._stop_reason = "no-visible-rows"
+            return
+        if self.options["browser_thumbnail_background_screens"] == 0:
+            self._stop_reason = "disabled"
+            return
+        if self._near_cache_blocked:
+            self._stop_reason = "near-cache-capacity"
             return
         provider = window.thumbnail_provider
         foreground_timer = getattr(window, "_thumbnail_request_timer", None)
         if (getattr(window, "_first_paint_pending_generation", None) is not None
                 or (foreground_timer is not None and foreground_timer.isActive())):
+            self._stop_reason = "foreground-pending"
             return
         if provider.pending_count:
+            self._stop_reason = "provider-busy"
             return  # Completion or resume, not a polling timer, continues.
+        if getattr(provider, "_paused", False):
+            self._stop_reason = "provider-paused"
+            return
         if self._inflight is not None:
             # A queued speculative request can be removed by visible-only
             # reprioritization without a worker callback. Do not strand it.
@@ -132,7 +294,14 @@ class BrowserWorkflowController(QObject):
             row = self._cursor.take()
             if row is None:
                 if not self._cursor.exhausted:
+                    self._stop_reason = "scan-yield"
                     self.schedule_background()
+                else:
+                    self._stop_reason = "range-complete"
+                return
+            if self._next_band_ready_at_capacity():
+                self._cursor.retry(row)
+                self._stop_reason = "far-cache-capacity"
                 return
             item = window.item_model.item_at(row)
             if (item is None or not item.can_generate_preview
@@ -151,8 +320,13 @@ class BrowserWorkflowController(QObject):
             self._inflight = None
             if state == "blocked":
                 self._cursor.retry(row)
+                self._stop_reason = (
+                    "provider-paused" if getattr(provider, "_paused", False)
+                    else "provider-busy"
+                )
                 return
             self._cursor.complete(row)
+        self._stop_reason = "scan-yield"
         self.schedule_background()  # Bounded cached/unsupported scan per tick.
 
     def _settled(self, path, generation, token, revision, state) -> None:
@@ -171,6 +345,19 @@ class BrowserWorkflowController(QObject):
                     self._cursor.retry(row)
                 else:
                     self._cursor.complete(row)
+                    has_memory = getattr(
+                        self.window.thumbnail_provider,
+                        "has_memory_thumbnail",
+                        None,
+                    )
+                    if (state == "ready" and row in self._next_rows
+                            and item is not None and callable(has_memory)
+                            and not has_memory(item, self.window.thumbnail_render_spec)):
+                        # One terminal attempt is enough for this viewport. A
+                        # too-small cache must stop normally, never resubmit an
+                        # image that cannot fit and evict itself forever.
+                        self._near_cache_blocked = True
+                        self._stop_reason = "near-cache-capacity"
             # A running low-priority request may become visible without Qt
             # allowing queue promotion. Reuse its now-complete memory entry.
             region = self.window._visible_row_range()
@@ -186,6 +373,7 @@ class BrowserWorkflowController(QObject):
             if self._cursor is not None:
                 self._cursor.retry(current[0])
             self._inflight = None
+            self._stop_reason = "submission-rejected"
             return
         if current is None:
             self.schedule_background()

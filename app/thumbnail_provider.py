@@ -57,6 +57,7 @@ class ThumbnailLoadResult:
     preview_source: PreviewSource = PreviewSource.EXISTING
     persist_to_disk: bool = True
     page_count: int | None = None
+    disk_cache_hit: bool = False
 
     @property
     def resolved_kind(self) -> PreviewResultKind:
@@ -208,6 +209,15 @@ class BrowserThumbnailProvider(QObject):
             tuple[str, int, tuple[object, ...]], int
         ] = {}
         self._cache_specs: dict[int, ThumbnailRenderSpec] = {}
+        # Keys in this map are the content identities currently useful to the
+        # Browser viewport. Lower rank means more important; old/far entries
+        # remain cached but are the first eviction candidates.
+        self._cache_retention_rank: dict[
+            tuple[str, tuple[object, ...]], int
+        ] = {}
+        self._cache_entry_priority: dict[
+            tuple[str, int, tuple[object, ...]], int
+        ] = {}
         self._active_request_tokens: dict[str, set[int]] = {}
         self._pending: dict[tuple[str, int, int], _PendingThumbnail] = {}
         self._pending_lock = Lock()
@@ -218,6 +228,7 @@ class BrowserThumbnailProvider(QObject):
             "requested_selected": 0,
             "requested_read_ahead": 0,
             "requested_prefetch": 0,
+            "requested_background": 0,
             "memory_hit": 0,
             "disk_hit": 0,
             "generated": 0,
@@ -225,12 +236,18 @@ class BrowserThumbnailProvider(QObject):
             "generated_selected": 0,
             "generated_read_ahead": 0,
             "generated_prefetch": 0,
+            "generated_background": 0,
             "disk_saved": 0,
             "disk_saved_visible": 0,
             "disk_saved_selected": 0,
             "disk_saved_read_ahead": 0,
+            "disk_saved_background": 0,
             "memory_only": 0,
             "prefetch_skipped": 0,
+            "memory_cache_evictions": 0,
+            "background_self_evictions": 0,
+            "generated_background_nonresident": 0,
+            "background_disk_hit": 0,
         }
         self._generated_buckets: dict[str, int] = {}
         self._generated_variants: dict[str, int] = {}
@@ -240,6 +257,13 @@ class BrowserThumbnailProvider(QObject):
         self._loader = self._load_pipeline
         self._disk_cache = disk_cache
         self._disk_cache_enabled = bool(disk_cache_enabled)
+        self._disk_cache_health_lock = Lock()
+        # None means that the configured route has not been exercised yet.
+        # An observed failure blocks unbounded far generation; a later
+        # successful write can restore the route if it becomes writable.
+        self._disk_cache_write_available: bool | None = (
+            None if self._disk_cache_enabled and disk_cache is not None else False
+        )
         self._session_start_disk_bytes = (
             disk_cache.usage_bytes()
             if disk_cache_enabled and disk_cache is not None
@@ -350,7 +374,13 @@ class BrowserThumbnailProvider(QObject):
         cached = self._cache.get(cache_key)
         if cached is not None:
             self._increment_stat("memory_hit")
+            self._cache_entry_priority[cache_key] = max(
+                int(normalized_priority),
+                self._cache_entry_priority.get(cache_key, int(normalized_priority)),
+            )
             self._cache.move_to_end(cache_key)
+            if not self._cache_retention_rank:
+                self._reorder_memory_cache()
             image = QImage(cached)
             page_count = self._cache_page_counts.get(cache_key)
             QTimer.singleShot(
@@ -739,6 +769,149 @@ class BrowserThumbnailProvider(QObject):
         """Bytes retained by Browser thumbnails, excluding Viewer caches."""
         return self._cache_bytes
 
+    def has_memory_thumbnail(
+        self,
+        item: BrowserItem,
+        size: int | ThumbnailRenderSpec,
+    ) -> bool:
+        """Return whether a suitable current-revision image is already in RAM.
+
+        This deliberately performs no filesystem or disk-cache I/O, so the
+        Browser workflow can reconcile its near range on the GUI thread.
+        """
+        token = size.cache_token if isinstance(size, ThumbnailRenderSpec) else int(size)
+        path_key = self._path_key(item.path)
+        if (path_key, token, item.thumbnail_revision) in self._cache:
+            return True
+        if not isinstance(size, ThumbnailRenderSpec):
+            return False
+        candidate = self._memory_candidate(path_key, item.thumbnail_revision, size)
+        return bool(
+            candidate is not None
+            and candidate[1].long_edge >= size.long_edge * 0.95
+        )
+
+    @property
+    def memory_cache_capacity_reached(self) -> bool:
+        """Cheap RAM-only capacity check; safe for GUI scheduling decisions."""
+        return (
+            len(self._cache) >= self._cache_capacity
+            or self._cache_bytes >= self._cache_capacity_bytes
+        )
+
+    @property
+    def memory_cache_capacity_entries(self) -> int:
+        return self._cache_capacity
+
+    @property
+    def memory_cache_has_evictable_entries(self) -> bool:
+        """Whether old/distant RAM entries can make room for more work."""
+        return any(
+            self._retention_rank_for_cache_key(key) is None
+            for key in self._cache
+        )
+
+    @property
+    def background_disk_cache_enabled(self) -> bool:
+        """Whether disk persistence is configured and has not failed lately.
+
+        This memory-only scheduling hint allows one attempt for an untested
+        route. An observed failed save prevents far work from decoding rows
+        that cannot be retained.
+        """
+        with self._disk_cache_health_lock:
+            return bool(
+                self._disk_cache_enabled
+                and self._disk_cache is not None
+                and self._disk_cache_write_available is not False
+            )
+
+    def _record_disk_cache_write_availability(self, available: bool) -> None:
+        with self._disk_cache_health_lock:
+            self._disk_cache_write_available = bool(available)
+
+    def _has_persisted_thumbnail(
+        self,
+        item: BrowserItem,
+        size: int | ThumbnailRenderSpec,
+        cache_token: int,
+        entry_path: str | None,
+    ) -> bool:
+        """Check an equivalent artifact on the worker lane after put() fails."""
+        disk_cache = self._disk_cache
+        if not self._disk_cache_enabled or disk_cache is None:
+            return False
+        try:
+            if isinstance(size, ThumbnailRenderSpec) and hasattr(
+                disk_cache, "get_suitable"
+            ):
+                try:
+                    existing = disk_cache.get_suitable(
+                        item, size, entry_path=entry_path
+                    )
+                except TypeError:
+                    existing = disk_cache.get_suitable(item, size)
+                return bool(
+                    existing is not None
+                    and not getattr(existing, "low_resolution_placeholder", False)
+                )
+            try:
+                existing = disk_cache.get(
+                    item, cache_token, entry_path=entry_path
+                )
+            except TypeError:
+                existing = disk_cache.get(item, cache_token)
+            return existing is not None
+        except Exception:
+            return False
+
+    def set_cache_retention_priorities(
+        self,
+        entries: list[tuple[str | Path, tuple[object, ...], int]],
+    ) -> None:
+        """Recenter RAM retention without deleting reusable cache artifacts.
+
+        The caller supplies only the current/selected/near rows, not the whole
+        listing. Eviction order is updated in place so distant cached images
+        remain available until memory pressure actually requires their removal.
+        """
+        priorities: dict[tuple[str, tuple[object, ...]], int] = {}
+        for path, revision, rank in entries:
+            key = (self._path_key(Path(path)), tuple(revision))
+            priorities[key] = min(int(rank), priorities.get(key, int(rank)))
+        self._cache_retention_rank = priorities
+        self._reorder_memory_cache()
+
+    def _retention_rank_for_cache_key(
+        self,
+        key: tuple[str, int, tuple[object, ...]],
+    ) -> int | None:
+        return self._cache_retention_rank.get((key[0], key[2]))
+
+    def _reorder_memory_cache(self) -> None:
+        if len(self._cache) < 2:
+            return
+        original = list(self._cache.items())
+        original_order = {key: index for index, (key, _image) in enumerate(original)}
+
+        def eviction_order(entry):
+            key = entry[0]
+            rank = self._retention_rank_for_cache_key(key)
+            if not self._cache_retention_rank:
+                source_priority = self._cache_entry_priority.get(
+                    key, int(ThumbnailPriority.BACKGROUND)
+                )
+                return (0, source_priority, original_order[key])
+            if rank is None:
+                return (0, 0, original_order[key])
+            # The highest numeric rank is least valuable inside the retained
+            # window and therefore stays closest to the eviction end.
+            return (1, -rank, original_order[key])
+
+        original.sort(key=eviction_order)
+        self._cache.clear()
+        self._cache.update(original)
+
     def cache_statistics(self) -> dict[str, object]:
         disk_stats: dict[str, object] = {}
         if self._disk_cache_enabled and self._disk_cache is not None:
@@ -750,6 +923,11 @@ class BrowserThumbnailProvider(QObject):
         stats["memory_cache_usage_bytes"] = self._cache_bytes
         stats["memory_cache_capacity_bytes"] = self._cache_capacity_bytes
         stats["memory_cache_entries"] = len(self._cache)
+        stats["memory_cache_capacity_entries"] = self._cache_capacity
+        stats["memory_cache_retained_entries"] = sum(
+            self._retention_rank_for_cache_key(key) is not None
+            for key in self._cache
+        )
         usage = int(disk_stats.get("usage_bytes", 0))
         stats.update(disk_stats)
         stats["session_growth_bytes"] = max(
@@ -760,6 +938,11 @@ class BrowserThumbnailProvider(QObject):
 
     def set_disk_cache_enabled(self, enabled: bool) -> None:
         self._disk_cache_enabled = bool(enabled)
+        with self._disk_cache_health_lock:
+            self._disk_cache_write_available = (
+                None if self._disk_cache_enabled and self._disk_cache is not None
+                else False
+            )
 
     def set_disk_cache_limit_mb(self, limit_mb: int) -> None:
         disk_cache = self._disk_cache
@@ -835,6 +1018,7 @@ class BrowserThumbnailProvider(QObject):
         self._cache_bytes = 0
         self._cache_page_counts.clear()
         self._cache_specs.clear()
+        self._cache_entry_priority.clear()
         self._preview_registry.shell_service.clear_memory_cache()
         with self._failure_lock:
             self._failed.clear()
@@ -1033,8 +1217,16 @@ class BrowserThumbnailProvider(QObject):
                 page_count_callback(normalized)
 
         provisional: QImage | None = None
-        if self._disk_cache_enabled and disk_cache is not None:
-            disk_cache.set_enabled(True)
+        disk_cache_available = bool(self._disk_cache_enabled and disk_cache is not None)
+        if disk_cache_available:
+            try:
+                disk_cache.set_enabled(True)
+                disk_cache_available = bool(getattr(disk_cache, "enabled", True))
+            except Exception:
+                disk_cache_available = False
+            if not disk_cache_available:
+                self._record_disk_cache_write_availability(False)
+        if disk_cache_available:
             with self._stats_lock:
                 if not self._session_disk_baseline_initialized:
                     self._session_start_disk_bytes = disk_cache.usage_bytes()
@@ -1054,6 +1246,8 @@ class BrowserThumbnailProvider(QObject):
                     cached_result = disk_cache.get_suitable(item, size)
                 if cached_result is not None:
                     self._increment_stat("disk_hit")
+                    if ThumbnailPriority(thumbnail_priority) is ThumbnailPriority.BACKGROUND:
+                        self._increment_stat("background_disk_hit")
                     if (
                         cached_result.page_count is not None
                         and page_count_callback is not None
@@ -1063,6 +1257,7 @@ class BrowserThumbnailProvider(QObject):
                         return ThumbnailLoadResult(
                             cached_result.image,
                             page_count=cached_result.page_count,
+                            disk_cache_hit=True,
                         )
                     provisional = cached_result.image
                     if provisional_callback is not None:
@@ -1079,7 +1274,9 @@ class BrowserThumbnailProvider(QObject):
                     cached = disk_cache.get(item, cache_token)
                 if cached is not None:
                     self._increment_stat("disk_hit")
-                    return ThumbnailLoadResult(cached)
+                    if ThumbnailPriority(thumbnail_priority) is ThumbnailPriority.BACKGROUND:
+                        self._increment_stat("background_disk_hit")
+                    return ThumbnailLoadResult(cached, disk_cache_hit=True)
 
         normalized_priority = ThumbnailPriority(thumbnail_priority)
         if (
@@ -1218,7 +1415,7 @@ class BrowserThumbnailProvider(QObject):
             ThumbnailPriority(thumbnail_priority)
             is not ThumbnailPriority.PREFETCH
             and result.persist_to_disk
-            and self._disk_cache_enabled
+            and disk_cache_available
             and disk_cache is not None
         ):
             # Publish the same matte-composited pixels that we save. Otherwise
@@ -1228,15 +1425,23 @@ class BrowserThumbnailProvider(QObject):
                 result = replace(result, image=pil_to_qimage(
                     policy.prepare_pixels(ThumbnailDiskCache._qimage_to_pil(result.image))
                 ))
-            saved = disk_cache.put(
-                item,
-                size if isinstance(size, ThumbnailRenderSpec) else cache_token,
-                result.image,
-                cover_path=result.cover_path,
-                entry_path=result.entry_path,
-                page_count=result.page_count,
-                protected_thumbnail_sizes=self._protected_thumbnail_sizes(item),
-                encoding_policy=policy,
+            try:
+                saved = disk_cache.put(
+                    item,
+                    size if isinstance(size, ThumbnailRenderSpec) else cache_token,
+                    result.image,
+                    cover_path=result.cover_path,
+                    entry_path=result.entry_path,
+                    page_count=result.page_count,
+                    protected_thumbnail_sizes=self._protected_thumbnail_sizes(item),
+                    encoding_policy=policy,
+                )
+            except Exception:
+                saved = False
+            self._record_disk_cache_write_availability(
+                bool(saved) or self._has_persisted_thumbnail(
+                    item, size, cache_token, disk_entry_path
+                )
             )
             if saved:
                 self._increment_stat("disk_saved")
@@ -1248,6 +1453,8 @@ class BrowserThumbnailProvider(QObject):
                 }.get(normalized_priority)
                 if saved_key is not None:
                     self._increment_stat(saved_key)
+            else:
+                self._increment_stat("memory_only")
         else:
             self._increment_stat("memory_only")
         return ThumbnailLoadResult(
@@ -1259,6 +1466,7 @@ class BrowserThumbnailProvider(QObject):
             preview_source=result.preview_source,
             persist_to_disk=result.persist_to_disk,
             page_count=result.page_count,
+            disk_cache_hit=result.disk_cache_hit,
         )
 
     @Slot(str, int, object, object, object)
@@ -1459,11 +1667,15 @@ class BrowserThumbnailProvider(QObject):
         existing_image = self._cache.pop(cache_key, None)
         if existing_image is not None:
             self._cache_bytes -= int(existing_image.sizeInBytes())
+        self._cache_entry_priority.pop(cache_key, None)
         self._cache_page_counts.pop(cache_key, None)
         image_bytes = int(cached_image.sizeInBytes())
         if image_bytes <= self._cache_capacity_bytes:
             self._cache[cache_key] = cached_image
             self._cache_bytes += image_bytes
+            self._cache_entry_priority[cache_key] = int(
+                pending.priority if pending is not None else ThumbnailPriority.VISIBLE
+            )
             if loaded.page_count is not None:
                 self._cache_page_counts[cache_key] = max(
                     0,
@@ -1474,17 +1686,11 @@ class BrowserThumbnailProvider(QObject):
         ):
             self._cache_specs[int(size_token)] = pending.worker.size
         if cache_key in self._cache:
-            # Background work is scheduled near-to-far. Keep those entries
-            # older than visible/selected results so a finite LRU evicts the
-            # farthest speculative work first and cannot push the current or
-            # immediate next viewport out of RAM just because warmup ran.
-            self._cache.move_to_end(
-                cache_key,
-                last=(
-                    pending is None
-                    or pending.priority is not ThumbnailPriority.BACKGROUND
-                ),
-            )
+            # Append new distant work after old distant entries. The priority
+            # reorder below keeps current/near rows last; when full, eviction
+            # removes stale far entries first instead of the new result itself.
+            self._cache.move_to_end(cache_key, last=True)
+            self._reorder_memory_cache()
         while (
             len(self._cache) > self._cache_capacity
             or self._cache_bytes > self._cache_capacity_bytes
@@ -1492,6 +1698,21 @@ class BrowserThumbnailProvider(QObject):
             evicted_key, _evicted_image = self._cache.popitem(last=False)
             self._cache_bytes -= int(_evicted_image.sizeInBytes())
             self._cache_page_counts.pop(evicted_key, None)
+            self._cache_entry_priority.pop(evicted_key, None)
+            self._increment_stat("memory_cache_evictions")
+            if (
+                evicted_key == cache_key
+                and pending is not None
+                and pending.priority is ThumbnailPriority.BACKGROUND
+            ):
+                self._increment_stat("background_self_evictions")
+        if (
+            pending is not None
+            and pending.priority is ThumbnailPriority.BACKGROUND
+            and not loaded.disk_cache_hit
+            and cache_key not in self._cache
+        ):
+            self._increment_stat("generated_background_nonresident")
         if pending is None or pending.priority is not ThumbnailPriority.BACKGROUND:
             self.thumbnail_ready.emit(path, generation, image)
 
