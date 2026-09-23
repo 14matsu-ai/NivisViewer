@@ -4758,7 +4758,11 @@ class BrowserWindow(QMainWindow):
                 ),
             )
         )
-        popup = BrowserLocationListPopup(tuple(popup_entries), self)
+        popup = BrowserLocationListPopup(
+            tuple(popup_entries),
+            self,
+            compact_rows=True,
+        )
         self._search_history_popup = popup
         popup.entryActivated.connect(self._activate_search_history_entry)
         popup.closed.connect(
