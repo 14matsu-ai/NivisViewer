@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from .browser_workflow_controller import BrowserWorkflowController
 from .browser_workflow_policy import paste_is_move
+from .browser_download_policy import RefreshBurst
+from .browser_download_retry import BrowserDownloadRetry
 
 from .i18n import tr
 from .menu_icons import install_text_icon_menu_style, settings_icon
@@ -312,6 +314,7 @@ class _PendingDirectoryScan:
     first_batch_arrived: bool = False
     first_batch_applied: bool = False
     snapshot_hit: bool = False
+    retry_failed_thumbnails: bool = False
 
 
 class _BrowserContextFilenameEdit(QLineEdit):
@@ -1024,8 +1027,12 @@ class BrowserWindow(QMainWindow):
         self._directory_change_timer.timeout.connect(
             self._flush_directory_changes
         )
+        self._directory_change_burst = RefreshBurst(
+            quiet_ms=BROWSER_DIRECTORY_CHANGE_COALESCE_MS,
+        )
         self._build_ui()
         self._browser_workflow = BrowserWorkflowController(self)
+        self._download_retry = BrowserDownloadRetry(self)
         self.shortcut_bindings = normalize_shortcut_bindings(
             self.settings.get("shortcut_bindings")
         ).get("browser", {})
@@ -1141,6 +1148,7 @@ class BrowserWindow(QMainWindow):
         navigation_source: str = "interactive",
         trace_id: int = 0,
         atomic_restore: bool = False,
+        retry_failed_thumbnails: bool = False,
     ) -> bool:
         if trace_id:
             performance_trace.mark(trace_id, "navigation.navigate_to.called")
@@ -1247,6 +1255,7 @@ class BrowserWindow(QMainWindow):
                 else navigation_source
             ),
             atomic_restore=atomic_restore,
+            retry_failed_thumbnails=retry_failed_thumbnails,
         )
         if not self._same_path(self._directory_watch_path, target):
             self._set_active_directory_watch(target)
@@ -1365,10 +1374,17 @@ class BrowserWindow(QMainWindow):
             # listing metadata. Retry failed previews once per coalesced event.
             filesystem_change = pending.navigation_source == "filesystem_watch"
             listing_changed = tuple(items) != self.item_model.source_items
-            retry_failed = filesystem_change and self.thumbnail_provider.has_failed_requests
+            retry_failed_requested = (
+                filesystem_change
+                or pending.retry_failed_thumbnails
+                or pending.navigation_source == "manual_refresh"
+            )
+            retry_failed = (
+                retry_failed_requested and self.thumbnail_provider.has_failed_requests
+            )
             if listing_changed:
                 self._generation = self.thumbnail_provider.begin_generation(
-                    retry_failed=filesystem_change,
+                    retry_failed=retry_failed_requested,
                 )
                 self.item_model.set_sorted_items(
                     items,
@@ -1390,6 +1406,7 @@ class BrowserWindow(QMainWindow):
                 self._generation = self.thumbnail_provider.begin_generation(
                     retry_failed=True,
                 )
+                self._browser_workflow.retry_failed_thumbnails()
             # A snapshot history restore can reach this refresh completion
             # before its first-paint callback runs.  That callback is fenced
             # by the newer scan generation, so explicitly re-arm the bounded
@@ -1684,6 +1701,7 @@ class BrowserWindow(QMainWindow):
             navigation_source=pending.navigation_source,
             trace_id=pending.trace_id,
             atomic_restore=pending.atomic_restore,
+            retry_failed_thumbnails=pending.retry_failed_thumbnails,
         )
 
     @staticmethod
@@ -2033,6 +2051,7 @@ class BrowserWindow(QMainWindow):
     def _refresh_current_folder(self, *, navigation_source: str) -> bool:
         if self.current_path is None:
             return False
+        explicit_retry = navigation_source == "manual_refresh"
         if self._snapshot_reconcile_pending:
             navigation_source = "snapshot_reconcile"
         location = self._current_location()
@@ -2042,8 +2061,11 @@ class BrowserWindow(QMainWindow):
             restore_location=location,
             force_reload=True,
             navigation_source=navigation_source,
+            retry_failed_thumbnails=explicit_retry,
         ):
             return False
+        if explicit_retry:
+            self._download_retry.reset()
         return True
 
     def _set_active_directory_watch(self, path: str | Path) -> None:
@@ -2061,6 +2083,8 @@ class BrowserWindow(QMainWindow):
         self._directory_change_pending = False
         if hasattr(self, "_directory_change_timer"):
             self._directory_change_timer.stop()
+        if hasattr(self, "_directory_change_burst"):
+            self._directory_change_burst.reset()
         self.directory_watcher.clear()
 
     def _restore_current_directory_watch(self) -> None:
@@ -2096,7 +2120,7 @@ class BrowserWindow(QMainWindow):
         if not self._same_path(self.current_path, changed_path):
             return
         self._directory_change_pending = True
-        self._directory_change_timer.start()
+        self._arm_directory_change_timer()
 
     def _schedule_directory_reconciliation(self) -> None:
         if self._shutdown_prepared or self.current_path is None:
@@ -2107,10 +2131,18 @@ class BrowserWindow(QMainWindow):
         ):
             return
         self._directory_change_pending = True
-        self._directory_change_timer.start()
+        self._arm_directory_change_timer()
+
+    def _arm_directory_change_timer(self) -> None:
+        if self._shutdown_prepared:
+            return
+        self._directory_change_timer.start(
+            self._directory_change_burst.delay_ms(monotonic())
+        )
 
     def _flush_directory_changes(self) -> None:
         self._directory_change_timer.stop()
+        self._directory_change_burst.reset()
         if not self._directory_change_pending or self._shutdown_prepared:
             return
         if self.file_operation_coordinator.busy:
@@ -2147,7 +2179,7 @@ class BrowserWindow(QMainWindow):
             # accumulated while that operation was running.
             self._directory_change_pending = False
             return
-        self._directory_change_timer.start()
+        self._arm_directory_change_timer()
 
     def _on_browser_folder_gesture(self, pattern: str) -> None:
         if not self.browser_folder_gestures_enabled:
@@ -4024,6 +4056,7 @@ class BrowserWindow(QMainWindow):
             return True
         self._shutdown_prepared = True
         if self._shutdown_cleanup_phase == 0:
+            self._download_retry.close()
             self._close_zip_progress_dialog()
             self.clear_file_clipboard()
             if (
@@ -5882,6 +5915,8 @@ class BrowserWindow(QMainWindow):
                 self._update_tag_quick_filter_geometry(force=True)
             QTimer.singleShot(0, self._install_screen_tracking)
             QTimer.singleShot(0, self._reevaluate_thumbnail_dpr)
+        if event.type() in {QEvent.Type.Show, QEvent.Type.WindowStateChange}:
+            QTimer.singleShot(0, self._download_retry.wake)
         return handled
 
     def _handle_extra_button_event(
@@ -7272,6 +7307,9 @@ class BrowserWindow(QMainWindow):
             self._sync_tree_to_path(self.current_path)
 
     def _request_visible_thumbnails(self) -> None:
+        retry = getattr(self, "_download_retry", None)
+        if retry is not None:
+            retry.wake()
         workflow = getattr(self, "_browser_workflow", None)
         if workflow is not None:
             # Recenter cache retention before the visible requests below can

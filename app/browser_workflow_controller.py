@@ -259,6 +259,31 @@ class BrowserWorkflowController(QObject):
         self._near_cache_blocked = False
         self.schedule_background()
 
+    def retry_failed_thumbnail(self, path, token, revision) -> bool:
+        """Make an existing failed row eligible in the normal warmup lane."""
+        window = self.window
+        if (window._shutdown_prepared
+                or int(token) != window.thumbnail_render_spec.cache_token):
+            return False
+        row = window.item_model.row_for_path(path)
+        item = window.item_model.item_at(row) if row >= 0 else None
+        if item is None or item.thumbnail_revision != tuple(revision):
+            return False
+        identity = self._memory_identity(item, int(token))
+        self._memory_attempted.discard(identity)
+        if self._cursor is not None:
+            self._cursor.invalidate(row)
+        self._rebuild_memory_refill()
+        self.schedule_background()
+        return True
+
+    def retry_failed_thumbnails(self) -> None:
+        """Reopen consumed warmup attempts after an explicit failure reset."""
+        # A folder refresh may release every provider failure without changing
+        # the model. Rebuild the bounded cursor so RAM-warmup failures are not
+        # left marked as already attempted. Resident thumbnails remain cache hits.
+        self._model_changed()
+
     def _resumed(self) -> None:
         if self._inflight is not None and self._cursor is not None:
             self._cursor.retry(self._inflight[0])

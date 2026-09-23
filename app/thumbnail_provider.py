@@ -323,6 +323,24 @@ class BrowserThumbnailProvider(QObject):
         with self._failure_lock:
             return bool(self._failed)
 
+    def clear_failed_thumbnail(
+        self,
+        item: BrowserItem,
+        size: int | ThumbnailRenderSpec,
+        *,
+        generation: int,
+    ) -> bool:
+        """Release one failed identity for an ordinary visible request."""
+        if self._closed or int(generation) != self._generation:
+            return False
+        token = size.cache_token if isinstance(size, ThumbnailRenderSpec) else int(size)
+        failure_key = (self._path_key(item.path), token, item.thumbnail_revision)
+        with self._failure_lock:
+            # Clear only the FAILED memo. Quiet non-applicable/unavailable
+            # results have a separate retry policy and stay untouched.
+            self._failed.discard(failure_key)
+        return True
+
     def begin_generation(self, *, retry_failed: bool = False) -> int:
         self._generation += 1
         self._active_request_tokens.clear()
