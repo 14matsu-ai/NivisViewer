@@ -311,6 +311,8 @@ class ViewerWindow(QMainWindow):
             tuple[str, AdjacentBookBrowserSnapshot | None] | None
         ) = None
         self._shutdown_prepared = False
+        self._shutdown_cleanup_phase = 0
+        self._shutdown_cleanup_complete = False
         self._reload_page_index: int | None = None
         self._pending_display_demand: (
             tuple[
@@ -567,6 +569,15 @@ class ViewerWindow(QMainWindow):
         self._raster_magnifier_cancel_timer.timeout.connect(
             self._refresh_after_raster_magnifier_cancel
         )
+        # This is only a trailing background-admission gate. Current rendering
+        # and all worker ownership remain in the existing raster runtime.
+        self._raster_zoom_warmup_timer = QTimer(self)
+        self._raster_zoom_warmup_timer.setSingleShot(True)
+        self._raster_zoom_warmup_timer.setInterval(150)
+        self._raster_zoom_warmup_timer.timeout.connect(
+            self._release_settled_raster_warmup
+        )
+        self._raster_zoom_warmup_context: tuple[int, int] | None = None
         self._viewer_memory_pressure_timer = QTimer(self)
         self._viewer_memory_pressure_timer.setInterval(5000)
         self._viewer_memory_pressure_timer.timeout.connect(
@@ -1859,6 +1870,7 @@ class ViewerWindow(QMainWindow):
             return
         snapshot = read_physical_memory_snapshot()
         if snapshot is None:
+            policy.reset_growth_observation()
             self._apply_raster_memory_policy()
             return
         runtime = getattr(self, "_zip_runtime", None)
@@ -1877,6 +1889,12 @@ class ViewerWindow(QMainWindow):
         policy.observe_memory_pressure(
             snapshot,
             current_cache_bytes=current_cache_bytes,
+            auto_growth_requested=bool(
+                isinstance(runtime, RasterBookRuntime)
+                and self._zip_runtime_active
+                and self.isActiveWindow()
+                and runtime.auto_cache_growth_requested
+            ),
         )
         self._apply_raster_memory_policy()
 
@@ -3620,6 +3638,20 @@ class ViewerWindow(QMainWindow):
         self._raster_topology = topology
         return topology
 
+    def _raster_background_allowed(self) -> bool:
+        # Full-pixel fidelity is not a reason to disable prefetch. Unknown and
+        # known full-source jobs still pass runtime admission/reservations.
+        # Keep magnifier promotion isolated; cancel already restores normal
+        # warmup. During repeated zoom changes prepare only the current frame.
+        return not (
+            self.viewer.magnifier_selecting
+            or self.viewer.magnifier_active
+            or (
+                self.fit_mode == "manual_zoom"
+                and self._raster_zoom_warmup_timer.isActive()
+            )
+        )
+
     def _zip_runtime_request(
         self,
         spread: DisplaySpread,
@@ -3645,11 +3677,7 @@ class ViewerWindow(QMainWindow):
         decoder_bound = self._current_book_runtime_decode_bounds()
         if self.viewer.magnifier_selecting or self.viewer.magnifier_active:
             decoder_bound = None
-        source_interactive = (
-            self.viewer.magnifier_selecting
-            or self.viewer.magnifier_active
-            or decoder_bound is None
-        )
+        background_enabled = self._raster_background_allowed()
         warmup_plan = RasterWarmupPlan(
             self._raster_book_topology(source),
             current=current,
@@ -3658,10 +3686,10 @@ class ViewerWindow(QMainWindow):
                 page.page_index for page in unit.pages
             ),
             direction=direction,
-            # Full-source promotion is an explicit current-page demand.
-            # Raster warm-up is governed by memory, not the legacy prefetch
-            # preset/count controls used by PDF and the retained old pipeline.
-            background_enabled=not source_interactive,
+            # Full-source promotion for the lens remains current-only;
+            # stable actual/manual/nearest views can prefetch within budget.
+            # The legacy PDF prefetch preset/count controls are unchanged.
+            background_enabled=background_enabled,
             nearby_units=(
                 self._zip_display_unit(
                     tuple(slot.page_index for slot in candidate.slots),
@@ -3734,6 +3762,8 @@ class ViewerWindow(QMainWindow):
         preserve_book_state: bool = False,
     ) -> None:
         self._raster_magnifier_cancel_timer.stop()
+        self._raster_zoom_warmup_timer.stop()
+        self._raster_zoom_warmup_context = None
         self._clear_pending_raster_navigation(reset_policy=True)
         if not self._zip_runtime_active:
             if clear_artifacts and self._zip_runtime is not None:
@@ -6479,6 +6509,11 @@ class ViewerWindow(QMainWindow):
         self._sync_actions()
         self._update_status()
         if self._zip_runtime_active:
+            self._raster_zoom_warmup_context = (
+                self.book_session.generation,
+                id(self.book_session.source),
+            )
+            self._raster_zoom_warmup_timer.start()
             self._refresh_view()
             return
         if self.image_cache.set_raster_decode_bounds(
@@ -6487,6 +6522,33 @@ class ViewerWindow(QMainWindow):
             self._refresh_view()
         else:
             self._schedule_pdf_rerender()
+
+    def _release_settled_raster_warmup(self) -> None:
+        context = self._raster_zoom_warmup_context
+        self._raster_zoom_warmup_context = None
+        if (
+            context is None
+            or self._shutdown_prepared
+            or not self._zip_runtime_active
+            or self.presentation_state.replacement_open_pending
+            or self.fit_mode != "manual_zoom"
+            or context != (
+                self.book_session.generation,
+                id(self.book_session.source),
+            )
+            or not self._raster_background_allowed()
+        ):
+            return
+        request = self._zip_runtime_request(self.model.spread_at())
+        runtime = self._zip_runtime
+        if request is None or runtime is None:
+            return
+        # Refresh only the existing request's work order: no presentation,
+        # history/progress change, new request serial, or input-gate release.
+        if runtime.refresh_work_order(request):
+            pending = self._pending_zip_runtime_request
+            if pending is not None and pending.request_id == request.request_id:
+                self._pending_zip_runtime_request = request
 
     def _current_raster_decode_bounds(self) -> tuple[int, int] | None:
         if (
@@ -6577,8 +6639,15 @@ class ViewerWindow(QMainWindow):
         force_refresh = self._presentation_viewport_refresh_required
         self._presentation_viewport_refresh_required = False
         if self._zip_runtime_active:
-            if self._zip_runtime is not None:
-                self._zip_runtime.invalidate_layout()
+            runtime = self._zip_runtime
+            if runtime is not None:
+                request = self._zip_runtime_request(self.model.spread_at())
+                # Duplicate size notifications and A -> B -> A during the
+                # existing debounce do not invalidate an unchanged render key.
+                # A genuinely different layout still takes the established
+                # invalidation path. Source/adjustment keys are not weakened.
+                if request is None or not runtime.matches_render_spec(request.render_spec):
+                    runtime.invalidate_layout()
             self._refresh_view()
             return
         if (
@@ -7185,62 +7254,90 @@ class ViewerWindow(QMainWindow):
             self._is_fullscreen_mode() and self.hide_cursor_in_fullscreen
         )
 
-    def prepare_shutdown(self, *, wait_msecs: int = 250) -> None:
-        if self._shutdown_prepared:
-            return
+    def prepare_shutdown(self, *, wait_msecs: int = 250) -> bool:
+        if self._shutdown_cleanup_complete:
+            return True
+        # This flag fences all new input/work on the first attempt and stays
+        # set while timed-out cleanup phases are retried.
         self._shutdown_prepared = True
-        self._save_current_reading_position()
-        self._pending_book_open_projection = None
-        self.presentation_state.close()
-        self._project_presentation_surface()
-        self._zip_runtime_request_timer.stop()
-        self._pending_zip_runtime_request = None
-        self._presentation_side_effect_timer.stop()
-        self._pending_presentation_side_effect_token = None
-        self._raster_magnifier_cancel_timer.stop()
-        self._viewer_memory_pressure_timer.stop()
-        self._page_list_filter_timer.stop()
-        self._page_list_viewport_timer.stop()
-        self._set_page_list_paused(True)
-        for runtime in {
-            self._page_list_runtime,
-            self._staged_page_list_runtime,
-        }:
-            if runtime is not None:
-                runtime.set_visible(False)
-        self.page_list_model.clear()
-        self._path_probe_generation += 1
-        self._pending_path_probe = None
-        self.fullscreen_chrome.shutdown()
-        self._cancel_interactive_open()
-        self.viewer.cancel_mouse_gesture()
-        self.viewer.cancel_pending_canvas_click()
-        self._deactivate_zip_runtime(clear_artifacts=True)
-        if not self._pdf_loupe_cache.shutdown(max(5000, wait_msecs)):
-            raise RuntimeError("PDF loupe worker shutdown did not complete")
-        self.viewer.shutdown_rendering(max(5000, wait_msecs))
-        self.slideshow_timer.stop()
-        self._pdf_render_timer.stop()
-        self._prepared_display_timer.stop()
-        self._raster_viewport_timer.stop()
-        self._raster_paint_fallback_timer.stop()
-        self._raster_prefetch_after_paint = None
-        self._clear_raster_prefetch_pipeline()
-        self._release_raster_interactive_lane()
-        self._cancel_pending_display_demand()
-        self._cancel_pending_decode_demand()
-        self._cancel_deferred_pdf_prefetch()
-        self.book_session.shutdown(wait_msecs=wait_msecs)
-        if self._owns_archive_backend_registry:
-            self.archive_backend_registry.close()
-        if self._owns_pdfium_service:
-            if not self.pdfium_service.shutdown():
+        phase = self._shutdown_cleanup_phase
+        if phase == 0:
+            self._save_current_reading_position()
+            self._pending_book_open_projection = None
+            self.presentation_state.close()
+            self._project_presentation_surface()
+            self._zip_runtime_request_timer.stop()
+            self._pending_zip_runtime_request = None
+            self._presentation_side_effect_timer.stop()
+            self._pending_presentation_side_effect_token = None
+            self._raster_magnifier_cancel_timer.stop()
+            self._viewer_memory_pressure_timer.stop()
+            self._raster_zoom_warmup_timer.stop()
+            self._raster_zoom_warmup_context = None
+            self._page_list_filter_timer.stop()
+            self._page_list_viewport_timer.stop()
+            self._set_page_list_paused(True)
+            for runtime in {
+                self._page_list_runtime,
+                self._staged_page_list_runtime,
+            }:
+                if runtime is not None:
+                    runtime.set_visible(False)
+            self.page_list_model.clear()
+            self._path_probe_generation += 1
+            self._pending_path_probe = None
+            self.fullscreen_chrome.shutdown()
+            self._cancel_interactive_open()
+            self.viewer.cancel_mouse_gesture()
+            self.viewer.cancel_pending_canvas_click()
+            self._deactivate_zip_runtime(clear_artifacts=True)
+            self._shutdown_cleanup_phase = 1
+
+        if self._shutdown_cleanup_phase == 1:
+            if not self._pdf_loupe_cache.shutdown(max(5000, wait_msecs)):
+                return False
+            self._shutdown_cleanup_phase = 2
+
+        if self._shutdown_cleanup_phase == 2:
+            if not self.viewer.shutdown_rendering(max(5000, wait_msecs)):
+                return False
+            self._shutdown_cleanup_phase = 3
+
+        if self._shutdown_cleanup_phase == 3:
+            self.slideshow_timer.stop()
+            self._pdf_render_timer.stop()
+            self._prepared_display_timer.stop()
+            self._raster_viewport_timer.stop()
+            self._raster_paint_fallback_timer.stop()
+            self._raster_prefetch_after_paint = None
+            self._clear_raster_prefetch_pipeline()
+            self._release_raster_interactive_lane()
+            self._cancel_pending_display_demand()
+            self._cancel_pending_decode_demand()
+            self._cancel_deferred_pdf_prefetch()
+            self.book_session.shutdown(wait_msecs=wait_msecs)
+            self._shutdown_cleanup_phase = 4
+
+        if self._shutdown_cleanup_phase == 4:
+            if self._owns_archive_backend_registry:
+                self.archive_backend_registry.close()
+            self._shutdown_cleanup_phase = 5
+
+        if self._shutdown_cleanup_phase == 5:
+            if self._owns_pdfium_service and not self.pdfium_service.shutdown():
                 raise RuntimeError(
                     self.pdfium_service.last_shutdown_error
                     or "PDFium shutdown did not complete."
                 )
-        if self._owns_path_availability_service:
-            self.path_availability_service.close()
+            self._shutdown_cleanup_phase = 6
+
+        if self._shutdown_cleanup_phase == 6:
+            if self._owns_path_availability_service:
+                self.path_availability_service.close()
+            self._shutdown_cleanup_phase = 7
+
+        self._shutdown_cleanup_complete = self._shutdown_cleanup_phase == 7
+        return self._shutdown_cleanup_complete
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
         guard = getattr(self, "_application_close_guard", None)
@@ -7250,6 +7347,13 @@ class ViewerWindow(QMainWindow):
         application = QApplication.instance()
         if application is not None:
             application.removeEventFilter(self)
-        self.prepare_shutdown()
+        try:
+            if not self.prepare_shutdown():
+                event.ignore()
+                return
+        except Exception:
+            _LOG.exception("Viewer shutdown preparation did not complete")
+            event.ignore()
+            return
         self.closing.emit(self)
         super().closeEvent(event)

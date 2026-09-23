@@ -591,3 +591,48 @@ def test_viewer_canvas_side_and_slider_wheel_settings_are_normalized(
     assert restored["viewer_canvas_click_direction"] == "auto"
     assert restored["viewer_canvas_left_click_action"] == "next_single_page"
     assert restored["viewer_slider_wheel_single_page_enabled"] is False
+
+
+def test_invalid_utf8_config_is_preserved_and_never_silently_overwritten(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    original = b'{"ui_language":"\xff"}'
+    path.write_bytes(original)
+    manager = ConfigManager(path)
+
+    loaded = manager.load()
+    assert loaded["ui_language"] == manager.DEFAULTS["ui_language"]
+    assert "UTF-8" in (manager.last_error or "")
+    manager.save({"window_width": 777})
+
+    assert path.read_bytes() == original
+    assert "保護" in (manager.last_error or "")
+
+
+def test_truncated_json_config_is_preserved(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    original = b'{"ui_language":"ja",'
+    path.write_bytes(original)
+    manager = ConfigManager(path)
+
+    manager.load()
+    manager.save()
+
+    assert path.read_bytes() == original
+    assert "JSON" in (manager.last_error or "")
+
+
+def test_config_loads_utf8_bom_and_unicode_and_readonly_save_preserves_bytes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.json"
+    original = b'\xef\xbb\xbf{"ui_language":"ja","last_browser_path":"\xe6\x9c\xac\xe6\xa3\x9a"}'
+    path.write_bytes(original)
+    manager = ConfigManager(path, writable=False)
+
+    assert manager.load()["last_browser_path"] == "本棚"
+    manager.save({"last_browser_path": "別の棚"})
+
+    assert path.read_bytes() == original
+    assert manager.last_error

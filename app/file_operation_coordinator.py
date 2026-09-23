@@ -93,6 +93,26 @@ class FileOperationCoordinator(QObject):
     def _on_completed(self, result: FileOperationResult) -> None:
         # Unsupported and undo operations deliberately clear the one-step journal.
         self._undo_entries = result.undo_entries if result.operation is not FileOperationKind.UNDO else ()
+        metadata_warnings: list[str] = []
+
+        def sync_metadata(method_name: str, *paths: str) -> None:
+            if self.metadata_store is None:
+                return
+            method = getattr(self.metadata_store, method_name, None)
+            try:
+                completed = bool(callable(method) and method(*paths))
+            except Exception as exc:
+                completed = False
+                error = str(exc)
+            else:
+                error = str(getattr(self.metadata_store, "last_error", "") or "")
+            if not completed:
+                label = ", ".join(paths)
+                detail = f": {error}" if error else ""
+                metadata_warnings.append(
+                    f"{method_name} ({label}){detail}"
+                )
+
         if self.metadata_store is not None:
             for item in result.effective_items:
                 operation = item.operation or result.operation
@@ -100,8 +120,8 @@ class FileOperationCoordinator(QObject):
                     continue
                 if item.replaced_existing and item.destination_published:
                     if operation is FileOperationKind.COPY:
-                        self.metadata_store.apply_copy_replace_metadata(
-                            item.destination_path
+                        sync_metadata(
+                            "apply_copy_replace_metadata", item.destination_path
                         )
                     elif (
                         operation is FileOperationKind.MOVE
@@ -110,12 +130,14 @@ class FileOperationCoordinator(QObject):
                         and item.state is FileOperationItemState.MOVED
                         and item.source_path
                     ):
-                        self.metadata_store.apply_move_replace_metadata(
+                        sync_metadata(
+                            "apply_move_replace_metadata",
                             item.source_path,
                             item.destination_path,
                         )
                     elif operation is FileOperationKind.MOVE and item.source_path:
-                        self.metadata_store.apply_partial_move_replace_metadata(
+                        sync_metadata(
+                            "apply_partial_move_replace_metadata",
                             item.source_path,
                             item.destination_path,
                         )
@@ -125,10 +147,16 @@ class FileOperationCoordinator(QObject):
                     and item.success
                     and item.source_path
                 ):
-                    self.metadata_store.relocate_tree(
+                    sync_metadata(
+                        "relocate_tree",
                         item.source_path,
                         item.destination_path,
                     )
+        if metadata_warnings:
+            result = replace(
+                result,
+                metadata_sync_warnings=tuple(metadata_warnings),
+            )
         self.operation_completed.emit(result)
 
     @property

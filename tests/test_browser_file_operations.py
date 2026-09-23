@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import os
 from pathlib import Path
 from threading import Event
@@ -14,6 +15,7 @@ from app.browser_window import BrowserWindow
 from app.browser_navigation import BrowserLocation
 from app.config_manager import ConfigManager
 from app.file_operation_coordinator import FileOperationCoordinator
+from app.file_operation_queue import FileOperationQueue
 from app.file_operation_service import (
     FileOperationKind,
     FileOperationProgress,
@@ -168,6 +170,49 @@ def test_f2_rename_refreshes_and_selects_new_path_without_history_or_open(
     assert len(window.navigation_history) == history_size
     assert opened == []
     close_window(window, coordinator, qapp)
+
+
+def test_browser_shutdown_retries_probe_drain_without_unfencing(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    folder.mkdir()
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    original_close = window.image_detail_probe.close
+    workflow = window._browser_workflow
+    original_workflow_shutdown = workflow.shutdown
+    probe_calls = 0
+    workflow_calls = 0
+
+    def fail_probe_once(msecs=-1):
+        nonlocal probe_calls
+        probe_calls += 1
+        if probe_calls == 1:
+            return False
+        return original_close(msecs)
+
+    def count_workflow_shutdown():
+        nonlocal workflow_calls
+        workflow_calls += 1
+        return original_workflow_shutdown()
+
+    monkeypatch.setattr(window.image_detail_probe, "close", fail_probe_once)
+    monkeypatch.setattr(workflow, "shutdown", count_workflow_shutdown)
+    try:
+        assert window.prepare_shutdown() is False
+        assert window._shutdown_prepared
+        assert not window._shutdown_cleanup_complete
+        assert workflow_calls == 1
+
+        assert window.prepare_shutdown() is True
+        assert window._shutdown_prepared
+        assert window._shutdown_cleanup_complete
+        assert probe_calls == 2
+        assert workflow_calls == 1
+    finally:
+        close_window(window, coordinator, qapp)
 
 
 @pytest.mark.parametrize("is_directory", [False, True])
@@ -1820,6 +1865,85 @@ def test_cancelled_cut_paste_keeps_source_and_cut_state(
         close_window(window, coordinator, qapp)
 
 
+def test_browser_keeps_metadata_warning_expanded_then_reuses_panel(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "old.txt"
+    write_file(source)
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.set("last_browser_path", str(folder))
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    monkeypatch.setattr(metadata, "relocate_tree", lambda *_paths: False)
+    queue = FileOperationQueue(service=FileOperationService())
+    coordinator = FileOperationCoordinator(metadata, queue=queue)
+    window = BrowserWindow(
+        config_manager=config,
+        metadata_store=metadata,
+        file_operation_coordinator=coordinator,
+    )
+    window.resize(700, 480)
+    window.show()
+    assert window.wait_for_scan()
+    panel = window.file_operation_panel
+    status_bar = window.statusBar()
+    destroyed: list[bool] = []
+    panel.destroyed.connect(lambda _object=None: destroyed.append(True))
+
+    try:
+        assert window._start_file_operation(
+            FileOperationKind.RENAME,
+            sources=(str(source),),
+            new_name="renamed.txt",
+        )
+        finish_operation(window, coordinator, qapp)
+
+        assert (folder / "renamed.txt").exists()
+        assert panel.awaiting_result_acknowledgement
+        assert panel.details_view.isVisible()
+        assert "relocate_tree" in panel.details_view.toPlainText()
+        assert status_bar.maximumHeight() > 1000
+
+        QTest.qWait(3350)
+        qapp.processEvents()
+
+        assert panel.isVisible()
+        assert panel.details_view.isVisible()
+        assert panel.details_view.height() > 0
+        assert status_bar.maximumHeight() > 1000
+
+        panel.cancel_button.click()
+        qapp.processEvents()
+        expected_idle_height = max(
+            22,
+            status_bar.fontMetrics().height() + 6,
+        )
+        assert panel.isHidden()
+        assert not panel.awaiting_result_acknowledgement
+        assert status_bar.maximumHeight() == expected_idle_height
+        assert destroyed == []
+
+        second = folder / "second-operation"
+        assert window._start_file_operation(
+            FileOperationKind.CREATE_DIRECTORY,
+            destination=folder,
+            new_name=second.name,
+        )
+        assert panel.isVisible()
+        finish_operation(window, coordinator, qapp)
+
+        assert second.is_dir()
+        assert panel.summary_label.text() == "完了"
+        assert panel.isHidden()
+        assert panel._queue is queue
+        assert destroyed == []
+    finally:
+        close_window(window, coordinator, qapp)
+
+
 def test_slow_operation_shows_progress_and_keeps_qtimer_running(
     tmp_path: Path,
     qapp: QApplication,
@@ -1858,3 +1982,68 @@ def test_slow_operation_shows_progress_and_keeps_qtimer_running(
         qapp.processEvents()
         window.close()
         coordinator.close()
+
+
+def test_partial_cross_volume_cut_refreshes_destination_and_keeps_clipboard(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    source_folder = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source = source_folder / "book.cbz"
+    write_file(source, "payload")
+    destination.mkdir()
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.set("last_browser_path", str(source_folder))
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    service = FileOperationService()
+    coordinator = FileOperationCoordinator(
+        metadata,
+        executor=FileOperationExecutor(service),
+    )
+    window = BrowserWindow(
+        config_manager=config,
+        metadata_store=metadata,
+        file_operation_coordinator=coordinator,
+    )
+    window.show()
+    assert window.wait_for_scan()
+    select_paths(window, [source])
+    original_rename = os.rename
+    target = destination / source.name
+
+    def inject_cross_volume(old, new, *args, **kwargs):
+        if (
+            os.path.abspath(os.fspath(old)) == os.path.abspath(source)
+            and os.path.abspath(os.fspath(new)) == os.path.abspath(target)
+        ):
+            raise OSError(errno.EXDEV, "injected cross-volume move")
+        return original_rename(old, new, *args, **kwargs)
+
+    original_copy = service._copy_atomic
+
+    def publish_then_cancel(src, dst, cancelled, **kwargs):
+        published = original_copy(src, dst, cancelled, **kwargs)
+        cancelled.set()
+        return published
+
+    monkeypatch.setattr("app.file_operation_service.os.rename", inject_cross_volume)
+    monkeypatch.setattr(service, "_copy_atomic", publish_then_cancel)
+    try:
+        assert window.cut_selected_items()
+        assert window.navigate_to(destination)
+        assert window.wait_for_scan()
+        assert window.paste_items()
+        finish_operation(window, coordinator, qapp)
+
+        assert source.read_text(encoding="utf-8") == "payload"
+        assert target.read_text(encoding="utf-8") == "payload"
+        assert window._clipboard_cut
+        assert window._clipboard_paths == (str(source.absolute()),)
+        assert window.item_model.row_for_path(target) >= 0
+        assert "キャンセル" in window.statusBar().currentMessage()
+    finally:
+        qapp.clipboard().clear()
+        close_window(window, coordinator, qapp)

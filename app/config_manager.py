@@ -6,6 +6,7 @@ from .i18n import tr
 
 
 import json
+import logging
 import re
 from copy import deepcopy
 from pathlib import Path
@@ -43,6 +44,9 @@ from .viewer_memory_policy import (
     normalize_viewer_memory_mode,
     viewer_memory_mode_from_legacy_mib,
 )
+
+
+_LOG = logging.getLogger("nivisviewer.config")
 
 SLIDESHOW_INTERVAL_MIN_MS = 500
 SLIDESHOW_INTERVAL_MAX_MS = 600_000
@@ -277,6 +281,7 @@ class ConfigManager(QObject):
         self.path = Path(path) if path else base_dir / "config.json"
         self.writable = bool(writable)
         self.last_error: str | None = None
+        self._preserve_unreadable_config = False
         self.data: dict[str, Any] = deepcopy(self.DEFAULTS)
 
     @property
@@ -292,6 +297,8 @@ class ConfigManager(QObject):
         return self.base_dir / "data" / "metadata.sqlite3"
 
     def load(self) -> dict[str, Any]:
+        self._preserve_unreadable_config = False
+        self.last_error = None
         defaults = deepcopy(self.DEFAULTS)
         if not self.path.exists():
             # A truly new profile follows the Windows display language once.
@@ -302,9 +309,33 @@ class ConfigManager(QObject):
             return self.data
 
         try:
-            with self.path.open("r", encoding="utf-8") as file:
+            with self.path.open("r", encoding="utf-8-sig") as file:
                 loaded = json.load(file)
-        except (OSError, json.JSONDecodeError):
+        except UnicodeDecodeError as exc:
+            self._preserve_unreadable_config = True
+            self.last_error = tr(
+                '設定ファイルをUTF-8として読めません。元ファイルを保護し、既定値で起動します: {p0}',
+                p0=exc,
+            )
+            _LOG.warning("Config encoding error; preserving original bytes path=%s: %s", self.path, exc)
+            self._replace_data(defaults)
+            return self.data
+        except json.JSONDecodeError as exc:
+            self._preserve_unreadable_config = True
+            self.last_error = tr(
+                '設定ファイルのJSONを読み取れません。元ファイルを保護し、既定値で起動します: {p0}',
+                p0=exc,
+            )
+            _LOG.warning("Config JSON error; preserving original bytes path=%s: %s", self.path, exc)
+            self._replace_data(defaults)
+            return self.data
+        except OSError as exc:
+            self._preserve_unreadable_config = True
+            self.last_error = tr(
+                '設定ファイルを読み取れません。元ファイルを保護し、既定値で起動します: {p0}',
+                p0=exc,
+            )
+            _LOG.warning("Config read error; preserving original file path=%s: %s", self.path, exc)
             self._replace_data(defaults)
             return self.data
 
@@ -373,6 +404,17 @@ class ConfigManager(QObject):
         self.data.pop(self._LEGACY_VIEWER_CACHE_MEMORY_KEY, None)
         for key in self._LEGACY_RESAMPLING_KEYS:
             self.data.pop(key, None)
+
+        if self._preserve_unreadable_config:
+            if self.last_error is None:
+                self.last_error = tr(
+                    '設定ファイルの元データを保護中のため保存していません。ファイルを確認してください。'
+                )
+            _LOG.warning(
+                "Config save skipped to preserve unreadable source path=%s",
+                self.path,
+            )
+            return
 
         if not self.writable:
             self.last_error = tr('プロファイルは読み取り専用です。')

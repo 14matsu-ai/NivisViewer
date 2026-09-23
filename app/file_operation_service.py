@@ -178,6 +178,7 @@ class FileOperationResult:
         return tuple(items)
 
     undo_entries: tuple[FileUndoEntry, ...] = ()
+    metadata_sync_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -272,6 +273,17 @@ class _ArtifactOperationError(OSError):
         self.artifact_path = paths[0] if paths else ""
         self.cleanup = cleanup_results[0] if cleanup_results else None
         self.published = bool(published)
+
+
+@dataclass(frozen=True)
+class _SourceReceiptEntry:
+    relative_path: str
+    kind: str
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
 
 
 class FileOperationService:
@@ -879,14 +891,18 @@ class FileOperationService:
                 destination_existed_before=destination_existed_before,
             )
         except BaseException as exc:
+            failed = self._exception_failure(
+                source,
+                destination,
+                exc,
+                operation=request.operation,
+            )
             return replace(
-                self._exception_failure(
-                    source,
-                    destination,
-                    exc,
-                    operation=request.operation,
+                failed,
+                replaced_existing=bool(
+                    destination_existed_before
+                    and getattr(exc, "published", False)
                 ),
-                replaced_existing=False,
                 destination_existed_before=destination_existed_before,
             )
         if request.operation is FileOperationKind.MOVE:
@@ -1733,6 +1749,7 @@ class FileOperationService:
         except OSError as exc:
             if exc.errno != errno.EXDEV:
                 raise
+        source_receipt = self._capture_source_receipt(source)
         published = self._copy_atomic(source, destination, cancelled)
         if cancelled.is_set():
             if published is not True and os.path.lexists(destination):
@@ -1752,7 +1769,7 @@ class FileOperationService:
                     source,
                     destination,
                 )
-            self._remove_source(source)
+            self._remove_source_receipt(source, source_receipt, cancelled)
         except OSError as exc:
             if _LOG.isEnabledFor(logging.DEBUG):
                 _LOG.debug(
@@ -1796,9 +1813,12 @@ class FileOperationService:
             except OSError as exc:
                 if exc.errno != errno.EXDEV:
                     raise
+        source_receipt = self._capture_source_receipt(source)
         self._copy_atomic_replace(source, destination, cancelled)
         if cancelled.is_set():
-            raise _OperationCancelled
+            raise _SourceDeleteFailed(
+                tr('置換先は公開済みですが、キャンセルにより元項目を残しました')
+            )
         try:
             if _LOG.isEnabledFor(logging.DEBUG):
                 _LOG.debug(
@@ -1806,7 +1826,7 @@ class FileOperationService:
                     source,
                     destination,
                 )
-            self._remove_source(source)
+            self._remove_source_receipt(source, source_receipt, cancelled)
         except OSError as exc:
             if _LOG.isEnabledFor(logging.DEBUG):
                 _LOG.debug(
@@ -1839,6 +1859,135 @@ class FileOperationService:
             shutil.rmtree(source)
         else:
             os.unlink(source)
+
+    @classmethod
+    def _capture_source_receipt(
+        cls,
+        source: str,
+    ) -> tuple[_SourceReceiptEntry, ...]:
+        """Record the copied source tree before a cross-volume move.
+
+        A later cleanup may remove only these exact objects. Reparse points and
+        platforms without stable file identities fail closed; same-volume
+        rename paths never pay this enumeration cost.
+        """
+        receipt: list[_SourceReceiptEntry] = []
+
+        def visit(path: str, relative_path: str) -> None:
+            value = os.lstat(path)
+            attributes = int(getattr(value, "st_file_attributes", 0))
+            reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+            if stat.S_ISLNK(value.st_mode) or attributes & reparse_flag:
+                raise OSError(errno.ELOOP, tr('再解析ポイントの移動は安全に確認できません'), path)
+            kind = (
+                "directory" if stat.S_ISDIR(value.st_mode)
+                else "file" if stat.S_ISREG(value.st_mode)
+                else "other"
+            )
+            device = int(getattr(value, "st_dev", 0))
+            inode = int(getattr(value, "st_ino", 0))
+            if kind == "other" or device == 0 or inode == 0:
+                raise OSError(errno.ENOTSUP, tr('元項目の同一性を確認できません'), path)
+            receipt.append(
+                _SourceReceiptEntry(
+                    relative_path,
+                    kind,
+                    device,
+                    inode,
+                    int(value.st_size),
+                    int(getattr(value, "st_mtime_ns", 0)),
+                    int(getattr(value, "st_ctime_ns", 0)),
+                )
+            )
+            if kind == "directory":
+                with os.scandir(path) as children:
+                    names = sorted(entry.name for entry in children)
+                for name in names:
+                    child_relative = (
+                        name if not relative_path
+                        else os.path.join(relative_path, name)
+                    )
+                    visit(os.path.join(path, name), child_relative)
+
+        visit(source, "")
+        return tuple(sorted(receipt, key=lambda item: item.relative_path))
+
+    @classmethod
+    def _remove_source_receipt(
+        cls,
+        source: str,
+        receipt: tuple[_SourceReceiptEntry, ...],
+        cancelled: Event,
+    ) -> None:
+        """Remove only receipt-matched objects, never recursively delete a root."""
+        current = cls._capture_source_receipt(source)
+        if current != receipt:
+            raise OSError(errno.EBUSY, tr('コピー中に元項目が変更されたため残しました'), source)
+
+        expected = {item.relative_path: item for item in receipt}
+        ordered = sorted(
+            receipt,
+            key=lambda item: (
+                item.relative_path.count(os.sep),
+                item.kind != "directory",
+                item.relative_path,
+            ),
+            reverse=True,
+        )
+        for entry in ordered:
+            if cancelled.is_set():
+                raise OSError(errno.ECANCELED, tr('キャンセルにより元項目を残しました'), source)
+            path = (
+                source if not entry.relative_path
+                else os.path.join(source, entry.relative_path)
+            )
+            parts = Path(entry.relative_path).parts
+            ancestors = [""]
+            for count in range(1, len(parts)):
+                ancestors.append(os.path.join(*parts[:count]))
+            for relative_parent in ancestors:
+                parent_entry = expected.get(relative_parent)
+                parent_path = (
+                    source if not relative_parent
+                    else os.path.join(source, relative_parent)
+                )
+                try:
+                    parent_stat = os.lstat(parent_path)
+                except FileNotFoundError:
+                    continue
+                if (
+                    parent_entry is None
+                    or not stat.S_ISDIR(parent_stat.st_mode)
+                    or int(getattr(parent_stat, "st_dev", 0)) != parent_entry.device
+                    or int(getattr(parent_stat, "st_ino", 0)) != parent_entry.inode
+                ):
+                    raise OSError(errno.EBUSY, tr('元フォルダが置き換わったため残しました'), parent_path)
+            try:
+                value = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            same_identity = (
+                int(getattr(value, "st_dev", 0)) == entry.device
+                and int(getattr(value, "st_ino", 0)) == entry.inode
+                and (
+                    stat.S_ISDIR(value.st_mode)
+                    if entry.kind == "directory"
+                    else stat.S_ISREG(value.st_mode)
+                )
+            )
+            same_content_stamp = entry.kind == "directory" or (
+                int(value.st_size) == entry.size
+                and int(getattr(value, "st_mtime_ns", 0)) == entry.mtime_ns
+                and int(getattr(value, "st_ctime_ns", 0)) == entry.ctime_ns
+            )
+            if not same_identity or not same_content_stamp:
+                raise OSError(errno.EBUSY, tr('コピー元の項目が置き換わったため残しました'), path)
+            if entry.kind == "directory":
+                os.rmdir(path)
+            else:
+                os.unlink(path)
+        if os.path.lexists(source):
+            raise OSError(errno.ENOTEMPTY, tr('コピー元に未確認の項目が残っています'), source)
 
     @staticmethod
     def _is_reparse_path(path: str) -> bool:
@@ -1895,11 +2044,24 @@ class FileOperationService:
     def _is_descendant(cls, candidate: str, root: str) -> bool:
         candidate_key = cls._path_key(candidate)
         root_key = cls._path_key(root)
+
+        def is_below(candidate_value: str, root_value: str) -> bool:
+            try:
+                common = os.path.commonpath((candidate_value, root_value))
+            except ValueError:
+                return False
+            return common == root_value and candidate_value != root_value
+
+        if is_below(candidate_key, root_key):
+            return True
         try:
-            common = os.path.commonpath((candidate_key, root_key))
-        except ValueError:
-            return False
-        return common == root_key and candidate_key != root_key
+            resolved_candidate = cls._path_key(os.path.realpath(candidate))
+            resolved_root = cls._path_key(os.path.realpath(root))
+        except (OSError, RuntimeError, ValueError):
+            # A destination that cannot be resolved with certainty is unsafe
+            # for recursive publication into a source directory.
+            return True
+        return is_below(resolved_candidate, resolved_root)
 
     @classmethod
     def _name_exists(cls, path: str, *, ignore_path: str | None = None) -> bool:

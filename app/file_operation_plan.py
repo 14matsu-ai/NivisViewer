@@ -734,11 +734,24 @@ class FileOperationPlanner:
     def _is_descendant(cls, candidate: str, root: str) -> bool:
         candidate_key = cls._path_key(candidate)
         root_key = cls._path_key(root)
+
+        def is_below(candidate_value: str, root_value: str) -> bool:
+            try:
+                common = os.path.commonpath((candidate_value, root_value))
+            except ValueError:
+                return False
+            return common == root_value and candidate_value != root_value
+
+        if is_below(candidate_key, root_key):
+            return True
         try:
-            common = os.path.commonpath((candidate_key, root_key))
-        except ValueError:
-            return False
-        return common == root_key and candidate_key != root_key
+            resolved_candidate = cls._path_key(os.path.realpath(candidate))
+            resolved_root = cls._path_key(os.path.realpath(root))
+        except (OSError, RuntimeError, ValueError):
+            # A recursive destination with an unresolved reparse chain is not
+            # safe to publish; keep the user's displayed paths unchanged.
+            return True
+        return is_below(resolved_candidate, resolved_root)
 
     @staticmethod
     def _is_reparse(path_stat: os.stat_result) -> bool:
