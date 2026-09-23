@@ -20,6 +20,7 @@ IdentityT = TypeVar("IdentityT", bound=Hashable)
 class WarmupStopReason(str, Enum):
     WAITING_FOR_COMMIT = "waiting_for_commit"
     RUNNING = "running"
+    YIELDED = "yielded"
     SOFT_TARGET = "soft_target"
     HARD_LIMIT = "hard_limit"
     COMPLETE = "complete"
@@ -380,6 +381,7 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
         "_deferred_by_target",
         "_iterator",
         "_last_candidate_identity",
+        "_last_scan_count",
         "_opposite_units",
         "_plan",
         "_preferred_units",
@@ -398,6 +400,7 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
         self._stop_reason = WarmupStopReason.WAITING_FOR_COMMIT
         self._visited_identities: set[IdentityT] = set()
         self._last_candidate_identity: IdentityT | None = None
+        self._last_scan_count = 0
         self._mark_current_visited()
         self._iterator = self._new_iterator()
 
@@ -557,7 +560,15 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
         identity_of: Callable[[UnitT], IdentityT],
         is_ready: Callable[[UnitT], bool],
         is_terminal_failure: Callable[[UnitT], bool],
+        scan_limit: int | None = None,
     ) -> UnitT | None:
+        """Find a miss, or yield without confusing a slice with completion.
+
+        The runtime supplies its remaining per-drive allowance. None keeps
+        the historical unbounded API for explicit non-GUI callers/tests.
+        Skips and cache hits consume the allowance just like misses do.
+        """
+        self._last_scan_count = 0
         if not self._released:
             self._stop_reason = WarmupStopReason.WAITING_FOR_COMMIT
             return None
@@ -567,7 +578,19 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
             WarmupStopReason.HARD_LIMIT,
         }:
             return None
-        for unit in self._iterator:
+        limit = None if scan_limit is None else max(1, int(scan_limit))
+        while limit is None or self._last_scan_count < limit:
+            try:
+                unit = next(self._iterator)
+            except StopIteration:
+                self._last_candidate_identity = None
+                self._stop_reason = (
+                    WarmupStopReason.COMPLETE_WITH_SKIPS
+                    if self._capacity_skips
+                    else WarmupStopReason.COMPLETE
+                )
+                return None
+            self._last_scan_count += 1
             identity = identity_of(unit)
             self._visited_identities.add(identity)
             if identity in self._capacity_skips:
@@ -578,12 +601,13 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
             self._stop_reason = WarmupStopReason.RUNNING
             return unit
         self._last_candidate_identity = None
-        self._stop_reason = (
-            WarmupStopReason.COMPLETE_WITH_SKIPS
-            if self._capacity_skips
-            else WarmupStopReason.COMPLETE
-        )
+        self._stop_reason = WarmupStopReason.YIELDED
         return None
+
+    @property
+    def last_scan_count(self) -> int:
+        """Candidate checks made by the last next_candidate() call."""
+        return self._last_scan_count
 
     def _new_iterator(self) -> Iterator[UnitT]:
         return self._plan.iter_continuous_units(
