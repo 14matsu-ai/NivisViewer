@@ -23,18 +23,18 @@ def test_paste_current_clipboard_is_authoritative(matching,cut,effect,expected):
                          preferred_effect=effect) is expected
 
 @pytest.mark.parametrize('values,expected', [
-    ({}, (3,38,2,'auto',True,False)),
-    ({'browser_thumbnail_background_screens':-1},(-1,38,2,'auto',True,False)),
-    ({'browser_thumbnail_background_screens':0},(0,38,2,'auto',True,False)),
-    ({'browser_selection_color':'#FF00AA'},(3,38,2,'#ff00aa',True,False)),
-    ({'browser_selection_color':'url(bad)'},(3,38,2,'auto',True,False)),
-    ({'browser_selection_filename_opacity':999,'browser_selection_border_width':-99},(3,100,1,'auto',True,False)),
-    ({'browser_thumbnail_background_screens':float('inf')},(3,38,2,'auto',True,False)),
-    ({'browser_thumbnail_background_screens':True},(3,38,2,'auto',True,False)),
+    ({}, (3,38,2,'auto',True,False,'auto')),
+    ({'browser_thumbnail_background_screens':-1},(-1,38,2,'auto',True,False,'auto')),
+    ({'browser_thumbnail_background_screens':0},(0,38,2,'auto',True,False,'auto')),
+    ({'browser_selection_color':'#FF00AA'},(3,38,2,'#ff00aa',True,False,'auto')),
+    ({'browser_selection_color':'url(bad)'},(3,38,2,'auto',True,False,'auto')),
+    ({'browser_selection_filename_opacity':999,'browser_selection_border_width':-99},(3,100,1,'auto',True,False,'auto')),
+    ({'browser_thumbnail_background_screens':float('inf')},(3,38,2,'auto',True,False,'auto')),
+    ({'browser_thumbnail_background_screens':True},(3,38,2,'auto',True,False,'auto')),
     ({'browser_selection_text_color_auto_adjust':False,
-      'browser_selection_frame_rounded':True},(3,38,2,'auto',False,True)),
+      'browser_selection_frame_rounded':True},(3,38,2,'auto',False,True,'auto')),
     ({'browser_selection_text_color_auto_adjust':'false',
-      'browser_selection_frame_rounded':1},(3,38,2,'auto',True,False)),
+      'browser_selection_frame_rounded':1},(3,38,2,'auto',True,False,'auto')),
 ])
 def test_preferences_normalized(values,expected):
     data=normalize_workflow_settings(values)

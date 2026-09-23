@@ -186,7 +186,7 @@ class BrowserThumbnailProvider(QObject):
         parent: QObject | None = None,
         *,
         max_workers: int = 2,
-        cache_capacity: int = 128,
+        cache_capacity: int | None = None,
         cache_capacity_bytes: int = _DEFAULT_BROWSER_MEMORY_CACHE_BYTES,
         loader: Callable[[BrowserItem, int], QImage | None] | None = None,
         disk_cache: ThumbnailDiskCache | None = None,
@@ -201,8 +201,14 @@ class BrowserThumbnailProvider(QObject):
         self._coordinator = image_work_coordinator
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(1)
-        self._cache_capacity = max(1, cache_capacity)
+        self._browser_entry_limit_managed = cache_capacity is None
+        self._cache_capacity = max(1, int(128 if cache_capacity is None else cache_capacity))
         self._cache_capacity_bytes = max(1, int(cache_capacity_bytes))
+        self._browser_memory_managed = False
+        self._browser_memory_mode = "auto"
+        self._browser_memory_desired_bytes = self._cache_capacity_bytes
+        self._browser_memory_group_capacity_bytes = self._cache_capacity_bytes
+        self._browser_memory_reason = "unmanaged"
         self._cache_bytes = 0
         self._cache: OrderedDict[tuple[str, int, tuple[object, ...]], QImage] = OrderedDict()
         self._cache_page_counts: dict[
@@ -769,6 +775,54 @@ class BrowserThumbnailProvider(QObject):
         """Bytes retained by Browser thumbnails, excluding Viewer caches."""
         return self._cache_bytes
 
+    @property
+    def memory_cache_bytes(self) -> int:
+        """Application broker interface: Browser provider-owned QImage bytes."""
+        return self._cache_bytes
+
+    @property
+    def memory_cache_limit_bytes(self) -> int:
+        return self._cache_capacity_bytes
+
+    @property
+    def background_persistence_available(self) -> bool:
+        """Whether generated far thumbnails have a usable persistent route."""
+        return self.background_disk_cache_enabled
+
+    def configure_browser_memory(
+        self, *, mode: str, limit_bytes: int, desired_bytes: int,
+        group_capacity_bytes: int, reason: str,
+    ) -> None:
+        """Apply one broker grant and promptly evict to its byte allowance."""
+        self._browser_memory_managed = True
+        self._browser_memory_mode = str(mode)
+        self._browser_memory_desired_bytes = max(0, int(desired_bytes))
+        self._browser_memory_group_capacity_bytes = max(0, int(group_capacity_bytes))
+        self._browser_memory_reason = str(reason)
+        self._cache_capacity = (
+            65536 if self._browser_entry_limit_managed
+            else min(self._cache_capacity, 65536)
+        )
+        self._cache_capacity_bytes = max(0, int(limit_bytes))
+        self._trim_browser_memory()
+
+    def memory_has_thumbnail(self, item: BrowserItem, size) -> bool:
+        """Broker/controller spelling for the existing I/O-free RAM lookup."""
+        return self.has_memory_thumbnail(item, size)
+
+    def browser_memory_diagnostics(self) -> dict[str, object]:
+        """Return provider-only RAM accounting; performs no cache or disk I/O."""
+        return {
+            "bytes": int(self._cache_bytes),
+            "entries": len(self._cache),
+            "limit_bytes": int(self._cache_capacity_bytes),
+            "desired_bytes": int(self._browser_memory_desired_bytes),
+            "group_capacity_bytes": int(self._browser_memory_group_capacity_bytes),
+            "mode": self._browser_memory_mode,
+            "reason": self._browser_memory_reason,
+            "managed": bool(self._browser_memory_managed),
+        }
+
     def has_memory_thumbnail(
         self,
         item: BrowserItem,
@@ -808,6 +862,8 @@ class BrowserThumbnailProvider(QObject):
         """Whether old/distant RAM entries can make room for more work."""
         return any(
             self._retention_rank_for_cache_key(key) is None
+            or (self._browser_memory_managed
+                and self._retention_rank_for_cache_key(key) >= 3)
             for key in self._cache
         )
 
@@ -880,7 +936,46 @@ class BrowserThumbnailProvider(QObject):
             key = (self._path_key(Path(path)), tuple(revision))
             priorities[key] = min(int(rank), priorities.get(key, int(rank)))
         self._cache_retention_rank = priorities
-        self._reorder_memory_cache()
+        if self._browser_memory_managed:
+            self._trim_browser_memory()
+        else:
+            self._reorder_memory_cache()
+
+    def set_browser_memory_order(
+        self,
+        entries: list[tuple[str | Path, tuple[object, ...], int]],
+    ) -> None:
+        """Set Browser hot-row eviction order using the provider's shared path."""
+        self.set_cache_retention_priorities(entries)
+
+    def _trim_browser_memory(self) -> None:
+        if not self._browser_memory_managed:
+            return
+        if (len(self._cache) <= self._cache_capacity
+                and self._cache_bytes <= self._cache_capacity_bytes):
+            return
+        from .browser_thumbnail_memory_policy import cache_victims
+
+        # Rows outside the hot window share one lower-value rank. Stable sort
+        # order within that rank preserves provider LRU, so stale entries leave
+        # before newly generated background results.
+        ranks = {
+            key: rank for key in self._cache
+            if (rank := self._retention_rank_for_cache_key(key)) is not None
+        }
+        costs = {key: int(image.sizeInBytes()) for key, image in self._cache.items()}
+        victims = cache_victims(
+            costs, ranks, byte_limit=self._cache_capacity_bytes,
+            entry_limit=self._cache_capacity,
+        )
+        for key in victims:
+            image = self._cache.pop(key, None)
+            if image is None:
+                continue
+            self._cache_bytes -= int(image.sizeInBytes())
+            self._cache_page_counts.pop(key, None)
+            self._cache_entry_priority.pop(key, None)
+            self._increment_stat("memory_cache_evictions")
 
     def _retention_rank_for_cache_key(
         self,
@@ -1686,26 +1781,32 @@ class BrowserThumbnailProvider(QObject):
         ):
             self._cache_specs[int(size_token)] = pending.worker.size
         if cache_key in self._cache:
-            # Append new distant work after old distant entries. The priority
-            # reorder below keeps current/near rows last; when full, eviction
-            # removes stale far entries first instead of the new result itself.
+            # Keep this as the newest LRU item. The trim path consults its
+            # current viewport rank and preserves LRU order within each rank.
             self._cache.move_to_end(cache_key, last=True)
-            self._reorder_memory_cache()
-        while (
-            len(self._cache) > self._cache_capacity
-            or self._cache_bytes > self._cache_capacity_bytes
-        ):
-            evicted_key, _evicted_image = self._cache.popitem(last=False)
-            self._cache_bytes -= int(_evicted_image.sizeInBytes())
-            self._cache_page_counts.pop(evicted_key, None)
-            self._cache_entry_priority.pop(evicted_key, None)
-            self._increment_stat("memory_cache_evictions")
-            if (
-                evicted_key == cache_key
-                and pending is not None
-                and pending.priority is ThumbnailPriority.BACKGROUND
-            ):
+            if not self._browser_memory_managed:
+                self._reorder_memory_cache()
+        if self._browser_memory_managed:
+            self._trim_browser_memory()
+            if (cache_key not in self._cache and pending is not None
+                    and pending.priority is ThumbnailPriority.BACKGROUND):
                 self._increment_stat("background_self_evictions")
+        else:
+            while (
+                len(self._cache) > self._cache_capacity
+                or self._cache_bytes > self._cache_capacity_bytes
+            ):
+                evicted_key, _evicted_image = self._cache.popitem(last=False)
+                self._cache_bytes -= int(_evicted_image.sizeInBytes())
+                self._cache_page_counts.pop(evicted_key, None)
+                self._cache_entry_priority.pop(evicted_key, None)
+                self._increment_stat("memory_cache_evictions")
+                if (
+                    evicted_key == cache_key
+                    and pending is not None
+                    and pending.priority is ThumbnailPriority.BACKGROUND
+                ):
+                    self._increment_stat("background_self_evictions")
         if (
             pending is not None
             and pending.priority is ThumbnailPriority.BACKGROUND

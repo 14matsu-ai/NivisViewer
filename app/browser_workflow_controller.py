@@ -1,6 +1,8 @@
 """Browser-only glue; the existing operation and thumbnail lanes do the work."""
 from __future__ import annotations
 
+from collections import deque
+from itertools import islice
 from math import ceil
 
 from PySide6.QtCore import QObject, QEvent, QTimer, Qt
@@ -10,6 +12,11 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 from .browser_model import BrowserItemKind
 from .browser_workflow_policy import (
     SelectionAppearance, ThumbnailWarmupCursor, normalize_workflow_settings,
+)
+from .browser_thumbnail_memory import BrowserThumbnailMemoryBroker
+from .browser_thumbnail_memory_policy import (
+    MAX_SELECTED_HOT_ROWS, MAX_SELECTED_SCAN_ROWS,
+    frame_byte_estimate, hot_row_order,
 )
 from .file_operation_service import FileOperationKind
 from .i18n import tr
@@ -33,6 +40,14 @@ class BrowserWorkflowController(QObject):
         self._next_rows: set[int] = set()
         self._near_cache_blocked = False
         self._stop_reason = "idle"
+        self._memory_broker = None
+        self._memory_near_bytes = 0
+        self._memory_scope: tuple[tuple[int, tuple[object, ...]], ...] = ()
+        self._memory_refill: deque[int] = deque()
+        self._memory_attempted: set[tuple[object, ...]] = set()
+        self._memory_quota_epoch = 0
+        self._memory_grant_bytes: int | None = None
+        self._inflight_lane = "cursor"
         self._ime_composing = False
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
@@ -48,14 +63,166 @@ class BrowserWorkflowController(QObject):
         window.thumbnail_provider.scheduling_resumed.connect(self._resumed)
         window.thumbnail_provider.cache_cleared.connect(self._model_changed)
         window.config.settings_changed.connect(self._settings_changed)
+        if callable(getattr(window.thumbnail_provider, "configure_browser_memory", None)):
+            try:
+                self._memory_broker = BrowserThumbnailMemoryBroker.for_application()
+                self._memory_broker.register(self)
+            except RuntimeError:
+                # Isolated controller tests may intentionally omit QApplication.
+                self._memory_broker = None
         self._apply_appearance()
 
     def _settings_changed(self, _changes=None) -> None:
         options = normalize_workflow_settings(self.window.config.data)
+        memory_mode_changed = (
+            options["browser_thumbnail_memory_mode"]
+            != self.options["browser_thumbnail_memory_mode"]
+        )
         if options["browser_thumbnail_background_screens"] != self.options["browser_thumbnail_background_screens"]:
             self._model_changed()
         self.options = options
+        if memory_mode_changed and self._memory_broker is not None:
+            self._memory_broker.rebalance()
         self._apply_appearance()
+
+    def _apply_memory_grant(self, grant) -> None:
+        configure = getattr(self.window.thumbnail_provider, "configure_browser_memory", None)
+        if not callable(configure):
+            return
+        limit = max(0, int(grant.limit_bytes))
+        changed = self._memory_grant_bytes != limit
+        configure(
+            mode=str(self.options["browser_thumbnail_memory_mode"]),
+            limit_bytes=limit,
+            desired_bytes=int(grant.desired_bytes),
+            group_capacity_bytes=int(grant.group_capacity_bytes),
+            reason=str(grant.reason),
+        )
+        if changed:
+            self._memory_grant_bytes = limit
+            self._memory_quota_epoch += 1
+            self._memory_attempted.clear()
+            self._rebuild_memory_refill()
+
+    def shutdown(self) -> None:
+        """Release the app-wide grant before the owning Browser closes its provider."""
+        if self._memory_broker is not None:
+            self._memory_near_bytes = 0
+            self._memory_broker.unregister(id(self))
+            self._memory_broker = None
+        self._memory_scope = ()
+        self._memory_refill.clear()
+        self._memory_attempted.clear()
+
+    @staticmethod
+    def _memory_identity(item, token) -> tuple[object, ...]:
+        return (str(item.path).casefold(), token, item.thumbnail_revision)
+
+    def _rebuild_memory_refill(self) -> None:
+        if self._memory_broker is None:
+            self._memory_refill.clear()
+            return
+        model = self.window.item_model
+        token = self.window.thumbnail_render_spec.cache_token
+        first, last = (self._viewport[0], self._viewport[1]) if self._viewport else (-1, -1)
+        has_memory = getattr(self.window.thumbnail_provider, "has_memory_thumbnail", None)
+        rows = []
+        for row, identity in self._memory_scope:
+            if first <= row <= last or identity in self._memory_attempted:
+                continue
+            item = model.item_at(row)
+            if (item is None or self._memory_identity(item, token) != identity
+                    or not item.can_generate_preview
+                    or item.kind not in {BrowserItemKind.IMAGE, BrowserItemKind.FOLDER,
+                                         BrowserItemKind.ARCHIVE, BrowserItemKind.PDF}):
+                continue
+            if callable(has_memory) and has_memory(item, self.window.thumbnail_render_spec):
+                continue
+            rows.append(row)
+        self._memory_refill = deque(rows)
+
+    def _set_memory_scope(self, rows, first: int, last: int) -> None:
+        if self._memory_broker is None:
+            return
+        model = self.window.item_model
+        token = self.window.thumbnail_render_spec.cache_token
+        scope = []
+        visible_paths = []
+        for row in rows:
+            item = model.item_at(row)
+            if (item is None or not item.can_generate_preview
+                    or item.kind not in {BrowserItemKind.IMAGE, BrowserItemKind.FOLDER,
+                                         BrowserItemKind.ARCHIVE, BrowserItemKind.PDF}):
+                continue
+            scope.append((row, self._memory_identity(item, token)))
+            if first <= row <= last:
+                visible_paths.append(item.path)
+        new_scope = tuple(scope)
+        if new_scope != self._memory_scope:
+            self._memory_attempted.intersection_update(identity for _row, identity in new_scope)
+            self._memory_scope = new_scope
+            self._rebuild_memory_refill()
+        retain_images = getattr(model, "retain_thumbnail_images", None)
+        if callable(retain_images):
+            retain_images(visible_paths)
+        near_bytes = frame_byte_estimate(self.window.thumbnail_render_spec) * len(scope)
+        if near_bytes != self._memory_near_bytes:
+            self._memory_near_bytes = near_bytes
+            self._memory_broker.rebalance()
+
+    def _clear_memory_scope(self) -> None:
+        if self._memory_broker is None:
+            return
+        self._memory_near_bytes = 0
+        self._memory_scope = ()
+        self._memory_refill.clear()
+        self._memory_attempted.clear()
+        retain_images = getattr(self.window.item_model, "retain_thumbnail_images", None)
+        if callable(retain_images):
+            retain_images(())
+        self._memory_broker.rebalance()
+
+    @staticmethod
+    def _selected_rows_bounded(
+        selection_model, *, count: int, limit: int, excluded_rows=(),
+    ) -> list[int]:
+        """Read only a small prefix of selected row ranges for RAM retention."""
+        limit = max(0, int(limit))
+        if limit == 0:
+            return []
+        result = []
+        seen = set()
+        excluded = set(excluded_rows)
+        try:
+            selection = selection_model.selection()
+            range_count = min(int(selection.count()), MAX_SELECTED_SCAN_ROWS)
+            checked = 0
+            for selection_index in range(range_count):
+                selected_range = selection.at(selection_index)
+                top = max(0, int(selected_range.topLeft().row()))
+                bottom = min(count - 1, int(selected_range.bottomRight().row()))
+                for row in range(top, bottom + 1):
+                    if checked >= MAX_SELECTED_SCAN_ROWS:
+                        return result
+                    checked += 1
+                    if row not in seen and row not in excluded:
+                        seen.add(row)
+                        result.append(row)
+                        if len(result) >= limit:
+                            return result
+            return result
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            # Lightweight test doubles may expose only selectedIndexes(). Keep
+            # that compatibility path bounded too.
+            try:
+                return list(dict.fromkeys(
+                    int(index.row()) for index in islice(
+                        selection_model.selectedIndexes(), MAX_SELECTED_SCAN_ROWS
+                    ) if 0 <= int(index.row()) < count
+                    and int(index.row()) not in excluded
+                ))[:limit]
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                return []
 
     def _apply_appearance(self) -> None:
         self.window.item_delegate.selection_appearance = SelectionAppearance.from_settings(self.options)
@@ -66,9 +233,13 @@ class BrowserWorkflowController(QObject):
         self._context = None
         self._cursor = None
         self._inflight = None
+        self._inflight_lane = "cursor"
         self._near_rows.clear()
         self._next_rows.clear()
         self._near_cache_blocked = False
+        self._memory_scope = ()
+        self._memory_refill.clear()
+        self._memory_attempted.clear()
         self._stop_reason = "model-changed"
         self.schedule_background()
 
@@ -91,7 +262,14 @@ class BrowserWorkflowController(QObject):
     def _resumed(self) -> None:
         if self._inflight is not None and self._cursor is not None:
             self._cursor.retry(self._inflight[0])
+            if self._inflight_lane == "memory":
+                row = self._inflight[0]
+                if row not in self._memory_refill and any(
+                    scoped_row == row for scoped_row, _identity in self._memory_scope
+                ):
+                    self._memory_refill.appendleft(row)
         self._inflight = None
+        self._inflight_lane = "cursor"
         self.schedule_background()
 
     def schedule_background(self) -> None:
@@ -105,6 +283,8 @@ class BrowserWorkflowController(QObject):
         count = window.item_model.rowCount()
         region = window._visible_row_range()
         if count <= 0 or region is None:
+            if count <= 0:
+                self._clear_memory_scope()
             return False
         token = window.thumbnail_render_spec.cache_token
         context = (window._generation, token, self._model_revision, count)
@@ -149,13 +329,6 @@ class BrowserWorkflowController(QObject):
         count = window.item_model.rowCount()
         span = max(1, last - first + 1)
         direction = -1 if int(direction) < 0 else 1
-        try:
-            selection_model = window.list_view.selectionModel()
-            selected_rows = sorted(
-                {index.row() for index in selection_model.selectedIndexes()}
-            )
-        except (AttributeError, RuntimeError):
-            selected_rows = []
 
         retained: dict[int, int] = {}
 
@@ -182,13 +355,27 @@ class BrowserWorkflowController(QObject):
 
         provider = window.thumbnail_provider
         base_rows = set(range(first, last + 1)) | set(next_rows) | set(safety_rows)
-        selected_capacity = max(
-            0,
-            int(getattr(provider, "memory_cache_capacity_entries", 128))
+        frame_bytes = frame_byte_estimate(window.thumbnail_render_spec)
+        entry_capacity = max(
+            0, int(getattr(provider, "memory_cache_capacity_entries", 128))
             - len(base_rows),
         )
-        selected_outside = [row for row in selected_rows if row not in base_rows]
-        add_rows(selected_outside[:selected_capacity], 0)
+        byte_capacity = max(
+            0, (int(getattr(provider, "memory_cache_limit_bytes", 128 * 1024 * 1024))
+                - frame_bytes * len(base_rows)) // frame_bytes,
+        )
+        selected_capacity = min(
+            MAX_SELECTED_HOT_ROWS, entry_capacity, byte_capacity
+        )
+        try:
+            selection_model = window.list_view.selectionModel()
+            selected_rows = self._selected_rows_bounded(
+                selection_model, count=count, limit=selected_capacity,
+                excluded_rows=base_rows,
+            )
+        except (AttributeError, RuntimeError):
+            selected_rows = []
+        add_rows(selected_rows, 0)
         add_rows(range(first, last + 1), 0)
         add_rows(next_rows, 1)
         add_rows(safety_rows, 2)
@@ -196,14 +383,35 @@ class BrowserWorkflowController(QObject):
         prioritize = getattr(provider, "set_cache_retention_priorities", None)
         if callable(prioritize):
             entries = []
-            for row, rank in retained.items():
-                item = window.item_model.item_at(row)
-                if item is not None and item.can_generate_preview:
-                    entries.append((item.path, item.thumbnail_revision, rank))
+            if self._memory_broker is not None:
+                hot_rows = hot_row_order(
+                    count=count, first=first, last=last, direction=direction,
+                    screens=screens, selected=selected_rows,
+                    selected_limit=selected_capacity,
+                )
+                selected_set = set(selected_rows)
+                near_set = set(next_rows)
+                safety_set = set(safety_rows)
+                for rank, row in enumerate(hot_rows):
+                    item = window.item_model.item_at(row)
+                    if item is not None and item.can_generate_preview:
+                        retention_rank = (
+                            0 if first <= row <= last or row in selected_set else
+                            1 if row in near_set else
+                            2 if row in safety_set else 3
+                        )
+                        entries.append((item.path, item.thumbnail_revision, retention_rank))
+                self._set_memory_scope(hot_rows, first, last)
+            else:
+                for row, rank in retained.items():
+                    item = window.item_model.item_at(row)
+                    if item is not None and item.can_generate_preview:
+                        entries.append((item.path, item.thumbnail_revision, rank))
             prioritize(entries)
 
         has_memory = getattr(provider, "has_memory_thumbnail", None)
-        if reopen_missing and self._cursor is not None and callable(has_memory):
+        if (self._memory_broker is None and reopen_missing and self._cursor is not None
+                and callable(has_memory)):
             missing_near = []
             for row in near_rows:
                 if not self._cursor.eligible(row):
@@ -270,10 +478,16 @@ class BrowserWorkflowController(QObject):
         if self.options["browser_thumbnail_background_screens"] == 0:
             self._stop_reason = "disabled"
             return
-        if self._near_cache_blocked:
-            self._stop_reason = "near-cache-capacity"
-            return
         provider = window.thumbnail_provider
+        if self._near_cache_blocked:
+            can_roll = bool(
+                self._memory_broker is not None
+                and (getattr(provider, "background_persistence_available", False)
+                     or getattr(provider, "memory_cache_has_evictable_entries", False))
+            )
+            if not can_roll:
+                self._stop_reason = "near-cache-capacity"
+                return
         foreground_timer = getattr(window, "_thumbnail_request_timer", None)
         if (getattr(window, "_first_paint_pending_generation", None) is not None
                 or (foreground_timer is not None and foreground_timer.isActive())):
@@ -285,11 +499,67 @@ class BrowserWorkflowController(QObject):
         if getattr(provider, "_paused", False):
             self._stop_reason = "provider-paused"
             return
+        if self._memory_broker is not None and self._memory_refill:
+            for _ in range(32):
+                if not self._memory_refill:
+                    break
+                if (self._next_band_ready_at_capacity()
+                        and not bool(getattr(
+                            provider, "background_persistence_available", False
+                        ))):
+                    self._stop_reason = "far-cache-capacity"
+                    return
+                row = self._memory_refill.popleft()
+                item = window.item_model.item_at(row)
+                if (item is None or not item.can_generate_preview
+                        or item.kind not in {BrowserItemKind.IMAGE, BrowserItemKind.FOLDER,
+                                             BrowserItemKind.ARCHIVE, BrowserItemKind.PDF}):
+                    continue
+                identity = self._memory_identity(
+                    item, window.thumbnail_render_spec.cache_token
+                )
+                if identity in self._memory_attempted:
+                    continue
+                if provider.has_memory_thumbnail(item, window.thumbnail_render_spec):
+                    self._memory_attempted.add(identity)
+                    if self._cursor is not None:
+                        self._cursor.complete(row)
+                    continue
+                key = (row, str(item.path), window._generation,
+                       window.thumbnail_render_spec.cache_token, item.thumbnail_revision,
+                       self._context)
+                self._inflight = key
+                self._inflight_lane = "memory"
+                state = provider.request_background(item, window.thumbnail_render_spec,
+                                                    generation=window._generation)
+                if state == "queued":
+                    return
+                self._inflight = None
+                self._inflight_lane = "cursor"
+                if state == "blocked":
+                    self._memory_refill.appendleft(row)
+                    self._stop_reason = "provider-busy"
+                    return
+                self._memory_attempted.add(identity)
+                if self._cursor is not None:
+                    self._cursor.complete(row)
+            if self._memory_refill:
+                self._stop_reason = "memory-refill-yield"
+                self.schedule_background()
+                return
+        if (self._memory_broker is not None
+                and self.options["browser_thumbnail_background_screens"] < 0
+                and not bool(getattr(provider, "background_persistence_available", False))):
+            self._stop_reason = "persistence-unavailable"
+            return
         if self._inflight is not None:
             # A queued speculative request can be removed by visible-only
             # reprioritization without a worker callback. Do not strand it.
             self._cursor.retry(self._inflight[0])
+            if self._inflight_lane == "memory":
+                self._memory_refill.appendleft(self._inflight[0])
             self._inflight = None
+            self._inflight_lane = "cursor"
         for _ in range(32):
             row = self._cursor.take()
             if row is None:
@@ -313,6 +583,7 @@ class BrowserWorkflowController(QObject):
                    window.thumbnail_render_spec.cache_token, item.thumbnail_revision,
                    self._context)
             self._inflight = key
+            self._inflight_lane = "cursor"
             state = provider.request_background(item, window.thumbnail_render_spec,
                                                 generation=window._generation)
             if state == "queued":
@@ -332,8 +603,10 @@ class BrowserWorkflowController(QObject):
     def _settled(self, path, generation, token, revision, state) -> None:
         current = self._inflight
         if current is not None and current[1:5] == (path, generation, token, revision):
+            lane = self._inflight_lane
             row, _path, _generation, _token, _revision, context = current
             self._inflight = None
+            self._inflight_lane = "cursor"
             if context == self._context and self._cursor is not None:
                 item = self.window.item_model.item_at(row)
                 item_changed = (
@@ -343,8 +616,15 @@ class BrowserWorkflowController(QObject):
                 )
                 if state == "cancelled" or item_changed:
                     self._cursor.retry(row)
+                    if (lane == "memory" and state == "cancelled" and not item_changed
+                            and row not in self._memory_refill):
+                        self._memory_refill.appendleft(row)
                 else:
                     self._cursor.complete(row)
+                    if lane == "memory" and item is not None:
+                        identity = self._memory_identity(item, token)
+                        if any(identity == current_identity for _scoped_row, current_identity in self._memory_scope):
+                            self._memory_attempted.add(identity)
                     has_memory = getattr(
                         self.window.thumbnail_provider,
                         "has_memory_thumbnail",
@@ -372,7 +652,11 @@ class BrowserWorkflowController(QObject):
         ):
             if self._cursor is not None:
                 self._cursor.retry(current[0])
+            if (getattr(self, "_inflight_lane", "cursor") == "memory"
+                    and current[0] not in getattr(self, "_memory_refill", ())):
+                self._memory_refill.appendleft(current[0])
             self._inflight = None
+            self._inflight_lane = "cursor"
             self._stop_reason = "submission-rejected"
             return
         if current is None:
