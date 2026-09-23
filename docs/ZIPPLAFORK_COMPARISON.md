@@ -1562,16 +1562,16 @@ not a thumbnail helper attached to the old `QListWidget`:
 BookSession (one owner per installed book)
   -> ViewerPageListRuntime
        -> lazy source-specific read-only fork
-       -> replaceable visible-row order
+       -> replaceable visible-first, direction-aware row order
        -> one active low-priority job
        -> entry read -> target decode/render -> orientation/filter/rotation
           -> final-size QImage
        -> desired/spec/book-generation validation
-       -> visible-only QImage byte cache
+       -> 32 MiB LRU QImage byte cache
 
 ViewerWindow (GUI projection only)
   -> ViewerPageListModel / QListView virtual rows
-  -> viewport + two-row margin request
+  -> visible rows + one viewport ahead / half viewport behind (capped)
   -> accepted final-size QImage -> QPixmap/QIcon once
   -> page click -> navigation request only
   -> frame commit -> O(1) committed-page selection
@@ -1592,19 +1592,27 @@ The production integration is split deliberately:
 - `app/pdf_image_source.py` opens a separate PDF document session through the
   existing `PdfiumService`; PageList renders directly to the thumbnail target
   and closes that document after callback drainage.
-- `app/viewer_window.py` maps only the visible viewport plus two rows on each
-  side, performs the accepted `QPixmap.fromImage`, and projects the committed
-  presentation page through direct page/row mapping.  It pauses PageList when
-  a ZIP, folder/external-archive, or PDF current frame is cold and resumes on
-  the accepted paint (or the existing post-completion hidden-window fallback).
+- `app/viewer_window.py` maps visible rows first, then one viewport in the
+  current scroll direction and at most half a viewport behind (96 ahead / 48
+  rear rows maximum).  It uses row-to-page mapping after filtering, performs
+  accepted `QPixmap.fromImage` only for visible rows, and projects the
+  committed presentation page through direct page/row mapping.  It pauses
+  PageList when a ZIP, folder/external-archive, or PDF current frame is cold
+  and resumes on accepted paint (or the existing post-completion hidden-window
+  fallback).
 
-Hidden/fullscreen PageList state now has zero rows, zero desired jobs, zero
-thumbnail artifacts and no open thumbnail-source fork.  Changing thumbnail
-size, DPR, rotation or adjustments changes the immutable spec; late results
-from the preceding spec cannot upload.  A rapid scroll replaces the order and
-cancels a no-longer-visible active entry request.  Completed icons are kept
-only for the current desired rows, while the QImage side has an explicit byte
-budget.
+Hidden/fullscreen PageList state has zero model rows, zero desired jobs, no
+open thumbnail-source fork, and retains only the bounded 32 MiB QImage LRU.
+That cache lets reopening the optional dock republish recently used images
+without decoding again; its independent archive/PDF source clone is released
+when hidden and reopened lazily on a cache miss.  Changing thumbnail size,
+DPR, rotation or adjustments changes the immutable spec; late results from
+the preceding spec cannot upload.  A rapid scroll replaces the order, gives
+newly visible rows priority, and cancels a lower-priority prefetch when needed.
+Only visible rows own QIcon/QPixmap projections; the runtime republishes its
+cached QImage when a prefetched row becomes visible.  Cache artifacts are
+retained by LRU recency rather than viewport membership, with the byte budget
+as the sole eviction bound.
 
 Book replacement has a two-phase presentation boundary.  Source installation
 stages the new runtime but does not relabel the old frame.  The preceding row
@@ -1624,11 +1632,11 @@ ported and is therefore recorded as AGPL-3.0-or-later-derived:
 
 | Upstream class / method | Adopted behavior | NivisViewer destination |
 |---|---|---|
-| `ThumbViewerItem.LoadAsync`, `ThumbViewerItem.Clear` | One thumbnail load lifecycle and explicit release outside the useful region. | `_ViewerPageThumbnailJob`; `ViewerPageListRuntime._drive`, `set_visible`, `_retain_cache` |
+| `ThumbViewerItem.LoadAsync`, `ThumbViewerItem.Clear` | One thumbnail load lifecycle and explicit release outside the useful region. | `_ViewerPageThumbnailJob`; `ViewerPageListRuntime._drive`, `set_visible`, byte-bounded `_put_cache` LRU |
 | `ThumbViewer.PaintPart`, `ThumbViewer.DrawItem` | Materialize/publish only items required by the painted region; update the completed item locally. | `ViewerWindow._update_page_list_visible_work`, `_on_page_list_thumbnail_ready`; `ViewerPageListModel.set_thumbnail` |
-| `ThumbViewer.preRenderScroll`, `ThumbViewer.OnMouseWheel` | Re-evaluate the useful range after scrolling rather than filling the book. | `ViewerWindow._schedule_page_list_visible_work`; `ViewerPageListRuntime.request_visible_pages` |
+| `ThumbViewer.preRenderScroll`, `ThumbViewer.OnMouseWheel` | Re-evaluate the useful range after scrolling rather than filling the book. | `ViewerWindow._schedule_page_list_visible_work`; visible-first `request_visible_pages` with row-mapped directional read-ahead |
 | `ThumbViewer.SilentSet` and data/show-index mappings | Separate lightweight item identity from the displayed row and provide direct mapping. | `ViewerPageListModel.page_index_at`, `row_for_page`, filtered mapping |
-| `ThumbViewer.Clear` | Dispose thumbnail ownership when the view/book no longer needs it. | `ViewerPageListRuntime.cancel` / `shutdown`; `ViewerPageListModel.clear` |
+| `ThumbViewer.Clear` | Dispose thumbnail ownership when the view/book no longer needs it. | `ViewerPageListRuntime.cancel` / `shutdown`; hidden state releases the source clone but retains the bounded LRU; `ViewerPageListModel.clear` |
 | `CatalogForm.bmwMakePreview_RunWorkerStarting` lightweight item setup | Metadata rows do not eagerly own decoded images. | `ViewerPageListModel.rowCount` / `data` |
 
 NivisViewer's Qt model, book/spec generations, byte accounting, source forks,
@@ -1652,14 +1660,43 @@ fallback:
 | `PageThumbnailProvider.create_icon` GUI smooth-scale of the full decoded image | Class removed.  Worker publishes a final-size QImage; GUI performs only accepted pixmap/icon upload. |
 | PageList mutation from `ImageCache.pageLoaded` | Removed.  PageList has its own source, queue, artifacts and callbacks for every supported book source. |
 | `_page_list_dirty`, eager `_rebuild_page_list`, `_update_page_list_thumbnail` | Removed.  Hidden state clears model/runtime ownership; visibility reconstructs only virtual metadata and the current work order. |
-| Icons accumulated for every page visited while the list was ever visible | Replaced by visible-window retention and explicit release. |
+| Icons accumulated for every page visited while the list was ever visible | Replaced by visible-row-only icons; bounded read-ahead images stay in the runtime LRU and are lazily republished on visibility. |
 
 The Browser thumbnail provider/cache is a separate subsystem and was not
 changed.  `ImageCache` and the prepared-display scheduler remain only for the
 main non-ZIP Viewer until the ranked folder/external/PDF runtimes replace them;
 PageList is no longer a reason to preserve those structures.
 
-### 13.7 Offscreen PageList A/B
+### 13.7 Direction-aware PageList read-ahead correction
+
+The source comparison above uses the fixed ZipPlaFork revision
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, specifically
+`source/ZipPla/CatalogForm.cs`: `ThumbViewer.PaintPart` identifies the visible
+portion and `preRenderScroll` re-evaluates work as the scroll position moves;
+`ThumbViewerItem.LoadAsync` keeps thumbnail execution to one worker lane.  The
+integration adopts that visible-window/replaceable-order boundary, then adapts
+it to Qt with an explicit visible prefix, one-viewport forward read-ahead, a
+half-viewport rear range, 96/48 row caps, and a short idle grace before the
+prefetch lane begins.  Filtered windows are computed in view-row space and
+mapped through `ViewerPageListModel.page_index_at`, so page-number gaps do not
+change the scroll distance.  This is not all-pages eager work, and it does not
+reuse the full-page raster cache.
+
+Offscreen synthetic tests now cover visible-before-prefetch ordering,
+forward/back cache reuse without duplicate decodes, long-jump reprioritization,
+filtered-row mapping, viewport resizing, hidden source release, and the hard
+cache-byte bound.  These checks establish scheduler/cache behavior only; they
+do not establish native Windows scrolling feel.
+
+In the deterministic three-visible/three-ahead forward-and-return fixture,
+the first ahead batch reached **3 ready thumbnails**.  Scrolling forward and
+back issued **6 cache hits, 9 misses, and 9 unique decodes** for pages 3--11;
+the returning visible rows were republished from QImage cache without another
+source decode.  A separate 1,500-pixel synthetic artifact fixture exercised
+the production default and stayed at or below **32 MiB** while evicting older
+LRU entries.  These are offscreen runtime measurements, not native UI timing.
+
+### 13.8 Offscreen PageList A/B
 
 `scripts/benchmark_viewer_page_list_runtime.py` uses offscreen Qt and one real
 temporary stored JPEG ZIP.  A is a benchmark-only reproduction of the removed
@@ -3205,7 +3242,7 @@ The remaining boundaries are explicit:
 |---|---|
 | Lazy-size wide/spread topology | A decoded preview/full source survives size discovery and can be reused. If the newly known aspect changes single, spread-partner or wide-split topology, however, the old layout key is not a complete frame for the new unit. A display-ready frame must be generated again, without another source decode when the retained tier is sufficient. |
 | Very large books | Resolved in section 19: topology is built once per layout revision and navigation replaces only a lazy current-centered cursor. Physical-device responsiveness around 10,000 pages remains unverified, but the former per-input full-order materialization is gone. |
-| PageList memory ownership | `ViewerPageListRuntime` remains deliberately separate with an explicit fixed 64 MiB QImage budget. It is neither derived from nor live-resized by `viewer_memory_mode`, so the main source+frame authority cannot silently change thumbnail retention. |
+| PageList memory ownership | `ViewerPageListRuntime` remains deliberately separate with an explicit fixed 32 MiB QImage budget. It is neither derived from nor live-resized by `viewer_memory_mode`, so the main source+frame authority cannot silently change thumbnail retention. |
 
 These residuals do not change the 24-page results in section 18.4. They limit
 the claim to the measured ordinary book and establish the next optimization

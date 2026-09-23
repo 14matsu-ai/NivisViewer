@@ -197,7 +197,7 @@ def test_runtime_bounds_cache_and_hidden_state_closes_owned_clone(
 
         assert len(source.clones) == 1
         assert source.clones[0].calls == ["0.jpg", "1.jpg", "2.jpg"]
-        assert runtime.cached_pages == (0,)
+        assert runtime.cached_pages == (2,)
         assert 0 < runtime.cache_bytes <= 13_000
         assert runtime.metrics.cache_evictions == 2
 
@@ -205,8 +205,10 @@ def test_runtime_bounds_cache_and_hidden_state_closes_owned_clone(
         qapp.processEvents()
 
         assert runtime.desired_pages == ()
-        assert runtime.cached_pages == ()
-        assert runtime.cache_bytes == 0
+        # Hiding releases the source clone but retains the bounded image LRU
+        # so reopening the dock can use it without another decode.
+        assert runtime.cached_pages == (2,)
+        assert 0 < runtime.cache_bytes <= 13_000
         assert source.clones[0].closed
         assert not source.closed
     finally:
@@ -267,3 +269,182 @@ def test_book_switch_and_close_keep_source_until_thumbnail_callback_drains(
         assert first.clones[0].closed
         session.shutdown(wait_msecs=3000)
         assert coordinator.shutdown(wait_msecs=3000)
+
+
+def _wait_for_runtime_window(
+    qapp: QApplication,
+    runtime: ViewerPageListRuntime,
+    *,
+    visible_count: int,
+    timeout_ms: int = 3000,
+) -> None:
+    _wait_until(
+        qapp,
+        lambda: not runtime.has_unfinished_tasks()
+        and len(runtime.ready_ahead_pages)
+        == max(0, len(runtime.desired_pages) - visible_count),
+        timeout_ms=timeout_ms,
+    )
+
+
+def test_runtime_prioritizes_visible_then_reuses_forward_and_reverse_cache(
+    qapp: QApplication,
+) -> None:
+    image_ids = tuple(f"page-{index:03d}.jpg" for index in range(40))
+    source = _FakeThumbnailSource("book", image_ids)
+    runtime = ViewerPageListRuntime(
+        source,
+        image_ids,
+        21,
+        cache_byte_budget=32 * 1024 * 1024,
+        collect_metrics=True,
+    )
+    delivered = []
+    runtime.thumbnailReady.connect(delivered.append)
+    try:
+        runtime.set_visible(True)
+        first_window = (3, 4, 5, 6, 7, 8)
+        assert runtime.request_visible_pages(
+            first_window,
+            _thumbnail_spec(),
+            visible_count=3,
+        )
+        _wait_for_runtime_window(qapp, runtime, visible_count=3)
+        assert source.clones[0].calls[:3] == [
+            "page-003.jpg",
+            "page-004.jpg",
+            "page-005.jpg",
+        ]
+        assert runtime.ready_ahead_pages == (6, 7, 8)
+
+        forward_window = (6, 7, 8, 9, 10, 11)
+        assert runtime.request_visible_pages(
+            forward_window,
+            _thumbnail_spec(),
+            visible_count=3,
+        )
+        _wait_for_runtime_window(qapp, runtime, visible_count=3)
+
+        assert runtime.request_visible_pages(
+            first_window,
+            _thumbnail_spec(),
+            visible_count=3,
+        )
+        _wait_for_runtime_window(qapp, runtime, visible_count=3)
+
+        assert source.clones[0].calls == [
+            f"page-{index:03d}.jpg" for index in range(3, 12)
+        ]
+        assert len(source.clones[0].calls) == len(set(source.clones[0].calls))
+        assert runtime.ready_ahead_pages == (6, 7, 8)
+        assert runtime.cache_bytes <= 32 * 1024 * 1024
+        assert runtime.metrics.cache_hits == 6
+        assert runtime.metrics.cache_misses == 9
+        assert runtime.metrics.jobs_submitted == 9
+        reused = [item for item in delivered if item.cache_hit]
+        assert {item.page_index for item in reused} >= {3, 4, 5, 6, 7, 8}
+        assert all(
+            item.qimage is not None and not item.qimage.isNull()
+            for item in reused
+        )
+    finally:
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()
+
+
+def test_runtime_cache_never_exceeds_default_32_mib_budget(
+    qapp: QApplication,
+) -> None:
+    image_ids = tuple(f"large-{index}.jpg" for index in range(5))
+    source = _FakeThumbnailSource("large-book", image_ids)
+    runtime = ViewerPageListRuntime(source, image_ids, 23, collect_metrics=True)
+    try:
+        runtime.set_visible(True)
+        assert runtime.request_visible_pages(
+            range(len(image_ids)),
+            _thumbnail_spec(1500),
+        )
+        _wait_until(
+            qapp,
+            lambda: not runtime.has_unfinished_tasks(),
+            timeout_ms=10000,
+        )
+
+        assert 0 < runtime.cache_bytes <= 32 * 1024 * 1024
+        assert 0 < len(runtime.cached_pages) < len(image_ids)
+        assert runtime.metrics.cache_evictions > 0
+    finally:
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()
+
+
+def test_long_jump_cancels_active_prefetch_and_replaces_queued_order(
+    qapp: QApplication,
+) -> None:
+    blocked_started = Event()
+    release_blocked = Event()
+    image_ids = tuple(f"page-{index:03d}.jpg" for index in range(100))
+
+    class BlockingPrefetchSource(_FakeThumbnailSource):
+        def open_image(self, image_id: str) -> Image.Image:
+            self.calls.append(image_id)
+            if self.is_clone:
+                with self._guard:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                try:
+                    if image_id == "page-001.jpg":
+                        blocked_started.set()
+                        assert release_blocked.wait(3)
+                finally:
+                    with self._guard:
+                        self.active -= 1
+            return Image.new("RGB", (64, 64), "white")
+
+        def fork_for_thumbnail(self) -> ImageSource:
+            clone = BlockingPrefetchSource(
+                f"{self.source_path.name}-thumbnail",
+                self.image_ids,
+                is_clone=True,
+            )
+            self.clones.append(clone)
+            return clone
+
+    source = BlockingPrefetchSource("book", image_ids)
+    runtime = ViewerPageListRuntime(
+        source,
+        image_ids,
+        22,
+        collect_metrics=True,
+    )
+    try:
+        runtime.set_visible(True)
+        assert runtime.request_visible_pages(
+            (0, 1, 2, 3),
+            _thumbnail_spec(),
+            visible_count=1,
+        )
+        _wait_until(qapp, blocked_started.is_set, timeout_ms=2000)
+        assert source.clones[0].calls == ["page-000.jpg", "page-001.jpg"]
+
+        assert runtime.request_visible_pages(
+            (50, 51, 52),
+            _thumbnail_spec(),
+            visible_count=1,
+        )
+        release_blocked.set()
+        _wait_for_runtime_window(qapp, runtime, visible_count=1)
+
+        assert source.clones[0].calls[:3] == [
+            "page-000.jpg",
+            "page-001.jpg",
+            "page-050.jpg",
+        ]
+        assert "page-002.jpg" not in source.clones[0].calls
+        assert "page-003.jpg" not in source.clones[0].calls
+        assert runtime.metrics.cancel_requests >= 1
+        assert runtime.metrics.stale_results >= 1
+    finally:
+        release_blocked.set()
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()

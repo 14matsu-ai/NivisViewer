@@ -1,8 +1,8 @@
-"""Virtual Viewer page list and visible-thumbnail runtime.
+"""Virtual Viewer page list and bounded thumbnail/read-ahead runtime.
 
-The visible-window work order, one-at-a-time thumbnail lane, and immediate
-release of thumbnails outside that window are structural translations of
-ZipPlaFork ``source/ZipPla/CatalogForm.cs`` at fixed revision
+The visible-window work order, one-at-a-time thumbnail lane, and bounded
+scroll-direction read-ahead are adapted from ZipPlaFork
+``source/ZipPla/CatalogForm.cs`` at fixed revision
 ``07955f5267e2fb92d6fc6e40fde2507d8fb07b3b``.  In particular this follows
 ``ThumbViewer.PaintPart``, ``ThumbViewerItem.LoadAsync`` / ``Clear``, and the
 revision's single-permit thumbnail semaphore.  That source is
@@ -33,6 +33,7 @@ from PySide6.QtCore import (
     QObject,
     QRunnable,
     QSize,
+    QTimer,
     QThreadPool,
     Qt,
     Signal,
@@ -49,6 +50,7 @@ from .viewer_render import qimage_to_pillow
 _LOG = logging.getLogger(__name__)
 _DEFAULT_CACHE_BYTES = 32 * 1024 * 1024
 _MAX_PHYSICAL_EDGE = 2048
+_PREFETCH_START_DELAY_MS = 60
 
 
 class ViewerPageListModel(QAbstractListModel):
@@ -573,7 +575,7 @@ class _ViewerPageThumbnailJob(QRunnable):
 
 
 class ViewerPageListRuntime(QObject):
-    """Book-scoped visible-only thumbnail subsystem."""
+    """Book-scoped visible-priority thumbnail and read-ahead subsystem."""
 
     thumbnailReady = Signal(object)
     idle = Signal(object)
@@ -604,6 +606,12 @@ class ViewerPageListRuntime(QObject):
         self._cache_bytes = 0
         self._desired_pages: tuple[int, ...] = ()
         self._desired_keys: tuple[_ThumbnailKey, ...] = ()
+        self._visible_count = 0
+        self._prefetch_ready = False
+        self._prefetch_timer = QTimer(self)
+        self._prefetch_timer.setSingleShot(True)
+        self._prefetch_timer.setInterval(_PREFETCH_START_DELAY_MS)
+        self._prefetch_timer.timeout.connect(self._enable_prefetch)
         self._spec: ViewerPageThumbnailSpec | None = None
         self._failed_keys: set[_ThumbnailKey] = set()
         self._completed_keys: set[_ThumbnailKey] = set()
@@ -652,23 +660,42 @@ class ViewerPageListRuntime(QObject):
         return self._desired_pages
 
     @property
+    def visible_pages(self) -> tuple[int, ...]:
+        return self._desired_pages[: self._visible_count]
+
+    @property
+    def ready_ahead_pages(self) -> tuple[int, ...]:
+        """Cached pages in the current request after its visible prefix."""
+
+        return tuple(
+            key.page_index
+            for key in self._desired_keys[self._visible_count :]
+            if key in self._cache
+        )
+
+    @property
     def visible(self) -> bool:
         return self._visible
 
     def set_visible(self, visible: bool) -> None:
         normalized = bool(visible)
-        if normalized == self._visible and normalized:
+        if normalized == self._visible:
             return
         self._visible = normalized
         if not normalized:
             self._generation += 1
             self._desired_pages = ()
             self._desired_keys = ()
+            self._visible_count = 0
             self._spec = None
             self._failed_keys.clear()
             self._completed_keys.clear()
+            self._prefetch_ready = False
+            self._prefetch_timer.stop()
             self._cancel_active_job()
-            self._clear_cache()
+            # A hidden dock keeps only its bounded QImage LRU.  Releasing the
+            # independent source clone avoids holding an archive/PDF session
+            # open; a later cache miss lazily creates a fresh clone.
             self._request_owned_source_release()
             return
         self._drive()
@@ -677,6 +704,8 @@ class ViewerPageListRuntime(QObject):
         self,
         order: Iterable[int],
         spec: ViewerPageThumbnailSpec,
+        *,
+        visible_count: int | None = None,
     ) -> bool:
         if not self._accepting_requests or not isinstance(
             spec, ViewerPageThumbnailSpec
@@ -691,36 +720,81 @@ class ViewerPageListRuntime(QObject):
             seen.add(page)
             pages.append(page)
         normalized_pages = tuple(pages)
-        if normalized_pages == self._desired_pages and spec == self._spec:
+        normalized_visible_count = (
+            len(normalized_pages)
+            if visible_count is None
+            else min(len(normalized_pages), max(0, int(visible_count)))
+        )
+        if (
+            normalized_pages == self._desired_pages
+            and spec == self._spec
+            and normalized_visible_count == self._visible_count
+        ):
             self._drive()
             return True
 
         self._generation += 1
         old_keys = set(self._desired_keys)
+        old_key_positions = {
+            key: position for position, key in enumerate(self._desired_keys)
+        }
+        old_visible_count = self._visible_count
         self._desired_pages = normalized_pages
         self._spec = spec
         self._desired_keys = tuple(self._key_for(page, spec) for page in pages)
+        self._visible_count = normalized_visible_count
         desired_set = set(self._desired_keys)
         self._failed_keys.clear()
-        self._retain_cache(desired_set)
         self._completed_keys = set(self._cache)
+        self._prefetch_ready = False
+        self._prefetch_timer.stop()
+        self._release_source_requested = False
 
         active = self._active_job
         if active is not None:
-            if active.key in desired_set and not active.cancelled.is_set():
+            active_position = next(
+                (
+                    position
+                    for position, key in enumerate(self._desired_keys)
+                    if key == active.key
+                ),
+                -1,
+            )
+            visible_missing = any(
+                key not in self._cache and key not in self._failed_keys
+                for key in self._desired_keys[: self._visible_count]
+            )
+            if (
+                active_position >= 0
+                and not (
+                    active_position >= self._visible_count and visible_missing
+                )
+                and not active.cancelled.is_set()
+            ):
                 active.adopt_generation(self._generation)
             else:
                 self._cancel_active_job()
 
-        for key in self._desired_keys:
+        # Touch the most useful entries last so visible images remain the most
+        # recent LRU entries, followed by the nearby prefetch window.
+        for key in reversed(self._desired_keys):
             cached = self._cache.get(key)
             if cached is None:
-                self._bump("cache_misses")
+                if key not in old_keys:
+                    self._bump("cache_misses")
                 continue
             self._cache.move_to_end(key)
-            if key not in old_keys:
+            was_only_prefetch = (
+                key in old_key_positions
+                and old_key_positions[key] >= old_visible_count
+            )
+            is_visible = key in self._desired_keys[: self._visible_count]
+            if key not in old_keys or (is_visible and was_only_prefetch):
                 self._bump("cache_hits")
-                self.thumbnailReady.emit(self._public_thumbnail(cached, True))
+                if is_visible:
+                    self.thumbnailReady.emit(
+                        self._public_thumbnail(cached, True)
+                    )
         self._drive()
         return True
 
@@ -739,10 +813,13 @@ class ViewerPageListRuntime(QObject):
         self._generation += 1
         self._desired_pages = ()
         self._desired_keys = ()
+        self._visible_count = 0
         self._spec = None
         self._failed_keys.clear()
         self._completed_keys.clear()
         self._cancel_active_job()
+        self._prefetch_timer.stop()
+        self._prefetch_ready = False
         self._clear_cache()
         self._request_owned_source_release()
 
@@ -781,10 +858,14 @@ class ViewerPageListRuntime(QObject):
         self._generation += 1
         self._desired_pages = ()
         self._desired_keys = ()
+        self._visible_count = 0
         self._spec = None
         self._failed_keys.clear()
         self._completed_keys.clear()
         self._cancel_active_job()
+        self._prefetch_timer.stop()
+        self._prefetch_ready = False
+        self._request_owned_source_release()
         if self._coordinator is None:
             self._thread_pool.clear()
         return not self._jobs
@@ -804,13 +885,16 @@ class ViewerPageListRuntime(QObject):
             return
         if self._is_paused:
             self._generation += 1
+            self._prefetch_timer.stop()
+            self._prefetch_ready = False
             self._cancel_active_job()
             return
         self._drive()
 
     def _drive(self) -> None:
-        # Structural port of CatalogForm's visible item scheduling: only the
-        # replaceable visible order is eligible and exactly one item runs.
+        # Visible rows always win.  Start a modest read-ahead only after a
+        # short idle grace; each request replaces the order and can cancel a
+        # now-lower-priority active prefetch.
         if (
             not self._accepting_requests
             or not self._visible
@@ -818,7 +902,8 @@ class ViewerPageListRuntime(QObject):
             or self._active_job is not None
         ):
             return
-        for key in self._desired_keys:
+        visible_keys = self._desired_keys[: self._visible_count]
+        for key in visible_keys:
             if (
                 key in self._cache
                 or key in self._failed_keys
@@ -827,6 +912,27 @@ class ViewerPageListRuntime(QObject):
                 continue
             self._submit(key)
             return
+        ahead_keys = self._desired_keys[self._visible_count :]
+        if not ahead_keys:
+            return
+        if not self._prefetch_ready:
+            if not self._prefetch_timer.isActive():
+                self._prefetch_timer.start()
+            return
+        for key in ahead_keys:
+            if (
+                key in self._cache
+                or key in self._failed_keys
+                or key in self._completed_keys
+            ):
+                continue
+            self._submit(key)
+            return
+
+    @Slot()
+    def _enable_prefetch(self) -> None:
+        self._prefetch_ready = True
+        self._drive()
 
     def _submit(self, key: _ThumbnailKey) -> None:
         self._serial += 1
@@ -900,19 +1006,21 @@ class ViewerPageListRuntime(QObject):
         elif result.error is not None or result.qimage is None or result.qimage.isNull():
             self._failed_keys.add(result.key)
             self._bump("terminal_errors")
-            self.thumbnailReady.emit(
-                ViewerPageThumbnail(
-                    self.runtime_id,
-                    self.source_epoch,
-                    result.key.page_index,
-                    result.key.image_id,
-                    result.key.spec,
-                    None,
-                    False,
-                    result.completed_at,
-                    result.error or "thumbnail decoder returned an empty image",
+            if result.key in self._desired_keys[: self._visible_count]:
+                self.thumbnailReady.emit(
+                    ViewerPageThumbnail(
+                        self.runtime_id,
+                        self.source_epoch,
+                        result.key.page_index,
+                        result.key.image_id,
+                        result.key.spec,
+                        None,
+                        False,
+                        result.completed_at,
+                        result.error
+                        or "thumbnail decoder returned an empty image",
+                    )
                 )
-            )
         else:
             self._bump("qimage_creations")
             self._completed_keys.add(result.key)
@@ -922,7 +1030,10 @@ class ViewerPageListRuntime(QObject):
                 result.completed_at,
             )
             self._put_cache(cached)
-            self.thumbnailReady.emit(self._public_thumbnail(cached, False))
+            if result.key in self._desired_keys[: self._visible_count]:
+                self.thumbnailReady.emit(
+                    self._public_thumbnail(cached, False)
+                )
 
         self._release_owned_source_if_drained()
         self._drive()
@@ -967,32 +1078,20 @@ class ViewerPageListRuntime(QObject):
 
     def _put_cache(self, cached: _CachedThumbnail) -> None:
         self._remove_cache(cached.key)
+        byte_cost = _qimage_bytes(cached.qimage)
+        if byte_cost > self._cache_budget:
+            # A single oversized artifact must not violate the hard byte cap.
+            self._bump("cache_evictions")
+            return
         self._cache[cached.key] = cached
-        self._cache_bytes += _qimage_bytes(cached.qimage)
+        self._cache_bytes += byte_cost
         evicted = 0
-        while self._cache_bytes > self._cache_budget and len(self._cache) > 1:
-            victim = next(
-                (
-                    key
-                    for key in reversed(self._desired_keys)
-                    if key in self._cache and key != self._desired_keys[0]
-                ),
-                next(iter(self._cache)),
-            )
+        while self._cache_bytes > self._cache_budget and self._cache:
+            victim = next(iter(self._cache))
             self._remove_cache(victim)
             evicted += 1
         if evicted:
             self._bump("cache_evictions", evicted)
-
-    def _retain_cache(self, desired: set[_ThumbnailKey]) -> None:
-        removed = 0
-        for key in tuple(self._cache):
-            if key in desired:
-                continue
-            self._remove_cache(key)
-            removed += 1
-        if removed:
-            self._bump("cache_evictions", removed)
 
     def _remove_cache(self, key: _ThumbnailKey) -> None:
         cached = self._cache.pop(key, None)
