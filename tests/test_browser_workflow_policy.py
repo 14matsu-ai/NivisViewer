@@ -23,14 +23,18 @@ def test_paste_current_clipboard_is_authoritative(matching,cut,effect,expected):
                          preferred_effect=effect) is expected
 
 @pytest.mark.parametrize('values,expected', [
-    ({}, (3,38,2,'auto')),
-    ({'browser_thumbnail_background_screens':-1},(-1,38,2,'auto')),
-    ({'browser_thumbnail_background_screens':0},(0,38,2,'auto')),
-    ({'browser_selection_color':'#FF00AA'},(3,38,2,'#ff00aa')),
-    ({'browser_selection_color':'url(bad)'},(3,38,2,'auto')),
-    ({'browser_selection_filename_opacity':999,'browser_selection_border_width':-99},(3,100,1,'auto')),
-    ({'browser_thumbnail_background_screens':float('inf')},(3,38,2,'auto')),
-    ({'browser_thumbnail_background_screens':True},(3,38,2,'auto')),
+    ({}, (3,38,2,'auto',True,False)),
+    ({'browser_thumbnail_background_screens':-1},(-1,38,2,'auto',True,False)),
+    ({'browser_thumbnail_background_screens':0},(0,38,2,'auto',True,False)),
+    ({'browser_selection_color':'#FF00AA'},(3,38,2,'#ff00aa',True,False)),
+    ({'browser_selection_color':'url(bad)'},(3,38,2,'auto',True,False)),
+    ({'browser_selection_filename_opacity':999,'browser_selection_border_width':-99},(3,100,1,'auto',True,False)),
+    ({'browser_thumbnail_background_screens':float('inf')},(3,38,2,'auto',True,False)),
+    ({'browser_thumbnail_background_screens':True},(3,38,2,'auto',True,False)),
+    ({'browser_selection_text_color_auto_adjust':False,
+      'browser_selection_frame_rounded':True},(3,38,2,'auto',False,True)),
+    ({'browser_selection_text_color_auto_adjust':'false',
+      'browser_selection_frame_rounded':1},(3,38,2,'auto',True,False)),
 ])
 def test_preferences_normalized(values,expected):
     data=normalize_workflow_settings(values)
@@ -58,6 +62,21 @@ def test_finite_screens_both_sides_direction_priority():
     up=ThumbnailWarmupCursor(200)
     up.recenter(40,49,-1,2)
     assert drain(up) == list(range(39,19,-1)) + list(range(50,70))
+
+
+@pytest.mark.parametrize(
+    "screens,expected_count",
+    [(0, 0), (1, 80), (3, 240), (10, 800), (-1, 1960)],
+)
+def test_background_screen_range_values(screens, expected_count):
+    cursor = ThumbnailWarmupCursor(2000)
+    cursor.recenter(700, 739, 1, screens)
+    rows = drain(cursor)
+    assert len(rows) == expected_count
+    if screens > 0:
+        assert rows[: min(screens * 40, 1260)] == list(
+            range(740, 740 + min(screens * 40, 1260))
+        )
 
 
 def test_zero_and_unlimited_do_not_materialize_a_queue():

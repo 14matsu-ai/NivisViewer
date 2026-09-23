@@ -12,6 +12,8 @@ WORKFLOW_DEFAULTS = {
     "browser_selection_filename_opacity": 38,
     "browser_selection_border_width": 2,
     "browser_selection_color": "auto",
+    "browser_selection_text_color_auto_adjust": True,
+    "browser_selection_frame_rounded": False,
 }
 
 
@@ -35,6 +37,16 @@ def normalize_workflow_settings(values: Mapping[str, object]) -> dict[str, objec
         "browser_selection_border_width": bounded_int(
             values.get("browser_selection_border_width", 2), 2, 1, 12),
         "browser_selection_color": color,
+        "browser_selection_text_color_auto_adjust": (
+            values.get("browser_selection_text_color_auto_adjust", True)
+            if isinstance(values.get("browser_selection_text_color_auto_adjust", True), bool)
+            else True
+        ),
+        "browser_selection_frame_rounded": (
+            values.get("browser_selection_frame_rounded", False)
+            if isinstance(values.get("browser_selection_frame_rounded", False), bool)
+            else False
+        ),
     }
 
 
@@ -66,13 +78,17 @@ class SelectionAppearance:
     opacity_percent: int = 38
     border_width: int = 2
     color: str = "auto"
+    auto_adjust_text_color: bool = True
+    rounded_frame: bool = False
 
     @classmethod
     def from_settings(cls, values: Mapping[str, object]) -> SelectionAppearance:
         values = normalize_workflow_settings(values)
         return cls(int(values["browser_selection_filename_opacity"]),
                    int(values["browser_selection_border_width"]),
-                   str(values["browser_selection_color"]))
+                   str(values["browser_selection_color"]),
+                   bool(values["browser_selection_text_color_auto_adjust"]),
+                   bool(values["browser_selection_frame_rounded"]))
 
     @property
     def alpha(self) -> int:
@@ -134,6 +150,15 @@ class ThumbnailWarmupCursor:
     def complete(self, row: int) -> None:
         if 0 <= row < self.count:
             self._done[row] = 1
+
+    def invalidate(self, row: int) -> None:
+        if not 0 <= row < self.count:
+            return
+        self._done[row] = 0
+        self._retry = deque(candidate for candidate in self._retry if candidate != row)
+        if self.eligible(row):
+            self._retry.appendleft(row)
+        self.exhausted = False
 
     def retry(self, row: int) -> None:
         if 0 <= row < self.count and not self._done[row] and row not in self._retry:

@@ -6,7 +6,9 @@ from collections import OrderedDict
 from dataclasses import dataclass
 
 from PySide6.QtCore import QModelIndex, QRect, QRectF, QSize, Qt
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QImage, QPainter, QPen
+from PySide6.QtGui import (
+    QColor, QFont, QFontMetrics, QIcon, QImage, QPainter, QPainterPath, QPen,
+)
 from PySide6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
 from .browser_model import BrowserItem, BrowserItemKind, BrowserItemModel
@@ -1446,11 +1448,31 @@ class BrowserItemDelegate(QStyledItemDelegate):
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
         focused = bool(option.state & QStyle.StateFlag.State_HasFocus)
         if selected:
-            painter.setPen(QPen(self._selection_color(option), self.selection_appearance.border_width))
+            pen = QPen(
+                self._selection_color(option),
+                self.selection_appearance.border_width,
+            )
+            pen.setJoinStyle(
+                Qt.PenJoinStyle.RoundJoin
+                if self.selection_appearance.rounded_frame
+                else Qt.PenJoinStyle.MiterJoin
+            )
+            pen.setCapStyle(
+                Qt.PenCapStyle.RoundCap
+                if self.selection_appearance.rounded_frame
+                else Qt.PenCapStyle.SquareCap
+            )
+            painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             inset = max(0.0, (self.selection_appearance.border_width - 2) / 2)
             target = snap_logical_rect_to_physical_pixels(QRectF(selection_rect).adjusted(inset, inset, -inset, -inset), dpr)
-            painter.drawRect(target)
+            selection_path = QPainterPath()
+            if self.selection_appearance.rounded_frame:
+                radius = min(5.0, min(target.width(), target.height()) * 0.08)
+                selection_path.addRoundedRect(target, radius, radius)
+            else:
+                selection_path.addRect(target)
+            painter.drawPath(selection_path)
         elif hovered:
             color = option.palette.highlight().color()
             color.setAlpha(170)
@@ -1467,6 +1489,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
         return QColor(option.palette.highlight().color()) if value == "auto" else QColor(value)
 
     def _selection_text_color(self, option) -> QColor:
+        if not self.selection_appearance.auto_adjust_text_color:
+            return QColor(option.palette.text().color())
         base = option.palette.base().color()
         selected = self._selection_color(option)
         alpha = self.selection_appearance.alpha / 255.0

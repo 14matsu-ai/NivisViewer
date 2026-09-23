@@ -1074,6 +1074,50 @@ ENGLISH.update({
     'ドライブを選択': 'Select a drive',
 })
 
+ENGLISH.update({
+    "背景生成・選択表示": "Background Generation and Selection Display",
+    "表示範囲のみ": "Visible items only",
+    "画面数を指定": "Specify screen count",
+    "無制限（現在の一覧全体）": "Unlimited (current listing)",
+    " 画面分": " screens",
+    "サムネイル背景生成の範囲:": "Background thumbnail generation range:",
+    (
+        "画面内を最優先し、停止後に前後の指定画面数を生成します。"
+        "無制限でも待機ジョブ・メモリ・ディスクの上限は維持します。"
+        "画像・フォルダ・書庫・PDFが対象です。"
+    ): (
+        "Prioritize visible items, then generate the specified screens before "
+        "and after scrolling stops. Unlimited mode still obeys pending-job, "
+        "memory, and disk limits. Applies to images, folders, archives, and PDFs."
+    ),
+    "ファイル名の選択色の不透明度:": "Filename selection color opacity:",
+    "ファイル名にかかる選択色の不透明度。0%で透明、100%で不透明です。": (
+        "Opacity of the selection color behind filenames. 0% is transparent; "
+        "100% is opaque."
+    ),
+    "選択帯（外枠）の太さ:": "Selection frame width:",
+    "サムネイルとファイル名を囲む選択枠の太さ。画面倍率に追従します。": (
+        "Width of the frame around the thumbnail and filename. Follows display scaling."
+    ),
+    "選択色を変更": "Change selection color",
+    "システムの選択色を使う": "Use system selection color",
+    "選択色:": "Selection color:",
+    "大量の操作を元に戻す": "Undo a large operation",
+    (
+        "{count}項目を元に戻します。\n"
+        "操作後に変更された項目はスキップされる場合があります。"
+        "処理をキャンセルすると一部だけ元に戻ることがあります。\n"
+        "続行しますか？"
+    ): (
+        "Undo {count} items.\nItems changed since the operation may be skipped. "
+        "Cancelling can leave the batch partially undone.\nContinue?"
+    ),
+    "選択中のファイル名の文字色を自動調整する": (
+        "Automatically adjust selected filename text color"
+    ),
+    "選択枠の角を丸くする": "Round selection frame corners",
+})
+
 ENGLISH_DISAMBIGUATED = {
     ("縮小", "resampling"): "Downscaling",
     ("拡大", "resampling"): "Upscaling",
