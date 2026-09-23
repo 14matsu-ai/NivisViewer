@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .browser_workflow_controller import BrowserWorkflowController
+from .browser_workflow_policy import paste_is_move
+
 from .i18n import tr
 from .menu_icons import install_text_icon_menu_style, settings_icon
 
@@ -201,6 +204,7 @@ from .history_model import HistoryModel
 from .image_work_coordinator import ImageWorkCoordinator
 from .image_source import FolderListingSnapshot
 from .internal_clipboard import (
+    ClipboardPasteReceipt,
     InternalClipboardOperation,
     InternalClipboardState,
 )
@@ -228,6 +232,8 @@ BROWSER_SHORTCUT_RUNTIME_IDS = frozenset(
         "browser_up",
         "browser_refresh",
         "browser_focus_address",
+        "browser_focus_search",
+        "browser_undo",
         "browser_rename",
         "browser_delete",
         "browser_copy",
@@ -750,6 +756,7 @@ class BrowserWindow(QMainWindow):
         self._operation_refresh_generation: int | None = None
         self._operation_completion_message: str | None = None
         self._file_operation_requests: dict[int, FileOperationRequest] = {}
+        self._clipboard_paste_receipts: dict[int, ClipboardPasteReceipt] = {}
         self._properties_dialogs: set[FilePropertiesDialog] = set()
         self._property_rename_requests: dict[
             int, tuple[FilePropertiesDialog, bool]
@@ -1016,6 +1023,7 @@ class BrowserWindow(QMainWindow):
             self._flush_directory_changes
         )
         self._build_ui()
+        self._browser_workflow = BrowserWorkflowController(self)
         self.shortcut_bindings = normalize_shortcut_bindings(
             self.settings.get("shortcut_bindings")
         ).get("browser", {})
@@ -2725,16 +2733,33 @@ class BrowserWindow(QMainWindow):
     def paste_items(self) -> bool:
         if self.current_path is None:
             return False
-        sources = self._clipboard_paths or self._clipboard_file_urls()
+        clipboard = QApplication.clipboard()
+        mime = clipboard.mimeData()
+        clipboard_receipt = ClipboardPasteReceipt.capture(
+            self._internal_clipboard_state,
+            mime,
+        )
+        sources = self._clipboard_file_urls(mime)
         if not sources:
             self._show_temporary_status(tr('貼り付けるファイルがありません'))
             return False
+        internal_matches = self._internal_clipboard_state.matches_mime(mime)
+        preferred_effect = InternalClipboardState.preferred_drop_effect(mime)
         operation = (
             FileOperationKind.MOVE
-            if self._internal_clipboard_state.paths
-            and self._internal_clipboard_state.is_cut
+            if paste_is_move(
+                internal_matches=internal_matches,
+                internal_cut=self._internal_clipboard_state.is_cut,
+                preferred_effect=preferred_effect,
+            )
             else FileOperationKind.COPY
         )
+        if not clipboard_receipt.matches(
+            self._internal_clipboard_state,
+            clipboard.mimeData(),
+        ):
+            self._show_temporary_status(tr('クリップボードが変更されたため貼り付けを中止しました'))
+            return False
         if _FILE_OPERATION_LOG.isEnabledFor(logging.DEBUG):
             snapshot = self._internal_clipboard_state.snapshot
             _FILE_OPERATION_LOG.debug(
@@ -2762,6 +2787,7 @@ class BrowserWindow(QMainWindow):
             operation,
             sources=sources,
             destination=self.current_path,
+            clipboard_receipt=(clipboard_receipt if operation is FileOperationKind.MOVE else None),
         )
 
     def rename_selected_item(self) -> bool:
@@ -2977,6 +3003,7 @@ class BrowserWindow(QMainWindow):
         sources: tuple[str, ...] = (),
         destination: str | Path | None = None,
         new_name: str | None = None,
+        clipboard_receipt: ClipboardPasteReceipt | None = None,
     ) -> bool:
         if self._snapshot_reconcile_pending:
             self._show_temporary_status(tr('一覧を更新中のため操作できません'))
@@ -3004,7 +3031,7 @@ class BrowserWindow(QMainWindow):
             FileOperationKind.RENAME,
             FileOperationKind.MOVE,
             FileOperationKind.RECYCLE,
-        } and not self._confirm_and_close_affected_viewers(sources):
+        FileOperationKind.UNDO} and not self._confirm_and_close_affected_viewers(sources):
             return False
         self._file_operation_request_id += 1
         request = FileOperationRequest(
@@ -3029,6 +3056,19 @@ class BrowserWindow(QMainWindow):
                 request.destination_directory,
                 self._internal_clipboard_state.is_cut,
             )
+        if clipboard_receipt is not None:
+            current_mime = QApplication.clipboard().mimeData()
+            if (
+                not clipboard_receipt.matches(self._internal_clipboard_state, current_mime)
+                or (
+                    clipboard_receipt.internal_request_identity is not None
+                    and not clipboard_receipt.matches_internal_snapshot(
+                        self._internal_clipboard_state
+                    )
+                )
+            ):
+                self._show_temporary_status(tr('クリップボードが変更されたため貼り付けを中止しました'))
+                return False
         selected_paths = self.selected_file_operation_paths()
         current_row = (
             self.list_view.currentIndex().row()
@@ -3036,12 +3076,31 @@ class BrowserWindow(QMainWindow):
             else None
         )
         self._file_operation_requests[request.request_id] = request
+        if clipboard_receipt is not None:
+            self._clipboard_paste_receipts[request.request_id] = clipboard_receipt
         self._file_operation_selection_before[request.request_id] = (
             selected_paths,
             current_row,
         )
+        if clipboard_receipt is not None:
+            current_mime = QApplication.clipboard().mimeData()
+            if (
+                not clipboard_receipt.matches(self._internal_clipboard_state, current_mime)
+                or (
+                    clipboard_receipt.internal_request_identity is not None
+                    and not clipboard_receipt.matches_internal_snapshot(
+                        self._internal_clipboard_state
+                    )
+                )
+            ):
+                self._file_operation_requests.pop(request.request_id, None)
+                self._clipboard_paste_receipts.pop(request.request_id, None)
+                self._file_operation_selection_before.pop(request.request_id, None)
+                self._show_temporary_status(tr('クリップボードが変更されたため貼り付けを中止しました'))
+                return False
         if not self.file_operation_coordinator.execute(request):
             self._file_operation_requests.pop(request.request_id, None)
+            self._clipboard_paste_receipts.pop(request.request_id, None)
             self._file_operation_selection_before.pop(request.request_id, None)
             self._show_temporary_status(tr('ファイル操作を開始できません'))
             return False
@@ -3258,8 +3317,9 @@ class BrowserWindow(QMainWindow):
             self._setting_clipboard = False
         self._update_file_action_states()
 
-    def _clipboard_file_urls(self) -> tuple[str, ...]:
-        mime = QApplication.clipboard().mimeData()
+    def _clipboard_file_urls(self, mime: QMimeData | None = None) -> tuple[str, ...]:
+        if mime is None:
+            mime = QApplication.clipboard().mimeData()
         if mime is None or not mime.hasUrls():
             return ()
         paths = [
@@ -3363,6 +3423,10 @@ class BrowserWindow(QMainWindow):
         if result.request_id == self._zip_progress_request_id:
             self._close_zip_progress_dialog()
         request = self._file_operation_requests.pop(result.request_id, None)
+        clipboard_receipt = self._clipboard_paste_receipts.pop(
+            result.request_id,
+            None,
+        )
         before_paths, before_row = self._file_operation_selection_before.pop(
             result.request_id,
             ((), None),
@@ -3383,7 +3447,7 @@ class BrowserWindow(QMainWindow):
         )
         self._update_file_action_states()
 
-        if result.operation in {FileOperationKind.RENAME, FileOperationKind.MOVE}:
+        if result.operation in {FileOperationKind.RENAME, FileOperationKind.MOVE, FileOperationKind.UNDO}:
             relocation_items = tuple(
                 item
                 for item in result.items
@@ -3404,28 +3468,8 @@ class BrowserWindow(QMainWindow):
             self._complete_folder_rating_rename(result)
             return
 
-        if result.operation is FileOperationKind.MOVE and self._clipboard_cut:
-            top_level = {
-                self._path_key(item.source_path): item
-                for item in result.items
-                if item.source_path
-            }
-            remaining_list: list[str] = []
-            for path in self._clipboard_paths:
-                item = top_level.get(self._path_key(path))
-                if item is None:
-                    remaining_list.append(path)
-                elif item.success:
-                    continue
-                elif item.child_results and item.retry_source_paths:
-                    remaining_list.extend(item.retry_source_paths)
-                else:
-                    remaining_list.append(path)
-            remaining = tuple(dict.fromkeys(remaining_list))
-            if remaining:
-                self._set_file_clipboard(remaining, cut=True)
-            else:
-                self.clear_file_clipboard()
+        if result.operation is FileOperationKind.MOVE and clipboard_receipt is not None:
+            self._finish_paste_clipboard(result, clipboard_receipt)
 
         if _FILE_OPERATION_LOG.isEnabledFor(logging.DEBUG):
             for item in result.effective_items:
@@ -3571,7 +3615,7 @@ class BrowserWindow(QMainWindow):
                 FileOperationKind.RECYCLE,
                 FileOperationKind.CREATE_DIRECTORY,
                 FileOperationKind.CREATE_ZIP,
-            }
+            FileOperationKind.UNDO}
             and (source_is_current or destination_is_current)
         ) or (
             result.operation is FileOperationKind.MOVE
@@ -3647,6 +3691,7 @@ class BrowserWindow(QMainWindow):
             FileOperationKind.RECYCLE: tr('削除'),
             FileOperationKind.CREATE_DIRECTORY: tr('フォルダ作成'),
             FileOperationKind.CREATE_ZIP: tr('zipに圧縮'),
+            FileOperationKind.UNDO: tr('元に戻す'),
         }[operation]
 
     def add_browser_bookmark(
@@ -5168,6 +5213,69 @@ class BrowserWindow(QMainWindow):
         self._update_selected_detail()
         self._update_file_action_states()
 
+    def _finish_paste_clipboard(
+        self,
+        result: FileOperationResult,
+        receipt: ClipboardPasteReceipt,
+    ) -> None:
+        clipboard = QApplication.clipboard()
+        mime = clipboard.mimeData()
+        if not receipt.matches(self._internal_clipboard_state, mime):
+            return
+        if (
+            receipt.internal_request_identity is not None
+            and not receipt.matches_internal_snapshot(self._internal_clipboard_state)
+        ):
+            return
+
+        if receipt.privately_owned and receipt.matches_internal_snapshot(
+            self._internal_clipboard_state
+        ):
+            top_level = {
+                self._path_key(item.source_path): item
+                for item in result.items
+                if item.source_path
+            }
+            remaining_list: list[str] = []
+            for path in receipt.internal_paths:
+                item = top_level.get(self._path_key(path))
+                if item is None:
+                    remaining_list.append(path)
+                elif item.success and not item.partial_success and not item.partially_completed:
+                    continue
+                elif item.child_results and item.retry_source_paths:
+                    remaining_list.extend(item.retry_source_paths)
+                else:
+                    remaining_list.append(path)
+            remaining = tuple(dict.fromkeys(remaining_list))
+            if remaining and remaining != receipt.internal_paths:
+                self._set_file_clipboard(remaining, cut=True)
+                return
+
+        fully_moved = bool(result.items) and all(
+            item.success
+            and not item.partial_success
+            and not item.partially_completed
+            and (item.source_removed or item.source_root_removed is True)
+            for item in result.items
+        )
+        if not fully_moved or not receipt.matches(
+            self._internal_clipboard_state,
+            clipboard.mimeData(),
+        ):
+            return
+        if (
+            receipt.internal_request_identity is not None
+            and not receipt.matches_internal_snapshot(self._internal_clipboard_state)
+        ):
+            return
+        # A successful cut is one-shot. The Windows sequence + Qt MIME identity
+        # check above prevents an older queued completion from clearing a newer
+        # clipboard, even when its URLs happen to be identical.
+        clipboard.clear(QClipboard.Mode.Clipboard)
+        if receipt.matches_internal_snapshot(self._internal_clipboard_state):
+            self.clear_file_clipboard()
+
     def _rating_hit(self, position: QPoint) -> tuple[BrowserItem, int] | None:
         index = self.list_view.indexAt(position)
         item = self.item_model.item_at(index)
@@ -5381,6 +5489,7 @@ class BrowserWindow(QMainWindow):
             return
 
     def _finalize_rating_batch(self, batch: _RatingRenameBatch) -> bool:
+        self.file_operation_coordinator.invalidate_undo()
         if self._rating_batch is batch:
             self._rating_batch = None
         replacements = batch.replacements
@@ -5961,6 +6070,13 @@ class BrowserWindow(QMainWindow):
         return True
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
+        workflow = getattr(self, "_browser_workflow", None)
+        if workflow is not None:
+            if (watched in (self, self.list_view.viewport())
+                    and event.type() in {QEvent.Type.Show, QEvent.Type.Resize, QEvent.Type.WindowActivate}):
+                self._schedule_thumbnail_requests(0)
+            if workflow.handle_key(watched, event):
+                return True
         extra_button_result = self._handle_extra_button_event(watched, event)
         if extra_button_result is not None:
             return extra_button_result
@@ -7097,6 +7213,9 @@ class BrowserWindow(QMainWindow):
             self._sync_tree_to_path(self.current_path)
 
     def _request_visible_thumbnails(self) -> None:
+        workflow = getattr(self, "_browser_workflow", None)
+        if workflow is not None:
+            workflow.schedule_background()
         row_count = self.item_model.rowCount()
         if self._shutdown_prepared or row_count <= 0:
             return
@@ -7112,7 +7231,8 @@ class BrowserWindow(QMainWindow):
             first_visible=visible_range[0],
             last_visible=visible_range[1],
             selected_rows=selected_rows,
-            prefetch_screens=1,
+            prefetch_screens=0,
+            opposite_safety_fraction=0.0,
             scroll_direction=self._thumbnail_scroll_direction,
             fast_scrolling=self._fast_scrolling,
         )

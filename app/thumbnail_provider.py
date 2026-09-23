@@ -175,6 +175,7 @@ class BrowserThumbnailProvider(QObject):
     page_count_ready = Signal(str, int, int)
     cache_cleared = Signal()
     scheduling_resumed = Signal()
+    work_settled = Signal(str, int, object, object, str)
 
     def __init__(
         self,
@@ -332,6 +333,7 @@ class BrowserThumbnailProvider(QObject):
                 ThumbnailPriority.SELECTED: "requested_selected",
                 ThumbnailPriority.READ_AHEAD: "requested_read_ahead",
                 ThumbnailPriority.PREFETCH: "requested_prefetch",
+                ThumbnailPriority.BACKGROUND: "requested_background",
             }[normalized_priority]
         )
         self._active_request_tokens.setdefault(path_key, set()).add(cache_token)
@@ -1153,6 +1155,7 @@ class BrowserThumbnailProvider(QObject):
                 ThumbnailPriority.SELECTED: "generated_selected",
                 ThumbnailPriority.READ_AHEAD: "generated_read_ahead",
                 ThumbnailPriority.PREFETCH: "generated_prefetch",
+                ThumbnailPriority.BACKGROUND: "generated_background",
             }[normalized_priority]
         )
         bucket = (
@@ -1203,6 +1206,7 @@ class BrowserThumbnailProvider(QObject):
                     ThumbnailPriority.VISIBLE: "disk_saved_visible",
                     ThumbnailPriority.SELECTED: "disk_saved_selected",
                     ThumbnailPriority.READ_AHEAD: "disk_saved_read_ahead",
+                ThumbnailPriority.BACKGROUND: "disk_saved_background",
                 }.get(normalized_priority)
                 if saved_key is not None:
                     self._increment_stat(saved_key)
@@ -1228,6 +1232,10 @@ class BrowserThumbnailProvider(QObject):
         _modified_at: tuple[object, ...],
         image: QImage | None,
     ) -> None:
+        with self._pending_lock:
+            pending = self._pending.get((self._path_key(Path(path)), int(_size_token), generation))
+        if pending is not None and pending.priority is ThumbnailPriority.BACKGROUND:
+            return
         if (
             self._closed
             or generation != self._generation
@@ -1350,10 +1358,11 @@ class BrowserThumbnailProvider(QObject):
             ThumbnailPriority.SELECTED: int(PdfRenderPriority.THUMBNAIL_SELECTED),
             ThumbnailPriority.READ_AHEAD: int(PdfRenderPriority.THUMBNAIL_PREFETCH),
             ThumbnailPriority.PREFETCH: int(PdfRenderPriority.THUMBNAIL_PREFETCH),
+                ThumbnailPriority.BACKGROUND: int(PdfRenderPriority.THUMBNAIL_PREFETCH),
         }[ThumbnailPriority(priority)]
 
     @Slot(str, int, object, object, object)
-    def _on_finished(
+    def _consume_thumbnail_finished(
         self,
         path: str,
         generation: int,
@@ -1377,7 +1386,8 @@ class BrowserThumbnailProvider(QObject):
             else ThumbnailLoadResult(result)
         )
         provisional = loaded.provisional_image
-        if provisional is not None and not provisional.isNull():
+        if (provisional is not None and not provisional.isNull()
+                and (pending is None or pending.priority is not ThumbnailPriority.BACKGROUND)):
             self.thumbnail_provisional.emit(path, generation, provisional)
         if (
             loaded.page_count is not None
@@ -1421,7 +1431,8 @@ class BrowserThumbnailProvider(QObject):
         while len(self._cache) > self._cache_capacity:
             evicted_key, _evicted_image = self._cache.popitem(last=False)
             self._cache_page_counts.pop(evicted_key, None)
-        self.thumbnail_ready.emit(path, generation, image)
+        if pending is None or pending.priority is not ThumbnailPriority.BACKGROUND:
+            self.thumbnail_ready.emit(path, generation, image)
 
     @Slot(str, int, object, object, object)
     def _on_page_count_finished(
@@ -1889,6 +1900,7 @@ class BrowserThumbnailProvider(QObject):
                 ThumbnailPriority.SELECTED: ImageWorkPriority.BROWSER_SELECTED,
                 ThumbnailPriority.READ_AHEAD: ImageWorkPriority.BROWSER_READ_AHEAD,
                 ThumbnailPriority.PREFETCH: ImageWorkPriority.BROWSER_PREFETCH,
+                ThumbnailPriority.BACKGROUND: ImageWorkPriority.BROWSER_PREFETCH,
             }[normalized]
             return self._coordinator.start_browser(worker, mapped)
         self._pool.start(worker, int(normalized))
@@ -1910,6 +1922,47 @@ class BrowserThumbnailProvider(QObject):
         if self._disk_cache is not None:
             self._disk_cache.close()
         _RETIRED_THUMBNAIL_PROVIDERS.discard(self)
+
+    def request_background(self, item, size, *, generation):
+        """Generate through the existing lane; never enqueue the entire listing."""
+        if self._closed or self._paused or generation != self._generation:
+            return "blocked"
+        token = size.cache_token
+        cache_key = (self._path_key(item.path), token, item.thumbnail_revision)
+        candidate = self._memory_candidate(cache_key[0], item.thumbnail_revision, size)
+        adequate = candidate is not None and candidate[1].long_edge >= size.long_edge * .95
+        if cache_key in self._cache or adequate:
+            return "settled"
+        with self._failure_lock:
+            if cache_key in self._failed or cache_key in self._quiet_results:
+                return "settled"
+        if self.pending_count:
+            return "blocked"
+        if self.request(item, size, generation=generation, priority=ThumbnailPriority.BACKGROUND):
+            return "queued"
+        with self._pending_lock:
+            if (cache_key[0], token, generation) in self._pending:
+                return "queued"
+        candidate = self._memory_candidate(cache_key[0], item.thumbnail_revision, size)
+        adequate = candidate is not None and candidate[1].long_edge >= size.long_edge * .95
+        if cache_key in self._cache or adequate:
+            return "settled"
+        return "blocked"
+
+    @Slot(str, int, object, object, object)
+    def _on_finished(self, path, generation, size_token, modified_at, result):
+        loaded = result if isinstance(result, ThumbnailLoadResult) else ThumbnailLoadResult(result)
+        state = loaded.resolved_kind.value
+        key = (self._path_key(Path(path)), int(size_token), generation)
+        with self._pending_lock:
+            pending = self._pending.get(key)
+            if pending is not None and pending.worker.cancelled.is_set():
+                state = "cancelled"
+        try:
+            self._consume_thumbnail_finished(path, generation, size_token, modified_at, result)
+        finally:
+            if not self._closed:
+                self.work_settled.emit(path, generation, size_token, modified_at, state)
 
 
 def _invoke_thumbnail_loader(

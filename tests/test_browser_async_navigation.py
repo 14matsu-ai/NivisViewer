@@ -54,8 +54,13 @@ class FakeScanner(QObject):
 class RecordingThumbnailProvider(BrowserThumbnailProvider):
     def __init__(self) -> None:
         super().__init__()
-        self.requests: list[tuple[str, int, int, ThumbnailPriority]] = []
+        self.requests: list[tuple[str, object, int, ThumbnailPriority]] = []
         self.cancel_calls: list[set[str]] = []
+        self._background_inflight = None
+
+    @property
+    def pending_count(self) -> int:
+        return int(self._background_inflight is not None)
 
     def request(
         self,
@@ -68,7 +73,31 @@ class RecordingThumbnailProvider(BrowserThumbnailProvider):
         self.requests.append(
             (str(item.path), size, int(generation or 0), priority)
         )
+        if priority is ThumbnailPriority.BACKGROUND:
+            self._background_inflight = (item, size, int(generation or 0))
         return True
+
+    def request_background(self, item, size, *, generation):
+        if self._background_inflight is not None:
+            return "blocked"
+        if self.request(
+            item,
+            size,
+            generation=generation,
+            priority=ThumbnailPriority.BACKGROUND,
+        ):
+            return "queued"
+        return "blocked"
+
+    def finish_background(self, state: str = "generated") -> None:
+        current = self._background_inflight
+        assert current is not None
+        item, size, generation = current
+        self._background_inflight = None
+        token = size.cache_token if hasattr(size, "cache_token") else size
+        self.work_settled.emit(
+            str(item.path), generation, token, item.thumbnail_revision, state
+        )
 
     def cancel_prefetch_except(
         self,
@@ -961,8 +990,7 @@ def test_large_model_requests_only_visible_and_limited_prefetch(
 
     assert 0 < len(provider.requests) < 500
     priorities = {request[3] for request in provider.requests}
-    assert ThumbnailPriority.VISIBLE in priorities
-    assert ThumbnailPriority.READ_AHEAD in priorities
+    assert priorities == {ThumbnailPriority.VISIBLE}
     window.close()
 
 
@@ -987,26 +1015,32 @@ def test_fast_scroll_suppresses_prefetch_and_idle_resumes_it(
         BrowserScanCompleted(request.path, request.generation, 200)
     )
     window._flush_pending_scan_batch()
+    window.show()
+    qapp.processEvents()
+    window._first_paint_pending_generation = None
+    window._thumbnail_request_timer.stop()
 
     window._on_list_scrolled(1000)
     provider.requests.clear()
     window._request_visible_thumbnails()
-    assert all(
-        item[3] not in {
-            ThumbnailPriority.PREFETCH,
-            ThumbnailPriority.READ_AHEAD,
-        }
-        for item in provider.requests
-    )
+    window._browser_workflow._timer.stop()
+    window._browser_workflow._pump()
+    assert {item[3] for item in provider.requests} == {ThumbnailPriority.VISIBLE}
     assert provider.cancel_calls
 
     provider.requests.clear()
     window._on_scroll_idle()
     window._request_visible_thumbnails()
+    window._thumbnail_request_timer.stop()
+    window._browser_workflow._timer.stop()
+    window._browser_workflow._pump()
     assert any(
-        item[3] is ThumbnailPriority.READ_AHEAD
+        item[3] is ThumbnailPriority.BACKGROUND
         for item in provider.requests
     )
+    assert sum(
+        item[3] is ThumbnailPriority.BACKGROUND for item in provider.requests
+    ) == 1
     window.close()
 
 
@@ -1028,35 +1062,51 @@ def test_scroll_direction_recenters_bounded_read_ahead_without_queue_growth(
         BrowserScanCompleted(request.path, request.generation, len(entries))
     )
     window._flush_pending_scan_batch()
+    window.show()
+    qapp.processEvents()
+    window._first_paint_pending_generation = None
+    window._thumbnail_request_timer.stop()
     window._fast_scrolling = False
     window._visible_row_range = lambda: (100, 119)  # type: ignore[method-assign]
 
     provider.requests.clear()
     window._thumbnail_scroll_direction = 1
     window._request_visible_thumbnails()
+    window._browser_workflow._timer.stop()
+    window._browser_workflow._pump()
     down = provider.requests.copy()
     assert sum(item[3] is ThumbnailPriority.VISIBLE for item in down) == 20
-    assert sum(item[3] is ThumbnailPriority.READ_AHEAD for item in down) == 20
-    assert sum(item[3] is ThumbnailPriority.PREFETCH for item in down) == 5
-    assert {
-        Path(item[0]).name for item in down if item[3] is ThumbnailPriority.READ_AHEAD
-    } == {f"{index:04d}.jpg" for index in range(120, 140)}
+    assert sum(item[3] is ThumbnailPriority.BACKGROUND for item in down) == 1
+    assert all(
+        item[3] not in {ThumbnailPriority.READ_AHEAD, ThumbnailPriority.PREFETCH}
+        for item in down
+    )
+    assert Path(next(
+        item[0] for item in down if item[3] is ThumbnailPriority.BACKGROUND
+    )).name == "0120.jpg"
+    window._browser_workflow._pump()
+    assert sum(
+        item[3] is ThumbnailPriority.BACKGROUND for item in provider.requests
+    ) == 1
 
+    provider.finish_background()
     provider.requests.clear()
     window._thumbnail_scroll_direction = -1
+    window._visible_row_range = lambda: (120, 139)  # type: ignore[method-assign]
     window._request_visible_thumbnails()
+    window._thumbnail_request_timer.stop()
+    window._browser_workflow._timer.stop()
+    window._browser_workflow._pump()
     reverse = provider.requests.copy()
-    assert {
-        Path(item[0]).name
-        for item in reverse
-        if item[3] is ThumbnailPriority.READ_AHEAD
-    } == {f"{index:04d}.jpg" for index in range(80, 100)}
-    assert {Path(path).name for path in provider.cancel_calls[-1]} == {
-        f"{index:04d}.jpg" for index in range(80, 125)
-    }
-    assert not {
-        f"{index:04d}.jpg" for index in range(125, 140)
-    }.intersection(Path(path).name for path in provider.cancel_calls[-1])
+    assert sum(item[3] is ThumbnailPriority.VISIBLE for item in reverse) == 20
+    assert sum(item[3] is ThumbnailPriority.BACKGROUND for item in reverse) == 1
+    assert Path(next(
+        item[0] for item in reverse if item[3] is ThumbnailPriority.BACKGROUND
+    )).name == "0119.jpg"
+    window._browser_workflow._pump()
+    assert sum(
+        item[3] is ThumbnailPriority.BACKGROUND for item in provider.requests
+    ) == 1
     window.close()
 
 

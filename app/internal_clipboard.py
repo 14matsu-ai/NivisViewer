@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from .browser_workflow_policy import decode_preferred_drop_effect
+
 import os
 import uuid
+import ctypes
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -32,6 +35,50 @@ class InternalClipboardSnapshot:
     @property
     def is_cut(self) -> bool:
         return self.operation is InternalClipboardOperation.CUT
+
+
+@dataclass(frozen=True)
+class ClipboardPasteReceipt:
+    """Identity of the exact clipboard state used to submit a paste."""
+
+    mime_identity: tuple[int | None, int]
+    signature: tuple[tuple[str, ...], str]
+    internal_request_identity: str | None
+    internal_generation: int | None
+    internal_paths: tuple[str, ...]
+    privately_owned: bool
+
+    @classmethod
+    def capture(
+        cls,
+        state: InternalClipboardState,
+        mime: QMimeData | None,
+    ) -> ClipboardPasteReceipt:
+        snapshot = state.snapshot if state.matches_mime(mime) else None
+        return cls(
+            InternalClipboardState.mime_identity(mime),
+            InternalClipboardState.mime_signature(mime),
+            snapshot.request_identity if snapshot is not None else None,
+            snapshot.generation if snapshot is not None else None,
+            snapshot.paths if snapshot is not None else (),
+            state.owns_mime(mime),
+        )
+
+    def matches(self, state: InternalClipboardState, mime: QMimeData | None) -> bool:
+        return (
+            self.mime_identity == state.mime_identity(mime)
+            and self.signature == state.mime_signature(mime)
+        )
+
+    def matches_internal_snapshot(self, state: InternalClipboardState) -> bool:
+        snapshot = state.snapshot
+        return bool(
+            self.internal_request_identity
+            and snapshot is not None
+            and snapshot.request_identity == self.internal_request_identity
+            and snapshot.generation == self.internal_generation
+            and snapshot.is_cut
+        )
 
 
 class InternalClipboardState:
@@ -161,26 +208,65 @@ class InternalClipboardState:
             self.path_key(path) for path in snapshot.paths
         )
 
+    def owns_mime(self, mime: QMimeData | None) -> bool:
+        """Return true only for the private marker created by this window."""
+        snapshot = self._snapshot
+        if snapshot is None or mime is None:
+            return False
+        try:
+            request_identity, generation, raw_operation, raw_paths = mime.property(
+                INTERNAL_CLIPBOARD_MARKER_PROPERTY
+            )
+            return (
+                str(request_identity) == snapshot.request_identity
+                and int(generation) == snapshot.generation
+                and InternalClipboardOperation(str(raw_operation)) is snapshot.operation
+                and tuple(self._absolute(path) for path in raw_paths) == snapshot.paths
+            )
+        except (TypeError, ValueError):
+            return False
+
+    @classmethod
+    def mime_identity(cls, mime: QMimeData | None) -> tuple[int | None, int]:
+        if mime is None:
+            return (None, 0)
+        try:
+            import shiboken6
+
+            pointer = int(shiboken6.getCppPointer(mime)[0])
+        except (ImportError, RuntimeError, TypeError, IndexError):
+            pointer = id(mime)
+        sequence: int | None = None
+        if os.name == "nt":
+            try:
+                get_sequence = ctypes.WinDLL("user32", use_last_error=True).GetClipboardSequenceNumber
+                get_sequence.argtypes = ()
+                get_sequence.restype = ctypes.c_uint32
+                sequence = int(get_sequence())
+            except (AttributeError, OSError):
+                sequence = None
+        return (sequence, pointer)
+
+    @classmethod
+    def mime_signature(cls, mime: QMimeData | None) -> tuple[tuple[str, ...], str]:
+        if mime is None:
+            return ((), "unknown")
+        paths = tuple(
+            dict.fromkeys(
+                cls.path_key(url.toLocalFile())
+                for url in mime.urls()
+                if url.isLocalFile() and url.toLocalFile()
+            )
+        )
+        return (paths, cls.preferred_drop_effect(mime))
+
     @staticmethod
     def preferred_drop_effect(mime: QMimeData | None) -> str:
         if mime is None:
             return "unknown"
-        preferred_formats = (
-            WINDOWS_PREFERRED_DROP_EFFECT_MIME,
-            "Preferred DropEffect",
-        )
-        for mime_format in preferred_formats:
-            if not mime.hasFormat(mime_format):
-                continue
-            raw = bytes(mime.data(mime_format))
-            if not raw:
-                continue
-            value = int.from_bytes(raw[:4], byteorder="little", signed=False)
-            if value & 2:
-                return "move"
-            if value & 1:
-                return "copy"
-            return f"unknown({value})"
+        for name in ('application/x-qt-windows-mime;value="Preferred DropEffect"', "Preferred DropEffect"):
+            if mime.hasFormat(name):
+                return decode_preferred_drop_effect(bytes(mime.data(name)))
         return "unspecified"
 
     @staticmethod

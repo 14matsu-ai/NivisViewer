@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .browser_workflow_settings import BrowserWorkflowSettings, gesture_help_row
+from .browser_workflow_policy import WORKFLOW_DEFAULTS
+
 from .i18n import UI_LANGUAGE_CHOICES, active_ui_language, tr
 
 
@@ -313,6 +316,7 @@ TAB_SETTING_KEYS: dict[str, tuple[str, ...]] = {
         "fullscreen_ui_hide_delay_ms",
     ),
     "browser": (
+        *WORKFLOW_DEFAULTS,
         "thumbnail_size", "thumbnail_frame_ratio", "thumbnail_crop_mode",
         "browser_thumbnail_display_mode", "browser_folder_fallback_background", "browser_file_fallback_background",
         "browser_display_density", "browser_item_spacing_x", "browser_item_spacing_y", "browser_cell_padding",
@@ -2101,6 +2105,8 @@ class SettingsDialog(QDialog):
     def _build_browser_tab(self) -> QWidget:
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
+        self.browser_workflow_settings = BrowserWorkflowSettings(tab)
+        layout.addWidget(self.browser_workflow_settings)
 
         list_group = QGroupBox(tr('一覧表示'), tab)
         list_form = QFormLayout(list_group)
@@ -2823,7 +2829,7 @@ class SettingsDialog(QDialog):
             gesture_group,
         )
         self.mouse_gestures_checkbox.toggled.connect(self._sync_gesture_controls)
-        gesture_form.addRow(self.mouse_gestures_checkbox)
+        gesture_form.addRow(gesture_help_row(self.mouse_gestures_checkbox, gesture_group, _CircularHelpButton))
         self.mouse_gesture_trail_checkbox = QCheckBox(
             tr('操作中に軌跡を表示する（Viewer・Browser共通）'),
             gesture_group,
@@ -2851,7 +2857,7 @@ class SettingsDialog(QDialog):
             tr('Browserのサムネイル一覧でフォルダージェスチャーを使用する'),
             browser_gesture_group,
         )
-        browser_gesture_layout.addWidget(self.browser_folder_gestures_checkbox)
+        browser_gesture_layout.addWidget(gesture_help_row(self.browser_folder_gestures_checkbox, browser_gesture_group, _CircularHelpButton))
         browser_gesture_description = QLabel(
             tr('上：上の階層へ移動\u3000左：前のフォルダー\u3000右：次のフォルダー\u3000下：フォルダーを更新'),
             browser_gesture_group,
@@ -2878,6 +2884,7 @@ class SettingsDialog(QDialog):
         return tab
 
     def load_current_values(self) -> None:
+        self.browser_workflow_settings.load(self.config.data)
         for key, spin in self.browser_icon_margin_spins.items():
             spin.setValue(normalize_browser_icon_margin(self.config.get(key, -1)))
         self.mouse_side_buttons_folder_navigation_checkbox.setChecked(
@@ -3790,6 +3797,7 @@ class SettingsDialog(QDialog):
             ),
             "winrar_executable": self.winrar_path_edit.text().strip().strip('"'),
             "seven_zip_executable": self.seven_zip_path_edit.text().strip().strip('"'),
+            **self.browser_workflow_settings.values(),
             "mouse_gestures_enabled": self.mouse_gestures_checkbox.isChecked(),
             "browser_folder_gestures_enabled": (
                 self.browser_folder_gestures_checkbox.isChecked()
