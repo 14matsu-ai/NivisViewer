@@ -88,8 +88,18 @@ class ExplorerListView(QListView):
         self,
         mode: object,
         custom_rows: object,
+        fixed_pixels: object = 96,
+        viewport_percent: object = 50,
     ) -> None:
-        self._wheel_scroll.configure(mode, custom_rows)
+        self._wheel_scroll.configure(
+            mode,
+            custom_rows,
+            fixed_pixels,
+            viewport_percent,
+        )
+
+    def reset_wheel_scroll_remainder(self) -> None:
+        self._wheel_scroll.reset()
 
     @property
     def wheel_scroll_mode(self) -> str:
@@ -99,6 +109,14 @@ class ExplorerListView(QListView):
     def wheel_scroll_custom_rows(self) -> int:
         return self._wheel_scroll.custom_rows
 
+    @property
+    def wheel_scroll_fixed_pixels(self) -> float:
+        return self._wheel_scroll.fixed_pixels
+
+    @property
+    def wheel_scroll_viewport_percent(self) -> float:
+        return self._wheel_scroll.viewport_percent
+
     def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
         # Pixel deltas are already device/gesture-native. Keep Qt's smooth
         # touchpad path intact and customize only vertical angle-wheel input.
@@ -106,18 +124,43 @@ class ExplorerListView(QListView):
             self._wheel_scroll.mode == "system"
             or not event.pixelDelta().isNull()
             or event.angleDelta().y() == 0
-            or bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            or event.angleDelta().x() != 0
+            or event.modifiers() != Qt.KeyboardModifier.NoModifier
         ):
+            if self._wheel_scroll.mode != "system":
+                self._wheel_scroll.reset()
             super().wheelEvent(event)
             return
 
+        scrollbar = self.verticalScrollBar()
+        angle_delta_y = event.angleDelta().y()
+        if (
+            (scrollbar.value() <= scrollbar.minimum() and angle_delta_y > 0)
+            or (scrollbar.value() >= scrollbar.maximum() and angle_delta_y < 0)
+        ):
+            # Outward movement at either limit is discarded. Do not retain a
+            # fraction that could cancel the first later wheel event inward.
+            self._wheel_scroll.reset()
+            event.accept()
+            return
+
         movement = self._wheel_scroll.consume_angle_delta(
-            event.angleDelta().y(),
+            angle_delta_y,
             self.gridSize().height(),
+            self.viewport().height(),
         )
         if movement:
-            scrollbar = self.verticalScrollBar()
-            scrollbar.setValue(scrollbar.value() + movement)
+            previous_value = scrollbar.value()
+            scrollbar.setValue(previous_value + movement)
+            current_value = scrollbar.value()
+            if (
+                current_value - previous_value != movement
+                or current_value <= scrollbar.minimum()
+                or current_value >= scrollbar.maximum()
+            ):
+                # Discard fractions both when clipped and when this event lands
+                # exactly on an endpoint; either fraction can swallow reversal.
+                self._wheel_scroll.reset()
         event.accept()
 
     def ensure_viewport_drop_target(self) -> None:

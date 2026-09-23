@@ -1,23 +1,27 @@
 from __future__ import annotations
 
 import logging
+import os
 import zipfile
+import time
 from collections import OrderedDict
 from pathlib import Path
 from threading import Event
 
 import pytest
 from PIL import Image
+from PySide6.QtCore import QRunnable
 from PySide6.QtGui import QImage
 from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import QApplication
 
 from app.browser_model import BrowserItem, BrowserItemKind
 from app.file_preview import PreviewResultKind
-from app.thumbnail_provider import BrowserThumbnailProvider
+from app.thumbnail_provider import BrowserThumbnailProvider, ThumbnailLoadResult
 from app.browser_thumbnail_scheduler import ThumbnailPriority
-from app.thumbnail_disk_cache import ThumbnailDiskCache
-from app.thumbnail_render import ThumbnailRenderSpec
+from app.thumbnail_disk_cache import ThumbnailDiskCache, ThumbnailSourceIdentity
+from app import thumbnail_render as thumbnail_render_module
+from app.thumbnail_render import ThumbnailRenderSpec, render_pil_thumbnail
 
 
 def write_image(path: Path, *, color: str = "white") -> None:
@@ -28,6 +32,120 @@ def write_image(path: Path, *, color: str = "white") -> None:
 
 def make_item(path: Path, kind: BrowserItemKind) -> BrowserItem:
     return BrowserItem(path.name, path, kind, path.stat().st_mtime)
+
+
+def _wait_for_spy(spy: QSignalSpy, qapp: QApplication, timeout_ms: int = 3000) -> bool:
+    deadline = time.monotonic() + timeout_ms / 1000
+    while spy.count() == 0 and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.002)
+    qapp.processEvents()
+    return spy.count() > 0
+
+
+def test_generation_change_clears_queued_cache_maintenance_and_allows_retry(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    disk_cache = ThumbnailDiskCache(tmp_path / "queued-maintenance-cache")
+    provider = BrowserThumbnailProvider(disk_cache=disk_cache)
+    lane_started = Event()
+    release_lane = Event()
+    maintenance_calls: list[bool] = []
+
+    class BlockingRunnable(QRunnable):
+        def run(self) -> None:
+            lane_started.set()
+            release_lane.wait(5)
+
+    def record_maintenance(*, force: bool = False) -> bool:
+        maintenance_calls.append(force)
+        return True
+
+    disk_cache.cleanup_if_due = record_maintenance  # type: ignore[method-assign]
+    try:
+        provider._pool.start(BlockingRunnable())
+        assert lane_started.wait(2)
+        assert provider.cleanup_caches_async(force=True)
+        queued_worker = provider._maintenance_worker
+        assert queued_worker is not None
+        assert not queued_worker.run_started.is_set()
+        assert provider._maintenance_running
+
+        provider.begin_generation()
+        assert not provider._maintenance_running
+        assert provider._maintenance_worker is None
+
+        release_lane.set()
+        assert provider._pool.waitForDone(3000)
+        assert maintenance_calls == []
+
+        assert provider.cleanup_caches_async(force=True)
+        assert provider.wait_for_done(3000)
+        qapp.processEvents()
+        assert maintenance_calls == [True]
+        assert not provider._maintenance_running
+    finally:
+        release_lane.set()
+        provider.close(wait_msecs=1000)
+        qapp.processEvents()
+
+
+def test_running_cache_maintenance_remains_single_flight_across_generation_change(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    disk_cache = ThumbnailDiskCache(tmp_path / "running-maintenance-cache")
+    provider = BrowserThumbnailProvider(disk_cache=disk_cache)
+    maintenance_started = Event()
+    release_maintenance = Event()
+    calls: list[bool] = []
+    active = 0
+    maximum_active = 0
+
+    def controlled_maintenance(*, force: bool = False) -> bool:
+        nonlocal active, maximum_active
+        calls.append(force)
+        active += 1
+        maximum_active = max(maximum_active, active)
+        try:
+            if len(calls) == 1:
+                maintenance_started.set()
+                release_maintenance.wait(5)
+            return True
+        finally:
+            active -= 1
+
+    disk_cache.cleanup_if_due = controlled_maintenance  # type: ignore[method-assign]
+    try:
+        assert provider.cleanup_caches_async(force=True)
+        assert maintenance_started.wait(2)
+        running_worker = provider._maintenance_worker
+        assert running_worker is not None
+        assert running_worker.run_started.is_set()
+        assert provider._maintenance_running
+
+        provider.begin_generation()
+        assert provider._maintenance_running
+        assert not provider.cleanup_caches_async(force=True)
+        assert calls == [True]
+        assert maximum_active == 1
+
+        release_maintenance.set()
+        assert provider.wait_for_done(3000)
+        qapp.processEvents()
+        assert not provider._maintenance_running
+
+        assert provider.cleanup_caches_async(force=True)
+        assert provider.wait_for_done(3000)
+        qapp.processEvents()
+        assert calls == [True, True]
+        assert maximum_active == 1
+        assert not provider._maintenance_running
+    finally:
+        release_maintenance.set()
+        provider.close(wait_msecs=1000)
+        qapp.processEvents()
 
 
 def test_loads_image_folder_and_archive_thumbnails_with_unicode_paths(
@@ -213,6 +331,8 @@ def test_background_generation_decodes_folder_and_zip_into_disk_cache(
         assert provider.request_background(item, spec, generation=generation) == "queued"
         assert provider.wait_for_done(5000)
         qapp.processEvents()
+        assert provider.wait_for_done(5000)
+        qapp.processEvents()
         stats = provider.cache_statistics()
         assert stats["generated_background"] >= 1
         assert stats["disk_saved_background"] >= 1
@@ -245,6 +365,8 @@ def test_page_count_completion_releases_background_capacity(
     generation = provider.begin_generation()
 
     assert provider.request_page_count(item, generation=generation)
+    assert provider.wait_for_done(5000)
+    qapp.processEvents()
     assert provider.wait_for_done(5000)
     qapp.processEvents()
 
@@ -315,6 +437,8 @@ def test_cancelling_queued_thumbnail_releases_background_capacity(
     assert provider.pending_count == 1
 
     release_loader.set()
+    assert provider.wait_for_done(5000)
+    qapp.processEvents()
     assert provider.wait_for_done(5000)
     qapp.processEvents()
     assert provider.pending_count == 0
@@ -487,6 +611,8 @@ def test_background_thumbnail_survives_failed_disk_write_in_ram(tmp_path, qapp):
     provider.set_cache_retention_priorities([(item.path, item.thumbnail_revision, 2)])
 
     assert provider.request_background(item, spec, generation=generation) == "queued"
+    assert provider.wait_for_done(5000)
+    qapp.processEvents()
     assert provider.wait_for_done(5000)
     qapp.processEvents()
 
@@ -897,6 +1023,7 @@ def test_read_ahead_persists_to_existing_disk_cache_for_next_visible_hit(
     )
     assert first_provider.wait_for_done(2000)
     qapp.processEvents()
+    assert first_provider.wait_for_done(5000)
     first_stats = first_provider.cache_statistics()
     assert first_stats["disk_saved_read_ahead"] == 1
     first_provider.close()
@@ -948,6 +1075,7 @@ def test_background_replenishment_reads_disk_without_source_decode(
     assert writer.request_background(item, spec, generation=generation) == "queued"
     assert writer.wait_for_done(5000)
     qapp.processEvents()
+    assert writer.wait_for_done(5000)
     assert writer.cache_statistics()["disk_saved_background"] == 1
     writer.close()
 
@@ -1105,6 +1233,377 @@ def test_loader_exception_finishes_once_clears_pending_and_can_retry(
     assert states.at(1)[2] == PreviewResultKind.READY.value
     assert ready.count() == 1
     provider.close()
+
+
+def test_slow_disk_persistence_cannot_withhold_ready_thumbnail(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "slow-save.jpg"
+    write_image(source)
+    item = make_item(source, BrowserItemKind.IMAGE)
+    disk_cache = ThumbnailDiskCache(tmp_path / "thumbnail-cache")
+    original_put = disk_cache.put
+    save_started = Event()
+    release_save = Event()
+
+    def slow_put(*args, **kwargs):
+        save_started.set()
+        release_save.wait(3)
+        return original_put(*args, **kwargs)
+
+    monkeypatch.setattr(disk_cache, "put", slow_put)
+
+    def loader(_item: BrowserItem, _size: int) -> QImage:
+        image = QImage(32, 32, QImage.Format.Format_RGBA8888)
+        image.fill(0xFF336699)
+        return image
+
+    provider = BrowserThumbnailProvider(loader=loader, disk_cache=disk_cache)
+    ready = QSignalSpy(provider.thumbnail_ready)
+    generation = provider.begin_generation()
+    spec = ThumbnailRenderSpec.from_settings(96, "square_1_1", "letterbox")
+    assert provider.request(item, spec, generation=generation)
+
+    assert _wait_for_spy(ready, qapp, 2000)
+    assert save_started.wait(1)
+    assert ready.count() == 1
+    assert not release_save.is_set()
+    release_save.set()
+    assert provider.wait_for_done(5000)
+    qapp.processEvents()
+    assert provider.cache_statistics()["disk_saved"] == 1
+    provider.close()
+
+
+def test_deferred_save_does_not_cache_pixels_for_a_newer_source(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "deferred-source.jpg"
+    write_image(source, color="red")
+    # Deliberately omit file_size/modified_time_ns as can happen for an item
+    # supplied by callers that have not retained scan metadata.
+    item = BrowserItem(source.name, source, BrowserItemKind.IMAGE, source.stat().st_mtime)
+    disk_cache = ThumbnailDiskCache(tmp_path / "thumbnail-cache")
+    original_put = disk_cache.put
+    save_started = Event()
+    release_save = Event()
+
+    def paused_put(*args, **kwargs):
+        save_started.set()
+        release_save.wait(3)
+        return original_put(*args, **kwargs)
+
+    monkeypatch.setattr(disk_cache, "put", paused_put)
+
+    def loader(_item: BrowserItem, _size: int) -> QImage:
+        image = QImage(24, 24, QImage.Format.Format_RGBA8888)
+        image.fill(0xFFFF0000)
+        return image
+
+    provider = BrowserThumbnailProvider(loader=loader, disk_cache=disk_cache)
+    ready = QSignalSpy(provider.thumbnail_ready)
+    generation = provider.begin_generation()
+    spec = ThumbnailRenderSpec.from_settings(96, "square_1_1", "letterbox")
+    assert provider.request(item, spec, generation=generation)
+    assert _wait_for_spy(ready, qapp, 2000)
+    assert save_started.wait(1)
+
+    old_mtime_ns = source.stat().st_mtime_ns
+    write_image(source, color="blue")
+    os.utime(source, ns=(old_mtime_ns + 2_000_000_000, old_mtime_ns + 2_000_000_000))
+    release_save.set()
+
+    assert provider.wait_for_done(5000)
+    qapp.processEvents()
+    assert disk_cache.get_suitable(make_item(source, BrowserItemKind.IMAGE), spec) is None
+    assert provider.cache_statistics()["disk_saved"] == 0
+    provider.close()
+
+
+def test_deferred_folder_save_does_not_cache_pixels_for_a_newer_cover(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "deferred-folder"
+    cover = folder / "cover.jpg"
+    write_image(cover, color="red")
+    item = make_item(folder, BrowserItemKind.FOLDER)
+    disk_cache = ThumbnailDiskCache(tmp_path / "thumbnail-cache")
+    original_put = disk_cache.put
+    save_started = Event()
+    release_save = Event()
+
+    def paused_put(*args, **kwargs):
+        save_started.set()
+        release_save.wait(3)
+        return original_put(*args, **kwargs)
+
+    def decoded_cover(*_args, **_kwargs):
+        image = QImage(24, 24, QImage.Format.Format_RGBA8888)
+        image.fill(0xFFFF0000)
+        return image
+
+    monkeypatch.setattr(disk_cache, "put", paused_put)
+    monkeypatch.setattr(
+        BrowserThumbnailProvider,
+        "_load_image_path",
+        staticmethod(decoded_cover),
+    )
+    provider = BrowserThumbnailProvider(disk_cache=disk_cache)
+    ready = QSignalSpy(provider.thumbnail_ready)
+    generation = provider.begin_generation()
+    spec = ThumbnailRenderSpec.from_settings(96, "square_1_1", "letterbox")
+    assert provider.request(item, spec, generation=generation)
+    assert _wait_for_spy(ready, qapp, 2000)
+    assert save_started.wait(1)
+
+    old_mtime_ns = cover.stat().st_mtime_ns
+    write_image(cover, color="blue")
+    os.utime(cover, ns=(old_mtime_ns + 2_000_000_000, old_mtime_ns + 2_000_000_000))
+    release_save.set()
+
+    assert provider.wait_for_done(5000)
+    qapp.processEvents()
+    assert disk_cache.get_suitable(make_item(folder, BrowserItemKind.FOLDER), spec) is None
+    assert provider.cache_statistics()["disk_saved"] == 0
+    provider.close()
+
+
+def test_duplicate_deferred_saves_coalesce_by_source_and_render_spec(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "duplicate-save.jpg"
+    write_image(source)
+    item = make_item(source, BrowserItemKind.IMAGE)
+    disk_cache = ThumbnailDiskCache(tmp_path / "thumbnail-cache")
+    original_put = disk_cache.put
+    save_started = Event()
+    release_save = Event()
+    put_calls = 0
+
+    def paused_put(*args, **kwargs):
+        nonlocal put_calls
+        put_calls += 1
+        save_started.set()
+        release_save.wait(3)
+        return original_put(*args, **kwargs)
+
+    monkeypatch.setattr(disk_cache, "put", paused_put)
+    provider = BrowserThumbnailProvider(loader=lambda *_: None, disk_cache=disk_cache)
+    spec = ThumbnailRenderSpec.from_settings(96, "square_1_1", "letterbox")
+    image = QImage(24, 24, QImage.Format.Format_RGBA8888)
+    image.fill(0xFF336699)
+    source_identity = ThumbnailSourceIdentity.capture(item)
+    assert source_identity is not None
+    result = ThumbnailLoadResult(image, source_identity=source_identity)
+
+    assert provider._queue_thumbnail_save(
+        item, spec, result, ThumbnailPriority.BACKGROUND
+    )
+    assert save_started.wait(1)
+    assert provider._queue_thumbnail_save(
+        item, spec, result, ThumbnailPriority.VISIBLE
+    )
+    release_save.set()
+
+    assert provider.wait_for_done(5000)
+    assert put_calls == 1
+    assert provider.cache_statistics()["disk_saved"] == 1
+    provider.close()
+
+
+def test_cache_clear_invalidates_a_save_already_waiting_to_encode(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "clear-race.jpg"
+    write_image(source)
+    item = make_item(source, BrowserItemKind.IMAGE)
+    disk_cache = ThumbnailDiskCache(tmp_path / "thumbnail-cache")
+    original_put = disk_cache.put
+    save_started = Event()
+    release_save = Event()
+
+    def slow_put(*args, **kwargs):
+        save_started.set()
+        release_save.wait(3)
+        return original_put(*args, **kwargs)
+
+    monkeypatch.setattr(disk_cache, "put", slow_put)
+
+    def loader(_item: BrowserItem, _size: int) -> QImage:
+        image = QImage(24, 24, QImage.Format.Format_RGBA8888)
+        image.fill(0xFFAA5500)
+        return image
+
+    provider = BrowserThumbnailProvider(loader=loader, disk_cache=disk_cache)
+    ready = QSignalSpy(provider.thumbnail_ready)
+    generation = provider.begin_generation()
+    spec = ThumbnailRenderSpec.from_settings(96, "square_1_1", "letterbox")
+    assert provider.request(item, spec, generation=generation)
+    assert _wait_for_spy(ready, qapp, 2000)
+    assert save_started.wait(1)
+
+    cleared = QSignalSpy(provider.cache_cleared)
+    provider.clear_all_caches_async()
+    release_save.set()
+    assert _wait_for_spy(cleared, qapp, 3000)
+    assert provider.wait_for_done(3000)
+    qapp.processEvents()
+    assert disk_cache.usage_bytes() == 0
+    provider.close()
+
+
+def test_folder_and_zip_fallback_stop_between_candidates_when_cancelled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "cancel-folder"
+    write_image(folder / "01.jpg")
+    write_image(folder / "02.jpg")
+    folder_cancel = Event()
+    folder_attempts: list[Path] = []
+
+    def cancel_folder_candidate(path, *_args, **_kwargs):
+        folder_attempts.append(path)
+        folder_cancel.set()
+        return None
+
+    monkeypatch.setattr(
+        BrowserThumbnailProvider,
+        "_load_image_path",
+        staticmethod(cancel_folder_candidate),
+    )
+    spec = ThumbnailRenderSpec.from_settings(96, "square_1_1", "letterbox")
+    folder_result = BrowserThumbnailProvider.load_thumbnail_result(
+        make_item(folder, BrowserItemKind.FOLDER),
+        spec,
+        cancel_token=folder_cancel,
+    )
+    assert folder_result.resolved_kind is PreviewResultKind.CANCELLED
+    assert len(folder_attempts) == 1
+
+    archive = tmp_path / "cancel.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.write(folder / "01.jpg", "01.jpg")
+        output.write(folder / "02.jpg", "02.jpg")
+    archive_cancel = Event()
+    render_attempts: list[str] = []
+
+    def cancel_archive_render(*_args, **_kwargs):
+        render_attempts.append("first")
+        archive_cancel.set()
+        raise OSError("simulate an unreadable first archive image")
+
+    monkeypatch.setattr(
+        BrowserThumbnailProvider,
+        "_render_image",
+        staticmethod(cancel_archive_render),
+    )
+    archive_result = BrowserThumbnailProvider.load_thumbnail_result(
+        make_item(archive, BrowserItemKind.ARCHIVE),
+        spec,
+        cancel_token=archive_cancel,
+    )
+    assert archive_result.resolved_kind is PreviewResultKind.CANCELLED
+    assert len(render_attempts) == 1
+
+
+def test_zip_thumbnail_skips_unreadable_first_member_and_uses_next_image(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "fallback.zip"
+    valid_image = tmp_path / "valid.png"
+    write_image(valid_image)
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("00-unreadable.jpg", b"not an image")
+        output.write(valid_image, "01-valid.png")
+
+    spec = ThumbnailRenderSpec.from_settings(96, "square_1_1", "letterbox")
+    result = BrowserThumbnailProvider.load_thumbnail_result(
+        make_item(archive, BrowserItemKind.ARCHIVE),
+        spec,
+    )
+
+    assert result.image is not None and not result.image.isNull()
+    assert result.entry_path == "01-valid.png"
+    assert result.page_count == 2
+
+
+def test_zip_jpeg_uses_draft_decode_before_full_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "large-archive-entry.jpg"
+    with Image.new("RGB", (3000, 4200), "#426b8f") as image:
+        image.save(source, format="JPEG", quality=90)
+    archive = tmp_path / "large-entry.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        output.write(source, "large-entry.jpg")
+
+    observed_sizes: list[tuple[int, int]] = []
+    original_draft = thumbnail_render_module._draft_jpeg_before_copy
+
+    def record_draft(image, spec, normalized_crop):
+        changed = original_draft(image, spec, normalized_crop)
+        observed_sizes.append(image.size)
+        return changed
+
+    monkeypatch.setattr(
+        thumbnail_render_module,
+        "_draft_jpeg_before_copy",
+        record_draft,
+    )
+    spec = ThumbnailRenderSpec.from_settings(
+        256,
+        "square_1_1",
+        "letterbox",
+        quality_mode="high",
+    )
+    result = BrowserThumbnailProvider.load_thumbnail_result(
+        make_item(archive, BrowserItemKind.ARCHIVE),
+        spec,
+    )
+
+    assert result.image is not None and not result.image.isNull()
+    assert observed_sizes
+    assert observed_sizes[0] != (3000, 4200)
+
+
+@pytest.mark.parametrize("orientation", [6, 8])
+def test_jpeg_draft_precedes_copy_and_preserves_oriented_target_size(
+    tmp_path: Path,
+    qapp: QApplication,
+    orientation: int,
+) -> None:
+    source = tmp_path / f"oriented-large-{orientation}.jpg"
+    exif = Image.Exif()
+    exif[274] = orientation
+    with Image.new("RGB", (2400, 3600), "#336699") as image:
+        image.save(source, format="JPEG", quality=92, exif=exif)
+    spec = ThumbnailRenderSpec.from_settings(
+        256,
+        "portrait_1_sqrt2",
+        "smart_crop",
+        max_edge=512,
+    )
+    with Image.open(source) as image:
+        original_size = image.size
+        rendered, crop = render_pil_thumbnail(image, spec)
+        assert image.size != original_size
+    assert (rendered.width(), rendered.height()) == (
+        spec.frame_width,
+        spec.frame_height,
+    )
+    assert crop is not None
 
 
 def test_loader_exception_from_stale_generation_is_not_applied(

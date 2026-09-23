@@ -12,7 +12,7 @@ from PySide6.QtCore import QRectF, QSize
 from PySide6.QtGui import QColor, QImage
 
 
-THUMBNAIL_IMPLEMENTATION_VERSION = 3
+THUMBNAIL_IMPLEMENTATION_VERSION = 4
 THUMBNAIL_RENDER_POLICY_VERSION = 1
 SMART_CROP_ALGORITHM_VERSION = 1
 THUMBNAIL_SIZE_BUCKETS = (
@@ -481,12 +481,63 @@ def detect_smart_crop(
         return normalized_center_crop(image.size, target_size)
 
 
+def _draft_jpeg_before_copy(
+    image: Image.Image,
+    spec: ThumbnailRenderSpec,
+    normalized_crop: tuple[float, float, float, float] | None,
+) -> bool:
+    """Ask Pillow's lazy JPEG decoder for a 2x-quality source before copying."""
+    if image.format != "JPEG":
+        return False
+    try:
+        image.seek(0)
+        source_width, source_height = image.size
+        if source_width <= 0 or source_height <= 0:
+            return False
+        orientation = int(image.getexif().get(274, 1))
+        swaps_axes = orientation in {5, 6, 7, 8}
+        oriented_size = (
+            (source_height, source_width)
+            if swaps_axes
+            else (source_width, source_height)
+        )
+        target = (spec.frame_width, spec.frame_height)
+        if spec.crop_mode == "letterbox":
+            visible = (1.0, 1.0)
+        else:
+            crop = normalized_crop or normalized_center_crop(oriented_size, target)
+            visible = (
+                max(1e-6, min(1.0, float(crop[2]))),
+                max(1e-6, min(1.0, float(crop[3]))),
+            )
+        scale = max(
+            (target[0] * 2.0) / (oriented_size[0] * visible[0]),
+            (target[1] * 2.0) / (oriented_size[1] * visible[1]),
+        )
+        if scale >= 0.8:
+            return False
+        requested_oriented = (
+            max(1, int(math.ceil(oriented_size[0] * scale))),
+            max(1, int(math.ceil(oriented_size[1] * scale))),
+        )
+        requested_source = (
+            (requested_oriented[1], requested_oriented[0])
+            if swaps_axes
+            else requested_oriented
+        )
+        image.draft(None, requested_source)
+        return image.size != (source_width, source_height)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def render_pil_thumbnail(
     image: Image.Image,
     spec: ThumbnailRenderSpec,
     *,
     normalized_crop: tuple[float, float, float, float] | None = None,
 ) -> tuple[QImage, tuple[float, float, float, float] | None]:
+    _draft_jpeg_before_copy(image, spec, normalized_crop)
     frame = image.copy()
     frame.seek(0)
     prepared = ImageOps.exif_transpose(frame)

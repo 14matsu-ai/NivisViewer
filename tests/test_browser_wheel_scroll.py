@@ -20,15 +20,17 @@ def _wheel_event(
     target,
     *,
     angle_y: int = 0,
+    angle_x: int = 0,
     pixel_y: int = 0,
+    modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier,
 ) -> QWheelEvent:
     return QWheelEvent(
         QPointF(10, 10),
         QPointF(target.mapToGlobal(QPoint(10, 10))),
         QPoint(0, pixel_y),
-        QPoint(0, angle_y),
+        QPoint(angle_x, angle_y),
         Qt.MouseButton.NoButton,
-        Qt.KeyboardModifier.NoModifier,
+        modifiers,
         Qt.ScrollPhase.ScrollUpdate,
         False,
     )
@@ -40,6 +42,8 @@ def _scroll_view(
     mode: str = "system",
     custom_rows: int = 3,
     row_height: int = 100,
+    fixed_pixels: float = 96,
+    viewport_percent: float = 50,
 ) -> ExplorerListView:
     view = ExplorerListView()
     view.setViewMode(QListView.ViewMode.IconMode)
@@ -53,7 +57,12 @@ def _scroll_view(
     view.show()
     qapp.processEvents()
     view.verticalScrollBar().setValue(view.verticalScrollBar().maximum() // 2)
-    view.set_wheel_scroll_policy(mode, custom_rows)
+    view.set_wheel_scroll_policy(
+        mode,
+        custom_rows,
+        fixed_pixels,
+        viewport_percent,
+    )
     return view
 
 
@@ -160,6 +169,128 @@ def test_custom_rows_and_partial_angle_deltas_are_accumulated(
     high_resolution.close()
 
 
+def test_fixed_logical_pixels_and_viewport_percentage_modes(qapp: QApplication) -> None:
+    fixed = _scroll_view(qapp, mode="pixels", fixed_pixels=96)
+    assert _wheel_distance(fixed) == 96
+    fixed.set_wheel_scroll_policy("pixels", 3, 160, 50)
+    assert _wheel_distance(fixed) == 160
+    fixed.close()
+
+    viewport = _scroll_view(qapp, mode="viewport", viewport_percent=25)
+    height = viewport.viewport().height()
+    assert _wheel_distance(viewport) == int(height * 0.25)
+    viewport.set_wheel_scroll_policy("viewport", 3, 96, 100)
+    assert _wheel_distance(viewport) == height
+    viewport.close()
+
+
+def test_geometry_changes_reset_fractional_remainder_and_boundary_reversal(
+    qapp: QApplication,
+) -> None:
+    accumulator = BrowserWheelScrollAccumulator("viewport", 3, 96, 50)
+    assert accumulator.consume_angle_delta(-60, 100, 201) == 50
+    assert accumulator.pixel_remainder == 0.25
+    assert accumulator.consume_angle_delta(-60, 100, 301) == 75
+    assert accumulator.pixel_remainder == 0.25
+    fixed = BrowserWheelScrollAccumulator("pixels", 3, 96)
+    assert fixed.consume_angle_delta(1, 100, 200) == 0
+    assert fixed.pixel_remainder != 0
+    fixed.reset()
+    assert fixed.pixel_remainder == 0
+
+    view = _scroll_view(qapp, mode="pixels", fixed_pixels=96)
+    scrollbar = view.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum() - 2)
+    view.wheelEvent(_wheel_event(view.viewport(), angle_y=-120))
+    assert scrollbar.value() == scrollbar.maximum()
+    view.wheelEvent(_wheel_event(view.viewport(), angle_y=120))
+    assert scrollbar.value() == scrollbar.maximum() - 96
+    view.wheelEvent(_wheel_event(view.viewport(), angle_y=1))
+    assert view._wheel_scroll.pixel_remainder != 0
+    view.wheelEvent(_wheel_event(view.viewport(), pixel_y=-12))
+    assert view._wheel_scroll.pixel_remainder == 0
+    view.close()
+
+
+def test_scrollbar_boundary_discards_fractional_and_clipped_wheel_motion(
+    qapp: QApplication,
+) -> None:
+    view = _scroll_view(qapp, mode="pixels", fixed_pixels=1)
+    scrollbar = view.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum())
+
+    view.wheelEvent(_wheel_event(view.viewport(), angle_y=-60))
+    assert scrollbar.value() == scrollbar.maximum()
+    assert view._wheel_scroll.pixel_remainder == 0
+    view.wheelEvent(_wheel_event(view.viewport(), angle_y=120))
+    assert scrollbar.value() == scrollbar.maximum() - 1
+
+    scrollbar.setValue(scrollbar.minimum())
+    view.wheelEvent(_wheel_event(view.viewport(), angle_y=60))
+    assert scrollbar.value() == scrollbar.minimum()
+    assert view._wheel_scroll.pixel_remainder == 0
+    view.wheelEvent(_wheel_event(view.viewport(), angle_y=-120))
+    assert scrollbar.value() == scrollbar.minimum() + 1
+
+    scrollbar.setValue(scrollbar.maximum() - 1)
+    view.set_wheel_scroll_policy("pixels", 3, 3)
+    view.wheelEvent(_wheel_event(view.viewport(), angle_y=-120))
+    assert scrollbar.value() == scrollbar.maximum()
+    assert view._wheel_scroll.pixel_remainder == 0
+    view.wheelEvent(_wheel_event(view.viewport(), angle_y=120))
+    assert scrollbar.value() == scrollbar.maximum() - 3
+    view.close()
+
+
+def test_exact_arrival_at_scrollbar_boundary_does_not_swallow_reversal(
+    qapp: QApplication,
+) -> None:
+    view = _scroll_view(qapp, mode="pixels", fixed_pixels=1)
+    scrollbar = view.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum() - 1)
+
+    view.wheelEvent(_wheel_event(view.viewport(), angle_y=-180))
+    assert scrollbar.value() == scrollbar.maximum()
+    assert view._wheel_scroll.pixel_remainder == 0
+    view.wheelEvent(_wheel_event(view.viewport(), angle_y=120))
+    assert scrollbar.value() == scrollbar.maximum() - 1
+
+    scrollbar.setValue((scrollbar.minimum() + scrollbar.maximum()) // 2)
+    middle_start = scrollbar.value()
+    view.wheelEvent(_wheel_event(view.viewport(), angle_y=-60))
+    assert scrollbar.value() == middle_start
+    assert view._wheel_scroll.pixel_remainder == 0.5
+    view.wheelEvent(_wheel_event(view.viewport(), angle_y=-60))
+    assert scrollbar.value() == middle_start + 1
+    assert view._wheel_scroll.pixel_remainder == 0
+    view.close()
+
+
+def test_modified_and_horizontal_angle_wheels_keep_qt_ownership(
+    qapp: QApplication,
+) -> None:
+    qt_view = _plain_system_view(qapp)
+    custom_view = _scroll_view(qapp, mode="pixels", fixed_pixels=300)
+    qt_before = qt_view.verticalScrollBar().value()
+    custom_before = custom_view.verticalScrollBar().value()
+    qt_view.wheelEvent(_wheel_event(qt_view.viewport(), angle_y=-120,
+                                    modifiers=Qt.KeyboardModifier.ControlModifier))
+    custom_view.wheelEvent(_wheel_event(custom_view.viewport(), angle_y=-120,
+                                        modifiers=Qt.KeyboardModifier.ControlModifier))
+    assert custom_view.verticalScrollBar().value() - custom_before == (
+        qt_view.verticalScrollBar().value() - qt_before
+    )
+    qt_before = qt_view.verticalScrollBar().value()
+    custom_before = custom_view.verticalScrollBar().value()
+    qt_view.wheelEvent(_wheel_event(qt_view.viewport(), angle_x=120))
+    custom_view.wheelEvent(_wheel_event(custom_view.viewport(), angle_x=120))
+    assert custom_view.verticalScrollBar().value() - custom_before == (
+        qt_view.verticalScrollBar().value() - qt_before
+    )
+    qt_view.close()
+    custom_view.close()
+
+
 def test_wheel_config_persists_and_clamps_invalid_custom_rows(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     config = ConfigManager(path)
@@ -183,6 +314,10 @@ def test_wheel_config_persists_and_clamps_invalid_custom_rows(tmp_path: Path) ->
     assert restored.get("browser_wheel_scroll_custom_rows") == 12
     restored.apply({"browser_wheel_scroll_mode": "unknown"})
     assert restored.get("browser_wheel_scroll_mode") == "system"
+    restored.apply({"browser_wheel_scroll_mode": "pixels", "browser_wheel_scroll_fixed_pixels": float("nan")})
+    assert restored.get("browser_wheel_scroll_fixed_pixels") == 96
+    restored.apply({"browser_wheel_scroll_viewport_percent": float("inf")})
+    assert restored.get("browser_wheel_scroll_viewport_percent") == 50
 
 
 def test_settings_dialog_exposes_custom_rows_and_restores_system_default(
@@ -214,7 +349,8 @@ def test_settings_dialog_exposes_custom_rows_and_restores_system_default(
     assert [
         dialog.browser_wheel_scroll_mode_combo.itemText(index)
         for index in range(dialog.browser_wheel_scroll_mode_combo.count())
-    ] == ["System / Default", "Small", "Medium", "Large", "Custom"]
+    ] == ["System / Default", "Small", "Medium", "Large", "Custom",
+          "Fixed logical pixels", "Viewport percentage"]
     browser_page = dialog.tabs.widget(1).widget()
     mouse_scroll = dialog.tabs.widget(mouse_tab_index)
     mouse_page = mouse_scroll.widget()
@@ -239,11 +375,15 @@ def test_settings_dialog_exposes_custom_rows_and_restores_system_default(
     assert dialog.browser_wheel_scroll_mode_combo.currentData() == "custom"
     assert dialog.browser_wheel_scroll_custom_spin.value() == 8
     assert dialog.browser_wheel_scroll_custom_spin.isEnabled()
+    assert not dialog.browser_wheel_scroll_pixels_spin.isEnabled()
+    assert not dialog.browser_wheel_scroll_viewport_spin.isEnabled()
     dialog._restore_browser_wheel_scroll_default()
     values = dialog.values()
     assert values["browser_wheel_scroll_mode"] == "system"
     assert values["browser_wheel_scroll_custom_rows"] == 3
     assert not dialog.browser_wheel_scroll_custom_spin.isEnabled()
+    assert dialog.browser_wheel_scroll_pixels_spin.value() == 96
+    assert dialog.browser_wheel_scroll_viewport_spin.value() == 50
     default_changed = dialog.apply_settings()
     assert default_changed["browser_wheel_scroll_mode"] == "system"
     assert default_changed["browser_wheel_scroll_custom_rows"] == 3
@@ -257,6 +397,20 @@ def test_settings_dialog_exposes_custom_rows_and_restores_system_default(
     restored.load()
     assert restored.get("browser_wheel_scroll_mode") == "custom"
     assert restored.get("browser_wheel_scroll_custom_rows") == 6
+    pixels_index = dialog.browser_wheel_scroll_mode_combo.findData("pixels")
+    dialog.browser_wheel_scroll_mode_combo.setCurrentIndex(pixels_index)
+    dialog.browser_wheel_scroll_pixels_spin.setValue(160)
+    changed_pixels = dialog.apply_settings()
+    assert changed_pixels["browser_wheel_scroll_mode"] == "pixels"
+    assert changed_pixels["browser_wheel_scroll_fixed_pixels"] == 160
+    restored.load()
+    assert restored.get("browser_wheel_scroll_mode") == "pixels"
+    assert restored.get("browser_wheel_scroll_fixed_pixels") == 160
+    viewport_index = dialog.browser_wheel_scroll_mode_combo.findData("viewport")
+    dialog.browser_wheel_scroll_mode_combo.setCurrentIndex(viewport_index)
+    dialog.browser_wheel_scroll_viewport_spin.setValue(25)
+    changed_viewport = dialog.apply_settings()
+    assert changed_viewport["browser_wheel_scroll_viewport_percent"] == 25
     dialog.close()
     qapp.processEvents()
 
@@ -364,18 +518,54 @@ def test_live_browser_wheel_setting_has_no_scan_decode_or_generation_side_effect
 
     config.apply(
         {
-            "browser_wheel_scroll_mode": "large",
+            "browser_wheel_scroll_mode": "pixels",
             "browser_wheel_scroll_custom_rows": 11,
+            "browser_wheel_scroll_fixed_pixels": 160,
+            "browser_wheel_scroll_viewport_percent": 75,
         }
     )
 
-    assert window.list_view.wheel_scroll_mode == "large"
+    assert window.list_view.wheel_scroll_mode == "pixels"
     assert window.list_view.wheel_scroll_custom_rows == 11
+    assert window.list_view.wheel_scroll_fixed_pixels == 160
+    assert window.list_view.wheel_scroll_viewport_percent == 75
     assert (
         window.list_view.verticalScrollBar().singleStep(),
         window.list_view.verticalScrollBar().pageStep(),
     ) == scrollbar_steps
     assert calls == {"request": 0, "generation": 0, "scan": 0}
+    window.close()
+    qapp.processEvents()
+
+
+def test_repeated_small_scroll_events_do_not_suppress_visible_work_forever(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    provider = BrowserThumbnailProvider(disk_cache_enabled=False)
+    window = BrowserWindow(
+        config_manager=config,
+        thumbnail_provider=provider,
+        pdfium_service=object(),
+        restore_initial_location=False,
+    )
+    now = 10.0
+
+    def advance_clock() -> float:
+        nonlocal now
+        now += 0.016
+        return now
+
+    monkeypatch.setattr("app.browser_window.monotonic", advance_clock)
+    window._last_scroll_value = 0
+    window._last_scroll_time = now
+    for value in range(1, 101):
+        window._on_list_scrolled(value)
+        assert not window._fast_scrolling
+    assert not provider._fast_scroll_suppressed
     window.close()
     qapp.processEvents()
 

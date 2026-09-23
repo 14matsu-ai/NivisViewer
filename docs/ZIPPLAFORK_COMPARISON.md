@@ -12,6 +12,11 @@ retain the upstream AGPL provenance. Qt/Python resource ownership, cancellation,
 generation checks and display integration adapt those structures to NivisViewer.
 See `THIRD_PARTY_NOTICES.md` for the retained notices and port boundaries.
 
+| Reference structure | NivisViewer mapping |
+| --- | --- |
+| `CatalogForm.Designer.cs`, `CatalogForm`: distinct distance presets and line-count presets | `app/browser_wheel_scroll.py`, `BrowserWheelScrollAccumulator`; `app/explorer_list_view.py`, `ExplorerListView.wheelEvent`: preserve system and row modes, add independent logical-pixel and viewport-percentage modes |
+
+
 | Fixed source / observed behavior | Adopted mapping |
 | --- | --- |
 | `Program.cs:1352`, `Program.SetTagsToToolStripMenuItems`: all/none/mixed initial state, both mouse buttons toggle, right button keeps dropdown open | `browser_tag_dialogs.py:TagSelectionMenu`, explicit Qt mouse handling and colored registry swatches |

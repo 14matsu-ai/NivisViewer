@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QColorDialog,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -70,8 +71,12 @@ from .browser_item_delegate import (
 )
 from .fallback_background_editor import FallbackBackgroundEditor
 from .browser_wheel_scroll import (
+    BROWSER_WHEEL_SCROLL_DEFAULT_PIXELS,
+    BROWSER_WHEEL_SCROLL_DEFAULT_VIEWPORT_PERCENT,
     BROWSER_WHEEL_SCROLL_CUSTOM_MAX_ROWS,
     BROWSER_WHEEL_SCROLL_CUSTOM_MIN_ROWS,
+    BROWSER_WHEEL_SCROLL_MAX_PIXELS,
+    BROWSER_WHEEL_SCROLL_MAX_VIEWPORT_PERCENT,
 )
 from .browser_folder_snapshot_cache import (
     BROWSER_FOLDER_SNAPSHOT_CACHE_ENTRY_LIMITS,
@@ -346,7 +351,8 @@ TAB_SETTING_KEYS: dict[str, tuple[str, ...]] = {
     "mouse": (
         "mouse_gestures_enabled", "mouse_gesture_show_trail", "mouse_gesture_min_distance",
         "mouse_gesture_bindings", "browser_folder_gestures_enabled", "browser_wheel_scroll_mode",
-        "browser_wheel_scroll_custom_rows", "mouse_back_button_action", "mouse_forward_button_action",
+        "browser_wheel_scroll_custom_rows", "browser_wheel_scroll_fixed_pixels",
+        "browser_wheel_scroll_viewport_percent", "mouse_back_button_action", "mouse_forward_button_action",
         "mouse_side_buttons_folder_navigation",
     ),
 }
@@ -1249,6 +1255,12 @@ class SettingsDialog(QDialog):
         self.browser_folder_gestures_checkbox.setChecked(bool(defaults["browser_folder_gestures_enabled"]))
         self._select_data(self.browser_wheel_scroll_mode_combo, defaults["browser_wheel_scroll_mode"])
         self.browser_wheel_scroll_custom_spin.setValue(int(defaults["browser_wheel_scroll_custom_rows"]))
+        self.browser_wheel_scroll_pixels_spin.setValue(
+            float(defaults["browser_wheel_scroll_fixed_pixels"])
+        )
+        self.browser_wheel_scroll_viewport_spin.setValue(
+            float(defaults["browser_wheel_scroll_viewport_percent"])
+        )
         self._select_command(self.mouse_back_action_combo, defaults["mouse_back_button_action"])
         self._select_command(self.mouse_forward_action_combo, defaults["mouse_forward_button_action"])
         self.mouse_side_buttons_folder_navigation_checkbox.setChecked(
@@ -2032,6 +2044,8 @@ class SettingsDialog(QDialog):
             ("Medium", "medium"),
             ("Large", "large"),
             ("Custom", "custom"),
+            ("Fixed logical pixels", "pixels"),
+            ("Viewport percentage", "viewport"),
         ):
             self.browser_wheel_scroll_mode_combo.addItem(label, mode)
         self.browser_wheel_scroll_mode_combo.setToolTip(
@@ -2056,6 +2070,34 @@ class SettingsDialog(QDialog):
             tr('Customの行数:'),
             self.browser_wheel_scroll_custom_spin,
         )
+        self.browser_wheel_scroll_pixels_spin = QDoubleSpinBox(
+            self.browser_wheel_scroll_group
+        )
+        self.browser_wheel_scroll_pixels_spin.setRange(1.0, BROWSER_WHEEL_SCROLL_MAX_PIXELS)
+        self.browser_wheel_scroll_pixels_spin.setDecimals(1)
+        self.browser_wheel_scroll_pixels_spin.setSingleStep(8.0)
+        self.browser_wheel_scroll_pixels_spin.setValue(BROWSER_WHEEL_SCROLL_DEFAULT_PIXELS)
+        self.browser_wheel_scroll_pixels_spin.setSuffix(tr(' 論理px／1目盛り'))
+        browser_wheel_form.addRow(
+            tr('固定距離:'),
+            self.browser_wheel_scroll_pixels_spin,
+        )
+        self.browser_wheel_scroll_viewport_spin = QDoubleSpinBox(
+            self.browser_wheel_scroll_group
+        )
+        self.browser_wheel_scroll_viewport_spin.setRange(
+            1.0, BROWSER_WHEEL_SCROLL_MAX_VIEWPORT_PERCENT
+        )
+        self.browser_wheel_scroll_viewport_spin.setDecimals(1)
+        self.browser_wheel_scroll_viewport_spin.setSingleStep(5.0)
+        self.browser_wheel_scroll_viewport_spin.setValue(
+            BROWSER_WHEEL_SCROLL_DEFAULT_VIEWPORT_PERCENT
+        )
+        self.browser_wheel_scroll_viewport_spin.setSuffix(tr(' %／1目盛り'))
+        browser_wheel_form.addRow(
+            tr('表示領域の割合:'),
+            self.browser_wheel_scroll_viewport_spin,
+        )
         self.browser_wheel_scroll_restore_button = QPushButton(
             tr('既定に戻す'),
             self.browser_wheel_scroll_group,
@@ -2065,7 +2107,7 @@ class SettingsDialog(QDialog):
         )
         browser_wheel_form.addRow(self.browser_wheel_scroll_restore_button)
         browser_wheel_note = QLabel(
-            tr('Smallは1行、Mediumは2行、Largeは3行を移動します。'),
+            tr('Smallは1行、Mediumは2行、Largeは3行を移動します。表示領域の割合はファイル一覧の高さを基準にします。'),
             self.browser_wheel_scroll_group,
         )
         browser_wheel_note.setWordWrap(True)
@@ -3138,6 +3180,18 @@ class SettingsDialog(QDialog):
         self.browser_wheel_scroll_custom_spin.setValue(
             int(self.config.get("browser_wheel_scroll_custom_rows", 3))
         )
+        self.browser_wheel_scroll_pixels_spin.setValue(
+            float(self.config.get(
+                "browser_wheel_scroll_fixed_pixels",
+                BROWSER_WHEEL_SCROLL_DEFAULT_PIXELS,
+            ))
+        )
+        self.browser_wheel_scroll_viewport_spin.setValue(
+            float(self.config.get(
+                "browser_wheel_scroll_viewport_percent",
+                BROWSER_WHEEL_SCROLL_DEFAULT_VIEWPORT_PERCENT,
+            ))
+        )
         self._sync_browser_wheel_scroll_controls()
         self._sync_browser_grid_preset()
         self._browser_random_seed = self.config.get("browser_random_seed", 0)
@@ -3322,6 +3376,10 @@ class SettingsDialog(QDialog):
     def _restore_browser_wheel_scroll_default(self) -> None:
         self._select_data(self.browser_wheel_scroll_mode_combo, "system")
         self.browser_wheel_scroll_custom_spin.setValue(3)
+        self.browser_wheel_scroll_pixels_spin.setValue(BROWSER_WHEEL_SCROLL_DEFAULT_PIXELS)
+        self.browser_wheel_scroll_viewport_spin.setValue(
+            BROWSER_WHEEL_SCROLL_DEFAULT_VIEWPORT_PERCENT
+        )
         self._sync_browser_wheel_scroll_controls()
 
     def _show_browser_folder_snapshot_cache_help(self) -> None:
@@ -3364,6 +3422,23 @@ class SettingsDialog(QDialog):
         self.browser_wheel_scroll_custom_spin.setEnabled(
             self.browser_wheel_scroll_mode_combo.currentData() == "custom"
         )
+        mode = self.browser_wheel_scroll_mode_combo.currentData()
+        self.browser_wheel_scroll_pixels_spin.setEnabled(mode == "pixels")
+        self.browser_wheel_scroll_viewport_spin.setEnabled(mode == "viewport")
+        form = self.browser_wheel_scroll_group.layout()
+        if isinstance(form, QFormLayout):
+            form.setRowVisible(
+                self.browser_wheel_scroll_custom_spin,
+                mode == "custom",
+            )
+            form.setRowVisible(
+                self.browser_wheel_scroll_pixels_spin,
+                mode == "pixels",
+            )
+            form.setRowVisible(
+                self.browser_wheel_scroll_viewport_spin,
+                mode == "viewport",
+            )
 
     def _sync_browser_folder_snapshot_cache_controls(
         self,
@@ -3686,6 +3761,12 @@ class SettingsDialog(QDialog):
             ),
             "browser_wheel_scroll_custom_rows": (
                 self.browser_wheel_scroll_custom_spin.value()
+            ),
+            "browser_wheel_scroll_fixed_pixels": (
+                self.browser_wheel_scroll_pixels_spin.value()
+            ),
+            "browser_wheel_scroll_viewport_percent": (
+                self.browser_wheel_scroll_viewport_spin.value()
             ),
             "thumbnail_quality_mode": str(
                 self.thumbnail_quality_mode_combo.currentData()

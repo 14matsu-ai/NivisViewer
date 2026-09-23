@@ -18,6 +18,11 @@ from .thumbnail_render import THUMBNAIL_ENCODER_QUALITY, normalize_thumbnail_web
 from .i18n import detect_windows_ui_language, normalize_ui_language
 
 from .browser_wheel_scroll import (
+    BROWSER_WHEEL_SCROLL_DEFAULT_PIXELS,
+    BROWSER_WHEEL_SCROLL_DEFAULT_VIEWPORT_PERCENT,
+    BROWSER_WHEEL_SCROLL_MAX_PIXELS,
+    BROWSER_WHEEL_SCROLL_MAX_VIEWPORT_PERCENT,
+    normalize_browser_wheel_amount,
     normalize_browser_wheel_custom_rows,
     normalize_browser_wheel_scroll_mode,
 )
@@ -149,6 +154,8 @@ class ConfigManager(QObject):
         },
         "browser_wheel_scroll_mode": "system",
         "browser_wheel_scroll_custom_rows": 3,
+        "browser_wheel_scroll_fixed_pixels": BROWSER_WHEEL_SCROLL_DEFAULT_PIXELS,
+        "browser_wheel_scroll_viewport_percent": BROWSER_WHEEL_SCROLL_DEFAULT_VIEWPORT_PERCENT,
         "thumbnail_quality_mode": "auto",
         "thumbnail_webp_quality": THUMBNAIL_ENCODER_QUALITY,
         "thumbnail_preserve_alpha": False,
@@ -602,6 +609,16 @@ class ConfigManager(QObject):
             normalize_browser_wheel_custom_rows(
                 normalized.get("browser_wheel_scroll_custom_rows")
             )
+        )
+        normalized["browser_wheel_scroll_fixed_pixels"] = normalize_browser_wheel_amount(
+            normalized.get("browser_wheel_scroll_fixed_pixels"),
+            default=BROWSER_WHEEL_SCROLL_DEFAULT_PIXELS,
+            maximum=BROWSER_WHEEL_SCROLL_MAX_PIXELS,
+        )
+        normalized["browser_wheel_scroll_viewport_percent"] = normalize_browser_wheel_amount(
+            normalized.get("browser_wheel_scroll_viewport_percent"),
+            default=BROWSER_WHEEL_SCROLL_DEFAULT_VIEWPORT_PERCENT,
+            maximum=BROWSER_WHEEL_SCROLL_MAX_VIEWPORT_PERCENT,
         )
         if normalized.get("browser_filename_display") not in {
             "hidden",

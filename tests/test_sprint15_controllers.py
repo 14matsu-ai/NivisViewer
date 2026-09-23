@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint
+from collections.abc import Iterator
+
+import pytest
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -20,8 +23,34 @@ from app.fullscreen_chrome import FullscreenChromeController
 from app.sidebar_layout import SidebarLayoutController
 
 
-def test_fullscreen_edge_reveal_is_overlay_and_keeps_viewer_focus(qapp) -> None:
+@pytest.fixture
+def chrome_window(qapp) -> Iterator[QMainWindow]:
     window = QMainWindow()
+    window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    try:
+        yield window
+    finally:
+        for controller in window.findChildren(FullscreenChromeController):
+            controller.shutdown()
+        window.close()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        qapp.processEvents()
+
+
+@pytest.fixture
+def sidebar_container(qapp) -> Iterator[QWidget]:
+    container = QWidget()
+    container.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    try:
+        yield container
+    finally:
+        container.close()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        qapp.processEvents()
+
+
+def test_fullscreen_edge_reveal_is_overlay_and_keeps_viewer_focus(qapp, chrome_window) -> None:
+    window = chrome_window
     central = QWidget(window)
     layout = QVBoxLayout(central)
     layout.setContentsMargins(0, 0, 0, 0)
@@ -78,11 +107,10 @@ def test_fullscreen_edge_reveal_is_overlay_and_keeps_viewer_focus(qapp) -> None:
     qapp.processEvents()
     assert menu_bar.parent() is window
     assert status.parent() is window
-    window.close()
 
 
-def test_fullscreen_trigger_and_delay_are_clamped() -> None:
-    window = QMainWindow()
+def test_fullscreen_trigger_and_delay_are_clamped(chrome_window) -> None:
+    window = chrome_window
     central = QWidget(window)
     layout = QVBoxLayout(central)
     viewer = QWidget(central)
@@ -111,11 +139,10 @@ def test_fullscreen_trigger_and_delay_are_clamped() -> None:
     )
     assert controller.edge_trigger_px == 32
     assert controller.hide_delay_ms == 3000
-    window.close()
 
 
-def test_fullscreen_chrome_does_not_hide_during_slider_or_popup(qapp) -> None:
-    window = QMainWindow()
+def test_fullscreen_chrome_does_not_hide_during_slider_or_popup(qapp, chrome_window) -> None:
+    window = chrome_window
     central = QWidget(window)
     layout = QVBoxLayout(central)
     viewer = QWidget(central)
@@ -150,11 +177,10 @@ def test_fullscreen_chrome_does_not_hide_during_slider_or_popup(qapp) -> None:
     assert controller.top_overlay.isVisible()
     popup.close()
     controller.set_active(False)
-    window.close()
 
 
-def test_fullscreen_chrome_hides_after_configured_delay(qapp) -> None:
-    window = QMainWindow()
+def test_fullscreen_chrome_hides_after_configured_delay(qapp, chrome_window) -> None:
+    window = chrome_window
     central = QWidget(window)
     layout = QVBoxLayout(central)
     viewer = QWidget(central)
@@ -183,11 +209,10 @@ def test_fullscreen_chrome_hides_after_configured_delay(qapp) -> None:
 
     assert not controller.top_overlay.isVisible()
     controller.set_active(False)
-    window.close()
 
 
-def test_sidebar_layout_variants_and_splitter_state(qapp) -> None:
-    container = QWidget()
+def test_sidebar_layout_variants_and_splitter_state(qapp, sidebar_container) -> None:
+    container = sidebar_container
     favorites = QListView()
     tree = QTreeView()
     history = QListView()
@@ -228,11 +253,10 @@ def test_sidebar_layout_variants_and_splitter_state(qapp) -> None:
     assert container.layout().itemAt(0).widget() is favorites
     controller.apply("tree_only")
     assert container.layout().itemAt(0).widget() is tree
-    container.close()
 
 
-def test_sidebar_component_visibility_removes_hidden_tabs() -> None:
-    container = QWidget()
+def test_sidebar_component_visibility_removes_hidden_tabs(sidebar_container) -> None:
+    container = sidebar_container
     favorites = QListView()
     tree = QTreeView()
     history = QListView()
@@ -255,8 +279,8 @@ def test_sidebar_component_visibility_removes_hidden_tabs() -> None:
     assert controller.tabs.tabText(0) == "フォルダ"
 
 
-def test_sidebar_keeps_existing_book_bookmarks_accessible() -> None:
-    container = QWidget()
+def test_sidebar_keeps_existing_book_bookmarks_accessible(sidebar_container) -> None:
+    container = sidebar_container
     favorites = QListView()
     bookmarks = QListView()
     tree = QTreeView()
