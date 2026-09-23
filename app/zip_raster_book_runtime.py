@@ -28,7 +28,7 @@ from threading import Event, Lock
 from time import monotonic
 
 from PIL import Image, ImageEnhance
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
 
 from .archive_backend import ArchiveErrorCode
@@ -70,6 +70,7 @@ _FIT_PREVIEW_MODES = frozenset(
 )
 _UNKNOWN_JPEG_ASPECT_LIMIT = 4
 _MAX_EXACT_RENDER_PIXELS = 64 * 1024 * 1024
+_WARMUP_SCAN_SLICE_UNITS = 64
 DecoderMaximumSize = tuple[int | None, int | None]
 
 
@@ -2406,6 +2407,10 @@ class RasterBookRuntime(QObject):
         self._jobs: set[_ZipRasterUnitJob] = set()
         self._inflight_reservations: dict[_ZipRasterUnitJob, int] = {}
         self._processing_completion = False
+        self._warmup_continue_timer = QTimer(self)
+        self._warmup_continue_timer.setSingleShot(True)
+        self._warmup_continue_timer.setInterval(0)
+        self._warmup_continue_timer.timeout.connect(self._drive)
         self._pending_completion_keys: set[_UnitKey] = set()
         self._failed_prefetch: set[_UnitKey] = set()
         # Failed header attempts are suppressed per book; successful dimensions
@@ -2997,6 +3002,7 @@ class RasterBookRuntime(QObject):
         suspend_dispatch: bool,
         preserve_started_compatible: bool = False,
     ) -> None:
+        self._warmup_continue_timer.stop()
         current_key = self._key_for(request.current, request.render_spec)
         if (
             self._source_hydration_key is not None
@@ -3214,6 +3220,7 @@ class RasterBookRuntime(QObject):
         return True
 
     def cancel(self, *, clear_artifacts: bool = False) -> None:
+        self._warmup_continue_timer.stop()
         if clear_artifacts:
             self._source_hydration_key = None
             self._source_hydration_frame = None
@@ -3250,6 +3257,7 @@ class RasterBookRuntime(QObject):
 
         if not self._accepting_requests:
             return
+        self._warmup_continue_timer.stop()
         self._restore_source_hydration_frame()
         self._dispatch_suspended = True
         planner = self._warmup_planner
@@ -3258,6 +3266,7 @@ class RasterBookRuntime(QObject):
         self._cancel_active_job()
 
     def invalidate_layout(self) -> None:
+        self._warmup_continue_timer.stop()
         # Layout-dependent QPixmaps are invalid, but decoded archive content
         # remains valid.  Keeping this boundary is what prevents resize, DPI,
         # rotation, and magnifier transitions from reopening the same entry.
@@ -3325,6 +3334,7 @@ class RasterBookRuntime(QObject):
         # after its reservation transfers into the cache, not midway through.
         if self._processing_completion:
             return
+        self._warmup_continue_timer.stop()
         request = self._current_request
         planner = self._warmup_planner
         if (
@@ -3345,7 +3355,11 @@ class RasterBookRuntime(QObject):
             if self._free_slot_available():
                 self._submit(self._current_key, ImageWorkPriority.VIEWER_CURRENT)
             return
+        remaining = _WARMUP_SCAN_SLICE_UNITS
         while self._free_slot_available():
+            if remaining <= 0:
+                self._schedule_warmup_continuation()
+                return
             unit = planner.next_candidate(
                 identity_of=lambda candidate: candidate.identity,
                 is_ready=lambda candidate: (
@@ -3360,8 +3374,12 @@ class RasterBookRuntime(QObject):
                     self._key_for(candidate, request.render_spec)
                     in self._failed_prefetch
                 ),
+                scan_limit=remaining,
             )
+            remaining -= planner.last_scan_count
             if unit is None:
+                if planner.stop_reason is WarmupStopReason.YIELDED:
+                    self._schedule_warmup_continuation()
                 return
             key = self._key_for(unit, request.render_spec)
             metadata_pages = self._layout_metadata_pages_for(key)
@@ -3414,6 +3432,21 @@ class RasterBookRuntime(QObject):
             ):
                 planner.recenter(request.warmup_plan)
                 return
+
+    def _schedule_warmup_continuation(self) -> None:
+        """One owner-bound continuation, never an idle polling scheduler.
+
+        Its callback reads the current request instead of capturing an old
+        generation. Cancel/suspend/layout changes stop the timer explicitly.
+        """
+        if (
+            self._accepting_requests
+            and not self._dispatch_suspended
+            and self._current_request is not None
+            and self._warmup_planner is not None
+            and not self._warmup_continue_timer.isActive()
+        ):
+            self._warmup_continue_timer.start()
 
     def _has_pending_completion(self, key: _UnitKey) -> bool:
         if key in self._pending_completion_keys:
@@ -3488,16 +3521,10 @@ class RasterBookRuntime(QObject):
         self,
         key: _UnitKey,
     ) -> RasterAdmissionDecision:
-        """Reject work that cannot coexist with the protected current unit.
+        """Check free, unreserved bytes before enumerating reclaim candidates.
 
-        The frame store alone cannot see the usually larger decoded source
-        allocation.  Admission therefore uses the combined book budget and a
-        conservative estimate of both missing sources and the display frame. A
-        full store may reserve only whole artifacts that rank below this
-        candidate.  This phase is deliberately non-mutating: cancellation or
-        stale completion must leave every prior ready artifact intact.  Actual
-        bytes are replanned and reclaimed only for a relevant successful GUI
-        result immediately before it enters the stores.
+        Unknown dimensions still require worker-side exact admission. No
+        cache object is removed here, and reservations cannot share victims.
         """
         rank = self._background_rank(key)
         admission_rank = self._admission_rank(key)
@@ -3521,6 +3548,22 @@ class RasterBookRuntime(QObject):
                 reclaimable_lower_rank_bytes=0,
                 rank=admission_rank,
             )
+        required_bytes = self._prefetch_retained_cost_hint(unit, key.render_spec)
+        decision = self._admission_policy.decide_background(
+            retained_bytes=self.cache_bytes + reserved_bytes,
+            estimated_bytes=required_bytes,
+            reclaimable_lower_rank_bytes=0,
+            rank=admission_rank,
+        )
+        if (
+            decision.admitted
+            or reserved_bytes
+            or decision.action is RasterAdmissionAction.SKIP_OVERSIZED
+        ):
+            # A cheap PROBE_EXACT_COST is permission to inspect, not proof
+            # that unknown pixels fit. _prefetch_worker_budget retains the
+            # full lower-rank allowance for that worker's exact confirmation.
+            return decision
         source_candidates = self._source_store.lower_rank_reclaim_candidates(
             unit,
             key.render_spec,
@@ -3533,49 +3576,33 @@ class RasterBookRuntime(QObject):
         ) + sum(
             size for _candidate, size, _retention in frame_candidates
         )
-        if reserved_bytes:
-            # Concurrent jobs cannot both reserve the same reclaim candidate.
-            reclaimable_bytes = 0
-        requires_exact_worker_admission = any(
-            _requires_exact_prefetch_admission(
-                page,
-                _decoder_maximum_for_page(key.render_spec, unit, page),
-                has_cached_source=self._source_store.find(
-                    page,
-                    key.render_spec,
-                    unit=unit,
-                    touch=False,
-                )
-                is not None,
-            )
-            for page in unit.pages
-        )
-        if requires_exact_worker_admission:
-            # A prior giant lazy PNG must not make every later unknown page
-            # inherit its observed provisional cost and skip the header probe.
-            # Prove only rank/unit replaceability here; the worker compares its
-            # exact header cost against free + strictly lower-rank allowance.
-            return self._admission_policy.decide_background(
-                retained_bytes=self.cache_bytes + reserved_bytes,
-                estimated_bytes=None,
-                reclaimable_lower_rank_bytes=reclaimable_bytes,
-                rank=admission_rank,
-            )
-        source_bytes = self._estimated_missing_source_bytes(
-            unit,
-            key.render_spec,
-        )
-        frame_bytes = self._estimated_frame_bytes(
-            unit,
-            key.render_spec,
-            source_bytes=source_bytes,
-        )
-        required_bytes = source_bytes + frame_bytes
         return self._admission_policy.decide_background(
             retained_bytes=self.cache_bytes + reserved_bytes,
             estimated_bytes=required_bytes,
             reclaimable_lower_rank_bytes=reclaimable_bytes,
             rank=admission_rank,
+        )
+
+    def _prefetch_retained_cost_hint(
+        self,
+        unit: ZipRasterDisplayUnit,
+        render_spec: ZipRasterRenderSpec,
+    ) -> int | None:
+        """Per-unit estimate only; None must retain exact worker admission."""
+        if any(
+            _requires_exact_prefetch_admission(
+                page,
+                _decoder_maximum_for_page(render_spec, unit, page),
+                has_cached_source=self._source_store.find(
+                    page, render_spec, unit=unit, touch=False,
+                ) is not None,
+            )
+            for page in unit.pages
+        ):
+            return None
+        source_bytes = self._estimated_missing_source_bytes(unit, render_spec)
+        return source_bytes + self._estimated_frame_bytes(
+            unit, render_spec, source_bytes=source_bytes,
         )
 
     def _lower_rank_reclaim_plan(
@@ -3586,6 +3613,8 @@ class RasterBookRuntime(QObject):
         bytes_needed: int,
         excluded_source_keys: frozenset[_SourceKey] = frozenset(),
     ) -> tuple[tuple[_SourceKey, ...], tuple[_UnitKey, ...]] | None:
+        if bytes_needed <= 0:
+            return (), ()
         frame_candidates = self._frame_store.lower_rank_reclaim_candidates(key)
         source_candidates = self._source_store.lower_rank_reclaim_candidates(
             unit,
@@ -3649,6 +3678,12 @@ class RasterBookRuntime(QObject):
         free = max(0, target - self.cache_bytes - reserved_bytes)
         if reserved_bytes:
             return free
+        required_bytes = self._prefetch_retained_cost_hint(unit, key.render_spec)
+        if required_bytes is not None and required_bytes <= free:
+            return free
+        # Unknown dimensions must still be allowed to replace lower-ranked
+        # artifacts after the worker confirms their real cost. Granting only
+        # free bytes here would reintroduce false capacity declines.
         source_allowance = sum(
             size
             for _candidate, size, _rank in (
@@ -4488,23 +4523,16 @@ class RasterBookRuntime(QObject):
                 source_candidate is not None
                 and source_candidate[2] >= frame_candidate[2]
             ):
-                source_evicted, _freed = (
-                    self._source_store.remove_reclaim_candidates(
-                        (source_candidate[0],)
-                    )
-                )
-                if not source_evicted:
+                # evict_one() pops the previously ranked victim and updates
+                # the byte/identity ledgers without invalidating this order.
+                # No GUI event is dispatched inside this synchronous drain.
+                if not self._source_store.evict_one():
                     break
-                self._record_source_evictions(source_evicted)
+                self._record_source_evictions(1)
                 continue
-            frame_evicted, _freed = (
-                self._frame_store.remove_reclaim_candidates(
-                    (frame_candidate[0],)
-                )
-            )
-            if not frame_evicted:
+            if not self._frame_store.evict_one():
                 break
-            self._bump("cache_evictions", frame_evicted)
+            self._bump("cache_evictions", 1)
 
     def _emit_idle_if_needed(self) -> None:
         if not self._active_slots() and not self.has_unfinished_tasks():
