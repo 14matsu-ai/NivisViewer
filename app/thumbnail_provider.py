@@ -44,6 +44,7 @@ from .thumbnail_render import (
 _RETIRED_THUMBNAIL_PROVIDERS: set[BrowserThumbnailProvider] = set()
 _THUMBNAIL_LOG = logging.getLogger("nivisviewer.thumbnail")
 _PAGE_COUNT_REQUEST_TOKEN = -1
+_DEFAULT_BROWSER_MEMORY_CACHE_BYTES = 128 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -175,6 +176,8 @@ class BrowserThumbnailProvider(QObject):
     page_count_ready = Signal(str, int, int)
     cache_cleared = Signal()
     scheduling_resumed = Signal()
+    capacity_released = Signal()
+    submission_rejected = Signal(str, int, object, object)
     work_settled = Signal(str, int, object, object, str)
 
     def __init__(
@@ -183,6 +186,7 @@ class BrowserThumbnailProvider(QObject):
         *,
         max_workers: int = 2,
         cache_capacity: int = 128,
+        cache_capacity_bytes: int = _DEFAULT_BROWSER_MEMORY_CACHE_BYTES,
         loader: Callable[[BrowserItem, int], QImage | None] | None = None,
         disk_cache: ThumbnailDiskCache | None = None,
         disk_cache_enabled: bool = True,
@@ -197,6 +201,8 @@ class BrowserThumbnailProvider(QObject):
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(1)
         self._cache_capacity = max(1, cache_capacity)
+        self._cache_capacity_bytes = max(1, int(cache_capacity_bytes))
+        self._cache_bytes = 0
         self._cache: OrderedDict[tuple[str, int, tuple[object, ...]], QImage] = OrderedDict()
         self._cache_page_counts: dict[
             tuple[str, int, tuple[object, ...]], int
@@ -280,10 +286,13 @@ class BrowserThumbnailProvider(QObject):
         with self._failure_lock:
             self._quiet_results.clear()
         with self._pending_lock:
+            had_pending = bool(self._pending)
             for pending in self._pending.values():
                 pending.worker.cancelled.set()
                 self._try_take(pending.worker)
             self._pending.clear()
+        if had_pending:
+            self.capacity_released.emit()
         if retry_failed:
             with self._failure_lock:
                 self._failed.clear()
@@ -424,7 +433,12 @@ class BrowserThumbnailProvider(QObject):
         if self._start_worker(worker, normalized_priority):
             return True
         with self._pending_lock:
-            self._pending.pop(pending_key, None)
+            removed = self._pending.pop(pending_key, None)
+        if removed is not None:
+            self.submission_rejected.emit(
+                str(item.path), requested_generation, cache_token,
+                item.thumbnail_revision,
+            )
         return False
 
     def cancel_page_count_requests_except(
@@ -454,6 +468,8 @@ class BrowserThumbnailProvider(QObject):
                 cancelled += 1
                 if self._try_take(pending.worker):
                     self._pending.pop(key, None)
+        if cancelled:
+            self.capacity_released.emit()
         return cancelled
 
     def request_page_count(
@@ -559,7 +575,12 @@ class BrowserThumbnailProvider(QObject):
         if self._start_worker(worker, normalized_priority):
             return True
         with self._pending_lock:
-            self._pending.pop(pending_key, None)
+            removed = self._pending.pop(pending_key, None)
+        if removed is not None:
+            self.submission_rejected.emit(
+                str(item.path), requested_generation, _PAGE_COUNT_REQUEST_TOKEN,
+                item.thumbnail_revision,
+            )
         return False
 
     def retry(
@@ -629,6 +650,8 @@ class BrowserThumbnailProvider(QObject):
                     pending.worker.cancelled.set()
                     self._pending.pop(key, None)
                     cancelled += 1
+        if cancelled:
+            self.capacity_released.emit()
         return cancelled
 
     def cancel_requests_except(
@@ -665,6 +688,8 @@ class BrowserThumbnailProvider(QObject):
                     pending.worker.cancelled.set()
                     self._pending.pop(key, None)
                     cancelled += 1
+        if cancelled:
+            self.capacity_released.emit()
         return cancelled
 
     @Slot(bool)
@@ -674,11 +699,15 @@ class BrowserThumbnailProvider(QObject):
             return
         self._paused = normalized
         if normalized:
+            cancelled = 0
             with self._pending_lock:
                 for key, pending in tuple(self._pending.items()):
                     if self._try_take(pending.worker):
                         pending.worker.cancelled.set()
                         self._pending.pop(key, None)
+                        cancelled += 1
+            if cancelled:
+                self.capacity_released.emit()
         else:
             self.scheduling_resumed.emit()
 
@@ -705,6 +734,11 @@ class BrowserThumbnailProvider(QObject):
             return 0
         return self._disk_cache.usage_bytes()
 
+    @property
+    def memory_cache_usage_bytes(self) -> int:
+        """Bytes retained by Browser thumbnails, excluding Viewer caches."""
+        return self._cache_bytes
+
     def cache_statistics(self) -> dict[str, object]:
         disk_stats: dict[str, object] = {}
         if self._disk_cache_enabled and self._disk_cache is not None:
@@ -713,6 +747,9 @@ class BrowserThumbnailProvider(QObject):
             stats: dict[str, object] = dict(self._stats)
             stats["generated_buckets"] = dict(self._generated_buckets)
             stats["generated_variants"] = dict(self._generated_variants)
+        stats["memory_cache_usage_bytes"] = self._cache_bytes
+        stats["memory_cache_capacity_bytes"] = self._cache_capacity_bytes
+        stats["memory_cache_entries"] = len(self._cache)
         usage = int(disk_stats.get("usage_bytes", 0))
         stats.update(disk_stats)
         stats["session_growth_bytes"] = max(
@@ -795,6 +832,7 @@ class BrowserThumbnailProvider(QObject):
 
     def clear_memory_cache(self) -> None:
         self._cache.clear()
+        self._cache_bytes = 0
         self._cache_page_counts.clear()
         self._cache_specs.clear()
         self._preview_registry.shell_service.clear_memory_cache()
@@ -1417,19 +1455,42 @@ class BrowserThumbnailProvider(QObject):
                     tr('サムネイルを生成できませんでした'),
                 )
             return
-        self._cache[cache_key] = QImage(image)
-        if loaded.page_count is not None:
-            self._cache_page_counts[cache_key] = max(
-                0,
-                int(loaded.page_count),
-            )
+        cached_image = QImage(image)
+        existing_image = self._cache.pop(cache_key, None)
+        if existing_image is not None:
+            self._cache_bytes -= int(existing_image.sizeInBytes())
+        self._cache_page_counts.pop(cache_key, None)
+        image_bytes = int(cached_image.sizeInBytes())
+        if image_bytes <= self._cache_capacity_bytes:
+            self._cache[cache_key] = cached_image
+            self._cache_bytes += image_bytes
+            if loaded.page_count is not None:
+                self._cache_page_counts[cache_key] = max(
+                    0,
+                    int(loaded.page_count),
+                )
         if pending is not None and isinstance(
             pending.worker.size, ThumbnailRenderSpec
         ):
             self._cache_specs[int(size_token)] = pending.worker.size
-        self._cache.move_to_end(cache_key)
-        while len(self._cache) > self._cache_capacity:
+        if cache_key in self._cache:
+            # Background work is scheduled near-to-far. Keep those entries
+            # older than visible/selected results so a finite LRU evicts the
+            # farthest speculative work first and cannot push the current or
+            # immediate next viewport out of RAM just because warmup ran.
+            self._cache.move_to_end(
+                cache_key,
+                last=(
+                    pending is None
+                    or pending.priority is not ThumbnailPriority.BACKGROUND
+                ),
+            )
+        while (
+            len(self._cache) > self._cache_capacity
+            or self._cache_bytes > self._cache_capacity_bytes
+        ):
             evicted_key, _evicted_image = self._cache.popitem(last=False)
+            self._cache_bytes -= int(_evicted_image.sizeInBytes())
             self._cache_page_counts.pop(evicted_key, None)
         if pending is None or pending.priority is not ThumbnailPriority.BACKGROUND:
             self.thumbnail_ready.emit(path, generation, image)
@@ -1451,6 +1512,8 @@ class BrowserThumbnailProvider(QObject):
         )
         with self._pending_lock:
             pending = self._pending.pop(pending_key, None)
+        if pending is not None:
+            self.capacity_released.emit()
         if self._closed:
             self._release_retired_if_idle()
             return
@@ -1487,9 +1550,13 @@ class BrowserThumbnailProvider(QObject):
             if self._try_take(pending.worker):
                 pending.worker.cancelled.set()
                 self._pending.pop(pending_key, None)
-                return True
-            pending.worker.cancelled.set()
-            return False
+                cancelled = True
+            else:
+                pending.worker.cancelled.set()
+                cancelled = False
+        if cancelled:
+            self.capacity_released.emit()
+        return cancelled
 
     def _increment_stat(self, key: str, amount: int = 1) -> None:
         with self._stats_lock:

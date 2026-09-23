@@ -36,12 +36,38 @@ class BrowserWorkflowSettings(QGroupBox):
         self.opacity.setRange(0, 100)
         self.opacity.setSuffix(" %")
         self.opacity.setToolTip(tr("ファイル名にかかる選択色の不透明度。0%で透明、100%で不透明です。"))
-        form.addRow(tr("ファイル名の選択色の不透明度:"), self.opacity)
+        opacity_row = QWidget(self)
+        opacity_layout = QHBoxLayout(opacity_row)
+        opacity_layout.setContentsMargins(0, 0, 0, 0)
+        opacity_layout.addWidget(self.opacity)
+        self.opacity_reset_button = QPushButton(tr("既定に戻す"), opacity_row)
+        self.opacity_reset_button.setObjectName("browser_selection_opacity_reset")
+        self.opacity_reset_button.clicked.connect(
+            lambda: self.opacity.setValue(
+                int(WORKFLOW_DEFAULTS["browser_selection_filename_opacity"])
+            )
+        )
+        opacity_layout.addWidget(self.opacity_reset_button)
+        opacity_layout.addStretch(1)
+        form.addRow(tr("ファイル名の選択色の不透明度:"), opacity_row)
         self.border_width_spin = QSpinBox(self)
         self.border_width_spin.setRange(1, 12)
         self.border_width_spin.setSuffix(" px")
         self.border_width_spin.setToolTip(tr("サムネイルとファイル名を囲む選択枠の太さ。画面倍率に追従します。"))
-        form.addRow(tr("選択帯（外枠）の太さ:"), self.border_width_spin)
+        border_row = QWidget(self)
+        border_layout = QHBoxLayout(border_row)
+        border_layout.setContentsMargins(0, 0, 0, 0)
+        border_layout.addWidget(self.border_width_spin)
+        self.border_width_reset_button = QPushButton(tr("既定に戻す"), border_row)
+        self.border_width_reset_button.setObjectName("browser_selection_border_width_reset")
+        self.border_width_reset_button.clicked.connect(
+            lambda: self.border_width_spin.setValue(
+                int(WORKFLOW_DEFAULTS["browser_selection_border_width"])
+            )
+        )
+        border_layout.addWidget(self.border_width_reset_button)
+        border_layout.addStretch(1)
+        form.addRow(tr("選択帯（外枠）の太さ:"), border_row)
         self.color_button = QPushButton(tr("選択色を変更"), self)
         self.automatic = QCheckBox(tr("システムの選択色を使う"), self)
         self.color_button.clicked.connect(self._choose_color)
@@ -52,6 +78,20 @@ class BrowserWorkflowSettings(QGroupBox):
         color_layout.addWidget(self.automatic)
         color_layout.addWidget(self.color_button)
         form.addRow(tr("選択色:"), color_row)
+        self.auto_adjust_text_color = QCheckBox(
+            tr("選択中のファイル名の文字色を自動調整する"), self
+        )
+        self.auto_adjust_text_color.setObjectName(
+            "browser_selection_text_color_auto_adjust"
+        )
+        form.addRow(self.auto_adjust_text_color)
+        self.rounded_selection_frame = QCheckBox(
+            tr("選択枠の角を丸くする"), self
+        )
+        self.rounded_selection_frame.setObjectName(
+            "browser_selection_frame_rounded"
+        )
+        form.addRow(self.rounded_selection_frame)
         self._color = "#308cc6"
         self.load(WORKFLOW_DEFAULTS)
 
@@ -69,6 +109,12 @@ class BrowserWorkflowSettings(QGroupBox):
         self.screens.setValue(max(1, screens))
         self.opacity.setValue(int(values["browser_selection_filename_opacity"]))
         self.border_width_spin.setValue(int(values["browser_selection_border_width"]))
+        self.auto_adjust_text_color.setChecked(
+            bool(values["browser_selection_text_color_auto_adjust"])
+        )
+        self.rounded_selection_frame.setChecked(
+            bool(values["browser_selection_frame_rounded"])
+        )
         color = str(values["browser_selection_color"])
         self.automatic.setChecked(color == "auto")
         if color != "auto":
@@ -83,6 +129,12 @@ class BrowserWorkflowSettings(QGroupBox):
             "browser_selection_filename_opacity": self.opacity.value(),
             "browser_selection_border_width": self.border_width_spin.value(),
             "browser_selection_color": "auto" if self.automatic.isChecked() else self._color,
+            "browser_selection_text_color_auto_adjust": (
+                self.auto_adjust_text_color.isChecked()
+            ),
+            "browser_selection_frame_rounded": (
+                self.rounded_selection_frame.isChecked()
+            ),
         })
 
 

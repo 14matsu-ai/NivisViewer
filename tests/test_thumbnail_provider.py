@@ -183,6 +183,259 @@ def test_memory_cache_is_checked_before_decoder(
     provider.close()
 
 
+def test_background_generation_decodes_folder_and_zip_into_disk_cache(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "背景フォルダ"
+    write_image(folder / "01.jpg", color="red")
+    write_image(folder / "02.jpg", color="blue")
+    archive = tmp_path / "背景書庫.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.write(folder / "02.jpg", "02.jpg")
+        output.write(folder / "01.jpg", "01.jpg")
+
+    disk_cache = ThumbnailDiskCache(tmp_path / "thumbnail-cache")
+    provider = BrowserThumbnailProvider(disk_cache=disk_cache)
+    generation = provider.begin_generation()
+    spec = ThumbnailRenderSpec.from_settings(96, "square_1_1", "letterbox")
+
+    entries = [
+        (folder, BrowserItemKind.FOLDER),
+        (archive, BrowserItemKind.ARCHIVE),
+    ]
+    items = []
+    for path, kind in entries:
+        item = make_item(path, kind)
+        items.append(item)
+        assert provider.request_background(item, spec, generation=generation) == "queued"
+        assert provider.wait_for_done(5000)
+        qapp.processEvents()
+        stats = provider.cache_statistics()
+        assert stats["generated_background"] >= 1
+        assert stats["disk_saved_background"] >= 1
+        assert stats["usage_bytes"] > 0
+
+    assert provider.cache_statistics()["generated_background"] == 2
+    provider.clear_memory_cache()
+    for item in items:
+        assert provider.request_background(
+            item, spec, generation=generation
+        ) == "queued"
+        assert provider.wait_for_done(5000)
+        qapp.processEvents()
+    stats = provider.cache_statistics()
+    assert stats["disk_hit"] >= 2
+    assert stats["generated_background"] == 2
+    provider.close()
+
+
+def test_page_count_completion_releases_background_capacity(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "metadata-only-folder"
+    write_image(folder / "01.jpg")
+    item = make_item(folder, BrowserItemKind.FOLDER)
+    provider = BrowserThumbnailProvider(disk_cache_enabled=False)
+    released: list[bool] = []
+    provider.capacity_released.connect(lambda: released.append(True))
+    generation = provider.begin_generation()
+
+    assert provider.request_page_count(item, generation=generation)
+    assert provider.wait_for_done(5000)
+    qapp.processEvents()
+
+    assert released
+    assert provider.pending_count == 0
+    provider.close()
+
+
+def test_rejected_thumbnail_submission_releases_background_capacity(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    path = tmp_path / "rejected.jpg"
+    write_image(path)
+    provider = BrowserThumbnailProvider(disk_cache_enabled=False)
+    provider._start_worker = lambda _worker, _priority: False
+    rejected: list[tuple[object, ...]] = []
+    provider.submission_rejected.connect(lambda *args: rejected.append(args))
+    generation = provider.begin_generation()
+
+    item = make_item(path, BrowserItemKind.IMAGE)
+    assert not provider.request(item, 120, generation=generation)
+    qapp.processEvents()
+
+    assert rejected == [(str(path), generation, 120, item.thumbnail_revision)]
+    assert provider.pending_count == 0
+    provider.close()
+
+
+def test_cancelling_queued_thumbnail_releases_background_capacity(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    first_path = tmp_path / "active.jpg"
+    queued_path = tmp_path / "queued.jpg"
+    write_image(first_path)
+    write_image(queued_path)
+    active = make_item(first_path, BrowserItemKind.IMAGE)
+    queued = make_item(queued_path, BrowserItemKind.IMAGE)
+    entered = Event()
+    release_loader = Event()
+
+    def loader(item, _size, _cancel_token):
+        if item.path == active.path:
+            entered.set()
+            release_loader.wait(3)
+        image = QImage(8, 8, QImage.Format.Format_RGBA8888)
+        image.fill(0xFFFFFFFF)
+        return image
+
+    provider = BrowserThumbnailProvider(
+        loader=loader, disk_cache_enabled=False
+    )
+    released: list[bool] = []
+    provider.capacity_released.connect(lambda: released.append(True))
+    generation = provider.begin_generation()
+    assert provider.request(active, 100, generation=generation)
+    assert entered.wait(2)
+    assert provider.request(
+        queued, 100, generation=generation, priority=ThumbnailPriority.READ_AHEAD
+    )
+
+    assert provider.cancel_requests_except(
+        {str(active.path)}, size=100, generation=generation
+    ) == 1
+    qapp.processEvents()
+    assert released
+    assert provider.pending_count == 1
+
+    release_loader.set()
+    assert provider.wait_for_done(5000)
+    qapp.processEvents()
+    assert provider.pending_count == 0
+    provider.close()
+
+
+def test_browser_memory_cache_obeys_retained_byte_limit(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    first_path = tmp_path / "first.jpg"
+    second_path = tmp_path / "second.jpg"
+    write_image(first_path)
+    write_image(second_path)
+    provider = BrowserThumbnailProvider(
+        cache_capacity=100,
+        cache_capacity_bytes=4096,
+        disk_cache_enabled=False,
+    )
+    generation = provider.begin_generation()
+    first = make_item(first_path, BrowserItemKind.IMAGE)
+    second = make_item(second_path, BrowserItemKind.IMAGE)
+
+    for item in (first, second):
+        image = QImage(24, 24, QImage.Format.Format_RGBA8888)
+        image.fill(0xFFFFFFFF)
+        provider._on_finished(
+            str(item.path), generation, 120, item.thumbnail_revision, image
+        )
+
+    assert provider.memory_cache_usage_bytes == 24 * 24 * 4
+    assert provider.memory_cache_usage_bytes <= 4096
+    assert len(provider._cache) == 1
+    provider.close()
+
+
+def test_oversized_browser_thumbnail_is_not_retained_in_memory_cache(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    path = tmp_path / "large.jpg"
+    write_image(path)
+    item = make_item(path, BrowserItemKind.IMAGE)
+    provider = BrowserThumbnailProvider(
+        cache_capacity_bytes=1024,
+        disk_cache_enabled=False,
+    )
+    generation = provider.begin_generation()
+    image = QImage(64, 64, QImage.Format.Format_RGBA8888)
+    image.fill(0xFFFFFFFF)
+
+    provider._on_finished(
+        str(item.path), generation, 120, item.thumbnail_revision, image
+    )
+
+    assert provider.memory_cache_usage_bytes == 0
+    assert not provider._cache
+    provider.close()
+
+
+def test_background_warmup_keeps_visible_and_next_viewport_in_ram(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    paths = []
+    items = []
+    for row in range(160):
+        path = tmp_path / f"cached-{row:03}.jpg"
+        path.write_bytes(b"fixture")
+        paths.append(path)
+        items.append(make_item(path, BrowserItemKind.IMAGE))
+
+    loaded_paths = []
+
+    def loader(item, _size, _cancel_token):
+        loaded_paths.append(item.path)
+        image = QImage(24, 24, QImage.Format.Format_RGBA8888)
+        image.fill(0xFF336699)
+        return image
+
+    provider = BrowserThumbnailProvider(
+        loader=loader,
+        cache_capacity=128,
+        disk_cache_enabled=False,
+    )
+    generation = provider.begin_generation()
+    spec = ThumbnailRenderSpec.from_settings(96, "square_1_1", "letterbox")
+
+    # Model an already-painted 40-row viewport through the normal provider
+    # lane, then warm three forward screens without further scrolling.
+    for item in items[:40]:
+        assert provider.request(
+            item,
+            spec,
+            generation=generation,
+            priority=ThumbnailPriority.VISIBLE,
+        )
+    assert provider.wait_for_done(10000)
+    qapp.processEvents()
+    assert provider.pending_count == 0
+
+    for item in items[40:]:
+        assert provider.request_background(
+            item, spec, generation=generation
+        ) == "queued"
+        assert provider.wait_for_done(5000)
+        qapp.processEvents()
+        assert provider.pending_count == 0
+
+    cached_paths = {entry[0] for entry in provider._cache}
+    visible_paths = {provider._path_key(path) for path in paths[:40]}
+    next_viewport_paths = {provider._path_key(path) for path in paths[40:80]}
+    stats = provider.cache_statistics()
+    assert visible_paths <= cached_paths
+    assert next_viewport_paths <= cached_paths
+    assert stats["memory_cache_entries"] == 128
+    assert stats["generated_background"] == 120
+    assert len(loaded_paths) == 160
+    assert provider.pending_count == 0
+    assert stats["memory_cache_usage_bytes"] <= stats["memory_cache_capacity_bytes"]
+    provider.close()
+
+
 def test_memory_cache_hit_uses_cow_image_handles_without_sharing_mutation(
     tmp_path: Path,
     qapp: QApplication,

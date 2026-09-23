@@ -3,13 +3,14 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, QEvent, QTimer, Qt
 from PySide6.QtGui import QInputMethodEvent, QKeyEvent, QKeySequence
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from .browser_model import BrowserItemKind
 from .browser_workflow_policy import (
     SelectionAppearance, ThumbnailWarmupCursor, normalize_workflow_settings,
 )
 from .file_operation_service import FileOperationKind
+from .i18n import tr
 from .shortcut_catalog import canonical_key, normalize_shortcut_bindings
 
 
@@ -34,7 +35,10 @@ class BrowserWorkflowController(QObject):
         for signal in (model.modelReset, model.layoutChanged,
                        model.rowsInserted, model.rowsRemoved):
             signal.connect(self._model_changed)
+        model.dataChanged.connect(self._item_data_changed)
         window.thumbnail_provider.work_settled.connect(self._settled)
+        window.thumbnail_provider.capacity_released.connect(self.schedule_background)
+        window.thumbnail_provider.submission_rejected.connect(self._submission_rejected)
         window.thumbnail_provider.scheduling_resumed.connect(self._resumed)
         window.thumbnail_provider.cache_cleared.connect(self._model_changed)
         window.config.settings_changed.connect(self._settings_changed)
@@ -56,6 +60,20 @@ class BrowserWorkflowController(QObject):
         self._context = None
         self._cursor = None
         self._inflight = None
+        self.schedule_background()
+
+    def _item_data_changed(self, top_left, bottom_right, roles=()) -> None:
+        model = self.window.item_model
+        item_role = getattr(model, "ItemRole", None)
+        if roles and item_role is not None and item_role not in roles:
+            return
+        if self._cursor is None:
+            self.schedule_background()
+            return
+        first = max(0, int(top_left.row()))
+        last = min(self._cursor.count - 1, int(bottom_right.row()))
+        for row in range(first, last + 1):
+            self._cursor.invalidate(row)
         self.schedule_background()
 
     def _resumed(self) -> None:
@@ -143,7 +161,13 @@ class BrowserWorkflowController(QObject):
             row, _path, _generation, _token, _revision, context = current
             self._inflight = None
             if context == self._context and self._cursor is not None:
-                if state == "cancelled":
+                item = self.window.item_model.item_at(row)
+                item_changed = (
+                    item is None
+                    or str(item.path) != path
+                    or item.thumbnail_revision != _revision
+                )
+                if state == "cancelled" or item_changed:
                     self._cursor.retry(row)
                 else:
                     self._cursor.complete(row)
@@ -153,6 +177,18 @@ class BrowserWorkflowController(QObject):
             if region is not None and region[0] <= row <= region[1]:
                 self.window._schedule_thumbnail_requests(0)
         self.schedule_background()
+
+    def _submission_rejected(self, path, generation, token, revision) -> None:
+        current = self._inflight
+        if current is not None and current[1:5] == (
+            path, generation, token, revision
+        ):
+            if self._cursor is not None:
+                self._cursor.retry(current[0])
+            self._inflight = None
+            return
+        if current is None:
+            self.schedule_background()
 
     def handle_key(self, watched, event) -> bool:
         window = self.window
@@ -201,6 +237,22 @@ class BrowserWorkflowController(QObject):
         entries = coordinator.undo_entries
         if coordinator.busy or not entries or window._rating_batch is not None:
             return False
+        if len(entries) > 512:
+            answer = QMessageBox.question(
+                window,
+                tr("大量の操作を元に戻す"),
+                tr(
+                    "{count}項目を元に戻します。\n"
+                    "操作後に変更された項目はスキップされる場合があります。"
+                    "処理をキャンセルすると一部だけ元に戻ることがあります。\n"
+                    "続行しますか？",
+                    count=len(entries),
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
         # Viewer-in-use confirmation and the existing operation queue remain
         # authoritative; a new executor/thread pool is deliberately not added.
         return window._start_file_operation(

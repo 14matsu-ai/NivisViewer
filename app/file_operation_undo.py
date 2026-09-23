@@ -66,7 +66,7 @@ def make_undo_entries(result: FileOperationResult) -> tuple[FileUndoEntry, ...]:
     This also prevents crossing an unsupported operation to undo an older one.
     """
     from .file_operation_service import FileOperationKind as Kind
-    if result.cancelled or not result.items or len(result.items) > 512:
+    if result.cancelled or not result.items:
         return ()
     if result.operation not in {Kind.COPY, Kind.MOVE, Kind.RENAME,
                                  Kind.CREATE_DIRECTORY, Kind.CREATE_ZIP}:
