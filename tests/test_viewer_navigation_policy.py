@@ -25,7 +25,7 @@ def test_discrete_and_low_speed_wheel_dispatch_immediately() -> None:
     ) is NavigationAdmissionDecision.IMMEDIATE
 
 
-def test_rapid_wheel_stages_but_reversal_and_finish_dispatch() -> None:
+def test_rapid_wheel_keeps_cold_admission_and_ready_flush_boundary() -> None:
     policy = NavigationAdmissionPolicy()
 
     assert policy.decide(
@@ -37,7 +37,7 @@ def test_rapid_wheel_stages_but_reversal_and_finish_dispatch() -> None:
         NavigationInputKind.WHEEL,
         direction=1,
         now_ns=9_000_000,
-    ) is NavigationAdmissionDecision.STAGE
+    ) is NavigationAdmissionDecision.IMMEDIATE
     assert policy.wheel_flush_delay_ms == 10
     assert policy.decide(
         NavigationInputKind.WHEEL,
@@ -51,6 +51,42 @@ def test_rapid_wheel_stages_but_reversal_and_finish_dispatch() -> None:
         NavigationInputKind.WHEEL,
         direction=-1,
         now_ns=18_000_000,
+    ) is NavigationAdmissionDecision.IMMEDIATE
+
+
+def test_readable_continuous_wheel_never_imposes_a_cold_wait() -> None:
+    policy = NavigationAdmissionPolicy()
+    decisions = [
+        policy.decide(
+            NavigationInputKind.WHEEL,
+            direction=1,
+            now_ns=index * 20_000_000,
+        )
+        for index in range(12)
+    ]
+
+    assert all(decision is NavigationAdmissionDecision.IMMEDIATE for decision in decisions)
+    assert policy.wheel_flush_delay_ms == 22
+    policy.finish_wheel()
+    assert policy.decide(
+        NavigationInputKind.WHEEL, direction=1, now_ns=221_000_000,
+    ) is NavigationAdmissionDecision.IMMEDIATE
+
+
+def test_true_rapid_wheel_does_not_gate_a_fast_decoder() -> None:
+    policy = NavigationAdmissionPolicy()
+    decisions = [
+        policy.decide(
+            NavigationInputKind.WHEEL,
+            direction=1,
+            now_ns=index * 8_000_000,
+        )
+        for index in range(24)
+    ]
+    assert all(decision is NavigationAdmissionDecision.IMMEDIATE for decision in decisions)
+    assert policy.wheel_flush_delay_ms == 10
+    assert policy.decide(
+        NavigationInputKind.WHEEL, direction=-1, now_ns=193_000_000,
     ) is NavigationAdmissionDecision.IMMEDIATE
 
 

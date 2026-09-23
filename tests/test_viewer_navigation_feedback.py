@@ -81,9 +81,10 @@ def test_cold_wheel_target_feedback_precedes_release_and_preserves_commit(blocke
         assert window.viewer._images[0].pixmap.cacheKey() == pixmap
         assert displayed.values.path in window.status.currentMessage()
         if target == 3:
-            assert window._pending_zip_runtime_request is not None
-    # Direction reversal may admit its first cold target immediately; feedback
-    # must work for both dispatched and still-staged accepted destinations.
+            assert window._pending_zip_runtime_request is None
+            assert not window._zip_runtime._dispatch_suspended
+    # Every cold wheel target reaches the runtime, including reversal. Feedback
+    # still leads the blocked decode without changing the displayed frame.
     window._finish_wheel_navigation()
     _assert_controls(window, 2)
     source.release.set()

@@ -234,7 +234,7 @@ def test_discrete_admission_shared_runtime_budget_and_archive_replacement(tmp_pa
         assert source.payload_cache_bytes == 0
 
 
-def test_rapid_wheel_cancels_warmup_adopts_wanted_and_commits_final(tmp_path, qapp):
+def test_rapid_wheel_retains_started_read_and_holds_unready_target(tmp_path, qapp):
     backend = Backend()
     backend.block = {"1.jpg", "4.jpg"}
     with viewer_fixture(tmp_path, qapp, backend) as window:
@@ -249,15 +249,20 @@ def test_rapid_wheel_cancels_warmup_adopts_wanted_and_commits_final(tmp_path, qa
         assert backend.reads.count("1.jpg") == 1
         for _ in range(3):
             window.next_page(input_kind=NavigationInputKind.WHEEL)
-        assert runtime._dispatch_suspended
+        # The foreground runtime keeps one worker slot. Further same-direction
+        # notches are consumed until the first cold page is complete.
+        assert not runtime._dispatch_suspended
+        assert runtime._current_request.current.pages[0].page_index == 1
         window._finish_wheel_navigation()
-        _wait_until(qapp, lambda: "4.jpg" in backend.reads)
+        assert "4.jpg" not in backend.reads
         assert "2.jpg" not in backend.reads and "3.jpg" not in backend.reads
         assert commits == []
-        assert backend.cancelled.is_set()
+        assert not backend.cancelled.is_set()
         backend.release.set()
-        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 4)
-        assert commits == [4]
+        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 1)
+        assert "4.jpg" not in backend.reads
+        assert 1 in runtime.cached_page_indexes
+        assert commits == [1]
 
 
 @pytest.mark.parametrize("direction", ["ltr", "rtl"])

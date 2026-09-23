@@ -172,7 +172,7 @@ def test_zip_first_paint_populates_book_wide_display_ready_cache(
         assert [
             unit.pages[0].page_index
             for unit in _planned_units(reversed_request)[:5]
-        ] == [6, 5, 7, 4, 8]
+        ] == [6, 5, 7, 4, 3]
 
         # Raster population is byte-budget driven.  The legacy preset remains
         # available to PDF/legacy paths but no longer narrows this plan.
@@ -186,7 +186,7 @@ def test_zip_first_paint_populates_book_wide_display_ready_cache(
         assert [
             unit.pages[0].page_index
             for unit in _planned_units(disabled_request)[:5]
-        ] == [6, 5, 7, 4, 8]
+        ] == [6, 5, 7, 4, 3]
 
         window.prefetch_preset = "standard"
         window.fit_mode = "actual_size"
@@ -201,7 +201,7 @@ def test_zip_first_paint_populates_book_wide_display_ready_cache(
         window.set_view_mode("spread")
         layout_request = window._zip_runtime_request(window.model.spread_at())
         assert layout_request is not None
-        assert layout_request.warmup_plan.topology is not initial_topology
+        assert layout_request.warmup_plan.topology is initial_topology
         repeated_layout_request = window._zip_runtime_request(
             window.model.spread_at()
         )
@@ -360,7 +360,7 @@ def test_input_kind_admission_is_immediate_except_rapid_bursts(
         monkeypatch.setattr(
             runtime,
             "request",
-            lambda request: requested.append(request) or True,
+            lambda request, **_kwargs: requested.append(request) or True,
         )
         monkeypatch.setattr(
             runtime,
@@ -374,6 +374,9 @@ def test_input_kind_admission_is_immediate_except_rapid_bursts(
         )
 
         assert window._finish_opened_book(opened, modal_on_empty=False)
+        # This test isolates admission timing; real wheel-readiness behavior
+        # is covered by the blocked-worker integration cases below.
+        monkeypatch.setattr(window, "_hold_unready_wheel_advance", lambda *_args: False)
         requested.clear()
 
         # Qt input timestamps are quint64.  They must survive the signal path
@@ -391,38 +394,36 @@ def test_input_kind_admission_is_immediate_except_rapid_bursts(
         assert not window._zip_runtime_request_timer.isActive()
         assert not window._raster_viewport_timer.isActive()
 
-        # The first wheel packet remains immediate. Once the second packet
-        # proves a rapid burst, following targets replace the staged target
-        # even if a small-image worker happens to become idle between packets.
+        # Cold targets reach the runtime immediately regardless of synthetic
+        # busy state; the real runtime owns coalescing when decode is slow.
         busy[0] = True
         window.next_page(input_kind=NavigationInputKind.WHEEL)
         window.next_page(input_kind=NavigationInputKind.WHEEL)
         window.next_page(input_kind=NavigationInputKind.WHEEL)
-        assert requested[-1].current.pages[0].page_index == 2
-        assert [request.current.pages[0].page_index for request in staged] == [3, 4]
-        assert window._pending_zip_runtime_request is staged[-1]
+        assert [request.current.pages[0].page_index for request in requested[-3:]] == [2, 3, 4]
+        assert not staged
+        assert window._pending_zip_runtime_request is None
 
         busy[0] = False
         wheel_end = _wheel_end_event()
         window.viewer.wheelEvent(wheel_end)
         assert wheel_end.isAccepted()
-        assert released[-1] is staged[-1]
+        assert not released
         assert window._pending_zip_runtime_request is None
 
-        # A ready frame can publish during the same wheel cadence, but it now
-        # remains staged so recentered warmup cannot start a cold transit page
-        # before the final wheel target is known.
+        # A ready wheel frame also reaches the runtime immediately, allowing
+        # its recentered background order to use an available worker slot.
         busy[0] = True
         cached[0] = True
         staged_count = len(staged)
         requested_count = len(requested)
         window.next_page(input_kind=NavigationInputKind.WHEEL)
-        assert len(requested) == requested_count
-        assert len(staged) == staged_count + 1
-        assert staged[-1].current.pages[0].page_index == 5
-        assert window._pending_zip_runtime_request is staged[-1]
+        assert len(requested) == requested_count + 1
+        assert len(staged) == staged_count
+        assert requested[-1].current.pages[0].page_index == 5
+        assert window._pending_zip_runtime_request is None
         window._finish_wheel_navigation()
-        assert released[-1] is staged[-1]
+        assert not released
 
         # Raw key identity keeps the leading press immediate, coalesces only
         # auto-repeat, and flushes the exact final target on release.
@@ -484,7 +485,7 @@ def test_slider_admission_paces_cold_targets_and_coalesces_rapid_scrub(
         monkeypatch.setattr(
             runtime,
             "request",
-            lambda request: requested.append(request) or True,
+            lambda request, **_kwargs: requested.append(request) or True,
         )
         monkeypatch.setattr(
             runtime,
@@ -558,7 +559,7 @@ def test_continuous_slider_scrub_periodically_admits_and_releases_latest(
         monkeypatch.setattr(
             runtime,
             "request",
-            lambda request: requested.append(request) or True,
+            lambda request, **_kwargs: requested.append(request) or True,
         )
         monkeypatch.setattr(
             runtime,
@@ -601,9 +602,126 @@ def test_continuous_slider_scrub_periodically_admits_and_releases_latest(
         qapp.processEvents()
 
 
-def test_rapid_wheel_preempts_started_warmup_and_commits_only_final_target(
+def test_wheel_cold_requests_follow_capacity_lane_and_ready_hits_stay_synchronous(
     tmp_path: Path,
     qapp: QApplication,
+    monkeypatch,
+) -> None:
+    window, session, _source, archive = _window(tmp_path, pages=16)
+    try:
+        window.set_view_mode("single")
+        opened = session.open_book(archive)
+        runtime = session.viewer_runtime
+        assert runtime is not None
+        requested: list[ZipRasterRequest] = []
+        staged: list[tuple[ZipRasterRequest, bool]] = []
+        released: list[ZipRasterRequest] = []
+        ready_pages = {2, 3, 7}
+        monkeypatch.setattr(runtime, "has_unfinished_tasks", lambda: True)
+        monkeypatch.setattr(
+            runtime, "has_cached_current",
+            lambda request: request.current.pages[0].page_index in ready_pages,
+        )
+        monkeypatch.setattr(
+            runtime, "request",
+            lambda request, **_kwargs: requested.append(request) or True,
+        )
+        monkeypatch.setattr(
+            runtime, "stage",
+            lambda request, *, publish_cached=False: (
+                staged.append((request, publish_cached)) or True
+            ),
+        )
+        monkeypatch.setattr(
+            runtime, "release_staged",
+            lambda request: released.append(request) or True,
+        )
+        assert window._finish_opened_book(opened, modal_on_empty=False)
+        monkeypatch.setattr(window, "_hold_unready_wheel_advance", lambda *_args: False)
+        requested.clear()
+
+        for index in range(10):
+            window.viewer.wheelInputObserved.emit(1_000_000 + index * 20)
+            window.next_page(input_kind=NavigationInputKind.WHEEL)
+
+        assert [request.current.pages[0].page_index for request in requested] == list(range(1, 11))
+        assert not staged
+        assert window._pending_zip_runtime_request is None
+
+        # Reversal remains immediate after both ready and cold targets.
+        window.viewer.wheelInputObserved.emit(1_000_200)
+        window.previous_page(input_kind=NavigationInputKind.WHEEL)
+        assert requested[-1].current.pages[0].page_index == 9
+        assert window._pending_zip_runtime_request is None
+        window._finish_wheel_navigation()
+
+        requested.clear()
+        staged.clear()
+        for index in range(4):
+            window.viewer.wheelInputObserved.emit(1_000_300 + index * 8)
+            window.next_page(input_kind=NavigationInputKind.WHEEL)
+        assert [request.current.pages[0].page_index for request in requested] == [
+            10, 11, 12, 13,
+        ]
+        assert not staged
+        window._finish_wheel_navigation()
+        assert not released
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_fast_cold_wheel_commits_each_page_before_next_rapid_packet(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    window, session, _source, archive = _window(tmp_path, pages=6)
+    window.set_view_mode("single")
+    try:
+        window.show()
+        qapp.processEvents()
+        assert window._finish_opened_book(
+            session.open_book(archive), modal_on_empty=False
+        )
+        runtime = session.viewer_runtime
+        assert runtime is not None
+        _wait_until(qapp, lambda: runtime.cached_unit_count == 6)
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+
+        # Hold only background warmup. Every target below is a genuine cold
+        # request through the production runtime and decoder.
+        planner = runtime._warmup_planner
+        assert planner is not None
+        monkeypatch.setattr(type(planner), "next_candidate", lambda *_args, **_kwargs: None)
+        for frame in tuple(runtime._frame_store.values()):
+            if frame.unit.pages[0].page_index in (1, 2, 3, 4):
+                runtime._frame_store.take(frame.key)
+        runtime._source_store.clear()
+        commits: list[int] = []
+        window.presentationCommitted.connect(
+            lambda commit: commits.append(commit.frame.unit.focused_index)
+        )
+
+        for index in range(1, 5):
+            assert index not in runtime.cached_page_indexes
+            window.viewer.wheelInputObserved.emit(1_000_000 + index * 8)
+            window.next_page(input_kind=NavigationInputKind.WHEEL)
+            assert window._pending_zip_runtime_request is None
+            assert not runtime._dispatch_suspended
+            _wait_until(qapp, lambda index=index: (
+                window.presentation_state.displayed_page == index
+            ))
+        assert commits == [1, 2, 3, 4]
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_rapid_wheel_holds_unready_target_and_finishes_started_work(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
 ) -> None:
     archive = _write_zip(tmp_path, pages=12)
 
@@ -642,36 +760,53 @@ def test_rapid_wheel_preempts_started_warmup_and_commits_only_final_target(
             and window.presentation_state.displayed.unit.focused_index == 0,
         )
         assert source.page_one_started.wait(1.0)
+        planner = runtime._warmup_planner
+        assert planner is not None
+        monkeypatch.setattr(type(planner), "next_candidate", lambda *_args, **_kwargs: None)
         started_job = runtime._active_job
         assert started_job is not None and started_job.started.is_set()
 
         for _index in range(10):
+            window.viewer.wheelInputObserved.emit(1_000_000 + _index * 8)
             window.next_page(input_kind=NavigationInputKind.WHEEL)
-        assert window.model.focused_index == 10
+        assert window.model.focused_index == 1
         requested = window.presentation_state.requested
         displayed = window.presentation_state.displayed
-        assert requested is not None and requested.unit.focused_index == 10
+        assert requested is not None and requested.unit.focused_index == 1
         assert displayed is not None and displayed.unit.focused_index == 0
         assert runtime._active_job is started_job
-        assert started_job.cancelled.is_set()
-        assert runtime.metrics.cancel_requests == 1
-        assert runtime.metrics.running_job_adoptions == 0
+        assert not started_job.cancelled.is_set()
+        assert runtime.metrics.cancel_requests == 0
+        assert not runtime._dispatch_suspended
+        assert window._pending_zip_runtime_request is None
+        assert len(runtime._jobs) <= 1
 
-        # Production's wheel boundary admits the exact final request. The
-        # cancelled warmup never becomes a cache artifact; only page 10 can
-        # atomically replace the displayed page 0 presentation.
-        window._finish_wheel_navigation()
+        # Repeated same-direction notches do not create a backlog. The
+        # already-started page completes and becomes the next displayed unit.
         source.release_page_one.set()
         _wait_until(
             qapp,
             lambda: window.presentation_state.displayed is not None
-            and window.presentation_state.displayed.unit.focused_index == 10,
+            and window.presentation_state.displayed.unit.focused_index == 1,
             timeout_ms=5000,
         )
-        assert 1 not in runtime.cached_page_indexes
-        assert runtime.metrics.cancel_requests == 1
+        assert 1 in runtime.cached_page_indexes
+        assert runtime.metrics.cancel_requests == 0
         assert runtime.metrics.stale_results == 0
         assert runtime.metrics.warmup_planner_creations == 1
+
+        # A fresh notch after completion can advance again; no old notches
+        # are replayed automatically.
+        for frame in tuple(runtime._frame_store.values()):
+            if frame.unit.pages[0].page_index == 2:
+                runtime._frame_store.take(frame.key)
+        runtime._source_store.clear()
+        assert 2 not in runtime.cached_page_indexes
+        window.viewer.wheelInputObserved.emit(1_000_080)
+        window.next_page(input_kind=NavigationInputKind.WHEEL)
+        assert window._pending_zip_runtime_request is None
+        assert not runtime._dispatch_suspended
+        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 2)
     finally:
         source.release_page_one.set()
         window.close()
@@ -682,14 +817,11 @@ def test_rapid_wheel_preempts_started_warmup_and_commits_only_final_target(
     (
         "ready_pages",
         "final_page",
-        "expected_intermediate_commits",
-        "expected_intermediate_paint",
-        "forbidden_transit_decodes",
     ),
     (
-        ({1, 2}, 3, [1, 2], 2, set()),
-        (set(), 3, [], None, {2}),
-        ({1, 3}, 4, [1, 3], 3, {2}),
+        ({1, 2}, 3),
+        (set(), 3),
+        ({1, 3}, 4),
     ),
     ids=("ready", "cold", "mixed"),
 )
@@ -698,9 +830,6 @@ def test_rapid_wheel_presents_only_ready_intermediate_frames(
     qapp: QApplication,
     ready_pages: set[int],
     final_page: int,
-    expected_intermediate_commits: list[int],
-    expected_intermediate_paint: int | None,
-    forbidden_transit_decodes: set[int],
 ) -> None:
     archive = _write_zip(tmp_path, pages=6)
 
@@ -785,26 +914,24 @@ def test_rapid_wheel_presents_only_ready_intermediate_frames(
             window.next_page(input_kind=NavigationInputKind.WHEEL)
             assert window.slider.value() == _page_index
             assert f"{_page_index + 1} / 6" in window.status.currentMessage()
+            if _page_index == 1 and _page_index in ready_pages:
+                # A ready hit commits now but waits for Qt's posted paint.
+                assert paints == []
+            if _page_index < final_page and _page_index not in ready_pages:
+                _wait_until(
+                    qapp,
+                    lambda page_index=_page_index: (
+                        window.presentation_state.displayed_page == page_index
+                    ),
+                )
         window._finish_wheel_navigation()
-        if expected_intermediate_paint is None:
-            assert all(page_index == 0 for page_index in paints)
-        else:
-            # The final cold job is admitted first. The latest legitimate
-            # ready transit frame is then painted synchronously so a queued
-            # run of native wheel messages cannot starve its update event.
-            assert paints and paints[-1] == expected_intermediate_paint
         _wait_until(qapp, source.final_started.is_set)
 
-        assert commits == expected_intermediate_commits
+        assert commits == list(range(1, final_page))
         assert window.slider.value() == final_page
         assert f"{final_page + 1} / 6" in window.status.currentMessage()
         assert window.presentation_state.requested_page == final_page
-        assert window.presentation_state.displayed_page == (
-            expected_intermediate_commits[-1]
-            if expected_intermediate_commits
-            else 0
-        )
-        assert forbidden_transit_decodes.isdisjoint(source.decode_starts)
+        assert window.presentation_state.displayed_page == final_page - 1
         assert final_page in source.decode_starts
 
         source.release_final.set()
@@ -813,7 +940,7 @@ def test_rapid_wheel_presents_only_ready_intermediate_frames(
             lambda: window.presentation_state.displayed_page == final_page,
         )
         _wait_until(qapp, lambda: paints and paints[-1] == final_page)
-        assert commits == [*expected_intermediate_commits, final_page]
+        assert commits == list(range(1, final_page + 1))
         assert runtime.metrics.stale_results == 0
     finally:
         source.release_final.set()
@@ -837,7 +964,7 @@ def test_zip_book_uses_one_runtime_across_spread_rotation_filter_and_page_list(
         cancel_runtime = runtime.cancel
         monkeypatch.setattr(runtime, "has_cached_current", lambda _request: True)
 
-        def accept_request(request: ZipRasterRequest) -> bool:
+        def accept_request(request: ZipRasterRequest, **_kwargs) -> bool:
             captured.append(request)
             return accepting[0]
 
@@ -1024,7 +1151,7 @@ def test_raster_magnifier_cancel_adopts_retained_preview_once(
         monkeypatch.setattr(
             runtime,
             "request",
-            lambda request: requested.append(request) or True,
+            lambda request, **_kwargs: requested.append(request) or True,
         )
         monkeypatch.setattr(runtime, "cancel", cancel)
 

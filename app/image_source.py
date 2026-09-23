@@ -40,6 +40,46 @@ from .supported_formats import (
 SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS
 JpegMaximumSize = tuple[int | None, int | None]
 
+_PILLOW_FORMAT_BY_SUFFIX = {
+    ".jpg": "JPEG",
+    ".jpeg": "JPEG",
+    ".png": "PNG",
+    ".webp": "WEBP",
+    ".avif": "AVIF",
+    ".bmp": "BMP",
+    ".gif": "GIF",
+    ".tif": "TIFF",
+    ".tiff": "TIFF",
+    ".ico": "ICO",
+}
+
+
+def _pillow_formats_for_image(image_id: str, data: bytes) -> tuple[str, ...] | None:
+    """Limit Pillow's malformed-file scan while keeping common mislabels readable."""
+    prefix = data[:16]
+    detected = None
+    if prefix.startswith(b"\x89PNG\r\n\x1a\n"):
+        detected = "PNG"
+    elif prefix.startswith(b"\xff\xd8\xff"):
+        detected = "JPEG"
+    elif prefix.startswith((b"GIF87a", b"GIF89a")):
+        detected = "GIF"
+    elif prefix.startswith(b"BM"):
+        detected = "BMP"
+    elif prefix.startswith((b"II*\x00", b"MM\x00*")):
+        detected = "TIFF"
+    elif prefix.startswith(b"\x00\x00\x01\x00"):
+        detected = "ICO"
+    elif prefix.startswith(b"RIFF") and prefix[8:12] == b"WEBP":
+        detected = "WEBP"
+    elif prefix[4:8] == b"ftyp" and prefix[8:12] in {
+        b"avif", b"avis", b"mif1", b"msf1",
+    }:
+        detected = "AVIF"
+    declared = _PILLOW_FORMAT_BY_SUFFIX.get(Path(image_id).suffix.casefold())
+    format_hint = detected or declared
+    return (format_hint,) if format_hint is not None else None
+
 
 def jpeg_decode_target_size(
     logical_size: tuple[int, int],
@@ -607,6 +647,7 @@ class FolderImageSource(ImageSource):
             listing_snapshot if self._image_snapshot is not None else None
         )
         self._listed_images: tuple[str, ...] | None = self._image_snapshot
+        self._metadata_lock = threading.Lock()
         self._size_cache: dict[str, tuple[int, int]] = {}
         self._file_size_cache = {
             self._path_identity(image_id): max(0, int(file_size))
@@ -615,6 +656,20 @@ class FolderImageSource(ImageSource):
         }
         if not self.source_path.is_dir():
             raise ImageSourceError(tr('フォルダが見つかりません: {p0}', p0=self.source_path))
+
+    def _remember_folder_metadata(
+        self,
+        image_id: str,
+        *,
+        byte_count: int | None = None,
+        size: tuple[int, int] | None = None,
+    ) -> None:
+        # Protect only short cache writes; file IO and decoding stay parallel.
+        with self._metadata_lock:
+            if byte_count is not None:
+                self._file_size_cache[self._path_identity(image_id)] = byte_count
+            if size is not None:
+                self._size_cache[image_id] = size
 
     def list_images(self) -> list[str]:
         if self._listed_images is not None:
@@ -687,12 +742,15 @@ class FolderImageSource(ImageSource):
             # holding the source file open while a queued Viewer task runs.
             _require_image_decoder(image_id)
             data = _read_image_file_bytes(image_id)
-            self._file_size_cache[self._path_identity(image_id)] = len(data)
-            with Image.open(io.BytesIO(data)) as image:
+            self._remember_folder_metadata(image_id, byte_count=len(data))
+            with Image.open(
+                io.BytesIO(data),
+                formats=_pillow_formats_for_image(image_id, data),
+            ) as image:
                 image.seek(0)
                 result = ImageOps.exif_transpose(image)
                 result.load()
-                self._size_cache[image_id] = result.size
+                self._remember_folder_metadata(image_id, size=result.size)
                 return result
         except ImageSourceError:
             raise
@@ -706,11 +764,11 @@ class FolderImageSource(ImageSource):
             data = _read_image_file_bytes(image_id)
         except OSError:
             return None
-        self._file_size_cache[self._path_identity(image_id)] = len(data)
+        self._remember_folder_metadata(image_id, byte_count=len(data))
         image = _read_webp_qimage(data)
         if image is None:
             return None
-        self._size_cache[image_id] = (image.width(), image.height())
+        self._remember_folder_metadata(image_id, size=(image.width(), image.height()))
         return image
 
     def open_qimage_at_most(
@@ -724,11 +782,11 @@ class FolderImageSource(ImageSource):
             data = _read_image_file_bytes(image_id)
         except OSError:
             return None
-        self._file_size_cache[self._path_identity(image_id)] = len(data)
+        self._remember_folder_metadata(image_id, byte_count=len(data))
         decoded = _read_folder_jpeg_qimage_at_most(data, maximum_size)
         if decoded is not None:
             _image, logical_size = decoded
-            self._size_cache[image_id] = logical_size
+            self._remember_folder_metadata(image_id, size=logical_size)
         return decoded
 
     def open_compatible_jpeg_at_most(
@@ -742,12 +800,12 @@ class FolderImageSource(ImageSource):
             data = _read_image_file_bytes(image_id)
         except OSError:
             return None
-        self._file_size_cache[self._path_identity(image_id)] = len(data)
+        self._remember_folder_metadata(image_id, byte_count=len(data))
         decoded = _read_folder_compatible_jpeg_at_most(data, maximum_size)
         if decoded is None:
             return None
         image, logical_size = decoded
-        self._size_cache[image_id] = logical_size
+        self._remember_folder_metadata(image_id, size=logical_size)
         return StreamedJpegDecode(
             qimage=image,
             original_size=logical_size,
@@ -765,7 +823,8 @@ class FolderImageSource(ImageSource):
         return jpeg_native_reduction_size(logical_size, maximum_size)
 
     def logical_size(self, image_id: str) -> tuple[int, int] | None:
-        cached = self._size_cache.get(image_id)
+        with self._metadata_lock:
+            cached = self._size_cache.get(image_id)
         if cached is not None:
             return cached
         try:
@@ -775,16 +834,48 @@ class FolderImageSource(ImageSource):
                 if orientation in {5, 6, 7, 8}:
                     width, height = height, width
                 logical = (width, height)
-                self._size_cache[image_id] = logical
+                self._remember_folder_metadata(image_id, size=logical)
                 return logical
         except Exception:
             return None
+
+    def probe_image_size(self, image_id: str) -> tuple[int, int] | None:
+        """Read folder image geometry with Qt's header reader, without pixels.
+
+        Pillow's generic format sniffing can import every registered plugin
+        when a malformed file is probed. Besides doing needless work, that can
+        contend with optional decoder initialization while an interactive
+        request adopts a running prefetch. QImageReader selects from the file
+        format and reads only its header. Pillow remains the fallback for the
+        two optional formats not covered by the app's Qt runtime.
+        """
+
+        with self._metadata_lock:
+            cached = self._size_cache.get(image_id)
+        if cached is not None:
+            return cached
+        suffix = Path(image_id).suffix.casefold()
+        if suffix in {".avif", ".jxl"}:
+            return self.logical_size(image_id)
+        reader = QImageReader(image_id)
+        size = reader.size()
+        if not size.isValid() or size.width() <= 0 or size.height() <= 0:
+            return None
+        width, height = int(size.width()), int(size.height())
+        if reader.transformation().value & (
+            QImageIOHandler.Transformation.TransformationRotate90.value
+        ):
+            width, height = height, width
+        logical_size = (width, height)
+        self._remember_folder_metadata(image_id, size=logical_size)
+        return logical_size
 
     def display_path(self, image_id: str) -> str:
         return str(Path(image_id))
 
     def file_size(self, image_id: str) -> int | None:
-        return self._file_size_cache.get(self._path_identity(image_id))
+        with self._metadata_lock:
+            return self._file_size_cache.get(self._path_identity(image_id))
 
     def fork_for_thumbnail(self) -> ImageSource:
         return FolderImageSource(

@@ -26,11 +26,11 @@ class NavigationAdmissionDecision(str, Enum):
 class NavigationAdmissionPolicy:
     """Small state machine for cold raster-navigation admission.
 
-    The caller observes every navigation input so a sequence of ready hits can
-    still identify the first later cold wheel/repeat.  A ready frame always
-    ignores a ``STAGE`` decision and commits immediately.  The policy never
-    owns a timer: ``STAGE`` means that the caller should replace the pending
-    work order without dispatching a new job.
+    The caller observes every navigation input. Cold wheel requests are
+    admitted immediately when the Window's readiness guard permits a turn;
+    ready wheel frames commit synchronously. Key repeat and
+    slider scrub may return ``STAGE`` to replace their pending work order.
+    The policy never owns a timer.
     """
 
     DEFAULT_RAPID_WHEEL_NS = 40_000_000
@@ -174,10 +174,10 @@ class NavigationAdmissionPolicy:
         elapsed_ns = observed_ns - previous_ns
         rapid = 0 <= elapsed_ns <= self._rapid_wheel_ns
         if rapid:
-            # Future input is unknowable.  Once the second rapid packet proves
-            # a burst, use its cadence only as a short trailing boundary. This
-            # suppresses transit decodes even when a small image finishes
-            # before the next packet, without delaying the leading/single turn.
+            # The cadence is retained only for legacy staged-request cleanup.
+            # Wheel admission itself remains immediate; the Window holds a
+            # repeated direction at an unready display unit, while the
+            # runtime reorders unstarted work around its sole running job.
             self._wheel_flush_delay_ns = min(
                 self._MAX_WHEEL_FLUSH_NS,
                 max(
@@ -185,7 +185,7 @@ class NavigationAdmissionPolicy:
                     elapsed_ns + self._WHEEL_FLUSH_PADDING_NS,
                 ),
             )
-            return NavigationAdmissionDecision.STAGE
+            return NavigationAdmissionDecision.IMMEDIATE
         self._wheel_flush_delay_ns = 0
         return NavigationAdmissionDecision.IMMEDIATE
 

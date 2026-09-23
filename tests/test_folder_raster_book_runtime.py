@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from threading import Event, Lock
 from time import monotonic, sleep
 
 from PIL import Image
+import pytest
+from PySide6.QtCore import QRunnable
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from app.book_session import BookSession
 from app.config_manager import ConfigManager
 from app.folder_raster_book_runtime import FolderRasterBookRuntime
+from app.image_work_coordinator import ImageWorkCoordinator
 from app.image_source import FolderImageSource
+from app.image_source import ZipImageSource
 from app.raster_warmup_planner import RasterBookTopology, RasterWarmupPlan
 from app.raster_book_runtime import (
     RasterDisplayUnit,
@@ -21,6 +26,13 @@ from app.raster_book_runtime import (
     RasterRequest,
 )
 from app.viewer_window import ViewerWindow
+from app.viewer_navigation_policy import NavigationInputKind
+from app.zip_raster_book_runtime import ZipRasterBookRuntime, _ZipRasterUnitJob
+from tests.test_zip_raster_book_runtime import (
+    _request as _zip_request,
+    _unit as _zip_unit,
+    _write_zip,
+)
 
 
 def _write_folder(root: Path, *, pages: int = 3, suffix: str = ".png") -> Path:
@@ -102,6 +114,949 @@ def _wait_until(
         qapp.processEvents()
         QTest.qWait(5)
     assert predicate()
+
+
+def test_ready_wheel_keeps_folder_prefetch_running_and_latest_cold_wins(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    class ControlledFolderSource(FolderImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.block = False
+            self.started_six = Event()
+            self.started_seven = Event()
+            self.release_six = Event()
+            self.release_seven = Event()
+
+        def open_image(self, image_id: str) -> Image.Image:
+            if self.block:
+                index = int(Path(image_id).stem)
+                if index == 6:
+                    self.started_six.set()
+                    self.release_six.wait(3)
+                elif index == 7:
+                    self.started_seven.set()
+                    self.release_seven.wait(3)
+            return super().open_image(image_id)
+
+    folder = _write_folder(tmp_path / "book", pages=10)
+    source = ControlledFolderSource(folder)
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    session = BookSession(
+        source_factory=lambda *_args, **_kwargs: (source, None),
+        folder_worker_limit=1,
+    )
+    window = ViewerWindow(config_manager=config, book_session=session)
+    window.resize(640, 480)
+    window.set_view_mode("single")
+    try:
+        window.show()
+        qapp.processEvents()
+        assert window._finish_opened_book(session.open_book(folder), modal_on_empty=False)
+        runtime = session.viewer_runtime
+        assert runtime is not None
+        _wait_until(qapp, lambda: runtime.cached_unit_count == 10 and not runtime.has_unfinished_tasks())
+        for frame in tuple(runtime._frame_store.values()):
+            if frame.unit.pages[0].page_index >= 6:
+                runtime._frame_store.take(frame.key)
+        runtime._source_store.clear()
+        assert set(runtime.cached_page_indexes) == set(range(6))
+        source.block = True
+        commits: list[int] = []
+        window.presentationCommitted.connect(
+            lambda commit: commits.append(commit.frame.unit.focused_index)
+        )
+
+        window.viewer.wheelInputObserved.emit(1_000_000)
+        window.next_page(input_kind=NavigationInputKind.WHEEL)
+        assert window.presentation_state.displayed_page == 1
+        assert source.started_six.wait(1)
+        assert runtime._active_job is not None
+        assert not runtime._dispatch_suspended
+        assert not window._zip_runtime_request_timer.isActive()
+
+        window.viewer.wheelInputObserved.emit(1_000_008)
+        window.next_page(input_kind=NavigationInputKind.WHEEL)
+        window.viewer.wheelInputObserved.emit(1_000_016)
+        window.previous_page(input_kind=NavigationInputKind.WHEEL)
+        assert window.presentation_state.displayed_page == 1
+        assert len(runtime._jobs) <= 1
+        source.release_six.set()
+        _wait_until(qapp, source.started_seven.is_set)
+        assert 6 in runtime.cached_page_indexes
+        assert runtime._active_job is not None
+        assert not runtime._dispatch_suspended
+
+        window.viewer.wheelInputObserved.emit(1_000_024)
+        window._go_to_index_with_history(8, input_kind=NavigationInputKind.WHEEL)
+        window.viewer.wheelInputObserved.emit(1_000_032)
+        window.next_page(input_kind=NavigationInputKind.WHEEL)
+        # A pending direct seek remains the destination; wheel input cannot
+        # race one more page ahead of its missing image.
+        assert window.presentation_state.requested_page == 8
+        assert window._pending_zip_runtime_request is None
+        assert len(runtime._jobs) <= 1
+        source.release_seven.set()
+        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 8)
+        window.next_page(input_kind=NavigationInputKind.WHEEL)
+        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 9)
+        assert 7 not in commits
+        assert commits[-1] == 9
+        assert 7 in runtime.cached_page_indexes
+        assert runtime.metrics.cancel_requests == 0
+        assert not runtime._dispatch_suspended
+    finally:
+        source.release_six.set()
+        source.release_seven.set()
+        window.close()
+        qapp.processEvents()
+
+
+def test_folder_wheel_preserves_started_neighbor_then_promotes_reversed_current(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    class BlockingFolderSource(FolderImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.started = Event()
+            self.release = Event()
+            self.opens: list[int] = []
+
+        def open_image(self, image_id: str) -> Image.Image:
+            index = int(Path(image_id).stem)
+            self.opens.append(index)
+            if index == 1:
+                self.started.set()
+                self.release.wait(3)
+            return super().open_image(image_id)
+
+    source = BlockingFolderSource(_write_folder(tmp_path / "book", pages=4))
+    runtime = FolderRasterBookRuntime(source, 1)
+    units = tuple(_unit(source, index) for index in range(4))
+    frames: list[RasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    try:
+        assert runtime.request(_request(1, units[0], *units, direction=1))
+        _wait_until(qapp, lambda: frames and frames[-1].request_id == 1)
+        assert runtime.release_continuous_warmup(request_id=1)
+        assert source.started.wait(1)
+        started_job = runtime._active_job
+        assert started_job is not None and started_job.started.is_set()
+
+        assert runtime.request(
+            _request(2, units[2], *units, direction=1),
+            preserve_started_compatible=True,
+        )
+        assert runtime._active_job is started_job
+        assert not started_job.cancelled.is_set()
+        assert len(runtime._jobs) <= 1
+
+        assert runtime.request(
+            _request(3, units[1], *units, direction=-1),
+            preserve_started_compatible=True,
+        )
+        assert runtime._active_job is started_job
+        assert not started_job.cancelled.is_set()
+        source.release.set()
+        _wait_until(qapp, lambda: frames[-1].request_id == 3)
+        assert [frame.request_id for frame in frames] == [1, 3]
+        assert 1 in runtime.cached_page_indexes
+        assert runtime.metrics.cancel_requests == 0
+        assert source.opens[:2] == [0, 1]
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+    finally:
+        source.release.set()
+        assert runtime.shutdown(wait_msecs=3000)
+
+
+def test_ready_folder_wheel_queues_latest_committed_frame_paint(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = _write_folder(tmp_path / "book", pages=4)
+    source = FolderImageSource(folder)
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    session = BookSession(source_factory=lambda *_args, **_kwargs: (source, None))
+    window = ViewerWindow(config_manager=config, book_session=session)
+    window.resize(640, 480)
+    window.set_view_mode("single")
+    try:
+        window.show()
+        qapp.processEvents()
+        assert window._finish_opened_book(session.open_book(folder), modal_on_empty=False)
+        runtime = session.viewer_runtime
+        assert runtime is not None
+        _wait_until(qapp, lambda: runtime.cached_unit_count == 4 and not runtime.has_unfinished_tasks())
+        commits: list[int] = []
+        paints: list[int] = []
+        window.presentationCommitted.connect(
+            lambda commit: commits.append(commit.frame.unit.focused_index)
+        )
+        window.viewer.framePainted.connect(
+            lambda _serial, ids: paints.append(int(Path(ids[0]).stem))
+        )
+
+        # Deliberately do not pump queued Qt paint events between inputs.
+        for timestamp, advance in ((1_000_000, True), (1_000_008, True), (1_000_016, False)):
+            window.viewer.wheelInputObserved.emit(timestamp)
+            if advance:
+                window.next_page(input_kind=NavigationInputKind.WHEEL)
+            else:
+                window.previous_page(input_kind=NavigationInputKind.WHEEL)
+        assert commits == [1, 2, 1]
+        assert paints == []
+        _wait_until(qapp, lambda: bool(paints))
+        assert paints[-1] == 1
+        assert window.presentation_state.displayed_page == 1
+        assert runtime.metrics.cancel_requests == 0
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+@pytest.mark.parametrize("view_mode", ["single", "spread"])
+@pytest.mark.parametrize("reading_direction", ["ltr", "rtl"])
+def test_cold_wheel_holds_one_unit_and_reversal_returns_to_ready_frame(
+    tmp_path: Path,
+    qapp: QApplication,
+    view_mode: str,
+    reading_direction: str,
+) -> None:
+    class BlockingSource(FolderImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.block = False
+            self.started = Event()
+            self.release = Event()
+
+        def open_image(self, image_id: str) -> Image.Image:
+            if self.block and int(Path(image_id).stem) > 0:
+                self.started.set()
+                self.release.wait(3)
+            return super().open_image(image_id)
+
+    folder = _write_folder(tmp_path / "book", pages=6)
+    source = BlockingSource(folder)
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    session = BookSession(source_factory=lambda *_args, **_kwargs: (source, None))
+    window = ViewerWindow(config_manager=config, book_session=session)
+    window.resize(640, 480)
+    window.set_view_mode(view_mode)
+    window.set_reading_direction(reading_direction)
+    if view_mode == "spread":
+        window.set_single_first_page(True)
+    try:
+        window.show()
+        qapp.processEvents()
+        assert window._finish_opened_book(session.open_book(folder), modal_on_empty=False)
+        runtime = session.viewer_runtime
+        assert runtime is not None and runtime._max_active_jobs == 1
+        _wait_until(
+            qapp,
+            lambda: (
+                window.presentation_state.displayed_page == 0
+                and window.presentation_state.displayed is not None
+            ),
+        )
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+        first = window.presentation_state.displayed
+        assert first is not None
+        for frame in tuple(runtime._frame_store.values()):
+            if frame.unit.identity != first.unit.identity:
+                runtime._frame_store.take(frame.key)
+        runtime._source_store.clear()
+        source.block = True
+
+        window.next_page(input_kind=NavigationInputKind.WHEEL)
+        assert source.started.wait(1)
+        pending = window.presentation_state.requested
+        assert pending is not None and pending.unit.identity != first.unit.identity
+        for _ in range(5):
+            window.next_page(input_kind=NavigationInputKind.WHEEL)
+        window.slider.nextDisplayUnitRequested.emit()
+        assert window.presentation_state.requested is pending
+        assert runtime.metrics.cancel_requests == 0
+
+        window.previous_page(input_kind=NavigationInputKind.WHEEL)
+        assert window.presentation_state.displayed is not None
+        assert window.presentation_state.displayed.unit.identity == first.unit.identity
+        source.release.set()
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+        assert runtime.metrics.cancel_requests == 0
+        window.next_page(input_kind=NavigationInputKind.WHEEL)
+        assert window.presentation_state.displayed is not None
+        assert window.presentation_state.displayed.unit.identity == pending.unit.identity
+    finally:
+        source.release.set()
+        window.close()
+        qapp.processEvents()
+
+
+def test_failed_folder_page_does_not_hold_later_wheel_navigation(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = _write_folder(tmp_path / "book", pages=3)
+    (folder / "1.png").write_bytes(b"broken image")
+    source = FolderImageSource(folder)
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    session = BookSession(source_factory=lambda *_args, **_kwargs: (source, None))
+    window = ViewerWindow(config_manager=config, book_session=session)
+    window.resize(640, 480)
+    window.set_view_mode("single")
+    try:
+        window.show()
+        qapp.processEvents()
+        assert window._finish_opened_book(session.open_book(folder), modal_on_empty=False)
+        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 0)
+        window.next_page(input_kind=NavigationInputKind.WHEEL)
+        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 1)
+        assert window.presentation_state.displayed is not None
+        assert window.presentation_state.displayed.has_errors
+        window.next_page(input_kind=NavigationInputKind.WHEEL)
+        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 2)
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_folder_warmup_reads_without_waiting_for_a_paint_event(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    class ObservedSource(FolderImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.neighbor_started = Event()
+
+        def open_image(self, image_id: str) -> Image.Image:
+            if Path(image_id).stem == "1":
+                self.neighbor_started.set()
+            return super().open_image(image_id)
+
+    folder = _write_folder(tmp_path / "book", pages=3)
+    source = ObservedSource(folder)
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    session = BookSession(source_factory=lambda *_args, **_kwargs: (source, None))
+    window = ViewerWindow(config_manager=config, book_session=session)
+    window.resize(640, 480)
+    window.set_view_mode("single")
+    paints: list[object] = []
+    window.viewer.framePainted.connect(lambda *_args: paints.append(_args))
+    try:
+        # A hidden widget has no physical paint acknowledgement. Its first
+        # atomic commit must still release continuous one-worker warm-up.
+        assert window._finish_opened_book(session.open_book(folder), modal_on_empty=False)
+        _wait_until(qapp, source.neighbor_started.is_set)
+        assert paints == []
+        assert session.viewer_runtime is not None
+        assert session.viewer_runtime.metrics.continuous_warmup_releases == 1
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_folder_wheel_cancels_started_work_for_incompatible_render(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    class BlockingFolderSource(FolderImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.started = Event()
+            self.release = Event()
+
+        def open_image(self, image_id: str) -> Image.Image:
+            if Path(image_id).stem == "0":
+                self.started.set()
+                self.release.wait(3)
+            return super().open_image(image_id)
+
+    source = BlockingFolderSource(_write_folder(tmp_path / "book", pages=3))
+    runtime = FolderRasterBookRuntime(source, 1)
+    units = tuple(_unit(source, index) for index in range(3))
+    frames: list[RasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    try:
+        assert runtime.request(_request(1, units[0], *units))
+        assert source.started.wait(1)
+        started_job = runtime._active_job
+        assert started_job is not None and started_job.started.is_set()
+        assert runtime.request(
+            _request(2, units[2], *units, spec=RasterRenderSpec((800, 600))),
+            preserve_started_compatible=True,
+        )
+        assert started_job.cancelled.is_set()
+        source.release.set()
+        _wait_until(qapp, lambda: frames and frames[-1].request_id == 2)
+        assert [frame.request_id for frame in frames] == [2]
+        assert runtime.metrics.cancel_requests == 1
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+    finally:
+        source.release.set()
+        assert runtime.shutdown(wait_msecs=3000)
+
+
+@pytest.mark.parametrize("release_first", (1, 2))
+@pytest.mark.parametrize("coordinated", (False, True))
+@pytest.mark.parametrize("targets", ((5,), (5, 4, 5, 3)))
+def test_two_folder_workers_run_and_cold_current_takes_next_free_slot(
+    tmp_path: Path,
+    qapp: QApplication,
+    release_first: int,
+    coordinated: bool,
+    targets: tuple[int, ...],
+) -> None:
+    class ControlledSource(FolderImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.started = {index: Event() for index in (1, 2, 3, 4, 5)}
+            self.release = {index: Event() for index in (1, 2)}
+
+        def open_image(self, image_id: str) -> Image.Image:
+            index = int(Path(image_id).stem)
+            if index in self.started:
+                self.started[index].set()
+            if index in self.release:
+                self.release[index].wait(3)
+            return super().open_image(image_id)
+
+    source = ControlledSource(_write_folder(tmp_path / "book", pages=6))
+    coordinator = (
+        ImageWorkCoordinator(max_workers=2, folder_supplemental_workers=1)
+        if coordinated else None
+    )
+    runtime = FolderRasterBookRuntime(
+        source, 1, image_work_coordinator=coordinator, max_active_jobs=2,
+    )
+    units = tuple(_unit(source, index) for index in range(6))
+    frames: list[RasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    try:
+        assert runtime.request(_request(1, units[0], *units, direction=1))
+        _wait_until(qapp, lambda: frames and frames[-1].request_id == 1)
+        assert runtime.release_continuous_warmup(request_id=1)
+        _wait_until(qapp, source.started[1].is_set)
+        _wait_until(qapp, source.started[2].is_set)
+        assert runtime.active_job_count == 2
+        assert len(runtime._jobs) == 2
+
+        for request_id, target in enumerate(targets, start=2):
+            final = _request(request_id, units[target], *units, direction=1)
+            assert runtime.request(final, preserve_started_compatible=True)
+        latest = targets[-1]
+        assert not source.started[latest].is_set()
+        assert len(runtime._jobs) == 2
+        source.release[release_first].set()
+        _wait_until(qapp, source.started[latest].is_set)
+        assert not source.release[3 - release_first].is_set()
+        final_request_id = len(targets) + 1
+        _wait_until(qapp, lambda: frames[-1].request_id == final_request_id)
+        assert [frame.request_id for frame in frames] == [1, final_request_id]
+        assert release_first in runtime.cached_page_indexes
+        assert runtime.active_job_count <= 2
+        source.release[3 - release_first].set()
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+    finally:
+        for event in source.release.values():
+            event.set()
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+        assert runtime.shutdown(wait_msecs=3000)
+        if coordinator is not None:
+            assert coordinator.shutdown(wait_msecs=3000)
+
+
+def test_two_folder_inflight_reservations_cancel_on_limit_shrink(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    class BlockedSource(FolderImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.started = {1: Event(), 2: Event()}
+            self.release = Event()
+
+        def open_image(self, image_id: str) -> Image.Image:
+            index = int(Path(image_id).stem)
+            if index in self.started:
+                self.started[index].set()
+                self.release.wait(3)
+            return super().open_image(image_id)
+
+    source = BlockedSource(_write_folder(tmp_path / "book", pages=4))
+    runtime = FolderRasterBookRuntime(source, 1, max_active_jobs=2)
+    units = tuple(_unit(source, index) for index in range(4))
+    frames: list[RasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    try:
+        assert runtime.request(_request(1, units[0], *units, direction=1))
+        _wait_until(qapp, lambda: bool(frames))
+        assert runtime.release_continuous_warmup(request_id=1)
+        assert source.started[1].wait(1)
+        assert source.started[2].wait(1)
+        before = runtime.cache_debug_values()
+        assert before["active_job_count"] == 2
+        assert before["inflight_reservation_bytes"] > 0
+
+        hard = runtime.cache_bytes + 1
+        runtime.set_memory_limits(hard_limit_bytes=hard, soft_target_bytes=hard)
+        assert all(job.cancelled.is_set() for job in runtime._active_slots())
+        source.release.set()
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+        after = runtime.cache_debug_values()
+        assert after["inflight_reservation_bytes"] == 0
+        assert runtime.cache_bytes <= hard
+        assert runtime.cached_page_indexes == (0,)
+    finally:
+        source.release.set()
+        assert runtime.shutdown(wait_msecs=3000)
+
+
+def test_two_folder_prefetch_jobs_do_not_spend_same_free_budget(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    class BlockedSource(FolderImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.started = {1: Event(), 2: Event()}
+            self.release = Event()
+
+        def open_image(self, image_id: str) -> Image.Image:
+            index = int(Path(image_id).stem)
+            if index in self.started:
+                self.started[index].set()
+                self.release.wait(3)
+            return super().open_image(image_id)
+
+    source = BlockedSource(_write_folder(tmp_path / "book", pages=3))
+    runtime = FolderRasterBookRuntime(source, 1, max_active_jobs=2)
+    units = tuple(_unit(source, index) for index in range(3))
+    frames: list[RasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    try:
+        initial = _request(1, units[0], *units, direction=1)
+        assert runtime.request(initial)
+        _wait_until(qapp, lambda: bool(frames))
+        def cost(unit):
+            source_bytes = runtime._estimated_missing_source_bytes(unit, initial.render_spec)
+            return source_bytes + runtime._estimated_frame_bytes(
+                unit, initial.render_spec, source_bytes=source_bytes
+            )
+        first_cost, second_cost = cost(units[1]), cost(units[2])
+        hard = runtime.cache_bytes + first_cost + max(1, second_cost // 2)
+        runtime.set_memory_limits(hard_limit_bytes=hard, soft_target_bytes=hard)
+        assert runtime.release_continuous_warmup(request_id=1)
+        assert source.started[1].wait(1)
+        qapp.processEvents()
+        assert not source.started[2].is_set()
+        assert runtime.active_job_count == 1
+        debug = runtime.cache_debug_values()
+        assert debug["cache_used_bytes"] + debug["inflight_reservation_bytes"] <= hard
+        source.release.set()
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+        assert runtime.cache_bytes <= hard
+    finally:
+        source.release.set()
+        assert runtime.shutdown(wait_msecs=3000)
+
+
+def test_repeated_queued_replacements_release_budget_for_later_prefetch(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = FolderImageSource(_write_folder(tmp_path / "book", pages=2))
+    runtime = FolderRasterBookRuntime(source, 1, max_active_jobs=2)
+    units = tuple(_unit(source, index) for index in range(2))
+    frames: list[RasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    try:
+        request = _request(1, units[0], *units, direction=1)
+        assert runtime.request(request)
+        _wait_until(qapp, lambda: bool(frames))
+        neighbor_key = runtime._key_for(units[1], request.render_spec)
+        hard = runtime.cache_bytes + 2_000_000
+        runtime.set_memory_limits(hard_limit_bytes=hard, soft_target_bytes=hard)
+        queued: set[_ZipRasterUnitJob] = set()
+        monkeypatch.setattr(runtime, "_try_take", lambda job: job in queued)
+        for serial in range(3):
+            job = _ZipRasterUnitJob(
+                serial=10_000 + serial,
+                key=neighbor_key,
+                request_id=1,
+                source=source,
+                unit=units[1],
+            )
+            queued.add(job)
+            runtime._secondary_job = job
+            runtime._jobs.add(job)
+            runtime._inflight_reservations[job] = hard
+            assert runtime._take_unstarted_job(job)
+            assert runtime.cache_debug_values()["inflight_reservation_bytes"] == 0
+        assert runtime._prefetch_admission_decision(neighbor_key).admitted
+        assert runtime.release_continuous_warmup(request_id=1)
+        _wait_until(qapp, lambda: 1 in runtime.cached_page_indexes)
+        assert runtime.cache_debug_values()["inflight_reservation_bytes"] == 0
+    finally:
+        assert runtime.shutdown(wait_msecs=3000)
+
+
+def test_limit_expansion_updates_both_folder_job_reservations(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = FolderImageSource(_write_folder(tmp_path / "book", pages=3))
+    runtime = FolderRasterBookRuntime(source, 1, max_active_jobs=2)
+    units = tuple(_unit(source, index) for index in range(3))
+    frames: list[RasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    try:
+        request = _request(1, units[0], *units, direction=1)
+        assert runtime.request(request)
+        _wait_until(qapp, lambda: bool(frames))
+        jobs = []
+        initial = runtime.cache_bytes + 1_000
+        runtime.set_memory_limits(hard_limit_bytes=initial, soft_target_bytes=initial)
+        for index in (1, 2):
+            job = _ZipRasterUnitJob(
+                serial=20_000 + index,
+                key=runtime._key_for(units[index], request.render_spec),
+                request_id=1,
+                source=source,
+                unit=units[index],
+                prefetch_budget_bytes=100,
+            )
+            job.started.set()
+            jobs.append(job)
+            runtime._jobs.add(job)
+            runtime._inflight_reservations[job] = 100
+        runtime._active_job, runtime._secondary_job = jobs
+        monkeypatch.setattr(runtime, "_drive", lambda: None)
+        hard = runtime.cache_bytes + 4_000_000
+        runtime.set_memory_limits(hard_limit_bytes=hard, soft_target_bytes=hard)
+        assert all(job.prefetch_budget_bytes > 100 for job in jobs), (
+            [job.prefetch_budget_bytes for job in jobs],
+            [runtime._background_rank(job.key) for job in jobs],
+        )
+        assert all(
+            runtime._inflight_reservations[job] >= job.prefetch_budget_bytes
+            for job in jobs
+        )
+        assert runtime.cache_bytes + sum(runtime._inflight_reservations.values()) <= hard
+    finally:
+        runtime._active_job = None
+        runtime._secondary_job = None
+        runtime._jobs.difference_update(jobs if "jobs" in locals() else ())
+        runtime._inflight_reservations.clear()
+        assert runtime.shutdown(wait_msecs=3000)
+
+
+def test_finished_folder_worker_keeps_reservation_until_gui_result(
+    tmp_path: Path,
+) -> None:
+    source = FolderImageSource(_write_folder(tmp_path / "book", pages=1))
+    runtime = FolderRasterBookRuntime(source, 1, max_active_jobs=2)
+    unit = _unit(source, 0)
+    job = _ZipRasterUnitJob(
+        serial=30_001,
+        key=runtime._key_for(unit, RasterRenderSpec((100, 100))),
+        request_id=1,
+        source=source,
+        unit=unit,
+    )
+    runtime._active_job = job
+    runtime._jobs.add(job)
+    runtime._inflight_reservations[job] = 12_345
+    try:
+        job.finished.set()
+        assert runtime._release_finished_active_slot()
+        assert runtime.active_job_count == 0
+        assert runtime.has_unfinished_tasks()
+        assert runtime.cache_debug_values()["inflight_reservation_bytes"] == 12_345
+    finally:
+        runtime._jobs.discard(job)
+        runtime._inflight_reservations.pop(job, None)
+        assert runtime.shutdown(wait_msecs=3000)
+
+
+def test_two_folder_jobs_cancel_at_source_epoch_change(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    class BlockedSource(FolderImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.started = {1: Event(), 2: Event()}
+            self.release = Event()
+
+        def open_image(self, image_id: str) -> Image.Image:
+            index = int(Path(image_id).stem)
+            if index in self.started:
+                self.started[index].set()
+                self.release.wait(3)
+            return super().open_image(image_id)
+
+    old_source = BlockedSource(_write_folder(tmp_path / "old", pages=3))
+    new_source = FolderImageSource(_write_folder(tmp_path / "new", pages=1))
+    old = FolderRasterBookRuntime(old_source, 1, max_active_jobs=2)
+    new = FolderRasterBookRuntime(new_source, 2, max_active_jobs=2)
+    old_frames: list[RasterFrame] = []
+    new_frames: list[RasterFrame] = []
+    old.frameReady.connect(old_frames.append)
+    new.frameReady.connect(new_frames.append)
+    units = tuple(_unit(old_source, index) for index in range(3))
+    try:
+        assert old.request(_request(1, units[0], *units, direction=1))
+        _wait_until(qapp, lambda: bool(old_frames))
+        assert old.release_continuous_warmup(request_id=1)
+        assert old_source.started[1].wait(1)
+        assert old_source.started[2].wait(1)
+        old.cancel(clear_artifacts=True)
+        assert all(job.cancelled.is_set() for job in old._active_slots())
+        assert new.request(replace(_request(1, _unit(new_source, 0)), source_epoch=2))
+        old_source.release.set()
+        _wait_until(qapp, lambda: bool(new_frames) and not old.has_unfinished_tasks())
+        assert [frame.unit.start_index for frame in old_frames] == [0]
+        assert [frame.unit.start_index for frame in new_frames] == [0]
+        assert old.cached_unit_count == 0
+        assert old.cache_debug_values()["inflight_reservation_bytes"] == 0
+    finally:
+        old_source.release.set()
+        _wait_until(
+            qapp, lambda: not old.has_unfinished_tasks() and not new.has_unfinished_tasks()
+        )
+        assert old.shutdown(wait_msecs=3000)
+        assert new.shutdown(wait_msecs=3000)
+
+
+def test_folder_supplemental_capacity_is_global_and_browser_stays_independent(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    class BlockedSource(FolderImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.started = Event()
+            self.release = Event()
+
+        def open_image(self, image_id: str) -> Image.Image:
+            self.started.set()
+            self.release.wait(3)
+            return super().open_image(image_id)
+
+    class BrowserTask(QRunnable):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = Event()
+            self.release = Event()
+
+        def run(self) -> None:
+            self.started.set()
+            self.release.wait(3)
+
+    coordinator = ImageWorkCoordinator(max_workers=2, folder_supplemental_workers=1)
+    sources = tuple(
+        BlockedSource(_write_folder(tmp_path / f"book{index}", pages=1))
+        for index in range(3)
+    )
+    runtimes = tuple(
+        FolderRasterBookRuntime(
+            source, 1, image_work_coordinator=coordinator, max_active_jobs=2
+        )
+        for source in sources
+    )
+    browser = BrowserTask()
+    try:
+        for index in (0, 1):
+            unit = _unit(sources[index], 0)
+            assert runtimes[index].request(_request(1, unit))
+            assert sources[index].started.wait(1)
+        third_unit = _unit(sources[2], 0)
+        assert runtimes[2].request(_request(1, third_unit))
+        assert not sources[2].started.is_set()
+        assert sum(runtime.active_job_count for runtime in runtimes) == 2
+
+        assert coordinator.start_browser(browser, 300)
+        assert browser.started.wait(1)
+        assert sum(runtime.active_job_count for runtime in runtimes) == 2
+        sources[0].release.set()
+        _wait_until(qapp, sources[2].started.is_set)
+        assert not sources[1].release.is_set()
+        assert sum(runtime.active_job_count for runtime in runtimes) <= 2
+    finally:
+        browser.release.set()
+        for source in sources:
+            source.release.set()
+        _wait_until(
+            qapp, lambda: all(not runtime.has_unfinished_tasks() for runtime in runtimes)
+        )
+        for runtime in runtimes:
+            assert runtime.shutdown(wait_msecs=3000)
+        assert coordinator.shutdown(wait_msecs=3000)
+
+
+def test_folder_supplemental_lane_does_not_run_zip_work(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    class BlockedFolder(FolderImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.started = Event()
+            self.release = Event()
+
+        def open_image(self, image_id: str) -> Image.Image:
+            self.started.set()
+            self.release.wait(3)
+            return super().open_image(image_id)
+
+    class ObservedZip(ZipImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.started = Event()
+
+        def open_image(self, image_id: str) -> Image.Image:
+            self.started.set()
+            return super().open_image(image_id)
+
+    coordinator = ImageWorkCoordinator(max_workers=2, folder_supplemental_workers=1)
+    first = BlockedFolder(_write_folder(tmp_path / "first", pages=1))
+    second = BlockedFolder(_write_folder(tmp_path / "second", pages=1))
+    folder_a = FolderRasterBookRuntime(
+        first, 1, image_work_coordinator=coordinator, max_active_jobs=2
+    )
+    folder_b = FolderRasterBookRuntime(
+        second, 1, image_work_coordinator=coordinator, max_active_jobs=2
+    )
+    zip_source = ObservedZip(_write_zip(tmp_path, pages=1))
+    archive = ZipRasterBookRuntime(zip_source, 1, image_work_coordinator=coordinator)
+    try:
+        assert folder_a.request(_request(1, _unit(first, 0)))
+        assert first.started.wait(1)
+        assert archive.request(_zip_request(1, _zip_unit(0)))
+        assert not zip_source.started.is_set()
+        assert folder_b.request(_request(1, _unit(second, 0)))
+        assert second.started.wait(1)
+        assert not zip_source.started.is_set()
+        first.release.set()
+        _wait_until(qapp, zip_source.started.is_set)
+    finally:
+        first.release.set()
+        second.release.set()
+        _wait_until(
+            qapp,
+            lambda: all(
+                not runtime.has_unfinished_tasks()
+                for runtime in (folder_a, folder_b, archive)
+            ),
+        )
+        for runtime in (folder_a, folder_b, archive):
+            assert runtime.shutdown(wait_msecs=3000)
+        assert coordinator.shutdown(wait_msecs=3000)
+
+
+def test_explicit_folder_two_worker_trial_with_coordinator(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    class BlockedSource(FolderImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.started = {1: Event(), 2: Event()}
+            self.release = Event()
+
+        def open_image(self, image_id: str) -> Image.Image:
+            index = int(Path(image_id).stem)
+            if index in self.started:
+                self.started[index].set()
+                self.release.wait(3)
+            return super().open_image(image_id)
+
+    folder = _write_folder(tmp_path / "book", pages=4)
+    source = BlockedSource(folder)
+    coordinator = ImageWorkCoordinator(max_workers=2, folder_supplemental_workers=1)
+    session = BookSession(
+        source_factory=lambda *_args, **_kwargs: (source, None),
+        image_work_coordinator=coordinator,
+        folder_worker_limit=2,
+    )
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    window = ViewerWindow(
+        config_manager=config,
+        book_session=session,
+        image_work_coordinator=coordinator,
+    )
+    window.resize(640, 480)
+    window.set_view_mode("single")
+    try:
+        window.show()
+        qapp.processEvents()
+        assert window._finish_opened_book(session.open_book(folder), modal_on_empty=False)
+        runtime = session.viewer_runtime
+        assert runtime is not None and runtime._max_active_jobs == 2
+        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 0)
+        _wait_until(qapp, source.started[1].is_set)
+        _wait_until(qapp, source.started[2].is_set)
+        assert runtime.active_job_count == 2
+    finally:
+        source.release.set()
+        window.close()
+        qapp.processEvents()
+        assert coordinator.shutdown(wait_msecs=3000)
+
+
+def test_default_coordinator_runs_only_one_folder_viewer_job_globally(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    class BlockingSource(FolderImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.started = Event()
+            self.release = Event()
+
+        def open_image(self, image_id: str) -> Image.Image:
+            self.started.set()
+            self.release.wait(3)
+            return super().open_image(image_id)
+
+    coordinator = ImageWorkCoordinator()
+    sources = [
+        BlockingSource(_write_folder(tmp_path / f"book{index}", pages=1))
+        for index in range(2)
+    ]
+    runtimes = [
+        FolderRasterBookRuntime(source, 1, image_work_coordinator=coordinator)
+        for source in sources
+    ]
+    try:
+        assert coordinator.folder_supplemental_workers == 0
+        for index, runtime in enumerate(runtimes):
+            unit = _unit(sources[index], 0)
+            assert runtime.request(_request(1, unit))
+            if index == 0:
+                assert sources[0].started.wait(1)
+        qapp.processEvents()
+        assert not sources[1].started.is_set()
+        sources[0].release.set()
+        _wait_until(qapp, sources[1].started.is_set)
+    finally:
+        for source in sources:
+            source.release.set()
+        _wait_until(qapp, lambda: all(not runtime.has_unfinished_tasks() for runtime in runtimes))
+        for runtime in runtimes:
+            assert runtime.shutdown(wait_msecs=3000)
+        assert coordinator.shutdown(wait_msecs=3000)
 
 
 def test_folder_runtime_builds_startup_runway_bypasses_hits_and_skips_single_prefetch(
@@ -661,6 +1616,8 @@ def test_folder_production_uses_one_runtime_and_keeps_page_list_separate(
         )
         runtime = window.book_session.viewer_runtime
         assert isinstance(runtime, FolderRasterBookRuntime)
+        assert runtime._max_active_jobs == 1
+        assert ImageWorkCoordinator().folder_supplemental_workers == 0
         assert window._zip_runtime is runtime
         assert window._zip_runtime_active
         assert window.viewer._direct_display_mode

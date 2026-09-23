@@ -194,7 +194,7 @@ class _BookOpenWorker(QRunnable):
 
 _RETIRED_BOOK_OPEN_POOLS: set[QThreadPool] = set()
 _RETIRED_BOOK_SESSIONS: set[BookSession] = set()
-_DEFAULT_PAGE_LIST_CACHE_BYTES = 64 * 1024 * 1024
+_DEFAULT_PAGE_LIST_CACHE_BYTES = 32 * 1024 * 1024
 
 
 class BookSession(QObject):
@@ -214,6 +214,7 @@ class BookSession(QObject):
         *,
         source_factory: SourceFactory = create_image_source,
         image_work_coordinator: ImageWorkCoordinator | None = None,
+        folder_worker_limit: int = 1,
     ) -> None:
         super().__init__(parent)
         self.model = PageModel()
@@ -223,6 +224,7 @@ class BookSession(QObject):
             image_work_coordinator=image_work_coordinator,
         )
         self._image_work_coordinator = image_work_coordinator
+        self._folder_worker_limit = max(1, min(2, int(folder_worker_limit)))
         self.current_path: Path | None = None
         self.source: ImageSource | None = None
         self.viewer_runtime: RasterBookRuntime | None = None
@@ -706,6 +708,11 @@ class BookSession(QObject):
                 image_work_coordinator=self._image_work_coordinator,
                 cache_byte_budget=hard,
                 cache_soft_target_bytes=soft,
+                max_active_jobs=(
+                    self._folder_worker_limit
+                    if runtime_type is FolderRasterBookRuntime
+                    else 1
+                ),
             )
             if runtime_type is not None and source is not None
             else None
