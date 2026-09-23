@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import zipfile
+from collections import OrderedDict
 from pathlib import Path
 from threading import Event
 
+import pytest
 from PIL import Image
 from PySide6.QtGui import QImage
 from PySide6.QtTest import QSignalSpy
@@ -1140,6 +1142,55 @@ def test_loader_exception_from_stale_generation_is_not_applied(
     assert states.count() == 0
     assert ready.count() == 0
     provider.close()
+
+
+@pytest.mark.parametrize("entry_count", [256, 4096, 16384])
+def test_browser_cache_candidate_and_trim_use_key_indexes(
+    qapp: QApplication,
+    entry_count: int,
+) -> None:
+    provider = BrowserThumbnailProvider(
+        loader=lambda *_: None,
+        disk_cache_enabled=False,
+        cache_capacity=entry_count + 1,
+        cache_capacity_bytes=(entry_count + 1) * 4,
+    )
+    spec = ThumbnailRenderSpec.from_settings(48, "square_1_1", "letterbox")
+    image = QImage(1, 1, QImage.Format.Format_RGB32)
+    image.fill(0)
+    revision = ("test-revision",)
+    provider._browser_memory_managed = True
+    provider._cache_specs[spec.cache_token] = spec
+    for index in range(entry_count):
+        path_key = f"fixture-{index}"
+        key = (path_key, spec.cache_token, revision)
+        provider._cache[key] = image
+        provider._cache_bytes += int(image.sizeInBytes())
+        provider._cache_page_counts[key] = None
+        provider._cache_index_add(key)
+    provider._rebuild_cache_rank_index()
+
+    class NoAllCacheWalk(OrderedDict):
+        def items(self):
+            raise AssertionError("completion path walked every cached image")
+
+        def __iter__(self):
+            raise AssertionError("completion path iterated every cached key")
+
+    provider._cache = NoAllCacheWalk(list(provider._cache.items()))
+    try:
+        candidate = provider._memory_candidate(
+            f"fixture-{entry_count - 1}", revision, spec
+        )
+        assert candidate is not None
+
+        provider._cache_capacity = entry_count - 1
+        provider._cache_capacity_bytes = (entry_count - 1) * int(image.sizeInBytes())
+        provider._trim_browser_memory()
+        assert len(provider._cache) <= entry_count - 1
+        assert provider.memory_cache_bytes <= provider.memory_cache_limit_bytes
+    finally:
+        provider.close()
 
 
 def test_loader_exception_after_shutdown_is_not_applied(

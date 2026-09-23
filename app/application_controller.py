@@ -710,14 +710,18 @@ class ApplicationController(QObject):
         self._commit_application_exit()
         return True
 
-    def _prepare_viewers_for_shutdown(self) -> None:
+    def _prepare_viewers_for_shutdown(self) -> bool:
+        complete = True
         for window in tuple(self._viewer_windows):
-            window.prepare_shutdown()
+            if window.prepare_shutdown() is False:
+                complete = False
+        return complete
 
-    def _prepare_browser_for_shutdown(self) -> None:
+    def _prepare_browser_for_shutdown(self) -> bool:
         browser = self.get_browser_window()
         if browser is not None:
-            browser.prepare_shutdown()
+            return browser.prepare_shutdown() is not False
+        return True
 
     def _shutdown_settings_probes(self) -> bool:
         dialogs_by_id = {
@@ -1240,7 +1244,10 @@ class ApplicationController(QObject):
         if self._operation_fallback_panel is None:
             panel = FileOperationPanel()
             panel.setWindowTitle(tr('NivisViewer - ファイル操作'))
-            panel.bind(self.file_operation_queue)
+            panel.bind(
+                self.file_operation_queue,
+                completion_source=self.file_operation_coordinator,
+            )
             panel_id = id(panel)
             panel.destroyed.connect(
                 lambda _object=None, panel_id=panel_id: (

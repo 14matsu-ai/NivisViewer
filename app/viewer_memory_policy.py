@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from math import isfinite
 import sys
+from time import monotonic
 from typing import Final
 
 
@@ -58,6 +61,13 @@ _INACTIVE_SOFT_DENOMINATOR: Final = 2
 _PRESSURE_GRANULARITY_BYTES: Final = 16 * MIB
 _MIN_RECOVERY_STEP_BYTES: Final = 64 * MIB
 _MIN_RECOVERY_HEADROOM_BYTES: Final = 32 * MIB
+# These govern *observations*, not a second image scheduler. The Window owns
+# the existing five-second pressure timer. Growth changes permission only.
+_AUTO_GROWTH_SETTLE_SECONDS: Final = 10.0
+_AUTO_GROWTH_INTERVAL_SECONDS: Final = 5.0
+_AUTO_GROWTH_MAX_SAMPLE_GAP_SECONDS: Final = 15.0
+_AUTO_GROWTH_STEP_BYTES: Final = 256 * MIB
+_INACTIVE_CACHE_GRACE_SECONDS: Final = 10.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,11 +299,11 @@ def resolve_viewer_memory_budget(
     snapshot: PhysicalMemorySnapshot | None = None,
     current_cache_bytes: int = 0,
 ) -> ViewerMemoryResolution:
-    """Resolve one immutable book/session budget.
+    """Resolve an initial immutable budget snapshot.
 
-    Auto is deliberately bucketed and is resolved from one snapshot. Callers
-    keep the returned value rather than continuously following fluctuating
-    ``available`` memory.
+    Initial Auto selection is bucketed. ResolvedViewerMemoryPolicy owns later
+    pressure changes and opt-in, demand-driven growth; this function never
+    samples continuously or allocates cache storage.
     """
     normalized = normalize_viewer_memory_mode(mode)
     cache_bytes = max(0, int(current_cache_bytes))
@@ -349,16 +359,21 @@ def resolve_viewer_memory_budget(
 
 
 class ResolvedViewerMemoryPolicy:
-    """Stable hard ceiling plus live, pressure-aware population targets.
+    """Fixed user ceilings or demand-driven Auto growth, with pressure targets.
 
-    ``hard_limit_bytes`` changes only when :meth:`reconfigure` is called.  A
-    memory-pressure observation can lower the active/inactive soft targets
-    immediately, but recovery is hysteretic and incremental so transient
-    available-memory changes do not repeatedly prune and refill the cache.
+    Fixed modes never exceed their selected hard limit. Auto can expand only
+    for the active, capacity-limited raster reader after sustained headroom.
+    Pressure still shrinks soft targets immediately; activation grace affects
+    retention only and never raises the pressure ceiling.
     """
 
     __slots__ = (
         "_active",
+        "_clock",
+        "_inactive_since",
+        "_auto_growth_since",
+        "_last_auto_growth_at",
+        "_last_observation_at",
         "_pressure_ceiling_bytes",
         "_resolution",
     )
@@ -370,8 +385,15 @@ class ResolvedViewerMemoryPolicy:
         snapshot: PhysicalMemorySnapshot | None = None,
         current_cache_bytes: int = 0,
         active: bool = True,
+        clock: Callable[[], float] = monotonic,
     ) -> None:
         self._active = bool(active)
+        self._clock = clock
+        # Starting inactive is not a brief focus transition.
+        self._inactive_since: float | None = None
+        self._auto_growth_since: float | None = None
+        self._last_auto_growth_at: float | None = None
+        self._last_observation_at: float | None = None
         self._resolution = resolve_viewer_memory_budget(
             mode,
             snapshot=snapshot,
@@ -395,12 +417,30 @@ class ResolvedViewerMemoryPolicy:
 
     @property
     def target_bytes(self) -> int:
-        return self._resolution.target_bytes_for(active=self._active)
+        return self._resolution.target_bytes_for(
+            active=self._active or self.inactive_grace_active,
+        )
+
+    @property
+    def inactive_grace_active(self) -> bool:
+        if self._active or self._inactive_since is None:
+            return False
+        elapsed = self._clock() - self._inactive_since
+        return isfinite(elapsed) and 0 <= elapsed < _INACTIVE_CACHE_GRACE_SECONDS
 
     def set_active(self, active: bool) -> int:
-        """Select active/inactive target without changing the hard ceiling."""
-        self._active = bool(active)
+        """Keep brief focus changes from immediately discarding distant frames."""
+        normalized = bool(active)
+        if normalized != self._active:
+            self._inactive_since = None if normalized else self._clock()
+            self._active = normalized
+            self.reset_growth_observation()
         return self.target_bytes
+
+    def reset_growth_observation(self) -> None:
+        """A missing sample, mode change, or focus change cannot prove recovery."""
+        self._auto_growth_since = None
+        self._last_observation_at = None
 
     def reconfigure(
         self,
@@ -410,6 +450,8 @@ class ResolvedViewerMemoryPolicy:
         current_cache_bytes: int = 0,
     ) -> ViewerMemoryResolution:
         """Explicitly re-resolve a changed setting and reset pressure state."""
+        self.reset_growth_observation()
+        self._last_auto_growth_at = None
         self._resolution = resolve_viewer_memory_budget(
             mode,
             snapshot=snapshot,
@@ -425,20 +467,44 @@ class ResolvedViewerMemoryPolicy:
         snapshot: PhysicalMemorySnapshot,
         *,
         current_cache_bytes: int,
+        auto_growth_requested: bool = False,
+        auto_growth_cap_bytes: int | None = None,
     ) -> ViewerMemoryResolution:
-        """Apply one live pressure sample to soft targets.
+        """Apply a live sample, optionally expanding a capacity-limited Auto cache.
 
-        Pressure shrinks immediately.  Recovery requires meaningful headroom
-        and grows by at most one eighth of the configured hard limit per
-        observation.  The owner decides the observation cadence; no timer or
-        logging is hidden in this policy object.
+        Soft pressure targets shrink immediately and retain their bounded
+        recovery rule. Opt-in Auto hard growth requires ten seconds of useful
+        headroom and adds at most 256 MiB per five seconds. The owner supplies
+        the observation cadence; no Qt timer or logging is hidden here.
         """
+        # Invalid observations cannot establish sustained recovery (or mutate
+        # the last good limits). The Windows reader returns integer byte counts.
+        values = (
+            snapshot.total_physical_bytes,
+            snapshot.available_physical_bytes,
+            snapshot.process_working_set_bytes,
+            current_cache_bytes,
+        )
+        if (
+            any(type(value) is not int for value in values)
+            or snapshot.total_physical_bytes <= 0
+            or not 0 <= snapshot.available_physical_bytes <= snapshot.total_physical_bytes
+            or snapshot.process_working_set_bytes < 0
+            or current_cache_bytes < 0
+        ):
+            self.reset_growth_observation()
+            return self._resolution
         cache_bytes = max(0, int(current_cache_bytes))
         capacity, reserve = _safe_cache_capacity_bytes(
             snapshot,
             current_cache_bytes=cache_bytes,
         )
-        hard_limit = self._resolution.hard_limit_bytes
+        hard_limit = self._maybe_expand_auto_limit(
+            capacity,
+            current_cache_bytes=cache_bytes,
+            requested=auto_growth_requested,
+            external_cap_bytes=auto_growth_cap_bytes,
+        )
         desired_ceiling = min(hard_limit, capacity)
         if desired_ceiling < hard_limit:
             desired_ceiling = (
@@ -476,10 +542,57 @@ class ResolvedViewerMemoryPolicy:
         )
         return self._resolution
 
+    def _maybe_expand_auto_limit(
+        self,
+        capacity_bytes: int,
+        *,
+        current_cache_bytes: int,
+        requested: bool,
+        external_cap_bytes: int | None,
+    ) -> int:
+        hard = self._resolution.hard_limit_bytes
+        now = self._clock()
+        if not isfinite(now):
+            self.reset_growth_observation()
+            return hard
+        last = self._last_observation_at
+        if last is None or not 0 <= now - last <= _AUTO_GROWTH_MAX_SAMPLE_GAP_SECONDS:
+            self._auto_growth_since = None
+        self._last_observation_at = now
+        cap = min(max(_AUTO_BUCKETS_MIB) * MIB, max(0, capacity_bytes))
+        if external_cap_bytes is not None:
+            # Optional grant from an existing application memory arbiter.
+            # Do not construct a second global budget owner here.
+            cap = min(cap, max(0, int(external_cap_bytes)))
+        cap = cap // _PRESSURE_GRANULARITY_BYTES * _PRESSURE_GRANULARITY_BYTES
+        if not (
+            self._resolution.mode == "auto"
+            and self._active
+            and requested
+            and current_cache_bytes >= hard * 3 // 4
+            and self._pressure_ceiling_bytes >= hard * 7 // 8
+            and cap >= hard + _MIN_RECOVERY_HEADROOM_BYTES
+        ):
+            self._auto_growth_since = None
+            return hard
+        if self._auto_growth_since is None:
+            self._auto_growth_since = now
+            return hard
+        if now - self._auto_growth_since < _AUTO_GROWTH_SETTLE_SECONDS:
+            return hard
+        last_growth = self._last_auto_growth_at
+        if last_growth is not None and now - last_growth < _AUTO_GROWTH_INTERVAL_SECONDS:
+            return hard
+        self._last_auto_growth_at = now
+        return min(cap, hard + _AUTO_GROWTH_STEP_BYTES)
+
     def debug_values(self) -> dict[str, int | str | bool | None]:
         """Expose the resolved policy to tests/benchmarks without logging."""
         values: dict[str, int | str | bool | None] = dict(
             self._resolution.debug_values(active=self._active)
         )
         values["active"] = self._active
+        values["inactive_grace_active"] = self.inactive_grace_active
+        values["selected_soft_target_bytes"] = self.target_bytes
+        values["auto_growth_waiting"] = self._auto_growth_since is not None
         return values

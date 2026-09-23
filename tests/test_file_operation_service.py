@@ -289,3 +289,238 @@ def test_create_directory_and_invalid_destination_are_safe(tmp_path: Path) -> No
         invalid.failures[0].error_code
         == FileOperationErrorCode.INVALID_DESTINATION.value
     )
+
+
+def _inject_exdev_for_pair(monkeypatch, old_path: Path, new_path: Path) -> None:
+    original_rename = os.rename
+    old_key = os.path.normcase(os.path.abspath(old_path))
+    new_key = os.path.normcase(os.path.abspath(new_path))
+
+    def rename(old, new, *args, **kwargs):
+        if (
+            os.path.normcase(os.path.abspath(os.fspath(old))) == old_key
+            and os.path.normcase(os.path.abspath(os.fspath(new))) == new_key
+        ):
+            raise OSError(errno.EXDEV, "injected cross-volume move")
+        return original_rename(old, new, *args, **kwargs)
+
+    monkeypatch.setattr("app.file_operation_service.os.rename", rename)
+
+
+def test_cross_volume_move_preserves_file_added_after_copy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    source.mkdir()
+    destination_root.mkdir()
+    (source / "copied.txt").write_text("copied", encoding="utf-8")
+    destination = destination_root / source.name
+    _inject_exdev_for_pair(monkeypatch, source, destination)
+    service = FileOperationService()
+    original_copy = service._copy_atomic
+
+    def copy_then_add(src, dst, cancelled, **kwargs):
+        published = original_copy(src, dst, cancelled, **kwargs)
+        (Path(src) / "late.txt").write_text("preserve me", encoding="utf-8")
+        return published
+
+    monkeypatch.setattr(service, "_copy_atomic", copy_then_add)
+    result = service.move([source], destination_root)
+
+    item = result.items[0]
+    assert destination.joinpath("copied.txt").read_text(encoding="utf-8") == "copied"
+    assert not (destination / "late.txt").exists()
+    assert (source / "late.txt").read_text(encoding="utf-8") == "preserve me"
+    assert not item.success and item.partial_success
+    assert item.destination_published and item.source_exists_after
+
+
+def test_cross_volume_move_does_not_delete_replaced_source_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source"
+    moved_original = tmp_path / "original-source"
+    destination_root = tmp_path / "destination"
+    source.mkdir()
+    destination_root.mkdir()
+    (source / "old.txt").write_text("old", encoding="utf-8")
+    destination = destination_root / source.name
+    _inject_exdev_for_pair(monkeypatch, source, destination)
+    service = FileOperationService()
+    original_copy = service._copy_atomic
+    original_rename = os.rename
+
+    def copy_then_replace_root(src, dst, cancelled, **kwargs):
+        published = original_copy(src, dst, cancelled, **kwargs)
+        original_rename(src, moved_original)
+        Path(src).mkdir()
+        (Path(src) / "replacement.txt").write_text("keep", encoding="utf-8")
+        return published
+
+    monkeypatch.setattr(service, "_copy_atomic", copy_then_replace_root)
+    result = service.move([source], destination_root)
+
+    assert (moved_original / "old.txt").read_text(encoding="utf-8") == "old"
+    assert (source / "replacement.txt").read_text(encoding="utf-8") == "keep"
+    assert (destination / "old.txt").read_text(encoding="utf-8") == "old"
+    assert not result.items[0].success
+
+
+def test_cross_volume_replace_cancel_after_publish_reports_partial_move(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source.txt"
+    destination_root = tmp_path / "destination"
+    destination_root.mkdir()
+    destination = destination_root / source.name
+    source.write_text("new", encoding="utf-8")
+    destination.write_text("old", encoding="utf-8")
+    cancelled = Event()
+    service = FileOperationService()
+    original_replace = os.replace
+
+    def replace_with_exdev(old, new, *args, **kwargs):
+        if os.path.abspath(os.fspath(old)) == os.path.abspath(source) and os.path.abspath(os.fspath(new)) == os.path.abspath(destination):
+            raise OSError(errno.EXDEV, "injected cross-volume replace")
+        return original_replace(old, new, *args, **kwargs)
+
+    original_copy = service._copy_atomic_replace
+
+    def publish_then_cancel(src, dst, token):
+        original_copy(src, dst, token)
+        token.set()
+
+    monkeypatch.setattr("app.file_operation_service.os.replace", replace_with_exdev)
+    monkeypatch.setattr(service, "_copy_atomic_replace", publish_then_cancel)
+    result = service.move(
+        [source], destination_root,
+        collision_policy=FileCollisionPolicy.REPLACE,
+        cancelled=cancelled,
+    )
+
+    item = result.items[0]
+    assert result.cancelled
+    assert source.read_text(encoding="utf-8") == "new"
+    assert destination.read_text(encoding="utf-8") == "new"
+    assert item.destination_published and item.replaced_existing
+    assert item.source_exists_after and item.partial_success
+
+
+def test_replace_cancel_before_publish_preserves_both_original_files(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.txt"
+    destination_root = tmp_path / "destination"
+    destination_root.mkdir()
+    destination = destination_root / source.name
+    source.write_text("new", encoding="utf-8")
+    destination.write_text("old", encoding="utf-8")
+    cancelled = Event()
+    cancelled.set()
+
+    result = FileOperationService().move(
+        [source], destination_root,
+        collision_policy=FileCollisionPolicy.REPLACE,
+        cancelled=cancelled,
+    )
+
+    assert result.cancelled
+    assert source.read_text(encoding="utf-8") == "new"
+    assert destination.read_text(encoding="utf-8") == "old"
+    assert not result.items
+
+
+def test_cross_volume_cancel_during_source_cleanup_retains_remaining_files(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    source.mkdir()
+    destination_root.mkdir()
+    (source / "a.txt").write_text("a", encoding="utf-8")
+    (source / "b.txt").write_text("b", encoding="utf-8")
+    destination = destination_root / source.name
+    _inject_exdev_for_pair(monkeypatch, source, destination)
+    service = FileOperationService()
+    cancelled = Event()
+
+    def stop_cleanup(src, _receipt, token):
+        (Path(src) / "a.txt").unlink()
+        token.set()
+        raise OSError(errno.ECANCELED, "injected cleanup cancellation")
+
+    monkeypatch.setattr(service, "_remove_source_receipt", stop_cleanup)
+    result = service.move([source], destination_root, cancelled=cancelled)
+
+    item = result.items[0]
+    assert result.cancelled
+    assert (destination / "a.txt").read_text(encoding="utf-8") == "a"
+    assert (destination / "b.txt").read_text(encoding="utf-8") == "b"
+    assert not (source / "a.txt").exists()
+    assert (source / "b.txt").read_text(encoding="utf-8") == "b"
+    assert item.destination_published and item.partial_success
+
+
+def test_cross_volume_replace_cleanup_failure_preserves_published_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source.txt"
+    destination_root = tmp_path / "destination"
+    destination_root.mkdir()
+    destination = destination_root / source.name
+    source.write_text("new", encoding="utf-8")
+    destination.write_text("old", encoding="utf-8")
+    service = FileOperationService()
+    original_replace = os.replace
+
+    def replace_with_exdev(old, new, *args, **kwargs):
+        if os.path.abspath(os.fspath(old)) == os.path.abspath(source) and os.path.abspath(os.fspath(new)) == os.path.abspath(destination):
+            raise OSError(errno.EXDEV, "injected cross-volume replace")
+        return original_replace(old, new, *args, **kwargs)
+
+    def fail_cleanup(_src, _receipt, _cancelled):
+        raise PermissionError("injected source cleanup failure")
+
+    monkeypatch.setattr("app.file_operation_service.os.replace", replace_with_exdev)
+    monkeypatch.setattr(service, "_remove_source_receipt", fail_cleanup)
+    result = service.move(
+        [source], destination_root,
+        collision_policy=FileCollisionPolicy.REPLACE,
+    )
+
+    item = result.items[0]
+    assert not result.cancelled
+    assert source.read_text(encoding="utf-8") == "new"
+    assert destination.read_text(encoding="utf-8") == "new"
+    assert item.destination_published and item.replaced_existing
+    assert item.source_exists_after and item.partial_success
+
+
+def test_descendant_guard_resolves_destination_aliases_on_worker(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from app.file_operation_plan import FileOperationPlanner
+
+    source = tmp_path / "source"
+    child = source / "child"
+    alias = tmp_path / "outside-alias"
+    source.mkdir()
+    child.mkdir()
+    original_realpath = os.path.realpath
+
+    def resolve(path, *args, **kwargs):
+        path_text = os.path.abspath(os.fspath(path))
+        if os.path.normcase(path_text) == os.path.normcase(str(alias)):
+            return str(child)
+        return original_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr("app.file_operation_service.os.path.realpath", resolve)
+    assert FileOperationService._is_descendant(str(alias), str(source))
+    assert FileOperationPlanner._is_descendant(str(alias), str(source))

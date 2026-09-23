@@ -14,6 +14,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from app.application_controller import ApplicationController
+from app.application_shutdown import ApplicationShutdownCoordinator
 from app.book_session import BookSession
 from app.config_manager import ConfigManager
 from app.folder_raster_book_runtime import FolderRasterBookRuntime
@@ -1088,5 +1089,65 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
     finally:
         source.release_all()
         session.image_cache.wait_for_done(3000)
+        window.close()
+        qapp.processEvents()
+
+
+def test_viewer_shutdown_retries_failed_worker_phase_without_unfencing(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    window = ViewerWindow(config_manager=make_config(tmp_path))
+    original_loupe_shutdown = window._pdf_loupe_cache.shutdown
+    original_book_shutdown = window.book_session.shutdown
+    loupe_calls = 0
+    book_calls = 0
+    render_calls = 0
+
+    def fail_loupe_once(wait_msecs):
+        nonlocal loupe_calls
+        loupe_calls += 1
+        if loupe_calls == 1:
+            return False
+        return original_loupe_shutdown(wait_msecs)
+
+    def count_book_shutdown(wait_msecs=250):
+        nonlocal book_calls
+        book_calls += 1
+        return original_book_shutdown(wait_msecs)
+
+    original_render_shutdown = window.viewer.shutdown_rendering
+
+    def count_render_shutdown(wait_msecs=5000):
+        nonlocal render_calls
+        render_calls += 1
+        return original_render_shutdown(wait_msecs)
+
+    monkeypatch.setattr(window._pdf_loupe_cache, "shutdown", fail_loupe_once)
+    monkeypatch.setattr(window.book_session, "shutdown", count_book_shutdown)
+    monkeypatch.setattr(window.viewer, "shutdown_rendering", count_render_shutdown)
+    advanced: list[str] = []
+    shutdown = ApplicationShutdownCoordinator(
+        steps=[
+            ("viewer", lambda: window.prepare_shutdown(wait_msecs=0)),
+            ("next phase", lambda: advanced.append("next")),
+        ]
+    )
+    try:
+        assert shutdown.begin_shutdown() is False
+        assert window._shutdown_prepared
+        assert not window._shutdown_cleanup_complete
+        assert book_calls == render_calls == 0
+        assert advanced == []
+
+        assert shutdown.begin_shutdown() is True
+        assert window._shutdown_prepared
+        assert window._shutdown_cleanup_complete
+        assert loupe_calls == 2
+        assert book_calls == 1
+        assert render_calls == 1
+        assert advanced == ["next"]
+    finally:
         window.close()
         qapp.processEvents()

@@ -195,8 +195,9 @@ def test_zip_first_paint_populates_book_wide_display_ready_cache(
         )
         assert full_source_request is not None
         assert full_source_request.render_spec.decoder_maximum_size is None
-        assert not full_source_request.warmup_plan.background_enabled
-        assert tuple(full_source_request.warmup_plan.iter_background_units()) == ()
+        # Full-source fidelity no longer disables capacity-admitted warmup.
+        assert full_source_request.warmup_plan.background_enabled
+        assert tuple(full_source_request.warmup_plan.iter_background_units())
 
         window.set_view_mode("spread")
         layout_request = window._zip_runtime_request(window.model.spread_at())

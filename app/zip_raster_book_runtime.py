@@ -2443,6 +2443,40 @@ class RasterBookRuntime(QObject):
         return replace(self._metrics)
 
     @property
+    def auto_cache_growth_requested(self) -> bool:
+        """A live capacity-limited order, not a cumulative skip counter."""
+        planner = self._warmup_planner
+        request = self._current_request
+        return bool(
+            self._accepting_requests
+            and not self._dispatch_suspended
+            and planner is not None
+            and planner.background_released
+            and request is not None
+            and request.warmup_plan.background_enabled
+            and (
+                planner.stop_reason in {
+                    WarmupStopReason.SOFT_TARGET,
+                    WarmupStopReason.HARD_LIMIT,
+                }
+                or (
+                    self._admission_declined_prefetch
+                    and self.cache_bytes >= self._cache_soft_target_bytes * 3 // 4
+                )
+            )
+        )
+
+    def matches_render_spec(self, render_spec: ZipRasterRenderSpec) -> bool:
+        """Compare the active layout without touching cache or presentation."""
+        request = self._current_request
+        return bool(
+            self._accepting_requests
+            and request is not None
+            and request.source_epoch == self.source_epoch
+            and request.render_spec == render_spec
+        )
+
+    @property
     def active_job_count(self) -> int:
         return sum(
             not job.finished.is_set()

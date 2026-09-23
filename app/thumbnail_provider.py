@@ -6,6 +6,7 @@ from .i18n import tr
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from io import BytesIO
+import heapq
 import inspect
 import logging
 import os
@@ -224,6 +225,18 @@ class BrowserThumbnailProvider(QObject):
         self._cache_entry_priority: dict[
             tuple[str, int, tuple[object, ...]], int
         ] = {}
+        # Key-only indexes; QImages remain in the single authoritative cache.
+        self._cache_keys_by_path: dict[
+            str, OrderedDict[tuple[str, int, tuple[object, ...]], None]
+        ] = {}
+        self._cache_rank_buckets: dict[
+            int | None, OrderedDict[tuple[str, int, tuple[object, ...]], None]
+        ] = {}
+        self._cache_rank_values: list[int] = []
+        self._cache_rank_value_set: set[int] = set()
+        self._cache_key_indexed_rank: dict[
+            tuple[str, int, tuple[object, ...]], int | None
+        ] = {}
         self._active_request_tokens: dict[str, set[int]] = {}
         self._pending: dict[tuple[str, int, int], _PendingThumbnail] = {}
         self._pending_lock = Lock()
@@ -385,6 +398,7 @@ class BrowserThumbnailProvider(QObject):
                 self._cache_entry_priority.get(cache_key, int(normalized_priority)),
             )
             self._cache.move_to_end(cache_key)
+            self._cache_index_touch(cache_key)
             if not self._cache_retention_rank:
                 self._reorder_memory_cache()
             image = QImage(cached)
@@ -804,6 +818,7 @@ class BrowserThumbnailProvider(QObject):
             else min(self._cache_capacity, 65536)
         )
         self._cache_capacity_bytes = max(0, int(limit_bytes))
+        self._rebuild_cache_rank_index()
         self._trim_browser_memory()
 
     def memory_has_thumbnail(self, item: BrowserItem, size) -> bool:
@@ -937,6 +952,7 @@ class BrowserThumbnailProvider(QObject):
             priorities[key] = min(int(rank), priorities.get(key, int(rank)))
         self._cache_retention_rank = priorities
         if self._browser_memory_managed:
+            self._rebuild_cache_rank_index()
             self._trim_browser_memory()
         else:
             self._reorder_memory_cache()
@@ -954,28 +970,108 @@ class BrowserThumbnailProvider(QObject):
         if (len(self._cache) <= self._cache_capacity
                 and self._cache_bytes <= self._cache_capacity_bytes):
             return
-        from .browser_thumbnail_memory_policy import cache_victims
-
-        # Rows outside the hot window share one lower-value rank. Stable sort
-        # order within that rank preserves provider LRU, so stale entries leave
-        # before newly generated background results.
-        ranks = {
-            key: rank for key in self._cache
-            if (rank := self._retention_rank_for_cache_key(key)) is not None
-        }
-        costs = {key: int(image.sizeInBytes()) for key, image in self._cache.items()}
-        victims = cache_victims(
-            costs, ranks, byte_limit=self._cache_capacity_bytes,
-            entry_limit=self._cache_capacity,
-        )
-        for key in victims:
+        # Unranked entries leave first; then evict oldest entries in the
+        # least-valuable rank. Completion-time pressure trims need no full-cache
+        # walk, cost dictionary, or sort.
+        while (len(self._cache) > self._cache_capacity
+               or self._cache_bytes > self._cache_capacity_bytes):
+            bucket = self._cache_rank_buckets.get(None)
+            if bucket:
+                key = next(iter(bucket))
+            else:
+                while (
+                    self._cache_rank_values
+                    and -self._cache_rank_values[0] not in self._cache_rank_value_set
+                ):
+                    heapq.heappop(self._cache_rank_values)
+            if not bucket and self._cache_rank_values:
+                least_value_rank = -self._cache_rank_values[0]
+                bucket = self._cache_rank_buckets.get(least_value_rank)
+                if not bucket:
+                    self._rebuild_cache_rank_index()
+                    if not self._cache_rank_values:
+                        break
+                    least_value_rank = -self._cache_rank_values[0]
+                    bucket = self._cache_rank_buckets.get(least_value_rank)
+                if not bucket:
+                    break
+                key = next(iter(bucket))
+            elif not bucket:
+                self._rebuild_cache_rank_index()
+                bucket = self._cache_rank_buckets.get(None)
+                if not bucket:
+                    break
+                key = next(iter(bucket))
             image = self._cache.pop(key, None)
+            self._cache_index_remove(key)
             if image is None:
                 continue
             self._cache_bytes -= int(image.sizeInBytes())
             self._cache_page_counts.pop(key, None)
             self._cache_entry_priority.pop(key, None)
             self._increment_stat("memory_cache_evictions")
+
+    def _cache_index_rank_add(
+        self, key: tuple[str, int, tuple[object, ...]]
+    ) -> None:
+        rank = self._retention_rank_for_cache_key(key)
+        self._cache_rank_buckets.setdefault(rank, OrderedDict())[key] = None
+        self._cache_key_indexed_rank[key] = rank
+        if rank is not None and rank not in self._cache_rank_value_set:
+            heapq.heappush(self._cache_rank_values, -rank)
+            self._cache_rank_value_set.add(rank)
+            if len(self._cache_rank_values) > max(
+                64, 2 * len(self._cache_rank_value_set)
+            ):
+                self._cache_rank_values = [
+                    -value for value in self._cache_rank_value_set
+                ]
+                heapq.heapify(self._cache_rank_values)
+
+    def _cache_index_add(
+        self, key: tuple[str, int, tuple[object, ...]]
+    ) -> None:
+        self._cache_keys_by_path.setdefault(key[0], OrderedDict())[key] = None
+        if self._browser_memory_managed:
+            self._cache_index_rank_add(key)
+
+    def _cache_index_remove(
+        self, key: tuple[str, int, tuple[object, ...]]
+    ) -> None:
+        path_bucket = self._cache_keys_by_path.get(key[0])
+        if path_bucket is not None:
+            path_bucket.pop(key, None)
+            if not path_bucket:
+                self._cache_keys_by_path.pop(key[0], None)
+        rank = self._cache_key_indexed_rank.pop(key, None)
+        rank_bucket = self._cache_rank_buckets.get(rank)
+        if rank_bucket is not None:
+            rank_bucket.pop(key, None)
+            if not rank_bucket:
+                self._cache_rank_buckets.pop(rank, None)
+                if rank is not None:
+                    self._cache_rank_value_set.discard(rank)
+
+    def _cache_index_touch(
+        self, key: tuple[str, int, tuple[object, ...]]
+    ) -> None:
+        path_bucket = self._cache_keys_by_path.get(key[0])
+        if path_bucket is not None and key in path_bucket:
+            path_bucket.move_to_end(key)
+        rank = self._cache_key_indexed_rank.get(key)
+        rank_bucket = self._cache_rank_buckets.get(rank)
+        if rank_bucket is not None and key in rank_bucket:
+            rank_bucket.move_to_end(key)
+
+    def _rebuild_cache_rank_index(self) -> None:
+        self._cache_rank_buckets.clear()
+        self._cache_rank_values.clear()
+        self._cache_rank_value_set.clear()
+        self._cache_key_indexed_rank.clear()
+        if not self._browser_memory_managed:
+            return
+        for key in self._cache:
+            self._cache_index_rank_add(key)
 
     def _retention_rank_for_cache_key(
         self,
@@ -1006,6 +1102,9 @@ class BrowserThumbnailProvider(QObject):
         original.sort(key=eviction_order)
         self._cache.clear()
         self._cache.update(original)
+        self._cache_keys_by_path.clear()
+        for key, _image in original:
+            self._cache_keys_by_path.setdefault(key[0], OrderedDict())[key] = None
 
     def cache_statistics(self) -> dict[str, object]:
         disk_stats: dict[str, object] = {}
@@ -1114,6 +1213,11 @@ class BrowserThumbnailProvider(QObject):
         self._cache_page_counts.clear()
         self._cache_specs.clear()
         self._cache_entry_priority.clear()
+        self._cache_keys_by_path.clear()
+        self._cache_rank_buckets.clear()
+        self._cache_rank_values.clear()
+        self._cache_rank_value_set.clear()
+        self._cache_key_indexed_rank.clear()
         self._preview_registry.shell_service.clear_memory_cache()
         with self._failure_lock:
             self._failed.clear()
@@ -1762,12 +1866,14 @@ class BrowserThumbnailProvider(QObject):
         existing_image = self._cache.pop(cache_key, None)
         if existing_image is not None:
             self._cache_bytes -= int(existing_image.sizeInBytes())
+            self._cache_index_remove(cache_key)
         self._cache_entry_priority.pop(cache_key, None)
         self._cache_page_counts.pop(cache_key, None)
         image_bytes = int(cached_image.sizeInBytes())
         if image_bytes <= self._cache_capacity_bytes:
             self._cache[cache_key] = cached_image
             self._cache_bytes += image_bytes
+            self._cache_index_add(cache_key)
             self._cache_entry_priority[cache_key] = int(
                 pending.priority if pending is not None else ThumbnailPriority.VISIBLE
             )
@@ -1784,6 +1890,7 @@ class BrowserThumbnailProvider(QObject):
             # Keep this as the newest LRU item. The trim path consults its
             # current viewport rank and preserves LRU order within each rank.
             self._cache.move_to_end(cache_key, last=True)
+            self._cache_index_touch(cache_key)
             if not self._browser_memory_managed:
                 self._reorder_memory_cache()
         if self._browser_memory_managed:
@@ -1797,6 +1904,7 @@ class BrowserThumbnailProvider(QObject):
                 or self._cache_bytes > self._cache_capacity_bytes
             ):
                 evicted_key, _evicted_image = self._cache.popitem(last=False)
+                self._cache_index_remove(evicted_key)
                 self._cache_bytes -= int(_evicted_image.sizeInBytes())
                 self._cache_page_counts.pop(evicted_key, None)
                 self._cache_entry_priority.pop(evicted_key, None)
@@ -1893,9 +2001,12 @@ class BrowserThumbnailProvider(QObject):
         candidates: list[
             tuple[QImage, ThumbnailRenderSpec, int | None]
         ] = []
-        for cache_key, image in self._cache.items():
+        for cache_key in self._cache_keys_by_path.get(path_key, ()):
+            image = self._cache.get(cache_key)
+            if image is None:
+                continue
             cached_path, token, cached_modified = cache_key
-            if cached_path != path_key or cached_modified != modified_at:
+            if cached_modified != modified_at:
                 continue
             spec = self._cache_specs.get(token)
             if spec is None or spec.family_token != requested.family_token:

@@ -12,12 +12,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QCoreApplication, QObject, QTimer, Signal
 
 from .image_source import ARCHIVE_EXTENSIONS, PDF_EXTENSIONS, SUPPORTED_EXTENSIONS
 
 
 METADATA_SCHEMA_VERSION = 1
+_BUSY_RETRY_MAX_ATTEMPTS = 6
+_BUSY_RETRY_BASE_MSECS = 100
+
+
+class UnsupportedMetadataSchemaError(RuntimeError):
+    def __init__(self, version: int) -> None:
+        super().__init__(f"metadata schema version {version} requires a newer NivisViewer")
+        self.version = int(version)
 
 
 @dataclass(frozen=True)
@@ -82,6 +90,11 @@ class MetadataStore(QObject):
         self._connection: sqlite3.Connection | None = None
         self._lock = threading.RLock()
         self._pending_progress: dict[str, _PendingProgress] = {}
+        self._pending_progress_inflight: dict[str, _PendingProgress] = {}
+        self._progress_retry_attempt = 0
+        self._progress_retry_timer = QTimer(self)
+        self._progress_retry_timer.setSingleShot(True)
+        self._progress_retry_timer.timeout.connect(self.flush)
         self._closed = False
         if initialize:
             self._initialize()
@@ -143,6 +156,7 @@ class MetadataStore(QObject):
                     (item_id, now, page_index, self._safe_total(total_pages)),
                 )
                 self._connection.commit()
+                self._ack_pending_progress_locked()
                 changed = True
             except (OSError, sqlite3.DatabaseError, ValueError) as exc:
                 self._disable(exc)
@@ -173,6 +187,8 @@ class MetadataStore(QObject):
                     else previous.item_type if previous is not None else None
                 ),
             )
+            if self._progress_retry_attempt >= _BUSY_RETRY_MAX_ATTEMPTS:
+                self._progress_retry_attempt = 0
 
     def get_reading_progress(self, path: str) -> ReadingProgress | None:
         normalized = self.normalize_path(path)
@@ -242,7 +258,6 @@ class MetadataStore(QObject):
         normalized = self.normalize_path(path)
         changed = False
         with self._lock:
-            self._pending_progress.pop(normalized, None)
             if not self._available:
                 return
             try:
@@ -256,6 +271,8 @@ class MetadataStore(QObject):
                     (normalized,),
                 )
                 self._connection.commit()
+                self._pending_progress.pop(normalized, None)
+                self._pending_progress_inflight.pop(normalized, None)
                 changed = cursor.rowcount > 0
             except sqlite3.DatabaseError as exc:
                 self._disable(exc)
@@ -265,12 +282,13 @@ class MetadataStore(QObject):
     def clear_history(self) -> None:
         changed = False
         with self._lock:
-            self._pending_progress.clear()
             if not self._available:
                 return
             try:
                 cursor = self._connection.execute("DELETE FROM reading_history")
                 self._connection.commit()
+                self._pending_progress.clear()
+                self._pending_progress_inflight.clear()
                 changed = cursor.rowcount > 0
             except sqlite3.DatabaseError as exc:
                 self._disable(exc)
@@ -637,12 +655,15 @@ class MetadataStore(QObject):
                     ).fetchone()
                     if row is not None:
                         self._reset_content_metadata_locked(int(row[0]))
+                self._ack_pending_progress_locked()
             except Exception as exc:
                 self.last_error = str(exc)
                 try:
                     self._connection.rollback()
                 except sqlite3.DatabaseError:
                     pass
+                if self._is_retryable_database_lock(exc):
+                    self._disable(exc)
                 return False
         self.history_changed.emit()
         self.metadata_changed.emit(self.display_path(path))
@@ -716,12 +737,15 @@ class MetadataStore(QObject):
                             destination_id=destination_id,
                             destination_path=destination_display,
                         )
+                self._ack_pending_progress_locked()
             except Exception as exc:
                 self.last_error = str(exc)
                 try:
                     self._connection.rollback()
                 except sqlite3.DatabaseError:
                     pass
+                if self._is_retryable_database_lock(exc):
+                    self._disable(exc)
                 return False
         self.history_changed.emit()
         self.bookmarks_changed.emit()
@@ -742,6 +766,7 @@ class MetadataStore(QObject):
             try:
                 self._flush_pending_locked()
                 self._connection.commit()
+                self._ack_pending_progress_locked()
                 if include_descendants:
                     rows = self._connection.execute(
                         """
@@ -807,6 +832,8 @@ class MetadataStore(QObject):
                     self._connection.rollback()
                 except sqlite3.DatabaseError:
                     pass
+                if self._is_retryable_database_lock(exc):
+                    self._disable(exc)
                 return False
         self.history_changed.emit()
         self.bookmarks_changed.emit()
@@ -814,34 +841,45 @@ class MetadataStore(QObject):
             self.metadata_changed.emit(path)
         return True
 
-    def flush(self) -> None:
+    def flush(self) -> bool:
         changed = False
         with self._lock:
             if not self._available:
-                return
+                return not self._pending_progress
             try:
-                changed = self._flush_pending_locked()
-                self._connection.commit()
+                pending_was_written = self._flush_pending_locked()
+                self._commit_transaction_locked()
+                self._ack_pending_progress_locked()
+                changed = pending_was_written
+                self._progress_retry_attempt = 0
+                self._progress_retry_timer.stop()
+                if not self._pending_progress:
+                    self.last_error = None
             except (OSError, sqlite3.DatabaseError, ValueError) as exc:
                 self._disable(exc)
         if changed:
             self.history_changed.emit()
+        with self._lock:
+            return not self._pending_progress
 
-    def close(self) -> None:
+    def close(self) -> bool:
         with self._lock:
             if self._closed:
-                return
-        self.flush()
+                return True
+        if not self.flush():
+            return False
         with self._lock:
             connection = self._connection
             self._connection = None
             self.enabled = False
             self._closed = True
+            self._progress_retry_timer.stop()
             if connection is not None:
                 try:
                     connection.close()
                 except sqlite3.DatabaseError:
                     pass
+        return True
 
     @property
     def _available(self) -> bool:
@@ -854,6 +892,14 @@ class MetadataStore(QObject):
                 self._open_connection()
                 self._migrate_schema()
                 self.enabled = True
+                self.last_error = None
+            except UnsupportedMetadataSchemaError as exc:
+                self.last_error = tr(
+                    'メタデータDBの形式が新しいため、より新しいNivisViewerが必要です: {p0}',
+                    p0=exc.version,
+                )
+                self._close_connection()
+                self.enabled = False
             except sqlite3.OperationalError as exc:
                 self.last_error = str(exc)
                 self._close_connection()
@@ -867,18 +913,17 @@ class MetadataStore(QObject):
         self._connection = sqlite3.connect(
             self.database_path,
             check_same_thread=False,
+            timeout=0.05,
         )
         self._connection.execute("PRAGMA foreign_keys=ON")
-        self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA synchronous=NORMAL")
 
     def _migrate_schema(self) -> None:
         assert self._connection is not None
         version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
         if version not in (0, METADATA_SCHEMA_VERSION):
-            raise sqlite3.DatabaseError(
-                f"unsupported metadata schema version: {version}"
-            )
+            raise UnsupportedMetadataSchemaError(version)
+        self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS library_items (
@@ -1009,7 +1054,10 @@ class MetadataStore(QObject):
         if not self._pending_progress:
             return False
         pending = tuple(self._pending_progress.values())
-        self._pending_progress.clear()
+        self._pending_progress_inflight = {
+            self.normalize_path(progress.display_path): progress
+            for progress in pending
+        }
         now = time.time()
         for progress in pending:
             item_type = progress.item_type
@@ -1048,6 +1096,59 @@ class MetadataStore(QObject):
                 ),
             )
         return True
+
+    def _ack_pending_progress_locked(self) -> None:
+        """Remove only the exact checkpoints included in a committed write."""
+        for normalized, progress in self._pending_progress_inflight.items():
+            if self._pending_progress.get(normalized) == progress:
+                self._pending_progress.pop(normalized, None)
+        self._pending_progress_inflight.clear()
+
+    def _commit_transaction_locked(self) -> None:
+        assert self._connection is not None
+        self._connection.commit()
+
+    def _is_retryable_database_lock(self, error: BaseException) -> bool:
+        if not isinstance(error, sqlite3.OperationalError):
+            return False
+        code = getattr(error, "sqlite_errorcode", None)
+        if code is not None and (int(code) & 0xFF) in {
+            sqlite3.SQLITE_BUSY,
+            sqlite3.SQLITE_LOCKED,
+        }:
+            return True
+        name = str(getattr(error, "sqlite_errorname", "")).upper()
+        message = str(error).casefold()
+        return (
+            name.startswith(("SQLITE_BUSY", "SQLITE_LOCKED"))
+            or "database is locked" in message
+            or "database table is locked" in message
+            or "database is busy" in message
+        )
+
+    def _schedule_progress_retry_locked(self, error: BaseException) -> None:
+        if self._closed:
+            return
+        if self._progress_retry_attempt >= _BUSY_RETRY_MAX_ATTEMPTS:
+            self.last_error = tr(
+                '進捗の保存を保留しています。DBロック解除後に再試行してください: {p0}',
+                p0=error,
+            )
+            return
+        self._progress_retry_attempt += 1
+        delay = min(
+            5000,
+            _BUSY_RETRY_BASE_MSECS * (2 ** (self._progress_retry_attempt - 1)),
+        )
+        self.last_error = tr(
+            'メタデータDBが使用中のため、進捗保存を再試行します: {p0}',
+            p0=error,
+        )
+        if (
+            QCoreApplication.instance() is not None
+            and not self._progress_retry_timer.isActive()
+        ):
+            self._progress_retry_timer.start(delay)
 
     def _merge_library_items(
         self,
@@ -1312,8 +1413,23 @@ class MetadataStore(QObject):
 
     def _disable(self, error: BaseException) -> None:
         self.last_error = str(error)
+        self._pending_progress_inflight.clear()
+        if self._is_retryable_database_lock(error):
+            connection = self._connection
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except sqlite3.DatabaseError:
+                    pass
+            if self._pending_progress:
+                self.enabled = True
+                self._schedule_progress_retry_locked(error)
+                return
+            # A one-off locked metadata operation failed, but the connection
+            # remains valid for subsequent user actions.
+            self.enabled = connection is not None
+            return
         self.enabled = False
-        self._pending_progress.clear()
         self._close_connection()
 
     def _close_connection(self) -> None:

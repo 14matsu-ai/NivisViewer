@@ -732,6 +732,8 @@ class BrowserWindow(QMainWindow):
         self._screen_tracking_window = None
         self._pressed_extra_buttons: set[Qt.MouseButton] = set()
         self._shutdown_prepared = False
+        self._shutdown_cleanup_phase = 0
+        self._shutdown_cleanup_complete = False
         self._zip_progress_dialog: QProgressDialog | None = None
         self._zip_progress_request_id: int | None = None
         self._fast_scrolling = False
@@ -3446,6 +3448,11 @@ class BrowserWindow(QMainWindow):
             self._compact_status_bar_if_idle,
         )
         self._update_file_action_states()
+        if result.metadata_sync_warnings:
+            self.statusBar().showMessage(
+                tr('ファイル操作は完了しましたが、メタデータ同期の確認が必要です'),
+                10000,
+            )
 
         if result.operation in {FileOperationKind.RENAME, FileOperationKind.MOVE, FileOperationKind.UNDO}:
             relocation_items = tuple(
@@ -3546,6 +3553,8 @@ class BrowserWindow(QMainWindow):
             completion_message = (
                 tr('{p0}が完了しました', p0=self._operation_label(result.operation))
             )
+        if result.metadata_sync_warnings:
+            completion_message += tr('（ファイル操作は完了しました。メタデータ同期の確認が必要です）')
 
         if property_rename is not None:
             dialog, close_on_success = property_rename
@@ -4010,54 +4019,76 @@ class BrowserWindow(QMainWindow):
             self.folder_tree_collapse_unrelated
         )
 
-    def prepare_shutdown(self) -> None:
-        if self._shutdown_prepared:
-            return
+    def prepare_shutdown(self) -> bool:
+        if self._shutdown_cleanup_complete:
+            return True
         self._shutdown_prepared = True
-        self._close_zip_progress_dialog()
-        self.clear_file_clipboard()
-        if (
-            self._owns_file_operation_coordinator
-            and self._active_file_operation_id is not None
-        ):
-            self.file_operation_coordinator.cancel()
-        if self._owns_file_operation_coordinator:
-            self.file_operation_coordinator.close()
-        self.browser_main_drop.close()
-        self.image_detail_probe.close()
-        self._pending_browser_focus = None
-        self._clear_active_directory_watch()
-        if self._owns_directory_watcher:
-            self.directory_watcher.close()
-        self._cancel_pending_scan(rollback_history=False)
-        self.scanner.close()
-        self.location_directory_loader.close()
-        self._location_directory_pending_path = None
-        self._close_location_directory_popup(cancel_pending=False)
-        self._close_owned_popup("_navigation_history_menu")
-        self._close_owned_popup("_location_history_popup")
-        self._close_owned_popup("_search_history_popup")
-        self._thumbnail_request_timer.stop()
-        self._browser_search_timer.stop()
-        self._scroll_idle_timer.stop()
-        self._scan_status_timer.stop()
-        self._scan_batch_timer.stop()
-        self._directory_change_timer.stop()
-        self._save_window_state()
-        workflow = getattr(self, "_browser_workflow", None)
-        if workflow is not None:
-            workflow.shutdown()
-        self.thumbnail_provider.close()
-        if self._owns_archive_backend_registry:
-            self.archive_backend_registry.close()
-        if self._owns_pdfium_service:
-            if not self.pdfium_service.shutdown():
+        if self._shutdown_cleanup_phase == 0:
+            self._close_zip_progress_dialog()
+            self.clear_file_clipboard()
+            if (
+                self._owns_file_operation_coordinator
+                and self._active_file_operation_id is not None
+            ):
+                self.file_operation_coordinator.cancel()
+            if self._owns_file_operation_coordinator:
+                self.file_operation_coordinator.close()
+            self.browser_main_drop.close()
+            self._pending_browser_focus = None
+            self._clear_active_directory_watch()
+            if self._owns_directory_watcher:
+                self.directory_watcher.close()
+            self._cancel_pending_scan(rollback_history=False)
+            self.scanner.close()
+            self.location_directory_loader.close()
+            self._location_directory_pending_path = None
+            self._close_location_directory_popup(cancel_pending=False)
+            self._close_owned_popup("_navigation_history_menu")
+            self._close_owned_popup("_location_history_popup")
+            self._close_owned_popup("_search_history_popup")
+            self._thumbnail_request_timer.stop()
+            self._browser_search_timer.stop()
+            self._scroll_idle_timer.stop()
+            self._scan_status_timer.stop()
+            self._scan_batch_timer.stop()
+            self._directory_change_timer.stop()
+            self._save_window_state()
+            workflow = getattr(self, "_browser_workflow", None)
+            if workflow is not None:
+                workflow.shutdown()
+            self._shutdown_cleanup_phase = 1
+
+        if self._shutdown_cleanup_phase == 1:
+            if not self.image_detail_probe.close(msecs=250):
+                return False
+            self._shutdown_cleanup_phase = 2
+
+        if self._shutdown_cleanup_phase == 2:
+            # This provider retires itself with its pool if the bounded wait
+            # expires; it never destroys a pool that still owns active work.
+            self.thumbnail_provider.close(wait_msecs=250)
+            self._shutdown_cleanup_phase = 3
+
+        if self._shutdown_cleanup_phase == 3:
+            if self._owns_archive_backend_registry:
+                self.archive_backend_registry.close()
+            self._shutdown_cleanup_phase = 4
+
+        if self._shutdown_cleanup_phase == 4:
+            if self._owns_pdfium_service and not self.pdfium_service.shutdown():
                 raise RuntimeError(
                     self.pdfium_service.last_shutdown_error
                     or "PDFium shutdown did not complete."
                 )
-        if self._owns_path_availability_service:
-            self.path_availability_service.close()
+            self._shutdown_cleanup_phase = 5
+
+        if self._shutdown_cleanup_phase == 5:
+            if self._owns_path_availability_service:
+                self.path_availability_service.close()
+            self._shutdown_cleanup_phase = 6
+
+        self._shutdown_cleanup_complete = self._shutdown_cleanup_phase == 6
+        return self._shutdown_cleanup_complete
 
     def _run_idle_cache_cleanup(self) -> None:
         if self._shutdown_prepared:
@@ -5618,6 +5649,9 @@ class BrowserWindow(QMainWindow):
     def _compact_status_bar_if_idle(self) -> None:
         if self._shutdown_prepared or self._active_file_operation_id is not None:
             return
+        panel = getattr(self, "file_operation_panel", None)
+        if panel is not None and panel.awaiting_result_acknowledgement:
+            return
         status_bar = self.statusBar()
         idle_height = max(
             BROWSER_STATUS_BAR_MIN_IDLE_HEIGHT,
@@ -6223,7 +6257,16 @@ class BrowserWindow(QMainWindow):
         if callable(guard) and not guard(self):
             event.ignore()
             return
-        self.prepare_shutdown()
+        try:
+            if not self.prepare_shutdown():
+                event.ignore()
+                return
+        except Exception:
+            _FILE_OPERATION_LOG.exception(
+                "Browser shutdown preparation did not complete"
+            )
+            event.ignore()
+            return
         self.closing.emit(self)
         application = QApplication.instance()
         if application is not None:
@@ -7060,7 +7103,17 @@ class BrowserWindow(QMainWindow):
         browser_status_bar.addPermanentWidget(self.cancel_operation_button)
         self.file_operation_panel = FileOperationPanel(self)
         if self.file_operation_coordinator.queue is not None:
-            self.file_operation_panel.bind(self.file_operation_coordinator.queue)
+            self.file_operation_panel.setAttribute(
+                Qt.WidgetAttribute.WA_DeleteOnClose,
+                False,
+            )
+            self.file_operation_panel.result_acknowledged.connect(
+                self._compact_status_bar_if_idle
+            )
+            self.file_operation_panel.bind(
+                self.file_operation_coordinator.queue,
+                completion_source=self.file_operation_coordinator,
+            )
             browser_status_bar.addPermanentWidget(self.file_operation_panel, 1)
         # QStatusBar rebuilds its private layout as permanent widgets are
         # inserted, so compact its idle chrome only after the final insertion.

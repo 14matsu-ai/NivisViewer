@@ -99,11 +99,14 @@ def test_legacy_auto_sentinels_do_not_migrate_to_minimal(legacy: object) -> None
 
 
 def test_active_and_inactive_targets_share_one_stable_hard_limit() -> None:
-    policy = ResolvedViewerMemoryPolicy("4096")
+    now = [0.0]
+    policy = ResolvedViewerMemoryPolicy("4096", clock=lambda: now[0])
 
     assert policy.hard_limit_bytes == 4 * GIB
     assert policy.target_bytes == 3584 * MIB
-    assert policy.set_active(False) == 2 * GIB
+    assert policy.set_active(False) == 3584 * MIB
+    now[0] = 10.0
+    assert policy.target_bytes == 2 * GIB
     assert policy.hard_limit_bytes == 4 * GIB
     assert policy.set_active(True) == 3584 * MIB
 

@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 import pytest
+from PySide6.QtCore import QCoreApplication, QEvent
 from PySide6.QtWidgets import QApplication
 
+from app.file_operation_coordinator import FileOperationCoordinator
 from app.file_operation_panel import (
     QT_PROGRESS_MAXIMUM,
     FileOperationPanel,
     _project_qt_progress,
 )
-from app.file_operation_service import FileOperationKind, FileOperationProgress
+from app.file_operation_queue import FileOperationQueue
+from app.file_operation_service import (
+    FileOperationItemResult,
+    FileOperationKind,
+    FileOperationProgress,
+    FileOperationRequest,
+    FileOperationResult,
+    FileOperationService,
+)
 
 
 @pytest.mark.parametrize(
@@ -131,3 +141,119 @@ def test_file_operation_panel_preserves_small_and_indeterminate_ranges(
         panel.current_file_progress.maximum(),
     ) == (0, 0)
     panel.close()
+
+
+class _FailedRelocationMetadataStore:
+    last_error = "injected database is locked"
+
+    def relocate_tree(self, _source: str, _destination: str) -> bool:
+        return False
+
+
+def test_bound_panel_keeps_coordinator_metadata_warning_until_dismissed(
+    tmp_path,
+    qapp: QApplication,
+) -> None:
+    source = tmp_path / "source.txt"
+    destination = tmp_path / "renamed.txt"
+    source.write_text("content", encoding="utf-8")
+    queue = FileOperationQueue(service=FileOperationService())
+    coordinator = FileOperationCoordinator(
+        _FailedRelocationMetadataStore(),
+        queue=queue,
+    )
+    panel = FileOperationPanel()
+    panel.bind(queue, completion_source=coordinator)
+    destroyed: list[bool] = []
+    panel.destroyed.connect(lambda _object=None: destroyed.append(True))
+
+    assert coordinator.execute(
+        FileOperationRequest(
+            55,
+            FileOperationKind.RENAME,
+            (str(source),),
+            new_name=destination.name,
+        )
+    )
+    assert queue.wait_for_done(3000)
+    for _ in range(3):
+        qapp.processEvents()
+
+    assert "完了" in panel.summary_label.text()
+    assert "メタデータ同期" in panel.summary_label.text()
+    assert "injected database is locked" in panel.details_view.toPlainText()
+    assert panel.details_button.isVisible()
+    assert panel.details_view.isVisible()
+    assert panel.cancel_button.text() == "閉じる"
+    assert panel.cancel_button.isEnabled()
+    assert not panel._hide_timer.isActive()
+    assert panel.isVisible()
+    assert destroyed == []
+    assert not queue.busy
+    assert not source.exists()
+    assert destination.read_text(encoding="utf-8") == "content"
+
+    panel.details_button.click()
+    assert not panel.details_view.isVisible()
+    panel.details_button.click()
+    assert panel.details_view.isVisible()
+    panel.cancel_button.click()
+    qapp.processEvents()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    qapp.processEvents()
+    assert destroyed == [True]
+    coordinator.close()
+
+
+@pytest.mark.parametrize(
+    ("result", "expected_summary"),
+    (
+        (
+            FileOperationResult(
+                FileOperationKind.COPY,
+                (FileOperationItemResult("source", "destination", True),),
+            ),
+            "完了",
+        ),
+        (
+            FileOperationResult(
+                FileOperationKind.COPY,
+                (
+                    FileOperationItemResult(
+                        "source", "destination", False,
+                        error_message="injected failure",
+                    ),
+                ),
+            ),
+            "失敗",
+        ),
+        (
+            FileOperationResult(
+                FileOperationKind.COPY,
+                (),
+                cancelled=True,
+            ),
+            "キャンセルしました",
+        ),
+    ),
+)
+def test_bound_panel_keeps_existing_non_warning_terminal_lifecycle(
+    result: FileOperationResult,
+    expected_summary: str,
+    qapp: QApplication,
+) -> None:
+    queue = FileOperationQueue()
+    panel = FileOperationPanel()
+    panel.bind(queue)
+    destroyed: list[bool] = []
+    panel.destroyed.connect(lambda _object=None: destroyed.append(True))
+
+    queue.operation_completed.emit(result)
+    assert expected_summary in panel.summary_label.text()
+    for _ in range(3):
+        qapp.processEvents()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    qapp.processEvents()
+
+    assert destroyed == [True]
+    queue.close()

@@ -63,6 +63,7 @@ def _project_qt_progress(
 
 class FileOperationPanel(QWidget):
     cancel_requested = Signal()
+    result_acknowledged = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -73,6 +74,7 @@ class FileOperationPanel(QWidget):
         self._active_operation = ""
         self._cancel_requested_for_operation = False
         self._idle_close_queued = False
+        self._result_requires_acknowledgement = False
         self.summary_label = QLabel("", self)
         self.detail_label = QLabel("", self)
         self.queue_label = QLabel("", self)
@@ -89,11 +91,7 @@ class FileOperationPanel(QWidget):
         self.details_view = QTextEdit(self)
         self.details_view.setReadOnly(True)
         self.details_view.setVisible(False)
-        self.details_button.clicked.connect(
-            lambda: self.details_view.setVisible(
-                not self.details_view.isVisible()
-            )
-        )
+        self.details_button.clicked.connect(self._toggle_details)
         top_layout = QHBoxLayout()
         top_layout.addWidget(self.summary_label)
         top_layout.addWidget(self.detail_label, 1)
@@ -112,7 +110,8 @@ class FileOperationPanel(QWidget):
         self._hide_timer.timeout.connect(self.hide)
         self.hide()
 
-    def bind(self, queue) -> None:
+    def bind(self, queue, *, completion_source=None) -> None:
+        """Bind queue activity and optionally post-processed results."""
         if self._queue is queue:
             return
         if self._queue is not None:
@@ -121,7 +120,10 @@ class FileOperationPanel(QWidget):
         queue.operation_preparing.connect(self._on_operation_preparing)
         queue.operation_started.connect(self._on_operation_started)
         queue.operation_progress.connect(self.show_progress)
-        queue.operation_completed.connect(self.show_result)
+        result_source = (
+            completion_source if completion_source is not None else queue
+        )
+        result_source.operation_completed.connect(self.show_result)
         queue.state_changed.connect(self._on_state_changed)
         queue.queue_changed.connect(self._on_queue_changed)
 
@@ -156,6 +158,10 @@ class FileOperationPanel(QWidget):
         self._active_operation = request.operation.value
         self._cancel_requested_for_operation = False
         self._idle_close_queued = False
+        self._result_requires_acknowledgement = False
+        self.details_view.setVisible(False)
+        self.details_button.setText(tr('詳細'))
+        self.cancel_button.setText(tr('キャンセル'))
 
     def _on_state_changed(
         self,
@@ -171,6 +177,11 @@ class FileOperationPanel(QWidget):
             )
 
     def _request_cancel(self) -> None:
+        if self._result_requires_acknowledgement:
+            self._result_requires_acknowledgement = False
+            self.close()
+            self.result_acknowledged.emit()
+            return
         if (
             self._queue is None
             or self._active_operation_id is None
@@ -275,8 +286,7 @@ class FileOperationPanel(QWidget):
             }
             for item in items
         )
-        self.details_view.setPlainText(
-            "\n".join(
+        details = [
                 f"{item.source_path or item.destination_path or tr('(不明)')}: "
                 f"{item.error_message or item.error_code or tr('失敗')}"
                 + (
@@ -291,13 +301,36 @@ class FileOperationPanel(QWidget):
                 )
                 for item in items
                 if not item.success
-            )
+            ]
+        details.extend(
+            tr('メタデータ同期の確認が必要です: {p0}', p0=warning)
+            for warning in result.metadata_sync_warnings
         )
-        self.details_button.setVisible(bool(failures))
+        self.details_view.setPlainText("\n".join(details))
+        self.details_button.setVisible(
+            bool(failures or result.metadata_sync_warnings)
+        )
         self.cancel_button.setEnabled(False)
+        self._result_requires_acknowledgement = bool(
+            result.metadata_sync_warnings
+        )
+        if self._result_requires_acknowledgement:
+            self._hide_timer.stop()
+            self.details_view.setVisible(True)
+            self.details_button.setText(tr('詳細を隠す'))
+            self.cancel_button.setText(tr('閉じる'))
+            self.cancel_button.setEnabled(True)
+        else:
+            self.details_view.setVisible(False)
+            self.details_button.setText(tr('詳細'))
+            self.cancel_button.setText(tr('キャンセル'))
         if result.cancelled:
-            self.summary_label.setText(tr('キャンセルしました'))
-            self._hide_timer.start(3000)
+            summary = tr('キャンセルしました')
+            if result.metadata_sync_warnings:
+                summary += tr('（メタデータ同期の確認が必要です）')
+            self.summary_label.setText(summary)
+            if not self._result_requires_acknowledgement:
+                self._hide_timer.start(3000)
         elif failures:
             summary = (
                 tr('完了: 成功 {p0} / スキップ {p1} / 失敗 {p2}', p0=sum(item.success for item in items), p1=skipped, p2=max(0, failures - skipped))
@@ -306,8 +339,13 @@ class FileOperationPanel(QWidget):
                 summary += tr('（元項目残留 {p0}）', p0=source_remaining)
             self.summary_label.setText(summary)
         else:
-            self.summary_label.setText(tr('完了'))
-            self._hide_timer.start(2500)
+            self.summary_label.setText(
+                tr('完了（メタデータ同期の確認が必要です）')
+                if result.metadata_sync_warnings
+                else tr('完了')
+            )
+            if not self._result_requires_acknowledgement:
+                self._hide_timer.start(2500)
         self.byte_progress.setRange(0, 1000)
         self.byte_progress.setValue(1000 if not result.cancelled else 0)
         self._active_operation_id = None
@@ -315,11 +353,23 @@ class FileOperationPanel(QWidget):
         self._cancel_requested_for_operation = False
         self.close_if_idle()
 
+    def _toggle_details(self) -> None:
+        visible = not self.details_view.isVisible()
+        self.details_view.setVisible(visible)
+        self.details_button.setText(
+            tr('詳細を隠す') if visible else tr('詳細を表示')
+        )
+
+    @property
+    def awaiting_result_acknowledgement(self) -> bool:
+        return self._result_requires_acknowledgement
+
     def close_if_idle(self) -> None:
         if (
             self._queue is None
             or self._queue.busy
             or self._active_operation_id is not None
+            or self._result_requires_acknowledgement
             or self._idle_close_queued
         ):
             return
@@ -334,6 +384,7 @@ class FileOperationPanel(QWidget):
             self._queue is not None
             and not self._queue.busy
             and self._active_operation_id is None
+            and not self._result_requires_acknowledgement
         ):
             self.close()
 

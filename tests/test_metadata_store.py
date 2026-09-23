@@ -399,5 +399,187 @@ def test_database_open_failure_disables_only_metadata(
     store.close()
 
     assert store.enabled is False
+    assert store.corrupt_backup_path is None
+    assert "read only" in (store.last_error or "")
     assert store.list_history() == []
     assert store.list_browser_bookmarks() == []
+
+
+def test_read_only_metadata_profile_does_not_create_a_database(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "readonly" / "metadata.sqlite3"
+    store = MetadataStore(database, initialize=False)
+    try:
+        assert not store.enabled
+        assert store.last_error
+        assert not database.exists()
+        assert store.corrupt_backup_path is None
+    finally:
+        store.close()
+
+
+def test_metadata_permission_error_is_not_treated_as_corruption(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database = tmp_path / "metadata.sqlite3"
+    database.write_bytes(b"user data that must not be moved")
+    original = database.read_bytes()
+
+    def deny_open(*_args, **_kwargs):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr("app.metadata_store.sqlite3.connect", deny_open)
+    store = MetadataStore(database)
+    try:
+        assert not store.enabled
+        assert store.corrupt_backup_path is None
+        assert database.read_bytes() == original
+        assert not tuple(tmp_path.glob("metadata.sqlite3.corrupt-*"))
+    finally:
+        store.close()
+
+
+def test_locked_metadata_database_is_not_renamed_as_corrupt(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "locked.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("CREATE TABLE supported (value TEXT)")
+        connection.execute("PRAGMA user_version=1")
+    original = database.read_bytes()
+    blocker = sqlite3.connect(database, timeout=0)
+    store = None
+    try:
+        blocker.execute("BEGIN EXCLUSIVE")
+        store = MetadataStore(database)
+        assert not store.enabled
+        assert store.corrupt_backup_path is None
+        assert database.read_bytes() == original
+    finally:
+        blocker.rollback()
+        blocker.close()
+        if store is not None:
+            store.close()
+
+
+def test_future_metadata_schema_is_preserved_and_requires_newer_app(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "future.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE future_data (value TEXT)")
+        connection.execute("INSERT INTO future_data VALUES ('keep')")
+        connection.execute("PRAGMA user_version=2")
+    before = database.read_bytes()
+
+    store = MetadataStore(database)
+    try:
+        assert not store.enabled
+        assert store.corrupt_backup_path is None
+        assert "新しい" in (store.last_error or "")
+        assert database.read_bytes() == before
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert connection.execute("SELECT value FROM future_data").fetchone()[0] == "keep"
+    finally:
+        store.close()
+
+
+def test_transient_sqlite_busy_keeps_progress_and_flush_recovers(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "metadata.sqlite3"
+    book = str(tmp_path / "book.cbz")
+    store = MetadataStore(database)
+    store._connection.execute("PRAGMA busy_timeout=0")
+    store.update_reading_progress(
+        book, page_index=8, total_pages=24, item_type="archive"
+    )
+    blocker = sqlite3.connect(database, timeout=0)
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
+        assert store.flush() is False
+        assert store.enabled
+        assert store.get_reading_progress(book).page_index == 8
+        assert len(store._pending_progress) == 1
+        assert "再試行" in (store.last_error or "")
+        assert store.close() is False
+        assert not store._closed and store.enabled
+
+        blocker.rollback()
+        assert store.flush() is True
+        assert not store._pending_progress
+        row = store._connection.execute(
+            "SELECT history.last_page_index FROM reading_history AS history "
+            "JOIN library_items AS item ON item.id=history.library_item_id "
+            "WHERE item.normalized_path=?",
+            (MetadataStore.normalize_path(book),),
+        ).fetchone()
+        assert row == (8,)
+    finally:
+        blocker.close()
+        store.close()
+
+
+def test_progress_commit_failure_retains_data_for_later_retry(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = MetadataStore(tmp_path / "metadata.sqlite3")
+    book = str(tmp_path / "book.zip")
+    store.update_reading_progress(
+        book, page_index=3, total_pages=9, item_type="archive"
+    )
+    original_commit = store._commit_transaction_locked
+
+    def fail_commit_once():
+        monkeypatch.setattr(store, "_commit_transaction_locked", original_commit)
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "_commit_transaction_locked", fail_commit_once)
+    try:
+        assert store.flush() is False
+        assert store.enabled
+        assert len(store._pending_progress) == 1
+        assert store.flush() is True
+        assert not store._pending_progress
+        progress = store.get_reading_progress(book)
+        assert progress is not None and progress.page_index == 3
+    finally:
+        store.close()
+
+
+def test_new_progress_during_commit_is_not_cleared_with_old_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = MetadataStore(tmp_path / "metadata.sqlite3")
+    book = str(tmp_path / "book.cbz")
+    store.update_reading_progress(
+        book, page_index=1, total_pages=12, item_type="archive"
+    )
+    original_commit = store._commit_transaction_locked
+    queued_newer = False
+
+    def commit_with_newer_progress():
+        nonlocal queued_newer
+        if not queued_newer:
+            queued_newer = True
+            store.update_reading_progress(
+                book, page_index=7, total_pages=12, item_type="archive"
+            )
+        original_commit()
+
+    monkeypatch.setattr(store, "_commit_transaction_locked", commit_with_newer_progress)
+    try:
+        assert store.flush() is False
+        assert store.get_reading_progress(book).page_index == 7
+        assert len(store._pending_progress) == 1
+        monkeypatch.setattr(store, "_commit_transaction_locked", original_commit)
+        assert store.flush() is True
+        assert store.get_reading_progress(book).page_index == 7
+    finally:
+        store.close()
