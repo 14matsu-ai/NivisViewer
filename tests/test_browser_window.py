@@ -599,7 +599,31 @@ def test_search_history_records_only_commits_persists_and_reuses_popup(
         qapp.processEvents()
         popup = window._search_history_popup
         assert popup is not None and popup.isVisible()
+        assert popup.compact_rows
         assert popup.list_widget.verticalScrollBar().maximum() > 0
+        history_row_height = popup.list_widget.sizeHintForRow(0)
+        assert {
+            popup.list_widget.sizeHintForRow(row)
+            for row in range(popup.entry_count)
+            if bool(
+                popup.list_widget.item(row).flags()
+                & Qt.ItemFlag.ItemIsEnabled
+            )
+        } == {history_row_height}
+        assert popup.list_widget.sizeHintForRow(popup.entry_count - 2) < (
+            history_row_height
+        )
+        margins = popup.layout().contentsMargins()
+        popup_vertical_chrome = (
+            2 * popup.frameWidth()
+            + 2 * popup.list_widget.frameWidth()
+            + margins.top()
+            + margins.bottom()
+        )
+        assert popup.height() == (
+            popup.maximum_visible_rows * history_row_height
+            + popup_vertical_chrome
+        )
         background_item = next(
             popup.list_widget.item(row)
             for row in range(popup.entry_count)

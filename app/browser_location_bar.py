@@ -17,12 +17,13 @@ from PySide6.QtCore import (
     QObject,
     QPoint,
     QRunnable,
+    QSize,
     QThreadPool,
     Qt,
     Signal,
     Slot,
 )
-from PySide6.QtGui import QFont, QGuiApplication, QHideEvent, QKeyEvent, QResizeEvent
+from PySide6.QtGui import QFont, QGuiApplication, QHideEvent, QKeyEvent, QPainter, QPalette, QResizeEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFrame,
@@ -30,6 +31,8 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMenu,
+    QStyleOptionViewItem,
+    QStyledItemDelegate,
     QSizePolicy,
     QToolButton,
     QVBoxLayout,
@@ -65,6 +68,62 @@ class LocationPopupEntry:
     current: bool = False
 
 
+class _CompactPopupItemDelegate(QStyledItemDelegate):
+    """Keep native item painting while overriding oversized row metrics."""
+
+    def __init__(
+        self,
+        view: QListWidget,
+        native_row_ceiling: int,
+    ) -> None:
+        super().__init__(view)
+        self._native_row_ceiling = max(1, int(native_row_ceiling))
+
+    def set_native_row_ceiling(self, height: int) -> None:
+        self._native_row_ceiling = max(1, int(height))
+
+    @staticmethod
+    def _is_separator(index) -> bool:
+        entry = index.data(Qt.ItemDataRole.UserRole)
+        return (
+            isinstance(entry, LocationPopupEntry)
+            and not entry.enabled
+            and entry.value is None
+        )
+
+    def sizeHint(self, option, index):  # noqa: N802
+        native_hint = super().sizeHint(option, index)
+        font_height = max(1, int(option.fontMetrics.height()))
+        if self._is_separator(index):
+            return QSize(int(native_hint.width()), max(4, font_height // 2))
+        # The history popup is intentionally denser than a native menu row.
+        # The font's own ascent/descent already provides the necessary space.
+        compact_target = font_height
+        height = min(
+            int(native_hint.height()),
+            self._native_row_ceiling,
+            compact_target,
+        )
+        return QSize(int(native_hint.width()), max(1, height))
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        if not self._is_separator(index):
+            super().paint(painter, option, index)
+            return
+        painter.save()
+        # The separator item is disabled; its current palette group would
+        # make the rule almost invisible on the native Windows style.
+        line_color = option.palette.color(
+            QPalette.ColorGroup.Active,
+            QPalette.ColorRole.Text,
+        )
+        line_color.setAlpha(200)
+        painter.setPen(line_color)
+        y = option.rect.center().y()
+        painter.drawLine(option.rect.left() + 8, y, option.rect.right() - 8, y)
+        painter.restore()
+
+
 class BrowserLocationListPopup(QFrame):
     """Finite-height, non-modal projection for location and history entries."""
 
@@ -78,16 +137,20 @@ class BrowserLocationListPopup(QFrame):
         parent: QWidget,
         *,
         maximum_visible_rows: int = DEFAULT_VISIBLE_ROWS,
+        compact_rows: bool = False,
     ) -> None:
         super().__init__(parent, Qt.WindowType.Popup)
         self.setObjectName("browser_location_list_popup")
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setFrameShadow(QFrame.Shadow.Raised)
         self.maximum_visible_rows = max(1, int(maximum_visible_rows))
+        self.compact_rows = bool(compact_rows)
         self._closed_emitted = False
         self.list_widget = QListWidget(self)
+        self._native_item_delegate = self.list_widget.itemDelegate()
+        self._compact_item_delegate: _CompactPopupItemDelegate | None = None
         self.list_widget.setObjectName("browser_location_popup_list")
-        self.list_widget.setUniformItemSizes(True)
+        self.list_widget.setUniformItemSizes(not self.compact_rows)
         self.list_widget.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
         )
@@ -110,7 +173,11 @@ class BrowserLocationListPopup(QFrame):
             item.setData(Qt.ItemDataRole.UserRole, entry)
             item.setToolTip(entry.tool_tip)
             if not entry.enabled:
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+                item.setFlags(
+                    item.flags()
+                    & ~Qt.ItemFlag.ItemIsEnabled
+                    & ~Qt.ItemFlag.ItemIsSelectable
+                )
             if entry.current:
                 font = QFont(item.font())
                 font.setBold(True)
@@ -183,12 +250,39 @@ class BrowserLocationListPopup(QFrame):
                 return row
         return -1
 
+    def _configure_compact_item_delegate(self) -> None:
+        # Measure the actual native delegate on each show, then cap the
+        # compact hint to it.  This responds to font/style/DPI changes and
+        # avoids the platform style's oversized content minimum.
+        self.list_widget.setItemDelegate(self._native_item_delegate)
+        native_row_height = min(
+            (
+                self.list_widget.sizeHintForRow(row)
+                for row in range(self.entry_count)
+            ),
+            default=self.list_widget.fontMetrics().height(),
+        )
+        if self._compact_item_delegate is None:
+            self._compact_item_delegate = _CompactPopupItemDelegate(
+                self.list_widget,
+                native_row_height,
+            )
+        else:
+            self._compact_item_delegate.set_native_row_ceiling(
+                native_row_height
+            )
+        self.list_widget.setItemDelegate(self._compact_item_delegate)
+
     def _show_at(self, position: QPoint, anchor_top: int, screen) -> None:
         self.ensurePolished()
-        row_height = max(
-            self.fontMetrics().height() + 8,
-            self.list_widget.sizeHintForRow(0),
-        )
+        if self.compact_rows:
+            self.list_widget.ensurePolished()
+            self._configure_compact_item_delegate()
+        else:
+            row_height = max(
+                self.fontMetrics().height() + 8,
+                self.list_widget.sizeHintForRow(0),
+            )
         visible_rows = max(
             1,
             min(self.entry_count, self.maximum_visible_rows),
@@ -208,7 +302,24 @@ class BrowserLocationListPopup(QFrame):
             default=160,
         )
         width = max(220, min(520, text_width + scrollbar_width + 36))
-        height = visible_rows * row_height + 2 * self.frameWidth() + 4
+        if self.compact_rows:
+            margins = self.layout().contentsMargins()
+            vertical_chrome = (
+                2 * self.frameWidth()
+                + 2 * self.list_widget.frameWidth()
+                + margins.top()
+                + margins.bottom()
+            )
+        else:
+            vertical_chrome = 2 * self.frameWidth() + 4
+        if self.compact_rows:
+            content_height = sum(
+                self.list_widget.sizeHintForRow(row)
+                for row in range(visible_rows)
+            )
+        else:
+            content_height = visible_rows * row_height
+        height = content_height + vertical_chrome
         if screen is not None:
             available = screen.availableGeometry()
             width = min(width, available.width())
