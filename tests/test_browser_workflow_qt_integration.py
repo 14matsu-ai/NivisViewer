@@ -26,6 +26,8 @@ from app.browser_workflow_policy import SelectionAppearance, ThumbnailWarmupCurs
 from app.browser_window import BrowserWindow
 from app.browser_model import BrowserItem, BrowserItemKind
 from app.thumbnail_provider import BrowserThumbnailProvider
+from app.browser_thumbnail_scheduler import ThumbnailPriority
+from app.thumbnail_disk_cache import ThumbnailDiskCache
 from app.thumbnail_render import ThumbnailRenderSpec
 from PIL import Image
 
@@ -624,6 +626,793 @@ def test_three_forward_screens_generate_120_real_file_thumbnails(tmp_path, qapp)
     assert cached_paths == expected_paths
     assert stats["memory_cache_entries"] == 120
     assert stats["memory_cache_usage_bytes"] <= stats["memory_cache_capacity_bytes"]
+    assert provider.pending_count == 0
+
+    provider.close()
+    window.deleteLater()
+    qapp.processEvents()
+
+
+def test_rolling_read_ahead_replenishes_next_screen_and_survives_reversal(
+    tmp_path, qapp
+):
+    items = [
+        BrowserItem(
+            f"page-{row:03}.jpg",
+            tmp_path / f"page-{row:03}.jpg",
+            BrowserItemKind.IMAGE,
+            float(row),
+            file_size=row + 1,
+            modified_time_ns=row + 1,
+        )
+        for row in range(180)
+    ]
+    source_decodes = []
+
+    def loader(item, _size, _cancel_token):
+        source_decodes.append(item.path)
+        image = QImage(16, 16, QImage.Format.Format_RGBA8888)
+        image.fill(0xFF336699)
+        return image
+
+    provider = BrowserThumbnailProvider(
+        loader=loader,
+        cache_capacity=40,
+        disk_cache_enabled=False,
+    )
+    generation = provider.begin_generation()
+    window = _WorkflowWindow()
+    window._shutdown_prepared = False
+    window._generation = generation
+    window._fast_scrolling = False
+    window._thumbnail_scroll_direction = 1
+    window._first_paint_pending_generation = None
+    window._thumbnail_request_timer = None
+    viewport = {"range": (0, 19)}
+    window._visible_row_range = lambda: viewport["range"]
+    window._schedule_thumbnail_requests = lambda _delay: None
+    window.thumbnail_provider = provider
+    spec = ThumbnailRenderSpec.from_settings(64, "square_1_1", "letterbox")
+    window.thumbnail_render_spec = spec
+    window.item_model = _WorkflowModel(items)
+    window.config = _WorkflowConfig()
+    window.config.data["browser_thumbnail_background_screens"] = 1
+    window.browser_search_edit = QLineEdit(window)
+    window.item_delegate = SimpleNamespace(selection_appearance=None)
+    window.list_view = _WorkflowListView(window)
+    workflow = BrowserWorkflowController(window)
+
+    import time
+
+    def drain_until(expected_background):
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            qapp.processEvents()
+            provider.wait_for_done(20)
+            qapp.processEvents()
+            stats = provider.cache_statistics()
+            if (stats.get("generated_background", 0) >= expected_background
+                    and provider.pending_count == 0
+                    and workflow.stop_reason in {
+                        "range-complete", "far-cache-capacity"
+                    }):
+                return stats
+            time.sleep(0.002)
+        pytest.fail(
+            f"rolling read-ahead stalled at {provider.cache_statistics()} "
+            f"stop={workflow.stop_reason}"
+        )
+
+    for item in items[:20]:
+        assert provider.request(item, spec, generation=generation,
+                                priority=ThumbnailPriority.VISIBLE)
+    assert provider.wait_for_done(5000)
+    qapp.processEvents()
+    workflow._pump()
+    drain_until(20)
+
+    positions = [(20, 39), (40, 59), (60, 79), (80, 99), (100, 119)]
+    for step, (first, last) in enumerate(positions, start=2):
+        viewport["range"] = (first, last)
+        window._thumbnail_scroll_direction = 1
+        workflow.recenter_cache_retention()
+        workflow._pump()
+        stats = drain_until(step * 20)
+        cached = {key[0] for key in provider._cache}
+        visible = {provider._path_key(item.path) for item in items[first:last + 1]}
+        next_screen = {
+            provider._path_key(item.path)
+            for item in items[last + 1:last + 21]
+        }
+        assert visible <= cached
+        assert next_screen <= cached
+        assert stats["background_self_evictions"] == 0
+        assert stats["generated_background_nonresident"] == 0
+        assert stats["memory_cache_entries"] <= 40
+        assert stats["memory_cache_usage_bytes"] <= stats["memory_cache_capacity_bytes"]
+
+    # Reverse across the cache horizon. Reprioritization happens before the
+    # visible pass, so the prior far edge cannot evict the newly visible rows.
+    viewport["range"] = (80, 99)
+    window._thumbnail_scroll_direction = -1
+    workflow.recenter_cache_retention()
+    for item in items[80:100]:
+        provider.request(item, spec, generation=generation,
+                         priority=ThumbnailPriority.VISIBLE)
+    provider.wait_for_done(5000)
+    qapp.processEvents()
+    workflow._pump()
+    stats = drain_until(140)
+    cached = {key[0] for key in provider._cache}
+    assert {
+        provider._path_key(item.path) for item in items[80:100]
+    } <= cached
+    assert {
+        provider._path_key(item.path) for item in items[60:80]
+    } <= cached
+    assert stats["generated_background"] == 140
+    assert stats["background_self_evictions"] == 0
+    assert stats["generated_background_nonresident"] == 0
+    assert len(source_decodes) == 180  # 40 visible + 140 background.
+    assert provider.pending_count == 0
+
+    provider.close()
+    window.deleteLater()
+    qapp.processEvents()
+
+
+def test_full_configured_horizon_finishes_when_current_and_both_sides_fit(
+    tmp_path, qapp
+):
+    items = [
+        BrowserItem(f"horizon-{row:02}.jpg", tmp_path / f"horizon-{row:02}.jpg",
+                    BrowserItemKind.IMAGE, float(row), file_size=row + 1,
+                    modified_time_ns=row + 1)
+        for row in range(80)
+    ]
+    decoded = []
+
+    def loader(item, _size, _cancel_token):
+        decoded.append(item.path)
+        image = QImage(8, 8, QImage.Format.Format_RGBA8888)
+        image.fill(0xFF225588)
+        return image
+
+    provider = BrowserThumbnailProvider(
+        loader=loader, cache_capacity=60, disk_cache_enabled=False
+    )
+    generation = provider.begin_generation()
+    window = _WorkflowWindow()
+    window._shutdown_prepared = False
+    window._generation = generation
+    window._fast_scrolling = False
+    window._thumbnail_scroll_direction = 1
+    window._first_paint_pending_generation = None
+    window._thumbnail_request_timer = None
+    window._visible_row_range = lambda: (20, 39)
+    window._schedule_thumbnail_requests = lambda _delay: None
+    window.thumbnail_provider = provider
+    spec = ThumbnailRenderSpec.from_settings(64, "square_1_1", "letterbox")
+    window.thumbnail_render_spec = spec
+    window.item_model = _WorkflowModel(items)
+    window.config = _WorkflowConfig()
+    window.config.data["browser_thumbnail_background_screens"] = 1
+    window.browser_search_edit = QLineEdit(window)
+    window.item_delegate = SimpleNamespace(selection_appearance=None)
+    window.list_view = _WorkflowListView(window)
+    workflow = BrowserWorkflowController(window)
+
+    for item in items[20:40]:
+        assert provider.request(item, spec, generation=generation,
+                                priority=ThumbnailPriority.VISIBLE)
+    provider.wait_for_done(5000)
+    qapp.processEvents()
+    workflow._pump()
+
+    import time
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        provider.wait_for_done(20)
+        qapp.processEvents()
+        if workflow.stop_reason == "range-complete" and provider.pending_count == 0:
+            break
+        time.sleep(0.002)
+
+    stats = provider.cache_statistics()
+    assert workflow.stop_reason == "range-complete"
+    assert stats["generated_background"] == 40
+    assert stats["memory_cache_entries"] == 60
+    assert stats["background_self_evictions"] == 0
+    assert stats["generated_background_nonresident"] == 0
+    assert {key[0] for key in provider._cache} == {
+        provider._path_key(item.path) for item in items[:60]
+    }
+    assert len(decoded) == 60
+
+    provider.close()
+    window.deleteLater()
+    qapp.processEvents()
+
+
+def test_zero_background_screens_disables_browser_workflow(tmp_path, qapp):
+    items = [
+        BrowserItem(f"disabled-{row}.jpg", tmp_path / f"disabled-{row}.jpg",
+                    BrowserItemKind.IMAGE, float(row), file_size=1,
+                    modified_time_ns=row + 1)
+        for row in range(2)
+    ]
+    decoded = []
+
+    def loader(item, _size, _cancel_token):
+        decoded.append(item.path)
+        image = QImage(8, 8, QImage.Format.Format_RGBA8888)
+        image.fill(0xFF225588)
+        return image
+
+    provider = BrowserThumbnailProvider(
+        loader=loader, cache_capacity=4, disk_cache_enabled=False
+    )
+    generation = provider.begin_generation()
+    window = _WorkflowWindow()
+    window._shutdown_prepared = False
+    window._generation = generation
+    window._fast_scrolling = False
+    window._thumbnail_scroll_direction = 1
+    window._first_paint_pending_generation = None
+    window._thumbnail_request_timer = None
+    window._visible_row_range = lambda: (0, 0)
+    window._schedule_thumbnail_requests = lambda _delay: None
+    window.thumbnail_provider = provider
+    window.thumbnail_render_spec = ThumbnailRenderSpec.from_settings(
+        64, "square_1_1", "letterbox"
+    )
+    window.item_model = _WorkflowModel(items)
+    window.config = _WorkflowConfig()
+    window.config.data["browser_thumbnail_background_screens"] = 0
+    window.browser_search_edit = QLineEdit(window)
+    window.item_delegate = SimpleNamespace(selection_appearance=None)
+    window.list_view = _WorkflowListView(window)
+    workflow = BrowserWorkflowController(window)
+
+    workflow._pump()
+
+    assert workflow.stop_reason == "disabled"
+    assert decoded == []
+    assert provider.pending_count == 0
+    assert provider.cache_statistics()["generated_background"] == 0
+
+    provider.close()
+    window.deleteLater()
+    qapp.processEvents()
+
+
+@pytest.mark.parametrize(
+    "screens,expected_generated",
+    [(3, 60), (-1, 160)],
+)
+def test_stale_folder_cache_does_not_truncate_configured_background_range(
+    tmp_path, qapp, screens, expected_generated
+):
+    items = [
+        BrowserItem(f"range-{row:03}.jpg", tmp_path / f"range-{row:03}.jpg",
+                    BrowserItemKind.IMAGE, float(row), file_size=row + 1,
+                    modified_time_ns=row + 1)
+        for row in range(200)
+    ]
+    stale_items = [
+        BrowserItem(f"old-{row:02}.jpg", tmp_path / "previous-folder" / f"old-{row:02}.jpg",
+                    BrowserItemKind.IMAGE, float(row), file_size=1,
+                    modified_time_ns=row + 1)
+        for row in range(20)
+    ]
+    decoded = []
+
+    def loader(item, _size, _cancel_token):
+        decoded.append(item.path)
+        image = QImage(8, 8, QImage.Format.Format_RGBA8888)
+        image.fill(0xFF446622)
+        return image
+
+    provider = BrowserThumbnailProvider(
+        loader=loader, cache_capacity=60, disk_cache_enabled=False
+    )
+    generation = provider.begin_generation()
+    window = _WorkflowWindow()
+    window._shutdown_prepared = False
+    window._generation = generation
+    window._fast_scrolling = False
+    window._thumbnail_scroll_direction = 1
+    window._first_paint_pending_generation = None
+    window._thumbnail_request_timer = None
+    window._visible_row_range = lambda: (20, 39)
+    window._schedule_thumbnail_requests = lambda _delay: None
+    window.thumbnail_provider = provider
+    spec = ThumbnailRenderSpec.from_settings(64, "square_1_1", "letterbox")
+    window.thumbnail_render_spec = spec
+    window.item_model = _WorkflowModel(items)
+    window.config = _WorkflowConfig()
+    window.config.data["browser_thumbnail_background_screens"] = screens
+    window.browser_search_edit = QLineEdit(window)
+    window.item_delegate = SimpleNamespace(selection_appearance=None)
+    window.list_view = _WorkflowListView(window)
+    workflow = BrowserWorkflowController(window)
+    workflow.recenter_cache_retention()
+
+    # Fill RAM as after a folder switch: visible + next screen + unrelated
+    # thumbnails from the prior folder. The far request must evict the stale
+    # group progressively instead of treating the full cache as a hard stop.
+    for item in [*items[20:40], *items[40:60], *stale_items]:
+        assert provider.request(item, spec, generation=generation,
+                                priority=ThumbnailPriority.VISIBLE)
+    assert provider.wait_for_done(5000)
+    qapp.processEvents()
+    assert provider.memory_cache_capacity_reached
+    assert provider.memory_cache_has_evictable_entries
+    assert len(provider._cache) == 60
+
+    workflow._pump()
+    import time
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        provider.wait_for_done(20)
+        qapp.processEvents()
+        if (workflow.stop_reason == "range-complete"
+                and provider.pending_count == 0
+                and provider.cache_statistics()["generated_background"]
+                >= expected_generated):
+            break
+        time.sleep(0.002)
+
+    stats = provider.cache_statistics()
+    assert workflow.stop_reason == "range-complete"
+    assert stats["generated_background"] == expected_generated
+    assert stats["background_self_evictions"] == 0
+    assert stats["memory_cache_entries"] == 60
+    assert len(provider._cache) <= 60
+    cached_paths = {key[0] for key in provider._cache}
+    assert not ({provider._path_key(item.path) for item in stale_items} & cached_paths)
+    assert {
+        provider._path_key(item.path) for item in items[20:40]
+    } <= cached_paths
+    assert {
+        provider._path_key(item.path) for item in items[40:60]
+    } <= cached_paths
+    assert provider.pending_count == 0
+
+    provider.close()
+    window.deleteLater()
+    qapp.processEvents()
+
+
+def test_full_near_ram_band_allows_remaining_range_to_finish_on_disk(
+    tmp_path, qapp
+):
+    items = []
+    for row in range(3):
+        path = tmp_path / f"disk-range-{row}.jpg"
+        path.write_bytes(b"source fixture")
+        stat = path.stat()
+        items.append(BrowserItem(
+            path.name, path, BrowserItemKind.IMAGE, stat.st_mtime,
+            file_size=stat.st_size, modified_time_ns=stat.st_mtime_ns,
+        ))
+    decoded = []
+
+    def loader(item, _size, _cancel_token):
+        decoded.append(item.path)
+        image = QImage(8, 8, QImage.Format.Format_RGBA8888)
+        image.fill(0xFF774422)
+        return image
+
+    provider = BrowserThumbnailProvider(
+        loader=loader,
+        cache_capacity=2,
+        disk_cache=ThumbnailDiskCache(tmp_path / "disk-cache", enabled=False),
+        disk_cache_enabled=True,
+    )
+    generation = provider.begin_generation()
+    window = _WorkflowWindow()
+    window._shutdown_prepared = False
+    window._generation = generation
+    window._fast_scrolling = False
+    window._thumbnail_scroll_direction = 1
+    window._first_paint_pending_generation = None
+    window._thumbnail_request_timer = None
+    window._visible_row_range = lambda: (1, 1)
+    window._schedule_thumbnail_requests = lambda _delay: None
+    window.thumbnail_provider = provider
+    spec = ThumbnailRenderSpec.from_settings(64, "square_1_1", "letterbox")
+    window.thumbnail_render_spec = spec
+    window.item_model = _WorkflowModel(items)
+    window.config = _WorkflowConfig()
+    window.config.data["browser_thumbnail_background_screens"] = 1
+    window.browser_search_edit = QLineEdit(window)
+    window.item_delegate = SimpleNamespace(selection_appearance=None)
+    window.list_view = _WorkflowListView(window)
+    workflow = BrowserWorkflowController(window)
+    workflow.recenter_cache_retention()
+
+    for item in items[1:3]:
+        assert provider.request(item, spec, generation=generation,
+                                priority=ThumbnailPriority.VISIBLE)
+    provider.wait_for_done(5000)
+    qapp.processEvents()
+    assert provider.memory_cache_capacity_reached
+
+    workflow._pump()
+    import time
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        provider.wait_for_done(20)
+        qapp.processEvents()
+        if workflow.stop_reason == "range-complete" and provider.pending_count == 0:
+            break
+        time.sleep(0.002)
+
+    stats = provider.cache_statistics()
+    assert workflow.stop_reason == "range-complete"
+    assert stats["generated_background"] == 1
+    assert stats["disk_saved_background"] == 1
+    assert stats["background_self_evictions"] == 1
+    assert stats["generated_background_nonresident"] == 1
+    assert stats["memory_cache_entries"] == 2
+    assert decoded.count(items[0].path) == 1
+    assert provider.pending_count == 0
+
+    provider.close()
+    window.deleteLater()
+    qapp.processEvents()
+
+
+def test_failed_background_disk_write_stops_far_generation_after_one_item(
+    tmp_path, qapp
+):
+    class DiskCacheWithFailedFarWrite:
+        enabled = True
+
+        def __init__(self):
+            self.write_attempts = 0
+
+        def usage_bytes(self):
+            return 0
+
+        def statistics(self):
+            return {"usage_bytes": 0}
+
+        def set_enabled(self, _enabled):
+            return None
+
+        def get_suitable(self, *_args, **_kwargs):
+            return None
+
+        def put(self, *_args, **_kwargs):
+            self.write_attempts += 1
+            # Existing current+next images establish a working route. The
+            # first distant save then fails, as on a read-only/full cache.
+            return self.write_attempts <= 4
+
+        def close(self):
+            return None
+
+    items = [
+        BrowserItem(f"write-route-{row}.jpg", tmp_path / f"write-route-{row}.jpg",
+                    BrowserItemKind.IMAGE, float(row), file_size=1,
+                    modified_time_ns=row + 1)
+        for row in range(7)
+    ]
+    decoded = []
+    disk_cache = DiskCacheWithFailedFarWrite()
+
+    def loader(item, _size, _cancel_token):
+        decoded.append(item.path)
+        image = QImage(8, 8, QImage.Format.Format_RGBA8888)
+        image.fill(0xFF774422)
+        return image
+
+    provider = BrowserThumbnailProvider(
+        loader=loader,
+        cache_capacity=4,
+        disk_cache=disk_cache,  # type: ignore[arg-type]
+        disk_cache_enabled=True,
+    )
+    generation = provider.begin_generation()
+    window = _WorkflowWindow()
+    window._shutdown_prepared = False
+    window._generation = generation
+    window._fast_scrolling = False
+    window._thumbnail_scroll_direction = 1
+    window._first_paint_pending_generation = None
+    window._thumbnail_request_timer = None
+    window._visible_row_range = lambda: (1, 2)
+    window._schedule_thumbnail_requests = lambda _delay: None
+    window.thumbnail_provider = provider
+    spec = ThumbnailRenderSpec.from_settings(64, "square_1_1", "letterbox")
+    window.thumbnail_render_spec = spec
+    window.item_model = _WorkflowModel(items)
+    window.config = _WorkflowConfig()
+    window.config.data["browser_thumbnail_background_screens"] = 2
+    window.browser_search_edit = QLineEdit(window)
+    window.item_delegate = SimpleNamespace(selection_appearance=None)
+    window.list_view = _WorkflowListView(window)
+    provider.set_cache_retention_priorities([
+        (item.path, item.thumbnail_revision, 0) for item in items[1:3]
+    ] + [
+        (item.path, item.thumbnail_revision, 1) for item in items[3:5]
+    ] + [
+        (items[0].path, items[0].thumbnail_revision, 2),
+    ])
+    for item in items[1:5]:
+        assert provider.request(item, spec, generation=generation,
+                                priority=ThumbnailPriority.VISIBLE)
+    assert provider.wait_for_done(5000)
+    qapp.processEvents()
+
+    workflow = BrowserWorkflowController(window)
+    workflow.recenter_cache_retention()
+    assert provider.memory_cache_capacity_reached
+    assert not provider.memory_cache_has_evictable_entries
+    assert all(provider.has_memory_thumbnail(item, spec) for item in items[3:5])
+
+    workflow._pump()
+    import time
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        provider.wait_for_done(20)
+        qapp.processEvents()
+        if workflow.stop_reason == "far-cache-capacity" and provider.pending_count == 0:
+            break
+        time.sleep(0.002)
+
+    stats = provider.cache_statistics()
+    assert workflow.stop_reason == "far-cache-capacity"
+    assert disk_cache.write_attempts == 5
+    assert decoded == [item.path for item in items[1:5]] + [items[0].path]
+    assert not provider.background_disk_cache_enabled
+    assert stats["generated_background"] == 1
+    assert stats["background_self_evictions"] == 1
+    assert stats["generated_background_nonresident"] == 1
+    assert stats["memory_cache_entries"] == 4
+    assert provider.pending_count == 0
+
+    provider.close()
+    window.deleteLater()
+    qapp.processEvents()
+
+
+def test_near_band_capacity_stops_after_one_nonresident_completion(tmp_path, qapp):
+    items = [
+        BrowserItem(f"small-{row}.jpg", tmp_path / f"small-{row}.jpg",
+                    BrowserItemKind.IMAGE, float(row), file_size=1,
+                    modified_time_ns=row + 1)
+        for row in range(2)
+    ]
+    source_decodes = []
+
+    def loader(item, _size, _cancel_token):
+        source_decodes.append(item.path)
+        image = QImage(16, 16, QImage.Format.Format_RGBA8888)
+        image.fill(0xFFFFFFFF)
+        return image
+
+    provider = BrowserThumbnailProvider(
+        loader=loader, cache_capacity=1, disk_cache_enabled=False
+    )
+    generation = provider.begin_generation()
+    window = _WorkflowWindow()
+    window._shutdown_prepared = False
+    window._generation = generation
+    window._fast_scrolling = False
+    window._thumbnail_scroll_direction = 1
+    window._first_paint_pending_generation = None
+    window._thumbnail_request_timer = None
+    window._visible_row_range = lambda: (0, 0)
+    window._schedule_thumbnail_requests = lambda _delay: None
+    window.thumbnail_provider = provider
+    window.thumbnail_render_spec = ThumbnailRenderSpec.from_settings(
+        64, "square_1_1", "letterbox"
+    )
+    window.item_model = _WorkflowModel(items)
+    window.config = _WorkflowConfig()
+    window.config.data["browser_thumbnail_background_screens"] = 1
+    window.browser_search_edit = QLineEdit(window)
+    window.item_delegate = SimpleNamespace(selection_appearance=None)
+    window.list_view = _WorkflowListView(window)
+    workflow = BrowserWorkflowController(window)
+
+    assert provider.request(items[0], window.thumbnail_render_spec,
+                            generation=generation,
+                            priority=ThumbnailPriority.VISIBLE)
+    provider.wait_for_done(5000)
+    qapp.processEvents()
+    workflow._pump()
+
+    import time
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        provider.wait_for_done(20)
+        qapp.processEvents()
+        if workflow.stop_reason == "near-cache-capacity":
+            break
+        time.sleep(0.002)
+
+    stats = provider.cache_statistics()
+    assert workflow.stop_reason == "near-cache-capacity"
+    assert stats["generated_background"] == 1
+    assert stats["background_self_evictions"] == 1
+    assert stats["generated_background_nonresident"] == 1
+    assert len(source_decodes) == 2
+    assert provider.pending_count == 0
+
+    provider.close()
+    window.deleteLater()
+    qapp.processEvents()
+
+
+def test_paused_provider_resumes_browser_warmup_without_polling(tmp_path, qapp):
+    items = [
+        BrowserItem(f"pause-{row}.jpg", tmp_path / f"pause-{row}.jpg",
+                    BrowserItemKind.IMAGE, float(row), file_size=1,
+                    modified_time_ns=row + 1)
+        for row in range(2)
+    ]
+
+    def loader(_item, _size, _cancel_token):
+        image = QImage(12, 12, QImage.Format.Format_RGBA8888)
+        image.fill(0xFF668844)
+        return image
+
+    provider = BrowserThumbnailProvider(
+        loader=loader, cache_capacity=4, disk_cache_enabled=False
+    )
+    generation = provider.begin_generation()
+    window = _WorkflowWindow()
+    window._shutdown_prepared = False
+    window._generation = generation
+    window._fast_scrolling = False
+    window._thumbnail_scroll_direction = 1
+    window._first_paint_pending_generation = None
+    window._thumbnail_request_timer = None
+    window._visible_row_range = lambda: (0, 0)
+    window._schedule_thumbnail_requests = lambda _delay: None
+    window.thumbnail_provider = provider
+    window.thumbnail_render_spec = ThumbnailRenderSpec.from_settings(
+        64, "square_1_1", "letterbox"
+    )
+    window.item_model = _WorkflowModel(items)
+    window.config = _WorkflowConfig()
+    window.config.data["browser_thumbnail_background_screens"] = 1
+    window.browser_search_edit = QLineEdit(window)
+    window.item_delegate = SimpleNamespace(selection_appearance=None)
+    window.list_view = _WorkflowListView(window)
+    workflow = BrowserWorkflowController(window)
+
+    assert provider.request(items[0], window.thumbnail_render_spec,
+                            generation=generation,
+                            priority=ThumbnailPriority.VISIBLE)
+    provider.wait_for_done(5000)
+    qapp.processEvents()
+    provider.set_paused(True)
+    workflow._pump()
+    assert workflow.stop_reason == "provider-paused"
+    assert provider.cache_statistics()["generated_background"] == 0
+
+    provider.set_paused(False)
+    import time
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        provider.wait_for_done(20)
+        qapp.processEvents()
+        if (provider.cache_statistics()["generated_background"] == 1
+                and workflow.stop_reason == "range-complete"):
+            break
+        time.sleep(0.002)
+    assert provider.cache_statistics()["generated_background"] == 1
+    assert workflow.stop_reason == "range-complete"
+    assert provider.pending_count == 0
+
+    provider.close()
+    window.deleteLater()
+    qapp.processEvents()
+
+
+def test_sort_filter_and_render_revisions_recenter_without_losing_cache(
+    tmp_path, qapp
+):
+    items = [
+        BrowserItem(f"revision-{row:02}.jpg", tmp_path / f"revision-{row:02}.jpg",
+                    BrowserItemKind.IMAGE, float(row), file_size=row + 1,
+                    modified_time_ns=row + 1)
+        for row in range(12)
+    ]
+    decoded = []
+
+    def loader(item, _size, _cancel_token):
+        decoded.append(item.path.name)
+        image = QImage(12, 12, QImage.Format.Format_RGBA8888)
+        image.fill(0xFF775533)
+        return image
+
+    provider = BrowserThumbnailProvider(
+        loader=loader, cache_capacity=16, disk_cache_enabled=False
+    )
+    generation = provider.begin_generation()
+    window = _WorkflowWindow()
+    window._shutdown_prepared = False
+    window._generation = generation
+    window._fast_scrolling = False
+    window._thumbnail_scroll_direction = 1
+    window._first_paint_pending_generation = None
+    window._thumbnail_request_timer = None
+    window._visible_row_range = lambda: (0, 1)
+    window._schedule_thumbnail_requests = lambda _delay: None
+    window.thumbnail_provider = provider
+    window.thumbnail_render_spec = ThumbnailRenderSpec.from_settings(
+        64, "square_1_1", "letterbox"
+    )
+    model = _WorkflowModel(items.copy())
+    window.item_model = model
+    window.config = _WorkflowConfig()
+    window.browser_search_edit = QLineEdit(window)
+    window.item_delegate = SimpleNamespace(selection_appearance=None)
+    window.list_view = _WorkflowListView(window)
+    workflow = BrowserWorkflowController(window)
+
+    import time
+
+    def finish_until(expected_background):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            qapp.processEvents()
+            provider.wait_for_done(20)
+            qapp.processEvents()
+            if (provider.cache_statistics()["generated_background"]
+                    >= expected_background and provider.pending_count == 0
+                    and workflow.stop_reason in {
+                        "range-complete", "far-cache-capacity"
+                    }):
+                return
+            time.sleep(0.002)
+        pytest.fail(f"workflow did not settle after revision: {workflow.stop_reason}")
+
+    workflow._pump()
+    finish_until(2)
+    old_cursor = workflow._cursor
+    old_context = workflow._context
+
+    model.items.reverse()
+    model.layoutChanged.emit()  # Browser sorting changes item-to-row mapping.
+    workflow._timer.stop()
+    workflow._pump()
+    finish_until(4)
+    assert workflow._cursor is not old_cursor
+    assert workflow._context != old_context
+    assert decoded[-2:] == ["revision-09.jpg", "revision-08.jpg"]
+
+    model.items = model.items[:4]
+    model.modelReset.emit()  # Filter result replaces the visible row set.
+    workflow._timer.stop()
+    workflow._pump()
+    finish_until(4)
+    assert workflow._cursor.count == 4
+    assert workflow._cursor is not old_cursor
+
+    old_token = window.thumbnail_render_spec.cache_token
+    window.thumbnail_render_spec = ThumbnailRenderSpec.from_settings(
+        128, "square_1_1", "letterbox"
+    )
+    window._generation = provider.begin_generation()
+    workflow._timer.stop()
+    workflow._pump()
+    finish_until(6)
+    assert window.thumbnail_render_spec.cache_token != old_token
+    assert workflow._context[0] == window._generation
+    assert workflow._context[1] == window.thumbnail_render_spec.cache_token
     assert provider.pending_count == 0
 
     provider.close()

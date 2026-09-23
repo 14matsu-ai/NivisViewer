@@ -106,6 +106,20 @@ def test_cancelled_or_rejected_request_not_lost():
     assert c.take()==3
 
 
+def test_reopen_requeues_only_missing_eligible_rows_in_preferred_order():
+    cursor = ThumbnailWarmupCursor(30)
+    cursor.recenter(10, 14, 1, 2)
+    assert cursor.take() == 15
+    cursor.complete(15)
+    cursor.complete(16)
+    cursor.reopen([16, 15, 16, 10, 25])
+    assert cursor.take() == 16
+    assert cursor.take() == 15
+    cursor.complete(16)
+    cursor.complete(15)
+    assert cursor.take() == 17
+
+
 def test_recenter_retries_unfinished_without_revisiting_done():
     c=ThumbnailWarmupCursor(20)
     c.recenter(0,2,1,2)

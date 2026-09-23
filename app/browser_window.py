@@ -5212,6 +5212,9 @@ class BrowserWindow(QMainWindow):
         self._update_status()
         self._update_selected_detail()
         self._update_file_action_states()
+        workflow = getattr(self, "_browser_workflow", None)
+        if workflow is not None:
+            workflow.recenter_cache_retention()
 
     def _finish_paste_clipboard(
         self,
@@ -7215,6 +7218,10 @@ class BrowserWindow(QMainWindow):
     def _request_visible_thumbnails(self) -> None:
         workflow = getattr(self, "_browser_workflow", None)
         if workflow is not None:
+            # Recenter cache retention before the visible requests below can
+            # touch the LRU. This also runs while rapid scrolling suppresses
+            # speculative generation, without doing any image or disk I/O.
+            workflow.recenter_cache_retention()
             workflow.schedule_background()
         row_count = self.item_model.rowCount()
         if self._shutdown_prepared or row_count <= 0:

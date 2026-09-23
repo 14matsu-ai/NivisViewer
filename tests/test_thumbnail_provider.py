@@ -400,6 +400,11 @@ def test_background_warmup_keeps_visible_and_next_viewport_in_ram(
     )
     generation = provider.begin_generation()
     spec = ThumbnailRenderSpec.from_settings(96, "square_1_1", "letterbox")
+    provider.set_cache_retention_priorities([
+        (item.path, item.thumbnail_revision, 0) for item in items[:40]
+    ] + [
+        (item.path, item.thumbnail_revision, 1) for item in items[40:80]
+    ])
 
     # Model an already-painted 40-row viewport through the normal provider
     # lane, then warm three forward screens without further scrolling.
@@ -433,6 +438,113 @@ def test_background_warmup_keeps_visible_and_next_viewport_in_ram(
     assert len(loaded_paths) == 160
     assert provider.pending_count == 0
     assert stats["memory_cache_usage_bytes"] <= stats["memory_cache_capacity_bytes"]
+    provider.close()
+
+
+def test_background_thumbnail_survives_failed_disk_write_in_ram(tmp_path, qapp):
+    class FailedWriteDiskCache:
+        enabled = True
+
+        def usage_bytes(self):
+            return 0
+
+        def statistics(self):
+            return {"usage_bytes": 0}
+
+        def set_enabled(self, _enabled):
+            return None
+
+        def get_suitable(self, *_args, **_kwargs):
+            return None
+
+        def put(self, *_args, **_kwargs):
+            return False
+
+        def close(self):
+            return None
+
+    path = tmp_path / "write-failure.jpg"
+    path.write_bytes(b"fixture")
+    item = make_item(path, BrowserItemKind.IMAGE)
+    decoded = []
+
+    def loader(current, _size, _cancel_token):
+        decoded.append(current.path)
+        image = QImage(12, 12, QImage.Format.Format_RGBA8888)
+        image.fill(0xFF224466)
+        return image
+
+    provider = BrowserThumbnailProvider(
+        loader=loader,
+        cache_capacity=4,
+        disk_cache=FailedWriteDiskCache(),  # type: ignore[arg-type]
+        disk_cache_enabled=True,
+    )
+    generation = provider.begin_generation()
+    spec = ThumbnailRenderSpec.from_settings(48, "square_1_1", "letterbox")
+    provider.set_cache_retention_priorities([(item.path, item.thumbnail_revision, 2)])
+
+    assert provider.request_background(item, spec, generation=generation) == "queued"
+    assert provider.wait_for_done(5000)
+    qapp.processEvents()
+
+    stats = provider.cache_statistics()
+    assert len(decoded) == 1
+    assert provider.has_memory_thumbnail(item, spec)
+    assert stats["generated_background"] == 1
+    assert stats.get("disk_saved_background", 0) == 0
+    assert stats["memory_only"] == 1
+    assert stats["generated_background_nonresident"] == 0
+    assert stats["background_self_evictions"] == 0
+    assert not provider.background_disk_cache_enabled
+    provider.close()
+
+
+def test_disk_cache_initialization_failure_is_not_reported_as_available(
+    tmp_path, qapp
+):
+    class DisabledDiskCache:
+        enabled = False
+
+        def usage_bytes(self):
+            return 0
+
+        def statistics(self):
+            return {"usage_bytes": 0}
+
+        def set_enabled(self, _enabled):
+            # Simulate a portable/read-only cache location that cannot open.
+            self.enabled = False
+
+        def put(self, *_args, **_kwargs):
+            raise AssertionError("put must not run when cache initialization fails")
+
+        def close(self):
+            return None
+
+    path = tmp_path / "cache-init-failure.jpg"
+    path.write_bytes(b"fixture")
+    item = make_item(path, BrowserItemKind.IMAGE)
+
+    def loader(_item, _size, _cancel_token):
+        image = QImage(12, 12, QImage.Format.Format_RGBA8888)
+        image.fill(0xFF224466)
+        return image
+
+    provider = BrowserThumbnailProvider(
+        loader=loader,
+        disk_cache=DisabledDiskCache(),  # type: ignore[arg-type]
+        disk_cache_enabled=True,
+    )
+    generation = provider.begin_generation()
+    spec = ThumbnailRenderSpec.from_settings(48, "square_1_1", "letterbox")
+
+    assert provider.request_background(item, spec, generation=generation) == "queued"
+    assert provider.wait_for_done(5000)
+    qapp.processEvents()
+
+    assert provider.has_memory_thumbnail(item, spec)
+    assert not provider.background_disk_cache_enabled
     provider.close()
 
 
@@ -805,6 +917,58 @@ def test_read_ahead_persists_to_existing_disk_cache_for_next_visible_hit(
     assert calls == [str(image_path)]
     assert second_provider.cache_statistics()["disk_hit"] == 1
     second_provider.close()
+
+
+def test_background_replenishment_reads_disk_without_source_decode(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    image_path = tmp_path / "background-disk-hit.jpg"
+    write_image(image_path)
+    item = make_item(image_path, BrowserItemKind.IMAGE)
+    cache_path = tmp_path / "cache"
+    calls: list[str] = []
+
+    def loader(current, _size, _cancel_token=None, _priority=None):
+        calls.append(str(current.path))
+        image = QImage(10, 10, QImage.Format.Format_RGBA8888)
+        image.fill(0xFF446688)
+        return image
+
+    spec = ThumbnailRenderSpec.from_settings(48, "square_1_1", "letterbox")
+    writer = BrowserThumbnailProvider(
+        loader=loader,
+        disk_cache=ThumbnailDiskCache(cache_path, enabled=False),
+        disk_cache_enabled=True,
+    )
+    generation = writer.begin_generation()
+    writer.set_cache_retention_priorities([(item.path, item.thumbnail_revision, 2)])
+    assert writer.request_background(item, spec, generation=generation) == "queued"
+    assert writer.wait_for_done(5000)
+    qapp.processEvents()
+    assert writer.cache_statistics()["disk_saved_background"] == 1
+    writer.close()
+
+    reader = BrowserThumbnailProvider(
+        loader=loader,
+        disk_cache=ThumbnailDiskCache(cache_path, enabled=False),
+        disk_cache_enabled=True,
+    )
+    second_generation = reader.begin_generation()
+    reader.set_cache_retention_priorities([(item.path, item.thumbnail_revision, 2)])
+    assert reader.request_background(
+        item, spec, generation=second_generation
+    ) == "queued"
+    assert reader.wait_for_done(5000)
+    qapp.processEvents()
+
+    stats = reader.cache_statistics()
+    assert calls == [str(image_path)]
+    assert stats["disk_hit"] == 1
+    assert stats["background_disk_hit"] == 1
+    assert stats.get("generated_background", 0) == 0
+    assert reader.has_memory_thumbnail(item, spec)
+    reader.close()
 
 
 def test_recenter_cancels_queued_old_visible_and_speculative_work(
