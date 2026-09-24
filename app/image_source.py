@@ -282,7 +282,11 @@ def _read_folder_jpeg_qimage_at_most(
             )
             image.draft("RGB", raw_target)
             image.load()
-            prepared = ImageOps.exif_transpose(image)
+            prepared = (
+                ImageOps.exif_transpose(image)
+                if orientation in {2, 3, 4, 5, 6, 7, 8}
+                else image
+            )
             try:
                 prepared.thumbnail(
                     logical_target,
@@ -337,7 +341,11 @@ def _read_folder_compatible_jpeg_at_most(
             )
             image.draft("RGB", raw_target)
             image.load()
-            prepared = ImageOps.exif_transpose(image)
+            prepared = (
+                ImageOps.exif_transpose(image)
+                if orientation in {2, 3, 4, 5, 6, 7, 8}
+                else image
+            )
             try:
                 prepared.load()
                 from .thumbnail_render import pil_to_qimage
@@ -908,6 +916,7 @@ class ZipImageSource(ImageSource):
         self._closed = threading.Event()
         self._zip_closed = False
         self._active_requests: dict[str, set[threading.Event]] = {}
+        self._read_ahead = None
         self._listed_images: tuple[str, ...] | None = None
         self._display_names: dict[str, str] = {}
         self._size_cache: dict[str, tuple[int, int]] = {}
@@ -1111,11 +1120,15 @@ class ZipImageSource(ImageSource):
             return None
         cancelled = self._begin_request(image_id)
         try:
-            payload, read_calls = self._read_entry_qbytearray(
-                image_id,
-                cancelled,
+            ahead = self._read_ahead
+            prepared = ahead.take(image_id) if ahead is not None else None
+            payload, read_calls = (
+                prepared if prepared is not None
+                else self._read_entry_qbytearray(image_id, cancelled)
             )
             self._raise_if_cancelled(cancelled)
+            if ahead is not None:
+                ahead.kick(image_id)
             if payload.size() < 3 or not payload.startsWith(
                 QByteArray(b"\xff\xd8\xff")
             ):
@@ -1299,7 +1312,7 @@ class ZipImageSource(ImageSource):
             with self._zip.open(info, "r") as file:
                 while True:
                     self._raise_if_cancelled(cancelled)
-                    chunk = file.read(self._READ_CHUNK_BYTES)
+                    chunk = file.read(self._entry_read_chunk_bytes(info))
                     self._raise_if_cancelled(cancelled)
                     if not chunk:
                         break
@@ -1341,7 +1354,7 @@ class ZipImageSource(ImageSource):
             with self._zip.open(info, "r") as file:
                 while True:
                     self._raise_if_cancelled(cancelled)
-                    chunk = file.read(self._READ_CHUNK_BYTES)
+                    chunk = file.read(self._entry_read_chunk_bytes(info))
                     read_calls += 1
                     self._raise_if_cancelled(cancelled)
                     if not chunk:
@@ -1354,6 +1367,65 @@ class ZipImageSource(ImageSource):
                         )
                     payload.append(chunk)
         return payload, read_calls
+
+    def _entry_read_chunk_bytes(self, info: zipfile.ZipInfo) -> int:
+        # Large deflated JPEGs spend measurable time copying ZipExtFile/zlib
+        # output buffers at 1 MiB. A smaller block reduces that cost while the
+        # final payload is still preallocated once. Stored entries keep large
+        # reads; explicit smaller test/cancellation limits remain effective.
+        if info.compress_type == zipfile.ZIP_DEFLATED:
+            return min(self._READ_CHUNK_BYTES, 128 * 1024)
+        return self._READ_CHUNK_BYTES
+
+    @property
+    def read_ahead_reserved_bytes(self) -> int:
+        return self._read_ahead.reserved_bytes if self._read_ahead is not None else 0
+
+    @property
+    def read_ahead_busy(self) -> bool:
+        return self._read_ahead.busy if self._read_ahead is not None else False
+
+    @property
+    def read_ahead_completed(self):
+        return self._read_ahead.signals.completed if self._read_ahead is not None else None
+
+    def wait_read_ahead(self, timeout: float) -> bool:
+        return self._read_ahead.wait(timeout) if self._read_ahead is not None else True
+
+    def configure_read_ahead(self, chain: tuple[str, ...], byte_budget: int) -> None:
+        from .zip_read_ahead import ZipReadAhead
+
+        budget = min(max(0, int(byte_budget)), 32 * 1024 * 1024)
+        next_reads = {}
+        keep = set()
+        for image_id in chain:
+            info = self._zip.NameToInfo.get(image_id)
+            if info is not None and 0 < info.file_size <= budget:
+                keep.add(image_id)
+        for trigger, next_id in zip(chain, chain[1:]):
+            info = self._zip.NameToInfo.get(next_id)
+            if (next_id in keep and info is not None
+                    and info.compress_type == zipfile.ZIP_DEFLATED
+                    and Path(next_id).suffix.casefold() in {".jpg", ".jpeg", ".jpe"}):
+                next_reads[trigger] = (next_id, info.file_size)
+        if self._read_ahead is None and next_reads and not self._closed.is_set():
+            self._read_ahead = ZipReadAhead(self._read_ahead_payload)
+        if self._read_ahead is not None:
+            self._read_ahead.configure(next_reads, keep)
+
+    def _read_ahead_payload(self, image_id: str, cancelled: threading.Event) -> tuple[QByteArray, int]:
+        with self._active_lock:
+            if self._closed.is_set():
+                cancelled.set()
+            self._active_requests.setdefault(image_id, set()).add(cancelled)
+        try:
+            return self._read_entry_qbytearray(image_id, cancelled)
+        finally:
+            self._finish_request(image_id, cancelled)
+
+    def cancel_read_ahead(self) -> None:
+        if self._read_ahead is not None:
+            self._read_ahead.cancel()
 
     def cancel_image_request(self, image_id: str) -> None:
         with self._active_lock:
@@ -1388,6 +1460,8 @@ class ZipImageSource(ImageSource):
             if not self._active_requests and not self._zip_closed:
                 self._zip_closed = True
                 close_zip = True
+        if self._read_ahead is not None:
+            self._read_ahead.close()
         # Do not make the UI wait for a running decoder that owns _lock.
         # The final _finish_request closes the persistent ZipFile instead.
         if close_zip:

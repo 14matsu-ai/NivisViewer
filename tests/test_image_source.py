@@ -3,6 +3,7 @@ from __future__ import annotations
 import zipfile
 from pathlib import Path
 from threading import Event, Thread
+import random
 
 import pytest
 from PIL import Image
@@ -21,6 +22,28 @@ def write_image(path: Path, *, size: tuple[int, int] = (8, 12)) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with Image.new("RGB", size, "white") as image:
         image.save(path)
+
+
+@pytest.mark.parametrize("qt_buffer", (False, True))
+def test_deflated_multiblock_payload_is_complete_and_crc_checked(tmp_path, qt_buffer):
+    payload = random.Random(24).randbytes(1024 * 1024 + 17)
+    path = tmp_path / "multiblock.zip"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        output.writestr("日本語.jpg", payload)
+    source = ZipImageSource(path)
+    try:
+        def read():
+            if qt_buffer:
+                data, _calls = source._read_entry_qbytearray("日本語.jpg", Event())
+                return bytes(data)
+            with source._read_entry_stream("日本語.jpg", Event()) as stream:
+                return stream.read()
+        assert read() == payload
+        source._zip.getinfo("日本語.jpg").CRC ^= 1
+        with pytest.raises(zipfile.BadZipFile, match="CRC"):
+            read()
+    finally:
+        source.close()
 
 
 def test_folder_lists_only_supported_images_in_natural_order(tmp_path: Path) -> None:

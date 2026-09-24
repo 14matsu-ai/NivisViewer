@@ -175,6 +175,7 @@ def _build_fixture(
     small_size: tuple[int, int],
     large_size: tuple[int, int],
     detail: bool,
+    deflated: bool = False,
 ) -> dict[str, Any]:
     payloads = {
         small_size: _jpeg_bytes(small_size, detail=detail),
@@ -189,7 +190,7 @@ def _build_fixture(
     with zipfile.ZipFile(
         archive_path,
         "w",
-        compression=zipfile.ZIP_STORED,
+        compression=zipfile.ZIP_DEFLATED if deflated else zipfile.ZIP_STORED,
     ) as archive:
         for index, size in enumerate(sizes):
             payload = payloads[size]
@@ -199,7 +200,7 @@ def _build_fixture(
                 f"日本語ページ/{name}",
                 date_time=(2024, 1, 1, 0, 0, 0),
             )
-            info.compress_type = zipfile.ZIP_STORED
+            info.compress_type = zipfile.ZIP_DEFLATED if deflated else zipfile.ZIP_STORED
             archive.writestr(info, payload)
     return {
         "paths": {
@@ -554,9 +555,9 @@ class _NavigationProbe:
 
         original_runtime_request = runtime.request
 
-        def dispatch_request(_runtime, request):
+        def dispatch_request(_runtime, request, **kwargs):
             started = _now_ns()
-            accepted = bool(original_runtime_request(request))
+            accepted = bool(original_runtime_request(request, **kwargs))
             probe._event(
                 "runtime_request",
                 request_id=int(getattr(request, "request_id", -1)),
@@ -571,13 +572,13 @@ class _NavigationProbe:
         original_submit = getattr(runtime, "_submit", None)
         if callable(original_submit):
 
-            def submit(_runtime, key, priority):
+            def submit(_runtime, key, priority, **kwargs):
                 probe._event(
                     "job_submit",
                     priority=int(priority),
                     identity=tuple(getattr(key, "unit_identity", ())),
                 )
-                return original_submit(key, priority)
+                return original_submit(key, priority, **kwargs)
 
             self._install(runtime, "_submit", submit)
 
@@ -1302,9 +1303,12 @@ class _Driver:
         completed = _now_ns()
         target_page = int(self.window.model.focused_index)
         if target_page == before_page:
-            raise AssertionError(
-                f"{kind} did not move from page {before_page}"
-            )
+            if not kind.startswith("wheel_"):
+                raise AssertionError(f"{kind} did not move from page {before_page}")
+            # Production consumes repeated wheel notches at an unready
+            # frontier. Keep these inputs visible in the report, without
+            # mistaking them for new page requests or forcing a new commit.
+            kind = "wheel_consumed"
         image_id = self.window.model.image_id_at(target_page)
         if image_id is None:
             raise AssertionError(f"page {target_page} has no image identity")
@@ -1354,6 +1358,15 @@ class _Driver:
         )
 
     def wait_input(self, record: _InputRecord) -> None:
+        if record.kind == "wheel_consumed":
+            _pump_until(
+                self.application,
+                lambda: self.window.presentation_state.displayed_page == record.target_page,
+                timeout=self.timeout,
+            )
+            _render_once(self.window)
+            self.application.processEvents()
+            return
         try:
             _pump_until(
                 self.application,
@@ -1671,6 +1684,7 @@ def _run_worker(args: argparse.Namespace) -> dict[str, object]:
             "fit_mode": "fit_window",
             "viewer_downscale_algorithm": "auto",
             "viewer_upscale_algorithm": "auto",
+            "viewer_decode_workers": args.workers,
             "viewer_memory_mode": (
                 "minimal" if int(args.cache_mib) == 128 else str(args.cache_mib)
             ),
@@ -1678,7 +1692,7 @@ def _run_worker(args: argparse.Namespace) -> dict[str, object]:
         },
         save=True,
     )
-    coordinator = ImageWorkCoordinator(max_workers=1)
+    coordinator = ImageWorkCoordinator(max_workers=1, folder_supplemental_workers=args.workers - 1)
     window = ViewerWindow(
         config_manager=config,
         image_work_coordinator=coordinator,
@@ -1838,6 +1852,8 @@ def _worker_command(
         str(args.cache_mib),
         "--timeout",
         str(args.timeout),
+        "--workers",
+        str(args.workers),
     ]
     if args.minimal:
         command.append("--minimal")
@@ -1883,6 +1899,7 @@ def _run_isolated(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pages", type=int, default=24)
+    parser.add_argument("--workers", type=int, choices=(1, 2), default=1)
     parser.add_argument("--small-width", type=int, default=900)
     parser.add_argument("--small-height", type=int, default=1350)
     parser.add_argument("--large-width", type=int, default=2400)
@@ -1897,6 +1914,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--timeout", type=float, default=45.0)
     parser.add_argument("--solid", action="store_true")
+    parser.add_argument("--deflated", action="store_true")
     parser.add_argument("--quick", action="store_true")
     parser.add_argument(
         "--minimal",
@@ -1963,6 +1981,7 @@ def main() -> int:
             small_size=(int(args.small_width), int(args.small_height)),
             large_size=(int(args.large_width), int(args.large_height)),
             detail=not bool(args.solid),
+            deflated=args.deflated,
         )
         manifest_path = root / "fixture.json"
         manifest_path.write_text(

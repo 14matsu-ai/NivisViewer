@@ -8633,3 +8633,21 @@ path committed all requested pages 1 through 9. Cached commits can outnumber
 paint events because `update()` permits Qt to coalesce paints. The probe
 records decode starts/completions, ready-cache counts, presentation commits
 and paint events separately; it does not measure native Windows latency.
+
+### 2026-09-24 large-raster timing follow-up
+
+See [Large raster timing review](LARGE_RASTER_TIMING_20260924.md) for the
+private-ZIP numeric-only investigation, the explicit ZipPlaFork / NivisViewer /
+Hybrid / New design comparison, and validation. The fixed reference remains
+`07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`, `ViewerForm.cs` page worker/resize
+switch and `ImageLoader.cs` stream loading, AGPL-3.0-or-later. No new reference
+code was copied. Production retains one worker: two-worker warmup improved,
+but cold reversal regressed. Selected changes reduce DEFLATE buffer overhead,
+no-op Folder JPEG orientation copies, and redundant Qt-to-Pillow byte copies.
+Existing ZipPlaFork license and copyright notices remain unchanged.
+
+The subsequent [continuous cold wheel review](CONTINUOUS_COLD_WHEEL_20260924.md)
+adds one bounded encoded ZIP reader alongside the single raster decoder.
+It documents the four-way architecture comparison, numeric-only same-book
+A/B timings and lifetime/budget constraints. This reader is new NivisViewer
+code; no additional ZipPlaFork code or structure was ported.

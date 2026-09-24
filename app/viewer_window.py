@@ -1763,6 +1763,8 @@ class ViewerWindow(QMainWindow):
                 "viewer_prefetch_pdf_forward_units",
                 "viewer_prefetch_pdf_backward_units",
                 "viewer_memory_mode",
+                "viewer_decode_workers",
+                "viewer_zip_read_ahead_enabled",
             }.intersection(changed)
         )
         if prefetch_settings_changed:
@@ -1774,6 +1776,10 @@ class ViewerWindow(QMainWindow):
             self._reapply_prefetch_settings()
 
     def _load_prefetch_settings(self) -> None:
+        self.book_session.set_viewer_parallelism(
+            workers=self.config.get("viewer_decode_workers", 1),
+            zip_read_ahead=self.config.get("viewer_zip_read_ahead_enabled", True),
+        )
         values = self.config.viewer_prefetch_settings()
         self.prefetch_preset = str(values["preset"])
         self.prefetch_direction_priority_enabled = bool(

@@ -1128,3 +1128,12 @@ ENGLISH_DISAMBIGUATED = {
     ("拡大", "resampling"): "Upscaling",
     ("移動", "navigation"): "Go",
 }
+
+ENGLISH.update({
+    '1（推奨）': '1 (recommended)',
+    '2': '2',
+    '画像の同時読み込み数:': 'Concurrent image loads:',
+    'ZIPの次ページ展開を並列処理する（推奨）': 'Extract the next ZIP page in parallel (recommended)',
+    '同時読み込み数は画像フォルダとZIPに適用します。ZIPの並列展開は最大1ページ分です。読み込み数を増やすと、ページを戻す操作が遅くなる場合があります。変更は次にファイルを開いたときから適用します。':
+        'Applies to image folders and ZIP files. ZIP extraction runs at most one page ahead. More concurrent loads can slow backward navigation. Changes apply the next time you open a file.',
+})

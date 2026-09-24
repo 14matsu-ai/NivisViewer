@@ -39,8 +39,24 @@ _ICON_LOCATION_TRADITIONAL = {
     'サムネイル枠の端から、見えるアイコンまでの距離です。\n画面倍率に応じて拡大されます。自動では従来の位置を保ちます。': '縮圖邊框邊緣到可見圖示的距離。\n隨顯示縮放比例調整。自動時保留原來的位置。',
     'ドライブを選択': '選擇磁碟機',
 }
-SIMPLIFIED_CHINESE = _complete_catalog(_S1, _S2, _S3, _S4, _ICON_LOCATION_SIMPLIFIED)
-TRADITIONAL_CHINESE = _complete_catalog(_T1, _T2, _T3, _T4, _ICON_LOCATION_TRADITIONAL)
+_PARALLEL_SIMPLIFIED = {
+    '1（推奨）': '1（推荐）',
+    '2': '2',
+    '画像の同時読み込み数:': '同时加载的图像数：',
+    'ZIPの次ページ展開を並列処理する（推奨）': '并行解压ZIP的下一页（推荐）',
+    '同時読み込み数は画像フォルダとZIPに適用します。ZIPの並列展開は最大1ページ分です。読み込み数を増やすと、ページを戻す操作が遅くなる場合があります。変更は次にファイルを開いたときから適用します。':
+        '同时加载数适用于图像文件夹和ZIP文件。ZIP最多提前解压一页。增加同时加载数可能会减慢向后翻页。更改将在下次打开文件时生效。',
+}
+_PARALLEL_TRADITIONAL = {
+    '1（推奨）': '1（建議）',
+    '2': '2',
+    '画像の同時読み込み数:': '同時載入的影像數：',
+    'ZIPの次ページ展開を並列処理する（推奨）': '平行解壓縮ZIP的下一頁（建議）',
+    '同時読み込み数は画像フォルダとZIPに適用します。ZIPの並列展開は最大1ページ分です。読み込み数を増やすと、ページを戻す操作が遅くなる場合があります。変更は次にファイルを開いたときから適用します。':
+        '同時載入數適用於影像資料夾和ZIP檔案。ZIP最多提前解壓縮一頁。增加同時載入數可能會減慢向後翻頁。變更將於下次開啟檔案時生效。',
+}
+SIMPLIFIED_CHINESE = _complete_catalog(_S1, _S2, _S3, _S4, _ICON_LOCATION_SIMPLIFIED, _PARALLEL_SIMPLIFIED)
+TRADITIONAL_CHINESE = _complete_catalog(_T1, _T2, _T3, _T4, _ICON_LOCATION_TRADITIONAL, _PARALLEL_TRADITIONAL)
 
 SIMPLIFIED_CHINESE_DISAMBIGUATED = {
     ("縮小", "resampling"): "缩小采样",
