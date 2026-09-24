@@ -295,6 +295,96 @@ def test_cold_first_frame_resize_fences_old_layout_without_idle_prompt(
         qapp.processEvents()
 
 
+def test_zip_spread_wide_page_is_preflighted_before_viewer_decode(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    archive = tmp_path / "lazy-layout.zip"
+    sizes = ((720, 1200), (1800, 900), (720, 1200))
+    with zipfile.ZipFile(archive, "w") as output:
+        for index, size in enumerate(sizes):
+            path = tmp_path / f"{index}.jpg"
+            with Image.new("RGB", size, (50 + index * 20, 90, 130)) as image:
+                image.save(path, "JPEG", quality=88)
+            output.write(path, path.name)
+
+    class CountingZipSource(ZipImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.probes: list[str] = []
+            self.entry_reads: list[str] = []
+            self.decodes: list[str] = []
+
+        def probe_image_size(self, image_id: str):
+            self.probes.append(image_id)
+            return super().probe_image_size(image_id)
+
+        def _read_entry_qbytearray(self, image_id, cancelled):
+            self.entry_reads.append(image_id)
+            return super()._read_entry_qbytearray(image_id, cancelled)
+
+        def open_compatible_jpeg_at_most(self, image_id, maximum_size):
+            self.decodes.append(image_id)
+            return super().open_compatible_jpeg_at_most(image_id, maximum_size)
+
+    source = CountingZipSource(archive)
+    session = BookSession(source_factory=lambda _path, **_kwargs: (source, None))
+    config = ConfigManager(tmp_path / "lazy-layout-config.json")
+    config.load()
+    window = ViewerWindow(config_manager=config, book_session=session)
+    monkeypatch.setattr(window, "_raster_background_allowed", lambda: False)
+    layout_flags: list[bool] = []
+    original_zip_request = window._zip_runtime_request
+
+    def record_zip_request(spread):
+        request = original_zip_request(spread)
+        if request is not None:
+            layout_flags.append(request.resolve_layout_metadata)
+        return request
+
+    monkeypatch.setattr(window, "_zip_runtime_request", record_zip_request)
+    window.resize(640, 480)
+    try:
+        window.set_view_mode("spread")
+        window.set_treat_wide_image_as_single(True)
+        window.show()
+        qapp.processEvents()
+        assert window._finish_opened_book(
+            session.open_book(archive),
+            modal_on_empty=False,
+        )
+        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 0)
+        source.probes.clear()
+        source.entry_reads.clear()
+        source.decodes.clear()
+
+        window._go_to_index_with_history(
+            1,
+            input_kind=NavigationInputKind.WHEEL,
+        )
+        _wait_until(
+            qapp,
+            lambda: (
+                window.presentation_state.displayed_page == 1
+                and window.presentation_state.displayed is not None
+                and window.presentation_state.displayed.unit.page_indexes == (1,)
+            ),
+        )
+
+        # The header probe determines the wide-page boundary before the
+        # current unit is decoded.  The final single-page frame therefore has
+        # one entry read/decode and does not re-decode after topology repair.
+        assert True in layout_flags
+        assert "1.jpg" in source.probes
+        assert "2.jpg" in source.probes
+        assert source.entry_reads.count("1.jpg") == 1
+        assert source.decodes.count("1.jpg") == 1
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
 def _key_event(
     event_type: QEvent.Type,
     key: Qt.Key,

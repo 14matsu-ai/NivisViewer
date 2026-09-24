@@ -3734,7 +3734,13 @@ class ViewerWindow(QMainWindow):
             render_spec,
             navigation_direction=direction,
             resolve_layout_metadata=(
-                isinstance(source, FolderImageSource)
+                (
+                    isinstance(source, FolderImageSource)
+                    or (
+                        isinstance(source, ZipImageSource)
+                        and len(spread.slots) > 1
+                    )
+                )
                 and self.view_mode == "spread"
                 and self.treat_wide_image_as_single
             ),
@@ -4237,9 +4243,14 @@ class ViewerWindow(QMainWindow):
         request_id: int,
     ) -> PresentationFrameToken | None:
         requested = self.presentation_state.requested
+        active_request_id = getattr(self, "_active_request_id", None)
         if (
             requested is None
             or requested.token.request_serial != int(request_id)
+            or (
+                active_request_id is not None
+                and requested.token.request_serial != active_request_id
+            )
         ):
             return None
         return requested.token
@@ -4251,7 +4262,15 @@ class ViewerWindow(QMainWindow):
         if not isinstance(token, PresentationFrameToken):
             return
         requested = self.presentation_state.requested
-        if requested is None or requested.token != token:
+        active_request_id = getattr(self, "_active_request_id", None)
+        if (
+            requested is None
+            or requested.token != token
+            or (
+                active_request_id is not None
+                and token.request_serial != active_request_id
+            )
+        ):
             return
         expected_identity = tuple(
             (page.index, page.image_id) for page in requested.unit.pages
@@ -6605,12 +6624,27 @@ class ViewerWindow(QMainWindow):
             # live viewport when they next request their authoritative frame.
             self._presentation_viewport_refresh_required = True
             return
+        # Qt can report duplicate geometry notifications without an effective
+        # render-spec change. Do not fence a live wheel intent; keep only one
+        # coalesced debounce so the timer callback can validate the key again.
+        if self._zip_runtime_active and self._zip_runtime is not None:
+            request = self._zip_runtime_request(self.model.spread_at())
+            if (
+                request is not None
+                and self._zip_runtime.matches_render_spec(request.render_spec)
+            ):
+                self._raster_viewport_timer.start(
+                    0
+                    if self.presentation_state.displayed is None
+                    else _RASTER_VIEWPORT_DEBOUNCE_MS
+                )
+                return
         pending_page = self.presentation_state.frame_loading
         if pending_page or self._zip_runtime_active:
             # Fence the old physical layout immediately.  With a committed
             # frame PresentationState keeps DISPLAYED ownership; without one
             # it projects LOADING rather than the idle prompt.
-            self.presentation_state.supersede_pending()
+            self.presentation_state.supersede_pending(preserve_intent=True)
             self._project_presentation_surface()
             self._request_id_adapter = None
             self._visible_page_indexes_adapter = None
@@ -6642,15 +6676,29 @@ class ViewerWindow(QMainWindow):
         self._presentation_viewport_refresh_required = False
         if self._zip_runtime_active:
             runtime = self._zip_runtime
+            render_changed = True
+            pending_fenced = False
             if runtime is not None:
                 request = self._zip_runtime_request(self.model.spread_at())
                 # Duplicate size notifications and A -> B -> A during the
                 # existing debounce do not invalidate an unchanged render key.
                 # A genuinely different layout still takes the established
                 # invalidation path. Source/adjustment keys are not weakened.
-                if request is None or not runtime.matches_render_spec(request.render_spec):
+                render_changed = (
+                    request is None
+                    or not runtime.matches_render_spec(request.render_spec)
+                )
+                if render_changed:
                     runtime.invalidate_layout()
-            self._refresh_view()
+            requested = self.presentation_state.requested
+            active_request_id = getattr(self, "_active_request_id", None)
+            pending_fenced = bool(
+                requested is not None
+                and active_request_id is not None
+                and requested.token.request_serial != active_request_id
+            )
+            if render_changed or pending_fenced:
+                self._refresh_view()
             return
         if (
             self.image_cache.set_raster_decode_bounds(
