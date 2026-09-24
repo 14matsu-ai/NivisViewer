@@ -155,11 +155,8 @@ class BrowserWorkflowController(QObject):
             selection_model = None
         for row in rows:
             item = model.item_at(row)
-            if (item is None or not item.can_generate_preview
-                    or item.kind not in {BrowserItemKind.IMAGE, BrowserItemKind.FOLDER,
-                                         BrowserItemKind.ARCHIVE, BrowserItemKind.PDF}):
+            if item is None or not item.can_generate_preview:
                 continue
-            scope.append((row, self._memory_identity(item, token)))
             try:
                 selected = bool(
                     selection_model is not None
@@ -169,6 +166,11 @@ class BrowserWorkflowController(QObject):
                 selected = False
             if first <= row <= last or selected:
                 retained_paths.append(item.path)
+            # Painted video/text/Shell previews must survive selection and
+            # Viewer resume even though they are not background-refill work.
+            if item.kind in {BrowserItemKind.IMAGE, BrowserItemKind.FOLDER,
+                             BrowserItemKind.ARCHIVE, BrowserItemKind.PDF}:
+                scope.append((row, self._memory_identity(item, token)))
         new_scope = tuple(scope)
         if new_scope != self._memory_scope:
             self._memory_attempted.intersection_update(identity for _row, identity in new_scope)
