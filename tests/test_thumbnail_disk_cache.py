@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import os
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
@@ -11,6 +12,7 @@ from PIL import Image
 from PySide6.QtGui import QColor, QImage
 
 from app.browser_model import BrowserItem, BrowserItemKind
+from app import thumbnail_disk_cache as disk_cache_module
 from app.thumbnail_disk_cache import ThumbnailDiskCache
 from app.thumbnail_render import (
     THUMBNAIL_ENCODER_QUALITY, THUMBNAIL_LOSSLESS_ENCODER_EFFORT,
@@ -51,6 +53,38 @@ def test_save_reload_no_duplicate_and_unicode_path(tmp_path: Path) -> None:
     assert loaded is not None and not loaded.isNull()
     assert reopened.usage_bytes() > 0
     reopened.close()
+
+
+def test_video_disk_cache_revisits_without_reading_source(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "日本語動画.mp4"
+    source.write_bytes(b"video payload")
+    item = make_item(source, BrowserItemKind.OTHER)
+    cache = ThumbnailDiskCache(tmp_path / "cache")
+    spec = ThumbnailRenderSpec.from_settings(128, "square_1_1", "letterbox")
+    monkeypatch.setattr(disk_cache_module, "_windows_change_time_ns", lambda _path: None)
+    original_open = Path.open
+
+    def guarded_open(path: Path, *args, **kwargs):
+        if path == source:
+            pytest.fail("Video source was read while checking thumbnail identity")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    try:
+        assert cache.put(item, spec, thumbnail(), entry_path="video-test")
+        for _ in range(3):
+            assert cache.get_suitable(item, spec, entry_path="video-test") is not None
+        cache.close()
+        cache = ThumbnailDiskCache(tmp_path / "cache")
+        assert cache.get_suitable(item, spec, entry_path="video-test") is not None
+        previous = source.stat()
+        with original_open(source, "ab") as stream:
+            stream.write(b" changed")
+        os.utime(source, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+        assert cache.get_suitable(make_item(source, BrowserItemKind.OTHER), spec,
+                                  entry_path="video-test") is None
+    finally:
+        cache.close()
 
 
 def test_foreground_put_does_not_prune_or_enumerate_unrelated_cache_entries(
