@@ -8,7 +8,7 @@ import zipfile
 
 from PIL import Image
 import pytest
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QTimer, Qt
 from PySide6.QtGui import QKeyEvent, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
@@ -247,7 +247,9 @@ def test_cold_first_frame_resize_fences_old_layout_without_idle_prompt(
         qapp.processEvents()
         opened = session.open_book(archive)
         assert window._finish_opened_book(opened, modal_on_empty=False)
-        assert source.entered.wait(2.0)
+        # ZIP spread geometry may be header-probed first.  Keep the Qt event
+        # loop running so the queued metadata result can release pixel decode.
+        _wait_until(qapp, source.entered.is_set, timeout_ms=2000)
         old_request = window.presentation_state.requested
         assert old_request is not None
 
@@ -380,6 +382,129 @@ def test_zip_spread_wide_page_is_preflighted_before_viewer_decode(
         assert "2.jpg" in source.probes
         assert source.entry_reads.count("1.jpg") == 1
         assert source.decodes.count("1.jpg") == 1
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_zip_spread_wheel_preflights_background_geometry_before_decode(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    """Unknown background spreads must not be decoded before wide-page repair."""
+
+    archive = tmp_path / "mixed-cold-wheel.zip"
+    sizes = (
+        (900, 1400),
+        (2016, 1152),
+        (900, 1400),
+        (1800, 1200),
+        (900, 1400),
+        (900, 1400),
+    )
+    with zipfile.ZipFile(archive, "w") as output:
+        for index, size in enumerate(sizes):
+            encoded = BytesIO()
+            with Image.new(
+                "RGB",
+                size,
+                (50 + index * 10, 80, 120),
+            ) as image:
+                image.save(encoded, format="JPEG", quality=86)
+            output.writestr(f"{index}.jpg", encoded.getvalue())
+
+    class CountingZipSource(ZipImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.decodes: list[str] = []
+            self.entry_reads: list[str] = []
+            self.probes: list[str] = []
+
+        def probe_image_size(self, image_id: str):
+            self.probes.append(image_id)
+            return super().probe_image_size(image_id)
+
+        def _read_entry_qbytearray(self, image_id, cancelled):
+            self.entry_reads.append(image_id)
+            return super()._read_entry_qbytearray(image_id, cancelled)
+
+        def open_compatible_jpeg_at_most(self, image_id, maximum_size):
+            self.decodes.append(image_id)
+            return super().open_compatible_jpeg_at_most(image_id, maximum_size)
+
+    source = CountingZipSource(archive)
+    session = BookSession(source_factory=lambda _path, **_kwargs: (source, None))
+    config = ConfigManager(tmp_path / "mixed-cold-wheel-config.json")
+    config.load()
+    window = ViewerWindow(config_manager=config, book_session=session)
+    window.resize(640, 480)
+    background_enabled = [False]
+    wheel_count = [0]
+    monkeypatch.setattr(
+        window,
+        "_raster_background_allowed",
+        lambda: background_enabled[0],
+    )
+
+    def wheel(timestamp: int) -> None:
+        event = QWheelEvent(
+            QPointF(10, 10),
+            QPointF(10, 10),
+            QPoint(),
+            QPoint(0, -120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.ScrollUpdate,
+            False,
+        )
+        event.setTimestamp(timestamp)
+        assert QApplication.sendEvent(window.viewer, event)
+        wheel_count[0] += 1
+
+    try:
+        window.set_view_mode("spread")
+        window.set_single_first_page(False)
+        window.set_treat_wide_image_as_single(True)
+        window.show()
+        qapp.processEvents()
+        assert window._finish_opened_book(
+            session.open_book(archive),
+            modal_on_empty=False,
+        )
+        runtime = session.viewer_runtime
+        assert runtime is not None
+        _wait_until(
+            qapp,
+            lambda: window.presentation_state.displayed is not None,
+        )
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+
+        # Leave later page headers cold while admitting the real wheel path.
+        source.decodes.clear()
+        source.entry_reads.clear()
+        source.probes.clear()
+        background_enabled[0] = True
+        for delay, timestamp in zip((0, 50, 100, 150, 200), range(5)):
+            QTimer.singleShot(delay, lambda timestamp=timestamp: wheel(timestamp))
+
+        _wait_until(
+            qapp,
+            lambda: wheel_count[0] == 5 and not runtime.has_unfinished_tasks(),
+            timeout_ms=8000,
+        )
+        assert window.presentation_state.displayed is not None
+        assert runtime.metrics.stale_results == 0
+        assert runtime.metrics.layout_metadata_pages >= 4
+        assert source.probes
+        # Page 3 is the mixed-orientation trigger: an old provisional spread
+        # would decode it once as (3, 2) and again as the repaired single page.
+        assert source.decodes.count("3.jpg") == 1
+        assert source.entry_reads.count("3.jpg") == 1
+        assert all(
+            source.decodes.count(image_id) <= 1
+            for image_id in set(source.decodes)
+        )
     finally:
         window.close()
         qapp.processEvents()

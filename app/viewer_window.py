@@ -3736,10 +3736,13 @@ class ViewerWindow(QMainWindow):
             resolve_layout_metadata=(
                 (
                     isinstance(source, FolderImageSource)
-                    or (
-                        isinstance(source, ZipImageSource)
-                        and len(spread.slots) > 1
-                    )
+                    # A background unit can still become a single page after
+                    # its header proves it is wide. Keep the geometry
+                    # boundary in the same worker lane even when the
+                    # currently visible unit is already provisional
+                    # single-page; otherwise that unit may be decoded as a
+                    # spread and decoded again after the layout repair.
+                    or isinstance(source, ZipImageSource)
                 )
                 and self.view_mode == "spread"
                 and self.treat_wide_image_as_single
