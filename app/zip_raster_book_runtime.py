@@ -3081,13 +3081,29 @@ class RasterBookRuntime(QObject):
             elif (
                 not active_cancelled
                 and self._active_job_is_artifact_compatible(active, request)
-                and (current_is_ready_or_pending or preserve_started_compatible)
+                and (
+                    current_is_ready_or_pending
+                    or (
+                        preserve_started_compatible
+                        and (
+                            not isinstance(self.source, ZipImageSource)
+                            or self._max_active_jobs > 1
+                            or any(
+                                page in current_key.unit_identity
+                                for page in active.key.unit_identity
+                            )
+                        )
+                    )
+                )
             ):
-                # Ready navigation can keep compatible book work. Wheel
-                # navigation also lets an already-started compatible decode
-                # finish as a cache artifact: dropping that work on every
-                # cold tick makes moderate scrolling appear to skip pages.
-                # Unstarted work is still replaced by the newest current.
+                # Ready/pending current frames can keep compatible book work.
+                # Preserve existing non-ZIP and multi-slot policies, plus
+                # started ZIP work sharing source pages with an overlapping
+                # current. An unrelated unit must not occupy a single ZIP lane
+                # ahead of a cold current merely because input was a wheel.
+                # It falls through to cooperative cancellation below; the
+                # native slot and reservation stay owned until the job settles.
+                # Exact-current work is still promoted above, never restarted.
                 if self._take_unstarted_job(active):
                     self._bump("queued_job_replacements")
                 else:
