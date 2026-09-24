@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 
 import pytest
-from PySide6.QtCore import QSize
+from PySide6.QtCore import QRect, QSize
 from PySide6.QtGui import QFont, QFontMetrics
-from PySide6.QtWidgets import QFormLayout, QStyleOptionViewItem
+from PySide6.QtWidgets import QFormLayout, QStyle, QStyleOptionViewItem
 
 from app.browser_grid_metrics import FILENAME_DISPLAY_LINES
 from app.browser_item_delegate import (
@@ -26,6 +26,7 @@ from test_sprint15_browser_integration import close_window, make_window
 class TextCapturePainter:
     def __init__(self):
         self.drawn_text: list[str] = []
+        self.filled_rects: list[QRect] = []
 
     def setFont(self, _font):
         pass
@@ -33,8 +34,43 @@ class TextCapturePainter:
     def setPen(self, _pen):
         pass
 
+    def fillRect(self, rect, _color):
+        self.filled_rects.append(QRect(rect))
+
     def drawText(self, _rect, _flags, text):
         self.drawn_text.append(text)
+
+
+def test_selected_title_paint_stays_inside_frame_width_and_touches_frame(qapp):
+    delegate = BrowserItemDelegate(
+        thumbnail_size=149,
+        density=BrowserDisplayDensity.MEDIUM,
+        filename_display="one_line",
+        filename_gap=6,
+        cell_padding=3,
+    )
+    option = QStyleOptionViewItem()
+    option.rect = delegate.grid_metrics.cell_rect()
+    option.state |= QStyle.StateFlag.State_Selected
+    painter = TextCapturePainter()
+
+    delegate._paint_title(
+        painter,
+        option,
+        delegate.grid_metrics.thumbnail_frame_rect(option.rect),
+        "selected.jpg",
+    )
+
+    frame = delegate.grid_metrics.thumbnail_frame_rect(option.rect)
+    assert painter.filled_rects == [
+        delegate.grid_metrics.selected_title_rect(option.rect)
+    ]
+    band = painter.filled_rects[0]
+    assert band.left() == frame.left()
+    assert band.right() == frame.right()
+    assert band.top() == frame.bottom()
+    assert band.left() > option.rect.left()
+    assert band.right() < option.rect.right()
 
 
 def paint_filename(

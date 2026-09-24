@@ -77,10 +77,23 @@ class BrowserGridMetrics:
             return QRect()
         frame = self.thumbnail_frame_rect(cell_rect)
         return QRect(
-            cell_rect.left(),
+            frame.left(),
             frame.bottom() + 1 + self.thumbnail_title_gap,
-            cell_rect.width(),
+            frame.width(),
             self.title_height,
+        )
+
+    def selected_title_rect(self, cell_rect: QRect) -> QRect:
+        """Selection band joining the thumbnail frame to its filename."""
+        title = self.title_rect(cell_rect)
+        if title.isEmpty():
+            return title
+        frame = self.thumbnail_frame_rect(cell_rect)
+        return QRect(
+            title.left(),
+            frame.bottom(),
+            title.width(),
+            title.bottom() - frame.bottom() + 1,
         )
 
     def selection_rect(self, cell_rect: QRect) -> QRect:

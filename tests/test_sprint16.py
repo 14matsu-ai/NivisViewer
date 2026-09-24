@@ -68,6 +68,34 @@ def test_filename_gap_and_padding_are_the_only_vertical_extras() -> None:
     assert metrics.selection_rect(metrics.cell_rect()).width() < metrics.cell_size.width()
 
 
+def test_selected_filename_band_matches_frame_and_bridges_filename_gap() -> None:
+    metrics = build_browser_grid_metrics(
+        thumbnail_size=128,
+        frame_ratio_id="square_1_1",
+        font_height=12,
+        filename_display="two_lines",
+        filename_gap=6,
+        filename_padding_y=2,
+        horizontal_margin=8,
+        cell_padding=3,
+        item_spacing_x=5,
+        item_spacing_y=7,
+    )
+    cell = metrics.cell_rect(20, 30)
+    frame = metrics.thumbnail_frame_rect(cell)
+    title = metrics.title_rect(cell)
+    selected_title = metrics.selected_title_rect(cell)
+
+    assert title.left() == frame.left()
+    assert title.right() == frame.right()
+    assert title.width() < cell.width()
+    assert selected_title.left() == frame.left()
+    assert selected_title.right() == frame.right()
+    assert selected_title.top() == frame.bottom()
+    assert selected_title.bottom() == title.bottom()
+    assert selected_title.contains(title)
+
+
 def test_config_defaults_and_cleanup_day_normalization(tmp_path: Path) -> None:
     config = ConfigManager(tmp_path / "config.json")
     settings = config.load()

@@ -1062,7 +1062,10 @@ class BrowserItemDelegate(QStyledItemDelegate):
         if option.state & QStyle.StateFlag.State_Selected:
             selected_background = self._selection_color(option)
             selected_background.setAlpha(self.selection_appearance.alpha)
-            painter.fillRect(title_rect.adjusted(-2, 0, 2, 0), selected_background)
+            painter.fillRect(
+                grid.selected_title_rect(option.rect),
+                selected_background,
+            )
         lines = (
             (
                 elide_filename_line(
