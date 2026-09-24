@@ -305,10 +305,12 @@ def qimage_to_pillow(image: QImage) -> Image.Image:
     mode_and_raw_mode = direct_formats.get(image.format())
     if mode_and_raw_mode is not None:
         mode, raw_mode = mode_and_raw_mode
+        # frombytes detaches into Pillow-owned pixels. It accepts Qt's buffer
+        # directly, so an intermediate full-size Python bytes copy is wasted.
         return Image.frombytes(
             mode,
             (image.width(), image.height()),
-            bytes(image.constBits()),
+            image.constBits(),
             "raw",
             raw_mode,
             image.bytesPerLine(),
@@ -319,7 +321,7 @@ def qimage_to_pillow(image: QImage) -> Image.Image:
     return Image.frombytes(
         "RGBA",
         (converted.width(), converted.height()),
-        bytes(converted.constBits()),
+        converted.constBits(),
         "raw",
         "RGBA",
         converted.bytesPerLine(),

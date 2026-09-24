@@ -2373,6 +2373,7 @@ class RasterBookRuntime(QObject):
         cache_byte_budget: int = _DEFAULT_CACHE_BYTES,
         cache_soft_target_bytes: int | None = None,
         max_active_jobs: int = 1,
+        zip_read_ahead: bool = False,
     ) -> None:
         if not isinstance(source, self._source_type):
             raise TypeError(
@@ -2385,6 +2386,8 @@ class RasterBookRuntime(QObject):
         self._coordinator = image_work_coordinator
         self._thread_pool = QThreadPool(self)
         self._max_active_jobs = max(1, min(2, int(max_active_jobs)))
+        self._zip_read_ahead_enabled = bool(zip_read_ahead) and isinstance(source, ZipImageSource)
+        self._zip_read_ahead_connected = False
         self._thread_pool.setMaxThreadCount(self._max_active_jobs)
         self._accepting_requests = True
         self._shutdown_complete = False
@@ -2532,6 +2535,7 @@ class RasterBookRuntime(QObject):
             self._frame_store.byte_size
             + self._source_store.byte_size
             + hydration_bytes
+            + (self.source.read_ahead_reserved_bytes if self._zip_read_ahead_enabled else 0)
         )
 
     @property
@@ -2596,6 +2600,9 @@ class RasterBookRuntime(QObject):
             "hard_limit_bytes": self._cache_byte_budget,
             "soft_target_bytes": self._cache_soft_target_bytes,
             "cache_used_bytes": self.cache_bytes,
+            "encoded_read_ahead_bytes": (
+                self.source.read_ahead_reserved_bytes if self._zip_read_ahead_enabled else 0
+            ),
             "inflight_reservation_bytes": sum(
                 self._inflight_reservations.values()
             ),
@@ -2685,6 +2692,10 @@ class RasterBookRuntime(QObject):
     ) -> None:
         previous_byte_budget = self._cache_byte_budget
         previous_soft_target = self._cache_soft_target_bytes
+        if self._zip_read_ahead_enabled and (
+            hard_limit_bytes < self._cache_byte_budget or soft_target_bytes < previous_soft_target
+        ):
+            self.source.cancel_read_ahead()
         self._cache_byte_budget = max(1, int(hard_limit_bytes))
         self._cache_soft_target_bytes = max(
             1,
@@ -3003,6 +3014,10 @@ class RasterBookRuntime(QObject):
         preserve_started_compatible: bool = False,
     ) -> None:
         self._warmup_continue_timer.stop()
+        previous = self._current_request
+        if (self._zip_read_ahead_enabled and previous is not None
+                and request.navigation_direction * previous.navigation_direction < 0):
+            self.source.cancel_read_ahead()
         current_key = self._key_for(request.current, request.render_spec)
         if (
             self._source_hydration_key is not None
@@ -3081,13 +3096,29 @@ class RasterBookRuntime(QObject):
             elif (
                 not active_cancelled
                 and self._active_job_is_artifact_compatible(active, request)
-                and (current_is_ready_or_pending or preserve_started_compatible)
+                and (
+                    current_is_ready_or_pending
+                    or (
+                        preserve_started_compatible
+                        and (
+                            not isinstance(self.source, ZipImageSource)
+                            or self._max_active_jobs > 1
+                            or any(
+                                page in current_key.unit_identity
+                                for page in active.key.unit_identity
+                            )
+                        )
+                    )
+                )
             ):
-                # Ready navigation can keep compatible book work. Wheel
-                # navigation also lets an already-started compatible decode
-                # finish as a cache artifact: dropping that work on every
-                # cold tick makes moderate scrolling appear to skip pages.
-                # Unstarted work is still replaced by the newest current.
+                # Ready/pending current frames can keep compatible book work.
+                # Preserve existing non-ZIP and multi-slot policies, plus
+                # started ZIP work sharing source pages with an overlapping
+                # current. An unrelated unit must not occupy a single ZIP lane
+                # ahead of a cold current merely because input was a wheel.
+                # It falls through to cooperative cancellation below; the
+                # native slot and reservation stay owned until the job settles.
+                # Exact-current work is still promoted above, never restarted.
                 if self._take_unstarted_job(active):
                     self._bump("queued_job_replacements")
                 else:
@@ -3292,7 +3323,9 @@ class RasterBookRuntime(QObject):
 
     def has_unfinished_tasks(self) -> bool:
         # Jobs remain owned until their queued GUI completion is consumed.
-        return bool(self._jobs)
+        return bool(self._jobs) or (
+            self._zip_read_ahead_enabled and self.source.read_ahead_busy
+        )
 
     def wait_for_done(self, msecs: int = 5000) -> bool:
         deadline = monotonic() + max(0, int(msecs)) / 1000
@@ -3300,6 +3333,8 @@ class RasterBookRuntime(QObject):
             remaining = max(0.0, deadline - monotonic())
             if not job.finished.wait(remaining):
                 return False
+        if self._zip_read_ahead_enabled:
+            return self.source.wait_read_ahead(max(0.0, deadline - monotonic()))
         return True
 
     def shutdown(self, *, wait_msecs: int = 5000) -> bool:
@@ -3888,6 +3923,40 @@ class RasterBookRuntime(QObject):
             )
         return max(1, viewport_bytes, observed, source_floor)
 
+    def _configure_zip_read_ahead(
+        self, unit: ZipRasterDisplayUnit, spec: ZipRasterRenderSpec, *, allow: bool,
+    ) -> None:
+        if not self._zip_read_ahead_enabled:
+            return
+        request = self._current_request
+        planner = self._warmup_planner
+        if (not allow or request is None or planner is None
+                or not planner.background_released or not request.warmup_plan.background_enabled):
+            self.source.cancel_read_ahead()
+            return
+        chain = [page.image_id for page in unit.pages]
+        direction = -1 if request.navigation_direction < 0 else 1
+        boundary = (min if direction < 0 else max)(page.page_index for page in unit.pages)
+        following = request.warmup_plan.unit_for_page(boundary + direction)
+        if following is not None and following.identity != unit.identity:
+            page = following.pages[0]
+            if self._source_store.find(page, spec, unit=following, touch=False) is None:
+                chain.append(page.image_id)
+        # Charge both reading and completed encoded bytes against the same
+        # book budget. The existing slot is credited only to replace/reuse it;
+        # the source never starts a second encoded read while that slot lives.
+        available = max(0, self._cache_soft_target_bytes - self.cache_bytes
+            + self.source.read_ahead_reserved_bytes - sum(self._inflight_reservations.values()))
+        self.source.configure_read_ahead(tuple(chain), available)
+        signal = self.source.read_ahead_completed
+        if not self._zip_read_ahead_connected and signal is not None:
+            signal.connect(self._on_zip_read_ahead_completed, Qt.ConnectionType.QueuedConnection)
+            self._zip_read_ahead_connected = True
+
+    def _on_zip_read_ahead_completed(self) -> None:
+        self._enforce_combined_budget()
+        self._emit_idle_if_needed()
+
     def _submit(
         self,
         key: _UnitKey,
@@ -3973,6 +4042,10 @@ class RasterBookRuntime(QObject):
             self._secondary_job = job
         self._jobs.add(job)
         self._inflight_reservations[job] = max(1, reservation)
+        self._configure_zip_read_ahead(
+            unit, key.render_spec,
+            allow=not metadata_pages and len(cached_sources) < len(unit.pages),
+        )
         if self._coordinator is not None:
             started = (
                 self._coordinator.start_folder_viewer(job, int(priority))
@@ -4062,6 +4135,8 @@ class RasterBookRuntime(QObject):
             self._publish_frame(request, cached, False)
 
     def _cancel_active_job(self) -> None:
+        if self._zip_read_ahead_enabled:
+            self.source.cancel_read_ahead()
         for job in self._active_slots():
             self._cancel_job(job)
 
@@ -4511,6 +4586,8 @@ class RasterBookRuntime(QObject):
             if limit_bytes is None
             else max(1, min(self._cache_byte_budget, int(limit_bytes)))
         )
+        if self._zip_read_ahead_enabled and self.cache_bytes > min(limit, self._cache_soft_target_bytes):
+            self.source.cancel_read_ahead()
         while self.cache_bytes > limit:
             source_candidate = self._source_store.worst_reclaim_candidate()
             frame_candidate = self._frame_store.worst_reclaim_candidate()

@@ -507,14 +507,16 @@ def test_folder_wheel_cancels_started_work_for_incompatible_render(
 @pytest.mark.parametrize("release_first", (1, 2))
 @pytest.mark.parametrize("coordinated", (False, True))
 @pytest.mark.parametrize("targets", ((5,), (5, 4, 5, 3)))
-def test_two_folder_workers_run_and_cold_current_takes_next_free_slot(
+@pytest.mark.parametrize("archive", (False, True), ids=("folder", "zip"))
+def test_two_raster_workers_run_and_cold_current_takes_next_free_slot(
     tmp_path: Path,
     qapp: QApplication,
     release_first: int,
     coordinated: bool,
     targets: tuple[int, ...],
+    archive: bool,
 ) -> None:
-    class ControlledSource(FolderImageSource):
+    class ControlledSource(ZipImageSource if archive else FolderImageSource):
         def __init__(self, path: Path) -> None:
             super().__init__(path)
             self.started = {index: Event() for index in (1, 2, 3, 4, 5)}
@@ -528,12 +530,14 @@ def test_two_folder_workers_run_and_cold_current_takes_next_free_slot(
                 self.release[index].wait(3)
             return super().open_image(image_id)
 
-    source = ControlledSource(_write_folder(tmp_path / "book", pages=6))
+    source = ControlledSource(
+        _write_zip(tmp_path, pages=6) if archive else _write_folder(tmp_path / "book", pages=6)
+    )
     coordinator = (
         ImageWorkCoordinator(max_workers=2, folder_supplemental_workers=1)
         if coordinated else None
     )
-    runtime = FolderRasterBookRuntime(
+    runtime = (ZipRasterBookRuntime if archive else FolderRasterBookRuntime)(
         source, 1, image_work_coordinator=coordinator, max_active_jobs=2,
     )
     units = tuple(_unit(source, index) for index in range(6))
@@ -573,11 +577,13 @@ def test_two_folder_workers_run_and_cold_current_takes_next_free_slot(
             assert coordinator.shutdown(wait_msecs=3000)
 
 
-def test_two_folder_inflight_reservations_cancel_on_limit_shrink(
+@pytest.mark.parametrize("archive", (False, True), ids=("folder", "zip"))
+def test_two_raster_inflight_reservations_cancel_on_limit_shrink(
     tmp_path: Path,
     qapp: QApplication,
+    archive: bool,
 ) -> None:
-    class BlockedSource(FolderImageSource):
+    class BlockedSource(ZipImageSource if archive else FolderImageSource):
         def __init__(self, path: Path) -> None:
             super().__init__(path)
             self.started = {1: Event(), 2: Event()}
@@ -590,8 +596,10 @@ def test_two_folder_inflight_reservations_cancel_on_limit_shrink(
                 self.release.wait(3)
             return super().open_image(image_id)
 
-    source = BlockedSource(_write_folder(tmp_path / "book", pages=4))
-    runtime = FolderRasterBookRuntime(source, 1, max_active_jobs=2)
+    source = BlockedSource(
+        _write_zip(tmp_path, pages=4) if archive else _write_folder(tmp_path / "book", pages=4)
+    )
+    runtime = (ZipRasterBookRuntime if archive else FolderRasterBookRuntime)(source, 1, max_active_jobs=2)
     units = tuple(_unit(source, index) for index in range(4))
     frames: list[RasterFrame] = []
     runtime.frameReady.connect(frames.append)
@@ -991,6 +999,7 @@ def test_explicit_folder_two_worker_trial_with_coordinator(
     )
     config = ConfigManager(tmp_path / "config.json")
     config.load()
+    config.apply({"viewer_decode_workers": 2})
     window = ViewerWindow(
         config_manager=config,
         book_session=session,

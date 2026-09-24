@@ -70,6 +70,14 @@ class ImageWorkCoordinator(QObject):
     def browser_paused(self) -> bool:
         return self._browser_paused
 
+    def set_viewer_supplemental_workers(self, workers: int) -> None:
+        """Set capacity for the next book without discarding owned jobs.
+
+        A disabled supplemental lane finishes its existing job, then accepts
+        no more work. Browser capacity and its dedicated pool are unchanged.
+        """
+        self.folder_supplemental_workers = max(0, min(1, int(workers)))
+
     def begin_viewer_interactive(self) -> None:
         self._interactive_depth += 1
         self._set_browser_paused(True)

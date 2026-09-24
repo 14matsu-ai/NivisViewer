@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 from threading import Event
-from time import monotonic
+from time import monotonic, perf_counter_ns
 import zipfile
 
 from PIL import Image
@@ -810,6 +811,211 @@ def test_rapid_wheel_holds_unready_target_and_finishes_started_work(
         _wait_until(qapp, lambda: window.presentation_state.displayed_page == 2)
     finally:
         source.release_page_one.set()
+        window.close()
+        qapp.processEvents()
+
+
+def test_actual_wheel_route_preempts_unrelated_cold_archive_work(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    archive = tmp_path / "cold-wheel-priority.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        for index in range(8):
+            encoded = BytesIO()
+            with Image.new(
+                "RGB",
+                (2016, 1152),
+                (25 + index * 19, 90 + index * 9, 160 - index * 11),
+            ) as image:
+                image.save(encoded, format="JPEG", quality=88)
+            output.writestr(f"{index:03d}.jpg", encoded.getvalue())
+
+    class GatedZipSource(ZipImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.background_started = Event()
+            self.background_cancelled = Event()
+            self.release_background = Event()
+            self.cold_target_started = Event()
+            self.release_cold_target = Event()
+            self.gate_cold_target = False
+            self.background_gate_entries = 0
+            self.completed_payload_reads: list[str] = []
+            self.payload_read_started_ns: dict[str, int] = {}
+            self.payload_read_finished_ns: dict[str, int] = {}
+
+        def _read_entry_qbytearray(self, image_id, cancelled):
+            page_index = int(Path(image_id).stem)
+            if page_index >= 4:
+                self.background_gate_entries += 1
+                self.background_started.set()
+                # Model a non-interruptible read already owned by the worker.
+                # Cancellation must keep its worker slot and reservation until
+                # this test releases the read.
+                while not self.release_background.wait(0.002):
+                    if cancelled.is_set():
+                        self.background_cancelled.set()
+                self._raise_if_cancelled(cancelled)
+            elif page_index == 3 and self.gate_cold_target:
+                self.cold_target_started.set()
+                while not self.release_cold_target.wait(0.002):
+                    self._raise_if_cancelled(cancelled)
+            self.payload_read_started_ns[image_id] = perf_counter_ns()
+            result = super()._read_entry_qbytearray(image_id, cancelled)
+            self.payload_read_finished_ns[image_id] = perf_counter_ns()
+            self.completed_payload_reads.append(image_id)
+            return result
+
+    source = GatedZipSource(archive)
+    config = ConfigManager(tmp_path / "cold-wheel-config.json")
+    config.load()
+    config.apply({"viewer_memory_mode": "4096"})
+    session = BookSession(
+        source_factory=lambda _path, **_kwargs: (source, None),
+    )
+    window = ViewerWindow(config_manager=config, book_session=session)
+    window.resize(640, 480)
+    window.set_view_mode("single")
+    commits: dict[int, int] = {}
+    paints: dict[int, int] = {}
+
+    def record_commit(commit) -> None:
+        commits[commit.frame.unit.focused_index] = perf_counter_ns()
+
+    def record_paint(_serial: int, image_ids: object) -> None:
+        if isinstance(image_ids, tuple) and image_ids:
+            paints[int(Path(str(image_ids[0])).stem)] = perf_counter_ns()
+
+    window.presentationCommitted.connect(record_commit)
+    window.viewer.framePainted.connect(record_paint)
+
+    def wheel_next(timestamp: int) -> None:
+        event = QWheelEvent(
+            QPointF(10, 10),
+            QPointF(10, 10),
+            QPoint(),
+            QPoint(0, -120),
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.ScrollUpdate,
+            False,
+        )
+        event.setTimestamp(timestamp)
+        assert QApplication.sendEvent(window.viewer, event)
+
+    try:
+        window.show()
+        qapp.processEvents()
+        assert window._finish_opened_book(
+            session.open_book(archive),
+            modal_on_empty=False,
+        )
+        runtime = session.viewer_runtime
+        assert runtime is not None
+        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 0)
+        _wait_until(qapp, source.background_started.is_set, timeout_ms=5000)
+        _wait_until(
+            qapp,
+            lambda: {1, 2, 3}.issubset(set(runtime.cached_page_indexes)),
+            timeout_ms=5000,
+        )
+        old_job = runtime._active_job
+        assert old_job is not None and old_job.started.is_set()
+        assert old_job in runtime._inflight_reservations
+
+        warm_latencies_ms: list[float] = []
+        warm_paint_latencies_ms: list[float] = []
+        for page_index in (1, 2):
+            reads_before = tuple(source.completed_payload_reads)
+            started = perf_counter_ns()
+            wheel_next(10_000 + page_index * 1_000)
+            _wait_until(
+                qapp,
+                lambda page_index=page_index: (
+                    window.presentation_state.displayed_page == page_index
+                ),
+            )
+            _wait_until(
+                qapp,
+                lambda page_index=page_index: page_index in paints,
+            )
+            warm_latencies_ms.append(
+                (commits[page_index] - started) / 1_000_000
+            )
+            warm_paint_latencies_ms.append(
+                (paints[page_index] - started) / 1_000_000
+            )
+            assert tuple(source.completed_payload_reads) == reads_before
+            assert runtime._active_job is old_job
+            assert not old_job.cancelled.is_set()
+
+        for frame in tuple(runtime._frame_store.values()):
+            if any(page.page_index == 3 for page in frame.unit.pages):
+                runtime._frame_store.take(frame.key)
+        runtime._source_store.clear()
+        assert 3 not in runtime.cached_page_indexes
+        page3_reads_before = source.completed_payload_reads.count("003.jpg")
+        source.gate_cold_target = True
+        cold_started = perf_counter_ns()
+        wheel_next(20_000)
+        assert window.presentation_state.requested_page == 3
+        _wait_until(qapp, source.background_cancelled.is_set)
+        assert old_job.cancelled.is_set()
+        assert runtime._active_job is old_job
+        assert old_job in runtime._inflight_reservations
+        assert not source.cold_target_started.is_set()
+
+        source.release_background.set()
+        _wait_until(qapp, source.cold_target_started.is_set, timeout_ms=5000)
+        _wait_until(
+            qapp,
+            lambda: old_job not in runtime._inflight_reservations,
+            timeout_ms=5000,
+        )
+        # Keep the post-target warmup from reading page 4 before assertions;
+        # its worker may start only after the cold current has completed.
+        source.release_background.clear()
+        cold_target_stage_started = perf_counter_ns()
+
+        # A repeated notch while page 3 is still cold must not queue page 4.
+        wheel_next(21_000)
+        assert window.model.focused_index == 3
+        assert window.presentation_state.requested_page == 3
+        assert window._pending_zip_runtime_request is None
+
+        source.release_cold_target.set()
+        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 3)
+        _wait_until(qapp, lambda: 3 in paints)
+        assert window.model.focused_index == 3
+        assert window.presentation_state.requested_page == 3
+        assert (
+            source.completed_payload_reads.count("003.jpg")
+            == page3_reads_before + 1
+        )
+        assert not any(
+            int(Path(image_id).stem) >= 4
+            for image_id in source.completed_payload_reads
+        )
+        assert runtime.metrics.stale_results == 0
+
+        # These local synthetic-archive timings compare the real viewer route;
+        # the gated slot adds test synchronization and is not a Windows claim.
+        print(
+            "cold-wheel-ms "
+            f"warm-commit={[round(value, 2) for value in warm_latencies_ms]} "
+            f"warm-paint={[round(value, 2) for value in warm_paint_latencies_ms]} "
+            f"cold-input-to-paint={round((paints[3] - cold_started) / 1_000_000, 2)} "
+            "cold-payload-read="
+            f"{round((source.payload_read_finished_ns['003.jpg'] - source.payload_read_started_ns['003.jpg']) / 1_000_000, 2)} "
+            "cold-payload-read-to-paint="
+            f"{round((paints[3] - source.payload_read_finished_ns['003.jpg']) / 1_000_000, 2)} "
+            "cold-target-stage-to-paint="
+            f"{round((paints[3] - cold_target_stage_started) / 1_000_000, 2)}"
+        )
+    finally:
+        source.release_background.set()
+        source.release_cold_target.set()
         window.close()
         qapp.processEvents()
 

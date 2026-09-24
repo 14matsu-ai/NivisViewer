@@ -269,6 +269,8 @@ class ConfigManager(QObject):
         "viewer_prefetch_pdf_forward_units": 3,
         "viewer_prefetch_pdf_backward_units": 3,
         "viewer_memory_mode": "auto",
+        "viewer_decode_workers": 1,
+        "viewer_zip_read_ahead_enabled": True,
         "rotation_angle": 0,
         "slideshow_interval_ms": 3000,
         "slideshow_repeat": False,
@@ -986,6 +988,11 @@ class ConfigManager(QObject):
         normalized["viewer_memory_mode"] = normalize_viewer_memory_mode(
             normalized.get("viewer_memory_mode")
         )
+        normalized["viewer_decode_workers"] = cls._clamped_int(
+            normalized.get("viewer_decode_workers"), default=1, minimum=1, maximum=2,
+        )
+        if not isinstance(normalized.get("viewer_zip_read_ahead_enabled"), bool):
+            normalized["viewer_zip_read_ahead_enabled"] = True
         normalized["thumbnail_cache_limit_mb"] = cls._clamped_int(
             normalized.get("thumbnail_cache_limit_mb"),
             default=int(cls.DEFAULTS["thumbnail_cache_limit_mb"]),

@@ -312,7 +312,8 @@ TAB_SETTING_KEYS: dict[str, tuple[str, ...]] = {
         "book_open_position", "viewer_canvas_click_direction", "viewer_canvas_left_click_action",
         "viewer_slider_wheel_single_page_enabled", "magnifier_allow_outside_image",
         "viewer_prefetch_preset", "viewer_prefetch_direction_priority_enabled",
-        "viewer_memory_mode", "viewer_downscale_algorithm", "viewer_upscale_algorithm",
+        "viewer_memory_mode", "viewer_decode_workers", "viewer_zip_read_ahead_enabled",
+        "viewer_downscale_algorithm", "viewer_upscale_algorithm",
         "magnifier_downscale_algorithm", "magnifier_upscale_algorithm",
         "viewer_prefetch_image_forward_units", "viewer_prefetch_image_backward_units",
         "viewer_prefetch_pdf_forward_units", "viewer_prefetch_pdf_backward_units",
@@ -1150,6 +1151,8 @@ class SettingsDialog(QDialog):
         }
         self._select_data(self.prefetch_preset_combo, defaults["viewer_prefetch_preset"])
         self._select_data(self.viewer_memory_mode_combo, defaults["viewer_memory_mode"])
+        self._select_data(self.viewer_decode_workers_combo, defaults["viewer_decode_workers"])
+        self.viewer_zip_read_ahead_checkbox.setChecked(defaults["viewer_zip_read_ahead_enabled"])
         self._select_data(self.viewer_downscale_algorithm_combo, defaults["viewer_downscale_algorithm"])
         self._select_data(self.viewer_upscale_algorithm_combo, defaults["viewer_upscale_algorithm"])
         self._select_data(self.magnifier_downscale_algorithm_combo, defaults["magnifier_downscale_algorithm"])
@@ -1781,6 +1784,22 @@ class SettingsDialog(QDialog):
             tr('ビューワーのメモリ使用量:'),
             self.viewer_memory_mode_combo,
         )
+        self.viewer_decode_workers_combo = QComboBox(memory_group)
+        self.viewer_decode_workers_combo.addItem(tr('1（推奨）'), 1)
+        self.viewer_decode_workers_combo.addItem(tr('2'), 2)
+        memory_form.addRow(tr('画像の同時読み込み数:'), self.viewer_decode_workers_combo)
+        self.viewer_zip_read_ahead_checkbox = QCheckBox(
+            tr('ZIPの次ページ展開を並列処理する（推奨）'), memory_group,
+        )
+        memory_form.addRow(self.viewer_zip_read_ahead_checkbox)
+        parallel_help = QLabel(tr(
+            '同時読み込み数は画像フォルダとZIPに適用します。'
+            'ZIPの並列展開は最大1ページ分です。'
+            '読み込み数を増やすと、ページを戻す操作が遅くなる場合があります。'
+            '変更は次にファイルを開いたときから適用します。'
+        ), memory_group)
+        parallel_help.setWordWrap(True)
+        memory_form.addRow(parallel_help)
 
         resampling_group = QGroupBox(tr('画像の拡大縮小'), tab)
         resampling_layout = QVBoxLayout(resampling_group)
@@ -3021,6 +3040,8 @@ class SettingsDialog(QDialog):
             self.viewer_memory_mode_combo,
             self.config.get("viewer_memory_mode", "auto"),
         )
+        self._select_data(self.viewer_decode_workers_combo, self.config.get("viewer_decode_workers", 1))
+        self.viewer_zip_read_ahead_checkbox.setChecked(self.config.get("viewer_zip_read_ahead_enabled", True))
         self._select_data(
             self.viewer_downscale_algorithm_combo,
             self.config.get("viewer_downscale_algorithm", "auto"),
@@ -3693,6 +3714,8 @@ class SettingsDialog(QDialog):
             "viewer_memory_mode": str(
                 self.viewer_memory_mode_combo.currentData() or "auto"
             ),
+            "viewer_decode_workers": int(self.viewer_decode_workers_combo.currentData() or 1),
+            "viewer_zip_read_ahead_enabled": self.viewer_zip_read_ahead_checkbox.isChecked(),
             "viewer_downscale_algorithm": str(
                 self.viewer_downscale_algorithm_combo.currentData() or "auto"
             ),

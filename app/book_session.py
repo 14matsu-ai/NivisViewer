@@ -215,6 +215,8 @@ class BookSession(QObject):
         source_factory: SourceFactory = create_image_source,
         image_work_coordinator: ImageWorkCoordinator | None = None,
         folder_worker_limit: int = 1,
+        zip_worker_limit: int = 1,
+        zip_read_ahead_enabled: bool = True,
     ) -> None:
         super().__init__(parent)
         self.model = PageModel()
@@ -225,6 +227,9 @@ class BookSession(QObject):
         )
         self._image_work_coordinator = image_work_coordinator
         self._folder_worker_limit = max(1, min(2, int(folder_worker_limit)))
+        self._zip_worker_limit = max(1, min(2, int(zip_worker_limit)))
+        self._zip_read_ahead_enabled = bool(zip_read_ahead_enabled)
+        self._configure_coordinator_workers = False
         self.current_path: Path | None = None
         self.source: ImageSource | None = None
         self.viewer_runtime: RasterBookRuntime | None = None
@@ -682,6 +687,12 @@ class BookSession(QObject):
         self._close_source(source)
         return True
 
+    def set_viewer_parallelism(self, *, workers: int, zip_read_ahead: bool) -> None:
+        """Configure the next book; leave currently owned jobs untouched."""
+        self._folder_worker_limit = self._zip_worker_limit = max(1, min(2, int(workers)))
+        self._zip_read_ahead_enabled = bool(zip_read_ahead)
+        self._configure_coordinator_workers = True
+
     def _replace_viewer_runtime(
         self,
         source: ImageSource | None,
@@ -700,6 +711,8 @@ class BookSession(QObject):
         else:
             runtime_type = None
         hard, soft = self._source_runtime_limits(source)
+        if self._configure_coordinator_workers and self._image_work_coordinator is not None:
+            self._image_work_coordinator.set_viewer_supplemental_workers(self._zip_worker_limit - 1)
         new_runtime = (
             runtime_type(
                 source,
@@ -708,9 +721,12 @@ class BookSession(QObject):
                 image_work_coordinator=self._image_work_coordinator,
                 cache_byte_budget=hard,
                 cache_soft_target_bytes=soft,
+                zip_read_ahead=self._zip_read_ahead_enabled and runtime_type is ZipRasterBookRuntime,
                 max_active_jobs=(
                     self._folder_worker_limit
                     if runtime_type is FolderRasterBookRuntime
+                    else self._zip_worker_limit
+                    if runtime_type is ZipRasterBookRuntime
                     else 1
                 ),
             )

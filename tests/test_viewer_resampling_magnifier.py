@@ -360,6 +360,10 @@ def test_async_resize_preserves_alpha() -> None:
         (QImage.Format.Format_RGB888, "RGB"),
         (QImage.Format.Format_RGBA8888, "RGBA"),
         (QImage.Format.Format_Grayscale8, "L"),
+        (QImage.Format.Format_RGBX8888, "RGB"),
+        (QImage.Format.Format_RGB32, "RGB"),
+        (QImage.Format.Format_ARGB32, "RGBA"),
+        (QImage.Format.Format_ARGB32_Premultiplied, "RGBA"),
     ],
 )
 def test_qimage_to_pillow_preserves_common_raster_mode(
@@ -373,6 +377,11 @@ def test_qimage_to_pillow_preserves_common_raster_mode(
     try:
         assert converted.mode == expected_mode
         assert converted.size == (17, 11)
+        # Conversion must own its pixels even though it reads Qt's buffer
+        # directly; a later cache/frame mutation cannot change the result.
+        source.fill(Qt.GlobalColor.black)
+        expected = 255 if expected_mode == "L" else (255,) * len(expected_mode)
+        assert converted.getpixel((16, 10)) == expected
     finally:
         converted.close()
 
