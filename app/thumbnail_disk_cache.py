@@ -7,9 +7,12 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import threading
 import time
 import uuid
+import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -28,6 +31,111 @@ from .thumbnail_render import (
 CACHE_SCHEMA_VERSION = 3
 OBSOLETE_FORMAT_PRUNE_BATCH = 128
 CACHE_MAINTENANCE_BATCH = 128
+_CONTENT_SIGNATURE_CHUNK_BYTES = 1024 * 1024
+_WINDOWS_KERNEL32 = None
+
+
+class _WindowsFileBasicInfo(ctypes.Structure):
+    _fields_ = [
+        ("creation_time", ctypes.c_longlong),
+        ("last_access_time", ctypes.c_longlong),
+        ("last_write_time", ctypes.c_longlong),
+        ("change_time", ctypes.c_longlong),
+        ("file_attributes", wintypes.DWORD),
+    ]
+
+
+def _windows_change_time_ns(path: Path) -> int | None:
+    """Read NTFS/FileBasicInfo ChangeTime without reading file contents."""
+    global _WINDOWS_KERNEL32
+    if os.name != "nt":
+        return None
+    try:
+        if _WINDOWS_KERNEL32 is None:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateFileW.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.HANDLE,
+            ]
+            kernel32.CreateFileW.restype = wintypes.HANDLE
+            kernel32.GetFileInformationByHandleEx.argtypes = [
+                wintypes.HANDLE,
+                wintypes.INT,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+            ]
+            kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            _WINDOWS_KERNEL32 = kernel32
+        handle = _WINDOWS_KERNEL32.CreateFileW(
+            str(path),
+            0x00000080,  # FILE_READ_ATTRIBUTES
+            0x00000001 | 0x00000002 | 0x00000004,  # share read/write/delete
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS (also works for files)
+            None,
+        )
+        invalid_handle = wintypes.HANDLE(-1).value
+        if handle == invalid_handle:
+            return None
+        info = _WindowsFileBasicInfo()
+        try:
+            if not _WINDOWS_KERNEL32.GetFileInformationByHandleEx(
+                handle,
+                0,  # FileBasicInfo
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            ):
+                return None
+        finally:
+            _WINDOWS_KERNEL32.CloseHandle(handle)
+        # FILETIME is expressed in 100 ns ticks since 1601-01-01 UTC.
+        return int(info.change_time) * 100
+    except (OSError, AttributeError, TypeError, ValueError):
+        return None
+
+
+def _content_signature(path: Path) -> str | None:
+    """Return a worker-side version token for one requested source.
+
+    Windows uses the cheap file identity plus native ChangeTime.  This catches
+    both same-file writes and replacement files without reading a large ZIP or
+    image.  Filesystems without that native version signal fall back to an
+    exact digest scoped to this requested source/cover, never a GUI-thread or
+    whole-library walk.
+    """
+    try:
+        info = path.stat()
+        if stat.S_ISDIR(info.st_mode):
+            kind = "dir"
+        elif stat.S_ISREG(info.st_mode):
+            kind = "file"
+        else:
+            return None
+        change_time_ns = _windows_change_time_ns(path)
+        if change_time_ns is not None and change_time_ns > 0:
+            file_id = f"{int(getattr(info, 'st_dev', 0))}:{int(getattr(info, 'st_ino', 0))}"
+            return f"win:{kind}:{file_id}:{change_time_ns}:{int(info.st_size)}"
+        if kind == "dir":
+            return ""
+        size = int(info.st_size)
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(str(size).encode("ascii"))
+        with path.open("rb") as stream:
+            while True:
+                chunk = stream.read(_CONTENT_SIGNATURE_CHUNK_BYTES)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
 
 
 @dataclass(frozen=True)
@@ -36,9 +144,12 @@ class _Fingerprint:
     item_kind: str
     source_size: int
     source_mtime_ns: int
+    source_ctime_ns: int
+    source_signature: str
     cover_path: str
     cover_size: int
     cover_mtime_ns: int
+    cover_signature: str
     entry_path: str
     thumbnail_size: int
     format_version: str
@@ -57,9 +168,12 @@ class ThumbnailSourceIdentity:
     item_kind: str
     source_size: int
     source_mtime_ns: int
+    source_ctime_ns: int = 0
+    source_signature: str = ""
     cover_path: str = ""
     cover_size: int = 0
     cover_mtime_ns: int = 0
+    cover_signature: str = ""
 
     @classmethod
     def capture(
@@ -71,7 +185,11 @@ class ThumbnailSourceIdentity:
             source_info = item.path.stat()
             source_size = int(source_info.st_size)
             source_mtime_ns = int(source_info.st_mtime_ns)
+            source_ctime_ns = int(getattr(source_info, "st_ctime_ns", 0))
+            source_signature = _content_signature(item.path)
         except OSError:
+            return None
+        if source_signature is None:
             return None
         if (
             (item.file_size is not None and item.file_size != source_size)
@@ -85,6 +203,7 @@ class ThumbnailSourceIdentity:
         normalized_cover = ""
         cover_size = 0
         cover_mtime_ns = 0
+        cover_signature = ""
         if item.kind is BrowserItemKind.FOLDER:
             if cover_path is None:
                 return None
@@ -93,7 +212,10 @@ class ThumbnailSourceIdentity:
                 cover_info = cover.stat()
                 cover_size = int(cover_info.st_size)
                 cover_mtime_ns = int(cover_info.st_mtime_ns)
+                cover_signature = _content_signature(cover)
             except OSError:
+                return None
+            if cover_signature is None:
                 return None
             normalized_cover = cls._normalize_path(cover)
         elif cover_path is not None:
@@ -104,9 +226,12 @@ class ThumbnailSourceIdentity:
             item_kind=item.kind.value,
             source_size=source_size,
             source_mtime_ns=source_mtime_ns,
+            source_ctime_ns=source_ctime_ns,
+            source_signature=source_signature,
             cover_path=normalized_cover,
             cover_size=cover_size,
             cover_mtime_ns=cover_mtime_ns,
+            cover_signature=cover_signature,
         )
 
     def matches(self, fingerprint: _Fingerprint) -> bool:
@@ -115,9 +240,12 @@ class ThumbnailSourceIdentity:
             and self.item_kind == fingerprint.item_kind
             and self.source_size == fingerprint.source_size
             and self.source_mtime_ns == fingerprint.source_mtime_ns
+            and self.source_ctime_ns == fingerprint.source_ctime_ns
+            and self.source_signature == fingerprint.source_signature
             and self.cover_path == fingerprint.cover_path
             and self.cover_size == fingerprint.cover_size
             and self.cover_mtime_ns == fingerprint.cover_mtime_ns
+            and self.cover_signature == fingerprint.cover_signature
         )
 
     @staticmethod
@@ -171,8 +299,11 @@ class ThumbnailDiskCache:
         self._saves_since_cleanup = 0
         self._write_epoch = 0
         self._entry_scan_cursor = ""
+        self._entry_scan_complete = False
         self._orphan_scanner = None
+        self._orphan_scan_complete = False
         self._maintenance_pending = False
+        self._active_staging_paths: set[str] = set()
         self._cached_usage_bytes = 0
         self._cached_entry_count = 0
         self._cached_last_cleanup = 0.0
@@ -183,6 +314,7 @@ class ThumbnailDiskCache:
         ).encoding_policy
         self.enabled = False
         self.last_error: str | None = None
+        self.last_put_status = "idle"
         if enabled:
             self.set_enabled(True)
 
@@ -291,7 +423,10 @@ class ThumbnailDiskCache:
                 rows = self._connection.execute(
                     f"""
                     SELECT cache_key, file_name, source_size, source_mtime_ns,
-                           cover_path, cover_size, cover_mtime_ns
+                           source_ctime_ns,
+                           source_signature,
+                           cover_path, cover_size, cover_mtime_ns,
+                           cover_signature
                       FROM entries
                      WHERE source_path = ? AND item_kind = ?
                        AND thumbnail_size = ? AND format_version = ?
@@ -305,13 +440,31 @@ class ThumbnailDiskCache:
                 return None
             invalid: list[tuple[str, str]] = []
             for row in rows:
-                key, file_name, source_size, source_mtime_ns, cover_path, cover_size, cover_mtime_ns = row
-                if (source[0], source[1]) != (source_size, source_mtime_ns):
+                (
+                    key,
+                    file_name,
+                    source_size,
+                    source_mtime_ns,
+                    source_ctime_ns,
+                    source_signature,
+                    cover_path,
+                    cover_size,
+                    cover_mtime_ns,
+                    cover_signature,
+                ) = row
+                if source != (source_size, source_mtime_ns, source_ctime_ns):
+                    invalid.append((key, file_name))
+                    continue
+                current_signature = _content_signature(item.path)
+                if current_signature != source_signature:
                     invalid.append((key, file_name))
                     continue
                 if cover_path:
                     cover = self._stat_path(Path(cover_path))
                     if cover is None or cover != (cover_size, cover_mtime_ns):
+                        invalid.append((key, file_name))
+                        continue
+                    if _content_signature(Path(cover_path)) != cover_signature:
                         invalid.append((key, file_name))
                         continue
                 cache_file = self.files_dir / file_name
@@ -366,7 +519,10 @@ class ThumbnailDiskCache:
                 rows = self._connection.execute(
                     f"""
                     SELECT cache_key, file_name, source_size, source_mtime_ns,
+                           source_ctime_ns,
+                           source_signature,
                            cover_path, cover_size, cover_mtime_ns,
+                           cover_signature,
                            thumbnail_size, frame_width, frame_height,
                            page_count
                       FROM entries
@@ -395,20 +551,29 @@ class ThumbnailDiskCache:
                     file_name,
                     source_size,
                     source_mtime_ns,
+                    source_ctime_ns,
+                    source_signature,
                     cover_path,
                     cover_size,
                     cover_mtime_ns,
+                    cover_signature,
                     cache_token,
                     frame_width,
                     frame_height,
                     page_count,
                 ) = row
-                if (source[0], source[1]) != (source_size, source_mtime_ns):
+                if source != (source_size, source_mtime_ns, source_ctime_ns):
+                    invalid.append((key, file_name))
+                    continue
+                if _content_signature(item.path) != source_signature:
                     invalid.append((key, file_name))
                     continue
                 if cover_path:
                     cover = self._stat_path(Path(cover_path))
                     if cover is None or cover != (cover_size, cover_mtime_ns):
+                        invalid.append((key, file_name))
+                        continue
+                    if _content_signature(Path(cover_path)) != cover_signature:
                         invalid.append((key, file_name))
                         continue
                 cache_file = self.files_dir / file_name
@@ -450,7 +615,9 @@ class ThumbnailDiskCache:
         expected_write_epoch: int | None = None,
         expected_source_identity: ThumbnailSourceIdentity | None = None,
     ) -> bool:
+        self.last_put_status = "cancelled"
         if image is None or image.isNull():
+            self.last_put_status = "invalid"
             return False
         with self._lock:
             if (
@@ -461,11 +628,13 @@ class ThumbnailDiskCache:
                     and expected_write_epoch != self._write_epoch
                 )
             ):
+                self.last_put_status = "disabled"
                 return False
         if isinstance(thumbnail_size, ThumbnailRenderSpec):
             policy = thumbnail_size.encoding_policy
             quality = thumbnail_size.encoder_quality
             if type(quality) is not int or not 1 <= quality <= 100:
+                self.last_put_status = "invalid"
                 return False
             cache_token = thumbnail_size.cache_token
             family_token = thumbnail_size.family_token
@@ -483,11 +652,13 @@ class ThumbnailDiskCache:
             format_version=self._format_version_for_policy(policy),
         )
         if fingerprint is None:
+            self.last_put_status = "source_changed"
             return False
         if (
             expected_source_identity is not None
             and not expected_source_identity.matches(fingerprint)
         ):
+            self.last_put_status = "source_changed"
             return False
         key = fingerprint.key
         file_name = f"{key}.{self._extension}"
@@ -503,11 +674,13 @@ class ThumbnailDiskCache:
                         and expected_write_epoch != self._write_epoch
                     )
                 ):
+                    self.last_put_status = "disabled"
                     return False
                 existing = self._connection.execute(
                     "SELECT file_name FROM entries WHERE cache_key = ?",
                     (key,),
                 ).fetchone()
+                self._active_staging_paths.add(os.path.normcase(str(temporary)))
                 if existing is not None and cache_file.is_file():
                     if page_count is not None:
                         self._connection.execute(
@@ -515,6 +688,7 @@ class ThumbnailDiskCache:
                             (max(0, int(page_count)), key),
                         )
                         self._connection.commit()
+                    self.last_put_status = "already_present"
                     return False
 
             if page_count is None:
@@ -536,6 +710,7 @@ class ThumbnailDiskCache:
                         and expected_write_epoch != self._write_epoch
                     )
                 ):
+                    self.last_put_status = "disabled"
                     return False
                 current_fingerprint = self._fingerprint(
                     item,
@@ -545,11 +720,13 @@ class ThumbnailDiskCache:
                     format_version=self._format_version_for_policy(policy),
                 )
                 if current_fingerprint != fingerprint:
+                    self.last_put_status = "source_changed"
                     return False
                 if (
                     expected_source_identity is not None
                     and not expected_source_identity.matches(current_fingerprint)
                 ):
+                    self.last_put_status = "source_changed"
                     return False
                 existing = self._connection.execute(
                     "SELECT file_name FROM entries WHERE cache_key = ?",
@@ -562,6 +739,7 @@ class ThumbnailDiskCache:
                             (max(0, int(page_count)), key),
                         )
                         self._connection.commit()
+                    self.last_put_status = "already_present"
                     return False
                 os.replace(temporary, cache_file)
                 now = time.time()
@@ -569,11 +747,15 @@ class ThumbnailDiskCache:
                     """
                     INSERT OR REPLACE INTO entries (
                         cache_key, source_path, item_kind, source_size,
-                        source_mtime_ns, cover_path, cover_size,
-                        cover_mtime_ns, entry_path, thumbnail_size, family_token,
+                        source_mtime_ns, source_ctime_ns, source_signature,
+                        cover_path, cover_size, cover_mtime_ns, cover_signature,
+                        entry_path, thumbnail_size, family_token,
                         frame_width, frame_height, format_version,
                         file_name, byte_size, created_at, last_used, page_count
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
                     """,
                     (
                         key,
@@ -581,9 +763,12 @@ class ThumbnailDiskCache:
                         fingerprint.item_kind,
                         fingerprint.source_size,
                         fingerprint.source_mtime_ns,
+                        fingerprint.source_ctime_ns,
+                        fingerprint.source_signature,
                         fingerprint.cover_path,
                         fingerprint.cover_size,
                         fingerprint.cover_mtime_ns,
+                        fingerprint.cover_signature,
                         fingerprint.entry_path,
                         fingerprint.thumbnail_size,
                         family_token,
@@ -609,11 +794,17 @@ class ThumbnailDiskCache:
                 self._connection.commit()
                 self._refresh_cached_statistics()
                 self._evict_global_capacity_locked(protected_key=key)
+                self.last_put_status = "stored"
                 return True
         except (OSError, sqlite3.DatabaseError, ValueError) as exc:
             self.last_error = str(exc)
+            self.last_put_status = "io_error"
             return False
         finally:
+            with self._lock:
+                self._active_staging_paths.discard(
+                    os.path.normcase(str(temporary))
+                )
             try:
                 temporary.unlink(missing_ok=True)
             except OSError:
@@ -631,10 +822,13 @@ class ThumbnailDiskCache:
             try:
                 row = self._connection.execute(
                     """
-                    SELECT page_count, source_size, source_mtime_ns
+                    SELECT page_count, source_size, source_mtime_ns,
+                           source_ctime_ns, source_signature
                       FROM entries
                      WHERE source_path = ? AND item_kind = ?
                        AND source_size = ? AND source_mtime_ns = ?
+                       AND source_ctime_ns = ?
+                       AND source_signature = ?
                        AND page_count IS NOT NULL
                      ORDER BY last_used DESC
                      LIMIT 1
@@ -644,12 +838,18 @@ class ThumbnailDiskCache:
                         item.kind.value,
                         source[0],
                         source[1],
+                        source[2],
+                        _content_signature(item.path),
                     ),
                 ).fetchone()
             except sqlite3.DatabaseError as exc:
                 self.last_error = str(exc)
                 return None
-            if row is None or source != (row[1], row[2]):
+            if (
+                row is None
+                or source != (row[1], row[2], row[3])
+                or row[4] != _content_signature(item.path)
+            ):
                 return None
             return max(0, int(row[0]))
 
@@ -668,6 +868,8 @@ class ThumbnailDiskCache:
                     UPDATE entries SET page_count = ?
                      WHERE source_path = ? AND item_kind = ?
                        AND source_size = ? AND source_mtime_ns = ?
+                       AND source_ctime_ns = ?
+                       AND source_signature = ?
                     """,
                     (
                         max(0, int(page_count)),
@@ -675,6 +877,8 @@ class ThumbnailDiskCache:
                         item.kind.value,
                         source[0],
                         source[1],
+                        source[2],
+                        _content_signature(item.path),
                     ),
                 )
                 self._connection.commit()
@@ -760,6 +964,18 @@ class ThumbnailDiskCache:
         with self._lock:
             if not self.enabled or self._connection is None:
                 return 0
+            if not self._maintenance_pending:
+                # A completed cycle is a boundary.  Reset both passes
+                # together only when a genuinely new cycle begins.
+                self._entry_scan_cursor = ""
+                self._entry_scan_complete = False
+                self._orphan_scan_complete = False
+                if self._orphan_scanner is not None:
+                    try:
+                        self._orphan_scanner.close()
+                    except OSError:
+                        pass
+                    self._orphan_scanner = None
             self.flush_accesses()
             try:
                 removed = 0
@@ -792,36 +1008,41 @@ class ThumbnailDiskCache:
                     self._remove_entries_without_commit(expired_batch)
                     removed += len(expired_batch)
 
-                cursor_row = connection.execute(
-                    "SELECT value FROM maintenance WHERE key = 'entry_scan_cursor'"
-                ).fetchone()
-                cursor = str(cursor_row[0]) if cursor_row else ""
-                scan_rows = connection.execute(
-                    "SELECT cache_key, file_name FROM entries "
-                    "WHERE cache_key > ? ORDER BY cache_key LIMIT ?",
-                    (cursor, batch + 1),
-                ).fetchall()
-                scan_more = len(scan_rows) > batch
-                scan_batch = scan_rows[:batch]
-                for key, file_name in scan_batch:
-                    if not (self.files_dir / file_name).is_file():
-                        try:
-                            (self.files_dir / file_name).unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                        connection.execute(
-                            "DELETE FROM entries WHERE cache_key = ?", (key,)
-                        )
-                        removed += 1
-                next_cursor = str(scan_batch[-1][0]) if scan_more and scan_batch else ""
-                connection.execute(
-                    "INSERT OR REPLACE INTO maintenance(key, value) VALUES (?, ?)",
-                    ("entry_scan_cursor", next_cursor),
-                )
-                self._entry_scan_cursor = next_cursor
+                scan_more = False
+                if not self._entry_scan_complete:
+                    cursor = self._entry_scan_cursor
+                    scan_rows = connection.execute(
+                        "SELECT cache_key, file_name FROM entries "
+                        "WHERE cache_key > ? ORDER BY cache_key LIMIT ?",
+                        (cursor, batch + 1),
+                    ).fetchall()
+                    scan_more = len(scan_rows) > batch
+                    scan_batch = scan_rows[:batch]
+                    for key, file_name in scan_batch:
+                        if not (self.files_dir / file_name).is_file():
+                            try:
+                                (self.files_dir / file_name).unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                            connection.execute(
+                                "DELETE FROM entries WHERE cache_key = ?", (key,)
+                            )
+                            removed += 1
+                    if scan_more and scan_batch:
+                        self._entry_scan_cursor = str(scan_batch[-1][0])
+                    else:
+                        self._entry_scan_complete = True
+                    connection.execute(
+                        "INSERT OR REPLACE INTO maintenance(key, value) VALUES (?, ?)",
+                        ("entry_scan_cursor", self._entry_scan_cursor),
+                    )
 
                 if remove_orphans:
-                    removed += self._prune_orphan_batch_locked(batch)
+                    if not self._orphan_scan_complete:
+                        removed += self._prune_orphan_batch_locked(batch)
+                        self._orphan_scan_complete = self._orphan_scanner is None
+                else:
+                    self._orphan_scan_complete = True
 
                 self._refresh_cached_statistics()
                 capacity_more = self._cached_usage_bytes > self.limit_bytes
@@ -848,8 +1069,8 @@ class ThumbnailDiskCache:
                 self._maintenance_pending = bool(
                     obsolete_more
                     or expired_more
-                    or scan_more
-                    or (remove_orphans and self._orphan_scanner is not None)
+                    or (not self._entry_scan_complete)
+                    or (remove_orphans and not self._orphan_scan_complete)
                     or self._cached_usage_bytes > self.limit_bytes
                 )
                 return removed
@@ -884,6 +1105,18 @@ class ThumbnailDiskCache:
                     break
                 if not entry.is_file(follow_symlinks=False):
                     continue
+                normalized = os.path.normcase(str(entry.path))
+                if normalized in self._active_staging_paths:
+                    continue
+                if entry.name.startswith(".") and entry.name.endswith(".tmp"):
+                    try:
+                        # A writer that crashed can be reclaimed eventually,
+                        # but an unregistered staging file younger than one
+                        # hour is still allowed to finish its publish step.
+                        if time.time() - entry.stat().st_mtime < 3600:
+                            continue
+                    except OSError:
+                        continue
                 known = connection.execute(
                     "SELECT 1 FROM entries WHERE file_name = ? LIMIT 1",
                     (entry.name,),
@@ -958,7 +1191,9 @@ class ThumbnailDiskCache:
                 self._cached_usage_bytes = 0
                 self._cached_entry_count = 0
                 self._entry_scan_cursor = ""
+                self._entry_scan_complete = False
                 self._maintenance_pending = False
+                self._orphan_scan_complete = False
                 if self._orphan_scanner is not None:
                     self._orphan_scanner.close()
                     self._orphan_scanner = None
@@ -1047,9 +1282,12 @@ class ThumbnailDiskCache:
                 item_kind TEXT NOT NULL,
                 source_size INTEGER NOT NULL,
                 source_mtime_ns INTEGER NOT NULL,
+                source_ctime_ns INTEGER NOT NULL DEFAULT 0,
+                source_signature TEXT NOT NULL DEFAULT '',
                 cover_path TEXT NOT NULL,
                 cover_size INTEGER NOT NULL,
                 cover_mtime_ns INTEGER NOT NULL,
+                cover_signature TEXT NOT NULL DEFAULT '',
                 entry_path TEXT NOT NULL,
                 thumbnail_size INTEGER NOT NULL,
                 family_token INTEGER NOT NULL,
@@ -1073,6 +1311,18 @@ class ThumbnailDiskCache:
         if "page_count" not in columns:
             self._connection.execute(
                 "ALTER TABLE entries ADD COLUMN page_count INTEGER"
+            )
+        if "source_ctime_ns" not in columns:
+            self._connection.execute(
+                "ALTER TABLE entries ADD COLUMN source_ctime_ns INTEGER NOT NULL DEFAULT 0"
+            )
+        if "source_signature" not in columns:
+            self._connection.execute(
+                "ALTER TABLE entries ADD COLUMN source_signature TEXT NOT NULL DEFAULT ''"
+            )
+        if "cover_signature" not in columns:
+            self._connection.execute(
+                "ALTER TABLE entries ADD COLUMN cover_signature TEXT NOT NULL DEFAULT ''"
             )
         self._connection.execute(
             """
@@ -1143,6 +1393,9 @@ class ThumbnailDiskCache:
         source = self._source_for_item(item)
         if source is None:
             return None
+        source_signature = _content_signature(item.path)
+        if source_signature is None:
+            return None
         if item.kind == BrowserItemKind.FOLDER:
             if cover_path is None:
                 return None
@@ -1150,17 +1403,24 @@ class ThumbnailDiskCache:
             if cover is None:
                 return None
             normalized_cover = self._normalize_path(cover_path)
+            cover_signature = _content_signature(cover_path)
+            if cover_signature is None:
+                return None
         else:
             cover = (0, 0)
             normalized_cover = ""
+            cover_signature = ""
         return _Fingerprint(
             source_path=self._normalize_path(item.path),
             item_kind=item.kind.value,
             source_size=source[0],
             source_mtime_ns=source[1],
+            source_ctime_ns=source[2],
+            source_signature=source_signature,
             cover_path=normalized_cover,
             cover_size=cover[0],
             cover_mtime_ns=cover[1],
+            cover_signature=cover_signature,
             entry_path=str(entry_path),
             thumbnail_size=thumbnail_size,
             format_version=self.format_version if format_version is None else format_version,
@@ -1320,11 +1580,17 @@ class ThumbnailDiskCache:
         except OSError:
             return None
 
-    def _source_for_item(self, item: BrowserItem) -> tuple[int, int] | None:
+    def _source_for_item(self, item: BrowserItem) -> tuple[int, int, int] | None:
         # A decode/count from the scanned version must never be published into
         # a later write's cache identity. Called only on the worker/cache path.
-        source = self._stat_path(item.path)
-        if source is None:
+        try:
+            info = item.path.stat()
+            source = (
+                int(info.st_size),
+                int(info.st_mtime_ns),
+                int(getattr(info, "st_ctime_ns", 0)),
+            )
+        except OSError:
             return None
         if (
             (item.file_size is not None and item.file_size != source[0])
