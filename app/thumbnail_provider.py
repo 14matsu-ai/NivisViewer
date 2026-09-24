@@ -243,6 +243,19 @@ class BrowserThumbnailProvider(QObject):
         self._save_lock = Lock()
         self._save_queue: deque[_ThumbnailSaveRequest] = deque()
         self._save_queue_bytes = 0
+        self._deferred_save_queue: OrderedDict[
+            tuple[object, ...], _ThumbnailSaveRequest
+        ] = OrderedDict()
+        self._deferred_save_bytes = 0
+        self._deferred_save_max_items = 64
+        self._deferred_save_max_bytes = 32 * 1024 * 1024
+        self._retry_save_queue: OrderedDict[
+            tuple[object, ...], _ThumbnailSaveRequest
+        ] = OrderedDict()
+        self._retry_save_bytes = 0
+        self._retry_save_max_items = 64
+        self._retry_save_max_bytes = 32 * 1024 * 1024
+        self._save_enqueue_backpressured = False
         self._save_drain_active = False
         self._active_save_key: tuple[object, ...] | None = None
         self._save_queue_max_items = 48
@@ -1355,6 +1368,10 @@ class BrowserThumbnailProvider(QObject):
         with self._save_lock:
             self._save_queue.clear()
             self._save_queue_bytes = 0
+            self._deferred_save_queue.clear()
+            self._deferred_save_bytes = 0
+            self._retry_save_queue.clear()
+            self._retry_save_bytes = 0
 
         def clear_disk() -> QImage | None:
             disk_cache.set_enabled(True)
@@ -1381,6 +1398,11 @@ class BrowserThumbnailProvider(QObject):
             return
         self._closed = True
         self._generation += 1
+        with self._save_lock:
+            self._deferred_save_queue.clear()
+            self._deferred_save_bytes = 0
+            self._retry_save_queue.clear()
+            self._retry_save_bytes = 0
         with self._pending_lock:
             for pending in self._pending.values():
                 pending.worker.cancelled.set()
@@ -2129,6 +2151,8 @@ class BrowserThumbnailProvider(QObject):
             or priority is ThumbnailPriority.PREFETCH
         ):
             return False
+        with self._save_lock:
+            self._save_enqueue_backpressured = False
         policy = (
             size.encoding_policy
             if isinstance(size, ThumbnailRenderSpec)
@@ -2166,12 +2190,48 @@ class BrowserThumbnailProvider(QObject):
                         self._save_queue[index] = queued
                         self._save_queue_bytes += byte_delta
                 return True
+            if self._closed:
+                return False
+            self._remove_deferred_save_locked(save_key)
+            self._remove_retry_save_locked(save_key)
             if (
-                self._closed
-                or len(self._save_queue) + int(self._save_drain_active)
+                len(self._save_queue) + int(self._save_drain_active)
                 >= self._save_queue_max_items
                 or self._save_queue_bytes + byte_cost > self._save_queue_max_bytes
             ):
+                self._save_enqueue_backpressured = True
+                previous = self._deferred_save_queue.pop(save_key, None)
+                if previous is not None:
+                    self._deferred_save_bytes = max(
+                        0, self._deferred_save_bytes - previous.byte_cost
+                    )
+                if (
+                    len(self._deferred_save_queue)
+                    < self._deferred_save_max_items
+                    and self._deferred_save_bytes + byte_cost
+                    <= self._deferred_save_max_bytes
+                ):
+                    self._deferred_save_queue[save_key] = queued
+                    self._deferred_save_bytes += byte_cost
+                else:
+                    previous = self._retry_save_queue.pop(save_key, None)
+                    if previous is not None:
+                        self._retry_save_bytes = max(
+                            0, self._retry_save_bytes - previous.byte_cost
+                        )
+                    if (
+                        len(self._retry_save_queue) < self._retry_save_max_items
+                        and self._retry_save_bytes + byte_cost
+                        <= self._retry_save_max_bytes
+                    ):
+                        self._retry_save_queue[save_key] = queued
+                        self._retry_save_bytes += byte_cost
+                    # Do not add another unbounded persistence tier.  The
+                    # completed RAM entry is evicted so the owning workflow
+                    # remains backpressured and will regenerate/re-save it
+                    # after capacity_released instead of reporting a RAM hit
+                    # as settled.
+                    self._evict_cache_entry_for_save(item, size)
                 return False
             self._save_queue.append(queued)
             self._save_queue_bytes += byte_cost
@@ -2200,14 +2260,34 @@ class BrowserThumbnailProvider(QObject):
         )
 
     def _drain_thumbnail_saves(self) -> None:
+        pending_was_released = False
         while True:
+            release_capacity = False
+            request = None
             with self._save_lock:
                 if not self._save_queue:
+                    had_pending = bool(
+                        self._deferred_save_queue
+                        or self._retry_save_queue
+                    )
+                    had_backpressure = self._save_enqueue_backpressured
+                    pending_was_released = pending_was_released or had_pending
                     self._save_drain_active = False
+                    self._promote_retry_saves_locked()
+                    self._promote_deferred_saves_locked()
+                    if self._save_queue:
+                        self._save_drain_active = True
+                        continue
                     self._active_save_key = None
-                    return
-                request = self._save_queue.popleft()
-                self._active_save_key = self._thumbnail_save_key(request)
+                    self._save_enqueue_backpressured = False
+                    release_capacity = had_pending or had_backpressure
+                else:
+                    request = self._save_queue.popleft()
+                    self._active_save_key = self._thumbnail_save_key(request)
+            if request is None:
+                if release_capacity or pending_was_released:
+                    self.capacity_released.emit()
+                return
             disk_cache = self._disk_cache
             saved = False
             persisted = False
@@ -2248,7 +2328,13 @@ class BrowserThumbnailProvider(QObject):
                 except Exception:
                     saved = False
                     persisted = False
-                self._record_disk_cache_write_availability(persisted)
+                outcome = str(getattr(disk_cache, "last_put_status", "io_error"))
+                if persisted or outcome == "already_present":
+                    self._record_disk_cache_write_availability(True)
+                elif outcome in {"io_error", "disabled"}:
+                    # Source revision/cancellation is an expected refusal,
+                    # not evidence that the persistence route is unhealthy.
+                    self._record_disk_cache_write_availability(False)
             if saved:
                 self._increment_stat("disk_saved")
                 self._increment_stat(
@@ -2268,10 +2354,95 @@ class BrowserThumbnailProvider(QObject):
                 )
                 if self._active_save_key == self._thumbnail_save_key(request):
                     self._active_save_key = None
+                self._promote_deferred_saves_locked()
+                self._promote_retry_saves_locked()
             if disk_cache is not None and getattr(
                 disk_cache, "maintenance_pending", False
             ):
                 QTimer.singleShot(0, self, self._continue_cache_maintenance)
+
+    def _promote_deferred_saves_locked(self) -> None:
+        while self._deferred_save_queue:
+            if (
+                len(self._save_queue) + int(self._save_drain_active)
+                >= self._save_queue_max_items
+                or self._save_queue_bytes >= self._save_queue_max_bytes
+            ):
+                return
+            save_key, request = self._deferred_save_queue.popitem(last=False)
+            self._deferred_save_bytes = max(
+                0, self._deferred_save_bytes - request.byte_cost
+            )
+            if self._active_save_key == save_key:
+                continue
+            if any(
+                self._thumbnail_save_key(existing) == save_key
+                for existing in self._save_queue
+            ):
+                continue
+            if self._save_queue_bytes + request.byte_cost > self._save_queue_max_bytes:
+                self._deferred_save_queue[save_key] = request
+                self._deferred_save_bytes += request.byte_cost
+                return
+            self._save_queue.append(request)
+            self._save_queue_bytes += request.byte_cost
+
+    def _promote_retry_saves_locked(self) -> None:
+        while self._retry_save_queue:
+            if (
+                len(self._deferred_save_queue) >= self._deferred_save_max_items
+                or self._deferred_save_bytes
+                >= self._deferred_save_max_bytes
+            ):
+                return
+            save_key, request = next(iter(self._retry_save_queue.items()))
+            if (
+                self._deferred_save_bytes + request.byte_cost
+                > self._deferred_save_max_bytes
+            ):
+                return
+            self._retry_save_queue.pop(save_key, None)
+            self._retry_save_bytes = max(
+                0, self._retry_save_bytes - request.byte_cost
+            )
+            if self._active_save_key == save_key:
+                continue
+            previous = self._deferred_save_queue.pop(save_key, None)
+            if previous is not None:
+                self._deferred_save_bytes = max(
+                    0, self._deferred_save_bytes - previous.byte_cost
+                )
+            self._deferred_save_queue[save_key] = request
+            self._deferred_save_bytes += request.byte_cost
+
+    def _remove_deferred_save_locked(self, save_key) -> None:
+        previous = self._deferred_save_queue.pop(save_key, None)
+        if previous is not None:
+            self._deferred_save_bytes = max(
+                0, self._deferred_save_bytes - previous.byte_cost
+            )
+
+    def _remove_retry_save_locked(self, save_key) -> None:
+        previous = self._retry_save_queue.pop(save_key, None)
+        if previous is not None:
+            self._retry_save_bytes = max(
+                0, self._retry_save_bytes - previous.byte_cost
+            )
+
+    def _evict_cache_entry_for_save(
+        self,
+        item: BrowserItem,
+        size: int | ThumbnailRenderSpec,
+    ) -> None:
+        token = size.cache_token if isinstance(size, ThumbnailRenderSpec) else int(size)
+        cache_key = (self._path_key(item.path), token, item.thumbnail_revision)
+        image = self._cache.pop(cache_key, None)
+        if image is None:
+            return
+        self._cache_bytes = max(0, self._cache_bytes - int(image.sizeInBytes()))
+        self._cache_index_remove(cache_key)
+        self._cache_page_counts.pop(cache_key, None)
+        self._cache_entry_priority.pop(cache_key, None)
 
     def _memory_candidate(
         self,
@@ -2744,8 +2915,13 @@ class BrowserThumbnailProvider(QObject):
         """Generate through the existing lane; never enqueue the entire listing."""
         if self._closed or self._paused or generation != self._generation:
             return "blocked"
+        with self._save_lock:
+            if self._save_enqueue_backpressured:
+                return "blocked"
         token = size.cache_token
         cache_key = (self._path_key(item.path), token, item.thumbnail_revision)
+        if self._has_pending_save_for(item, size):
+            return "blocked"
         if cache_key in self._cache:
             return "settled"
         candidate = self._memory_candidate(cache_key[0], item.thumbnail_revision, size)
@@ -2768,10 +2944,55 @@ class BrowserThumbnailProvider(QObject):
             return "settled"
         return "blocked"
 
+    def _has_pending_save_for(
+        self,
+        item: BrowserItem,
+        size: int | ThumbnailRenderSpec,
+    ) -> bool:
+        path_key = self._path_key(item.path)
+        token = size.cache_token if isinstance(size, ThumbnailRenderSpec) else int(size)
+
+        def matches(request: _ThumbnailSaveRequest) -> bool:
+            return (
+                self._path_key(Path(request.item.path)) == path_key
+                and (
+                    request.size.cache_token
+                    if isinstance(request.size, ThumbnailRenderSpec)
+                    else int(request.size)
+                ) == token
+            )
+
+        def key_matches(key: tuple[object, ...] | None) -> bool:
+            if key is None or len(key) < 2:
+                return False
+            identity = key[0]
+            source_path = getattr(identity, "source_path", None)
+            return (
+                source_path is not None
+                and self._path_key(Path(str(source_path))) == path_key
+                and int(key[1]) == token
+            )
+
+        with self._save_lock:
+            return bool(
+                key_matches(self._active_save_key)
+                or any(matches(request) for request in self._save_queue)
+                or any(
+                    matches(request)
+                    for request in self._deferred_save_queue.values()
+                )
+                or any(
+                    matches(request)
+                    for request in self._retry_save_queue.values()
+                )
+            )
+
     @Slot(str, int, object, object, object)
     def _on_finished(self, path, generation, size_token, modified_at, result):
         loaded = result if isinstance(result, ThumbnailLoadResult) else ThumbnailLoadResult(result)
         state = loaded.resolved_kind.value
+        with self._save_lock:
+            self._save_enqueue_backpressured = False
         key = (self._path_key(Path(path)), int(size_token), generation)
         with self._pending_lock:
             pending = self._pending.get(key)
@@ -2796,7 +3017,7 @@ class BrowserThumbnailProvider(QObject):
                 )
             ):
                 self._increment_stat("memory_only")
-            if not self._closed:
+            if not self._closed and not self._save_enqueue_backpressured:
                 self.work_settled.emit(path, generation, size_token, modified_at, state)
 
 

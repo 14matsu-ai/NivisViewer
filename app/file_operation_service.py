@@ -1503,6 +1503,18 @@ class FileOperationService:
                 tr('再解析ポイントはマージできません'),
                 operation=request.operation,
             )
+        # ``isdir``/``lexists`` follow an existing junction or symlink in an
+        # ancestor.  Validate the complete destination chain at the worker
+        # boundary as well as during planning so a target replaced after the
+        # plan cannot redirect a merge outside the selected root.
+        if self._has_reparse_component(child_destination):
+            return self._failure(
+                child_source,
+                child_destination,
+                FileOperationErrorCode.IO_ERROR,
+                tr('統合先の再解析ポイントはマージできません'),
+                operation=request.operation,
+            )
         if not os.path.lexists(child_destination):
             try:
                 if move:
@@ -1942,7 +1954,14 @@ class FileOperationService:
                 else os.path.join(source, entry.relative_path)
             )
             parts = Path(entry.relative_path).parts
-            ancestors = [""]
+            # The root file is the item being removed, not a directory that
+            # can contain an ancestor.  Treating it as ``source`` here made
+            # every unchanged cross-volume single-file move fail its final
+            # receipt check.  A directory root still needs its own identity
+            # checked before child removal.
+            ancestors = [""] if entry.kind == "directory" else []
+            if entry.relative_path:
+                ancestors = [""]
             for count in range(1, len(parts)):
                 ancestors.append(os.path.join(*parts[:count]))
             for relative_parent in ancestors:
@@ -1995,6 +2014,26 @@ class FileOperationService:
         attributes = int(getattr(path_stat, "st_file_attributes", 0))
         flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
         return stat.S_ISLNK(path_stat.st_mode) or bool(attributes & flag)
+
+    @classmethod
+    def _has_reparse_component(cls, path: str) -> bool:
+        """Reject a destination path whose existing component is reparse-backed."""
+
+        candidate = os.path.abspath(path)
+        while candidate:
+            try:
+                if cls._is_reparse_path(candidate):
+                    return True
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # An indeterminate destination boundary is unsafe to publish.
+                return True
+            parent = os.path.dirname(candidate)
+            if parent == candidate:
+                break
+            candidate = parent
+        return False
 
     def _collision_resolution(
         self,

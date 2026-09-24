@@ -180,7 +180,16 @@ class FileOperationPlanner:
                 )
                 continue
             try:
-                item = self._inspect_source(source, destination_root, cancel, warnings)
+                item = self._inspect_source(
+                    source,
+                    destination_root,
+                    cancel,
+                    warnings,
+                    measure=request.operation in {
+                        FileOperationKind.COPY,
+                        FileOperationKind.MOVE,
+                    },
+                )
             except FileNotFoundError:
                 warnings.append(tr('対象が見つかりません: {p0}', p0=source))
                 continue
@@ -293,13 +302,20 @@ class FileOperationPlanner:
         destination_root: str | None,
         cancelled: Event,
         warnings: list[str],
+        *,
+        measure: bool = True,
     ) -> PlannedFileItem:
         source_stat = os.lstat(source)
         is_directory = stat.S_ISDIR(source_stat.st_mode)
         reparse = self._is_reparse(source_stat)
-        size, files, directories = self._measure(
-            source, is_directory, reparse, cancelled, warnings
-        )
+        if measure:
+            size, files, directories = self._measure(
+                source, is_directory, reparse, cancelled, warnings
+            )
+        else:
+            size = 0
+            files = 0 if is_directory else 1
+            directories = 1 if is_directory else 0
         destination = (
             os.path.join(destination_root, os.path.basename(source))
             if destination_root
@@ -592,7 +608,17 @@ class FileOperationPlanner:
                             continue
                         destination_name, destination_path = destination_entry
                         source_is_directory = entry.is_dir(follow_symlinks=False)
-                        destination_is_directory = os.path.isdir(destination_path)
+                        destination_reparse = self._has_reparse_component(
+                            destination_path
+                        )
+                        destination_is_directory = (
+                            not destination_reparse
+                            and os.path.isdir(destination_path)
+                        )
+                        if destination_reparse:
+                            warnings.append(
+                                tr('統合先の再解析ポイントは再帰しません: {p0}', p0=destination_path)
+                            )
                         if entry.name != destination_name:
                             kind = FileConflictKind.CASE_ONLY_NAME
                             allowed = (
@@ -752,6 +778,23 @@ class FileOperationPlanner:
             # safe to publish; keep the user's displayed paths unchanged.
             return True
         return is_below(resolved_candidate, resolved_root)
+
+    @classmethod
+    def _has_reparse_component(cls, path: str) -> bool:
+        candidate = os.path.abspath(path)
+        while candidate:
+            try:
+                if cls._is_reparse(os.lstat(candidate)):
+                    return True
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return True
+            parent = os.path.dirname(candidate)
+            if parent == candidate:
+                break
+            candidate = parent
+        return False
 
     @staticmethod
     def _is_reparse(path_stat: os.stat_result) -> bool:
