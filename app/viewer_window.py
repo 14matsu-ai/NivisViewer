@@ -4424,27 +4424,16 @@ class ViewerWindow(QMainWindow):
                     )
                     return
                 self._clear_pending_raster_navigation(reset_policy=False)
-                if isinstance(self.book_session.source, ZipImageSource):
-                    # A cold ZIP wheel target owns the sole worker.  A
-                    # running compatible neighbor is useful only when it is
-                    # itself the current target (handled inside the runtime)
-                    # or when the new current already has a publishable
-                    # artifact.  Passing the old preserve hint here let an
-                    # unrelated startup warmup keep the worker until its
-                    # decode completed, so the latest cold wheel target could
-                    # not start.  The runtime still retains completed
-                    # compatible results and keeps the exact-current running
-                    # job through its normal adoption branch.
-                    accepted = runtime.request(zip_request)
-                elif input_kind is NavigationInputKind.WHEEL:
-                    # Folder/SevenZip runtimes retain their established
-                    # started-neighbor continuity contract.
-                    accepted = runtime.request(
-                        zip_request,
-                        preserve_started_compatible=True,
-                    )
-                else:
-                    accepted = runtime.request(zip_request)
+                # The runtime applies the source-overlap and worker-capacity
+                # limits for started compatibility.  A cold wheel may retain
+                # a started ZIP spread that shares a source page with the new
+                # current; unrelated single-lane warmup is still cancelled.
+                accepted = runtime.request(
+                    zip_request,
+                    preserve_started_compatible=(
+                        input_kind is NavigationInputKind.WHEEL
+                    ),
+                )
                 if accepted:
                     self._queue_ready_transit_frame_after_cold_dispatch(
                         zip_request

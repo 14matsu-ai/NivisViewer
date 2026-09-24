@@ -6,6 +6,7 @@ from threading import Lock
 from threading import Event
 from time import monotonic, sleep
 import io
+import os
 import zipfile
 
 from PIL import Image, ImageOps
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import QApplication
 from app.book_session import BookSession
 from app.config_manager import ConfigManager
 from app.image_source import ZipImageSource
+from app.viewer_navigation_policy import NavigationInputKind
 from app.viewer_window import ViewerWindow
 
 
@@ -83,6 +85,36 @@ class BlockingWarmupSource(ZipImageSource):
         if str(image_id) == self.blocked_image_id:
             self.blocked_image_started.set()
             self.release_blocked_image.wait(3.0)
+
+
+class SharedSpreadCountingSource(ZipImageSource):
+    """Count one real ZIP payload/decode and gate the shared spread page."""
+
+    def __init__(self, path: Path, blocked_image_id: str = "003.jpg") -> None:
+        super().__init__(path)
+        self.blocked_image_id = blocked_image_id
+        self.block_enabled = False
+        self.blocked_image_started = Event()
+        self.release_blocked_image = Event()
+        self.entry_reads: list[str] = []
+        self.decode_calls: list[str] = []
+
+    def _read_entry_qbytearray(self, image_id, cancelled):
+        image_id = str(image_id)
+        self.entry_reads.append(image_id)
+        if (
+            self.block_enabled
+            and image_id == self.blocked_image_id
+            and not self.release_blocked_image.is_set()
+        ):
+            self.blocked_image_started.set()
+            while not self.release_blocked_image.wait(0.002):
+                self._raise_if_cancelled(cancelled)
+        return super()._read_entry_qbytearray(image_id, cancelled)
+
+    def open_compatible_jpeg_at_most(self, image_id, maximum_size):
+        self.decode_calls.append(str(image_id))
+        return super().open_compatible_jpeg_at_most(image_id, maximum_size)
 
 
 def _wait_until(qapp: QApplication, predicate, timeout: float = 8.0) -> None:
@@ -160,6 +192,95 @@ def test_cold_start_rapid_wheel_reports_runtime_frontier(tmp_path, qapp):
         source.close()
 
 
+def test_cold_wheel_event_loop_intervals_are_recorded(tmp_path, qapp, monkeypatch):
+    """Record real Qt-loop timing around 20/50/100 ms wheel intervals."""
+    archive = tmp_path / "cold-wheel-event-loop.zip"
+    _write_zip(archive, pages=8)
+    source = SlowZipSource(archive)
+    session = BookSession(source_factory=lambda *_args, **_kwargs: (source, None))
+    config = ConfigManager(tmp_path / "cold-wheel-event-loop.json")
+    config.load()
+    window = ViewerWindow(config_manager=config, book_session=session)
+    window.resize(900, 700)
+    window.set_view_mode("single")
+    window.show()
+    qapp.processEvents()
+    try:
+        assert window._finish_opened_book(
+            session.open_book(archive), modal_on_empty=False
+        )
+        runtime = session.viewer_runtime
+        assert runtime is not None
+        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 0)
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+        planner = runtime._warmup_planner
+        assert planner is not None
+        monkeypatch.setattr(
+            type(planner),
+            "next_candidate",
+            lambda *_args, **_kwargs: None,
+        )
+        for frame in tuple(runtime._frame_store.values()):
+            if frame.unit.pages[0].page_index == 1:
+                runtime._frame_store.take(frame.key)
+        runtime._source_store.clear()
+        with source.lock:
+            source.started.clear()
+            source.finished.clear()
+            source.started_times.clear()
+            source.finished_times.clear()
+
+        paint_times: list[float] = []
+
+        def record_paint(_serial, image_ids):
+            if isinstance(image_ids, tuple) and any(
+                str(image_id).startswith("001.jpg") for image_id in image_ids
+            ):
+                paint_times.append(monotonic())
+
+        window.viewer.framePainted.connect(record_paint)
+        input_times: list[float] = []
+        intervals = (0.02, 0.05, 0.10)
+        for index, interval in enumerate(intervals):
+            qapp.processEvents()
+            input_times.append(monotonic())
+            assert QApplication.sendEvent(window.viewer, _wheel_event(index))
+            sleep(interval)
+            qapp.processEvents()
+        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 1)
+        _wait_until(qapp, lambda: bool(paint_times))
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+
+        page_started = next(
+            at for name, at in source.started_times if name == "001.jpg"
+        )
+        page_finished = next(
+            at for name, at in source.finished_times if name == "001.jpg"
+        )
+        print(
+            "cold-wheel-event-loop-ms",
+            {
+                "intervals": tuple(round(value * 1000, 1) for value in intervals),
+                "input_to_decode_start": round((page_started - input_times[0]) * 1000, 1),
+                "decode": round((page_finished - page_started) * 1000, 1),
+                "decode_to_paint": round((paint_times[0] - page_finished) * 1000, 1),
+                "started": tuple(source.started),
+                "finished": tuple(source.finished),
+                "cancel_requests": runtime.metrics.cancel_requests,
+                "stale_results": runtime.metrics.stale_results,
+                "inflight": runtime.cache_debug_values()["inflight_reservation_bytes"],
+            },
+            flush=True,
+        )
+        assert source.started.count("001.jpg") == 1
+        assert source.finished.count("001.jpg") == 1
+        assert runtime.metrics.stale_results == 0
+    finally:
+        window.close()
+        qapp.processEvents()
+        source.close()
+
+
 def test_cold_wheel_target_preempts_unrelated_started_startup_warmup(
     tmp_path,
     qapp,
@@ -207,6 +328,115 @@ def test_cold_wheel_target_preempts_unrelated_started_startup_warmup(
         assert runtime._current_request is not None
         assert runtime._current_request.current.pages[0].page_index == 1
         _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+    finally:
+        source.release_blocked_image.set()
+        window.close()
+        qapp.processEvents()
+        source.close()
+
+
+@pytest.mark.parametrize("reading_direction", ["ltr", "rtl"])
+def test_actual_viewer_wheel_reuses_started_shared_spread_source(
+    tmp_path,
+    qapp,
+    monkeypatch,
+    reading_direction,
+):
+    """The production wheel path keeps a started page shared by two spreads."""
+    archive = tmp_path / f"shared-spread-{reading_direction}.zip"
+    _write_zip(archive, pages=8)
+    source = SharedSpreadCountingSource(archive)
+    session = BookSession(source_factory=lambda *_args, **_kwargs: (source, None))
+    config = ConfigManager(tmp_path / f"shared-spread-{reading_direction}.json")
+    config.load()
+    window = ViewerWindow(config_manager=config, book_session=session)
+    window.resize(900, 700)
+    window.set_view_mode("spread")
+    window.set_single_first_page(False)
+    window.set_reading_direction(reading_direction)
+    window.show()
+    qapp.processEvents()
+    try:
+        assert window._finish_opened_book(
+            session.open_book(archive), modal_on_empty=False
+        )
+        runtime = session.viewer_runtime
+        assert runtime is not None
+        initial_indexes = (0, 1) if reading_direction == "ltr" else (1, 0)
+        _wait_until(
+            qapp,
+            lambda: window.viewer.displayed_page_indexes == initial_indexes,
+        )
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+        # First let the real warmup lane build the shifted (3,4) artifact.
+        # It is then ready and will be skipped while (2,3) is admitted.
+        assert window.page_navigation.go_to_focused_page_index(
+            1, input_kind=NavigationInputKind.DISCRETE
+        )
+        shifted_indexes = (1, 2) if reading_direction == "ltr" else (2, 1)
+        _wait_until(
+            qapp,
+            lambda: window.viewer.displayed_page_indexes == shifted_indexes,
+        )
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+
+        # Controlled before/after switch: this is only for proving that the
+        # old Viewer caller (which omitted the preserve hint) really fails.
+        if os.environ.get("NIVISVIEWER_FORCE_PRESERVE_FALSE") == "1":
+            real_request = runtime.request
+
+            def request_without_started_preserve(request, **_kwargs):
+                return real_request(request, preserve_started_compatible=False)
+
+            monkeypatch.setattr(runtime, "request", request_without_started_preserve)
+
+        # Keep the old paint visible, but make the current and shared source
+        # cold. The next refresh therefore starts (1,2), then the planner's
+        # ready (3,4) skip exposes the in-flight (2,3) neighbor.
+        for frame in tuple(runtime._frame_store.values()):
+            page_indexes = {page.page_index for page in frame.unit.pages}
+            if page_indexes in ({1, 2}, {2, 3}):
+                runtime._frame_store.take(frame.key)
+        runtime._source_store.clear()
+        source.entry_reads.clear()
+        source.decode_calls.clear()
+        source.block_enabled = True
+
+        window._refresh_view()
+        _wait_until(qapp, source.blocked_image_started.is_set)
+        started_job = runtime._active_job
+        assert started_job is not None and started_job.started.is_set()
+        expected_active_identity = (
+            ((2, "002.jpg"), (3, "003.jpg"))
+            if reading_direction == "ltr"
+            else ((3, "003.jpg"), (2, "002.jpg"))
+        )
+        assert started_job.key.unit_identity == expected_active_identity
+        for frame in tuple(runtime._frame_store.values()):
+            if {page.page_index for page in frame.unit.pages} == {3, 4}:
+                runtime._frame_store.take(frame.key)
+
+        # The canvas's real QWheelEvent advances the shifted spread to (3,4).
+        window.viewer.wheelEvent(_wheel_event(1))
+        assert window.model.current_index == 3
+        requested = runtime._current_request
+        assert requested is not None
+        expected_target_identity = (
+            ((3, "003.jpg"), (4, "004.jpg"))
+            if reading_direction == "ltr"
+            else ((4, "004.jpg"), (3, "003.jpg"))
+        )
+        assert requested.current.identity == expected_target_identity
+        assert not started_job.cancelled.is_set()
+        assert runtime.metrics.running_job_adoptions >= 1
+
+        source.release_blocked_image.set()
+        target_indexes = (3, 4) if reading_direction == "ltr" else (4, 3)
+        _wait_until(qapp, lambda: window.viewer.displayed_page_indexes == target_indexes)
+        _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+        assert source.entry_reads.count("003.jpg") == 1
+        assert source.decode_calls.count("003.jpg") == 1
+        assert runtime.metrics.stale_results == 0
     finally:
         source.release_blocked_image.set()
         window.close()
