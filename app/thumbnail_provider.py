@@ -1800,7 +1800,9 @@ class BrowserThumbnailProvider(QObject):
         return ThumbnailLoadResult(
             result.image,
             result.cover_path,
-            provisional_image=provisional,
+            provisional_image=(
+                provisional if provisional is not None else result.provisional_image
+            ),
             entry_path=result.entry_path,
             result_kind=result.resolved_kind,
             preview_source=result.preview_source,

@@ -20,6 +20,7 @@ from PIL import Image, features
 from PySide6.QtGui import QImage
 
 from .browser_model import BrowserItem, BrowserItemKind
+from .ffmpeg_thumbnail_backend import VIDEO_PREVIEW_EXTENSIONS
 from .thumbnail_render import (
     THUMBNAIL_ENCODER_QUALITY,
     ThumbnailEncodingPolicy,
@@ -104,11 +105,10 @@ def _windows_change_time_ns(path: Path) -> int | None:
 def _content_signature(path: Path) -> str | None:
     """Return a worker-side version token for one requested source.
 
-    Windows uses the cheap file identity plus native ChangeTime.  This catches
+    Windows uses the cheap file identity plus native ChangeTime. This catches
     both same-file writes and replacement files without reading a large ZIP or
-    image.  Filesystems without that native version signal fall back to an
-    exact digest scoped to this requested source/cover, never a GUI-thread or
-    whole-library walk.
+    image. Filesystems without that native version signal use file identity
+    and timestamps for video, and an exact digest for other requested files.
     """
     try:
         info = path.stat()
@@ -125,6 +125,16 @@ def _content_signature(path: Path) -> str | None:
         if kind == "dir":
             return ""
         size = int(info.st_size)
+        if path.suffix.casefold() in VIDEO_PREVIEW_EXTENSIONS:
+            # The source metadata is already checked by the cache fingerprint.
+            # Reading a whole video on every lookup can cost more than decoding
+            # the thumbnail and makes each repeated visit feel like a reload.
+            return (
+                f"video-metadata:{int(getattr(info, 'st_dev', 0))}:"
+                f"{int(getattr(info, 'st_ino', 0))}:{size}:"
+                f"{int(info.st_mtime_ns)}:"
+                f"{int(getattr(info, 'st_ctime_ns', 0))}"
+            )
         digest = hashlib.blake2b(digest_size=16)
         digest.update(str(size).encode("ascii"))
         with path.open("rb") as stream:
