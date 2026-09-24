@@ -149,17 +149,20 @@ class BrowserWorkflowController(QObject):
         token = self.window.thumbnail_render_spec.cache_token
         scope = []
         retained_paths = []
+        background_memory_kinds = {
+            BrowserItemKind.IMAGE,
+            BrowserItemKind.FOLDER,
+            BrowserItemKind.ARCHIVE,
+            BrowserItemKind.PDF,
+        }
         try:
             selection_model = self.window.list_view.selectionModel()
         except (AttributeError, RuntimeError):
             selection_model = None
         for row in rows:
             item = model.item_at(row)
-            if (item is None or not item.can_generate_preview
-                    or item.kind not in {BrowserItemKind.IMAGE, BrowserItemKind.FOLDER,
-                                         BrowserItemKind.ARCHIVE, BrowserItemKind.PDF}):
+            if item is None or not item.can_generate_preview:
                 continue
-            scope.append((row, self._memory_identity(item, token)))
             try:
                 selected = bool(
                     selection_model is not None
@@ -169,6 +172,12 @@ class BrowserWorkflowController(QObject):
                 selected = False
             if first <= row <= last or selected:
                 retained_paths.append(item.path)
+            # Keep the existing background-memory policy. OTHER providers such
+            # as FFmpeg are retained only as painted model images; they are not
+            # enrolled into the background refill lane.
+            if item.kind not in background_memory_kinds:
+                continue
+            scope.append((row, self._memory_identity(item, token)))
         new_scope = tuple(scope)
         if new_scope != self._memory_scope:
             self._memory_attempted.intersection_update(identity for _row, identity in new_scope)

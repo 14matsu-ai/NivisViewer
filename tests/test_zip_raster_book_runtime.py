@@ -29,6 +29,7 @@ from app.zip_raster_book_runtime import (
     _CachedSource,
     _SourceKey,
     _UnitKey,
+    _ZipRasterUnitJob,
     _ZipRasterFrameStore,
     _ZipRasterSourceStore,
 )
@@ -1325,13 +1326,12 @@ def test_layout_changes_reuse_book_scoped_decoded_source(
         assert frames[-1].pages[0].pixmap is not None
         assert frames[-1].pages[0].pixmap.size().toTuple() == (360, 540)
         assert frames[-1].pages[0].pixmap.devicePixelRatio() == 1.5
-        # 80x120 from a 120x180 JPEG requires the native 1/1 tier; retaining
-        # the full source avoids an arbitrary decoder resize and still lets the
-        # smaller layout reuse the same source without another decode.
-        assert not frames[-1].pages[0].source_is_preview
+        # The ZIP Qt path now retains the smallest sufficient M/8 tier.  The
+        # preview remains reusable for the later layout without another decode.
+        assert frames[-1].pages[0].source_is_preview
 
-        # An explicit full-resolution demand reuses that already-sufficient
-        # native 1/1 source instead of decoding the same JPEG again.
+        # An explicit full-resolution demand promotes the retained preview to
+        # a full source once; subsequent layouts reuse that source.
         assert runtime.request(
             _request(
                 3,
@@ -1341,9 +1341,9 @@ def test_layout_changes_reuse_book_scoped_decoded_source(
             )
         )
         _wait_until(qapp, lambda: len(frames) == 3)
-        assert source.decode_calls == 1
+        assert source.decode_calls == 2
         assert not frames[-1].pages[0].source_is_preview
-        assert runtime.decoded_source_count == 1
+        assert runtime.decoded_source_count == 2
 
         jobs_before_ready_return = runtime.metrics.jobs_submitted
         assert runtime.request(
@@ -1362,7 +1362,7 @@ def test_layout_changes_reuse_book_scoped_decoded_source(
         assert frames[-1].request_id == 4
         assert frames[-1].cache_hit
         assert frames[-1].pages[0].source_qimage is not None
-        assert not frames[-1].pages[0].source_is_preview
+        assert frames[-1].pages[0].source_is_preview
         assert runtime.metrics.jobs_submitted == jobs_before_ready_return
 
         # The same full source also satisfies a later larger layout.
@@ -1381,11 +1381,11 @@ def test_layout_changes_reuse_book_scoped_decoded_source(
         )
         _wait_until(qapp, lambda: len(frames) == 5)
 
-        assert source.decode_calls == 1
+        assert source.decode_calls == 2
         assert runtime.metrics.jobs_submitted == 4
-        assert runtime.metrics.source_cache_hits == 3
-        assert runtime.metrics.source_cache_misses == 1
-        assert runtime.decoded_source_count == 1
+        assert runtime.metrics.source_cache_hits == 2
+        assert runtime.metrics.source_cache_misses == 2
+        assert runtime.decoded_source_count == 2
         assert frames[-1].request_id == 5
         assert frames[-1].pages[0].source_qimage is not None
 
@@ -1643,7 +1643,7 @@ def test_memory_budget_prioritizes_a_display_ready_runway_over_sources(
         units = tuple(
             ZipRasterDisplayUnit(
                 index,
-                (ZipRasterPage(index, f"{index}.png", (120, 180)),),
+                (ZipRasterPage(index, f"{index}.png", (120, 180), False),),
                 True,
             )
             for index in range(6)
@@ -1663,7 +1663,9 @@ def test_memory_budget_prioritizes_a_display_ready_runway_over_sources(
         _wait_until(qapp, lambda: len(frames) == 1)
         source_bytes = runtime.decoded_source_bytes
         frame_bytes = runtime._frame_store.byte_size
-        assert source_bytes > frame_bytes * 2
+        # PNG navigation previews are retained at the decoder bound, so the
+        # source and display artifacts are intentionally in the same range.
+        assert source_bytes <= frame_bytes * 2
         assert runtime.cached_unit_count == 1
         # Several display frames plus two decoder-sized sources fit. Keeping
         # a decoded source beside every QPixmap does not. The runtime should
@@ -1681,6 +1683,213 @@ def test_memory_budget_prioritizes_a_display_ready_runway_over_sources(
         assert runtime.decoded_source_count <= 2
         assert runtime.cache_bytes <= runtime.cache_byte_budget
         assert source.opens[:4] == ["2.png", "3.png", "1.png", "4.png"]
+    finally:
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()
+
+
+@pytest.mark.parametrize("suffix", [".png", ".webp"])
+def test_static_png_and_webp_retain_pillow_navigation_preview(
+    tmp_path: Path,
+    qapp: QApplication,
+    suffix: str,
+) -> None:
+    image_path = tmp_path / f"source{suffix}"
+    with Image.new("RGBA", (800, 1200), (40, 90, 150, 220)) as image:
+        image.save(image_path, format="PNG" if suffix == ".png" else "WEBP")
+    archive = tmp_path / f"preview{suffix[1:]}.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.write(image_path, f"page{suffix}")
+
+    class CountingSource(ZipImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.open_image_calls = 0
+            self.open_qimage_calls = 0
+
+        def open_image(self, image_id: str) -> Image.Image:
+            self.open_image_calls += 1
+            return super().open_image(image_id)
+
+        def open_qimage(self, image_id: str) -> QImage | None:
+            self.open_qimage_calls += 1
+            return super().open_qimage(image_id)
+
+    source = CountingSource(archive)
+    runtime = ZipRasterBookRuntime(source, 1)
+    frames: list[ZipRasterFrame] = []
+    runtime.frameReady.connect(frames.append)
+    unit = ZipRasterDisplayUnit(
+        0,
+        (ZipRasterPage(0, f"page{suffix}", (800, 1200)),),
+        True,
+    )
+    try:
+        assert runtime.request(
+            _request(
+                1,
+                unit,
+                unit,
+                spec=ZipRasterRenderSpec(
+                    (400, 600),
+                    decoder_maximum_size=(400, 600),
+                ),
+            )
+        )
+        _wait_until(qapp, lambda: len(frames) == 1)
+        page = frames[-1].pages[0]
+        assert page.error is None
+        assert page.original_size == (800, 1200)
+        assert page.source_is_preview
+        assert page.source_qimage is not None
+        assert page.source_qimage.size().toTuple() == (400, 600)
+        assert source.open_image_calls == 1
+        assert source.open_qimage_calls == 0
+    finally:
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()
+
+
+@pytest.mark.parametrize(
+    ("suffix", "format_name"),
+    [(".webp", "WEBP"), (".png", "PNG")],
+)
+def test_animated_png_and_webp_keep_full_first_frame_without_preview_resize(
+    tmp_path: Path,
+    qapp: QApplication,
+    suffix: str,
+    format_name: str,
+) -> None:
+    image_path = tmp_path / f"animation{suffix}"
+    frames = [
+        Image.new("RGBA", (800, 1200), (220, 40, 60, 255)),
+        Image.new("RGBA", (800, 1200), (40, 180, 80, 255)),
+    ]
+    try:
+        frames[0].save(
+            image_path,
+            format=format_name,
+            save_all=True,
+            append_images=[frames[1]],
+            duration=20,
+            loop=0,
+        )
+    finally:
+        for frame in frames:
+            frame.close()
+    archive = tmp_path / f"animation{suffix[1:]}.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.write(image_path, f"animation{suffix}")
+
+    source = ZipImageSource(archive)
+    runtime = ZipRasterBookRuntime(source, 1)
+    frames_ready: list[ZipRasterFrame] = []
+    runtime.frameReady.connect(frames_ready.append)
+    unit = ZipRasterDisplayUnit(
+        0,
+        (ZipRasterPage(0, f"animation{suffix}", (800, 1200)),),
+        True,
+    )
+    try:
+        assert runtime.request(
+            _request(
+                1,
+                unit,
+                unit,
+                spec=ZipRasterRenderSpec(
+                    (400, 600),
+                    decoder_maximum_size=(400, 600),
+                ),
+            )
+        )
+        _wait_until(qapp, lambda: len(frames_ready) == 1)
+        page = frames_ready[-1].pages[0]
+        assert page.error is None
+        assert page.original_size == (800, 1200)
+        assert not page.source_is_preview
+        assert page.source_qimage is not None
+        assert page.source_qimage.size().toTuple() == (800, 1200)
+    finally:
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()
+
+
+@pytest.mark.parametrize("suffix", [".png", ".webp"])
+def test_prefetch_cost_hint_is_full_until_png_webp_animation_is_known(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    archive = tmp_path / f"cost{suffix[1:]}.zip"
+    image_path = tmp_path / f"page{suffix}"
+    first = Image.new("RGBA", (800, 1200), (40, 90, 150, 255))
+    second = Image.new("RGBA", (800, 1200), (150, 40, 90, 255))
+    try:
+        first.save(
+            image_path,
+            format="PNG" if suffix == ".png" else "WEBP",
+            save_all=True,
+            append_images=[second],
+            duration=20,
+            loop=0,
+        )
+    finally:
+        first.close()
+        second.close()
+    with zipfile.ZipFile(archive, "w") as output:
+        output.write(image_path, image_path.name)
+
+    source = ZipImageSource(archive)
+    runtime = ZipRasterBookRuntime(source, 1)
+    spec = ZipRasterRenderSpec(
+        (400, 600),
+        decoder_maximum_size=(400, 600),
+    )
+    static_unit = ZipRasterDisplayUnit(
+        0,
+        (ZipRasterPage(0, image_path.name, (800, 1200), False),),
+        True,
+    )
+    animated_unit = ZipRasterDisplayUnit(
+        0,
+        (ZipRasterPage(0, image_path.name, (800, 1200), True),),
+        True,
+    )
+    unknown_animation_unit = ZipRasterDisplayUnit(
+        0,
+        (ZipRasterPage(0, image_path.name, (800, 1200)),),
+        True,
+    )
+    try:
+        static_hint = runtime._prefetch_retained_cost_hint(static_unit, spec)
+        animated_hint = runtime._prefetch_retained_cost_hint(animated_unit, spec)
+        unknown_hint = runtime._prefetch_retained_cost_hint(
+            unknown_animation_unit,
+            spec,
+        )
+        assert static_hint == 400 * 600 * 4 + 400 * 600 * 4
+        assert animated_hint == 800 * 1200 * 4 + 400 * 600 * 4
+        assert unknown_hint == animated_hint
+        assert animated_hint > static_hint
+
+        key = _UnitKey(
+            1,
+            id(source),
+            unknown_animation_unit.identity,
+            True,
+            spec,
+        )
+        job = _ZipRasterUnitJob(
+            serial=1,
+            key=key,
+            request_id=1,
+            source=source,
+            unit=unknown_animation_unit,
+            prefetch_budget_bytes=animated_hint - 1,
+            prefetch_hard_limit_bytes=animated_hint,
+        )
+        assert not job._admit_unknown_prefetch_unit()
+        assert job.admission_declined
+        assert job.confirmed_required_bytes == animated_hint
     finally:
         assert runtime.shutdown(wait_msecs=3000)
         source.close()

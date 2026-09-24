@@ -52,6 +52,7 @@ _PILLOW_FORMAT_BY_SUFFIX = {
     ".tiff": "TIFF",
     ".ico": "ICO",
 }
+_ANIMATION_PROBE_BYTES = 1024 * 1024
 
 
 def _pillow_formats_for_image(image_id: str, data: bytes) -> tuple[str, ...] | None:
@@ -148,11 +149,44 @@ def jpeg_native_reduction_size(
     return logical_width, logical_height
 
 
-def _read_image_file_bytes(path: str | Path) -> bytes:
+def qt_jpeg_compatible_request_size(
+    logical_size: tuple[int, int],
+    maximum_size: JpegMaximumSize,
+) -> tuple[int, int]:
+    """Choose the smallest sufficient Qt/libjpeg M/8 request raster.
+
+    The ZIP backend uses QImageReader/libjpeg rather than Pillow's
+    ``Image.draft`` path.  Keep its request and its cache estimate on the same
+    floor-based 1/8..8/8 tier so a request never silently becomes undersized
+    or reserves a different raster than the decoder returns.
+    """
+
+    logical_width = max(1, int(logical_size[0]))
+    logical_height = max(1, int(logical_size[1]))
+    target_width, target_height = jpeg_decode_target_size(
+        (logical_width, logical_height),
+        maximum_size,
+    )
+    for numerator in range(1, 9):
+        reduced = (
+            max(1, logical_width * numerator // 8),
+            max(1, logical_height * numerator // 8),
+        )
+        if reduced[0] >= target_width and reduced[1] >= target_height:
+            return reduced
+    return logical_width, logical_height
+
+
+def _read_image_file_bytes(
+    path: str | Path,
+    *,
+    maximum_bytes: int | None = None,
+) -> bytes:
     """Read a local image without preventing rename/delete on Windows."""
     target = Path(path)
     if os.name != "nt":
-        return target.read_bytes()
+        with target.open("rb") as file:
+            return file.read() if maximum_bytes is None else file.read(maximum_bytes)
 
     import ctypes
     import msvcrt
@@ -189,7 +223,51 @@ def _read_image_file_bytes(path: str | Path) -> bytes:
         ctypes.windll.kernel32.CloseHandle(handle)
         raise
     with os.fdopen(file_descriptor, "rb") as file:
-        return file.read()
+        return file.read() if maximum_bytes is None else file.read(maximum_bytes)
+
+
+def _probe_animation_from_header(
+    data: bytes,
+    suffix: str,
+) -> bool | None:
+    """Detect PNG/WebP animation without decoding or reading the payload."""
+
+    if suffix == ".png":
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return None
+        offset = 8
+        while offset + 12 <= len(data):
+            length = int.from_bytes(data[offset:offset + 4], "big")
+            chunk = data[offset + 4:offset + 8]
+            if chunk == b"acTL":
+                return True
+            if chunk == b"IDAT" or chunk == b"IEND":
+                return False
+            next_offset = offset + 12 + length
+            if next_offset > len(data):
+                return None
+            offset = next_offset
+        return None
+    if suffix != ".webp" or len(data) < 12:
+        return None
+    if data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return None
+    offset = 12
+    while offset + 8 <= len(data):
+        chunk = data[offset:offset + 4]
+        length = int.from_bytes(data[offset + 4:offset + 8], "little")
+        payload = offset + 8
+        if chunk == b"VP8X":
+            if payload >= len(data):
+                return None
+            return bool(data[payload] & 0x02)
+        if chunk in {b"VP8 ", b"VP8L", b"ANIM", b"ANMF"}:
+            return False
+        next_offset = payload + length + (length & 1)
+        if next_offset > len(data):
+            return None
+        offset = next_offset
+    return None
 
 
 def _read_webp_qimage(data: bytes) -> QImage | None:
@@ -388,7 +466,10 @@ def _read_jpeg_qbytearray_at_most(
         # for the final physical frame.  The Viewer then owns one deliberate
         # exact resample with the configured algorithm; an arbitrary decoder
         # resize here would create a hidden first quality pass.
-        logical_target = jpeg_native_reduction_size(logical_size, maximum_size)
+        logical_target = qt_jpeg_compatible_request_size(
+            logical_size,
+            maximum_size,
+        )
         raw_target = (
             (logical_target[1], logical_target[0])
             if swaps_axes
@@ -605,6 +686,17 @@ class ImageSource(ABC):
 
         return self.logical_size(image_id)
 
+    def probe_image_is_animated(self, image_id: str) -> bool | None:
+        """Return animation state when the source can inspect its header cheaply.
+
+        ``None`` means that the source cannot establish a safe answer without
+        decoding.  Callers must treat that value as animated for retained
+        memory estimates.
+        """
+
+        del image_id
+        return None
+
     def fork_for_thumbnail(self) -> ImageSource:
         """Return a source session suitable for PageList thumbnail work.
 
@@ -649,6 +741,7 @@ class FolderImageSource(ImageSource):
         self._listed_images: tuple[str, ...] | None = self._image_snapshot
         self._metadata_lock = threading.Lock()
         self._size_cache: dict[str, tuple[int, int]] = {}
+        self._animation_cache: dict[str, bool | None] = {}
         self._file_size_cache = {
             self._path_identity(image_id): max(0, int(file_size))
             for image_id, file_size in (file_size_snapshot or ())
@@ -748,9 +841,16 @@ class FolderImageSource(ImageSource):
                 formats=_pillow_formats_for_image(image_id, data),
             ) as image:
                 image.seek(0)
+                source_is_animated = bool(
+                    getattr(image, "is_animated", False)
+                    or int(getattr(image, "n_frames", 1)) != 1
+                )
                 result = ImageOps.exif_transpose(image)
                 result.load()
+                setattr(result, "_nivis_source_is_animated", source_is_animated)
                 self._remember_folder_metadata(image_id, size=result.size)
+                with self._metadata_lock:
+                    self._animation_cache[image_id] = source_is_animated
                 return result
         except ImageSourceError:
             raise
@@ -839,6 +939,25 @@ class FolderImageSource(ImageSource):
         except Exception:
             return None
 
+    def probe_image_is_animated(self, image_id: str) -> bool | None:
+        with self._metadata_lock:
+            if image_id in self._animation_cache:
+                return self._animation_cache[image_id]
+        try:
+            suffix = Path(image_id).suffix.casefold()
+            data = _read_image_file_bytes(
+                image_id,
+                maximum_bytes=_ANIMATION_PROBE_BYTES,
+            )
+            result = _probe_animation_from_header(data, suffix)
+            if result is None:
+                return None
+            with self._metadata_lock:
+                self._animation_cache[image_id] = result
+            return result
+        except Exception:
+            return None
+
     def probe_image_size(self, image_id: str) -> tuple[int, int] | None:
         """Read folder image geometry with Qt's header reader, without pixels.
 
@@ -911,6 +1030,7 @@ class ZipImageSource(ImageSource):
         self._listed_images: tuple[str, ...] | None = None
         self._display_names: dict[str, str] = {}
         self._size_cache: dict[str, tuple[int, int]] = {}
+        self._animation_cache: dict[str, bool | None] = {}
 
     def list_images(self) -> list[str]:
         if self._listed_images is not None:
@@ -938,8 +1058,15 @@ class ZipImageSource(ImageSource):
             self._raise_if_cancelled(cancelled)
             with Image.open(stream) as image:
                 image.seek(0)
+                source_is_animated = bool(
+                    getattr(image, "is_animated", False)
+                    or int(getattr(image, "n_frames", 1)) != 1
+                )
                 result = ImageOps.exif_transpose(image)
                 result.load()
+                setattr(result, "_nivis_source_is_animated", source_is_animated)
+            with self._lock:
+                self._animation_cache[image_id] = source_is_animated
             if cancelled.is_set():
                 result.close()
                 self._raise_if_cancelled(cancelled)
@@ -1155,7 +1282,7 @@ class ZipImageSource(ImageSource):
         logical_size: tuple[int, int],
         maximum_size: JpegMaximumSize,
     ) -> tuple[int, int]:
-        return jpeg_native_reduction_size(logical_size, maximum_size)
+        return qt_jpeg_compatible_request_size(logical_size, maximum_size)
 
     def probe_image_size(self, image_id: str) -> tuple[int, int] | None:
         """Probe one ZIP image header without allocating its pixel raster."""
@@ -1218,6 +1345,49 @@ class ZipImageSource(ImageSource):
                         return logical_size
                     finally:
                         device.close()
+        except ImageSourceError:
+            raise
+        except Exception:
+            return None
+        finally:
+            self._finish_request(image_id, cancelled)
+
+    def probe_image_is_animated(self, image_id: str) -> bool | None:
+        """Inspect one ZIP image header without allocating pixel storage."""
+
+        if Path(image_id).suffix.casefold() not in {".png", ".webp"}:
+            return None
+        with self._lock:
+            if image_id in self._animation_cache:
+                return self._animation_cache[image_id]
+        cancelled = self._begin_request(image_id)
+        try:
+            self._raise_if_cancelled(cancelled)
+            with self._lock:
+                try:
+                    info = self._zip.getinfo(image_id)
+                except KeyError as exc:
+                    raise ImageSourceError(
+                        tr('書庫内の画像が見つかりません: {p0}', p0=image_id),
+                        code=ArchiveErrorCode.ENTRY_NOT_FOUND.value,
+                    ) from exc
+                if info.file_size > MAX_IMAGE_ENTRY_BYTES:
+                    raise ImageSourceError(
+                        tr('書庫内の画像が大きすぎます。'),
+                        code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
+                    )
+                with self._zip.open(info, "r") as entry:
+                    data = entry.read(_ANIMATION_PROBE_BYTES)
+            self._raise_if_cancelled(cancelled)
+            result = _probe_animation_from_header(
+                data,
+                Path(image_id).suffix.casefold(),
+            )
+            if result is None:
+                return None
+            with self._lock:
+                self._animation_cache[image_id] = result
+            return result
         except ImageSourceError:
             raise
         except Exception:

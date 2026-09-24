@@ -164,14 +164,14 @@ def pillow_resampling_for_policy(
                 target_size[0] / max(1, source_size[0]),
                 target_size[1] / max(1, source_size[1]),
             )
-            # BOX is a native area-style reduction and avoids spending a wide
-            # Lanczos kernel on a source that is reduced by at least half.
-            # Moderate reductions keep more edge detail with Lanczos.
-            return (
-                Image.Resampling.BOX
-                if scale <= 0.5
-                else Image.Resampling.LANCZOS
-            )
+            # Keep area-style reduction for strong shrinkage, use the cheaper
+            # cubic kernel in the narrow middle band, and reserve Lanczos for
+            # light reductions where its wider kernel is useful.
+            if scale <= 0.5:
+                return Image.Resampling.BOX
+            if scale <= 0.625:
+                return Image.Resampling.BICUBIC
+            return Image.Resampling.LANCZOS
         return _DOWNSCALE_PILLOW_FILTERS[policy.downscale_algorithm]
     if policy.upscale_algorithm == "auto":
         return Image.Resampling.BICUBIC
@@ -294,6 +294,13 @@ class ViewerRenderTask(QRunnable):
 
 
 def qimage_to_pillow(image: QImage) -> Image.Image:
+    """Convert a QImage to Pillow using an owned pixel snapshot.
+
+    The Viewer may detach or repaint the source QImage after this function
+    returns.  Always materialize Pillow's input bytes so later Qt writes cannot
+    mutate a worker-side render.
+    """
+
     direct_formats = {
         QImage.Format.Format_RGB888: ("RGB", "RGB"),
         QImage.Format.Format_RGBA8888: ("RGBA", "RGBA"),

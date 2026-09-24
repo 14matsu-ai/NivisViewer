@@ -16,7 +16,8 @@ from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import QApplication
 
 from app.browser_model import BrowserItem, BrowserItemKind
-from app.file_preview import PreviewResultKind
+from app.file_preview import PreviewResult, PreviewResultKind, PreviewSource
+from app.preview_provider_registry import PreviewProviderRegistry
 from app.thumbnail_provider import BrowserThumbnailProvider, ThumbnailLoadResult
 from app.browser_thumbnail_scheduler import ThumbnailPriority
 from app.thumbnail_disk_cache import ThumbnailDiskCache, ThumbnailSourceIdentity
@@ -41,6 +42,232 @@ def _wait_for_spy(spy: QSignalSpy, qapp: QApplication, timeout_ms: int = 3000) -
         time.sleep(0.002)
     qapp.processEvents()
     return spy.count() > 0
+
+
+def test_video_prefetch_shell_is_provisional_then_visible_runs_ffmpeg(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    path = tmp_path / "movie.mp4"
+    path.write_bytes(b"video-fixture")
+    item = make_item(path, BrowserItemKind.OTHER)
+    spec = ThumbnailRenderSpec.from_settings(96, "square_1_1", "letterbox")
+
+    class Shell:
+        def request_thumbnail(self, *_args, **_kwargs):
+            image = QImage(32, 32, QImage.Format.Format_RGBA8888)
+            image.fill(0xFF224466)
+            return PreviewResult.ready_image(
+                image,
+                source=PreviewSource.WINDOWS_SHELL,
+                persist_to_disk=False,
+            )
+
+    class FFmpeg:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.policy = None
+
+        def generate(self, _path, _spec, _cancel_token):
+            self.calls += 1
+            image = QImage(32, 32, QImage.Format.Format_RGBA8888)
+            image.fill(0xFF6688AA)
+            return PreviewResult.ready_image(
+                image,
+                source=PreviewSource.FFMPEG,
+                persist_to_disk=True,
+                entry_path="video-test-final",
+            )
+
+    ffmpeg = FFmpeg()
+    registry = PreviewProviderRegistry(
+        settings={
+            "video_thumbnail_enabled": True,
+            "video_thumbnail_backend": "auto",
+            "video_thumbnail_frame_mode": "smart",
+            "video_thumbnail_shell_placeholder": True,
+        },
+        shell_service=Shell(),  # type: ignore[arg-type]
+        ffmpeg_backend=ffmpeg,  # type: ignore[arg-type]
+    )
+    provider = BrowserThumbnailProvider(
+        disk_cache_enabled=False,
+        preview_registry=registry,
+    )
+    provisional = QSignalSpy(provider.thumbnail_provisional)
+    ready = QSignalSpy(provider.thumbnail_ready)
+    generation = provider.begin_generation()
+    try:
+        assert provider.request(
+            item,
+            spec,
+            generation=generation,
+            priority=ThumbnailPriority.PREFETCH,
+        )
+        assert provider.wait_for_done(3000)
+        qapp.processEvents()
+        assert provisional.count() == 1
+        assert ready.count() == 0
+        assert not provider.has_memory_thumbnail(item, spec)
+        assert ffmpeg.calls == 0
+
+        assert provider.request(
+            item,
+            spec,
+            generation=generation,
+            priority=ThumbnailPriority.VISIBLE,
+        )
+        assert provider.wait_for_done(3000)
+        qapp.processEvents()
+        assert ready.count() == 1
+        assert provider.has_memory_thumbnail(item, spec)
+        assert ffmpeg.calls == 1
+    finally:
+        provider.close(wait_msecs=1000)
+        qapp.processEvents()
+
+
+def test_running_video_prefetch_promotes_to_one_visible_ffmpeg_final(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    path = tmp_path / "running-movie.mp4"
+    path.write_bytes(b"video-fixture")
+    item = make_item(path, BrowserItemKind.OTHER)
+    spec = ThumbnailRenderSpec.from_settings(96, "square_1_1", "letterbox")
+    shell_started = Event()
+    release_shell = Event()
+
+    class Shell:
+        def request_thumbnail(self, *_args, **_kwargs):
+            shell_started.set()
+            assert release_shell.wait(3)
+            image = QImage(32, 32, QImage.Format.Format_RGBA8888)
+            image.fill(0xFF224466)
+            return PreviewResult.ready_image(
+                image,
+                source=PreviewSource.WINDOWS_SHELL,
+                persist_to_disk=False,
+            )
+
+    class FFmpeg:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.policy = None
+
+        def generate(self, _path, _spec, _cancel_token):
+            self.calls += 1
+            image = QImage(32, 32, QImage.Format.Format_RGBA8888)
+            image.fill(0xFF6688AA)
+            return PreviewResult.ready_image(
+                image,
+                source=PreviewSource.FFMPEG,
+                persist_to_disk=True,
+            )
+
+    ffmpeg = FFmpeg()
+    registry = PreviewProviderRegistry(
+        settings={
+            "video_thumbnail_enabled": True,
+            "video_thumbnail_backend": "auto",
+            "video_thumbnail_frame_mode": "smart",
+            "video_thumbnail_shell_placeholder": True,
+        },
+        shell_service=Shell(),  # type: ignore[arg-type]
+        ffmpeg_backend=ffmpeg,  # type: ignore[arg-type]
+    )
+    provider = BrowserThumbnailProvider(
+        disk_cache_enabled=False,
+        preview_registry=registry,
+    )
+    provisional = QSignalSpy(provider.thumbnail_provisional)
+    ready = QSignalSpy(provider.thumbnail_ready)
+    generation = provider.begin_generation()
+    try:
+        assert provider.request(
+            item,
+            spec,
+            generation=generation,
+            priority=ThumbnailPriority.PREFETCH,
+        )
+        assert shell_started.wait(2)
+
+        # The visible request arrives while the prefetch worker is already in
+        # the Shell call. It must not create a second worker or claim Shell as
+        # the final RAM result.
+        assert not provider.request(
+            item,
+            spec,
+            generation=generation,
+            priority=ThumbnailPriority.VISIBLE,
+        )
+        release_shell.set()
+        assert provider.wait_for_done(3000)
+        qapp.processEvents()
+        assert provisional.count() == 1
+        assert ready.count() == 0
+        assert ffmpeg.calls == 0
+
+        assert provider.request(
+            item,
+            spec,
+            generation=generation,
+            priority=ThumbnailPriority.VISIBLE,
+        )
+        assert provider.wait_for_done(3000)
+        qapp.processEvents()
+        assert ready.count() == 1
+        assert ffmpeg.calls == 1
+        assert provider.has_memory_thumbnail(item, spec)
+
+        # Repeated retention/request passes use the final RAM entry and do not
+        # regenerate FFmpeg output.
+        assert not provider.request(
+            item,
+            spec,
+            generation=generation,
+            priority=ThumbnailPriority.VISIBLE,
+        )
+        qapp.processEvents()
+        assert ffmpeg.calls == 1
+    finally:
+        release_shell.set()
+        provider.close(wait_msecs=1000)
+        qapp.processEvents()
+
+
+def test_windows_shell_video_mode_keeps_shell_result_final(tmp_path: Path) -> None:
+    path = tmp_path / "shell-only.mp4"
+    path.write_bytes(b"video-fixture")
+    item = make_item(path, BrowserItemKind.OTHER)
+    spec = ThumbnailRenderSpec.from_settings(96, "square_1_1", "letterbox")
+
+    class Shell:
+        def request_thumbnail(self, *_args, **_kwargs):
+            image = QImage(16, 16, QImage.Format.Format_RGBA8888)
+            image.fill(0xFF224466)
+            return PreviewResult.ready_image(
+                image,
+                source=PreviewSource.WINDOWS_SHELL,
+                persist_to_disk=False,
+            )
+
+    registry = PreviewProviderRegistry(
+        settings={
+            "video_thumbnail_enabled": True,
+            "video_thumbnail_backend": "windows_shell",
+            "video_thumbnail_frame_mode": "windows_shell",
+        },
+        shell_service=Shell(),  # type: ignore[arg-type]
+    )
+    result = registry.generate(
+        item,
+        spec,
+        priority=ThumbnailPriority.PREFETCH,
+    )
+    assert result.kind is PreviewResultKind.READY
+    assert result.ready
+    assert result.provisional_image is None
 
 
 def test_generation_change_clears_queued_cache_maintenance_and_allows_retry(
