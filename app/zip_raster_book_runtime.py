@@ -52,10 +52,12 @@ from .raster_warmup_planner import (
 )
 from .thumbnail_render import pil_to_qimage
 from .viewer_render import (
+    ResamplingPolicy,
     ViewerRenderKey,
     normalize_downscale_algorithm,
     normalize_resampling_mode,
     normalize_upscale_algorithm,
+    pillow_resampling_for_policy,
     qimage_to_pillow,
     render_qimage,
     resampling_policy_for_legacy_mode,
@@ -65,6 +67,7 @@ from .viewer_widget import calculate_spread_layout
 
 _DEFAULT_CACHE_BYTES = 256 * 1024 * 1024
 _JPEG_SUFFIXES = frozenset({".jpg", ".jpeg", ".jpe"})
+_PILLOW_PREVIEW_RESIZE_SUFFIXES = frozenset({".png", ".webp"})
 _FIT_PREVIEW_MODES = frozenset(
     {"fit_window", "fit_no_upscale", "fit_width", "fit_height"}
 )
@@ -101,6 +104,7 @@ class ZipRasterPage:
     page_index: int
     image_id: str
     known_size: tuple[int, int] | None = None
+    is_animated: bool | None = None
 
     def __post_init__(self) -> None:
         page_index = int(self.page_index)
@@ -115,9 +119,13 @@ class ZipRasterPage:
                 max(1, int(known_size[0])),
                 max(1, int(known_size[1])),
             )
+        is_animated = self.is_animated
+        if is_animated is not None:
+            is_animated = bool(is_animated)
         object.__setattr__(self, "page_index", page_index)
         object.__setattr__(self, "image_id", image_id)
         object.__setattr__(self, "known_size", known_size)
+        object.__setattr__(self, "is_animated", is_animated)
 
 
 @dataclass(frozen=True)
@@ -289,6 +297,41 @@ def _size_within_bounds(
         scales.append(max(1, int(maximum_size[1])) / height)
     scale = min(scales)
     return max(1, round(width * scale)), max(1, round(height * scale))
+
+
+def _can_prepare_pillow_preview(
+    render_spec: "ZipRasterRenderSpec",
+    unit: "ZipRasterDisplayUnit",
+    page: "ZipRasterPage",
+    decoder_maximum: DecoderMaximumSize | None,
+) -> bool:
+    """Whether one static PNG/WebP can be reduced before QImage conversion."""
+
+    del unit
+    return bool(
+        Path(page.image_id).suffix.casefold()
+        in _PILLOW_PREVIEW_RESIZE_SUFFIXES
+        and decoder_maximum is not None
+        and render_spec.rotation % 360 == 0
+        and not render_spec.split_wide_image
+    )
+
+
+def _retained_source_size_for_page(
+    render_spec: "ZipRasterRenderSpec",
+    unit: "ZipRasterDisplayUnit",
+    page: "ZipRasterPage",
+    logical_size: tuple[int, int],
+    decoder_maximum: DecoderMaximumSize | None,
+) -> tuple[int, int]:
+    if _can_prepare_pillow_preview(
+        render_spec,
+        unit,
+        page,
+        decoder_maximum,
+    ) and page.is_animated is False:
+        return _size_within_bounds(logical_size, decoder_maximum)
+    return logical_size
 
 
 def _qimage_satisfies_source_requirement(
@@ -1971,6 +2014,12 @@ class _ZipRasterUnitJob(QRunnable):
                 (qimage is None or qimage.isNull())
                 and spec.adjustments == (1.0, 1.0, 1.0)
                 and suffix == ".webp"
+                and not _can_prepare_pillow_preview(
+                    spec,
+                    self.unit,
+                    page,
+                    decoder_maximum,
+                )
             ):
                 self.source_decode_started.set()
                 qimage = self.source.open_qimage(page.image_id)
@@ -2023,8 +2072,48 @@ class _ZipRasterUnitJob(QRunnable):
                 adjusted: Image.Image | None = None
                 try:
                     adjusted = self._apply_adjustments(image, spec.adjustments)
-                    qimage = pil_to_qimage(adjusted)
                     original_size = adjusted.size
+                    if (
+                        _can_prepare_pillow_preview(
+                            spec,
+                            self.unit,
+                            page,
+                            decoder_maximum,
+                        )
+                        and not bool(
+                            getattr(
+                                image,
+                                "_nivis_source_is_animated",
+                                False,
+                            )
+                        )
+                        and not bool(
+                            getattr(adjusted, "is_animated", False)
+                        )
+                        and int(getattr(adjusted, "n_frames", 1)) == 1
+                    ):
+                        preview_size = _size_within_bounds(
+                            original_size,
+                            decoder_maximum,
+                        )
+                        if preview_size != adjusted.size:
+                            policy = ResamplingPolicy(
+                                spec.downscale_algorithm,
+                                spec.upscale_algorithm,
+                            )
+                            resampling = pillow_resampling_for_policy(
+                                policy,
+                                adjusted.size,
+                                preview_size,
+                            )
+                            preview = adjusted.resize(
+                                preview_size,
+                                resampling,
+                            )
+                            if adjusted is not image:
+                                adjusted.close()
+                            adjusted = preview
+                    qimage = pil_to_qimage(adjusted)
                 finally:
                     if adjusted is not None and adjusted is not image:
                         adjusted.close()
@@ -2102,6 +2191,24 @@ class _ZipRasterUnitJob(QRunnable):
         for page in self.unit.pages:
             if self.cancelled.is_set():
                 return False
+            is_animated = page.is_animated
+            if (
+                is_animated is None
+                and Path(page.image_id).suffix.casefold()
+                in _PILLOW_PREVIEW_RESIZE_SUFFIXES
+            ):
+                probe_animation = getattr(
+                    self.source,
+                    "probe_image_is_animated",
+                    None,
+                )
+                if callable(probe_animation):
+                    try:
+                        is_animated = probe_animation(page.image_id)
+                    except Exception:
+                        is_animated = None
+            if self.cancelled.is_set():
+                return False
             cached = self.cached_sources.get(page.image_id)
             logical_size = (
                 cached.original_size if cached is not None else page.known_size
@@ -2126,7 +2233,13 @@ class _ZipRasterUnitJob(QRunnable):
                     return self._decline_prefetch_if_still_bounded()
             except (TypeError, ValueError, OverflowError):
                 return self._decline_prefetch_if_still_bounded()
-            resolved_pages.append(replace(page, known_size=logical_size))
+            resolved_pages.append(
+                replace(
+                    page,
+                    known_size=logical_size,
+                    is_animated=is_animated,
+                )
+            )
 
         # Keep identity and slot semantics while giving admission and decode
         # the same resolved dimensions. PageModel remains the layout authority.
@@ -2169,7 +2282,13 @@ class _ZipRasterUnitJob(QRunnable):
                     decoder_maximum,
                 )
             else:
-                source_size = logical_size
+                source_size = _retained_source_size_for_page(
+                    self.key.render_spec,
+                    resolved_unit,
+                    page,
+                    logical_size,
+                    decoder_maximum,
+                )
             source_width, source_height = (
                 max(1, int(source_size[0])),
                 max(1, int(source_size[1])),
@@ -3797,6 +3916,14 @@ class RasterBookRuntime(QObject):
                         (width, height),
                         decoder_size,
                     )
+                else:
+                    width, height = _retained_source_size_for_page(
+                        render_spec,
+                        unit,
+                        page,
+                        (width, height),
+                        decoder_size,
+                    )
                 estimate += width * height * 4
                 continue
             if (
@@ -3898,11 +4025,15 @@ class RasterBookRuntime(QObject):
                         )
                     )
                 else:
-                    # Missing non-JPEG sources decode to their logical raster;
-                    # standard resampling then clamps the display artifact to
-                    # that source instead of charging a fictitious viewport
-                    # upscale that QPixmap will never receive.
-                    source_sizes.append(logical_size)
+                    source_sizes.append(
+                        _retained_source_size_for_page(
+                            render_spec,
+                            unit,
+                            page,
+                            logical_size,
+                            decoder_size,
+                        )
+                    )
             return _display_frame_bytes_for_sizes(
                 unit,
                 render_spec,

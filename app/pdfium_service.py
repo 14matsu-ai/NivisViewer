@@ -92,6 +92,7 @@ class PdfiumService:
         self._active_job: _PendingJob | None = None
         self._closing_documents: set[str] = set()
         self._document_close_errors: dict[str, BaseException] = {}
+        self._open_cleanup_scheduled: set[str] = set()
         self._shutdown_future: Future | None = None
         self.last_shutdown_error: str | None = None
         self._active_calls = 0
@@ -222,7 +223,12 @@ class PdfiumService:
             cancel_token=cancel_token,
             deduplicate=False,
         )
-        return self._wait(future, cancel_token)
+        try:
+            return self._wait(future, cancel_token)
+        except PdfBackendError as exc:
+            if exc.code is PdfErrorCode.CANCELLED:
+                self._schedule_open_cleanup(future)
+            raise
 
     def render_page(
         self,
@@ -414,6 +420,28 @@ class PdfiumService:
                 return self._cancelled_future("PDF document is closing")
             existing = self._pending.get(key) if deduplicate else None
             if existing is not None:
+                # A cancelled consumer must not hand its poisoned Future to a
+                # new live request for the same render key.  Queued jobs are
+                # detached immediately; a running native call remains owned
+                # by this service and the replacement is serialized behind it.
+                if is_cancelled(existing.cancel_token):
+                    # Detach the old consumer from the dedup map even when
+                    # its native call is still running.  The replacement can
+                    # retain the original key, so later live consumers still
+                    # join the replacement rather than creating a retry fan
+                    # out.  Completion of the old job is identity-checked
+                    # below and therefore cannot remove the replacement.
+                    if self._pending.get(key) is existing:
+                        self._pending.pop(key, None)
+                    if not existing.future.done():
+                        existing.future.set_exception(
+                            PdfBackendError(
+                                PdfErrorCode.CANCELLED,
+                                debug_message="PDF consumer detached",
+                            )
+                        )
+                    existing = None
+            if existing is not None:
                 if priority < existing.priority:
                     existing.priority = priority
                     existing.version += 1
@@ -494,22 +522,28 @@ class PdfiumService:
 
     def _finish_result(self, job: _PendingJob, result: object) -> None:
         with self._lock:
-            self._pending.pop(job.key, None)
+            if self._pending.get(job.key) is job:
+                self._pending.pop(job.key, None)
             if job.control == "close_document" and len(job.key) > 1:
                 document_id = str(job.key[1])
                 self._closing_documents.discard(document_id)
+                self._open_cleanup_scheduled.discard(document_id)
                 self._document_close_errors.pop(document_id, None)
             elif job.control == "shutdown_close_all":
                 self._document_close_errors.clear()
         if not job.future.done():
             job.future.set_result(result)
+        if job.key and job.key[0] == "open" and is_cancelled(job.cancel_token):
+            self._schedule_open_cleanup(job.future)
 
     def _finish_error(self, job: _PendingJob, exc: BaseException) -> None:
         with self._lock:
-            self._pending.pop(job.key, None)
+            if self._pending.get(job.key) is job:
+                self._pending.pop(job.key, None)
             if job.control == "close_document" and len(job.key) > 1:
                 document_id = str(job.key[1])
                 self._closing_documents.discard(document_id)
+                self._open_cleanup_scheduled.discard(document_id)
                 self._document_close_errors[document_id] = exc
         if not job.future.done():
             job.future.set_exception(exc)
@@ -550,6 +584,26 @@ class PdfiumService:
         if log and not repeated:
             _PDFIUM_LOG.error(message)
 
+    def _schedule_open_cleanup(self, future: Future) -> None:
+        """Close a document opened for a consumer that detached on cancel."""
+        if not future.done():
+            return
+        try:
+            result = future.result()
+        except BaseException:
+            return
+        document_id = getattr(result, "document_id", None)
+        if document_id is None:
+            return
+        document_id = str(document_id)
+        with self._lock:
+            if self._state is not PdfiumServiceState.RUNNING:
+                return
+            if document_id in self._open_cleanup_scheduled:
+                return
+            self._open_cleanup_scheduled.add(document_id)
+        self.close_document(document_id, wait=False)
+
     @staticmethod
     def _cancelled_future(message: str) -> Future:
         future: Future = Future()
@@ -564,6 +618,11 @@ class PdfiumService:
     @staticmethod
     def _wait(future: Future, cancel_token):
         while not future.done():
+            if is_cancelled(cancel_token):
+                # Detach the caller immediately.  The service still owns the
+                # Future/native document until its worker reaches a safe
+                # cleanup boundary, so this does not leak PDFium handles.
+                raise PdfBackendError(PdfErrorCode.CANCELLED)
             time.sleep(0.01)
         result = future.result()
         if is_cancelled(cancel_token):
