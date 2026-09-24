@@ -577,6 +577,7 @@ class ViewerPresentationState:
             self._closed
             or request is None
             or request.token != token
+            or request.token.request_serial != self._request_serial
         ):
             return False
         normalized_state = ViewerSlotState(state)
@@ -605,6 +606,7 @@ class ViewerPresentationState:
             self._closed
             or request is None
             or request.token != token
+            or request.token.request_serial != self._request_serial
             or token.book != request.token.book
             or token.layout_signature != request.token.layout_signature
             or token.dpr_milli != request.token.dpr_milli
@@ -728,13 +730,19 @@ class ViewerPresentationState:
             force_revision=True,
         )
 
-    def supersede_pending(self) -> None:
-        """Fence a request while retaining the last committed presentation."""
+    def supersede_pending(self, *, preserve_intent: bool = False) -> None:
+        """Fence a request while retaining the last committed presentation.
+
+        A viewport/layout fence can arrive while a wheel destination is still
+        being rendered. Preserve that logical destination until the owner
+        rebuilds the request for the new render specification.
+        """
 
         if self._closed:
             return
         self._request_serial += 1
-        self._requested = None
+        if not preserve_intent:
+            self._requested = None
         self._last_failure = None
         # A viewport/layout fence must not turn an initial in-flight open back
         # into the idle prompt.  With a committed frame, that frame remains

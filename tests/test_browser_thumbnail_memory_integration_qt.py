@@ -162,6 +162,73 @@ def _drain_workflow(app, window, timeout=5.0):
     )
 
 
+def test_visible_video_model_thumbnail_survives_memory_retention_pass(
+    tmp_path, app, controlled_broker,
+):
+    _broker, _snapshot = controlled_broker
+    path = tmp_path / "visible-video.mp4"
+    path.write_bytes(b"video-fixture")
+    stat = path.stat()
+    item = BrowserItem(
+        path.name,
+        path,
+        BrowserItemKind.OTHER,
+        stat.st_mtime,
+        file_size=stat.st_size,
+        modified_time_ns=stat.st_mtime_ns,
+        extension=".mp4",
+        can_generate_preview=True,
+        preview_kind="video",
+    )
+
+    def loader(_item, _size, _cancel_token):
+        image = QImage(24, 24, QImage.Format.Format_RGBA8888)
+        image.fill(0xFF335577)
+        return image
+
+    window = _Window(tmp_path, [item], loader=loader, screens=-1, mode="512")
+    try:
+        window._range = (0, 0)
+        token = window.thumbnail_render_spec.cache_token
+        final = QImage(24, 24, QImage.Format.Format_RGBA8888)
+        final.fill(0xFF335577)
+        assert window.item_model.set_thumbnail_image(
+            item.path,
+            final,
+            request_token=token,
+        )
+
+        window.workflow._set_memory_scope((0,), 0, 0)
+        retained = window.item_model.data(
+            window.item_model.index(0, 0),
+            window.item_model.ThumbnailImageRole,
+        )
+        assert retained is not None and not retained.isNull()
+        assert window.workflow._memory_scope == ()
+
+        provisional = QImage(24, 24, QImage.Format.Format_RGBA8888)
+        provisional.fill(0xFFAA5522)
+        assert not window.item_model.set_thumbnail_image(
+            item.path,
+            provisional,
+            low_resolution=True,
+        )
+        still_final = window.item_model.data(
+            window.item_model.index(0, 0),
+            window.item_model.ThumbnailImageRole,
+        )
+        assert still_final.pixelColor(0, 0).blue() > 0
+
+        window.workflow._set_memory_scope((0,), 1, 1)
+        released = window.item_model.data(
+            window.item_model.index(0, 0),
+            window.item_model.ThumbnailImageRole,
+        )
+        assert released is None
+    finally:
+        window.close_resources(app)
+
+
 def test_scrolls_forward_and_back_over_mixed_kinds_with_finite_ram_window(
     tmp_path, app, controlled_broker,
 ):

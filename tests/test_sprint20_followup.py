@@ -40,6 +40,7 @@ from app.browser_thumbnail_scheduler import ThumbnailPriority
 from app.browser_sort import BrowserSortPolicy
 from app.file_preview import PreviewResult, PreviewSource
 from app.thumbnail_render import ThumbnailRenderSpec
+from app.thumbnail_provider import BrowserThumbnailProvider
 from app.video_thumbnail_policy import (
     VideoMetadata,
     VideoThumbnailFrameMode,
@@ -1130,6 +1131,57 @@ def test_video_registry_returns_shell_placeholder_then_ffmpeg_final(tmp_path) ->
     assert result.source is PreviewSource.FFMPEG
     assert result.provisional_image is not None
     assert result.provisional_image.pixelColor(0, 0).red() > 240
+
+
+def test_video_provider_forwards_shell_placeholder_before_final(tmp_path) -> None:
+    path = tmp_path / "movie.mp4"
+    path.write_bytes(b"video")
+    shell_image = QImage(48, 48, QImage.Format.Format_ARGB32)
+    shell_image.fill(Qt.GlobalColor.red)
+    final_image = QImage(48, 48, QImage.Format.Format_ARGB32)
+    final_image.fill(Qt.GlobalColor.green)
+
+    class Shell:
+        def request_thumbnail(self, *_args, **_kwargs):
+            return PreviewResult.ready_image(
+                shell_image, source=PreviewSource.WINDOWS_SHELL,
+                persist_to_disk=False,
+            )
+
+        def shutdown(self):
+            pass
+
+    class FFmpeg:
+        policy = VideoThumbnailPolicy()
+
+        def generate(self, *_args, **_kwargs):
+            return PreviewResult.ready_image(
+                final_image, source=PreviewSource.FFMPEG,
+                persist_to_disk=True,
+                entry_path=VideoThumbnailPolicy.cache_variant("smart"),
+            )
+
+    from app.browser_model import BrowserItem, BrowserItemKind
+
+    registry = PreviewProviderRegistry(
+        settings={"video_thumbnail_backend": "auto",
+                  "video_thumbnail_shell_placeholder": True},
+        shell_service=Shell(),  # type: ignore[arg-type]
+        ffmpeg_backend=FFmpeg(),  # type: ignore[arg-type]
+    )
+    provider = BrowserThumbnailProvider(
+        preview_registry=registry, disk_cache_enabled=False,
+    )
+    item = BrowserItem(path.name, path, BrowserItemKind.OTHER, None, extension=".mp4")
+    result = provider._load_pipeline(
+        item, ThumbnailRenderSpec.from_settings(128, "square_1_1", "letterbox"),
+        thumbnail_priority=ThumbnailPriority.VISIBLE,
+    )
+    assert result.provisional_image is not None
+    assert result.provisional_image.pixelColor(0, 0).red() > 240
+    assert result.image is not None
+    assert result.image.pixelColor(0, 0).green() > 240
+    provider.close(wait_msecs=1000)
 
 
 def test_external_drop_event_reaches_browser_viewport_and_is_focus_only(

@@ -596,6 +596,15 @@ class BrowserItemModel(QAbstractListModel):
             if request_token is not None
             else None
         )
+        # A Shell/disk placeholder is only a bridge until the authoritative
+        # thumbnail is ready. Never let a late provisional notification
+        # downgrade a final thumbnail already painted for this row.
+        if (
+            low_resolution
+            and key in self._thumbnail_images
+            and key not in self._low_resolution_thumbnails
+        ):
+            return False
         if (
             not low_resolution
             and signature is not None

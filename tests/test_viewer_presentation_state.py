@@ -137,6 +137,23 @@ def test_navigation_feedback_is_a_derived_view_not_committed_progress():
     assert state.navigation_feedback is None
 
 
+def test_viewport_fence_preserves_wheel_intent_but_rejects_old_token():
+    state = ViewerPresentationState()
+    pending = _request(state, 1)
+
+    state.supersede_pending(preserve_intent=True)
+
+    assert state.requested is pending
+    assert state.requested_page == 1
+    assert state.pending_request_serial == pending.token.request_serial + 1
+    assert state.commit_frame(pending.token, 1, (1,)) is None
+    assert state.requested is pending
+
+    replacement = _request(state, 1)
+    assert replacement.token.request_serial == pending.token.request_serial + 2
+    assert state.commit_frame(replacement.token, 2, (1,)) is not None
+
+
 def test_surface_owner_keeps_loading_and_retained_replacement_explicit() -> None:
     state = ViewerPresentationState()
     assert state.surface.mode is PresentationSurfaceMode.EMPTY
