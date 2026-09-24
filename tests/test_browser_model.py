@@ -388,15 +388,15 @@ def test_thumbnail_signature_tracks_ready_spec_and_avoids_duplicate_change(
     assert not model.set_thumbnail_image(item.path, image, request_token=101)
     assert len(changes) == 1
 
-    assert model.set_thumbnail_image(
+    assert not model.set_thumbnail_image(
         item.path,
         image,
         low_resolution=True,
         request_token=101,
     )
-    assert not model._has_compatible_thumbnail(item, 101)
+    assert model._has_compatible_thumbnail(item, 101)
 
-    assert model.set_thumbnail_image(item.path, image, request_token=101)
+    assert not model.set_thumbnail_image(item.path, image, request_token=101)
     assert model._has_compatible_thumbnail(item, 101)
     assert model.set_thumbnail_error(item.path, "failed")
     assert not model._has_compatible_thumbnail(item, 101)

@@ -14,6 +14,8 @@ from app.image_source import (
     ImageSourceError,
     ZipImageSource,
     create_image_source,
+    jpeg_decode_target_size,
+    qt_jpeg_compatible_request_size,
 )
 
 
@@ -300,6 +302,87 @@ def test_zip_jpeg_target_decode_uses_display_bound(
     image, logical_size = decoded
     assert logical_size == (4096, 6500)
     assert (image.width(), image.height()) == (1361, 2160)
+
+
+def test_qt_jpeg_planner_uses_smallest_sufficient_m_over_eight_tier() -> None:
+    assert qt_jpeg_compatible_request_size((2500, 3500), (1429, 2000)) == (
+        1562,
+        2187,
+    )
+    assert qt_jpeg_compatible_request_size((2501, 3501), (1251, 1751)) == (
+        1563,
+        2188,
+    )
+    assert qt_jpeg_compatible_request_size((2501, 3501), (1250, 1750)) == (
+        1250,
+        1750,
+    )
+
+
+@pytest.mark.parametrize("orientation", [1, 5, 6, 7, 8])
+def test_zip_jpeg_qt_output_matches_planner_with_exif_axis_swaps(
+    tmp_path: Path,
+    orientation: int,
+) -> None:
+    path = tmp_path / f"source-{orientation}.jpg"
+    exif = Image.Exif()
+    exif[274] = orientation
+    with Image.new("RGB", (1001, 1501), (80, 120, 160)) as image:
+        image.save(path, "JPEG", quality=85, exif=exif)
+    archive = tmp_path / f"book-{orientation}.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.write(path, "ページ/001.jpg")
+
+    source = ZipImageSource(archive)
+    try:
+        logical = source.probe_jpeg_size("ページ/001.jpg")
+        assert logical is not None
+        maximum = (500, 750)
+        expected = source.estimate_compatible_jpeg_size(logical, maximum)
+        decoded = source.open_compatible_jpeg_at_most(
+            "ページ/001.jpg",
+            maximum,
+        )
+    finally:
+        source.close()
+
+    assert decoded is not None
+    image, logical_size = decoded.qimage, decoded.original_size
+    assert logical_size == logical
+    assert (image.width(), image.height()) == expected
+    target = jpeg_decode_target_size(logical, maximum)
+    assert image.width() >= target[0]
+    assert image.height() >= target[1]
+
+
+def test_zip_animation_probe_uses_bounded_header_read_before_decode(
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "page.png"
+    with Image.new("RGB", (64, 64), (40, 80, 120)) as image:
+        image.save(image_path)
+    archive = tmp_path / "probe.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.write(image_path, "page.png")
+
+    class CountingSource(ZipImageSource):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.full_entry_reads = 0
+
+        def _read_entry_stream(self, image_id, cancelled):
+            self.full_entry_reads += 1
+            return super()._read_entry_stream(image_id, cancelled)
+
+    source = CountingSource(archive)
+    try:
+        assert source.probe_image_is_animated("page.png") is False
+        assert source.full_entry_reads == 0
+        with source.open_image("page.png") as image:
+            assert image.size == (64, 64)
+        assert source.full_entry_reads == 1
+    finally:
+        source.close()
 
 
 def test_zip_streamed_jpeg_decodes_without_full_payload_materialization(

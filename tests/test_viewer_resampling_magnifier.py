@@ -109,6 +109,9 @@ def test_resampling_mode_maps_to_expected_pillow_filter(
     ("policy", "target", "expected"),
     (
         (ResamplingPolicy("auto", "auto"), (80, 80), Image.Resampling.BOX),
+        (ResamplingPolicy("auto", "auto"), (101, 101), Image.Resampling.BICUBIC),
+        (ResamplingPolicy("auto", "auto"), (125, 125), Image.Resampling.BICUBIC),
+        (ResamplingPolicy("auto", "auto"), (130, 130), Image.Resampling.LANCZOS),
         (ResamplingPolicy("sharp", "auto"), (160, 160), Image.Resampling.LANCZOS),
         (ResamplingPolicy("auto", "auto"), (300, 300), Image.Resampling.BICUBIC),
         (ResamplingPolicy("auto", "nearest"), (300, 300), Image.Resampling.NEAREST),
@@ -359,7 +362,10 @@ def test_async_resize_preserves_alpha() -> None:
     [
         (QImage.Format.Format_RGB888, "RGB"),
         (QImage.Format.Format_RGBA8888, "RGBA"),
+        (QImage.Format.Format_RGBX8888, "RGB"),
         (QImage.Format.Format_Grayscale8, "L"),
+        (QImage.Format.Format_RGB32, "RGB"),
+        (QImage.Format.Format_ARGB32, "RGBA"),
     ],
 )
 def test_qimage_to_pillow_preserves_common_raster_mode(
@@ -373,6 +379,28 @@ def test_qimage_to_pillow_preserves_common_raster_mode(
     try:
         assert converted.mode == expected_mode
         assert converted.size == (17, 11)
+    finally:
+        converted.close()
+
+
+@pytest.mark.parametrize(
+    "image_format",
+    [
+        QImage.Format.Format_RGBA8888,
+        QImage.Format.Format_RGBX8888,
+        QImage.Format.Format_Grayscale8,
+    ],
+)
+def test_qimage_to_pillow_snapshot_is_detached_from_qimage_writes(
+    image_format: QImage.Format,
+) -> None:
+    source = QImage(4, 3, image_format)
+    source.fill(Qt.GlobalColor.red)
+    converted = viewer_render_module.qimage_to_pillow(source)
+    try:
+        before = converted.getpixel((0, 0))
+        source.fill(Qt.GlobalColor.blue)
+        assert converted.getpixel((0, 0)) == before
     finally:
         converted.close()
 

@@ -1740,7 +1740,11 @@ class BrowserThumbnailProvider(QObject):
                         self._quiet_results[failure_key] = result.resolved_kind
             return ThumbnailLoadResult(
                 None,
-                provisional_image=provisional,
+                provisional_image=(
+                    provisional
+                    if provisional is not None
+                    else result.provisional_image
+                ),
                 entry_path=result.entry_path,
                 result_kind=result.resolved_kind,
                 preview_source=result.preview_source,

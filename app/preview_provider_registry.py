@@ -242,12 +242,20 @@ class PreviewProviderRegistry:
                 and backend == "windows_shell"
             ):
                 return shell_result
-            if (
-                backend == "windows_shell"
-                or priority is ThumbnailPriority.PREFETCH
-                or shell_result.kind is PreviewResultKind.CANCELLED
-            ):
+            if shell_result.kind is PreviewResultKind.CANCELLED:
                 return shell_result
+            if priority is ThumbnailPriority.PREFETCH:
+                if shell_result.ready:
+                    # Auto/FFmpeg video prefetch may show the Shell frame for
+                    # continuity, but it is not the authoritative thumbnail.
+                    return replace(
+                        shell_result,
+                        kind=PreviewResultKind.PENDING,
+                        image=None,
+                        persist_to_disk=False,
+                        provisional_image=shell_result.image,
+                    )
+                return PreviewResult(PreviewResultKind.UNAVAILABLE)
         if priority is ThumbnailPriority.PREFETCH:
             return PreviewResult(PreviewResultKind.UNAVAILABLE)
         if backend not in {"auto", "ffmpeg"}:
