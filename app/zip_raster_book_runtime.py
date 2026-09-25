@@ -32,6 +32,7 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, 
 from PySide6.QtGui import QImage, QPixmap
 
 from .archive_backend import ArchiveErrorCode
+from .freeze_diagnostics import trace_gui_phase
 from .image_source import ImageSource, ImageSourceError, ZipImageSource
 from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
 from .raster_layout_metadata import (
@@ -3469,6 +3470,30 @@ class RasterBookRuntime(QObject):
             self._shutdown_complete = True
         return completed
 
+    @trace_gui_phase
+    def drain_retired_artifacts(self) -> bool:
+        """Release a bounded GUI slice before finalizing an idle retired owner.
+
+        QPixmaps must stay on the GUI thread. A zero-wait shutdown still
+        destroys the whole cache synchronously, so waiting until first paint
+        alone does not prevent a long stall when replacing a warm book.
+        """
+        if self._accepting_requests or self.has_unfinished_tasks():
+            return False
+        deadline = monotonic() + 0.004
+        for _ in range(8):
+            if self._frame_store.unit_count:
+                key = next(iter(self._frame_store._frames))
+                self._frame_store._remove(key)
+            elif self._source_store.page_count:
+                key = next(iter(self._source_store._sources))
+                self._source_store._remove(key)
+            else:
+                return True
+            if monotonic() >= deadline:
+                break
+        return not (self._frame_store.unit_count or self._source_store.page_count)
+
     def retire(self) -> bool:
         """Stop work without synchronously destroying a large ready cache.
 
@@ -4291,6 +4316,7 @@ class RasterBookRuntime(QObject):
             return False
 
     @Slot(object)
+    @trace_gui_phase
     def _on_job_completed(self, result: _JobResult) -> None:
         owned = next(
             (job for job in self._jobs if job.serial == result.serial), None
