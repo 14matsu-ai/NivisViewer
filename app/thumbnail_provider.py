@@ -60,6 +60,7 @@ class ThumbnailLoadResult:
     page_count: int | None = None
     disk_cache_hit: bool = False
     source_identity: ThumbnailSourceIdentity | None = None
+    cache_in_memory: bool = True
 
     @property
     def resolved_kind(self) -> PreviewResultKind:
@@ -78,6 +79,7 @@ class ThumbnailLoadResult:
             result_kind=result.kind,
             preview_source=result.source,
             persist_to_disk=result.persist_to_disk,
+            cache_in_memory=result.cache_in_memory,
         )
 
 
@@ -1350,6 +1352,15 @@ class BrowserThumbnailProvider(QObject):
             self._failed.clear()
             self._quiet_results.clear()
 
+    def invalidate_windows_shell_previews(
+        self,
+        *,
+        begin_generation: bool = True,
+    ) -> int:
+        """Invalidate Shell-backed preview work without touching disk cache."""
+        self._preview_registry.shell_service.clear_memory_cache()
+        return self.begin_generation() if begin_generation else self._generation
+
     def update_preview_settings(self, settings: dict[str, object]) -> int:
         if self._disk_cache is not None:
             invalidate = getattr(self._disk_cache, "invalidate_pending_writes", None)
@@ -1734,7 +1745,10 @@ class BrowserThumbnailProvider(QObject):
             elif result.resolved_kind not in {
                 PreviewResultKind.CANCELLED,
                 PreviewResultKind.PENDING,
-            }:
+            } and not (
+                normalized_priority is ThumbnailPriority.PREFETCH
+                and result.resolved_kind is PreviewResultKind.UNAVAILABLE
+            ):
                 with self._failure_lock:
                     if cancel_token is None or not cancel_token.is_set():
                         self._quiet_results[failure_key] = result.resolved_kind
@@ -1750,6 +1764,7 @@ class BrowserThumbnailProvider(QObject):
                 preview_source=result.preview_source,
                 persist_to_disk=False,
                 page_count=result.page_count,
+                cache_in_memory=result.cache_in_memory,
             )
 
         self._increment_stat("generated")
@@ -1810,6 +1825,7 @@ class BrowserThumbnailProvider(QObject):
             page_count=result.page_count,
             disk_cache_hit=result.disk_cache_hit,
             source_identity=result.source_identity,
+            cache_in_memory=result.cache_in_memory,
         )
 
     @Slot(str, int, object, object, object)
@@ -2014,7 +2030,7 @@ class BrowserThumbnailProvider(QObject):
         self._cache_entry_priority.pop(cache_key, None)
         self._cache_page_counts.pop(cache_key, None)
         image_bytes = int(cached_image.sizeInBytes())
-        if image_bytes <= self._cache_capacity_bytes:
+        if loaded.cache_in_memory and image_bytes <= self._cache_capacity_bytes:
             self._cache[cache_key] = cached_image
             self._cache_bytes += image_bytes
             self._cache_index_add(cache_key)

@@ -328,6 +328,9 @@ TAB_SETTING_KEYS: dict[str, tuple[str, ...]] = {
         "browser_display_density", "browser_item_spacing_x", "browser_item_spacing_y", "browser_cell_padding",
         "browser_sort_key", "browser_sort_order", "browser_random_seed", "browser_folders_first",
         "browser_location_history_limit", "browser_search_history_limit", "browser_tag_grouped",
+        "browser_show_rating_overlay", "browser_show_tag_overlay",
+        "browser_rating_overlay_opacity", "browser_tag_overlay_opacity",
+        "browser_tag_auto_text_color", "browser_tag_text_luminance_threshold",
         "browser_filename_display", "browser_filename_elide_mode", "browser_filename_font_size",
         "browser_filename_show_extension", "browser_filename_gap", "browser_filename_padding_y",
         "browser_show_hidden_items", "browser_show_unsupported_files", "browser_show_system_items",
@@ -1194,6 +1197,7 @@ class SettingsDialog(QDialog):
         self.browser_filename_gap_spin.setValue(int(defaults["browser_filename_gap"]))
         self.browser_filename_padding_y_spin.setValue(int(defaults["browser_filename_padding_y"]))
         self.browser_tag_grouped_checkbox.setChecked(bool(defaults["browser_tag_grouped"]))
+        self._restore_browser_overlay_defaults()
         self.browser_filename_extension_checkbox.setChecked(bool(defaults["browser_filename_show_extension"]))
         self._select_data(self.browser_filename_elide_combo, defaults["browser_filename_elide_mode"])
         self._select_data(self.browser_filename_font_size_combo, defaults["browser_filename_font_size"])
@@ -2400,6 +2404,59 @@ class SettingsDialog(QDialog):
         )
         self._sync_browser_folder_snapshot_cache_controls()
 
+        overlay_group = QGroupBox(tr('サムネイル上の情報'), tab)
+        overlay_form = QFormLayout(overlay_group)
+        self.browser_show_rating_overlay_checkbox = QCheckBox(
+            tr('レートを表示する'), overlay_group
+        )
+        self.browser_show_rating_overlay_checkbox.toggled.connect(
+            self._sync_browser_overlay_controls
+        )
+        self.browser_show_tag_overlay_checkbox = QCheckBox(
+            tr('タグを表示する'), overlay_group
+        )
+        self.browser_show_tag_overlay_checkbox.toggled.connect(
+            self._sync_browser_overlay_controls
+        )
+        overlay_form.addRow(self.browser_show_rating_overlay_checkbox)
+        overlay_form.addRow(self.browser_show_tag_overlay_checkbox)
+
+        self.browser_rating_overlay_opacity_spin = QSpinBox(overlay_group)
+        self.browser_rating_overlay_opacity_spin.setRange(0, 100)
+        self.browser_rating_overlay_opacity_spin.setSuffix(' %')
+        overlay_form.addRow(
+            tr('レート背景の不透明度:'),
+            self.browser_rating_overlay_opacity_spin,
+        )
+        self.browser_tag_overlay_opacity_spin = QSpinBox(overlay_group)
+        self.browser_tag_overlay_opacity_spin.setRange(0, 100)
+        self.browser_tag_overlay_opacity_spin.setSuffix(' %')
+        overlay_form.addRow(
+            tr('タグ背景の不透明度:'),
+            self.browser_tag_overlay_opacity_spin,
+        )
+        self.browser_tag_auto_text_color_checkbox = QCheckBox(
+            tr('タグ文字色を背景色に合わせて自動調整'), overlay_group
+        )
+        self.browser_tag_auto_text_color_checkbox.toggled.connect(
+            self._sync_browser_overlay_controls
+        )
+        overlay_form.addRow(self.browser_tag_auto_text_color_checkbox)
+        self.browser_tag_text_luminance_threshold_spin = QSpinBox(overlay_group)
+        self.browser_tag_text_luminance_threshold_spin.setRange(0, 255)
+        overlay_form.addRow(
+            tr('文字色の切替しきい値:'),
+            self.browser_tag_text_luminance_threshold_spin,
+        )
+        self.browser_overlay_restore_button = QPushButton(
+            tr('レート・タグ表示を既定に戻す'), overlay_group
+        )
+        self.browser_overlay_restore_button.clicked.connect(
+            self._restore_browser_overlay_defaults
+        )
+        overlay_form.addRow(self.browser_overlay_restore_button)
+        layout.addWidget(overlay_group)
+
         cache_group = QGroupBox(tr('サムネイル'), tab)
         form = QFormLayout(cache_group)
 
@@ -3156,6 +3213,25 @@ class SettingsDialog(QDialog):
         self.browser_tag_grouped_checkbox.setChecked(
             bool(self.config.get("browser_tag_grouped", False))
         )
+        self.browser_show_rating_overlay_checkbox.setChecked(
+            bool(self.config.get("browser_show_rating_overlay", True))
+        )
+        self.browser_show_tag_overlay_checkbox.setChecked(
+            bool(self.config.get("browser_show_tag_overlay", True))
+        )
+        self.browser_rating_overlay_opacity_spin.setValue(
+            int(self.config.get("browser_rating_overlay_opacity", 85))
+        )
+        self.browser_tag_overlay_opacity_spin.setValue(
+            int(self.config.get("browser_tag_overlay_opacity", 100))
+        )
+        self.browser_tag_auto_text_color_checkbox.setChecked(
+            bool(self.config.get("browser_tag_auto_text_color", True))
+        )
+        self.browser_tag_text_luminance_threshold_spin.setValue(
+            int(self.config.get("browser_tag_text_luminance_threshold", 150))
+        )
+        self._sync_browser_overlay_controls()
         self.browser_filename_extension_checkbox.setChecked(
             bool(self.config.get("browser_filename_show_extension", True))
         )
@@ -3468,6 +3544,39 @@ class SettingsDialog(QDialog):
         self.browser_folder_snapshot_cache_max_entries_combo.setEnabled(
             self.browser_folder_snapshot_cache_checkbox.isChecked()
         )
+
+    def _sync_browser_overlay_controls(self, *_args: object) -> None:
+        rating_visible = self.browser_show_rating_overlay_checkbox.isChecked()
+        tags_visible = self.browser_show_tag_overlay_checkbox.isChecked()
+        self.browser_rating_overlay_opacity_spin.setEnabled(rating_visible)
+        self.browser_tag_overlay_opacity_spin.setEnabled(tags_visible)
+        self.browser_tag_auto_text_color_checkbox.setEnabled(tags_visible)
+        self.browser_tag_text_luminance_threshold_spin.setEnabled(
+            tags_visible
+            and self.browser_tag_auto_text_color_checkbox.isChecked()
+        )
+
+    def _restore_browser_overlay_defaults(self) -> None:
+        defaults = ConfigManager.DEFAULTS
+        self.browser_show_rating_overlay_checkbox.setChecked(
+            bool(defaults["browser_show_rating_overlay"])
+        )
+        self.browser_show_tag_overlay_checkbox.setChecked(
+            bool(defaults["browser_show_tag_overlay"])
+        )
+        self.browser_rating_overlay_opacity_spin.setValue(
+            int(defaults["browser_rating_overlay_opacity"])
+        )
+        self.browser_tag_overlay_opacity_spin.setValue(
+            int(defaults["browser_tag_overlay_opacity"])
+        )
+        self.browser_tag_auto_text_color_checkbox.setChecked(
+            bool(defaults["browser_tag_auto_text_color"])
+        )
+        self.browser_tag_text_luminance_threshold_spin.setValue(
+            int(defaults["browser_tag_text_luminance_threshold"])
+        )
+        self._sync_browser_overlay_controls()
 
     def _sync_delete_confirmation_controls(
         self,
@@ -3820,6 +3929,12 @@ class SettingsDialog(QDialog):
                 self.browser_preserve_search_for_viewer_roundtrip_checkbox.isChecked()
             ),
             "browser_tag_grouped": self.browser_tag_grouped_checkbox.isChecked(),
+            "browser_show_rating_overlay": self.browser_show_rating_overlay_checkbox.isChecked(),
+            "browser_show_tag_overlay": self.browser_show_tag_overlay_checkbox.isChecked(),
+            "browser_rating_overlay_opacity": self.browser_rating_overlay_opacity_spin.value(),
+            "browser_tag_overlay_opacity": self.browser_tag_overlay_opacity_spin.value(),
+            "browser_tag_auto_text_color": self.browser_tag_auto_text_color_checkbox.isChecked(),
+            "browser_tag_text_luminance_threshold": self.browser_tag_text_luminance_threshold_spin.value(),
             "browser_item_spacing_x": self.browser_item_spacing_x_spin.value(),
             "browser_item_spacing_y": self.browser_item_spacing_y_spin.value(),
             "browser_cell_padding": self.browser_cell_padding_spin.value(),

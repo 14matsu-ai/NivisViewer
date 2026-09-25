@@ -83,7 +83,13 @@ class FakeFileOperationCoordinator(QObject):
 
 
 class NoopThumbnailProvider(BrowserThumbnailProvider):
+    def __init__(self) -> None:
+        super().__init__(disk_cache_enabled=False)
+        self.requests: list[str] = []
+
     def request(self, *_args, **_kwargs) -> bool:
+        if _args:
+            self.requests.append(str(_args[0].path))
         return False
 
 
@@ -385,6 +391,52 @@ def test_unchanged_watch_retries_failed_thumbnail_without_model_reset(
     finally:
         window.close()
         qapp.processEvents()
+
+
+def test_same_listing_filesystem_watch_keeps_video_shell_thumbnail(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "folder"
+    video = folder / "movie.mp4"
+    write_item(video)
+    provider = NoopThumbnailProvider()
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.set("last_browser_path", str(folder))
+    watcher = FakeDirectoryWatcher()
+    window = BrowserWindow(
+        config_manager=config,
+        directory_watcher=watcher,  # type: ignore[arg-type]
+        thumbnail_provider=provider,
+    )
+    window.show()
+    assert window.wait_for_scan()
+    qapp.processEvents()
+    item = window.item_model.item_at(0)
+    assert item is not None and item.preview_kind == "video"
+    image = QImage(32, 32, QImage.Format.Format_RGBA8888)
+    image.fill(0xFF224466)
+    assert window.item_model.set_thumbnail_image(
+        video,
+        image,
+        request_token=window.thumbnail_render_spec.cache_token,
+    )
+    provider.requests.clear()
+
+    watcher.notify()
+    window._flush_directory_changes()
+    assert window.wait_for_scan()
+    qapp.processEvents()
+
+    stored = window.item_model.data(
+        window.item_model.index(0, 0),
+        window.item_model.ThumbnailImageRole,
+    )
+    assert stored is not None and not stored.isNull()
+    assert provider.requests == []
+    window.close()
+    qapp.processEvents()
 
 
 def test_burst_is_coalesced_and_idle_does_not_start_scans(

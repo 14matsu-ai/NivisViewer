@@ -24,6 +24,8 @@ SIIGBF_MEMORYONLY = 0x00000002
 SIIGBF_ICONONLY = 0x00000004
 SIIGBF_THUMBNAILONLY = 0x00000008
 SIIGBF_INCACHEONLY = 0x00000010
+ASSOCSTR_EXECUTABLE = 2
+ASSOCSTR_PROGID = 20
 
 
 class _GUID(ctypes.Structure):
@@ -97,6 +99,64 @@ class WindowsShellImageAdapter:
         if sys.platform != "win32":
             return None
         return _get_shell_item_image(Path(path), width, height, flags)
+
+
+def _assoc_query_string(extension: str, query: int) -> str:
+    """Read one association field using the Windows Shell association API."""
+
+    if sys.platform != "win32" or not extension:
+        return ""
+    try:
+        function = ctypes.windll.shlwapi.AssocQueryStringW
+        function.restype = ctypes.c_long
+        function.argtypes = [
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        length = wintypes.DWORD(0)
+        result = int(
+            function(
+                0,
+                int(query),
+                extension,
+                None,
+                None,
+                ctypes.byref(length),
+            )
+        )
+        if result < 0 or length.value <= 1:
+            return ""
+        buffer = ctypes.create_unicode_buffer(length.value)
+        result = int(
+            function(
+                0,
+                int(query),
+                extension,
+                None,
+                buffer,
+                ctypes.byref(length),
+            )
+        )
+        return "" if result < 0 else buffer.value.strip().casefold()
+    except (AttributeError, OSError, ValueError):
+        return ""
+
+
+def _windows_association_fingerprint(
+    path: str | Path,
+) -> tuple[str, str, str]:
+    extension = Path(path).suffix.casefold()
+    if not extension:
+        return "", "", ""
+    return (
+        extension,
+        _assoc_query_string(extension, ASSOCSTR_PROGID),
+        _assoc_query_string(extension, ASSOCSTR_EXECUTABLE),
+    )
 
 
 @dataclass
@@ -173,12 +233,14 @@ class WindowsShellPreviewService:
         flags = SIIGBF_THUMBNAILONLY | SIIGBF_BIGGER_SIZE_OK
         if cache_only:
             flags |= SIIGBF_INCACHEONLY
+        association = _windows_association_fingerprint(target)
         key = (
             str(target).casefold(),
             source_size,
             source_mtime_ns,
             int(spec.frame_width),
             int(spec.frame_height),
+            association,
         )
         with self._lock:
             if self._closed:

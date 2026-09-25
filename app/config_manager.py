@@ -179,6 +179,12 @@ class ConfigManager(QObject):
         "browser_search_history": [],
         "browser_tag_registry": [],
         "browser_tag_grouped": False,
+        "browser_show_rating_overlay": True,
+        "browser_show_tag_overlay": True,
+        "browser_rating_overlay_opacity": 85,
+        "browser_tag_overlay_opacity": 100,
+        "browser_tag_auto_text_color": True,
+        "browser_tag_text_luminance_threshold": 150,
         "browser_preserve_search_for_viewer_roundtrip": True,
         "browser_display_density": "standard",
         "browser_item_spacing_x": 0,
@@ -546,6 +552,9 @@ class ConfigManager(QObject):
             "browser_show_hidden_items",
             "browser_filename_show_extension",
             "browser_tag_grouped",
+            "browser_show_rating_overlay",
+            "browser_show_tag_overlay",
+            "browser_tag_auto_text_color",
             "browser_show_unsupported_files",
             "browser_show_system_items",
             "browser_folder_snapshot_cache_enabled",
@@ -557,6 +566,24 @@ class ConfigManager(QObject):
         ):
             if not isinstance(normalized.get(key), bool):
                 normalized[key] = cls.DEFAULTS[key]
+        normalized["browser_rating_overlay_opacity"] = cls._clamped_int(
+            normalized.get("browser_rating_overlay_opacity"),
+            default=85,
+            minimum=0,
+            maximum=100,
+        )
+        normalized["browser_tag_overlay_opacity"] = cls._clamped_int(
+            normalized.get("browser_tag_overlay_opacity"),
+            default=100,
+            minimum=0,
+            maximum=100,
+        )
+        normalized["browser_tag_text_luminance_threshold"] = cls._clamped_int(
+            normalized.get("browser_tag_text_luminance_threshold"),
+            default=150,
+            minimum=0,
+            maximum=255,
+        )
         normalized[
             "browser_folder_snapshot_cache_max_entries"
         ] = normalize_browser_folder_snapshot_cache_max_entries(

@@ -70,6 +70,9 @@ BROWSER_PLACEHOLDER_ICON_MAX_RATIO = 0.50
 BROWSER_DISPLAY_SURFACE_CACHE_MAX_ITEMS = 96
 BROWSER_DISPLAY_SURFACE_CACHE_MAX_BYTES = 32 * 1024 * 1024
 BROWSER_BADGE_INSET_CACHE_MAX_ITEMS = 192
+BROWSER_RATING_OVERLAY_DEFAULT_OPACITY = 85
+BROWSER_TAG_OVERLAY_DEFAULT_OPACITY = 100
+BROWSER_TAG_TEXT_LUMINANCE_THRESHOLD_DEFAULT = 150
 
 
 @dataclass(frozen=True)
@@ -519,6 +522,12 @@ class BrowserItemDelegate(QStyledItemDelegate):
         shell_icon_provider: ShellAssociatedIconProvider | None = None,
         badge_icon_left_margin: int = -1,
         badge_icon_bottom_margin: int = -1,
+        show_rating_overlay: bool = True,
+        show_tag_overlay: bool = True,
+        rating_overlay_opacity: int = BROWSER_RATING_OVERLAY_DEFAULT_OPACITY,
+        tag_overlay_opacity: int = BROWSER_TAG_OVERLAY_DEFAULT_OPACITY,
+        tag_auto_text_color: bool = True,
+        tag_text_luminance_threshold: int = BROWSER_TAG_TEXT_LUMINANCE_THRESHOLD_DEFAULT,
     ) -> None:
         super().__init__(parent)
         self.thumbnail_size = int(thumbnail_size)
@@ -575,6 +584,14 @@ class BrowserItemDelegate(QStyledItemDelegate):
         self._display_surface_cache = BrowserDisplaySurfaceCache()
         self.badge_icon_left_margin = normalize_browser_icon_margin(badge_icon_left_margin)
         self.badge_icon_bottom_margin = normalize_browser_icon_margin(badge_icon_bottom_margin)
+        self.show_rating_overlay = bool(show_rating_overlay)
+        self.show_tag_overlay = bool(show_tag_overlay)
+        self.rating_overlay_opacity = max(0, min(100, int(rating_overlay_opacity)))
+        self.tag_overlay_opacity = max(0, min(100, int(tag_overlay_opacity)))
+        self.tag_auto_text_color = bool(tag_auto_text_color)
+        self.tag_text_luminance_threshold = max(
+            0, min(255, int(tag_text_luminance_threshold))
+        )
         self._badge_inset_cache: OrderedDict[
             tuple[str, int, int], tuple[int, int]
         ] = OrderedDict()
@@ -659,6 +676,12 @@ class BrowserItemDelegate(QStyledItemDelegate):
         badge_file_icon_custom_percent: int | None = None,
         badge_icon_left_margin: int | None = None,
         badge_icon_bottom_margin: int | None = None,
+        show_rating_overlay: bool | None = None,
+        show_tag_overlay: bool | None = None,
+        rating_overlay_opacity: int | None = None,
+        tag_overlay_opacity: int | None = None,
+        tag_auto_text_color: bool | None = None,
+        tag_text_luminance_threshold: int | None = None,
     ) -> None:
         previous_surface_geometry = (
             self.thumbnail_size,
@@ -673,6 +696,20 @@ class BrowserItemDelegate(QStyledItemDelegate):
             self.badge_icon_left_margin = normalize_browser_icon_margin(badge_icon_left_margin)
         if badge_icon_bottom_margin is not None:
             self.badge_icon_bottom_margin = normalize_browser_icon_margin(badge_icon_bottom_margin)
+        if show_rating_overlay is not None:
+            self.show_rating_overlay = bool(show_rating_overlay)
+        if show_tag_overlay is not None:
+            self.show_tag_overlay = bool(show_tag_overlay)
+        if rating_overlay_opacity is not None:
+            self.rating_overlay_opacity = max(0, min(100, int(rating_overlay_opacity)))
+        if tag_overlay_opacity is not None:
+            self.tag_overlay_opacity = max(0, min(100, int(tag_overlay_opacity)))
+        if tag_auto_text_color is not None:
+            self.tag_auto_text_color = bool(tag_auto_text_color)
+        if tag_text_luminance_threshold is not None:
+            self.tag_text_luminance_threshold = max(
+                0, min(255, int(tag_text_luminance_threshold))
+            )
         if thumbnail_display_mode is not None:
             self.thumbnail_display_mode = (
                 thumbnail_display_mode
@@ -847,8 +884,10 @@ class BrowserItemDelegate(QStyledItemDelegate):
             self._paint_type_icon(painter, thumbnail_rect, item)
             if thumbnail_error:
                 self._paint_error_badge(painter, thumbnail_rect)
-            self._paint_rating(painter, option, index)
-            self._paint_tags(painter, option, thumbnail_rect, item)
+            if self.show_rating_overlay and self.rating_overlay_opacity > 0:
+                self._paint_rating(painter, option, index)
+            if self.show_tag_overlay and self.tag_overlay_opacity > 0:
+                self._paint_tags(painter, option, thumbnail_rect, item)
             self._paint_title(
                 painter,
                 option,
@@ -1145,6 +1184,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
         return rect
 
     def _paint_tags(self, painter, option, rect, item) -> None:
+        if not self.show_tag_overlay or self.tag_overlay_opacity <= 0:
+            return
         from .browser_tags import filename_tags
         registered = {tag['name']: tag for tag in self.tag_registry}
         # ZipPlaFork CatalogForm.drawTags (07955f5, AGPL-3.0-or-later):
@@ -1192,10 +1233,24 @@ class BrowserItemDelegate(QStyledItemDelegate):
                 label = metrics.elidedText(tag['name'], Qt.TextElideMode.ElideRight, available - 6)
                 width = min(available, metrics.horizontalAdvance(label) + 6)
                 box = QRect(x - width, y, width, height)
-                color = QColor(tag['color'])
+                opaque = QColor(tag['color'])
+                color = QColor(opaque)
+                color.setAlpha(round(255 * self.tag_overlay_opacity / 100))
                 painter.fillRect(box, color)
-                luminance = color.red() * .299 + color.green() * .587 + color.blue() * .114
-                painter.setPen(QColor('black' if luminance > 150 else 'white'))
+                if self.tag_auto_text_color:
+                    luminance = (
+                        opaque.red() * .299
+                        + opaque.green() * .587
+                        + opaque.blue() * .114
+                    )
+                    text_color = (
+                        'black'
+                        if luminance > self.tag_text_luminance_threshold
+                        else 'white'
+                    )
+                else:
+                    text_color = 'white'
+                painter.setPen(QColor(text_color))
                 painter.drawText(box.left() + 3, box.top() + 2 - ink.top(), label)
                 x -= width + 3
         finally:
@@ -1223,6 +1278,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
         position,
         font: QFont | None = None,
     ) -> int | None:
+        if not self.show_rating_overlay or self.rating_overlay_opacity <= 0:
+            return None
         overlay = self.rating_overlay_rect(cell_rect, font)
         stars = overlay.adjusted(4, 0, -4, 0)
         if stars.isEmpty() or not overlay.contains(position):
@@ -1236,6 +1293,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
         option: QStyleOptionViewItem,
         index: QModelIndex,
     ) -> None:
+        if not self.show_rating_overlay or self.rating_overlay_opacity <= 0:
+            return
         item = index.data(BrowserItemModel.ItemRole)
         if item is None:
             return
@@ -1252,7 +1311,9 @@ class BrowserItemDelegate(QStyledItemDelegate):
         painter.save()
         painter.setFont(rating_font)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(0, 0, 0, 218))
+        painter.setBrush(
+            QColor(0, 0, 0, round(255 * self.rating_overlay_opacity / 100))
+        )
         painter.drawRoundedRect(QRectF(overlay), 3, 3)
         text_rect = overlay.adjusted(4, 2, -4, -2)
         painter.setPen(QColor("#778899"))

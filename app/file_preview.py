@@ -52,6 +52,7 @@ class PreviewResult:
     persist_to_disk: bool = False
     entry_path: str = ""
     provisional_image: QImage | None = None
+    cache_in_memory: bool = True
 
     @property
     def ready(self) -> bool:
@@ -73,6 +74,7 @@ class PreviewResult:
         source: PreviewSource,
         persist_to_disk: bool,
         entry_path: str = "",
+        cache_in_memory: bool = True,
     ) -> PreviewResult:
         return cls(
             PreviewResultKind.READY,
@@ -80,6 +82,7 @@ class PreviewResult:
             source,
             persist_to_disk=persist_to_disk,
             entry_path=entry_path,
+            cache_in_memory=cache_in_memory,
         )
 
     @classmethod
