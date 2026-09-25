@@ -185,10 +185,11 @@ class SystemFileOpener:
         path: str | Path,
         *,
         is_directory: bool,
+        assume_available: bool = False,
     ) -> SystemOpenResult:
         target = self._absolute(path)
         if (
-            not os.path.exists(target)
+            (not assume_available and not os.path.exists(target))
             or FileOperationArtifactPolicy.is_internal_operation_artifact(target)
         ):
             return SystemOpenResult(

@@ -1101,6 +1101,48 @@ class BrowserItemModel(QAbstractListModel):
                 ],
             )
 
+    def clear_thumbnails_for_preview_kind(self, preview_kind: str) -> int:
+        """Drop rendered thumbnails for one provider-owned preview family."""
+        wanted = str(preview_kind or "").casefold()
+        if not wanted:
+            return 0
+        keys = {
+            self._key(item.path)
+            for item in self._source_items
+            if str(item.preview_kind or "").casefold() == wanted
+        }
+        changed = [
+            key
+            for key in keys
+            if (
+                key in self._thumbnail_images
+                or key in self._thumbnail_signatures
+                or key in self._low_resolution_thumbnails
+                or key in self._thumbnail_errors
+                or key in self._preview_statuses
+            )
+        ]
+        if not changed:
+            return 0
+        for key in changed:
+            self._thumbnail_images.pop(key, None)
+            self._thumbnail_signatures.pop(key, None)
+            self._low_resolution_thumbnails.discard(key)
+            self._thumbnail_errors.pop(key, None)
+            self._preview_statuses.pop(key, None)
+        if self._items:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(len(self._items) - 1, 0),
+                [
+                    self.ThumbnailImageRole,
+                    self.ThumbnailLowResolutionRole,
+                    self.ThumbnailErrorRole,
+                    self.PreviewStatusRole,
+                ],
+            )
+        return len(changed)
+
     def _has_compatible_thumbnail(
         self,
         item: BrowserItem,

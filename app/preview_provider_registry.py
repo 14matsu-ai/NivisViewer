@@ -226,6 +226,15 @@ class PreviewProviderRegistry:
         ).casefold()
         if frame_mode == VideoThumbnailFrameMode.WINDOWS_SHELL.value:
             backend = "windows_shell"
+        if (
+            backend == "windows_shell"
+            and priority is ThumbnailPriority.PREFETCH
+        ):
+            # Shell's cache-only probe is still native work and may be
+            # repeated for every speculative request. Keep the speculative
+            # lane from querying Windows; visible and interactive lanes may
+            # still request the authoritative Shell thumbnail.
+            return PreviewResult(PreviewResultKind.UNAVAILABLE)
         shell_result = PreviewResult(PreviewResultKind.UNAVAILABLE)
         use_shell_placeholder = bool(
             self._settings.get("video_thumbnail_shell_placeholder", True)
@@ -241,6 +250,8 @@ class PreviewProviderRegistry:
                 shell_result.kind is PreviewResultKind.READY
                 and backend == "windows_shell"
             ):
+                if priority is ThumbnailPriority.PREFETCH:
+                    return PreviewResult(PreviewResultKind.UNAVAILABLE)
                 return shell_result
             if shell_result.kind is PreviewResultKind.CANCELLED:
                 return shell_result
@@ -254,6 +265,7 @@ class PreviewProviderRegistry:
                         image=None,
                         persist_to_disk=False,
                         provisional_image=shell_result.image,
+                        cache_in_memory=False,
                     )
                 return PreviewResult(PreviewResultKind.UNAVAILABLE)
         if priority is ThumbnailPriority.PREFETCH:

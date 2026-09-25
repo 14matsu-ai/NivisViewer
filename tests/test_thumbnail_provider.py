@@ -263,11 +263,12 @@ def test_windows_shell_video_mode_keeps_shell_result_final(tmp_path: Path) -> No
     result = registry.generate(
         item,
         spec,
-        priority=ThumbnailPriority.PREFETCH,
+        priority=ThumbnailPriority.VISIBLE,
     )
     assert result.kind is PreviewResultKind.READY
     assert result.ready
     assert result.provisional_image is None
+    assert result.cache_in_memory
 
 
 def test_generation_change_clears_queued_cache_maintenance_and_allows_retry(

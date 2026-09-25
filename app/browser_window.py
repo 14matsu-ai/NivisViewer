@@ -211,7 +211,7 @@ from .internal_clipboard import (
     InternalClipboardState,
 )
 from .metadata_store import MetadataStore
-from .path_availability import PathAvailabilityService
+from .path_availability import PathAvailability, PathAvailabilityResult, PathAvailabilityService, path_key
 from .rating_rename_service import RatingRenameService
 from .zippla_filename_metadata import ZipPlaFilenameMetadata
 from .performance_trace import performance_trace
@@ -315,6 +315,15 @@ class _PendingDirectoryScan:
     first_batch_applied: bool = False
     snapshot_hit: bool = False
     retry_failed_thumbnails: bool = False
+
+
+@dataclass(frozen=True)
+class _PendingSystemOpen:
+    request_id: int
+    path: str
+    path_key: str
+    action: str
+    is_directory: bool = False
 
 
 class _BrowserContextFilenameEdit(QLineEdit):
@@ -594,6 +603,10 @@ class BrowserWindow(QMainWindow):
         self.path_availability_service = (
             path_availability_service or PathAvailabilityService(self)
         )
+        self.path_availability_service.result_ready.connect(
+            self._on_system_open_path_probe_result
+        )
+        self._pending_system_open: _PendingSystemOpen | None = None
         self._owns_file_operation_coordinator = file_operation_coordinator is None
         self.file_operation_coordinator = (
             file_operation_coordinator
@@ -883,6 +896,28 @@ class BrowserWindow(QMainWindow):
         self.browser_filter_state = BrowserFilterState()
         self.browser_tag_grouped = bool(
             self.settings.get("browser_tag_grouped", False)
+        )
+        self.browser_show_rating_overlay = bool(
+            self.settings.get("browser_show_rating_overlay", True)
+        )
+        self.browser_show_tag_overlay = bool(
+            self.settings.get("browser_show_tag_overlay", True)
+        )
+        self.browser_rating_overlay_opacity = max(
+            0, min(100, int(self.settings.get("browser_rating_overlay_opacity", 85)))
+        )
+        self.browser_tag_overlay_opacity = max(
+            0, min(100, int(self.settings.get("browser_tag_overlay_opacity", 100)))
+        )
+        self.browser_tag_auto_text_color = bool(
+            self.settings.get("browser_tag_auto_text_color", True)
+        )
+        self.browser_tag_text_luminance_threshold = max(
+            0,
+            min(
+                255,
+                int(self.settings.get("browser_tag_text_luminance_threshold", 150)),
+            ),
         )
         self.browser_display_density = normalize_browser_display_density(
             self.settings.get(
@@ -1206,23 +1241,18 @@ class BrowserWindow(QMainWindow):
                 self._current_browser_sort_policy(),
             )
             if snapshot is not None:
-                try:
-                    target_exists = target.is_dir()
-                except OSError:
-                    target_exists = False
-                if target_exists:
-                    return self._navigate_from_folder_snapshot(
-                        target,
-                        snapshot.items,
-                        record_history=record_history,
-                        restore_location=(
-                            restore_location or BrowserLocation(str(target))
-                        ),
-                        failure_history_revert=failure_history_revert,
-                        navigation_source=navigation_source,
-                        trace_id=trace_id,
-                        atomic_restore=atomic_restore,
-                    )
+                return self._navigate_from_folder_snapshot(
+                    target,
+                    snapshot.items,
+                    record_history=record_history,
+                    restore_location=(
+                        restore_location or BrowserLocation(str(target))
+                    ),
+                    failure_history_revert=failure_history_revert,
+                    navigation_source=navigation_source,
+                    trace_id=trace_id,
+                    atomic_restore=atomic_restore,
+                )
 
         self._cancel_pending_scan(rollback_history=not atomic_restore)
         self._scan_generation += 1
@@ -2055,10 +2085,33 @@ class BrowserWindow(QMainWindow):
     def refresh_current_folder(self) -> bool:
         return self._refresh_current_folder(navigation_source="manual_refresh")
 
+    def invalidate_windows_shell_thumbnails(
+        self,
+        *,
+        begin_generation: bool = True,
+    ) -> int:
+        """Invalidate video Shell previews before the next visible request."""
+        cleared = self.item_model.clear_thumbnails_for_preview_kind("video")
+        if not cleared:
+            return 0
+        invalidate = getattr(
+            self.thumbnail_provider,
+            "invalidate_windows_shell_previews",
+            None,
+        )
+        if callable(invalidate):
+            self._generation = int(
+                invalidate(begin_generation=begin_generation)
+            )
+        self._schedule_thumbnail_requests(0)
+        return cleared
+
     def _refresh_current_folder(self, *, navigation_source: str) -> bool:
         if self.current_path is None:
             return False
         explicit_retry = navigation_source == "manual_refresh"
+        if explicit_retry:
+            self.invalidate_windows_shell_thumbnails()
         if self._snapshot_reconcile_pending:
             navigation_source = "snapshot_reconcile"
         location = self._current_location()
@@ -2494,6 +2547,9 @@ class BrowserWindow(QMainWindow):
             )
 
     def _open_system_file(self, path: str | Path) -> bool:
+        return self._queue_system_open_probe(path, action="default")
+
+    def _open_system_file_after_probe(self, path: str | Path) -> bool:
         result = self.system_file_opener.open_with_default_application(
             path,
             parent_hwnd=int(self.winId()),
@@ -2515,9 +2571,12 @@ class BrowserWindow(QMainWindow):
 
     def _open_with_application_picker(self, item: BrowserItem) -> bool:
         target = self._absolute_browser_path(item.path)
-        if item.kind is BrowserItemKind.FOLDER or not target.is_file():
+        if item.kind is BrowserItemKind.FOLDER:
             self._show_temporary_status(tr('関連付けで開く対象が見つかりません'))
             return False
+        return self._queue_system_open_probe(target, action="picker")
+
+    def _open_with_application_picker_after_probe(self, target: str | Path) -> bool:
         result = self.system_file_opener.open_with_application_picker(
             target,
             parent_hwnd=int(self.winId()),
@@ -2532,9 +2591,17 @@ class BrowserWindow(QMainWindow):
 
     def _open_item_in_explorer(self, item: BrowserItem) -> bool:
         target = self._absolute_browser_path(item.path)
+        return self._queue_system_open_probe(
+            target, action="explorer", is_directory=item.kind is BrowserItemKind.FOLDER
+        )
+
+    def _open_item_in_explorer_after_probe(
+        self, target: str | Path, *, is_directory: bool
+    ) -> bool:
         result = self.system_file_opener.open_in_explorer(
             target,
-            is_directory=item.kind is BrowserItemKind.FOLDER,
+            is_directory=is_directory,
+            assume_available=True,
         )
         if result.success:
             return True
@@ -2544,16 +2611,58 @@ class BrowserWindow(QMainWindow):
         return False
 
     def _open_current_folder_in_explorer(self, item: BrowserItem) -> bool:
-        result = self.system_file_opener.open_in_explorer(
-            item.path,
-            is_directory=False,
+        return self._queue_system_open_probe(
+            item.path, action="explorer", is_directory=False
         )
-        if result.success:
-            return True
-        self._show_temporary_status(
-            result.error_message or tr('Explorerを開けませんでした')
+
+    def _queue_system_open_probe(
+        self, path: str | Path, *, action: str, is_directory: bool = False
+    ) -> bool:
+        # Native Viewer opens already perform physical I/O in BookSession's worker.
+        target = str(self._absolute_browser_path(path))
+        request_id = self.path_availability_service.request_probe(
+            target, purpose=f"browser_system_open:{action}", force=True
         )
-        return False
+        self._pending_system_open = None
+        if not request_id:
+            self._show_temporary_status(tr('場所を確認できません'))
+            return False
+        self._pending_system_open = _PendingSystemOpen(
+            request_id, target, path_key(target), action, is_directory
+        )
+        self._status_message_token += 1
+        self._temporary_status_message = tr('ドライブの応答を待っています…')
+        self.statusBar().showMessage(self._temporary_status_message)
+        return True
+
+    def _on_system_open_path_probe_result(self, result: PathAvailabilityResult) -> None:
+        pending = self._pending_system_open
+        if (
+            pending is None
+            or self._shutdown_prepared
+            or result.request_id != pending.request_id
+            or result.path_key != pending.path_key
+        ):
+            return
+        self._pending_system_open = None
+        if result.state is not PathAvailability.AVAILABLE:
+            message = {
+                PathAvailability.MISSING: tr('対象が見つかりません'),
+                PathAvailability.UNAVAILABLE: tr('現在アクセスできません'),
+                PathAvailability.ERROR: tr('場所を確認できません'),
+            }.get(result.state, tr('場所を確認できません'))
+            self._show_temporary_status(message)
+            return
+        if pending.action == "default":
+            self._open_system_file_after_probe(pending.path)
+        elif pending.action == "picker":
+            self._open_with_application_picker_after_probe(pending.path)
+        elif pending.action == "explorer":
+            if self._open_item_in_explorer_after_probe(
+                pending.path, is_directory=pending.is_directory
+            ):
+                self._temporary_status_message = None
+                self._update_status(force=True)
 
     def _folder_snapshot_for_item(
         self,
@@ -3046,7 +3155,10 @@ class BrowserWindow(QMainWindow):
         new_name: str | None = None,
         clipboard_receipt: ClipboardPasteReceipt | None = None,
     ) -> bool:
-        if self._snapshot_reconcile_pending:
+        if (
+            self._snapshot_reconcile_pending
+            and not self._snapshot_reconcile_has_committed_destination()
+        ):
             self._show_temporary_status(tr('一覧を更新中のため操作できません'))
             return False
         filtered_sources = tuple(
@@ -3146,6 +3258,14 @@ class BrowserWindow(QMainWindow):
             self._show_temporary_status(tr('ファイル操作を開始できません'))
             return False
         return True
+
+    def _snapshot_reconcile_has_committed_destination(self) -> bool:
+        if not self._snapshot_reconcile_pending:
+            return True
+        if self.current_path is None:
+            return False
+        pending = self._pending_scan
+        return pending is None or self._same_path(pending.path, self.current_path)
 
     def _on_file_operation_conflicts_required(
         self,
@@ -4062,6 +4182,7 @@ class BrowserWindow(QMainWindow):
         if self._shutdown_cleanup_complete:
             return True
         self._shutdown_prepared = True
+        self._pending_system_open = None
         if self._shutdown_cleanup_phase == 0:
             self._download_retry.close()
             self._close_zip_progress_dialog()
@@ -4161,6 +4282,61 @@ class BrowserWindow(QMainWindow):
             "badge_file_icon_size": self.browser_badge_file_icon_size,
             "badge_file_icon_custom_percent": self.browser_badge_file_icon_custom_percent,
         }
+
+    def _browser_overlay_delegate_options(self) -> dict[str, object]:
+        return {
+            "show_rating_overlay": self.browser_show_rating_overlay,
+            "show_tag_overlay": self.browser_show_tag_overlay,
+            "rating_overlay_opacity": self.browser_rating_overlay_opacity,
+            "tag_overlay_opacity": self.browser_tag_overlay_opacity,
+            "tag_auto_text_color": self.browser_tag_auto_text_color,
+            "tag_text_luminance_threshold": self.browser_tag_text_luminance_threshold,
+        }
+
+    def _apply_browser_overlay_settings(self, changed: dict[str, object]) -> None:
+        keys = {
+            "browser_show_rating_overlay",
+            "browser_show_tag_overlay",
+            "browser_rating_overlay_opacity",
+            "browser_tag_overlay_opacity",
+            "browser_tag_auto_text_color",
+            "browser_tag_text_luminance_threshold",
+        }
+        if not keys.intersection(changed):
+            return
+        self.browser_show_rating_overlay = bool(
+            self.config.get("browser_show_rating_overlay", True)
+        )
+        self.browser_show_tag_overlay = bool(
+            self.config.get("browser_show_tag_overlay", True)
+        )
+        self.browser_rating_overlay_opacity = max(
+            0, min(100, int(self.config.get("browser_rating_overlay_opacity", 85)))
+        )
+        self.browser_tag_overlay_opacity = max(
+            0, min(100, int(self.config.get("browser_tag_overlay_opacity", 100)))
+        )
+        self.browser_tag_auto_text_color = bool(
+            self.config.get("browser_tag_auto_text_color", True)
+        )
+        self.browser_tag_text_luminance_threshold = max(
+            0,
+            min(
+                255,
+                int(self.config.get("browser_tag_text_luminance_threshold", 150)),
+            ),
+        )
+        self.item_delegate.configure(
+            thumbnail_size=self.thumbnail_size,
+            density=self.browser_display_density,
+            **self._browser_overlay_delegate_options(),
+        )
+        if (
+            not self.browser_show_rating_overlay
+            or self.browser_rating_overlay_opacity <= 0
+        ):
+            self._clear_rating_hover()
+        self.list_view.viewport().update()
 
     def _apply_fallback_background_settings(self, changed: dict[str, object]) -> None:
         """Color-only effect boundary: configure once and repaint; no layout/I/O."""
@@ -4276,6 +4452,7 @@ class BrowserWindow(QMainWindow):
             )
         self._apply_fallback_background_settings(changed)
         self._apply_browser_icon_size_settings(changed)
+        self._apply_browser_overlay_settings(changed)
         if "browser_location_history_limit" in changed:
             self.navigation_history.set_recent_limit(
                 int(changed["browser_location_history_limit"])
@@ -5277,6 +5454,7 @@ class BrowserWindow(QMainWindow):
             item_spacing_y=self.browser_item_spacing_y,
             **self._fallback_background_delegate_options(),
             **self._browser_icon_delegate_options(),
+            **self._browser_overlay_delegate_options(),
         )
         self.list_view.setIconSize(QSize(self.thumbnail_size, self.thumbnail_size))
         self.list_view.setGridSize(self.item_delegate.grid_metrics.grid_size)
@@ -6509,6 +6687,7 @@ class BrowserWindow(QMainWindow):
             item_spacing_y=self.browser_item_spacing_y,
             **self._fallback_background_delegate_options(),
             **self._browser_icon_delegate_options(),
+            **self._browser_overlay_delegate_options(),
         )
         self.list_view.setItemDelegate(self.item_delegate)
         self.list_view.setViewMode(QListView.ViewMode.IconMode)
@@ -8340,20 +8519,15 @@ class BrowserWindow(QMainWindow):
             menu.addAction(tr('現在の階層をエクスプローラーで開く'))
             if item is not None and item.kind is BrowserItemKind.FOLDER else None
         )
-        target_exists = bool(
-            item is not None
-            and self._absolute_browser_path(item.path).exists()
-        )
         open_action.setEnabled(selection_count == 1 and item is not None)
         open_with_action.setEnabled(
             selection_count == 1
             and item is not None
             and item.kind is not BrowserItemKind.FOLDER
-            and target_exists
         )
-        location_action.setEnabled(item is not None and target_exists)
+        location_action.setEnabled(item is not None)
         if current_location_action is not None:
-            current_location_action.setEnabled(target_exists)
+            current_location_action.setEnabled(item is not None)
         menu.addSeparator()
         zip_action = menu.addAction(tr('zipに圧縮'))
         zip_action.setEnabled(
