@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import Event
 from typing import Callable
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal, Slot
 
 from .archive_backend import ArchiveErrorCode
 from .image_cache import ImageCache
@@ -27,6 +27,7 @@ from .image_source import (
 from .folder_raster_book_runtime import FolderRasterBookRuntime
 from .page_model import PageModel
 from .performance_trace import performance_trace
+from .freeze_diagnostics import trace_gui_phase
 from .raster_book_runtime import RasterBookRuntime
 from .viewer_page_list_runtime import ViewerPageListRuntime
 from .zip_raster_book_runtime import ZipRasterBookRuntime
@@ -256,6 +257,10 @@ class BookSession(QObject):
             int, ViewerPageListRuntime
         ] = {}
         self._retired_cleanup_deferred = False
+        self._retired_cleanup_timer = QTimer(self)
+        self._retired_cleanup_timer.setSingleShot(True)
+        self._retired_cleanup_timer.setInterval(10)
+        self._retired_cleanup_timer.timeout.connect(self._drain_retired_viewer_resources)
         self._open_pool = QThreadPool()
         self._open_pool.setMaxThreadCount(1)
         self._open_cancel: Event | None = None
@@ -523,6 +528,7 @@ class BookSession(QObject):
         self._maybe_finalize_shutdown()
 
     @Slot(object)
+    @trace_gui_phase
     def _on_async_prepared(self, result: _PreparedBook) -> None:
         self._open_workers.pop(result.generation, None)
         if not self._open_workers:
@@ -780,10 +786,31 @@ class BookSession(QObject):
         self,
         runtime: RasterBookRuntime,
     ) -> None:
+        if not self._shutdown and not runtime.drain_retired_artifacts():
+            self._retired_viewer_runtimes[id(runtime)] = runtime
+            if not runtime.has_unfinished_tasks():
+                self._retired_cleanup_timer.start()
+            return
         self._retired_viewer_runtimes.pop(id(runtime), None)
         runtime.shutdown(wait_msecs=0)
         runtime.setParent(None)
         runtime.deleteLater()
+
+    def _drain_retired_viewer_resources(self) -> None:
+        # One owner per turn: several rapid book switches must not multiply
+        # the per-turn disposal budget. In-flight owners retry through idle.
+        if self._retired_cleanup_deferred or self._shutdown:
+            return
+        for runtime in tuple(self._retired_viewer_runtimes.values()):
+            if runtime.has_unfinished_tasks():
+                continue
+            source = runtime.source
+            self._finalize_viewer_runtime(runtime)
+            self._try_release_retired_source(source)
+            if any(not item.has_unfinished_tasks()
+                   for item in self._retired_viewer_runtimes.values()):
+                self._retired_cleanup_timer.start()
+            break
 
     def _replace_page_list_runtime(
         self,
@@ -820,6 +847,7 @@ class BookSession(QObject):
             )
         self.page_list_runtime_changed.emit(new_runtime)
 
+    @trace_gui_phase
     def ensure_page_list_runtime(self) -> ViewerPageListRuntime | None:
         """Materialize the optional PageList owner after first-frame paint."""
 
@@ -908,6 +936,7 @@ class BookSession(QObject):
         runtime.setParent(None)
         runtime.deleteLater()
 
+    @trace_gui_phase
     def release_retired_book_resources(self) -> None:
         """Reclaim the preceding book after the replacement frame paints."""
 

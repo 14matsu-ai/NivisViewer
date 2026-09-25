@@ -88,6 +88,7 @@ from .path_availability import (
     lexical_absolute,
 )
 from .performance_trace import performance_trace
+from .freeze_diagnostics import trace_gui_phase
 from .raster_book_runtime import (
     RasterBookRuntime,
     RasterDisplayUnit,
@@ -2111,6 +2112,7 @@ class ViewerWindow(QMainWindow):
             )
         return True
 
+    @trace_gui_phase
     def _finish_opened_book(
         self,
         opened: BookOpened,
@@ -3189,6 +3191,7 @@ class ViewerWindow(QMainWindow):
         if schedule_visible_work:
             self._schedule_page_list_visible_work()
 
+    @trace_gui_phase
     def _flush_presentation_side_effects(self) -> None:
         token = self._pending_presentation_side_effect_token
         self._pending_presentation_side_effect_token = None
@@ -3978,6 +3981,7 @@ class ViewerWindow(QMainWindow):
         self._project_presentation_surface()
         self._set_status_override(message)
 
+    @trace_gui_phase
     def _on_zip_runtime_frame_ready(
         self,
         frame: RasterFrame,
@@ -4117,6 +4121,7 @@ class ViewerWindow(QMainWindow):
         )
         self._raster_paint_fallback_timer.start()
 
+    @trace_gui_phase
     def _on_zip_runtime_frame_painted(
         self,
         frame_serial: int,

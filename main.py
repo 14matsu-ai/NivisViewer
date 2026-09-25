@@ -15,6 +15,7 @@ from app.application_controller import ApplicationController
 from app.command_line import parse_command_line, version_text
 from app.config_manager import ConfigManager
 from app.frozen_smoke import run_frozen_smoke
+from app.freeze_diagnostics import FreezeDiagnostics
 from app.logging_setup import install_exception_hook, setup_logging
 from app.metadata_store import MetadataStore
 from app.single_instance import (
@@ -79,6 +80,7 @@ def main(arguments: list[str] | None = None) -> int:
         )
         return 0 if success else 1
 
+    freeze_diagnostics = FreezeDiagnostics(paths, application)
     config = ConfigManager(paths.config_path, writable=paths.writable)
     metadata = MetadataStore(paths.metadata_path, initialize=paths.writable)
     controller = ApplicationController(
@@ -104,6 +106,7 @@ def main(arguments: list[str] | None = None) -> int:
     try:
         return application.exec()
     finally:
+        freeze_diagnostics.close()
         controller.shutdown()
         if broker is not None:
             broker.close()

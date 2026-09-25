@@ -1298,7 +1298,13 @@ class ZipImageSource(ImageSource):
         return qt_jpeg_compatible_request_size(logical_size, maximum_size)
 
     def probe_image_size(self, image_id: str) -> tuple[int, int] | None:
-        """Probe one ZIP image header without allocating its pixel raster."""
+        """Probe a bounded header through a native buffer, never a Python device.
+
+        Qt plugin discovery may call readData while holding native locks.
+        A Python QIODevice callback can then wait for the GIL while another
+        reader waits in Qt. Keep ZIP I/O and Python callbacks outside Qt.
+        Unusually large headers fall back to geometry from the actual decode.
+        """
 
         cached = self._size_cache.get(image_id)
         if cached is not None:
@@ -1319,14 +1325,18 @@ class ZipImageSource(ImageSource):
                         tr('書庫内の画像が大きすぎます。'),
                         code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
                     )
-                with self._zip.open(info, "r") as entry:
-                    device = _ZipEntrySequentialDevice(
-                        entry,
-                        expected_size=info.file_size,
-                        cancelled=cancelled,
-                        maximum_bytes=MAX_IMAGE_ENTRY_BYTES,
-                        read_chunk_bytes=self._READ_CHUNK_BYTES,
-                    )
+                entry = self._zip.open(info, "r")
+            with entry:
+                header = QByteArray()
+                for limit in (64 * 1024, 256 * 1024, 1024 * 1024):
+                    self._raise_if_cancelled(cancelled)
+                    with self._lock:
+                        chunk = entry.read(max(0, min(limit, info.file_size) - header.size()))
+                    header.append(chunk)
+                    self._raise_if_cancelled(cancelled)
+                    # Both device methods and plugin reads stay in C++. Do
+                    # not hold the ZIP lock during reader/plugin operations.
+                    device = QBuffer(header)
                     if not device.open(QIODevice.OpenModeFlag.ReadOnly):
                         return None
                     try:
@@ -1334,17 +1344,12 @@ class ZipImageSource(ImageSource):
                         raw_size = reader.size()
                         transformation = reader.transformation()
                         self._raise_if_cancelled(cancelled)
-                        if device.too_large:
-                            raise ImageSourceError(
-                                tr('書庫内の画像が大きすぎます。'),
-                                code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
-                            )
-                        if device.read_error is not None:
-                            return None
                         raw_width = raw_size.width()
                         raw_height = raw_size.height()
                         if raw_width <= 0 or raw_height <= 0:
-                            return None
+                            if header.size() >= info.file_size or not chunk:
+                                return None
+                            continue
                         swaps_axes = bool(
                             transformation
                             & QImageIOHandler.Transformation.TransformationRotate90
@@ -1358,6 +1363,7 @@ class ZipImageSource(ImageSource):
                         return logical_size
                     finally:
                         device.close()
+                return None
         except ImageSourceError:
             raise
         except Exception:
