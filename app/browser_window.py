@@ -1408,22 +1408,25 @@ class BrowserWindow(QMainWindow):
             state = self._capture_list_view_state()
             pending.refresh_entries.clear()
             items = self.item_model.reuse_known_page_counts(items)
-            # A completed write can release a sharing lock without changing
-            # listing metadata. Retry failed previews once per coalesced event.
+            # Watch notifications describe the directory, not every failed
+            # item. Same-fingerprint lock recovery belongs to the finite retry ledger.
             filesystem_change = pending.navigation_source == "filesystem_watch"
             listing_changed = tuple(items) != self.item_model.source_items
             retry_failed_requested = (
-                filesystem_change
-                or pending.retry_failed_thumbnails
+                pending.retry_failed_thumbnails
                 or pending.navigation_source == "manual_refresh"
             )
             retry_failed = (
                 retry_failed_requested and self.thumbnail_provider.has_failed_requests
             )
             if listing_changed:
-                self._generation = self.thumbnail_provider.begin_generation(
-                    retry_failed=retry_failed_requested,
-                )
+                if filesystem_change and not retry_failed_requested:
+                    self.thumbnail_provider.reconcile_items(self.item_model.source_items, items)
+                    self._download_retry.reconcile_changes(self.item_model.source_items, items)
+                else:
+                    self._generation = self.thumbnail_provider.begin_generation(
+                        retry_failed=retry_failed_requested,
+                    )
                 self.item_model.set_sorted_items(
                     items,
                     preserve_thumbnails=True,
@@ -7766,7 +7769,10 @@ class BrowserWindow(QMainWindow):
     ) -> None:
         if self._shutdown_prepared or generation != self._generation:
             return
-        self.item_model.set_preview_status(path, status)
+        if status not in {"failed", "pending", "cancelled"}:
+            self.item_model.clear_thumbnail_error(path)
+        if status not in {"pending", "cancelled"}:
+            self.item_model.set_preview_status(path, status)
 
     def _on_thumbnail_provisional(
         self,
@@ -7802,7 +7808,7 @@ class BrowserWindow(QMainWindow):
             self.statusBar().showMessage(error)
             return
         pending = self._pending_scan
-        if pending is not None:
+        if pending is not None and getattr(pending, "navigation_source", None) != "filesystem_watch":
             remaining_items = getattr(
                 pending,
                 "remaining_items",

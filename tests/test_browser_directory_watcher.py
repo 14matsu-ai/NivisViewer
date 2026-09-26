@@ -369,7 +369,7 @@ def test_tag_rename_watch_reconciles_without_duplicate_reset_and_sees_external_a
         qapp.processEvents()
 
 
-def test_unchanged_watch_retries_failed_thumbnail_without_model_reset(
+def test_unchanged_watch_preserves_failed_thumbnail_without_model_reset(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
@@ -386,8 +386,8 @@ def test_unchanged_watch_retries_failed_thumbnail_without_model_reset(
         window._flush_directory_changes()
         assert window.wait_for_scan()
         assert not resets
-        assert window.thumbnail_provider.generation == generation + 1
-        assert not window.thumbnail_provider.has_failed_requests
+        assert window.thumbnail_provider.generation == generation
+        assert window.thumbnail_provider.has_failed_requests
     finally:
         window.close()
         qapp.processEvents()

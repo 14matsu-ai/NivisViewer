@@ -69,6 +69,12 @@ class DownloadRetryBudget:
             entry.due_at = min(entry.expires_at, float(now) + self.delays[entry.attempts])
         return True
 
+    def resume_interrupted(self, generation: int, now: float, eligible) -> None:
+        """Rearm consumed/cancelled work without renewing attempts or expiry."""
+        for key, entry in self._entries.items():
+            if entry.due_at is None and entry.attempts and eligible(key):
+                self.failed(key, generation, now)
+
     def resolved(self, key: Hashable) -> None:
         self._entries.pop(key, None)
 
