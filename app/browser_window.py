@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .cloud_files import online_only_message
 
 from .browser_workflow_controller import BrowserWorkflowController
 from .browser_workflow_policy import paste_is_move
@@ -2658,6 +2659,7 @@ class BrowserWindow(QMainWindow):
         if result.state is not PathAvailability.AVAILABLE:
             message = {
                 PathAvailability.MISSING: tr('対象が見つかりません'),
+                PathAvailability.ONLINE_ONLY: online_only_message(),
                 PathAvailability.UNAVAILABLE: tr('現在アクセスできません'),
                 PathAvailability.ERROR: tr('場所を確認できません'),
             }.get(result.state, tr('場所を確認できません'))

@@ -206,6 +206,7 @@ def test_folder_scandir_skips_entry_removed_during_listing(
 ) -> None:
     source = FolderImageSource(tmp_path)
     existing = tmp_path / "2.jpg"
+    existing.touch()  # Metadata admission checks require an existing file.
 
     class FakeEntry:
         def __init__(

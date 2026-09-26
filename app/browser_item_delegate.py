@@ -882,6 +882,11 @@ class BrowserItemDelegate(QStyledItemDelegate):
                     )
                 )
             self._paint_type_icon(painter, thumbnail_rect, item)
+            if item.online_only:
+                badge = QRect(thumbnail_rect.right() - 24, thumbnail_rect.top() + 3, 22, 20)
+                painter.fillRect(badge, option.palette.base())
+                painter.setPen(option.palette.text().color())
+                painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, '☁')
             if thumbnail_error:
                 self._paint_error_badge(painter, thumbnail_rect)
             if self.show_rating_overlay and self.rating_overlay_opacity > 0:

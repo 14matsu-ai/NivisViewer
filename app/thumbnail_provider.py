@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .cloud_files import require_local, local_image_candidate
 
 from .i18n import tr
 
@@ -646,7 +647,7 @@ class BrowserThumbnailProvider(QObject):
         if self._closed or self._paused:
             return False
         requested_generation = self._generation if generation is None else generation
-        if requested_generation != self._generation or item.kind not in {
+        if item.online_only or requested_generation != self._generation or item.kind not in {
             BrowserItemKind.FOLDER,
             BrowserItemKind.ARCHIVE,
         }:
@@ -1480,6 +1481,7 @@ class BrowserThumbnailProvider(QObject):
             else ThumbnailRenderSpec.from_settings(size, "square_1_1", "letterbox")
         )
         try:
+            require_local(item.path)
             if item.kind == BrowserItemKind.IMAGE:
                 return ThumbnailLoadResult(
                     BrowserThumbnailProvider._load_image_path(
@@ -1593,6 +1595,22 @@ class BrowserThumbnailProvider(QObject):
             else None
         )
 
+        try:
+            require_local(item.path)
+        except OSError:
+            cached = None
+            if self._disk_cache_enabled and disk_cache is not None:
+                get_saved = getattr(disk_cache, 'get_offline_preview', None)
+                if callable(get_saved):
+                    cached = get_saved(item)
+            with self._failure_lock:
+                self._quiet_results[failure_key] = PreviewResultKind.UNAVAILABLE
+            return ThumbnailLoadResult(
+                cached, disk_cache_hit=cached is not None,
+                result_kind=PreviewResultKind.UNAVAILABLE if cached is None else None,
+                persist_to_disk=False,
+            )
+
         def publish_page_count(page_count: int) -> None:
             if cancel_token is not None and cancel_token.is_set():
                 return
@@ -1663,6 +1681,17 @@ class BrowserThumbnailProvider(QObject):
                     if ThumbnailPriority(thumbnail_priority) is ThumbnailPriority.BACKGROUND:
                         self._increment_stat("background_disk_hit")
                     return ThumbnailLoadResult(cached, disk_cache_hit=True)
+
+        try:
+            require_local(item.path)
+        except OSError:
+            # Terminal for this generation; refreshing the folder permits retry.
+            with self._failure_lock:
+                self._quiet_results[failure_key] = PreviewResultKind.UNAVAILABLE
+            return ThumbnailLoadResult(
+                provisional, result_kind=PreviewResultKind.UNAVAILABLE,
+                persist_to_disk=False,
+            )
 
         normalized_priority = ThumbnailPriority(thumbnail_priority)
         if (
@@ -1919,6 +1948,11 @@ class BrowserThumbnailProvider(QObject):
         cancel_token=None,
         _thumbnail_priority: ThumbnailPriority = ThumbnailPriority.PREFETCH,
     ) -> ThumbnailLoadResult:
+        try:
+            require_local(item.path)
+        except OSError:
+            return ThumbnailLoadResult(None, result_kind=PreviewResultKind.UNAVAILABLE,
+                                       persist_to_disk=False)
         disk_cache = self._disk_cache
         if self._disk_cache_enabled and disk_cache is not None:
             disk_cache.set_enabled(True)
@@ -1935,6 +1969,7 @@ class BrowserThumbnailProvider(QObject):
         try:
             if self._is_cancelled(cancel_token):
                 raise InterruptedError
+            require_local(item.path)
             if item.kind is BrowserItemKind.FOLDER:
                 page_count = len(
                     self._folder_image_candidates(item.path, cancel_token)
@@ -2575,6 +2610,7 @@ class BrowserThumbnailProvider(QObject):
         smart_crop_cache: SmartCropCache | None = None,
     ) -> QImage | None:
         try:
+            require_local(path)
             stat = path.stat()
             if path.suffix.casefold() in PSD_EXTENSIONS:
                 image_context = decode_psd_thumbnail(
@@ -2624,6 +2660,7 @@ class BrowserThumbnailProvider(QObject):
         cancel_token=None,
     ) -> list[Path]:
         candidates: list[Path] = []
+        require_local(folder)
         with os.scandir(folder) as entries:
             for entry in entries:
                 if BrowserThumbnailProvider._is_cancelled(cancel_token):
@@ -2634,7 +2671,7 @@ class BrowserThumbnailProvider(QObject):
                 ):
                     continue
                 try:
-                    if entry.is_file(follow_symlinks=True):
+                    if local_image_candidate(entry.path) and entry.is_file(follow_symlinks=True):
                         candidates.append(Path(entry.path))
                 except OSError:
                     continue
@@ -2738,6 +2775,7 @@ class BrowserThumbnailProvider(QObject):
         cancel_token=None,
     ) -> ThumbnailLoadResult:
         try:
+            require_local(archive)
             stat = archive.stat()
             with zipfile.ZipFile(archive, "r") as source:
                 names = BrowserThumbnailProvider._zip_image_names(

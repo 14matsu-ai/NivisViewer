@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .cloud_files import require_local
 
 from .i18n import tr
 
@@ -111,6 +112,7 @@ def _content_signature(path: Path) -> str | None:
     and timestamps for video, and an exact digest for other requested files.
     """
     try:
+        require_local(path)
         info = path.stat()
         if stat.S_ISDIR(info.st_mode):
             kind = "dir"
@@ -404,6 +406,23 @@ class ThumbnailDiskCache:
                 ),
             )
             self._connection.commit()
+
+    def get_offline_preview(self, item: BrowserItem) -> QImage | None:
+        """Use only saved metadata and our cache; never inspect source contents."""
+        with self._lock:
+            if not self.enabled or self._connection is None:
+                return None
+            rows = self._connection.execute(
+                "SELECT file_name FROM entries WHERE source_path = ? AND item_kind = ? "
+                "AND source_size = ? AND source_mtime_ns = ? ORDER BY last_used DESC",
+                (os.path.normcase(os.path.abspath(item.path)), item.kind.value,
+                 item.file_size or 0, item.modified_time_ns or 0),
+            ).fetchall()
+            for (file_name,) in rows:
+                image = self._read_qimage(self.files_dir / file_name)
+                if image is not None:
+                    return image
+        return None
 
     def get(
         self,

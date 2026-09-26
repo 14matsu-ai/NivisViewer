@@ -5,6 +5,7 @@ search queries, persisted identifiers or other runtime user data here.
 """
 
 ENGLISH: dict[str, str] = {
+    "オンラインのみの項目です。Dropboxなどの同期アプリでダウンロードしてから、一覧を更新してください。": "This item is online-only. Download it using Dropbox or your sync app, then refresh the list.",
     "GIMP（XCF画像）": "GIMP (XCF images)",
     "XCFには、CLIPやPSDのように取り出して表示できるプレビュー画像がないため、読み込み・表示に時間がかかります。": "Unlike CLIP or PSD, XCF has no saved preview image that can be extracted for display, so loading and displaying it takes longer.",
     "XCF画像の読み込みを有効にする（再起動後に反映）": "Enable XCF image loading (restart required)",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .i18n import tr
+from .cloud_files import require_local, requires_download
 
 
 import os
@@ -82,6 +83,7 @@ class BrowserScanEntry:
     openable_by_nivisviewer: bool = True
     can_generate_preview: bool = True
     preview_kind: str = ""
+    online_only: bool = False
     rating: int | None = None
     page_count: int | None = None
     created_time_ns: int | None = None
@@ -238,6 +240,7 @@ def scan_entry_from_dir_entry(
         openable_by_nivisviewer=supported,
         can_generate_preview=True,
         preview_kind=preview_kind,
+        online_only=requires_download(attributes),
         rating=filename_metadata.rating,
         created_time_ns=creation_time_ns(entry_stat),
         accessed_time_ns=getattr(entry_stat, "st_atime_ns", None),
@@ -277,6 +280,7 @@ def scan_directory(
                 "scanner.scandir.begin",
                 request.path,
             )
+        require_local(target)
         with os.scandir(target) as entries:
             if request.trace_id:
                 performance_trace.mark(

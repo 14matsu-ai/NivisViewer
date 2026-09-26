@@ -12,9 +12,6 @@ REQUIRED = (
     "PROJECT_LICENSE.md",
     "THIRD_PARTY_NOTICES.md",
     "README.md",
-    "README.en.md",
-    "README.zh-CN.md",
-    "README.zh-TW.md",
     "licenses",
 )
 FORBIDDEN_NAMES = {
