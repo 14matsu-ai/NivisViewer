@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+VECTOR_IMAGE_EXTENSIONS = frozenset({".svg", ".ai"})
+
 PSD_EXTENSIONS = frozenset({".psd", ".psb"})
 KRA_EXTENSIONS = frozenset({".kra"})
 ORA_EXTENSIONS = frozenset({".ora"})
@@ -28,6 +30,8 @@ IMAGE_EXTENSIONS = frozenset(
         ".ora",
         ".clip",
         ".xcf",
+        ".svg",
+        ".ai",
     }
 )
 ZIP_ARCHIVE_EXTENSIONS = frozenset({".zip", ".cbz"})
@@ -50,6 +54,15 @@ FORMAT_CATEGORIES = {
 # above stable for file associations and configuration validation.
 ENABLED_IMAGE_EXTENSIONS = set(IMAGE_EXTENSIONS - XCF_EXTENSIONS)
 ENABLED_BOOK_FILE_EXTENSIONS = set(BOOK_FILE_EXTENSIONS - XCF_EXTENSIONS)
+
+
+def configure_vector_loading(*, ai=True, svg=True):
+    for suffix, enabled in (('.ai', ai), ('.svg', svg)):
+        for extensions in (ENABLED_IMAGE_EXTENSIONS, ENABLED_BOOK_FILE_EXTENSIONS):
+            if enabled:
+                extensions.add(suffix)
+            else:
+                extensions.discard(suffix)
 
 
 def configure_xcf_loading(enabled: bool) -> None:

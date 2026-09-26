@@ -44,7 +44,9 @@ Windows連携は設定画面で利用者が明示的に登録した場合だけ�
 - RAR / CBR（利用者環境のWinRARまたは7-Zipを使用）
 - 7z / CB7（利用者環境の対応済みWinRAR CLI構成または7-Zipを使用）
 - PDF（pypdfium2 v5／PDFiumを使用）
-- 画像: JPEG、PNG、WebP、AVIF、JPEG XL（JXL）、BMP、GIF、TIFF、ICO、PSD、PSB、KRA、ORA、CLIP、XCF
+- 画像: JPEG、PNG、WebP、AVIF、JPEG XL（JXL）、BMP、GIF、TIFF、ICO、PSD、PSB、KRA、ORA、CLIP、XCF、AI、SVG
+
+AI（PDF互換保存の先頭ページ）とSVG（静止画）にも対応します。Browser・Viewer・書庫内で1ファイルを1画像として表示し、拡大時は必要なサイズで再描画します。AI・SVGは既定ONで、「設定 → 書庫 → AI・SVG画像」で個別にOFFにできます（再起動後に反映）。チェック項目のツールチップと「？」に制約とAIの再保存方法を記載しています。SVGの外部参照・アニメーション・一部効果、PDF非互換AI、EPS、AIT、SVGZは非対応です。フォントや効果は元アプリと異なる場合があります。
 
 KRAは保存済み`mergedimage.png`、ORAは仕様上の`mergedimage.png`を表示します。
 CLIPはPhase 2では保存済みCanvasPreviewの表示のみで、原寸レンダーではありません。

@@ -1159,3 +1159,7 @@ ENGLISH.update({
     '同時読み込み数は画像フォルダとZIPに適用します。ZIPの並列展開は最大1ページ分です。読み込み数を増やすと、ページを戻す操作が遅くなる場合があります。変更は次にファイルを開いたときから適用します。':
         'Applies to image folders and ZIP files. ZIP extraction runs at most one page ahead. More concurrent loads can slow backward navigation. Changes apply the next time you open a file.',
 })
+
+ENGLISH.update({'AI・SVG画像': 'AI / SVG images', 'AI画像の読み込みを有効にする（再起動後に反映）': 'Enable AI image loading (restart required)', 'SVG画像の読み込みを有効にする（再起動後に反映）': 'Enable SVG image loading (restart required)', 'PDF互換で保存されたAIの先頭ページだけを表示します。非互換AIはIllustratorで「PDF互換ファイルを作成」を有効にして再保存してください。編集データや全アートボードを再現する機能ではありません。': 'Displays only the first page of PDF-compatible AI files. For other AI files, save again in Illustrator with Create PDF Compatible File enabled. Editing data and all artboards are not reproduced.', '外部参照を含まない静止画SVGを表示します。外部ファイル参照・アニメーション・一部の効果は非対応です。フォントや描画結果が元のアプリと異なる場合があります。': 'Displays static SVG files without external references. External files, animation and some effects are unsupported. Fonts and rendering may differ from the original application.'})
+
+ENGLISH.update({'PDF互換で保存されたAIに対応しています。非互換または破損したAIは表示できません。': 'PDF-compatible AI files are supported. Incompatible or damaged AI files cannot be displayed.', '外部参照を含まない静止画SVGに対応しています。': 'Only static SVG files without external references are supported.'})

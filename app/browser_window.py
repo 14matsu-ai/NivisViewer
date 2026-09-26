@@ -1027,7 +1027,7 @@ class BrowserWindow(QMainWindow):
         self._page_count_request_identity: tuple[int, str] | None = None
 
         self.rating_rename_service = RatingRenameService()
-        self.image_detail_probe = BrowserImageDetailProbe(self)
+        self.image_detail_probe = BrowserImageDetailProbe(self, pdfium_service=self.pdfium_service)
         self.image_detail_probe.completed.connect(
             self._on_image_detail_completed
         )

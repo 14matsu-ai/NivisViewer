@@ -80,6 +80,7 @@ class ViewerImage:
     split_range: tuple[int, int, int, int] | None = None
     display_prepared: bool = False
     source_is_preview: bool = False
+    is_vector: bool = False
 
 
 @dataclass(frozen=True)
@@ -2305,6 +2306,7 @@ class ViewerWidget(QWidget):
                     source_identity=source.source_identity,
                     split_range=source.split_range,
                     source_is_preview=source.source_is_preview,
+                    is_vector=source.is_vector,
                 )
             )
         self._images = attached
@@ -2911,7 +2913,7 @@ class ViewerWidget(QWidget):
         self._magnifier_pixmap = None
         self._magnifier_key = None
         self._magnifier_waiting_for_pdf = False
-        if all(page.rendered_size is not None for _, page, _ in self._last_image_layout):
+        if all(page.rendered_size is not None and not page.is_vector for _, page, _ in self._last_image_layout):
             # QPixmap is implicitly shared. Entry retains only already painted
             # surfaces: no toImage, whole-page allocation, or resize job.
             self._pdf_loupe_fallbacks = {
@@ -3106,7 +3108,7 @@ class ViewerWidget(QWidget):
             self._magnifier_pdf_source_key = 0
             signal = (
                 self.magnifierPdfResolutionRequested
-                if image.rendered_size is not None
+                if image.rendered_size is not None and not image.is_vector
                 else self.magnifierSourceResolutionRequested
             )
             signal.emit(
@@ -3117,7 +3119,12 @@ class ViewerWidget(QWidget):
             return
 
         promotion = None
-        if allow_pdf_request and image.source_is_preview:
+        vector_needs_render = True
+        if image.is_vector:
+            from .vector_image_decoder import target_size
+            required = target_size(image.original_size, (target_width, target_height))
+            vector_needs_render = image.qimage.width() < required[0] or image.qimage.height() < required[1]
+        if allow_pdf_request and image.source_is_preview and vector_needs_render:
             source_key = int(image.qimage.cacheKey())
             if not (
                 self._magnifier_waiting_for_pdf
@@ -3127,7 +3134,7 @@ class ViewerWidget(QWidget):
                 self._magnifier_pdf_source_key = source_key
                 promotion = self.magnifierSourceResolutionRequested, QSize(target_width, target_height)
 
-        elif allow_pdf_request and image.rendered_size is not None:
+        elif allow_pdf_request and image.rendered_size is not None and not image.is_vector:
             required_width = max(
                 source_size.width(),
                 target_width,
@@ -3273,11 +3280,11 @@ class ViewerWidget(QWidget):
             if allow_promotion:
                 if fallback or image.source_is_preview or image.rendered_size is not None:
                     previous = self._magnifier_spread_promotions.get(image_id)
-                    pdf = image.rendered_size is not None
+                    pdf = image.rendered_size is not None and not image.is_vector
                     # Raster hydration already requests the full source once.
                     # PDF resolution is target-sized, so a larger zoom needs
                     # an upgrade; policy-only changes/repeated targets do not.
-                    if previous is None or (pdf and (
+                    if previous is None or ((pdf or image.is_vector) and (
                         width > previous.width() or height > previous.height()
                     )):
                         target = QSize(
@@ -3285,6 +3292,10 @@ class ViewerWidget(QWidget):
                             max(height, previous.height() if previous else 0),
                         )
                         self._magnifier_spread_promotions[image_id] = target
+                        if image.is_vector and self.rotation_angle in {90, 270}:
+                            target = QSize(target.height(), target.width())
+                        if image.is_vector and image.split_range and image.qimage is not None:
+                            target.setWidth(round(target.width() * image.qimage.width() / max(1, image.split_range[2])))
                         promotions.append((image.page_index, target, pdf))
         ready = all(image_id in self._magnifier_spread_pixmaps for _, image_id in self._magnifier_spread_layout)
         for task in tuple(self._render_tasks):

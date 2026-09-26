@@ -456,6 +456,9 @@ class BrowserThumbnailProvider(QObject):
         generation: int | None = None,
         priority: ThumbnailPriority = ThumbnailPriority.VISIBLE,
     ) -> bool:
+        from .supported_formats import VECTOR_IMAGE_EXTENSIONS, ENABLED_IMAGE_EXTENSIONS
+        if item.path.suffix.casefold() in VECTOR_IMAGE_EXTENSIONS - ENABLED_IMAGE_EXTENSIONS:
+            return False
         if item.path.suffix.casefold() in XCF_EXTENSIONS and not xcf_loading_enabled():
             return False
         if self._closed:
@@ -1465,6 +1468,26 @@ class BrowserThumbnailProvider(QObject):
 
     @staticmethod
     def load_thumbnail_result(
+        item: BrowserItem,
+        size: int | ThumbnailRenderSpec,
+        archive_backend_registry=None,
+        cancel_token=None,
+        pdfium_service=None,
+        pdf_render_priority: int = int(PdfRenderPriority.THUMBNAIL_VISIBLE),
+        smart_crop_cache: SmartCropCache | None = None,
+        page_count_callback: Callable[[int], None] | None = None,
+        capture_source_identity: bool = False,
+    ) -> ThumbnailLoadResult:
+        from .vector_image_decoder import vector_context
+        with vector_context(pdfium_service, cancel_token, pdf_render_priority):
+            return BrowserThumbnailProvider._load_thumbnail_result_bound(
+                item, size, archive_backend_registry, cancel_token, pdfium_service,
+                pdf_render_priority, smart_crop_cache, page_count_callback,
+                capture_source_identity,
+            )
+
+    @staticmethod
+    def _load_thumbnail_result_bound(
         item: BrowserItem,
         size: int | ThumbnailRenderSpec,
         archive_backend_registry=None,
@@ -2612,7 +2635,10 @@ class BrowserThumbnailProvider(QObject):
         try:
             require_local(path)
             stat = path.stat()
-            if path.suffix.casefold() in PSD_EXTENSIONS:
+            if path.suffix.casefold() in {'.svg', '.ai'}:
+                from .vector_image_decoder import vector_pil
+                image_context = vector_pil(path, path.suffix.casefold(), (spec.long_edge, spec.long_edge))
+            elif path.suffix.casefold() in PSD_EXTENSIONS:
                 image_context = decode_psd_thumbnail(
                     path,
                     minimum_long_edge=spec.long_edge,
@@ -2789,7 +2815,14 @@ class BrowserThumbnailProvider(QObject):
                         raise InterruptedError
                     try:
                         with source.open(name, "r") as file:
-                            if Path(name).suffix.casefold() in PSD_EXTENSIONS:
+                            if Path(name).suffix.casefold() in {'.svg', '.ai'}:
+                                from .vector_image_decoder import vector_pil, MAX_SVG_BYTES, MAX_INPUT_BYTES
+                                suffix = Path(name).suffix.casefold()
+                                limit = MAX_SVG_BYTES if suffix == '.svg' else MAX_INPUT_BYTES
+                                if source.getinfo(name).file_size > limit:
+                                    continue
+                                image_context = vector_pil(file.read(limit + 1), suffix, (spec.long_edge, spec.long_edge))
+                            elif Path(name).suffix.casefold() in PSD_EXTENSIONS:
                                 if source.getinfo(name).file_size > MAX_IMAGE_ENTRY_BYTES:
                                     continue
                                 image_context = decode_psd_thumbnail(

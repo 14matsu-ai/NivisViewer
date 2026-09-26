@@ -34,7 +34,7 @@ from .archive_backend_registry import ArchiveBackendRegistry
 from .browser_window import BrowserWindow
 from .config_manager import ConfigManager
 from .gimp_xcf_backend import configure_gimp_executable
-from .supported_formats import configure_xcf_loading
+from .supported_formats import configure_xcf_loading, configure_vector_loading
 from .file_operation_coordinator import FileOperationCoordinator
 from .file_conflict_dialog import ConflictResolutionDialog
 from .file_operation_panel import FileOperationPanel
@@ -107,6 +107,8 @@ class ApplicationController(QObject):
         self.settings = self.config.load()
         configure_gimp_executable(self.settings.get("gimp_executable", ""))
         configure_xcf_loading(bool(self.settings.get("xcf_loading_enabled", False)))
+        configure_vector_loading(ai=bool(self.settings.get("ai_loading_enabled", True)),
+                                 svg=bool(self.settings.get("svg_loading_enabled", True)))
         initialize_ui_language(self.settings.get("ui_language", "ja"))
         self.metadata_store = metadata_store or MetadataStore(
             self.config.metadata_database_path,

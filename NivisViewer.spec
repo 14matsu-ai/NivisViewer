@@ -35,7 +35,7 @@ a = Analysis(
         (str(root / "licenses"), "licenses"),
         (str(root / "assets" / "icons"), "assets/icons"),
     ],
-    hiddenimports=["pillow_jxl.JpegXLImagePlugin", "PIL.AvifImagePlugin"],
+    hiddenimports=["pillow_jxl.JpegXLImagePlugin", "PySide6.QtSvg", "PIL.AvifImagePlugin"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[str(root / "scripts" / "frozen_smoke_hook.py")],

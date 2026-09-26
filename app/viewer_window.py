@@ -3803,6 +3803,8 @@ class ViewerWindow(QMainWindow):
             decoder_maximum_size=decoder_bound,
             decoder_headroom=self._current_book_runtime_decode_headroom(),
             decoder_layout_sized=True,
+            vector_minimum_size=(getattr(self, '_vector_magnifier_size', None)
+                                 if self.viewer.magnifier_selecting or self.viewer.magnifier_active else None),
         )
         return RasterRequest(
             self.book_session.generation,
@@ -4119,6 +4121,7 @@ class ViewerWindow(QMainWindow):
                     split_range=page.split_range,
                     display_prepared=(page.pixmap is not None),
                     source_is_preview=page.source_is_preview,
+                    is_vector=Path(page.logical_image_id).suffix.casefold() in {".svg", ".ai"},
                 )
             )
         for slot in self._display_unit.slots:
@@ -4179,7 +4182,8 @@ class ViewerWindow(QMainWindow):
                 request_id=frame.request_id,
             )
         if any(
-            page.source_qimage is not None and not page.source_is_preview
+            page.source_qimage is not None and (not page.source_is_preview
+                or Path(page.logical_image_id).suffix.casefold() in {".svg", ".ai"})
             for page in frame.pages
         ):
             self.viewer.resume_magnifier_after_source_render()
@@ -6920,6 +6924,7 @@ class ViewerWindow(QMainWindow):
         if isinstance(self.book_session.source, PdfImageSource):
             return
         if self._zip_runtime_active:
+            self._vector_magnifier_size = (max(1, _physical_size.width()), max(1, _physical_size.height()))
             # The full-source render spec has its own key.  Adopting that
             # request is enough to hydrate the current page; clearing every
             # ready QPixmap would unnecessarily destroy navigation hits.

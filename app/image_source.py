@@ -627,6 +627,7 @@ class ImageSource(ABC):
 
     def __init__(self, source_path: str | Path) -> None:
         self.source_path = Path(source_path)
+        self.vector_pdfium_service = None
 
     @abstractmethod
     def list_images(self) -> list[str]:
@@ -645,6 +646,50 @@ class ImageSource(ABC):
 
     def logical_size(self, image_id: str) -> tuple[int, int] | None:
         return None
+
+    def _vector_payload(self, image_id, cancel_token=None):
+        from .vector_image_decoder import read_vector, MAX_INPUT_BYTES, MAX_SVG_BYTES, check_cancel
+        suffix = Path(image_id).suffix.casefold()
+        if suffix not in IMAGE_EXTENSIONS:
+            raise ImageSourceError("Vector loading is disabled")
+        limit = MAX_SVG_BYTES if suffix == '.svg' else MAX_INPUT_BYTES
+        require_local(self.source_path)
+        check_cancel(cancel_token)
+        if isinstance(self, FolderImageSource):
+            return read_vector(image_id, suffix)
+        if isinstance(self, ZipImageSource):
+            cancelled = self._begin_request(image_id)
+            try:
+                with self._lock:
+                    info = self._zip.getinfo(image_id)
+                    if info.file_size > limit:
+                        raise ImageSourceError('Vector entry exceeds limit')
+                    with self._zip.open(info) as stream:
+                        data = stream.read(limit + 1)
+                self._raise_if_cancelled(cancelled)
+                check_cancel(cancel_token)
+                return read_vector(data, suffix)
+            finally:
+                self._finish_request(image_id, cancelled)
+        if isinstance(self, SevenZipImageSource):
+            entry = self._entry_by_id.get(image_id)
+            if entry is None or entry.size is None or entry.size > limit:
+                raise ImageSourceError('Vector entry exceeds limit')
+            data = self._read_payload(image_id)
+            check_cancel(cancel_token)
+            return read_vector(data, suffix)
+        raise ImageSourceError('Vector source unavailable')
+
+    def render_vector(self, image_id, bounds=None, *, probe=False, cancel_token=None):
+        from .vector_image_decoder import render_vector
+        return render_vector(self._vector_payload(image_id, cancel_token),
+                             Path(image_id).suffix.casefold(), bounds, probe=probe,
+                             service=self.vector_pdfium_service, cancel_token=cancel_token)
+
+    def _open_vector_image(self, image_id, bounds=None):
+        from .vector_image_decoder import vector_pil
+        return vector_pil(self._vector_payload(image_id), Path(image_id).suffix.casefold(), bounds,
+                          service=self.vector_pdfium_service)
 
     def page_identity(self, image_id: str) -> str:
         return str(image_id)
@@ -858,6 +903,8 @@ class FolderImageSource(ImageSource):
         return self.index_for_identity(os.fspath(path))
 
     def open_image(self, image_id: str) -> Image.Image:
+        if Path(image_id).suffix.casefold() in {'.svg', '.ai'}:
+            return self._open_vector_image(image_id)
         try:
             require_local(image_id)
             if Path(image_id).suffix.casefold() in PSD_EXTENSIONS:
@@ -986,6 +1033,8 @@ class FolderImageSource(ImageSource):
         return jpeg_native_reduction_size(logical_size, maximum_size)
 
     def logical_size(self, image_id: str) -> tuple[int, int] | None:
+        if Path(image_id).suffix.casefold() in {'.svg', '.ai'}:
+            return self.render_vector(image_id, probe=True)
         with self._metadata_lock:
             cached = self._size_cache.get(image_id)
         if cached is not None:
@@ -1029,6 +1078,8 @@ class FolderImageSource(ImageSource):
             return None
 
     def probe_image_is_animated(self, image_id: str) -> bool | None:
+        if Path(image_id).suffix.casefold() in {'.svg', '.ai'}:
+            return False
         with self._metadata_lock:
             if image_id in self._animation_cache:
                 return self._animation_cache[image_id]
@@ -1069,6 +1120,9 @@ class FolderImageSource(ImageSource):
         two optional formats not covered by the app's Qt runtime.
         """
 
+        if Path(image_id).suffix.casefold() in {'.svg', '.ai'}:
+            return self.render_vector(image_id, probe=True)
+
         with self._metadata_lock:
             cached = self._size_cache.get(image_id)
         if cached is not None:
@@ -1102,13 +1156,15 @@ class FolderImageSource(ImageSource):
             return self._file_size_cache.get(self._path_identity(image_id))
 
     def fork_for_thumbnail(self) -> ImageSource:
-        return FolderImageSource(
+        source = FolderImageSource(
             self.source_path,
             recursive=self.recursive,
             sort_descending=self.sort_descending,
             image_snapshot=tuple(self.list_images()),
             listing_snapshot=self.listing_snapshot,
         )
+        source.vector_pdfium_service = self.vector_pdfium_service
+        return source
 
 
 class ZipImageSource(ImageSource):
@@ -1158,6 +1214,8 @@ class ZipImageSource(ImageSource):
         return list(self._listed_images)
 
     def open_image(self, image_id: str) -> Image.Image:
+        if Path(image_id).suffix.casefold() in {'.svg', '.ai'}:
+            return self._open_vector_image(image_id)
         _require_image_decoder(image_id)
         cancelled = self._begin_request(image_id)
         try:
@@ -1422,6 +1480,9 @@ class ZipImageSource(ImageSource):
         Unusually large headers fall back to geometry from the actual decode.
         """
 
+        if Path(image_id).suffix.casefold() in {'.svg', '.ai'}:
+            return self.render_vector(image_id, probe=True)
+
         cached = self._size_cache.get(image_id)
         if cached is not None:
             return cached
@@ -1554,6 +1615,9 @@ class ZipImageSource(ImageSource):
 
     def probe_image_is_animated(self, image_id: str) -> bool | None:
         """Inspect one ZIP image header without allocating pixel storage."""
+
+        if Path(image_id).suffix.casefold() in {'.svg', '.ai'}:
+            return False
 
         if Path(image_id).suffix.casefold() in PSD_EXTENSIONS:
             return False
@@ -1806,10 +1870,12 @@ class ZipImageSource(ImageSource):
             return None
 
     def fork_for_thumbnail(self) -> ImageSource:
-        return ZipImageSource(
+        source = ZipImageSource(
             self.source_path,
             sort_descending=self.sort_descending,
         )
+        source.vector_pdfium_service = self.vector_pdfium_service
+        return source
 
     def close(self) -> None:
         close_zip = False
@@ -2019,6 +2085,8 @@ class SevenZipImageSource(ImageSource):
                         self._active_requests.pop(image_id, None)
 
     def open_image(self, image_id: str) -> Image.Image:
+        if Path(image_id).suffix.casefold() in {'.svg', '.ai'}:
+            return self._open_vector_image(image_id)
         _require_image_decoder(image_id)
         data = self._read_payload(image_id)
         try:
@@ -2041,6 +2109,8 @@ class SevenZipImageSource(ImageSource):
     def open_thumbnail_image(
         self, image_id: str, *, minimum_long_edge: int
     ) -> Image.Image:
+        if Path(image_id).suffix.casefold() in {'.svg', '.ai'}:
+            return self._open_vector_image(image_id, (minimum_long_edge, minimum_long_edge))
         suffix = Path(image_id).suffix.casefold()
         if (
             suffix not in PSD_EXTENSIONS
@@ -2098,6 +2168,8 @@ class SevenZipImageSource(ImageSource):
         return jpeg_native_reduction_size(logical_size, maximum_size)
 
     def probe_image_size(self, image_id: str) -> tuple[int, int] | None:
+        if Path(image_id).suffix.casefold() in {'.svg', '.ai'}:
+            return self.render_vector(image_id, probe=True)
         _require_image_decoder(image_id)
         data = self._read_payload(image_id)
         try:
@@ -2139,12 +2211,14 @@ class SevenZipImageSource(ImageSource):
         return entry.size if entry is not None else None
 
     def fork_for_thumbnail(self) -> ImageSource:
-        return SevenZipImageSource(
+        source = SevenZipImageSource(
             self.source_path,
             backend=self.backend,
             sort_descending=self.sort_descending,
             listing_snapshot=self._listing_snapshot,
         )
+        source.vector_pdfium_service = self.vector_pdfium_service
+        return source
 
     def close(self) -> None:
         self._closed.set()
@@ -2156,7 +2230,7 @@ class SevenZipImageSource(ImageSource):
                     cancelled.set()
 
 
-def create_image_source(
+def _create_image_source(
     path: str | Path,
     *,
     recursive_folder: bool = False,
@@ -2266,3 +2340,9 @@ def _path_identity_key(path: str | Path) -> str:
     return os.path.normcase(
         os.path.abspath(os.path.normpath(os.fspath(path)))
     ).casefold()
+
+
+def create_image_source(path, **kwargs):
+    source, selected = _create_image_source(path, **kwargs)
+    source.vector_pdfium_service = kwargs.get('pdfium_service')
+    return source, selected

@@ -204,6 +204,44 @@ class PdfiumBackend:
             if page is not None:
                 page.close()
 
+    def render_ai(self, data, bounds, *, probe=False, cancel_token=None):
+        # One owner-thread operation owns both immutable bytes and all native handles.
+        from .vector_image_decoder import target_size, check_cancel
+        from PySide6.QtGui import QImage
+        from PySide6.QtCore import Qt
+        check_cancel(cancel_token)
+        document = page = bitmap = image = copied = None
+        try:
+            document = self._module().PdfDocument(data)
+            if len(document) < 1:
+                raise PdfBackendError(PdfErrorCode.ZERO_PAGES)
+            page = document[0]
+            width, height = validate_page_size(*page.get_size())
+            logical = (max(1, round(width * 96 / 72)), max(1, round(height * 96 / 72)))
+            target_size(logical, logical)
+            check_cancel(cancel_token)
+            if probe:
+                return logical
+            target = target_size(logical, bounds)
+            bitmap = page.render(scale=min(target[0] / width, target[1] / height),
+                                 fill_color=(0, 0, 0, 0), draw_annots=True,
+                                 limit_image_cache=True, rev_byteorder=True, maybe_alpha=True)
+            image = bitmap.to_pil()
+            copied = image.convert('RGBA')
+            pixels = copied.tobytes('raw', 'RGBA')
+            result = QImage(pixels, copied.width, copied.height, copied.width * 4,
+                            QImage.Format.Format_RGBA8888).copy()
+            if (result.width(), result.height()) != target:
+                result = result.scaled(*target, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            check_cancel(cancel_token)
+            return result, logical
+        finally:
+            from contextlib import ExitStack
+            with ExitStack() as cleanup:
+                for owned in (document, page, bitmap, image, copied):
+                    if owned is not None:
+                        cleanup.callback(owned.close)
+
     def close_document(self, document_id: str) -> None:
         with self._lock:
             state = self._documents.get(document_id)

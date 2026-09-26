@@ -10,6 +10,7 @@ from . import pillow_plugins  # noqa: F401 - also supports standalone probes
 
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 
 from PIL import Image
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
@@ -32,8 +33,10 @@ class _ProbeSignals(QObject):
 
 
 class _ProbeWorker(QRunnable):
-    def __init__(self, path: str, generation: int) -> None:
+    def __init__(self, path: str, generation: int, pdfium_service=None) -> None:
         super().__init__()
+        self.pdfium_service = pdfium_service
+        self.cancelled = Event()
         self.path = path
         self.generation = generation
         self.signals = _ProbeSignals()
@@ -42,6 +45,14 @@ class _ProbeWorker(QRunnable):
     def run(self) -> None:
         dimensions: tuple[int, int] | None = None
         try:
+            from .cloud_files import require_local
+            require_local(self.path)
+            if Path(self.path).suffix.casefold() in {'.svg', '.ai'}:
+                from .vector_image_decoder import render_vector
+                dimensions = render_vector(self.path, Path(self.path).suffix.casefold(),
+                                           probe=True, service=self.pdfium_service, priority=60, cancel_token=self.cancelled)
+                self.signals.completed.emit(BrowserImageDetailResult(self.path, self.generation, dimensions))
+                return
             if is_psd_image_id(self.path):
                 with open(self.path, "rb") as source:
                     dimensions = probe_psd_size_from_header(source.read(PSD_HEADER_SIZE))
@@ -87,8 +98,9 @@ class _ProbeWorker(QRunnable):
 class BrowserImageDetailProbe(QObject):
     completed = Signal(object)
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(self, parent: QObject | None = None, *, pdfium_service=None) -> None:
         super().__init__(parent)
+        self.pdfium_service = pdfium_service
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(1)
         self._workers: set[_ProbeWorker] = set()
@@ -97,13 +109,14 @@ class BrowserImageDetailProbe(QObject):
         # Selection scrubbing keeps at most the active probe plus the newest
         # pending identity. Stale results are still fenced by the Browser.
         for pending in tuple(self._workers):
+            pending.cancelled.set()
             try:
                 removed = self._pool.tryTake(pending)
             except RuntimeError:
                 removed = False
             if removed:
                 self._workers.discard(pending)
-        worker = _ProbeWorker(str(path), int(generation))
+        worker = _ProbeWorker(str(path), int(generation), self.pdfium_service)
         self._workers.add(worker)
         worker.signals.completed.connect(
             lambda result, owned=worker: self._finish(result, owned)
@@ -119,6 +132,8 @@ class BrowserImageDetailProbe(QObject):
         self.completed.emit(result)
 
     def close(self, msecs: int = -1) -> bool:
+        for worker in self._workers:
+            worker.cancelled.set()
         self._pool.clear()
         completed = self._pool.waitForDone(int(msecs))
         if completed:

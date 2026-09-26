@@ -43,4 +43,5 @@ def test_new_window_and_reuse_are_mutually_exclusive():
 
 
 def test_version_text_uses_central_version():
-    assert version_text() == "NivisViewer 1.0.17"
+    from app.version import __version__
+    assert version_text() == f"NivisViewer {__version__}"

@@ -476,7 +476,12 @@ class _ViewerPageThumbnailJob(QRunnable):
 
     def _decode(self, source) -> QImage:
         edge = self.key.spec.physical_edge
-        qimage = self._target_qimage(source, edge)
+        if Path(self.key.image_id).suffix.casefold() in {'.svg', '.ai'}:
+            from .vector_image_decoder import vector_context
+            with vector_context(cancel_token=self.cancelled, priority=50):
+                qimage, _logical = source.render_vector(self.key.image_id, (edge, edge), cancel_token=self.cancelled)
+        else:
+            qimage = self._target_qimage(source, edge)
         if qimage is None or qimage.isNull():
             qimage = self._direct_qimage(source)
         if qimage is None or qimage.isNull():

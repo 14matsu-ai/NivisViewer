@@ -65,6 +65,7 @@ from .viewer_render import (
     resampling_policy_for_legacy_mode,
 )
 from .viewer_widget import calculate_spread_layout
+from .vector_image_decoder import VECTOR_SUFFIXES, RENDERER_VERSION, target_size as vector_target_size
 
 
 _DEFAULT_CACHE_BYTES = 256 * 1024 * 1024
@@ -175,6 +176,7 @@ class ZipRasterRenderSpec:
     decoder_maximum_size: DecoderMaximumSize | None = None
     decoder_headroom: float = 1.0
     decoder_layout_sized: bool = False
+    vector_minimum_size: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         viewport = (
@@ -326,6 +328,8 @@ def _retained_source_size_for_page(
     logical_size: tuple[int, int],
     decoder_maximum: DecoderMaximumSize | None,
 ) -> tuple[int, int]:
+    if Path(page.image_id).suffix.casefold() in VECTOR_SUFFIXES:
+        return _vector_size_for_page(render_spec, unit, page, logical_size)
     if _can_prepare_pillow_preview(
         render_spec,
         unit,
@@ -440,6 +444,34 @@ def _display_frame_bytes_for_sizes(
     return max(1, frame_bytes)
 
 
+def _vector_size_for_page(spec, unit, page, logical=None):
+    logical = logical or page.known_size or (360, 520)
+    expanded = []
+    for candidate in unit.pages:
+        size = logical if candidate.image_id == page.image_id else (candidate.known_size or logical)
+        w, h = size
+        if spec.split_wide_image and unit.is_single and w >= 2 and w / h >= 1.25:
+            expanded.extend([(candidate.image_id, (w // 2, h)), (candidate.image_id, (w - w // 2, h))])
+        else:
+            expanded.append((candidate.image_id, size))
+    rotated = spec.rotation in {90, 270}
+    layout = calculate_spread_layout(
+        [(h, w) if rotated else (w, h) for _, (w, h) in expanded], spec.viewport_size,
+        fit_mode=spec.fit_mode, manual_zoom=spec.manual_zoom, gap=spec.gap,
+        join_spread_pages=spec.join_spread_pages, spread_is_single=unit.is_single,
+        horizontal_alignment=spec.horizontal_alignment,
+    )
+    scale = 0.0
+    for (image_id, (w, h)), rect in zip(expanded, layout.rects):
+        if image_id == page.image_id:
+            rw, rh = (rect.height(), rect.width()) if rotated else (rect.width(), rect.height())
+            scale = max(scale, rw * spec.device_pixel_ratio / w, rh * spec.device_pixel_ratio / h)
+    bounds = (max(1, ceil(logical[0] * scale)), max(1, ceil(logical[1] * scale)))
+    if spec.vector_minimum_size:
+        bounds = tuple(max(a, b) for a, b in zip(bounds, spec.vector_minimum_size))
+    return vector_target_size(logical, bounds)
+
+
 def _decoder_maximum_for_page(
     render_spec: ZipRasterRenderSpec,
     unit: ZipRasterDisplayUnit,
@@ -453,6 +485,8 @@ def _decoder_maximum_for_page(
     historical box semantics for compatibility.
     """
 
+    if Path(page.image_id).suffix.casefold() in VECTOR_SUFFIXES:
+        return _vector_size_for_page(render_spec, unit, page)
     maximum_size = render_spec.decoder_maximum_size
     if maximum_size is None:
         return None
@@ -675,6 +709,7 @@ class _SourceKey:
     adjustments: tuple[float, float, float]
     pixel_size: tuple[int, int]
     full_resolution: bool
+    renderer_version: int = 0
 
 
 @dataclass(frozen=True)
@@ -924,7 +959,9 @@ class _ZipRasterSourceStore:
         candidates = tuple(
             self._sources[key]
             for key in group or ()
-            if self._satisfies(self._sources[key], required_size)
+            if self._satisfies(self._sources[key],
+                _vector_size_for_page(render_spec, display_unit, page, self._sources[key].original_size)
+                if Path(page.image_id).suffix.casefold() in VECTOR_SUFFIXES else required_size)
         )
         if not candidates:
             return None
@@ -1357,6 +1394,11 @@ class _ZipRasterSourceStore:
         source: _CachedSource,
         maximum_size: DecoderMaximumSize | None,
     ) -> bool:
+        if Path(source.key.image_id).suffix.casefold() in VECTOR_SUFFIXES:
+            required = vector_target_size(source.original_size, maximum_size)
+            return (source.key.renderer_version == RENDERER_VERSION
+                    and source.qimage.width() >= required[0]
+                    and source.qimage.height() >= required[1])
         if not source.source_is_preview:
             return True
         return _qimage_satisfies_source_requirement(
@@ -1745,6 +1787,12 @@ class _ZipRasterUnitJob(QRunnable):
 
     @Slot()
     def run(self) -> None:
+        from .vector_image_decoder import vector_context
+        priority = 20 if self.prefetch_budget_bytes is not None else 0
+        with vector_context(getattr(self.source, 'vector_pdfium_service', None), self.cancelled, priority):
+            self._run_owned()
+
+    def _run_owned(self) -> None:
         self.started.set()
         pages: tuple[_RenderedPage, ...] = ()
         metadata = (
@@ -1969,6 +2017,13 @@ class _ZipRasterUnitJob(QRunnable):
                     page.known_size or (360, 520),
                     False,
                 )
+            if suffix in VECTOR_SUFFIXES:
+                self.source_decode_started.set()
+                original_size = page.known_size or self.source.render_vector(
+                    page.image_id, probe=True, cancel_token=self.cancelled)
+                decoder_maximum = _vector_size_for_page(spec, self.unit, page, original_size)
+                qimage, original_size = self.source.render_vector(
+                    page.image_id, decoder_maximum, cancel_token=self.cancelled)
             if suffix in _JPEG_SUFFIXES:
                 # Keep JPEGs on the same bounded/native decoder path even when
                 # the caller requests the full source.  Besides avoiding a
@@ -2132,7 +2187,7 @@ class _ZipRasterUnitJob(QRunnable):
                 raise ImageSourceError(tr('画像decoderが結果を返しませんでした。'))
             logical = original_size or (qimage.width(), qimage.height())
             logical = (max(1, int(logical[0])), max(1, int(logical[1])))
-            source_is_preview = (qimage.width(), qimage.height()) != logical
+            source_is_preview = suffix in VECTOR_SUFFIXES or (qimage.width(), qimage.height()) != logical
             source_key = _SourceKey(
                 self.key.source_epoch,
                 self.key.source_identity,
@@ -2140,6 +2195,7 @@ class _ZipRasterUnitJob(QRunnable):
                 spec.adjustments,
                 (qimage.width(), qimage.height()),
                 not source_is_preview,
+                RENDERER_VERSION if suffix in VECTOR_SUFFIXES else 0,
             )
             return _DecodedPage(
                 page,
