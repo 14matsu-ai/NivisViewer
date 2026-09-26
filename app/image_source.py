@@ -34,7 +34,14 @@ from .supported_formats import (
     EXTERNAL_ARCHIVE_EXTENSIONS,
     IMAGE_EXTENSIONS,
     PDF_EXTENSIONS,
+    PSD_EXTENSIONS,
     ZIP_ARCHIVE_EXTENSIONS,
+)
+from .psd_decoder import (
+    PSD_HEADER_SIZE,
+    decode_psd_image,
+    decode_psd_thumbnail,
+    probe_psd_size_from_header,
 )
 
 SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS
@@ -838,6 +845,19 @@ class FolderImageSource(ImageSource):
 
     def open_image(self, image_id: str) -> Image.Image:
         try:
+            if Path(image_id).suffix.casefold() in PSD_EXTENSIONS:
+                data = _read_image_file_bytes(image_id)
+                result = decode_psd_image(data)
+                setattr(result, "_nivis_source_is_animated", False)
+                self._remember_folder_metadata(
+                    image_id,
+                    byte_count=len(data),
+                    size=result.size,
+                )
+                with self._metadata_lock:
+                    self._animation_cache[image_id] = False
+                return result
+
             # Detach the decoder from the filesystem before Pillow performs
             # potentially expensive pixel decoding.  On Windows this avoids
             # holding the source file open while a queued Viewer task runs.
@@ -935,6 +955,20 @@ class FolderImageSource(ImageSource):
             cached = self._size_cache.get(image_id)
         if cached is not None:
             return cached
+
+        if Path(image_id).suffix.casefold() in PSD_EXTENSIONS:
+            try:
+                header = _read_image_file_bytes(
+                    image_id,
+                    maximum_bytes=PSD_HEADER_SIZE,
+                )
+            except OSError:
+                return None
+            logical = probe_psd_size_from_header(header)
+            if logical is not None:
+                self._remember_folder_metadata(image_id, size=logical)
+            return logical
+
         try:
             with Image.open(image_id) as image:
                 width, height = image.size
@@ -951,6 +985,12 @@ class FolderImageSource(ImageSource):
         with self._metadata_lock:
             if image_id in self._animation_cache:
                 return self._animation_cache[image_id]
+
+        if Path(image_id).suffix.casefold() in PSD_EXTENSIONS:
+            with self._metadata_lock:
+                self._animation_cache[image_id] = False
+            return False
+
         try:
             suffix = Path(image_id).suffix.casefold()
             data = _read_image_file_bytes(
@@ -982,6 +1022,8 @@ class FolderImageSource(ImageSource):
         if cached is not None:
             return cached
         suffix = Path(image_id).suffix.casefold()
+        if suffix in PSD_EXTENSIONS:
+            return self.logical_size(image_id)
         if suffix in {".avif", ".jxl"}:
             return self.logical_size(image_id)
         reader = QImageReader(image_id)
@@ -1065,15 +1107,26 @@ class ZipImageSource(ImageSource):
         try:
             stream = self._read_entry_stream(image_id, cancelled)
             self._raise_if_cancelled(cancelled)
-            with Image.open(stream) as image:
-                image.seek(0)
-                source_is_animated = bool(
-                    getattr(image, "is_animated", False)
-                    or int(getattr(image, "n_frames", 1)) != 1
-                )
-                result = ImageOps.exif_transpose(image)
-                result.load()
-                setattr(result, "_nivis_source_is_animated", source_is_animated)
+
+            if Path(image_id).suffix.casefold() in PSD_EXTENSIONS:
+                result = decode_psd_image(stream.getvalue())
+                source_is_animated = False
+                setattr(result, "_nivis_source_is_animated", False)
+            else:
+                with Image.open(stream) as image:
+                    image.seek(0)
+                    source_is_animated = bool(
+                        getattr(image, "is_animated", False)
+                        or int(getattr(image, "n_frames", 1)) != 1
+                    )
+                    result = ImageOps.exif_transpose(image)
+                    result.load()
+                    setattr(
+                        result,
+                        "_nivis_source_is_animated",
+                        source_is_animated,
+                    )
+
             with self._lock:
                 self._animation_cache[image_id] = source_is_animated
             if cancelled.is_set():
@@ -1309,6 +1362,38 @@ class ZipImageSource(ImageSource):
         cached = self._size_cache.get(image_id)
         if cached is not None:
             return cached
+
+        if Path(image_id).suffix.casefold() in PSD_EXTENSIONS:
+            cancelled = self._begin_request(image_id)
+            try:
+                self._raise_if_cancelled(cancelled)
+                with self._lock:
+                    try:
+                        info = self._zip.getinfo(image_id)
+                    except KeyError as exc:
+                        raise ImageSourceError(
+                            tr(
+                                '書庫内の画像が見つかりません: {p0}',
+                                p0=image_id,
+                            ),
+                            code=ArchiveErrorCode.ENTRY_NOT_FOUND.value,
+                        ) from exc
+                    if info.file_size > MAX_IMAGE_ENTRY_BYTES:
+                        raise ImageSourceError(
+                            tr('書庫内の画像が大きすぎます。'),
+                            code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
+                        )
+                    with self._zip.open(info, "r") as entry:
+                        header = entry.read(PSD_HEADER_SIZE)
+
+                self._raise_if_cancelled(cancelled)
+                logical = probe_psd_size_from_header(header)
+                if logical is not None:
+                    self._size_cache[image_id] = logical
+                return logical
+            finally:
+                self._finish_request(image_id, cancelled)
+
         cancelled = self._begin_request(image_id)
         try:
             self._raise_if_cancelled(cancelled)
@@ -1374,6 +1459,8 @@ class ZipImageSource(ImageSource):
     def probe_image_is_animated(self, image_id: str) -> bool | None:
         """Inspect one ZIP image header without allocating pixel storage."""
 
+        if Path(image_id).suffix.casefold() in PSD_EXTENSIONS:
+            return False
         if Path(image_id).suffix.casefold() not in {".png", ".webp"}:
             return None
         with self._lock:
@@ -1836,12 +1923,34 @@ class SevenZipImageSource(ImageSource):
         _require_image_decoder(image_id)
         data = self._read_payload(image_id)
         try:
+            if Path(image_id).suffix.casefold() in PSD_EXTENSIONS:
+                result = decode_psd_image(data)
+                setattr(result, "_nivis_source_is_animated", False)
+                return result
             with Image.open(io.BytesIO(data)) as image:
                 image.seek(0)
                 return ImageOps.exif_transpose(image).copy()
         except Exception as exc:
             self._discard_payload(image_id)
             raise ImageSourceError(tr('書庫内の画像を読み込めません: {p0}', p0=image_id), code="decode_failed") from exc
+
+    def open_thumbnail_image(
+        self, image_id: str, *, minimum_long_edge: int
+    ) -> Image.Image:
+        if Path(image_id).suffix.casefold() not in PSD_EXTENSIONS:
+            return self.open_image(image_id)
+        try:
+            return decode_psd_thumbnail(
+                self._read_payload(image_id), minimum_long_edge=minimum_long_edge
+            )
+        except ImageSourceError:
+            raise
+        except Exception as exc:
+            self._discard_payload(image_id)
+            raise ImageSourceError(
+                tr('書庫内の画像を読み込めません: {p0}', p0=image_id),
+                code="decode_failed",
+            ) from exc
 
     def _discard_payload(self, image_id: str) -> None:
         with self._active_lock:
@@ -1876,6 +1985,13 @@ class SevenZipImageSource(ImageSource):
         _require_image_decoder(image_id)
         data = self._read_payload(image_id)
         try:
+            if Path(image_id).suffix.casefold() in PSD_EXTENSIONS:
+                logical = probe_psd_size_from_header(
+                    data[:PSD_HEADER_SIZE]
+                )
+                if logical is None:
+                    raise ValueError("invalid PSD/PSB header")
+                return logical
             with Image.open(io.BytesIO(data)) as image:
                 width, height = image.size
                 if image.getexif().get(274, 1) in {5, 6, 7, 8}:

@@ -28,6 +28,21 @@ codec; its Apache-2.0 OR BSD-2-Clause license texts are in `licenses/packaging/`
 Exact wheel hash, bundled-DLL limitations and integration are recorded in
 `docs/AVIF_JXL_SUPPORT.md`. No dependency is relicensed by this notice.
 
+## PSD / PSB decoder
+
+PSD and PSB read-only viewing uses `psd-tools 1.19.0`
+(https://github.com/psd-tools/psd-tools/tree/v1.19.0).
+The package declares the MIT license. Its original license text is retained at
+`licenses/psd-tools/LICENSE`.
+
+NivisViewer uses the saved merged document preview for Viewer rendering and the
+embedded PSD thumbnail for Browser thumbnails when it is large enough for the
+requested Browser render size. Layer editing is not implemented. The optional
+`psd-tools[composite]` dependency set is deliberately not included in this
+phase, so a document saved without a readable merged preview is reported as
+undecodable instead of being reconstructed with potentially different layer
+effects.
+
 
 ## ZipPlaFork-derived Viewer scheduling and raster-loading structure
 

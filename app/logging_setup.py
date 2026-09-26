@@ -62,6 +62,7 @@ def dependency_versions() -> dict[str, str]:
     for display, distribution in (
         ("PySide6", "PySide6"),
         ("Pillow", "Pillow"),
+        ("psd-tools", "psd-tools"),
         ("natsort", "natsort"),
         ("pypdfium2", "pypdfium2"),
     ):

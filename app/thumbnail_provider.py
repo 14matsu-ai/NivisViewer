@@ -26,11 +26,14 @@ from .browser_model import (
     BrowserItemKind,
 )
 from .browser_thumbnail_scheduler import ThumbnailPriority
+from .archive_backend import MAX_IMAGE_ENTRY_BYTES
 from .file_preview import PreviewResult, PreviewResultKind, PreviewSource
 from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
 from .image_source import EXTERNAL_ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS, SevenZipImageSource
 from .pdf_backend import PageRenderSpec, PdfRenderPriority
+from .psd_decoder import decode_psd_thumbnail
 from .preview_provider_registry import PreviewProviderRegistry
+from .supported_formats import PSD_EXTENSIONS
 from .thumbnail_disk_cache import ThumbnailDiskCache, ThumbnailSourceIdentity
 from .thumbnail_render import (
     SmartCropCache,
@@ -2531,7 +2534,15 @@ class BrowserThumbnailProvider(QObject):
     ) -> QImage | None:
         try:
             stat = path.stat()
-            with Image.open(path) as image:
+            if path.suffix.casefold() in PSD_EXTENSIONS:
+                image_context = decode_psd_thumbnail(
+                    path,
+                    minimum_long_edge=spec.long_edge,
+                )
+            else:
+                image_context = Image.open(path)
+
+            with image_context as image:
                 rendered, _crop = BrowserThumbnailProvider._render_image(
                     image,
                     spec,
@@ -2691,21 +2702,36 @@ class BrowserThumbnailProvider(QObject):
                     if BrowserThumbnailProvider._is_cancelled(cancel_token):
                         raise InterruptedError
                     try:
-                        with source.open(name, "r") as file, Image.open(file) as image:
-                            if BrowserThumbnailProvider._is_cancelled(cancel_token):
-                                raise InterruptedError
-                            qimage, _crop = BrowserThumbnailProvider._render_image(
-                                image,
-                                spec,
-                                smart_crop_cache,
-                                smart_crop_cache_key(
-                                    archive,
-                                    source_size=stat.st_size,
-                                    source_mtime_ns=stat.st_mtime_ns,
-                                    entry_path=name,
-                                    ratio_id=spec.frame_ratio_id,
-                                ),
-                            )
+                        with source.open(name, "r") as file:
+                            if Path(name).suffix.casefold() in PSD_EXTENSIONS:
+                                if source.getinfo(name).file_size > MAX_IMAGE_ENTRY_BYTES:
+                                    continue
+                                image_context = decode_psd_thumbnail(
+                                    file.read(),
+                                    minimum_long_edge=spec.long_edge,
+                                )
+                            else:
+                                image_context = Image.open(file)
+
+                            with image_context as image:
+                                if BrowserThumbnailProvider._is_cancelled(
+                                    cancel_token
+                                ):
+                                    raise InterruptedError
+                                qimage, _crop = (
+                                    BrowserThumbnailProvider._render_image(
+                                        image,
+                                        spec,
+                                        smart_crop_cache,
+                                        smart_crop_cache_key(
+                                            archive,
+                                            source_size=stat.st_size,
+                                            source_mtime_ns=stat.st_mtime_ns,
+                                            entry_path=name,
+                                            ratio_id=spec.frame_ratio_id,
+                                        ),
+                                    )
+                                )
                         if BrowserThumbnailProvider._is_cancelled(cancel_token):
                             raise InterruptedError
                         if qimage is not None:
@@ -2786,7 +2812,7 @@ class BrowserThumbnailProvider(QObject):
             if page_count_callback is not None:
                 page_count_callback(len(images))
             first = images[0]
-            with source.open_image(first) as image:
+            with source.open_thumbnail_image(first, minimum_long_edge=spec.long_edge) as image:
                 stat = archive.stat()
                 rendered, _crop = BrowserThumbnailProvider._render_image(
                     image,

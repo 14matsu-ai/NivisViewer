@@ -10,6 +10,7 @@ from threading import Event
 
 import pytest
 from PIL import Image
+from psd_tools import PSDImage
 from PySide6.QtCore import QRunnable
 from PySide6.QtGui import QImage
 from PySide6.QtTest import QSignalSpy
@@ -29,6 +30,32 @@ def write_image(path: Path, *, color: str = "white") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with Image.new("RGB", (24, 32), color) as image:
         image.save(path)
+
+
+def write_psd(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with Image.new("RGB", (120, 180), "navy") as image:
+        PSDImage.frompil(image).save(path)
+
+
+def test_psd_browser_thumbnail_uses_supported_image_path(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cover.psd"
+    write_psd(path)
+    spec = ThumbnailRenderSpec.from_settings(
+        96,
+        "square_1_1",
+        "letterbox",
+    )
+
+    result = BrowserThumbnailProvider.load_thumbnail(
+        make_item(path, BrowserItemKind.IMAGE),
+        spec,
+    )
+
+    assert result is not None
+    assert not result.isNull()
 
 
 def make_item(path: Path, kind: BrowserItemKind) -> BrowserItem:

@@ -55,6 +55,30 @@ def test_scan_hot_path_preserves_filename_metadata_and_suffix(tmp_path: Path) ->
         assert item.extension == path.suffix.casefold()
 
 
+def test_scanner_classifies_psd_and_psb_as_images(tmp_path: Path) -> None:
+    (tmp_path / "drawing.psd").write_bytes(b"placeholder")
+    (tmp_path / "large.psb").write_bytes(b"placeholder")
+
+    batches = []
+    result = scan_directory(
+        BrowserScanRequest(str(tmp_path), generation=71),
+        Event(),
+        batches.append,
+    )
+
+    assert isinstance(result, BrowserScanCompleted)
+    entries = [
+        entry
+        for batch in batches
+        for entry in batch.entries
+    ]
+    assert {Path(entry.path).suffix.casefold() for entry in entries} == {
+        ".psd",
+        ".psb",
+    }
+    assert {entry.item_kind for entry in entries} == {"image"}
+
+
 def test_scanner_emits_batches_with_generation_and_supported_kinds(
     tmp_path: Path,
 ) -> None:
