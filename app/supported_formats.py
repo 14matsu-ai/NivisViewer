@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+PSD_EXTENSIONS = frozenset({".psd", ".psb"})
+
 IMAGE_EXTENSIONS = frozenset(
     {
         ".jpg",
@@ -13,6 +15,8 @@ IMAGE_EXTENSIONS = frozenset(
         ".tif",
         ".tiff",
         ".ico",
+        ".psd",
+        ".psb",
     }
 )
 ZIP_ARCHIVE_EXTENSIONS = frozenset({".zip", ".cbz"})

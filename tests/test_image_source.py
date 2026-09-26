@@ -7,6 +7,7 @@ import random
 
 import pytest
 from PIL import Image
+from psd_tools import PSDImage
 
 from app.archive_backend import ArchiveErrorCode
 from app.image_source import (
@@ -24,6 +25,45 @@ def write_image(path: Path, *, size: tuple[int, int] = (8, 12)) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with Image.new("RGB", size, "white") as image:
         image.save(path)
+
+
+def write_psd(
+    path: Path,
+    *,
+    size: tuple[int, int] = (64, 96),
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with Image.new("RGB", size, "navy") as image:
+        PSDImage.frompil(image).save(path)
+
+
+def test_folder_lists_and_decodes_psd(tmp_path: Path) -> None:
+    psd_path = tmp_path / "page.psd"
+    write_psd(psd_path, size=(321, 654))
+
+    source = FolderImageSource(tmp_path)
+
+    assert source.list_images() == [str(psd_path)]
+    assert source.probe_image_size(str(psd_path)) == (321, 654)
+    with source.open_image(str(psd_path)) as image:
+        assert image.size == (321, 654)
+
+
+def test_zip_lists_and_decodes_psd(tmp_path: Path) -> None:
+    psd_path = tmp_path / "page.psd"
+    write_psd(psd_path, size=(160, 240))
+    archive = tmp_path / "psd-book.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+        output.write(psd_path, "pages/001.psd")
+
+    source = ZipImageSource(archive)
+    try:
+        assert source.list_images() == ["pages/001.psd"]
+        assert source.probe_image_size("pages/001.psd") == (160, 240)
+        with source.open_image("pages/001.psd") as image:
+            assert image.size == (160, 240)
+    finally:
+        source.close()
 
 
 @pytest.mark.parametrize("qt_buffer", (False, True))

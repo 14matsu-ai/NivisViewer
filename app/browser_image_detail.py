@@ -13,6 +13,7 @@ from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
+from .psd_decoder import PSD_HEADER_SIZE, is_psd_image_id, probe_psd_size_from_header
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,13 @@ class _ProbeWorker(QRunnable):
     def run(self) -> None:
         dimensions: tuple[int, int] | None = None
         try:
+            if is_psd_image_id(self.path):
+                with open(self.path, "rb") as source:
+                    dimensions = probe_psd_size_from_header(source.read(PSD_HEADER_SIZE))
+                self.signals.completed.emit(
+                    BrowserImageDetailResult(self.path, self.generation, dimensions)
+                )
+                return
             # Do not request a separate pixel load. Image.open itself may
             # decode the full payload in plugins such as pillow-jxl-plugin.
             with Image.open(self.path) as image:
