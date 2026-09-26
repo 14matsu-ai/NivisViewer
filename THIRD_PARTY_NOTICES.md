@@ -43,6 +43,35 @@ phase, so a document saved without a readable merged preview is reported as
 undecodable instead of being reconstructed with potentially different layer
 effects.
 
+## Creative project formats
+
+KRA and OpenRaster support use only Python's standard ZIP reader and Pillow to
+read the formats' saved preview/composite PNG members.
+
+CLIP STUDIO `.clip` preview support is an independent, minimal Python reader of
+the `CSFCHUNK` envelope and embedded SQLite `CanvasPreview`. The container
+layout and validation boundary were checked against:
+
+- upstream: <https://github.com/Aodaruma/clipfile-rs>
+- inspected revision: `bd88467fa80e63ad48c6c713fbfb5a8a116d798a`
+- upstream license: MIT
+- inspected files: `src/container.rs`, `src/model.rs`
+
+NivisViewer does not bundle or link the Rust crate in Phase 2. The Python code
+reimplements only the validated root/chunk framing, the `CHNKSQLi` location,
+and the `CanvasPreview` read-only query needed for preview display. The
+upstream MIT text used for provenance is retained at
+`licenses/clipfile-rs/LICENSE`.
+
+Limited legacy XCF layer decoding uses `gimpformats 2025`, which declares
+`LGPL-3.0-only`. Compositing and newer XCF files are rendered by a separately installed GIMP 3.x
+through its non-interactive batch interface; GIMP is not downloaded or bundled
+by NivisViewer. The installed Python distributions and their transitive
+dependencies remain part of the normal license-collection audit.
+
+CLIP STUDIO PAINT is a product of CELSYS, Inc. This implementation is
+independent and unofficial and is not affiliated with or endorsed by CELSYS.
+
 
 ## ZipPlaFork-derived Viewer scheduling and raster-loading structure
 

@@ -32,6 +32,7 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, 
 from PySide6.QtGui import QImage, QPixmap
 
 from .archive_backend import ArchiveErrorCode
+from .gimp_xcf_backend import gimp_cancellation
 from .freeze_diagnostics import trace_gui_phase
 from .image_source import ImageSource, ImageSourceError, ZipImageSource
 from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
@@ -2069,7 +2070,8 @@ class _ZipRasterUnitJob(QRunnable):
                             code="unsafe_scaled_decode_fallback",
                         )
                 self.source_decode_started.set()
-                image = self.source.open_image(page.image_id)
+                with gimp_cancellation(self.cancelled):
+                    image = self.source.open_image(page.image_id)
                 adjusted: Image.Image | None = None
                 try:
                     adjusted = self._apply_adjustments(image, spec.adjustments)

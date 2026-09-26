@@ -33,6 +33,8 @@ from .adjacent_book_search import (
 from .archive_backend_registry import ArchiveBackendRegistry
 from .browser_window import BrowserWindow
 from .config_manager import ConfigManager
+from .gimp_xcf_backend import configure_gimp_executable
+from .supported_formats import configure_xcf_loading
 from .file_operation_coordinator import FileOperationCoordinator
 from .file_conflict_dialog import ConflictResolutionDialog
 from .file_operation_panel import FileOperationPanel
@@ -103,6 +105,8 @@ class ApplicationController(QObject):
         self.application = application
         self.config = config_manager or ConfigManager()
         self.settings = self.config.load()
+        configure_gimp_executable(self.settings.get("gimp_executable", ""))
+        configure_xcf_loading(bool(self.settings.get("xcf_loading_enabled", False)))
         initialize_ui_language(self.settings.get("ui_language", "ja"))
         self.metadata_store = metadata_store or MetadataStore(
             self.config.metadata_database_path,
@@ -1568,6 +1572,8 @@ class ApplicationController(QObject):
             return False
 
     def _on_controller_settings_changed(self, changed: dict[str, object]) -> None:
+        if "gimp_executable" in changed:
+            configure_gimp_executable(str(changed["gimp_executable"] or ""))
         if (
             "browser_preserve_search_for_viewer_roundtrip" in changed
             and not bool(changed["browser_preserve_search_for_viewer_roundtrip"])

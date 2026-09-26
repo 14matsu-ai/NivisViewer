@@ -13,6 +13,10 @@ from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
+from .creative_image_decoder import (
+    is_creative_image_id,
+    probe_creative_image_size,
+)
 from .psd_decoder import PSD_HEADER_SIZE, is_psd_image_id, probe_psd_size_from_header
 
 
@@ -43,6 +47,16 @@ class _ProbeWorker(QRunnable):
                     dimensions = probe_psd_size_from_header(source.read(PSD_HEADER_SIZE))
                 self.signals.completed.emit(
                     BrowserImageDetailResult(self.path, self.generation, dimensions)
+                )
+                return
+            if is_creative_image_id(self.path):
+                dimensions = probe_creative_image_size(self.path)
+                self.signals.completed.emit(
+                    BrowserImageDetailResult(
+                        self.path,
+                        self.generation,
+                        dimensions,
+                    )
                 )
                 return
             # Do not request a separate pixel load. Image.open itself may

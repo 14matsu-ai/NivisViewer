@@ -10,6 +10,8 @@ from collections.abc import Callable
 from copy import deepcopy
 import logging
 from pathlib import Path
+from threading import Event
+from .gimp_xcf_backend import gimp_cancellation, probe_gimp_executable
 
 from PySide6.QtCore import (
     QEvent,
@@ -303,6 +305,27 @@ class _FFmpegProbeWorker(QRunnable):
 _RETIRED_SETTINGS_DIALOGS: set[QDialog] = set()
 
 
+class _GimpProbeWorker(QRunnable):
+    def __init__(self, generation: int, path: str) -> None:
+        super().__init__()
+        self.generation = generation
+        self.path = path
+        self.cancelled = Event()
+        self.signals = _FFmpegProbeSignals()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            with gimp_cancellation(self.cancelled):
+                result = probe_gimp_executable(self.path)
+        except Exception:
+            result = (None, "")
+        try:
+            self.signals.completed.emit(self.generation, result)
+        except RuntimeError:
+            pass
+
+
 TAB_SETTING_KEYS: dict[str, tuple[str, ...]] = {
     "shortcuts_browser": ("shortcut_bindings", "browser_cancel_clears_filters"),
     "shortcuts_viewer": ("shortcut_bindings", "viewer_slideshow_chord_enabled"),
@@ -351,7 +374,7 @@ TAB_SETTING_KEYS: dict[str, tuple[str, ...]] = {
     "file": (
         "file_operation_delete_confirm_focus_yes", "file_operation_delete_skip_confirmation",
     ),
-    "archive": ("archive_backend_preference", "winrar_executable", "seven_zip_executable"),
+    "archive": ("archive_backend_preference", "winrar_executable", "seven_zip_executable", "gimp_executable", "xcf_loading_enabled"),
     "mouse": (
         "mouse_gestures_enabled", "mouse_gesture_show_trail", "mouse_gesture_min_distance",
         "mouse_gesture_bindings", "browser_folder_gestures_enabled", "browser_wheel_scroll_mode",
@@ -641,6 +664,8 @@ class SettingsDialog(QDialog):
         self._accept_after_winrar_probe = False
         self._ffmpeg_probe_generation = 0
         self._ffmpeg_probe_workers: dict[int, _FFmpegProbeWorker] = {}
+        self._gimp_probe_generation = 0
+        self._gimp_probe_workers: dict[int, _GimpProbeWorker] = {}
         self._initial_probe_started = False
         self._custom_prefetch_values = {
             "image_forward_units": int(
@@ -1104,6 +1129,8 @@ class SettingsDialog(QDialog):
                 ConfigManager.DEFAULTS["archive_backend_preference"],
             )
             self.winrar_path_edit.setText(str(ConfigManager.DEFAULTS["winrar_executable"] or ""))
+            self.gimp_path_edit.clear()
+            self.xcf_loading_checkbox.setChecked(False)
             self.seven_zip_path_edit.setText(str(ConfigManager.DEFAULTS["seven_zip_executable"] or ""))
         elif scope == "mouse":
             self._reset_mouse_scope()
@@ -2048,6 +2075,57 @@ class SettingsDialog(QDialog):
         note.setWordWrap(True)
         form.addRow(note)
         layout.addWidget(group)
+        gimp_group = QGroupBox(tr('GIMP（XCF画像）'), tab)
+        gimp_form = QFormLayout(gimp_group)
+        self.xcf_loading_checkbox = QCheckBox(tr('XCF画像の読み込みを有効にする（再起動後に反映）'), gimp_group)
+        self.xcf_loading_checkbox.setToolTip(tr('XCFには、CLIPやPSDのように取り出して表示できるプレビュー画像がないため、読み込み・表示に時間がかかります。'))
+        xcf_row = QWidget(gimp_group)
+        xcf_layout = QHBoxLayout(xcf_row)
+        xcf_layout.setContentsMargins(0, 0, 0, 0)
+        xcf_layout.addWidget(self.xcf_loading_checkbox)
+        self.xcf_loading_help_button = _CircularHelpButton(xcf_row)
+        self.xcf_loading_help_button.setText('?')
+        self.xcf_loading_help_button.setFixedSize(20, 20)
+        self.xcf_loading_help_button.setAutoRaise(True)
+        self.xcf_loading_help_button.setToolTip(self.xcf_loading_checkbox.toolTip())
+        self.xcf_loading_help_button.setAccessibleName(tr('GIMP（XCF画像）'))
+        self.xcf_loading_help_button.clicked.connect(
+            lambda: QMessageBox.information(
+                self, tr('GIMP（XCF画像）'), self.xcf_loading_checkbox.toolTip()
+            )
+        )
+        xcf_layout.addWidget(self.xcf_loading_help_button)
+        xcf_layout.addStretch(1)
+        gimp_form.addRow(xcf_row)
+        self.gimp_path_edit = QLineEdit(gimp_group)
+        self.gimp_path_edit.setPlaceholderText(tr('空欄の場合は自動検出'))
+        self.gimp_browse_button = QPushButton(tr('参照…'), gimp_group)
+        self.gimp_browse_button.clicked.connect(self.browse_gimp)
+        path_row = QWidget(gimp_group)
+        path_layout = QHBoxLayout(path_row)
+        path_layout.setContentsMargins(0, 0, 0, 0)
+        path_layout.addWidget(self.gimp_path_edit, 1)
+        path_layout.addWidget(self.gimp_browse_button)
+        gimp_form.addRow(tr('実行ファイル:'), path_row)
+        action_row = QWidget(gimp_group)
+        actions = QHBoxLayout(action_row)
+        actions.setContentsMargins(0, 0, 0, 0)
+        self.gimp_auto_button = QPushButton(tr('自動検出へ戻す'), gimp_group)
+        self.gimp_auto_button.clicked.connect(self.gimp_path_edit.clear)
+        self.gimp_check_button = QPushButton(tr('GIMPを確認'), gimp_group)
+        self.gimp_check_button.clicked.connect(self.check_gimp)
+        actions.addWidget(self.gimp_auto_button)
+        actions.addWidget(self.gimp_check_button)
+        actions.addStretch(1)
+        gimp_form.addRow(action_row)
+        self.gimp_status_label = QLabel(tr('GIMP：未確認'), gimp_group)
+        self.gimp_status_label.setWordWrap(True)
+        gimp_form.addRow(tr('現在の状態:'), self.gimp_status_label)
+        note = QLabel(tr('XCFの読み込みにGIMP 3を使用します。CLIPには不要です。空欄は自動検出、指定した場合はその実行ファイルを使用します。'), gimp_group)
+        note.setWordWrap(True)
+        gimp_form.addRow(note)
+        self.gimp_path_edit.textChanged.connect(self._invalidate_gimp_probe)
+        layout.addWidget(gimp_group)
         layout.addWidget(self._make_tab_reset_button("archive", tab))
         layout.addStretch(1)
         return tab
@@ -3400,6 +3478,8 @@ class SettingsDialog(QDialog):
         self.winrar_path_edit.setText(
             str(self.config.get("winrar_executable", "") or "")
         )
+        self.gimp_path_edit.setText(str(self.config.get("gimp_executable", "") or ""))
+        self.xcf_loading_checkbox.setChecked(bool(self.config.get("xcf_loading_enabled", False)))
         self.seven_zip_path_edit.setText(
             str(self.config.get("seven_zip_executable", "") or "")
         )
@@ -4015,6 +4095,8 @@ class SettingsDialog(QDialog):
                 self.archive_backend_combo.currentData() or "auto"
             ),
             "winrar_executable": self.winrar_path_edit.text().strip().strip('"'),
+            "gimp_executable": self.gimp_path_edit.text().strip().strip('"'),
+            "xcf_loading_enabled": self.xcf_loading_checkbox.isChecked(),
             "seven_zip_executable": self.seven_zip_path_edit.text().strip().strip('"'),
             **self.browser_workflow_settings.values(),
             "mouse_gestures_enabled": self.mouse_gestures_checkbox.isChecked(),
@@ -4137,6 +4219,7 @@ class SettingsDialog(QDialog):
         if self._probes_closed:
             return
         self._probes_closed = True
+        self._invalidate_gimp_probe()
         self._probe_generation += 1
         self._winrar_probe_generation += 1
         self._ffmpeg_probe_generation += 1
@@ -4148,6 +4231,7 @@ class SettingsDialog(QDialog):
             self._probe_workers,
             self._winrar_probe_workers,
             self._ffmpeg_probe_workers,
+            self._gimp_probe_workers,
         ):
             for generation, worker in tuple(workers.items()):
                 try:
@@ -4162,6 +4246,7 @@ class SettingsDialog(QDialog):
             self._probe_workers
             or self._winrar_probe_workers
             or self._ffmpeg_probe_workers
+            or self._gimp_probe_workers
         )
 
     def _delete_when_probes_finish(self) -> None:
@@ -4191,6 +4276,7 @@ class SettingsDialog(QDialog):
             self._ffmpeg_probe_workers,
         ):
             workers.clear()
+        self._gimp_probe_workers.clear()
         self._delete_when_probes_finish()
         return self._probe_workers_idle()
 
@@ -4265,6 +4351,48 @@ class SettingsDialog(QDialog):
             )
         else:
             self.ffmpeg_status_label.setText(tr('FFmpeg：検出済み\n{p0}', p0=executable))
+
+    def browse_gimp(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, tr('GIMP実行ファイルを選択'), self.gimp_path_edit.text().strip(),
+            tr('実行ファイル (*.exe);;すべてのファイル (*.*)'),
+        )
+        if path:
+            self.gimp_path_edit.setText(path)
+
+    def _invalidate_gimp_probe(self) -> None:
+        self._gimp_probe_generation += 1
+        for worker in self._gimp_probe_workers.values():
+            worker.cancelled.set()
+        self.gimp_check_button.setEnabled(True)
+        self.gimp_status_label.setText(tr('GIMP：未確認'))
+
+    def check_gimp(self) -> None:
+        if self._probes_closed:
+            return
+        self._invalidate_gimp_probe()
+        generation = self._gimp_probe_generation
+        worker = _GimpProbeWorker(generation, self.gimp_path_edit.text())
+        worker.signals.completed.connect(self._on_gimp_probe_completed)
+        self._gimp_probe_workers[generation] = worker
+        self.gimp_check_button.setEnabled(False)
+        self.gimp_status_label.setText(tr('GIMP：確認中…'))
+        self._probe_pool.start(worker)
+
+    @Slot(int, object)
+    def _on_gimp_probe_completed(self, generation: int, result) -> None:
+        self._gimp_probe_workers.pop(generation, None)
+        if self._probes_closed:
+            self._delete_when_probes_finish()
+            return
+        if generation != self._gimp_probe_generation:
+            return
+        self.gimp_check_button.setEnabled(True)
+        path, version = result
+        self.gimp_status_label.setText(
+            tr('GIMP：検出済み {p0}\n{p1}', p0=version, p1=path)
+            if path else tr('GIMP 3が見つからないか、指定した実行ファイルを利用できません。')
+        )
 
     def browse_winrar(self) -> None:
         if self._probes_closed:

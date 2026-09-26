@@ -30,12 +30,21 @@ from .archive_backend import (
 )
 from .supported_formats import (
     ARCHIVE_EXTENSIONS,
-    BOOK_FILE_EXTENSIONS,
+    ENABLED_BOOK_FILE_EXTENSIONS as BOOK_FILE_EXTENSIONS,
+    CREATIVE_PROJECT_EXTENSIONS,
     EXTERNAL_ARCHIVE_EXTENSIONS,
-    IMAGE_EXTENSIONS,
+    ENABLED_IMAGE_EXTENSIONS as IMAGE_EXTENSIONS,
     PDF_EXTENSIONS,
     PSD_EXTENSIONS,
+    XCF_EXTENSIONS,
     ZIP_ARCHIVE_EXTENSIONS,
+)
+from .creative_image_decoder import (
+    XCF_HEADER_READ_BYTES,
+    decode_creative_image,
+    decode_creative_thumbnail,
+    probe_creative_image_size,
+    probe_xcf_size_from_header,
 )
 from .psd_decoder import (
     PSD_HEADER_SIZE,
@@ -858,6 +867,26 @@ class FolderImageSource(ImageSource):
                     self._animation_cache[image_id] = False
                 return result
 
+            suffix = Path(image_id).suffix.casefold()
+            if suffix in CREATIVE_PROJECT_EXTENSIONS:
+                result = decode_creative_image(
+                    image_id,
+                    suffix=suffix,
+                )
+                setattr(result, "_nivis_source_is_animated", False)
+                try:
+                    byte_count = Path(image_id).stat().st_size
+                except OSError:
+                    byte_count = None
+                self._remember_folder_metadata(
+                    image_id,
+                    byte_count=byte_count,
+                    size=result.size,
+                )
+                with self._metadata_lock:
+                    self._animation_cache[image_id] = False
+                return result
+
             # Detach the decoder from the filesystem before Pillow performs
             # potentially expensive pixel decoding.  On Windows this avoids
             # holding the source file open while a queued Viewer task runs.
@@ -969,6 +998,16 @@ class FolderImageSource(ImageSource):
                 self._remember_folder_metadata(image_id, size=logical)
             return logical
 
+        suffix = Path(image_id).suffix.casefold()
+        if suffix in CREATIVE_PROJECT_EXTENSIONS:
+            logical = probe_creative_image_size(
+                image_id,
+                suffix=suffix,
+            )
+            if logical is not None:
+                self._remember_folder_metadata(image_id, size=logical)
+            return logical
+
         try:
             with Image.open(image_id) as image:
                 width, height = image.size
@@ -987,6 +1026,11 @@ class FolderImageSource(ImageSource):
                 return self._animation_cache[image_id]
 
         if Path(image_id).suffix.casefold() in PSD_EXTENSIONS:
+            with self._metadata_lock:
+                self._animation_cache[image_id] = False
+            return False
+
+        if Path(image_id).suffix.casefold() in CREATIVE_PROJECT_EXTENSIONS:
             with self._metadata_lock:
                 self._animation_cache[image_id] = False
             return False
@@ -1023,6 +1067,8 @@ class FolderImageSource(ImageSource):
             return cached
         suffix = Path(image_id).suffix.casefold()
         if suffix in PSD_EXTENSIONS:
+            return self.logical_size(image_id)
+        if suffix in CREATIVE_PROJECT_EXTENSIONS:
             return self.logical_size(image_id)
         if suffix in {".avif", ".jxl"}:
             return self.logical_size(image_id)
@@ -1110,6 +1156,13 @@ class ZipImageSource(ImageSource):
 
             if Path(image_id).suffix.casefold() in PSD_EXTENSIONS:
                 result = decode_psd_image(stream.getvalue())
+                source_is_animated = False
+                setattr(result, "_nivis_source_is_animated", False)
+            elif Path(image_id).suffix.casefold() in CREATIVE_PROJECT_EXTENSIONS:
+                result = decode_creative_image(
+                    stream.getvalue(),
+                    suffix=Path(image_id).suffix.casefold(),
+                )
                 source_is_animated = False
                 setattr(result, "_nivis_source_is_animated", False)
             else:
@@ -1394,6 +1447,39 @@ class ZipImageSource(ImageSource):
             finally:
                 self._finish_request(image_id, cancelled)
 
+        suffix = Path(image_id).suffix.casefold()
+        if suffix in CREATIVE_PROJECT_EXTENSIONS:
+            # Nested KRA/ORA/CLIP probes would require seeking through the
+            # whole outer compressed entry. Avoid eager geometry work there;
+            # the real decode will publish its dimensions. XCF has a fixed
+            # small header, so it remains cheap to probe.
+            if suffix not in XCF_EXTENSIONS:
+                return None
+            cancelled = self._begin_request(image_id)
+            try:
+                self._raise_if_cancelled(cancelled)
+                with self._lock:
+                    info = self._zip.NameToInfo.get(image_id)
+                    if info is None:
+                        raise ImageSourceError(
+                            tr('書庫内の画像が見つかりません: {p0}', p0=image_id),
+                            code=ArchiveErrorCode.ENTRY_NOT_FOUND.value,
+                        )
+                    if info.file_size > MAX_IMAGE_ENTRY_BYTES:
+                        raise ImageSourceError(
+                            tr('書庫内の画像が大きすぎます。'),
+                            code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
+                        )
+                    with self._zip.open(info, "r") as entry:
+                        header = entry.read(XCF_HEADER_READ_BYTES)
+                self._raise_if_cancelled(cancelled)
+                logical = probe_xcf_size_from_header(header)
+                if logical is not None:
+                    self._size_cache[image_id] = logical
+                return logical
+            finally:
+                self._finish_request(image_id, cancelled)
+
         cancelled = self._begin_request(image_id)
         try:
             self._raise_if_cancelled(cancelled)
@@ -1460,6 +1546,8 @@ class ZipImageSource(ImageSource):
         """Inspect one ZIP image header without allocating pixel storage."""
 
         if Path(image_id).suffix.casefold() in PSD_EXTENSIONS:
+            return False
+        if Path(image_id).suffix.casefold() in CREATIVE_PROJECT_EXTENSIONS:
             return False
         if Path(image_id).suffix.casefold() not in {".png", ".webp"}:
             return None
@@ -1927,6 +2015,11 @@ class SevenZipImageSource(ImageSource):
                 result = decode_psd_image(data)
                 setattr(result, "_nivis_source_is_animated", False)
                 return result
+            suffix = Path(image_id).suffix.casefold()
+            if suffix in CREATIVE_PROJECT_EXTENSIONS:
+                result = decode_creative_image(data, suffix=suffix)
+                setattr(result, "_nivis_source_is_animated", False)
+                return result
             with Image.open(io.BytesIO(data)) as image:
                 image.seek(0)
                 return ImageOps.exif_transpose(image).copy()
@@ -1937,11 +2030,23 @@ class SevenZipImageSource(ImageSource):
     def open_thumbnail_image(
         self, image_id: str, *, minimum_long_edge: int
     ) -> Image.Image:
-        if Path(image_id).suffix.casefold() not in PSD_EXTENSIONS:
+        suffix = Path(image_id).suffix.casefold()
+        if (
+            suffix not in PSD_EXTENSIONS
+            and suffix not in CREATIVE_PROJECT_EXTENSIONS
+        ):
             return self.open_image(image_id)
         try:
-            return decode_psd_thumbnail(
-                self._read_payload(image_id), minimum_long_edge=minimum_long_edge
+            data = self._read_payload(image_id)
+            if suffix in PSD_EXTENSIONS:
+                return decode_psd_thumbnail(
+                    data,
+                    minimum_long_edge=minimum_long_edge,
+                )
+            return decode_creative_thumbnail(
+                data,
+                suffix=suffix,
+                minimum_long_edge=minimum_long_edge,
             )
         except ImageSourceError:
             raise
@@ -1991,6 +2096,15 @@ class SevenZipImageSource(ImageSource):
                 )
                 if logical is None:
                     raise ValueError("invalid PSD/PSB header")
+                return logical
+            suffix = Path(image_id).suffix.casefold()
+            if suffix in CREATIVE_PROJECT_EXTENSIONS:
+                logical = probe_creative_image_size(
+                    data,
+                    suffix=suffix,
+                )
+                if logical is None:
+                    raise ValueError("invalid creative-project header")
                 return logical
             with Image.open(io.BytesIO(data)) as image:
                 width, height = image.size

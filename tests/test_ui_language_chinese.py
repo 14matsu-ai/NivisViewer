@@ -24,6 +24,7 @@ from app.translations_zh import (
 )
 
 _TECHNICAL_WORDS = {
+    "GIMP", "XCF", "CLIP", "PSD",
     "NivisViewer", "Viewer", "Browser", "Windows", "Shell", "FFmpeg", "WinRAR", "ZIP", "Zip",
     "PDF", "RAR", "CBZ", "JPEG", "WebP", "PNG", "Qt", "Python", "HDD", "SSD",
     "MiB", "Ctrl", "Shift", "Alt", "Left", "Right", "Wheel", "Enter", "PageDown", "PageUp", "Esc", "S", "RGB",
@@ -80,7 +81,7 @@ def test_explicit_language_is_not_replaced_by_os_detection(tmp_path: Path, monke
 
 def test_catalogs_have_same_inventory_and_format_fields():
     formatter = Formatter()
-    assert len(ENGLISH) == 1057
+    assert len(ENGLISH) == 1068
     for catalog in (SIMPLIFIED_CHINESE, TRADITIONAL_CHINESE):
         assert set(catalog) == set(ENGLISH)
         for source, translated in catalog.items():

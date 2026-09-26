@@ -44,7 +44,11 @@ NivisViewer 的名稱源自拉丁語中表示「雪」的 *nix, nivis*。\
 - RAR / CBR（使用使用者環境中的 WinRAR 或 7-Zip）
 - 7z / CB7（使用受支援的 WinRAR 命令列設定或使用者環境中的 7-Zip）
 - PDF（使用 pypdfium2 v5／PDFium）
-- 圖片：JPEG、PNG、WebP、AVIF、JPEG XL（JXL）、BMP、GIF、TIFF、ICO、PSD、PSB
+- 圖片：JPEG、PNG、WebP、AVIF、JPEG XL（JXL）、BMP、GIF、TIFF、ICO、PSD、PSB、KRA、ORA、CLIP、XCF
+
+KRA與ORA顯示檔案中儲存的合成影像。Phase 2中的CLIP僅顯示CanvasPreview，
+不是原始解析度算圖。XCF讀取預設關閉，可在「設定 → 壓縮檔 → GIMP」中啟用，重新啟動後生效。
+支援的RGB8影像直接讀取；不支援的合成、遮罩和效果使用已安裝的GIMP 3.x，無法使用時回報讀取錯誤。
 
 閱讀 RAR／7z／CBR／CB7 時，程式會從 Windows 檔案關聯、標準安裝位置、PATH，或「設定 → 壓縮檔」中指定的 WinRAR／7-Zip 路徑選擇已識別的外部命令列工具。如果使用者安裝的 WinRAR 附有受支援的官方主控台工具，僅為閱讀 RAR／CBR 無須另裝 7-Zip。程式不會啟動未知的檔案關聯應用程式，也不會將其交給 ShellExecute。
 
