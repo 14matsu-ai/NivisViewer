@@ -41,6 +41,7 @@ SHORTCUT_SPECS: tuple[ShortcutSpec, ...] = (
     ShortcutSpec("browser_cancel", "browser", "操作をキャンセル", ("Esc",)),
     ShortcutSpec("browser_clear_filters", "browser", "検索・評価・タグ絞り込みを解除", ()),
     ShortcutSpec("browser_open_selection", "browser", "選択項目を開く", ("Return", "Enter")),
+    ShortcutSpec("browser_open_with", "browser", "関連付けで開く...", ("Ctrl+T",)),
     # Viewer navigation and commands.  Alias order is part of the persisted
     # contract; do not collapse the three zoom-in aliases to one value.
     ShortcutSpec("viewer_history_back", "viewer", "表示履歴を戻る", ("Alt+Left",)),
@@ -70,6 +71,7 @@ SHORTCUT_SPECS: tuple[ShortcutSpec, ...] = (
     ShortcutSpec("viewer_copy_view", "viewer", "現在の表示をコピー", ("Ctrl+Alt+C",)),
     ShortcutSpec("viewer_page_info", "viewer", "ページ情報", ("Ctrl+I",)),
     ShortcutSpec("viewer_open", "viewer", "開く", ("Ctrl+O",)),
+    ShortcutSpec("viewer_open_with", "viewer", "関連付けで開く...", ("Ctrl+T",)),
     ShortcutSpec("viewer_reload", "viewer", "再読み込み", ("F5",)),
     ShortcutSpec("viewer_rotate_left", "viewer", "左に回転", ("Ctrl+Left",)),
     ShortcutSpec("viewer_rotate_right", "viewer", "右に回転", ("Ctrl+Right",)),

@@ -35,6 +35,7 @@ from app.system_file_opener import (
 )
 from app.viewer_display_unit import ViewerDisplayUnit, ViewerSlotState
 from app.viewer_window import ViewerWindow
+from tests.test_application_controller import wait_until
 
 
 class FakeSystemOpenAdapter:
@@ -562,7 +563,7 @@ def test_supported_file_stays_internal_and_explicit_external_open_is_available(
 
 
 @pytest.mark.parametrize("suffix", [".jpg", ".zip", ".pdf", ".office"])
-def test_browser_explicit_open_with_picker_uses_native_picker_for_single_file(
+def test_browser_explicit_open_with_uses_association_for_single_file(
     tmp_path: Path,
     qapp: QApplication,
     suffix: str,
@@ -583,8 +584,9 @@ def test_browser_explicit_open_with_picker_uses_native_picker_for_single_file(
 
     assert window._open_with_application_picker(item)
 
-    assert adapter.default_calls == []
-    assert adapter.picker_calls == [(str(target.absolute()), int(window.winId()))]
+    assert wait_until(qapp, lambda: bool(adapter.default_calls))
+    assert adapter.default_calls == [(str(target.absolute()), int(window.winId()))]
+    assert adapter.picker_calls == []
     _close_browser(window, coordinator, qapp)
 
 

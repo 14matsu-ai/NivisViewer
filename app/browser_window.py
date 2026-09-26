@@ -247,6 +247,7 @@ BROWSER_SHORTCUT_RUNTIME_IDS = frozenset(
         "browser_cancel",
         "browser_clear_filters",
         "browser_open_selection",
+        "browser_open_with",
     }
 )
 
@@ -2576,16 +2577,25 @@ class BrowserWindow(QMainWindow):
             return False
         return self._queue_system_open_probe(target, action="picker")
 
+    def open_selected_with_application_picker(self) -> bool:
+        index = self.list_view.currentIndex()
+        item = self.item_model.item_at(index) if index.isValid() else None
+        if item is None:
+            return False
+        return self._open_with_application_picker(item)
+
     def _open_with_application_picker_after_probe(self, target: str | Path) -> bool:
-        result = self.system_file_opener.open_with_application_picker(
+        # Use the saved association; the opener offers a picker only when
+        # Windows reports that no association exists.
+        result = self.system_file_opener.open_with_default_application(
             target,
             parent_hwnd=int(self.winId()),
         )
         if result.success:
-            self._show_temporary_status(tr('アプリ選択画面を開きました'))
+            self._show_temporary_status("")
             return True
         self._show_temporary_status(
-            result.error_message or tr('アプリ選択画面を開けませんでした')
+            result.error_message or tr(' 関連付けアプリで開けませんでした').strip()
         )
         return False
 
@@ -6221,6 +6231,7 @@ class BrowserWindow(QMainWindow):
         shortcut_map = {
             "browser_focus_address": "focus_address_shortcut",
             "browser_rename": "rename_shortcut",
+            "browser_open_with": "open_with_shortcut",
             "browser_delete": "recycle_shortcut",
             "browser_copy": "copy_shortcut",
             "browser_cut": "cut_shortcut",
@@ -6233,6 +6244,7 @@ class BrowserWindow(QMainWindow):
         shortcut_handlers = {
             "browser_focus_address": self.focus_address_bar,
             "browser_rename": self.rename_selected_item,
+            "browser_open_with": self.open_selected_with_application_picker,
             "browser_delete": self.move_selected_to_recycle_bin,
             "browser_copy": self.copy_selected_items,
             "browser_cut": self.cut_selected_items,
@@ -7041,6 +7053,9 @@ class BrowserWindow(QMainWindow):
         self.focus_address_shortcut.activated.connect(self.focus_address_bar)
 
         self.rename_shortcut = QShortcut(QKeySequence("F2"), self.list_view)
+        self.open_with_shortcut = QShortcut(QKeySequence(), self.list_view)
+        self.open_with_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.open_with_shortcut.activated.connect(self.open_selected_with_application_picker)
         self.rename_shortcut.setContext(
             Qt.ShortcutContext.WidgetWithChildrenShortcut
         )
