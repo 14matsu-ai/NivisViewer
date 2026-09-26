@@ -334,14 +334,19 @@ class BrowserItemModel(QAbstractListModel):
         *,
         preserve_thumbnails: bool = False,
     ) -> None:
-        self.beginResetModel()
-        self._source_items = list(items)
+        old_items = self._items
+        new_source = list(items)
+        new_items = [item for item in new_source if self._filter_state.matches(item)]
+        same_rows = (preserve_thumbnails and
+                     [self._key(item.path) for item in old_items] ==
+                     [self._key(item.path) for item in new_items])
+        if not same_rows:
+            self.beginResetModel()
+        self._source_items = new_source
         self._rebuild_source_index()
         # Scanner results supplied here are already in current sort order.
         # Predicates preserve that order and avoid a redundant full sort.
-        self._items = [
-            item for item in self._source_items if self._filter_state.matches(item)
-        ]
+        self._items = new_items
         self._icons.clear()
         if preserve_thumbnails:
             self._retain_compatible_thumbnails()
@@ -349,14 +354,26 @@ class BrowserItemModel(QAbstractListModel):
             self._thumbnail_images.clear()
             self._thumbnail_signatures.clear()
             self._low_resolution_thumbnails.clear()
-        self._thumbnail_errors.clear()
-        self._preview_statuses.clear()
+        if preserve_thumbnails:
+            # Keep the last settled indication while replacement work runs.
+            retained = {self._key(item.path) for item in self._source_items}
+            self._thumbnail_errors = {key: value for key, value in self._thumbnail_errors.items() if key in retained}
+            self._preview_statuses = {key: value for key, value in self._preview_statuses.items() if key in retained}
+        else:
+            self._thumbnail_errors.clear()
+            self._preview_statuses.clear()
         self._rating_previews.clear()
         if not preserve_thumbnails:
             self._image_dimensions.clear()
         self._scan_generation = None
         self._rebuild_row_index()
-        self.endResetModel()
+        if not same_rows:
+            self.endResetModel()
+        else:
+            for row, (old, new) in enumerate(zip(old_items, self._items)):
+                if old != new:
+                    index = self.index(row, 0)
+                    self.dataChanged.emit(index, index, [])
 
     def reuse_known_page_counts(
         self,
@@ -666,6 +683,8 @@ class BrowserItemModel(QAbstractListModel):
         item = self._items[row]
         key = self._key(item.path)
         self._thumbnail_signatures.pop(key, None)
+        if self._thumbnail_errors.get(key) == str(message):
+            return False
         self._thumbnail_errors[key] = str(message)
         index = self.index(row, 0)
         self.dataChanged.emit(

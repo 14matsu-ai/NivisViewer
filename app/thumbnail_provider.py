@@ -6,6 +6,7 @@ from .i18n import tr
 
 from collections import OrderedDict, deque
 from dataclasses import dataclass, replace
+from enum import Enum
 import heapq
 import inspect
 import logging
@@ -60,6 +61,27 @@ _PAGE_COUNT_REQUEST_TOKEN = -1
 _DEFAULT_BROWSER_MEMORY_CACHE_BYTES = 128 * 1024 * 1024
 
 
+class ThumbnailFailureKind(str, Enum):
+    TRANSIENT = "transient"
+    PERMANENT = "permanent"
+
+
+def _failure_kind(exc) -> ThumbnailFailureKind:
+    from .archive_backend import ArchiveBackendError, ArchiveErrorCode
+    from .image_source import ImageSourceError
+    from .pdf_backend import PdfBackendError, PdfErrorCode
+    # ImageSource preserves backend error codes when adapting native failures.
+    # These are stable codes, never localized exception-message matching.
+    if isinstance(exc, (ArchiveBackendError, PdfBackendError, ImageSourceError)) and exc.code in {
+        ArchiveErrorCode.PASSWORD_REQUIRED, ArchiveErrorCode.UNSUPPORTED_ARCHIVE,
+        ArchiveErrorCode.BACKEND_NOT_FOUND, PdfErrorCode.PASSWORD_REQUIRED,
+        PdfErrorCode.INVALID_PASSWORD, PdfErrorCode.UNSUPPORTED_SECURITY,
+        PdfErrorCode.BACKEND_UNAVAILABLE,
+    }:
+        return ThumbnailFailureKind.PERMANENT
+    return ThumbnailFailureKind.TRANSIENT
+
+
 @dataclass(frozen=True)
 class ThumbnailLoadResult:
     image: QImage | None
@@ -73,6 +95,7 @@ class ThumbnailLoadResult:
     disk_cache_hit: bool = False
     source_identity: ThumbnailSourceIdentity | None = None
     cache_in_memory: bool = True
+    failure_kind: ThumbnailFailureKind = ThumbnailFailureKind.TRANSIENT
 
     @property
     def resolved_kind(self) -> PreviewResultKind:
@@ -380,6 +403,10 @@ class BrowserThumbnailProvider(QObject):
             and disk_cache.enabled
         )
         self._failed: set[tuple[str, int, tuple[object, ...]]] = set()
+        self._permanent_failures: set[tuple[str, int, tuple[object, ...]]] = set()
+        self._retrying_failures: set[tuple[str, int, tuple[object, ...]]] = set()
+        self._changed_revisions = {}
+        self._changing_paths = set()
         self._quiet_results: dict[
             tuple[str, int, tuple[object, ...]],
             PreviewResultKind,
@@ -409,12 +436,63 @@ class BrowserThumbnailProvider(QObject):
         with self._failure_lock:
             return bool(self._failed)
 
+    def reconcile_items(self, previous_items, items):
+        """Fence only changed/removed sources; keep unrelated worker ownership."""
+        previous = {self._path_key(item.path): item for item in previous_items}
+        current = {self._path_key(item.path): item for item in items}
+        changed = set()
+        for path, old in previous.items():
+            item = current.get(path)
+            revision = item.thumbnail_revision if item is not None else None
+            if revision != old.thumbnail_revision:
+                self._changed_revisions[path] = revision
+                changed.add(path)
+        for path, item in current.items():
+            if path not in previous and path in self._changed_revisions:
+                self._changed_revisions[path] = item.thumbnail_revision
+        with self._failure_lock:
+            self._failed = {key for key in self._failed if key[0] not in changed}
+            self._permanent_failures.intersection_update(self._failed)
+            self._retrying_failures = {key for key in self._retrying_failures if key[0] not in changed}
+            self._quiet_results = {key: value for key, value in self._quiet_results.items() if key[0] not in changed}
+        cancelled_requests = []
+        with self._pending_lock:
+            for key, pending in tuple(self._pending.items()):
+                if key[0] in changed:
+                    pending.worker.cancelled.set()
+                    if self._try_take(pending.worker):
+                        self._pending.pop(key, None)
+                        cancelled_requests.append((key, pending.worker))
+        # Queued workers removed from the pool never emit finished. Release
+        # their workflow ownership without releasing a running worker early.
+        for key, worker in cancelled_requests:
+            self.work_settled.emit(str(worker.item.path), key[2], key[1],
+                                   worker.item.thumbnail_revision, "cancelled")
+        return changed
+
+    def _revision_current(self, path, revision):
+        key = self._path_key(Path(path))
+        return key not in self._changed_revisions or self._changed_revisions[key] == revision
+
+    def defer_changing_item(self, item):
+        self._changing_paths.add(self._path_key(item.path))
+
+    def release_changing_item(self, item):
+        self._changing_paths.discard(self._path_key(item.path))
+
+    def can_retry_failed_thumbnail(self, item, size) -> bool:
+        token = size.cache_token if isinstance(size, ThumbnailRenderSpec) else int(size)
+        key = (self._path_key(item.path), token, item.thumbnail_revision)
+        with self._failure_lock:
+            return key in self._failed and key not in self._permanent_failures
+
     def clear_failed_thumbnail(
         self,
         item: BrowserItem,
         size: int | ThumbnailRenderSpec,
         *,
         generation: int,
+        automatic: bool = False,
     ) -> bool:
         """Release one failed identity for an ordinary visible request."""
         if self._closed or int(generation) != self._generation:
@@ -424,14 +502,23 @@ class BrowserThumbnailProvider(QObject):
         with self._failure_lock:
             # Clear only the FAILED memo. Quiet non-applicable/unavailable
             # results have a separate retry policy and stay untouched.
+            if automatic and failure_key in self._failed:
+                self._retrying_failures.add(failure_key)
             self._failed.discard(failure_key)
+            self._permanent_failures.discard(failure_key)
         return True
 
     def begin_generation(self, *, retry_failed: bool = False) -> int:
         self._generation += 1
         self._active_request_tokens.clear()
+        self._changed_revisions.clear()
+        self._changing_paths.clear()
         with self._failure_lock:
             self._quiet_results.clear()
+            # A generation change can cancel a retry before it reports a result.
+            # Restore its memo so an unrelated refresh cannot bypass the budget.
+            self._failed.update(self._retrying_failures)
+            self._retrying_failures.clear()
         with self._pending_lock:
             had_pending = bool(self._pending)
             for pending in self._pending.values():
@@ -443,6 +530,7 @@ class BrowserThumbnailProvider(QObject):
         if retry_failed:
             with self._failure_lock:
                 self._failed.clear()
+                self._permanent_failures.clear()
         self._cancel_queued_maintenance()
         if self._coordinator is None:
             self._pool.clear()
@@ -461,7 +549,8 @@ class BrowserThumbnailProvider(QObject):
             return False
         if item.path.suffix.casefold() in XCF_EXTENSIONS and not xcf_loading_enabled():
             return False
-        if self._closed:
+        if (self._closed or self._path_key(item.path) in self._changing_paths
+                or not self._revision_current(str(item.path), item.thumbnail_revision)):
             return False
         requested_generation = self._generation if generation is None else generation
         if requested_generation != self._generation:
@@ -516,11 +605,12 @@ class BrowserThumbnailProvider(QObject):
             QTimer.singleShot(
                 0,
                 lambda path=str(item.path), current=requested_generation,
-                result=image, count=page_count: self._emit_memory_hit(
+                result=image, count=page_count, revision=item.thumbnail_revision: self._emit_memory_hit(
                     path,
                     current,
                     result,
                     count,
+                    revision,
                 ),
             )
             return False
@@ -538,19 +628,20 @@ class BrowserThumbnailProvider(QObject):
                     QTimer.singleShot(
                         0,
                         lambda path=str(item.path), current=requested_generation,
-                        result=image, count=page_count: self._emit_memory_hit(
+                        result=image, count=page_count, revision=item.thumbnail_revision: self._emit_memory_hit(
                             path,
                             current,
                             result,
                             count,
+                            revision,
                         ),
                     )
                     return False
                 QTimer.singleShot(
                     0,
-                    lambda path=str(item.path), current=requested_generation, result=image: (
+                    lambda path=str(item.path), current=requested_generation, result=image, revision=item.thumbnail_revision: (
                         self.thumbnail_provisional.emit(path, current, result)
-                        if not self._closed and current == self._generation
+                        if not self._closed and current == self._generation and self._revision_current(path, revision)
                         else None
                     ),
                 )
@@ -584,7 +675,9 @@ class BrowserThumbnailProvider(QObject):
             worker.signals.finished.connect(self._on_finished)
             worker.signals.provisional.connect(self._on_provisional)
             worker.signals.page_count_discovered.connect(
-                self._on_page_count_discovered
+                lambda path, generation, count, revision=item.thumbnail_revision:
+                self._on_page_count_discovered(path, generation, count)
+                if self._revision_current(path, revision) else None
             )
             self._pending[pending_key] = _PendingThumbnail(
                 worker,
@@ -647,7 +740,9 @@ class BrowserThumbnailProvider(QObject):
         headers only; it never opens an image payload.
         """
 
-        if self._closed or self._paused:
+        if (self._closed or self._paused
+                or self._path_key(item.path) in self._changing_paths
+                or not self._revision_current(str(item.path), item.thumbnail_revision)):
             return False
         requested_generation = self._generation if generation is None else generation
         if item.online_only or requested_generation != self._generation or item.kind not in {
@@ -659,9 +754,10 @@ class BrowserThumbnailProvider(QObject):
             QTimer.singleShot(
                 0,
                 lambda path=str(item.path), current=requested_generation,
-                count=max(0, int(item.page_count)): (
+                count=max(0, int(item.page_count)), revision=item.thumbnail_revision: (
                     self.page_count_ready.emit(path, current, count)
-                    if not self._closed and current == self._generation
+                    if (not self._closed and current == self._generation
+                        and self._revision_current(path, revision))
                     else None
                 ),
             )
@@ -754,6 +850,7 @@ class BrowserThumbnailProvider(QObject):
         failure_key = (self._path_key(item.path), token, item.thumbnail_revision)
         with self._failure_lock:
             self._failed.discard(failure_key)
+            self._permanent_failures.discard(failure_key)
             self._quiet_results.pop(failure_key, None)
         return self.request(
             item,
@@ -1381,6 +1478,8 @@ class BrowserThumbnailProvider(QObject):
         self._preview_registry.shell_service.clear_memory_cache()
         with self._failure_lock:
             self._failed.clear()
+            self._permanent_failures.clear()
+            self._retrying_failures.clear()
             self._quiet_results.clear()
 
     def invalidate_windows_shell_previews(
@@ -1580,7 +1679,7 @@ class BrowserThumbnailProvider(QObject):
                 result_kind=PreviewResultKind.NO_CONTENT,
                 persist_to_disk=False,
             )
-        except Exception:
+        except Exception as exc:
             cancelled = bool(
                 cancel_token is not None
                 and getattr(cancel_token, "is_set", lambda: False)()
@@ -1592,6 +1691,7 @@ class BrowserThumbnailProvider(QObject):
                     if cancelled
                     else PreviewResultKind.FAILED
                 ),
+                failure_kind=_failure_kind(exc),
                 persist_to_disk=False,
             )
         return ThumbnailLoadResult(
@@ -1834,11 +1934,18 @@ class BrowserThumbnailProvider(QObject):
             return ThumbnailLoadResult(
                 None, result_kind=PreviewResultKind.CANCELLED, persist_to_disk=False
             )
+        with self._failure_lock:
+            if cancel_token is None or not cancel_token.is_set():
+                self._retrying_failures.discard(failure_key)
         if result.image is None or result.image.isNull():
             if result.resolved_kind is PreviewResultKind.FAILED:
                 with self._failure_lock:
                     if cancel_token is None or not cancel_token.is_set():
                         self._failed.add(failure_key)
+                        if result.failure_kind is ThumbnailFailureKind.PERMANENT:
+                            self._permanent_failures.add(failure_key)
+                        else:
+                            self._permanent_failures.discard(failure_key)
             elif result.resolved_kind not in {
                 PreviewResultKind.CANCELLED,
                 PreviewResultKind.PENDING,
@@ -1858,6 +1965,7 @@ class BrowserThumbnailProvider(QObject):
                 ),
                 entry_path=result.entry_path,
                 result_kind=result.resolved_kind,
+                failure_kind=result.failure_kind,
                 preview_source=result.preview_source,
                 persist_to_disk=False,
                 page_count=result.page_count,
@@ -1941,6 +2049,7 @@ class BrowserThumbnailProvider(QObject):
         if (
             self._closed
             or generation != self._generation
+            or not self._revision_current(path, _modified_at)
             or image is None
             or image.isNull()
         ):
@@ -2086,7 +2195,8 @@ class BrowserThumbnailProvider(QObject):
         if self._closed:
             self._release_retired_if_idle()
             return
-        if generation != self._generation:
+        if (generation != self._generation or not self._revision_current(path, modified_at)
+                or (pending is not None and pending.worker.cancelled.is_set())):
             return
         loaded = (
             result
@@ -2210,7 +2320,7 @@ class BrowserThumbnailProvider(QObject):
         if self._closed:
             self._release_retired_if_idle()
             return
-        if generation != self._generation:
+        if generation != self._generation or not self._revision_current(path, _modified_at):
             return
         if pending is None or pending.worker.cancelled.is_set():
             return
@@ -2608,8 +2718,9 @@ class BrowserThumbnailProvider(QObject):
         generation: int,
         image: QImage,
         page_count: int | None,
+        revision=None,
     ) -> None:
-        if self._closed or generation != self._generation:
+        if self._closed or generation != self._generation or (revision is not None and not self._revision_current(path, revision)):
             return
         if page_count is not None:
             self.page_count_ready.emit(path, generation, page_count)
@@ -2800,6 +2911,8 @@ class BrowserThumbnailProvider(QObject):
         page_count_callback: Callable[[int], None] | None = None,
         cancel_token=None,
     ) -> ThumbnailLoadResult:
+        encrypted = False
+        entry_failed = False
         try:
             require_local(archive)
             stat = archive.stat()
@@ -2813,6 +2926,9 @@ class BrowserThumbnailProvider(QObject):
                 for name in names:
                     if BrowserThumbnailProvider._is_cancelled(cancel_token):
                         raise InterruptedError
+                    if source.getinfo(name).flag_bits & 1:
+                        encrypted = True
+                        continue
                     try:
                         with source.open(name, "r") as file:
                             if Path(name).suffix.casefold() in {'.svg', '.ai'}:
@@ -2874,6 +2990,7 @@ class BrowserThumbnailProvider(QObject):
                     except InterruptedError:
                         raise
                     except Exception:
+                        entry_failed = True
                         continue
         except InterruptedError:
             return ThumbnailLoadResult(
@@ -2889,7 +3006,8 @@ class BrowserThumbnailProvider(QObject):
             )
         return ThumbnailLoadResult(
             None,
-            result_kind=PreviewResultKind.NO_CONTENT,
+            result_kind=(PreviewResultKind.FAILED if encrypted or entry_failed else PreviewResultKind.NO_CONTENT),
+            failure_kind=(ThumbnailFailureKind.PERMANENT if encrypted and not entry_failed else ThumbnailFailureKind.TRANSIENT),
             persist_to_disk=False,
             page_count=len(names),
         )
@@ -2969,7 +3087,7 @@ class BrowserThumbnailProvider(QObject):
                 persist_to_disk=False,
                 page_count=0,
             )
-        except Exception:
+        except Exception as exc:
             cancelled = bool(
                 cancel_token is not None
                 and getattr(cancel_token, "is_set", lambda: False)()
@@ -2981,6 +3099,7 @@ class BrowserThumbnailProvider(QObject):
                     if cancelled
                     else PreviewResultKind.FAILED
                 ),
+                failure_kind=_failure_kind(exc),
                 persist_to_disk=False,
             )
         finally:
@@ -3130,6 +3249,10 @@ class BrowserThumbnailProvider(QObject):
         """Generate through the existing lane; never enqueue the entire listing."""
         if self._closed or self._paused or generation != self._generation:
             return "blocked"
+        if self._path_key(item.path) in self._changing_paths:
+            # Skip this row until the quiet-release callback invalidates it;
+            # a growing download must not block unrelated background rows.
+            return "settled"
         with self._save_lock:
             if self._save_enqueue_backpressured:
                 return "blocked"
