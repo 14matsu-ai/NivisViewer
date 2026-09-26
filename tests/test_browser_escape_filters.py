@@ -1,4 +1,5 @@
 from unittest.mock import Mock
+from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QEvent, QObject, QPoint, QTimer, Qt
@@ -12,7 +13,8 @@ from app.browser_window import BROWSER_SHORTCUT_RUNTIME_IDS
 from app.config_manager import ConfigManager
 from app.shortcut_catalog import SPECS_BY_SCOPE
 from app.settings_dialog import SettingsDialog
-from tests.test_application_controller import make_controller, write_image, close_controller
+from app.system_file_opener import SystemOpenResult, SystemOpenStatus
+from tests.test_application_controller import make_controller, write_image, close_controller, wait_until
 
 
 @pytest.fixture
@@ -144,6 +146,25 @@ def test_escape_invalidates_saved_viewer_return_query(browser_case, qapp):
     controller._on_browser_activated(browser)
     assert browser.browser_filter_state == BrowserFilterState.normalized()
     assert 'a' in browser.search_history.entries
+
+
+def test_open_with_shortcut_defaults_to_ctrl_t_and_can_open_selected_item(browser_case, qapp, monkeypatch):
+    _, browser, root = browser_case
+    index = browser.item_model.index(browser.item_model.row_for_path(root / 'a.png'), 0)
+    browser.list_view.setCurrentIndex(index)
+    opened = Mock(return_value=SystemOpenResult(SystemOpenStatus.OPENED))
+    picker = Mock()
+    monkeypatch.setattr(browser.system_file_opener, 'open_with_default_application', opened)
+    monkeypatch.setattr(browser.system_file_opener, 'open_with_application_picker', picker)
+    assert browser.shortcut_bindings['browser_open_with'] == ['Ctrl+T']
+    assert browser.open_with_shortcut.key() == QKeySequence('Ctrl+T')
+    browser.activateWindow()
+    browser.list_view.setFocus()
+    qapp.processEvents()
+    QTest.keyClick(browser.list_view, Qt.Key.Key_T, Qt.KeyboardModifier.ControlModifier)
+    assert wait_until(qapp, lambda: opened.call_count == 1)
+    assert Path(opened.call_args.args[0]) == root / 'a.png'
+    picker.assert_not_called()
 
 
 def test_browser_open_selection_keeps_return_and_keypad_enter_and_supports_remap(

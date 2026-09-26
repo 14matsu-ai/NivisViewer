@@ -26,6 +26,20 @@ def window(tmp_path, qapp):
         qapp.processEvents()
 
 
+def test_open_with_shortcut_defaults_to_ctrl_t_and_works_without_menu(window, monkeypatch):
+    from unittest.mock import Mock
+    probe = Mock()
+    monkeypatch.setattr(window, 'open_current_with_application_picker', probe)
+    assert window.shortcut_bindings['viewer_open_with'] == ['Ctrl+T']
+    assert window.viewer_open_with_action.shortcuts() == []
+    window._rebuild_viewer_shortcuts()
+    window.menuBar().hide()
+    QTest.keyClick(window.viewer, Qt.Key.Key_T, Qt.KeyboardModifier.ControlModifier)
+    probe.assert_called_once_with()
+    # Do not open a previously displayed file after the user has changed pages.
+    window._open_with_after_probe('C:/images/old.png')
+
+
 def test_shift_r_uses_actual_viewer_focus_route_and_persists(window, qapp):
     original = window.reading_direction
     QTest.keyClick(window.viewer, Qt.Key.Key_R)

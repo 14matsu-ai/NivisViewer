@@ -817,6 +817,13 @@ class ViewerWidget(QWidget):
     def displayed_page_indexes(self) -> tuple[int, ...]:
         return tuple(slot.page_index for slot in self._spread.slots)
 
+    def displayed_page_at(self, position: QPoint) -> int | None:
+        """Hit-test the last painted layout, including RTL, zoom and rotation."""
+        for rect, image, pixmap in reversed(self._last_image_layout):
+            if rect.contains(position) and not pixmap.isNull():
+                return image.page_index
+        return None
+
     def displayed_source_snapshot(
         self,
         page_index: int,

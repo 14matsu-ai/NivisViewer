@@ -16,6 +16,7 @@ from PySide6.QtGui import (
     QAction,
     QActionGroup,
     QCloseEvent,
+    QCursor,
     QDesktopServices,
     QDragEnterEvent,
     QDropEvent,
@@ -982,6 +983,8 @@ class ViewerWindow(QMainWindow):
         self.viewer_open_action = open_action
         open_action.setShortcut(QKeySequence.StandardKey.Open)
         open_action.triggered.connect(self.open_dialog)
+        self.viewer_open_with_action = QAction(tr('関連付けで開く...'), self)
+        self.viewer_open_with_action.triggered.connect(self.open_current_with_application_picker)
         reload_action = QAction(tr('再読み込み'), self)
         self.viewer_reload_action = reload_action
         reload_action.setShortcut("F5")
@@ -1015,6 +1018,7 @@ class ViewerWindow(QMainWindow):
             lambda _checked=False: self.dispatch_command(commands.CLOSE_VIEWER)
         )
         file_menu.addAction(open_action)
+        file_menu.addAction(self.viewer_open_with_action)
         file_menu.addAction(reload_action)
         file_menu.addAction(export_view_action)
         file_menu.addAction(copy_path_action)
@@ -1443,6 +1447,7 @@ class ViewerWindow(QMainWindow):
                     for value in self.shortcut_bindings.get(action_id, [])
                 ])
         handlers: dict[str, Callable[[], object]] = {
+            "viewer_open_with": self.open_current_with_application_picker,
             "viewer_toggle_spread": lambda: self.dispatch_command(commands.TOGGLE_SPREAD),
             "viewer_toggle_reading_direction": lambda: self.dispatch_command(commands.TOGGLE_READING_DIRECTION),
             "viewer_fit_window": lambda: self.dispatch_command(commands.FIT_WINDOW),
@@ -1466,6 +1471,8 @@ class ViewerWindow(QMainWindow):
                     continue
                 shortcut = QShortcut(QKeySequence(value), self)
                 shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+                if action_id == "viewer_open_with":
+                    shortcut.setAutoRepeat(False)
                 shortcut.activated.connect(handler)
                 self._viewer_dynamic_shortcuts.append(shortcut)
 
@@ -2582,6 +2589,64 @@ class ViewerWindow(QMainWindow):
             self.model.display_path_for_index(self.model.focused_index)
         )
 
+    def open_current_with_application_picker(self) -> None:
+        if self._shutdown_prepared:
+            return
+        displayed = self.presentation_state.displayed
+        source = self.book_session.source
+        if displayed is None or source is None or self.displayed_browser_path is None:
+            return
+        index = self.viewer.displayed_page_at(self.viewer.mapFromGlobal(QCursor.pos()))
+        if index is None:
+            index = displayed.values.page_index
+        page = next((page for page in displayed.unit.pages if page.index == index), None)
+        if page is None:
+            return
+        old = getattr(self, '_external_open_worker', None)
+        if old is not None:
+            old.cancelled.set()
+        identity = (self.book_session.generation, id(source), page.image_id, object())
+        self._external_open_identity = identity
+        if isinstance(source, (ZipImageSource, SevenZipImageSource)):
+            from .viewer_external_open import ArchiveImageExport
+            worker = ArchiveImageExport(identity, source.source_path, page.image_id,
+                                        self.config.base_dir / 'data' / 'external-open',
+                                        self.archive_backend_registry)
+            self._external_open_worker = worker
+            worker.signals.finished.connect(self._external_image_prepared)
+            self._set_status_override(tr('読み込み中…'))
+            QThreadPool.globalInstance().start(worker)
+        else:
+            target = page.image_id if isinstance(source, FolderImageSource) else str(source.source_path)
+            self._external_open_path = lexical_absolute(target)
+            self._request_path_probe(self._external_open_path, "open_with")
+
+    def _external_open_is_current(self, identity) -> bool:
+        displayed = self.presentation_state.displayed
+        return bool(not self._shutdown_prepared and displayed is not None
+                    and identity == getattr(self, '_external_open_identity', None)
+                    and identity[:2] == (self.book_session.generation, id(self.book_session.source))
+                    and any(page.image_id == identity[2] for page in displayed.unit.pages))
+
+    def _external_image_prepared(self, identity, path, error) -> None:
+        if not self._external_open_is_current(identity):
+            return
+        if error or path is None:
+            self._set_status_override(error or tr('アプリ選択画面を開けませんでした'), 3000)
+            return
+        self._external_open_path = path
+        self._request_path_probe(path, 'open_with')
+
+    def _open_with_after_probe(self, path: str) -> None:
+        identity = getattr(self, '_external_open_identity', None)
+        if (identity is None or not self._external_open_is_current(identity)
+                or path != getattr(self, '_external_open_path', None)):
+            return
+        from .system_file_opener import SystemFileOpener
+        result = SystemFileOpener().open_with_default_application(path, parent_hwnd=int(self.winId()))
+        if not result.success:
+            self._set_status_override(result.error_message or tr(' 関連付けアプリで開けませんでした').strip(), 3000)
+
     def copy_current_image(self) -> None:
         if self.model.total_pages <= 0:
             return
@@ -2686,6 +2751,8 @@ class ViewerWindow(QMainWindow):
             self._update_status()
             if purpose == "recent_book_open":
                 self._request_open_path(path)
+            elif purpose == "open_with":
+                self._open_with_after_probe(path)
             else:
                 QDesktopServices.openUrl(QUrl.fromLocalFile(path))
             return
@@ -7319,6 +7386,9 @@ class ViewerWindow(QMainWindow):
         )
 
     def prepare_shutdown(self, *, wait_msecs: int = 250) -> bool:
+        export = getattr(self, '_external_open_worker', None)
+        if export is not None:
+            export.cancelled.set()
         if self._shutdown_cleanup_complete:
             return True
         # This flag fences all new input/work on the first attempt and stays
