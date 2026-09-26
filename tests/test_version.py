@@ -10,15 +10,15 @@ from app.windows_app_id import set_windows_app_user_model_id
 
 
 def test_version_has_display_and_numeric_forms():
-    assert __version__ == "1.0.21"
-    assert VERSION_TUPLE == (1, 0, 21, 0)
+    assert __version__ == "1.0.22"
+    assert VERSION_TUPLE == (1, 0, 22, 0)
     text = windows_version_info_text()
     assert "14matsu-ai" in text
     assert "NivisViewer.exe" in text
     assert __version__ in text
-    assert "StringStruct('FileVersion', '1.0.21')" in text
-    assert "StringStruct('ProductVersion', '1.0.21')" in text
-    assert "filevers=(1, 0, 21, 0)" in text
+    assert "StringStruct('FileVersion', '1.0.22')" in text
+    assert "StringStruct('ProductVersion', '1.0.22')" in text
+    assert "filevers=(1, 0, 22, 0)" in text
 
 
 def test_app_user_model_id_is_mockable_and_non_windows_is_noop():

@@ -22,7 +22,7 @@ from .pdf_backend import is_cancelled
 from .i18n import tr
 
 VECTOR_SUFFIXES = frozenset({'.svg', '.ai'})
-RENDERER_VERSION = 2
+RENDERER_VERSION = 3
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 MAX_SVG_BYTES = 8 * 1024 * 1024
 MAX_PIXELS = 16 * 1024 * 1024
@@ -183,11 +183,16 @@ def _remove_svg_metadata(node):
 
 
 def _svg(data):
-    # Expat rejects declarations before ElementTree/Qt can resolve anything.
+    # Ignore external document type identifiers without loading their DTD.
+    # Internal subsets/entities remain forbidden; Qt only sees the tree below.
     parser = expat.ParserCreate()
     def reject(*args):
         raise VectorImageError(tr(SVG_ERROR))
-    parser.StartDoctypeDeclHandler = reject
+    def doctype(name, system_id, public_id, has_internal_subset):
+        if name != 'svg' or has_internal_subset:
+            reject()
+    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    parser.StartDoctypeDeclHandler = doctype
     parser.EntityDeclHandler = reject
     parser.ExternalEntityRefHandler = reject
     parser.ProcessingInstructionHandler = reject

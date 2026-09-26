@@ -16,6 +16,7 @@ from app.browser_model import BrowserItem, BrowserItemKind
 from app.supported_formats import configure_vector_loading
 
 SVG = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="-10 -20 100 50"><rect x="-10" y="-20" width="50" height="50" fill="red"/></svg>'
+SVG_DTD = b'<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">' + SVG
 
 
 def pdf_bytes(rotation=0):
@@ -69,6 +70,41 @@ def test_dtd_and_cancel_rejected(qapp):
         render_vector(SVG, '.svg', cancel_token=cancel)
 
 
+@pytest.mark.parametrize('declaration', [
+    '<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 20010904//EN" "http://www.w3.org/TR/2001/REC-SVG-20010904/DTD/svg10.dtd">',
+    '<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">',
+    '<!DOCTYPE svg SYSTEM "file:///nonexistent/external.dtd">',
+])
+@pytest.mark.parametrize('encoding', ['utf-8', 'utf-16'])
+def test_svg_doctype_ignored_before_qt(declaration, encoding, monkeypatch, qapp):
+    import app.vector_image_decoder as decoder
+    expected, logical = render_vector(SVG, '.svg', (200, 100))
+    original = decoder.QSvgRenderer
+    received = []
+    class CheckedRenderer(original):
+        def load(self, data):
+            received.append(bytes(data))
+            assert b'<!DOCTYPE' not in bytes(data)
+            assert b'external.dtd' not in bytes(data)
+            return super().load(data)
+    monkeypatch.setattr(decoder, 'QSvgRenderer', CheckedRenderer)
+    payload = ('<?xml version="1.0" encoding="' + encoding + '"?>' + declaration + SVG.decode()).encode(encoding)
+    image, actual_logical = render_vector(payload, '.svg', (200, 100))
+    assert received and image == expected and actual_logical == logical
+
+
+@pytest.mark.parametrize('declaration', [
+    b'<!DOCTYPE svg [<!ENTITY x "expanded">]>',
+    b'<!DOCTYPE svg [<!ENTITY % x SYSTEM "file:///external.dtd">%x;]>',
+    b'<!DOCTYPE svg [<!ATTLIST svg width CDATA "100">]>',
+])
+def test_svg_internal_subset_rejected_before_qt(declaration, monkeypatch, qapp):
+    import app.vector_image_decoder as decoder
+    monkeypatch.setattr(decoder, 'QSvgRenderer', lambda: pytest.fail('Qt received a DTD'))
+    with pytest.raises(VectorImageError):
+        render_vector(declaration + SVG, '.svg')
+
+
 def test_ai_first_page_owner_thread_and_failure_cleanup(qapp):
     class Tracked(PdfiumBackend):
         def render_ai(self, *args, **kwargs):
@@ -94,7 +130,7 @@ def test_ai_first_page_owner_thread_and_failure_cleanup(qapp):
         assert service.shutdown()
 
 
-@pytest.mark.parametrize('suffix,payload', [('.svg',SVG),('.ai',pdf_bytes())], ids=['svg','ai'])
+@pytest.mark.parametrize('suffix,payload', [('.svg',SVG),('.svg',SVG_DTD),('.ai',pdf_bytes())], ids=['svg','svg-doctype','ai'])
 def test_folder_zip_thumbnail_and_original_identity(tmp_path, qapp, suffix, payload):
     path = tmp_path / ('合成'+suffix); path.write_bytes(payload)
     archive = tmp_path / '合成.zip'
