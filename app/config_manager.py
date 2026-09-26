@@ -250,6 +250,8 @@ class ConfigManager(QObject):
         "pdf_render_annotations": True,
         "archive_backend_preference": "auto",
         "winrar_executable": "",
+        "gimp_executable": "",
+        "xcf_loading_enabled": False,
         "seven_zip_executable": "",
         "magnifier_enabled": False,
         "magnifier_zoom": 2.0,
@@ -532,6 +534,10 @@ class ConfigManager(QObject):
             normalized["archive_backend_preference"] = "auto"
         if not isinstance(normalized.get("winrar_executable"), str):
             normalized["winrar_executable"] = ""
+        value = normalized.get("gimp_executable")
+        if not isinstance(normalized.get("xcf_loading_enabled"), bool):
+            normalized["xcf_loading_enabled"] = False
+        normalized["gimp_executable"] = value.strip().strip('"') if isinstance(value, str) else ""
         if not isinstance(normalized.get("seven_zip_executable"), str):
             normalized["seven_zip_executable"] = ""
         if not isinstance(normalized.get("last_browser_path"), str):

@@ -28,6 +28,18 @@ def _reject_external_launch(*args: object, **kwargs: object) -> None:
     )
 
 
+@pytest.fixture
+def enable_xcf():
+    """Explicitly opt in only for decoder capability tests."""
+    from app.supported_formats import configure_xcf_loading, xcf_loading_enabled
+    previous = xcf_loading_enabled()
+    configure_xcf_loading(True)
+    try:
+        yield
+    finally:
+        configure_xcf_loading(previous)
+
+
 def _safe_seven_zip_locator() -> Mock:
     locator = Mock()
     locator.locate.return_value = SevenZipInfo(

@@ -4,7 +4,7 @@
   "runtime": [
     {
       "name": "PySide6",
-      "version": "6.11.2",
+      "version": "6.11.1",
       "files": [
         "LicenseRef-Qt-Commercial.txt"
       ],
@@ -15,14 +15,11 @@
       "declared_license_files": [
         "LicenseRef-Qt-Commercial.txt"
       ],
-      "supplement": {
-        "path": "Qt/6.11.2/SOURCES.json",
-        "scope": "license texts and limited attribution, not complete source/module compliance"
-      }
+      "supplement": null
     },
     {
       "name": "PySide6_Addons",
-      "version": "6.11.2",
+      "version": "6.11.1",
       "files": [
         "LicenseRef-Qt-Commercial.txt"
       ],
@@ -33,14 +30,11 @@
       "declared_license_files": [
         "LicenseRef-Qt-Commercial.txt"
       ],
-      "supplement": {
-        "path": "Qt/6.11.2/SOURCES.json",
-        "scope": "license texts and limited attribution, not complete source/module compliance"
-      }
+      "supplement": null
     },
     {
       "name": "PySide6_Essentials",
-      "version": "6.11.2",
+      "version": "6.11.1",
       "files": [
         "LicenseRef-Qt-Commercial.txt"
       ],
@@ -51,14 +45,11 @@
       "declared_license_files": [
         "LicenseRef-Qt-Commercial.txt"
       ],
-      "supplement": {
-        "path": "Qt/6.11.2/SOURCES.json",
-        "scope": "license texts and limited attribution, not complete source/module compliance"
-      }
+      "supplement": null
     },
     {
       "name": "shiboken6",
-      "version": "6.11.2",
+      "version": "6.11.1",
       "files": [
         "LicenseRef-Qt-Commercial.txt"
       ],
@@ -69,19 +60,16 @@
       "declared_license_files": [
         "LicenseRef-Qt-Commercial.txt"
       ],
-      "supplement": {
-        "path": "Qt/6.11.2/SOURCES.json",
-        "scope": "license texts and limited attribution, not complete source/module compliance"
-      }
+      "supplement": null
     },
     {
       "name": "Pillow",
-      "version": "12.3.0",
+      "version": "12.1.1",
       "files": [
-        "LICENSE"
+        "LICENSE__926df5f888a7337fd4126a435202edf2847312be81a167df91a6d70cfa3f2ed3"
       ],
       "file_sha256": {
-        "LICENSE": "4f7866a74802c6326f81faff59a56546b6aec2b10b91973e0e9308de95e79857"
+        "LICENSE__926df5f888a7337fd4126a435202edf2847312be81a167df91a6d70cfa3f2ed3": "926df5f888a7337fd4126a435202edf2847312be81a167df91a6d70cfa3f2ed3"
       },
       "declared_license": "MIT-CMU",
       "declared_license_files": [
@@ -105,6 +93,219 @@
       "supplement": null
     },
     {
+      "name": "psd-tools",
+      "version": "1.19.0",
+      "files": [
+        "LICENSE__8a52d28368f5ba5847da1629e53e7d58791f1009627bd9c9db1449d2fe46a5f2"
+      ],
+      "file_sha256": {
+        "LICENSE__8a52d28368f5ba5847da1629e53e7d58791f1009627bd9c9db1449d2fe46a5f2": "8a52d28368f5ba5847da1629e53e7d58791f1009627bd9c9db1449d2fe46a5f2"
+      },
+      "declared_license": "MIT",
+      "declared_license_files": [
+        "LICENSE"
+      ],
+      "supplement": null
+    },
+    {
+      "name": "attrs",
+      "version": "26.1.0",
+      "files": [
+        "LICENSE"
+      ],
+      "file_sha256": {
+        "LICENSE": "882115c95dfc2af1eeb6714f8ec6d5cbcabf667caff8729f42420da63f714e9f"
+      },
+      "declared_license": "MIT",
+      "declared_license_files": [
+        "LICENSE"
+      ],
+      "supplement": null
+    },
+    {
+      "name": "numpy",
+      "version": "2.4.6",
+      "files": [
+        "LICENSE.txt",
+        "numpy___core__include__numpy__libdivide__LICENSE.txt",
+        "numpy___core__src__common__pythoncapi-compat__COPYING",
+        "numpy___core__src__highway__LICENSE",
+        "numpy___core__src__multiarray__dragon4_LICENSE.txt",
+        "numpy___core__src__npysort__x86-simd-sort__LICENSE.md",
+        "numpy___core__src__umath__svml__LICENSE",
+        "numpy__fft__pocketfft__LICENSE.md",
+        "numpy__linalg__lapack_lite__LICENSE.txt",
+        "numpy__ma__LICENSE",
+        "numpy__random__LICENSE.md",
+        "numpy__random__src__distributions__LICENSE.md",
+        "numpy__random__src__mt19937__LICENSE.md",
+        "numpy__random__src__pcg64__LICENSE.md",
+        "numpy__random__src__philox__LICENSE.md",
+        "numpy__random__src__sfc64__LICENSE.md",
+        "numpy__random__src__splitmix64__LICENSE.md"
+      ],
+      "file_sha256": {
+        "LICENSE.txt": "a804dff0ead9fadc5293456410bcbfc32bf024be9c4513459663fb7b442d2341",
+        "numpy___core__include__numpy__libdivide__LICENSE.txt": "d544761558b510866c21f7e8a2d5716fca76e0b98117e3b6b86314db7244d150",
+        "numpy___core__src__common__pythoncapi-compat__COPYING": "aea41976c720f91bd19725c16916a1ace40eb1ea42620d340e587a5de4bbcea0",
+        "numpy___core__src__highway__LICENSE": "d208152e2777ffd0126eacc1bd21c0320d69e4e6b622d21a2a12a47e8ef73763",
+        "numpy___core__src__multiarray__dragon4_LICENSE.txt": "b0fd592d4ead563148e3977e7b589169d46a5ef2ff133c755a81af880a3fc919",
+        "numpy___core__src__npysort__x86-simd-sort__LICENSE.md": "a732977853530066790c42817087f4829b518dd98d340c916acbfd227e39d3cb",
+        "numpy___core__src__umath__svml__LICENSE": "585483905b13d4b42f800c55ba99e89d6e2e33ccd5f503e201c07531d148ff41",
+        "numpy__fft__pocketfft__LICENSE.md": "8db000e158c162e7249787852d8c69764706502ccee725c06641b31c1e95c8af",
+        "numpy__linalg__lapack_lite__LICENSE.txt": "19060ef465e1797d682ee0fc3081bd25ab1395e995e43d25c9d13c95d9a3cd6b",
+        "numpy__ma__LICENSE": "d78dbb208b80d92b4d333e41a4baae50d12444f46e53199fa7726a91de6e2da7",
+        "numpy__random__LICENSE.md": "b4bc2f4fa1c95778f1ed3dd8f14706bece399475b978f9f34b5d3cd72521b48a",
+        "numpy__random__src__distributions__LICENSE.md": "cf5619f25b112d5ce7c896efffc8e610bcb345dfadcc19f2c1460aa48fff2c9e",
+        "numpy__random__src__mt19937__LICENSE.md": "92c10699884321f1c2947fe2a70ab23b0fbf1507f756d89dd08f38c61fc3d4fa",
+        "numpy__random__src__pcg64__LICENSE.md": "41190663b77bee5302386495a07b7eabfbfa571aa0ae2f11da6764162062fc4f",
+        "numpy__random__src__philox__LICENSE.md": "322ac46d870c8aeead6c53adcccc839296fb3c8e456eae155081297daf7f8013",
+        "numpy__random__src__sfc64__LICENSE.md": "28cad82ce1379dc529df30da78ec012d7d0d1d576b03ddcb93388aee53659f59",
+        "numpy__random__src__splitmix64__LICENSE.md": "454ec7350e478e037061850b67395753b425b1cb0a34bbc26290b020bf89d763"
+      },
+      "declared_license": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
+      "declared_license_files": [
+        "LICENSE.txt",
+        "numpy/_core/include/numpy/libdivide/LICENSE.txt",
+        "numpy/_core/src/common/pythoncapi-compat/COPYING",
+        "numpy/_core/src/highway/LICENSE",
+        "numpy/_core/src/multiarray/dragon4_LICENSE.txt",
+        "numpy/_core/src/npysort/x86-simd-sort/LICENSE.md",
+        "numpy/_core/src/umath/svml/LICENSE",
+        "numpy/fft/pocketfft/LICENSE.md",
+        "numpy/linalg/lapack_lite/LICENSE.txt",
+        "numpy/ma/LICENSE",
+        "numpy/random/LICENSE.md",
+        "numpy/random/src/distributions/LICENSE.md",
+        "numpy/random/src/mt19937/LICENSE.md",
+        "numpy/random/src/pcg64/LICENSE.md",
+        "numpy/random/src/philox/LICENSE.md",
+        "numpy/random/src/sfc64/LICENSE.md",
+        "numpy/random/src/splitmix64/LICENSE.md"
+      ],
+      "supplement": null
+    },
+    {
+      "name": "typing-extensions",
+      "version": "4.16.0",
+      "files": [
+        "LICENSE"
+      ],
+      "file_sha256": {
+        "LICENSE": "3b2f81fe21d181c499c59a256c8e1968455d6689d269aa85373bfb6af41da3bf"
+      },
+      "declared_license": "PSF-2.0",
+      "declared_license_files": [
+        "LICENSE"
+      ],
+      "supplement": null
+    },
+    {
+      "name": "gimpformats",
+      "version": "2025",
+      "files": [
+        "LICENSE.txt"
+      ],
+      "file_sha256": {
+        "LICENSE.txt": "e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118"
+      },
+      "declared_license": "LGPL-3.0-only",
+      "declared_license_files": [
+        "LICENSE.txt"
+      ],
+      "supplement": null
+    },
+    {
+      "name": "aenum",
+      "version": "3.1.17",
+      "files": [
+        "LICENSE"
+      ],
+      "file_sha256": {
+        "LICENSE": "0db837e38002017b352666c83c8d3216ee5b9b2229375eb2cf4487f8c24e1f8c"
+      },
+      "declared_license": "BSD License",
+      "declared_license_files": [],
+      "supplement": null
+    },
+    {
+      "name": "blendmodes",
+      "version": "2025",
+      "files": [
+        "LICENSE.md"
+      ],
+      "file_sha256": {
+        "LICENSE.md": "fd9c0c4d8653b241afc991413b1410481af5fa787d3ed9418d3da2fdd654406b"
+      },
+      "declared_license": "MIT",
+      "declared_license_files": [
+        "LICENSE.md"
+      ],
+      "supplement": null
+    },
+    {
+      "name": "brackettree",
+      "version": "0.2.5",
+      "files": [
+        "LICENSE"
+      ],
+      "file_sha256": {
+        "LICENSE": "da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768"
+      },
+      "declared_license": "LGPL-3.0",
+      "declared_license_files": [],
+      "supplement": {
+        "path": "brackettree/SOURCES.json",
+        "scope": "upstream license text"
+      }
+    },
+    {
+      "name": "loguru",
+      "version": "0.7.3",
+      "files": [
+        "LICENSE"
+      ],
+      "file_sha256": {
+        "LICENSE": "b35d026cc7aca9d5859a02eb87ddf7a386a24c986838651bd1f283f94e003327"
+      },
+      "declared_license": null,
+      "declared_license_files": [],
+      "supplement": {
+        "path": "loguru/SOURCES.json",
+        "scope": "upstream license text"
+      }
+    },
+    {
+      "name": "colorama",
+      "version": "0.4.6",
+      "files": [
+        "LICENSE.txt"
+      ],
+      "file_sha256": {
+        "LICENSE.txt": "cac35c02686e5d04a5a7140bfb3b36e73aed496656e891102e428886d7930318"
+      },
+      "declared_license": null,
+      "declared_license_files": [
+        "LICENSE.txt"
+      ],
+      "supplement": null
+    },
+    {
+      "name": "win32-setctime",
+      "version": "1.2.0",
+      "files": [
+        "LICENSE"
+      ],
+      "file_sha256": {
+        "LICENSE": "2f2d766c4cef27a40d4b3c17d3e02e5b5b9ddffba2544a93f99ffafe05778518"
+      },
+      "declared_license": "MIT license",
+      "declared_license_files": [
+        "LICENSE"
+      ],
+      "supplement": null
+    },
+    {
       "name": "packaging",
       "version": "26.3",
       "files": [
@@ -112,8 +313,8 @@
         "LICENSE.APACHE",
         "LICENSE.BSD",
         "__init__.py",
-        "__pycache______init__.cpython-311.pyc",
-        "__pycache_____spdx.cpython-311.pyc",
+        "__pycache______init__.cpython-311__9945d440c196b190ff558e0427d15242615d9e417c0dd297acc6d648ecc6010c.pyc",
+        "__pycache_____spdx.cpython-311__1990c28c0f95041b0c687205368f8be1186aac6fa9c767a0b638bf482b76799b.pyc",
         "_spdx.py"
       ],
       "file_sha256": {
@@ -121,8 +322,8 @@
         "LICENSE.APACHE": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
         "LICENSE.BSD": "b70e7e9b742f1cc6f948b34c16aa39ffece94196364bc88ff0d2180f0028fac5",
         "__init__.py": "590d12eee73ddbec53b4e9ee5bfc64d9cb3aacb4940e8ebcba260757ce56740b",
-        "__pycache______init__.cpython-311.pyc": "4d3469877d4a3ba0504afd2d32181a7a9bd7e0a8bb70a3122914a89a1f5177c2",
-        "__pycache_____spdx.cpython-311.pyc": "81f7b4da480bb411e30c41fb039dbef40113a36265be77dd9e92a21515139f11",
+        "__pycache______init__.cpython-311__9945d440c196b190ff558e0427d15242615d9e417c0dd297acc6d648ecc6010c.pyc": "9945d440c196b190ff558e0427d15242615d9e417c0dd297acc6d648ecc6010c",
+        "__pycache_____spdx.cpython-311__1990c28c0f95041b0c687205368f8be1186aac6fa9c767a0b638bf482b76799b.pyc": "1990c28c0f95041b0c687205368f8be1186aac6fa9c767a0b638bf482b76799b",
         "_spdx.py": "596ec35e2ca0ebcba9fd8343ff0a51625af548786257815f24b41f7e08613314"
       },
       "declared_license": "Apache-2.0 OR BSD-2-Clause",
@@ -150,7 +351,7 @@
     },
     {
       "name": "pypdfium2",
-      "version": "5.13.0",
+      "version": "5.12.1",
       "files": [
         "LICENSES__Apache-2.0.txt",
         "LICENSES__BSD-3-Clause.txt",
@@ -221,7 +422,7 @@
   "build_tools": [
     {
       "name": "PyInstaller",
-      "version": "6.22.2",
+      "version": "6.20.0",
       "files": [
         "COPYING.txt"
       ],
@@ -236,14 +437,10 @@
     }
   ],
   "warnings": [
-    "PySide6 6.11.2: wheel has only a commercial reference; official open-source texts supplemented, but module/third-party/source review remains",
-    "PySide6: installed 6.11.2 differs from release pin 6.11.1",
-    "PySide6_Addons 6.11.2: wheel has only a commercial reference; official open-source texts supplemented, but module/third-party/source review remains",
-    "PySide6_Essentials 6.11.2: wheel has only a commercial reference; official open-source texts supplemented, but module/third-party/source review remains",
-    "shiboken6 6.11.2: wheel has only a commercial reference; official open-source texts supplemented, but module/third-party/source review remains",
-    "Pillow: installed 12.3.0 differs from release pin 12.1.1",
-    "pypdfium2: installed 5.13.0 differs from release pin 5.12.1",
-    "PyInstaller: installed 6.22.2 differs from release pin 6.20.0"
+    "PySide6 6.11.1: wheel has only a commercial reference; open-source texts missing; inspect metadata and official sources, not a commercial-only conclusion",
+    "PySide6_Addons 6.11.1: wheel has only a commercial reference; open-source texts missing; inspect metadata and official sources, not a commercial-only conclusion",
+    "PySide6_Essentials 6.11.1: wheel has only a commercial reference; open-source texts missing; inspect metadata and official sources, not a commercial-only conclusion",
+    "shiboken6 6.11.1: wheel has only a commercial reference; open-source texts missing; inspect metadata and official sources, not a commercial-only conclusion"
   ],
   "interpreter": {
     "name": "CPython",

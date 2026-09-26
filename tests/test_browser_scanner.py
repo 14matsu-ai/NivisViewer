@@ -5,6 +5,7 @@ from pathlib import Path
 from threading import Event
 
 import pytest
+pytestmark = pytest.mark.usefixtures("enable_xcf")
 from PIL import Image
 from PySide6.QtWidgets import QApplication
 
@@ -75,6 +76,34 @@ def test_scanner_classifies_psd_and_psb_as_images(tmp_path: Path) -> None:
     assert {Path(entry.path).suffix.casefold() for entry in entries} == {
         ".psd",
         ".psb",
+    }
+    assert {entry.item_kind for entry in entries} == {"image"}
+
+
+def test_scanner_classifies_creative_project_files_as_images(
+    tmp_path: Path,
+) -> None:
+    for name in ("drawing.kra", "layers.ora", "page.clip", "work.xcf"):
+        (tmp_path / name).write_bytes(b"placeholder")
+
+    batches = []
+    result = scan_directory(
+        BrowserScanRequest(str(tmp_path), generation=72),
+        Event(),
+        batches.append,
+    )
+
+    assert isinstance(result, BrowserScanCompleted)
+    entries = [
+        entry
+        for batch in batches
+        for entry in batch.entries
+    ]
+    assert {Path(entry.path).suffix.casefold() for entry in entries} == {
+        ".kra",
+        ".ora",
+        ".clip",
+        ".xcf",
     }
     assert {entry.item_kind for entry in entries} == {"image"}
 

@@ -1,6 +1,13 @@
 from __future__ import annotations
 
 PSD_EXTENSIONS = frozenset({".psd", ".psb"})
+KRA_EXTENSIONS = frozenset({".kra"})
+ORA_EXTENSIONS = frozenset({".ora"})
+CLIP_EXTENSIONS = frozenset({".clip"})
+XCF_EXTENSIONS = frozenset({".xcf"})
+CREATIVE_PROJECT_EXTENSIONS = frozenset(
+    KRA_EXTENSIONS | ORA_EXTENSIONS | CLIP_EXTENSIONS | XCF_EXTENSIONS
+)
 
 IMAGE_EXTENSIONS = frozenset(
     {
@@ -17,6 +24,10 @@ IMAGE_EXTENSIONS = frozenset(
         ".ico",
         ".psd",
         ".psb",
+        ".kra",
+        ".ora",
+        ".clip",
+        ".xcf",
     }
 )
 ZIP_ARCHIVE_EXTENSIONS = frozenset({".zip", ".cbz"})
@@ -34,6 +45,23 @@ FORMAT_CATEGORIES = {
     "archive": ARCHIVE_EXTENSIONS,
     "pdf": PDF_EXTENSIONS,
 }
+
+# Runtime policy is resolved once at application startup. Keep capabilities
+# above stable for file associations and configuration validation.
+ENABLED_IMAGE_EXTENSIONS = set(IMAGE_EXTENSIONS - XCF_EXTENSIONS)
+ENABLED_BOOK_FILE_EXTENSIONS = set(BOOK_FILE_EXTENSIONS - XCF_EXTENSIONS)
+
+
+def configure_xcf_loading(enabled: bool) -> None:
+    for extensions in (ENABLED_IMAGE_EXTENSIONS, ENABLED_BOOK_FILE_EXTENSIONS):
+        if enabled:
+            extensions.update(XCF_EXTENSIONS)
+        else:
+            extensions.difference_update(XCF_EXTENSIONS)
+
+
+def xcf_loading_enabled() -> bool:
+    return ".xcf" in ENABLED_IMAGE_EXTENSIONS
 
 
 def normalize_extensions(extensions) -> tuple[str, ...]:

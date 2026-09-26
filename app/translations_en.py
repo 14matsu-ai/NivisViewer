@@ -5,6 +5,17 @@ search queries, persisted identifiers or other runtime user data here.
 """
 
 ENGLISH: dict[str, str] = {
+    "GIMP（XCF画像）": "GIMP (XCF images)",
+    "XCFには、CLIPやPSDのように取り出して表示できるプレビュー画像がないため、読み込み・表示に時間がかかります。": "Unlike CLIP or PSD, XCF has no saved preview image that can be extracted for display, so loading and displaying it takes longer.",
+    "XCF画像の読み込みを有効にする（再起動後に反映）": "Enable XCF image loading (restart required)",
+    "GIMPを確認": "Check GIMP",
+    "GIMP：未確認": "GIMP: not checked",
+    "GIMP：確認中…": "GIMP: checking…",
+    "GIMP：検出済み {p0}\n{p1}": "GIMP: detected {p0}\n{p1}",
+    "GIMP 3が見つからないか、指定した実行ファイルを利用できません。": "GIMP 3 was not found or the selected executable is unavailable.",
+    "GIMP実行ファイルを選択": "Select GIMP executable",
+    "実行ファイル (*.exe);;すべてのファイル (*.*)": "Executables (*.exe);;All files (*.*)",
+    "XCFの読み込みにGIMP 3を使用します。CLIPには不要です。空欄は自動検出、指定した場合はその実行ファイルを使用します。": "GIMP 3 is used to read XCF files. CLIP does not need it. Leave blank for automatic detection, or select the executable to use.",
     ('ファイル数の多いフォルダの再表示を高速化します。\n'
      '前回の一覧をメモリから先に表示し、あとで変更を確認します。\n'
      '保存した一覧を使い、検索・タグ・レートの絞り込みと解除も高速化します。\n'

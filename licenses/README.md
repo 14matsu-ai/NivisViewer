@@ -29,6 +29,11 @@ development license folder without that review.
 See `docs/RELEASE_LICENSE_AUDIT.md` for the inspected artifact inventory and
 unresolved Qt source/module, Python/native, and release-preparation obligations.
 
+`brackettree/` (0.2.5) and `loguru/` (0.7.3) supplement license texts omitted
+from their wheels and source distributions. Each `SOURCES.json` records the
+official upstream source and checksum; the collector checks the exact version
+and checksum before using these texts without network access.
+
 `ZipPlaFork/` is not generated from an installed distribution. It preserves
 the exact `license/AGPL.txt` and `license/About.txt` files from fixed revision
 `07955f5267e2fb92d6fc6e40fde2507d8fb07b3b` for the Viewer processing

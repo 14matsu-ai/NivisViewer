@@ -20,6 +20,13 @@ RUNTIME_DISTRIBUTIONS = (
     "attrs",
     "numpy",
     "typing-extensions",
+    "gimpformats",
+    "aenum",
+    "blendmodes",
+    "brackettree",
+    "loguru",
+    "colorama",
+    "win32-setctime",
     "packaging",
     "natsort",
     "pypdfium2",
@@ -28,6 +35,7 @@ BUILD_DISTRIBUTIONS = ("PyInstaller",)
 LICENSE_NAMES = ("license", "copying", "notice", "authors")
 ROOT = Path(__file__).resolve().parents[1]
 QT_DISTRIBUTIONS = frozenset(RUNTIME_DISTRIBUTIONS[:4])
+UPSTREAM_LICENSE_SUPPLEMENTS = {"brackettree": "0.2.5", "loguru": "0.7.3"}
 
 
 def _copy_notice(source: Path, destination: Path) -> str:
@@ -137,6 +145,16 @@ def collect(output: Path, *, strict: bool = False) -> dict[str, object]:
                     target_name = parts[-1]
                 copied.append(_copy_notice(source, destination / target_name))
             supplement = _qt_supplement(output, distribution.version) if name in QT_DISTRIBUTIONS else None
+            if not copied and UPSTREAM_LICENSE_SUPPLEMENTS.get(name) == distribution.version:
+                folder = ROOT / "licenses" / name
+                index = json.loads((folder / "SOURCES.json").read_text(encoding="utf-8"))
+                source = folder / "LICENSE"
+                if (index["version"] != distribution.version
+                        or hashlib.sha256(source.read_bytes()).hexdigest() != index["sha256"]):
+                    raise RuntimeError(f"{name}: upstream license supplement mismatch")
+                copied.append(_copy_notice(source, destination / "LICENSE"))
+                _copy_notice(folder / "SOURCES.json", destination / "SOURCES.json")
+                supplement = {"path": f"{name}/SOURCES.json", "scope": "upstream license text"}
             if not copied:
                 warning = f"{name} {distribution.version}: no license file found"
                 manifest["warnings"].append(warning)

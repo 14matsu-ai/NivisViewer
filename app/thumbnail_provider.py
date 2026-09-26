@@ -27,13 +27,21 @@ from .browser_model import (
 )
 from .browser_thumbnail_scheduler import ThumbnailPriority
 from .archive_backend import MAX_IMAGE_ENTRY_BYTES
+from .gimp_xcf_backend import gimp_cancellation
+from .xcf_raster_reader import DeferXcf, xcf_worker_scope
 from .file_preview import PreviewResult, PreviewResultKind, PreviewSource
 from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
 from .image_source import EXTERNAL_ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS, SevenZipImageSource
 from .pdf_backend import PageRenderSpec, PdfRenderPriority
+from .creative_image_decoder import decode_creative_thumbnail
 from .psd_decoder import decode_psd_thumbnail
 from .preview_provider_registry import PreviewProviderRegistry
-from .supported_formats import PSD_EXTENSIONS
+from .supported_formats import (
+    CREATIVE_PROJECT_EXTENSIONS,
+    PSD_EXTENSIONS,
+    XCF_EXTENSIONS,
+    xcf_loading_enabled,
+)
 from .thumbnail_disk_cache import ThumbnailDiskCache, ThumbnailSourceIdentity
 from .thumbnail_render import (
     SmartCropCache,
@@ -122,6 +130,7 @@ class _ThumbnailSaveDrain(QRunnable):
 
 
 class _ThumbnailWorkerSignals(QObject):
+    xcf_deferred = Signal(object)
     finished = Signal(str, int, object, object, object)
     provisional = Signal(str, int, object, object, object)
     page_count_discovered = Signal(str, int, int)
@@ -145,6 +154,8 @@ class _ThumbnailWorker(QRunnable):
         self.cancelled = Event()
         self.run_started = Event()
         self.page_count_reported = False
+        self.xcf_lane = item.path.suffix.lower() in XCF_EXTENSIONS
+        self.xcf_handoff_connected = False
         self.signals = _ThumbnailWorkerSignals()
 
     @Slot()
@@ -175,15 +186,21 @@ class _ThumbnailWorker(QRunnable):
             )
 
         try:
-            result = _invoke_thumbnail_loader(
-                self.loader,
-                self.item,
-                self.size,
-                self.cancelled,
-                self.priority,
-                report_provisional,
-                report_page_count,
-            )
+            with xcf_worker_scope(defer=not self.xcf_lane):
+                result = _invoke_thumbnail_loader(
+                    self.loader,
+                    self.item,
+                    self.size,
+                    self.cancelled,
+                    self.priority,
+                    report_provisional,
+                    report_page_count,
+                )
+        except DeferXcf:
+            # An archive/folder cover was discovered to be XCF. Release the
+            # ordinary lane before retrying under the same request identity.
+            self.signals.xcf_deferred.emit(self)
+            return
         except Exception:
             _THUMBNAIL_LOG.exception(
                 "thumbnail worker failed path=%s generation=%s",
@@ -240,6 +257,9 @@ class BrowserThumbnailProvider(QObject):
         self._coordinator = image_work_coordinator
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(1)
+        self._xcf_pool = QThreadPool(self)
+        self._xcf_pool.setMaxThreadCount(1)
+        self._xcf_pool.setExpiryTimeout(1000)
         self._save_pool = QThreadPool(self)
         self._save_pool.setMaxThreadCount(1)
         # This lane is short-lived between bursts; let idle provider threads
@@ -435,6 +455,8 @@ class BrowserThumbnailProvider(QObject):
         generation: int | None = None,
         priority: ThumbnailPriority = ThumbnailPriority.VISIBLE,
     ) -> bool:
+        if item.path.suffix.casefold() in XCF_EXTENSIONS and not xcf_loading_enabled():
+            return False
         if self._closed:
             return False
         requested_generation = self._generation if generation is None else generation
@@ -861,8 +883,10 @@ class BrowserThumbnailProvider(QObject):
         else:
             decode_done = self._pool.waitForDone(msecs)
         remaining = max(0, int((deadline - monotonic()) * 1000))
+        xcf_done = self._xcf_pool.waitForDone(remaining)
+        remaining = max(0, int((deadline - monotonic()) * 1000))
         save_done = self._save_pool.waitForDone(remaining)
-        return decode_done and save_done
+        return decode_done and xcf_done and save_done
 
     @property
     def disk_cache(self) -> ThumbnailDiskCache | None:
@@ -1641,6 +1665,24 @@ class BrowserThumbnailProvider(QObject):
                     return ThumbnailLoadResult(cached, disk_cache_hit=True)
 
         normalized_priority = ThumbnailPriority(thumbnail_priority)
+        if (
+            item.kind is BrowserItemKind.IMAGE
+            and item.path.suffix.casefold() in XCF_EXTENSIONS
+            and normalized_priority in {
+                ThumbnailPriority.READ_AHEAD,
+                ThumbnailPriority.PREFETCH,
+                ThumbnailPriority.BACKGROUND,
+            }
+        ):
+            # XCF has no cheap saved composite. Avoid speculative full-layer
+            # flattening; visible/selected requests may still render it.
+            self._increment_stat("prefetch_skipped")
+            return ThumbnailLoadResult(
+                None,
+                provisional_image=provisional,
+                result_kind=PreviewResultKind.NOT_APPLICABLE,
+                persist_to_disk=False,
+            )
         if (
             normalized_priority is ThumbnailPriority.PREFETCH
             and item.kind in {
@@ -2539,6 +2581,12 @@ class BrowserThumbnailProvider(QObject):
                     path,
                     minimum_long_edge=spec.long_edge,
                 )
+            elif path.suffix.casefold() in CREATIVE_PROJECT_EXTENSIONS:
+                image_context = decode_creative_thumbnail(
+                    path,
+                    suffix=path.suffix.casefold(),
+                    minimum_long_edge=spec.long_edge,
+                )
             else:
                 image_context = Image.open(path)
 
@@ -2708,6 +2756,18 @@ class BrowserThumbnailProvider(QObject):
                                     continue
                                 image_context = decode_psd_thumbnail(
                                     file.read(),
+                                    minimum_long_edge=spec.long_edge,
+                                )
+                            elif (
+                                Path(name).suffix.casefold()
+                                in CREATIVE_PROJECT_EXTENSIONS
+                            ):
+                                if source.getinfo(name).file_size > MAX_IMAGE_ENTRY_BYTES:
+                                    continue
+                                suffix = Path(name).suffix.casefold()
+                                image_context = decode_creative_thumbnail(
+                                    file.read(),
+                                    suffix=suffix,
                                     minimum_long_edge=spec.long_edge,
                                 )
                             else:
@@ -2915,6 +2975,11 @@ class BrowserThumbnailProvider(QObject):
         )
 
     def _try_take(self, worker: _ThumbnailWorker) -> bool:
+        if worker.xcf_lane:
+            try:
+                return self._xcf_pool.tryTake(worker)
+            except RuntimeError:
+                return False
         if self._coordinator is not None:
             return self._coordinator.try_take_browser(worker)
         try:
@@ -2930,6 +2995,16 @@ class BrowserThumbnailProvider(QObject):
         priority: ThumbnailPriority,
     ) -> bool:
         normalized = ThumbnailPriority(priority)
+        if not worker.xcf_handoff_connected:
+            worker.signals.xcf_deferred.connect(self._on_xcf_deferred)
+            worker.xcf_handoff_connected = True
+        if worker.xcf_lane:
+            if self._closed or self._paused or (
+                self._coordinator is not None and self._coordinator.browser_paused
+            ):
+                return False
+            self._xcf_pool.start(worker, int(normalized))
+            return True
         if self._coordinator is not None:
             mapped = {
                 ThumbnailPriority.VISIBLE: ImageWorkPriority.BROWSER_VISIBLE,
@@ -2941,6 +3016,27 @@ class BrowserThumbnailProvider(QObject):
             return self._coordinator.start_browser(worker, mapped)
         self._pool.start(worker, int(normalized))
         return True
+
+    def _on_xcf_deferred(self, old: _ThumbnailWorker) -> None:
+        token = old.size.cache_token if isinstance(old.size, ThumbnailRenderSpec) else old.size
+        key = (self._path_key(old.item.path), token, old.generation)
+        with self._pending_lock:
+            pending = self._pending.get(key)
+            if pending is None or pending.worker is not old:
+                return
+            worker = _ThumbnailWorker(old.item, old.size, old.generation, old.loader, old.priority)
+            worker.cancelled = old.cancelled
+            worker.signals = old.signals
+            worker.xcf_lane = True
+            worker.xcf_handoff_connected = True
+            self._pending[key] = _PendingThumbnail(worker, pending.priority)
+        if (not worker.cancelled.is_set() and old.generation == self._generation
+                and self._start_worker(worker, worker.priority)):
+            return
+        worker.signals.finished.emit(str(worker.item.path), worker.generation, token,
+                                     worker.item.thumbnail_revision, ThumbnailLoadResult(
+                                         None, result_kind=PreviewResultKind.CANCELLED,
+                                         persist_to_disk=False))
 
     def _release_retired_if_idle(self) -> None:
         if not self._closed:
@@ -3070,6 +3166,18 @@ class BrowserThumbnailProvider(QObject):
 
 
 def _invoke_thumbnail_loader(
+    loader, item, size, cancel_token,
+    thumbnail_priority=ThumbnailPriority.VISIBLE,
+    provisional_callback=None, page_count_callback=None,
+):
+    with gimp_cancellation(cancel_token):
+        return _invoke_thumbnail_loader_bound(
+            loader, item, size, cancel_token, thumbnail_priority,
+            provisional_callback, page_count_callback,
+        )
+
+
+def _invoke_thumbnail_loader_bound(
     loader,
     item: BrowserItem,
     size: int,

@@ -133,6 +133,20 @@ def test_collector_keeps_exact_interpreter_notice(tmp_path, monkeypatch):
     assert notice["sha256"] == hashlib.sha256(payload).hexdigest()
 
 
+@pytest.mark.parametrize("name,version", [("brackettree", "0.2.5"), ("loguru", "0.7.3")])
+def test_missing_wheel_license_uses_exact_upstream_supplement(tmp_path, monkeypatch, name, version):
+    distribution = fake_distribution(tmp_path / "wheel", {}, version=version)
+    monkeypatch.setattr(collector, "RUNTIME_DISTRIBUTIONS", (name,))
+    monkeypatch.setattr(collector, "BUILD_DISTRIBUTIONS", ())
+    monkeypatch.setattr(collector.metadata, "distribution", lambda _: distribution)
+    result = collector.collect(tmp_path / "output", strict=True)
+    assert result["runtime"][0]["files"] == ["LICENSE"]
+    assert result["runtime"][0]["supplement"]["path"] == f"{name}/SOURCES.json"
+    distribution.version = "99.0.0"
+    with pytest.raises(RuntimeError, match="no license file"):
+        collector.collect(tmp_path / "future", strict=True)
+
+
 @pytest.mark.parametrize("executable", ["ffmpeg.exe", "ffprobe.exe", "7z.exe", "WinRAR.exe"])
 def test_external_tools_cannot_silently_enter_portable_bundle(tmp_path, executable):
     (tmp_path / executable).write_bytes(b"fixture, not executable")

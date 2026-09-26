@@ -63,6 +63,7 @@ def dependency_versions() -> dict[str, str]:
         ("PySide6", "PySide6"),
         ("Pillow", "Pillow"),
         ("psd-tools", "psd-tools"),
+        ("gimpformats", "gimpformats"),
         ("natsort", "natsort"),
         ("pypdfium2", "pypdfium2"),
     ):

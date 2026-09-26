@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import zipfile
 from pathlib import Path
 from threading import Event, Thread
@@ -35,6 +36,33 @@ def write_psd(
     path.parent.mkdir(parents=True, exist_ok=True)
     with Image.new("RGB", size, "navy") as image:
         PSDImage.frompil(image).save(path)
+
+
+def write_kra(
+    path: Path,
+    *,
+    size: tuple[int, int] = (160, 240),
+) -> None:
+    merged = io.BytesIO()
+    preview = io.BytesIO()
+    with Image.new("RGB", size, "red") as image:
+        image.save(merged, "PNG")
+    with Image.new("RGB", (80, 120), "blue") as image:
+        image.save(preview, "PNG")
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mergedimage.png", merged.getvalue())
+        archive.writestr("preview.png", preview.getvalue())
+
+
+def test_folder_lists_and_decodes_kra(tmp_path: Path) -> None:
+    path = tmp_path / "drawing.kra"
+    write_kra(path, size=(321, 654))
+    source = FolderImageSource(tmp_path)
+
+    assert source.list_images() == [str(path)]
+    assert source.probe_image_size(str(path)) == (321, 654)
+    with source.open_image(str(path)) as image:
+        assert image.size == (321, 654)
 
 
 def test_folder_lists_and_decodes_psd(tmp_path: Path) -> None:

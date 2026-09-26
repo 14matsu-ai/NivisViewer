@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import logging
 import os
 import zipfile
@@ -38,6 +39,40 @@ def write_psd(path: Path) -> None:
         PSDImage.frompil(image).save(path)
 
 
+def write_kra(path: Path) -> None:
+    merged = io.BytesIO()
+    preview = io.BytesIO()
+    with Image.new("RGB", (120, 180), "red") as image:
+        image.save(merged, "PNG")
+    with Image.new("RGB", (96, 144), "blue") as image:
+        image.save(preview, "PNG")
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mergedimage.png", merged.getvalue())
+        archive.writestr("preview.png", preview.getvalue())
+
+
+def test_kra_browser_thumbnail_uses_embedded_preview(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cover.kra"
+    write_kra(path)
+    spec = ThumbnailRenderSpec.from_settings(
+        80,
+        "square_1_1",
+        "letterbox",
+    )
+
+    result = BrowserThumbnailProvider.load_thumbnail(
+        make_item(path, BrowserItemKind.IMAGE),
+        spec,
+    )
+
+    assert result is not None
+    assert not result.isNull()
+    center = result.pixelColor(result.width() // 2, result.height() // 2)
+    assert center.blue() > center.red()
+
+
 def test_psd_browser_thumbnail_uses_supported_image_path(
     tmp_path: Path,
 ) -> None:
@@ -60,6 +95,25 @@ def test_psd_browser_thumbnail_uses_supported_image_path(
 
 def make_item(path: Path, kind: BrowserItemKind) -> BrowserItem:
     return BrowserItem(path.name, path, kind, path.stat().st_mtime)
+
+
+@pytest.mark.parametrize("priority", [ThumbnailPriority.READ_AHEAD,
+    ThumbnailPriority.PREFETCH, ThumbnailPriority.BACKGROUND])
+def test_xcf_speculation_never_invokes_decoder(tmp_path, monkeypatch, priority):
+    import app.thumbnail_provider as module
+    path = tmp_path / "drawing.xcf"
+    path.write_bytes(b"not needed for a skipped decode")
+    def forbidden(*args, **kwargs):
+        pytest.fail("Speculative XCF work must not flatten layers")
+    monkeypatch.setattr(module, "decode_creative_thumbnail", forbidden)
+    provider = BrowserThumbnailProvider()
+    try:
+        result = provider._load_pipeline(make_item(path, BrowserItemKind.IMAGE),
+                                         80, thumbnail_priority=priority)
+        assert result.resolved_kind is PreviewResultKind.NOT_APPLICABLE
+        assert result.persist_to_disk is False
+    finally:
+        provider.close()
 
 
 def _wait_for_spy(spy: QSignalSpy, qapp: QApplication, timeout_ms: int = 3000) -> bool:

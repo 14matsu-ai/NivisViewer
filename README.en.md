@@ -44,7 +44,13 @@ The application is not code-signed, so Windows SmartScreen may warn about a down
 - RAR / CBR (using WinRAR or 7-Zip installed by the user)
 - 7z / CB7 (using a supported WinRAR CLI configuration or 7-Zip installed by the user)
 - PDF (using pypdfium2 v5 / PDFium)
-- Images: JPEG, PNG, WebP, AVIF, JPEG XL (JXL), BMP, GIF, TIFF, ICO, PSD, PSB
+- Images: JPEG, PNG, WebP, AVIF, JPEG XL (JXL), BMP, GIF, TIFF, ICO, PSD, PSB, KRA, ORA, CLIP, XCF
+
+KRA and ORA use their saved merged image. CLIP is preview-only in Phase 2 and
+does not render the native full-resolution layer raster. XCF loading is off by default;
+enable it in Settings → Archives → GIMP and restart. Supported RGB8 images are read
+directly. Unsupported compositing, masks and effects require installed GIMP 3.x;
+without it these files fail instead of displaying an approximation.
 
 For RAR/7z/CBR/CB7, the viewer selects a recognized external CLI from Windows file associations, standard installation locations, PATH, or the WinRAR/7-Zip path configured in Settings → Archives. If an installed WinRAR includes a supported official console CLI, an additional 7-Zip installation is not needed just for RAR/CBR viewing. Unknown file-association applications are never launched or passed to ShellExecute.
 
