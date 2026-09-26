@@ -629,6 +629,30 @@ class PdfiumService:
             raise PdfBackendError(PdfErrorCode.CANCELLED)
         return result
 
+    def render_ai(self, data, bounds, *, probe=False, cancel_token=None, priority=0):
+        # Do not detach an executing vector job: its caller retains the raster
+        # reservation until PDFium has closed the page and byte-backed document.
+        key = ('ai', self._next_sequence())
+        future = self._submit(
+            key, int(priority),
+            lambda: self.backend.render_ai(data, bounds, probe=probe, cancel_token=cancel_token),
+            cancel_token=cancel_token, deduplicate=False,
+        )
+        try:
+            result = future.result()
+        finally:
+            # Shutdown may complete a consumer Future before an active native
+            # call returns. Keep the caller's reservation until ownership ends.
+            while True:
+                with self._lock:
+                    active = self._active_job
+                    if active is None or active.key != key:
+                        break
+                time.sleep(0.001)
+        if is_cancelled(cancel_token):
+            raise PdfBackendError(PdfErrorCode.CANCELLED)
+        return result
+
     def _next_sequence(self) -> int:
         with self._lock:
             return self._next_sequence_locked()

@@ -44,7 +44,9 @@ NivisViewer 的名称源自拉丁语中表示“雪”的 *nix, nivis*。\
 - RAR / CBR（使用用户环境中的 WinRAR 或 7-Zip）
 - 7z / CB7（使用受支持的 WinRAR 命令行配置或用户环境中的 7-Zip）
 - PDF（使用 pypdfium2 v5／PDFium）
-- 图片：JPEG、PNG、WebP、AVIF、JPEG XL（JXL）、BMP、GIF、TIFF、ICO、PSD、PSB、KRA、ORA、CLIP、XCF
+- 图片：JPEG、PNG、WebP、AVIF、JPEG XL（JXL）、BMP、GIF、TIFF、ICO、PSD、PSB、KRA、ORA、CLIP、XCF、AI、SVG
+
+支持 AI（PDF 兼容文件的第一页）和静态 SVG，在 Browser、Viewer 和压缩包中将每个文件作为一张图片，放大时按所需尺寸重新渲染。两者默认启用，可在“设置 → 压缩包 → AI / SVG 图像”中分别关闭（重启后生效）。工具提示与“？”说明限制和 AI 重新保存方法。不支持 SVG 外部引用、动画及部分效果、非 PDF 兼容 AI、EPS、AIT、SVGZ。字体和效果可能与原应用不同。
 
 KRA和ORA显示文件中保存的合成图像。Phase 2中的CLIP仅显示CanvasPreview，
 不是原始分辨率渲染。XCF读取默认关闭，可在“设置 → 压缩包 → GIMP”中启用，重启后生效。

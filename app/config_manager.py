@@ -252,6 +252,8 @@ class ConfigManager(QObject):
         "winrar_executable": "",
         "gimp_executable": "",
         "xcf_loading_enabled": False,
+        "ai_loading_enabled": True,
+        "svg_loading_enabled": True,
         "seven_zip_executable": "",
         "magnifier_enabled": False,
         "magnifier_zoom": 2.0,
@@ -534,6 +536,9 @@ class ConfigManager(QObject):
             normalized["archive_backend_preference"] = "auto"
         if not isinstance(normalized.get("winrar_executable"), str):
             normalized["winrar_executable"] = ""
+        for key in ("ai_loading_enabled", "svg_loading_enabled"):
+            if not isinstance(normalized.get(key), bool):
+                normalized[key] = True
         value = normalized.get("gimp_executable")
         if not isinstance(normalized.get("xcf_loading_enabled"), bool):
             normalized["xcf_loading_enabled"] = False

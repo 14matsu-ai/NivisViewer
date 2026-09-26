@@ -374,7 +374,7 @@ TAB_SETTING_KEYS: dict[str, tuple[str, ...]] = {
     "file": (
         "file_operation_delete_confirm_focus_yes", "file_operation_delete_skip_confirmation",
     ),
-    "archive": ("archive_backend_preference", "winrar_executable", "seven_zip_executable", "gimp_executable", "xcf_loading_enabled"),
+    "archive": ("archive_backend_preference", "winrar_executable", "seven_zip_executable", "gimp_executable", "xcf_loading_enabled", "ai_loading_enabled", "svg_loading_enabled"),
     "mouse": (
         "mouse_gestures_enabled", "mouse_gesture_show_trail", "mouse_gesture_min_distance",
         "mouse_gesture_bindings", "browser_folder_gestures_enabled", "browser_wheel_scroll_mode",
@@ -2075,6 +2075,43 @@ class SettingsDialog(QDialog):
         note.setWordWrap(True)
         form.addRow(note)
         layout.addWidget(group)
+        vector_group = QGroupBox(tr('AI・SVG画像'), tab)
+        vector_form = QFormLayout(vector_group)
+        self.ai_loading_checkbox = QCheckBox(tr('AI画像の読み込みを有効にする（再起動後に反映）'), vector_group)
+        self.ai_loading_checkbox.setToolTip(tr('PDF互換で保存されたAIの先頭ページだけを表示します。非互換AIはIllustratorで「PDF互換ファイルを作成」を有効にして再保存してください。編集データや全アートボードを再現する機能ではありません。'))
+        ai_row = QWidget(vector_group)
+        ai_layout = QHBoxLayout(ai_row)
+        ai_layout.setContentsMargins(0, 0, 0, 0)
+        ai_layout.addWidget(self.ai_loading_checkbox)
+        self.ai_loading_help_button = _CircularHelpButton(ai_row)
+        self.ai_loading_help_button.setText('?')
+        self.ai_loading_help_button.setFixedSize(20, 20)
+        self.ai_loading_help_button.setAutoRaise(True)
+        self.ai_loading_help_button.setToolTip(self.ai_loading_checkbox.toolTip())
+        self.ai_loading_help_button.setAccessibleName(tr('AI・SVG画像'))
+        self.ai_loading_help_button.clicked.connect(lambda: QMessageBox.information(
+            self, tr('AI・SVG画像'), self.ai_loading_checkbox.toolTip()))
+        ai_layout.addWidget(self.ai_loading_help_button)
+        ai_layout.addStretch(1)
+        vector_form.addRow(ai_row)
+        self.svg_loading_checkbox = QCheckBox(tr('SVG画像の読み込みを有効にする（再起動後に反映）'), vector_group)
+        self.svg_loading_checkbox.setToolTip(tr('外部参照を含まない静止画SVGを表示します。外部ファイル参照・アニメーション・一部の効果は非対応です。フォントや描画結果が元のアプリと異なる場合があります。'))
+        svg_row = QWidget(vector_group)
+        svg_layout = QHBoxLayout(svg_row)
+        svg_layout.setContentsMargins(0, 0, 0, 0)
+        svg_layout.addWidget(self.svg_loading_checkbox)
+        self.svg_loading_help_button = _CircularHelpButton(svg_row)
+        self.svg_loading_help_button.setText('?')
+        self.svg_loading_help_button.setFixedSize(20, 20)
+        self.svg_loading_help_button.setAutoRaise(True)
+        self.svg_loading_help_button.setToolTip(self.svg_loading_checkbox.toolTip())
+        self.svg_loading_help_button.setAccessibleName(tr('AI・SVG画像'))
+        self.svg_loading_help_button.clicked.connect(lambda: QMessageBox.information(
+            self, tr('AI・SVG画像'), self.svg_loading_checkbox.toolTip()))
+        svg_layout.addWidget(self.svg_loading_help_button)
+        svg_layout.addStretch(1)
+        vector_form.addRow(svg_row)
+        layout.addWidget(vector_group)
         gimp_group = QGroupBox(tr('GIMP（XCF画像）'), tab)
         gimp_form = QFormLayout(gimp_group)
         self.xcf_loading_checkbox = QCheckBox(tr('XCF画像の読み込みを有効にする（再起動後に反映）'), gimp_group)
@@ -3480,6 +3517,8 @@ class SettingsDialog(QDialog):
         )
         self.gimp_path_edit.setText(str(self.config.get("gimp_executable", "") or ""))
         self.xcf_loading_checkbox.setChecked(bool(self.config.get("xcf_loading_enabled", False)))
+        self.ai_loading_checkbox.setChecked(bool(self.config.get("ai_loading_enabled", True)))
+        self.svg_loading_checkbox.setChecked(bool(self.config.get("svg_loading_enabled", True)))
         self.seven_zip_path_edit.setText(
             str(self.config.get("seven_zip_executable", "") or "")
         )
@@ -4097,6 +4136,8 @@ class SettingsDialog(QDialog):
             "winrar_executable": self.winrar_path_edit.text().strip().strip('"'),
             "gimp_executable": self.gimp_path_edit.text().strip().strip('"'),
             "xcf_loading_enabled": self.xcf_loading_checkbox.isChecked(),
+            "ai_loading_enabled": self.ai_loading_checkbox.isChecked(),
+            "svg_loading_enabled": self.svg_loading_checkbox.isChecked(),
             "seven_zip_executable": self.seven_zip_path_edit.text().strip().strip('"'),
             **self.browser_workflow_settings.values(),
             "mouse_gestures_enabled": self.mouse_gestures_checkbox.isChecked(),

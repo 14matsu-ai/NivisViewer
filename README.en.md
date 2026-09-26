@@ -44,7 +44,9 @@ The application is not code-signed, so Windows SmartScreen may warn about a down
 - RAR / CBR (using WinRAR or 7-Zip installed by the user)
 - 7z / CB7 (using a supported WinRAR CLI configuration or 7-Zip installed by the user)
 - PDF (using pypdfium2 v5 / PDFium)
-- Images: JPEG, PNG, WebP, AVIF, JPEG XL (JXL), BMP, GIF, TIFF, ICO, PSD, PSB, KRA, ORA, CLIP, XCF
+- Images: JPEG, PNG, WebP, AVIF, JPEG XL (JXL), BMP, GIF, TIFF, ICO, PSD, PSB, KRA, ORA, CLIP, XCF, AI, SVG
+
+AI (the first page of a PDF-compatible saved file) and static SVG are supported as one image per file in Browser, Viewer and archives. Zoom renders at the required size. Both are enabled by default and can be disabled separately in Settings → Archives → AI / SVG images (restart required). Tooltips and the ? buttons explain limitations and how to save compatible AI files. SVG external references, animation and some effects, non-PDF-compatible AI, EPS, AIT and SVGZ are unsupported. Fonts and effects may differ from the source application.
 
 KRA and ORA use their saved merged image. CLIP is preview-only in Phase 2 and
 does not render the native full-resolution layer raster. XCF loading is off by default;
