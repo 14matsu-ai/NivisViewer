@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from .cloud_files import require_local, OnlineOnlyError
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -17,6 +18,7 @@ class PathAvailability(StrEnum):
     MISSING = "missing"
     UNAVAILABLE = "unavailable"
     ERROR = "error"
+    ONLINE_ONLY = "online_only"
 
 
 class PathAvailabilityServiceState(StrEnum):
@@ -39,8 +41,11 @@ class PathAvailabilityFileSystem:
 
     def probe(self, path: str) -> PathAvailability:
         try:
+            require_local(path)
             os.stat(path)
             return PathAvailability.AVAILABLE
+        except OnlineOnlyError:
+            return PathAvailability.ONLINE_ONLY
         except FileNotFoundError:
             return (
                 PathAvailability.UNAVAILABLE

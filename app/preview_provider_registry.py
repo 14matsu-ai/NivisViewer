@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .cloud_files import require_local
 
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -123,6 +124,10 @@ class PreviewProviderRegistry:
         priority: ThumbnailPriority,
         cancel_token: Event | None = None,
     ) -> PreviewResult:
+        try:
+            require_local(item.path)
+        except OSError:
+            return PreviewResult(PreviewResultKind.UNAVAILABLE)
         capability = self.capability_for(item)
         if capability.preview_kind in {
             BrowserPreviewKind.FOLDER_COVER,

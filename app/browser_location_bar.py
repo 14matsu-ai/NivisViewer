@@ -1,6 +1,7 @@
 """Modern, filesystem-only Browser location breadcrumb controls."""
 
 from __future__ import annotations
+from .cloud_files import require_local
 
 from .i18n import tr
 
@@ -365,6 +366,7 @@ def list_child_directories(
 
     parent = Path(parent_path)
     directories: list[LocationSegment] = []
+    require_local(parent)
     with os.scandir(parent) as entries:
         for entry in entries:
             if cancelled is not None and cancelled.is_set():

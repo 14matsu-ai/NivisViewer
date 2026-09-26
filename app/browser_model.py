@@ -57,6 +57,7 @@ class BrowserItem:
     page_count: int | None = None
     created_time_ns: int | None = None
     accessed_time_ns: int | None = None
+    online_only: bool = False
 
     @property
     def thumbnail_revision(self) -> tuple[object, ...]:
@@ -146,6 +147,7 @@ def browser_item_from_scan_entry(entry: BrowserScanEntry) -> BrowserItem:
         page_count=entry.page_count,
         created_time_ns=entry.created_time_ns,
         accessed_time_ns=entry.accessed_time_ns,
+        online_only=entry.online_only,
     )
 
 
@@ -279,6 +281,9 @@ class BrowserItemModel(QAbstractListModel):
         if role == self.ModifiedTimeRole:
             return item.modified_time_ns
         if role == int(Qt.ItemDataRole.ToolTipRole):
+            if item.online_only:
+                from .cloud_files import online_only_message
+                return f"{item.path}\n{online_only_message()}"
             error = self._thumbnail_errors.get(self._key(item.path))
             return str(item.path) if not error else f"{item.path}\n{error}"
         return None

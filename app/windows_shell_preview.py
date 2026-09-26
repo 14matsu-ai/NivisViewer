@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .cloud_files import require_local
 
 from collections import OrderedDict
 import ctypes
@@ -352,6 +353,7 @@ class WindowsShellPreviewService:
                     task.done.set()
                     continue
                 try:
+                    require_local(task.path)
                     task.image = self._adapter.get_image(
                         task.path,
                         task.width,

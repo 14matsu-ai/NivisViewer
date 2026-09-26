@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .cloud_files import require_local
 
 from .i18n import tr
 
@@ -185,6 +186,7 @@ class FFmpegThumbnailBackend:
         )
         self.last_command = command
         try:
+            require_local(source)
             process = self._process_factory(
                 list(command),
                 stdin=subprocess.DEVNULL,
@@ -267,6 +269,7 @@ class FFmpegThumbnailBackend:
             str(source),
         ]
         try:
+            require_local(source)
             process = subprocess.Popen(
                 command,
                 stdin=subprocess.DEVNULL,

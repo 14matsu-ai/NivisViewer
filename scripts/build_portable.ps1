@@ -67,7 +67,7 @@ try {
     & $Python -m PyInstaller --noconfirm NivisViewer.spec
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed." }
 
-    foreach ($Name in @("portable.flag", "LICENSE", "PROJECT_LICENSE.md", "THIRD_PARTY_NOTICES.md", "README.md", "README.en.md", "README.zh-CN.md", "README.zh-TW.md")) {
+    foreach ($Name in @("portable.flag", "LICENSE", "PROJECT_LICENSE.md", "THIRD_PARTY_NOTICES.md", "README.md")) {
         Copy-Item -LiteralPath (Join-Path $RepoRoot $Name) -Destination $BundleDir -Force
     }
     Copy-Item -LiteralPath (Join-Path $RepoRoot "licenses") -Destination $BundleDir -Recurse -Force

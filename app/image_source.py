@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .cloud_files import require_local, local_image_candidate, walk_local_files, OnlineOnlyError
 
 from .i18n import tr
 from . import pillow_plugins  # noqa: F401 - registers the JXL Pillow decoder
@@ -200,6 +201,7 @@ def _read_image_file_bytes(
 ) -> bytes:
     """Read a local image without preventing rename/delete on Windows."""
     target = Path(path)
+    require_local(target)
     if os.name != "nt":
         with target.open("rb") as file:
             return file.read() if maximum_bytes is None else file.read(maximum_bytes)
@@ -750,10 +752,12 @@ class FolderImageSource(ImageSource):
         listing_snapshot: FolderListingSnapshot | None = None,
     ) -> None:
         super().__init__(folder_path)
+        require_local(folder_path)
         self.recursive = recursive
         self.sort_descending = sort_descending
         self._image_snapshot = (
-            tuple(image_snapshot) if image_snapshot is not None else None
+            tuple(path for path in image_snapshot if local_image_candidate(path))
+            if image_snapshot is not None else None
         )
         # Browser order is a book topology snapshot, not merely an open-time
         # directory-listing optimization.  Retain its identity for the whole
@@ -795,7 +799,7 @@ class FolderImageSource(ImageSource):
             if self.recursive:
                 files = [
                     path
-                    for path in self.source_path.rglob("*")
+                    for path in walk_local_files(self.source_path)
                     if (
                         path.is_file()
                         and path.suffix.lower() in SUPPORTED_EXTENSIONS
@@ -803,6 +807,7 @@ class FolderImageSource(ImageSource):
                 ]
             else:
                 files = []
+                require_local(self.source_path)
                 with os.scandir(self.source_path) as entries:
                     for entry in entries:
                         if (
@@ -811,7 +816,7 @@ class FolderImageSource(ImageSource):
                         ):
                             continue
                         try:
-                            is_file = entry.is_file(follow_symlinks=True)
+                            is_file = local_image_candidate(entry.path) and entry.is_file(follow_symlinks=True)
                         except OSError:
                             # Match Path.is_file(): an entry removed during
                             # enumeration, or otherwise unavailable, is simply
@@ -854,6 +859,7 @@ class FolderImageSource(ImageSource):
 
     def open_image(self, image_id: str) -> Image.Image:
         try:
+            require_local(image_id)
             if Path(image_id).suffix.casefold() in PSD_EXTENSIONS:
                 data = _read_image_file_bytes(image_id)
                 result = decode_psd_image(data)
@@ -985,6 +991,8 @@ class FolderImageSource(ImageSource):
         if cached is not None:
             return cached
 
+        require_local(image_id)
+
         if Path(image_id).suffix.casefold() in PSD_EXTENSIONS:
             try:
                 header = _read_image_file_bytes(
@@ -1072,6 +1080,7 @@ class FolderImageSource(ImageSource):
             return self.logical_size(image_id)
         if suffix in {".avif", ".jxl"}:
             return self.logical_size(image_id)
+        require_local(image_id)
         reader = QImageReader(image_id)
         size = reader.size()
         if not size.isValid() or size.width() <= 0 or size.height() <= 0:
@@ -1108,6 +1117,7 @@ class ZipImageSource(ImageSource):
 
     def __init__(self, archive_path: str | Path, *, sort_descending: bool = False) -> None:
         super().__init__(archive_path)
+        require_local(archive_path)
         self.sort_descending = sort_descending
         if not self.source_path.is_file():
             raise ImageSourceError(tr('書庫が見つかりません: {p0}', p0=self.source_path))
@@ -1844,6 +1854,7 @@ class SevenZipImageSource(ImageSource):
     ) -> None:
         super().__init__(archive_path)
         self.backend = backend
+        require_local(archive_path)
         self.sort_descending = sort_descending
         self._closed = threading.Event()
         self._active_lock = threading.RLock()
@@ -2158,6 +2169,10 @@ def create_image_source(
     folder_snapshot: FolderListingSnapshot | None = None,
 ) -> tuple[ImageSource, str | None]:
     target = Path(path)
+    try:
+        require_local(target)
+    except OnlineOnlyError as exc:
+        raise ImageSourceError(str(exc), code='online_only') from exc
     selected_image: str | None = None
 
     if target.is_dir():

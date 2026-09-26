@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .cloud_files import require_local, OnlineOnlyError
 
 from .i18n import tr
 
@@ -67,8 +68,11 @@ class TextPreviewProvider:
         if cancel_token is not None and cancel_token.is_set():
             return PreviewResult(PreviewResultKind.CANCELLED)
         try:
+            require_local(path)
             with Path(path).open("rb") as source:
                 data = source.read(self.max_bytes + 1)
+        except OnlineOnlyError:
+            return PreviewResult(PreviewResultKind.UNAVAILABLE)
         except (OSError, ValueError) as exc:
             return PreviewResult.failed(tr('テキストを読み込めません: {p0}', p0=exc))
         if cancel_token is not None and cancel_token.is_set():

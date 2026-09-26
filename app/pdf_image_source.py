@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .i18n import tr
+from .cloud_files import require_local
 
 
 from pathlib import Path
@@ -35,6 +36,7 @@ class PdfImageSource(ImageSource):
         draw_annotations: bool = True,
     ) -> None:
         super().__init__(pdf_path)
+        require_local(pdf_path)
         self.pdfium_service = pdfium_service
         self.base_dpi = max(72, min(300, int(base_dpi)))
         self.draw_annotations = bool(draw_annotations)

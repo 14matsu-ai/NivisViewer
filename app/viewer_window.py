@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .cloud_files import online_only_message
 
 from .i18n import tr
 from .menu_icons import install_text_icon_menu_style, settings_icon
@@ -2758,6 +2759,7 @@ class ViewerWindow(QMainWindow):
             return
         message = {
             PathAvailability.MISSING: tr('見つかりません'),
+            PathAvailability.ONLINE_ONLY: online_only_message(),
             PathAvailability.UNAVAILABLE: tr('現在アクセスできません'),
             PathAvailability.ERROR: tr('確認できません'),
         }.get(result.state, tr('確認できません'))
