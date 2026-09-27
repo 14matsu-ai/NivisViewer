@@ -6,7 +6,7 @@ from .i18n import tr
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -18,6 +18,31 @@ from PySide6.QtWidgets import (
 )
 
 from .app_icon import install_window_icon
+
+
+def _collapse_selected_left(edit: QLineEdit, event) -> bool:
+    if (
+        event.key() == Qt.Key.Key_Left
+        and event.modifiers() == Qt.KeyboardModifier.NoModifier
+        and edit.hasSelectedText()
+    ):
+        edit.setCursorPosition(edit.selectionStart())
+        event.accept()
+        return True
+    return False
+
+
+class FilenameSelectionLeftFilter(QObject):
+    """Collapse a selected filename to its left edge in Qt's text dialog."""
+
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            isinstance(watched, QLineEdit)
+            and event.type() == QEvent.Type.KeyPress
+            and _collapse_selected_left(watched, event)
+        ):
+            return True
+        return super().eventFilter(watched, event)
 
 
 class _PropertiesNameEdit(QLineEdit):
@@ -73,6 +98,8 @@ class _PropertiesNameEdit(QLineEdit):
     def keyPressEvent(self, event) -> None:
         self._first_click = False
         self._entry_press = None
+        if _collapse_selected_left(self, event):
+            return
         super().keyPressEvent(event)
 
 

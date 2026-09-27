@@ -180,7 +180,7 @@ from .bookmark_model import BookmarkModel
 from .config_manager import ConfigManager
 from .destination_history import DestinationHistoryStore
 from .file_conflict_dialog import ConflictResolutionDialog
-from .file_properties_dialog import FilePropertiesDialog
+from .file_properties_dialog import FilePropertiesDialog, FilenameSelectionLeftFilter
 from .file_operation_artifact import FileOperationArtifactPolicy
 from .file_operation_coordinator import FileOperationCoordinator
 from .file_operation_panel import FileOperationPanel
@@ -3487,7 +3487,10 @@ class BrowserWindow(QMainWindow):
         dialog.setTextValue(initial_name)
         editor = dialog.findChild(QLineEdit)
         if editor is not None:
-            stem_length = len(Path(initial_name).stem)
+            stem_length = len(
+                Path(initial_name).stem.encode("utf-16-le", errors="surrogatepass")
+            ) // 2
+            editor.installEventFilter(FilenameSelectionLeftFilter(dialog))
             QTimer.singleShot(
                 0,
                 lambda editor=editor, length=stem_length: editor.setSelection(0, length),

@@ -2,8 +2,9 @@ import pytest
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialog, QInputDialog, QLineEdit, QWidget
 
+from app.browser_window import BrowserWindow
 from app.file_properties_dialog import FilePropertiesDialog
 
 
@@ -34,6 +35,55 @@ def test_initial_click_and_focus_reentry_select_basename(tmp_path, qapp, name, f
         assert path.exists()
     finally:
         dialog.reject()
+
+
+def test_properties_left_from_selected_name_moves_to_selection_start(tmp_path, qapp):
+    path = tmp_path / '日本語📚.zip'
+    path.write_bytes(b'')
+    dialog = FilePropertiesDialog(path)
+    dialog.show()
+    qapp.processEvents()
+    edit = dialog.name_edit
+    try:
+        assert edit.selectedText() == '日本語📚'
+        QTest.keyClick(edit, Qt.Key.Key_Left)
+        assert not edit.hasSelectedText() and edit.cursorPosition() == 0
+        edit.selectAll()
+        QTest.keyClick(edit, Qt.Key.Key_Left)
+        assert not edit.hasSelectedText() and edit.cursorPosition() == 0
+        edit.setSelection(2, 2)
+        QTest.keyClick(edit, Qt.Key.Key_Left)
+        assert edit.cursorPosition() == 2
+        edit.setSelection(2, 2)
+        QTest.keyClick(edit, Qt.Key.Key_Left, Qt.KeyboardModifier.ShiftModifier)
+        assert edit.hasSelectedText()
+    finally:
+        dialog.reject()
+
+
+def test_f2_prompt_left_from_selected_name_moves_to_start(qapp, monkeypatch):
+    observed = []
+
+    def inspect(dialog):
+        qapp.processEvents()
+        edit = dialog.findChild(QLineEdit)
+        assert edit is not None and edit.selectedText() == '日本語📚'
+        QTest.keyClick(edit, Qt.Key.Key_Left)
+        observed.append((edit.hasSelectedText(), edit.cursorPosition()))
+        edit.selectAll()
+        QTest.keyClick(edit, Qt.Key.Key_Left)
+        observed.append((edit.hasSelectedText(), edit.cursorPosition()))
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(QInputDialog, 'exec', inspect)
+    parent = QWidget()
+    try:
+        assert BrowserWindow._prompt_for_filename(
+            parent, '名前の変更', '新しい名前:', '日本語📚.zip'
+        ) is None
+        assert observed == [(False, 0), (False, 0)]
+    finally:
+        parent.close()
 
 
 def test_draft_reentry_apply_and_cancel_preserve_existing_contract(tmp_path, qapp):
