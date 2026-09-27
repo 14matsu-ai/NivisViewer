@@ -11,6 +11,7 @@ class BrowserVisibilityPolicy:
     show_hidden_items: bool = True
     show_unsupported_files: bool = True
     show_system_items: bool = False
+    use_zippla_cover: bool = False
 
     def allows(
         self,

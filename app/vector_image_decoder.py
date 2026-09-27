@@ -22,10 +22,11 @@ from .pdf_backend import is_cancelled
 from .i18n import tr
 
 VECTOR_SUFFIXES = frozenset({'.svg', '.ai'})
-RENDERER_VERSION = 4
+RENDERER_VERSION = 6
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 MAX_SVG_BYTES = 8 * 1024 * 1024
 MAX_PIXELS = 16 * 1024 * 1024
+MAX_EMBEDDED_PIXELS = 32 * 1024 * 1024
 MAX_DIMENSION = 16384
 AI_ERROR = 'PDF互換で保存されたAIに対応しています。非互換または破損したAIは表示できません。'
 SVG_ERROR = '外部参照を含まない静止画SVGに対応しています。'
@@ -85,11 +86,16 @@ def _reference(value):
         return
     if value.startswith(('data:image/png;base64,', 'data:image/jpeg;base64,')):
         try:
-            payload = base64.b64decode(value.split(',', 1)[1], validate=True)
+            # Inkscape wraps embedded base64 across lines; discard only XML
+            # whitespace, then retain strict base64 validation.
+            encoded = re.sub(r'[\t\n\r ]+', '', value.split(',', 1)[1])
+            payload = base64.b64decode(encoded, validate=True)
             if len(payload) > 4 * 1024 * 1024:
                 raise ValueError()
             with Image.open(io.BytesIO(payload)) as im:
-                if im.format not in {'PNG', 'JPEG'} or im.width * im.height > MAX_PIXELS:
+                if (im.format not in {'PNG', 'JPEG'}
+                        or im.width > MAX_DIMENSION or im.height > MAX_DIMENSION
+                        or im.width * im.height > MAX_EMBEDDED_PIXELS):
                     raise ValueError()
                 im.verify()
             return
@@ -147,6 +153,7 @@ def _svg_logical_size(root):
 
 
 _SVG_NAMESPACE = 'http://www.w3.org/2000/svg'
+_XLINK_HREF = '{http://www.w3.org/1999/xlink}href'
 _EDITOR_NAMESPACES = frozenset({
     'http://www.inkscape.org/namespaces/inkscape',
     'http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd',
@@ -179,6 +186,30 @@ def _remove_svg_metadata(node):
             node.remove(child)
         else:
             _remove_svg_metadata(child)
+            previous = child
+
+
+def _prepare_svg_for_qt(node):
+    """Keep validated image references and hide unsupported flowed-text regions."""
+    xlink_href = node.attrib.pop(_XLINK_HREF, None)
+    if xlink_href is not None:
+        # ElementTree changes the original xlink prefix to nsN; Qt's SVG
+        # renderer does not resolve that renamed attribute on <image>.
+        node.attrib.setdefault('href', xlink_href)
+    previous = None
+    for child in tuple(node):
+        local = child.tag.rsplit('}', 1)[-1]
+        if local == 'flowRoot' and _namespace(child.tag) in {'', _SVG_NAMESPACE}:
+            # Qt paints the flowRegion's <rect> as a solid shape while never
+            # painting the flowPara text. Do not pass that unsupported subtree.
+            if child.tail:
+                if previous is None:
+                    node.text = (node.text or '') + child.tail
+                else:
+                    previous.tail = (previous.tail or '') + child.tail
+            node.remove(child)
+        else:
+            _prepare_svg_for_qt(child)
             previous = child
 
 
@@ -268,6 +299,7 @@ def _svg(data):
             if local == 'style':
                 _css(''.join(node.itertext()))
         logical = _svg_logical_size(root)
+        _prepare_svg_for_qt(root)
         renderer = QSvgRenderer()
         renderer.setAnimationEnabled(False)
         # Serialize the inspected tree, never the original unfiltered bytes.

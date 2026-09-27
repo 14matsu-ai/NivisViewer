@@ -33,6 +33,7 @@ SHORTCUT_SPECS: tuple[ShortcutSpec, ...] = (
     ShortcutSpec("browser_rename", "browser", "名前の変更", ("F2",)),
     ShortcutSpec("browser_delete", "browser", "削除", ("Delete",)),
     ShortcutSpec("browser_copy", "browser", "コピー", ("Ctrl+C",)),
+    ShortcutSpec("browser_copy_full_paths", "browser", "ファイルのフルパスをコピー", ("Shift+C",)),
     ShortcutSpec("browser_cut", "browser", "切り取り", ("Ctrl+X",)),
     ShortcutSpec("browser_paste", "browser", "貼り付け", ("Ctrl+V",)),
     ShortcutSpec("browser_new_folder", "browser", "新しいフォルダ", ("Ctrl+Shift+N",)),

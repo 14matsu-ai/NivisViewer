@@ -354,9 +354,11 @@ TAB_SETTING_KEYS: dict[str, tuple[str, ...]] = {
         "browser_show_rating_overlay", "browser_show_tag_overlay",
         "browser_rating_overlay_opacity", "browser_tag_overlay_opacity",
         "browser_tag_auto_text_color", "browser_tag_text_luminance_threshold",
+        "browser_tag_font_size", "browser_tag_max_characters", "browser_tag_text_color",
         "browser_filename_display", "browser_filename_elide_mode", "browser_filename_font_size",
         "browser_filename_show_extension", "browser_filename_gap", "browser_filename_padding_y",
         "browser_show_hidden_items", "browser_show_unsupported_files", "browser_show_system_items",
+        "browser_use_zippla_cover",
         "browser_folder_snapshot_cache_enabled", "browser_folder_snapshot_cache_max_entries",
         "browser_sidebar_layout", "folder_tree_sync_mode", "folder_tree_collapse_unrelated",
         "folder_tree_focus_rebase", "folder_tree_context_ancestor_levels", "favorite_row_padding_y",
@@ -1231,6 +1233,7 @@ class SettingsDialog(QDialog):
         self.browser_show_hidden_checkbox.setChecked(bool(defaults["browser_show_hidden_items"]))
         self.browser_show_unsupported_checkbox.setChecked(bool(defaults["browser_show_unsupported_files"]))
         self.browser_show_system_checkbox.setChecked(bool(defaults["browser_show_system_items"]))
+        self.browser_use_zippla_cover_checkbox.setChecked(bool(defaults["browser_use_zippla_cover"]))
         self.browser_folder_snapshot_cache_checkbox.setChecked(bool(defaults["browser_folder_snapshot_cache_enabled"]))
         self._select_data(
             self.browser_folder_snapshot_cache_max_entries_combo,
@@ -2077,7 +2080,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(group)
         vector_group = QGroupBox(tr('AI・SVG画像'), tab)
         vector_form = QFormLayout(vector_group)
-        self.ai_loading_checkbox = QCheckBox(tr('AI画像の読み込みを有効にする（再起動後に反映）'), vector_group)
+        self.ai_loading_checkbox = QCheckBox(tr('Illustrator（.ai）画像の読み込みを有効にする（再起動後に反映）'), vector_group)
         self.ai_loading_checkbox.setToolTip(tr('PDF互換で保存されたAIの先頭ページだけを表示します。非互換AIはIllustratorで「PDF互換ファイルを作成」を有効にして再保存してください。編集データや全アートボードを再現する機能ではありません。'))
         ai_row = QWidget(vector_group)
         ai_layout = QHBoxLayout(ai_row)
@@ -2447,6 +2450,13 @@ class SettingsDialog(QDialog):
             tr('Windowsの保護されたシステム項目を表示します。操作時は注意してください。')
         )
         list_form.addRow(self.browser_show_system_checkbox)
+        self.browser_use_zippla_cover_checkbox = QCheckBox(
+            tr('ZipPlaの表紙補助ファイルを利用する'), list_group,
+        )
+        self.browser_use_zippla_cover_checkbox.setToolTip(
+            tr('ON: ZipPlaの表紙補助ファイルを一覧から隠し、NivisViewerの表紙がない場合に使用します。OFF: ZipPlaの補助ファイルを通常の隠し画像として表示します。')
+        )
+        list_form.addRow(self.browser_use_zippla_cover_checkbox)
         self.browser_folder_snapshot_cache_checkbox_row = QWidget(list_group)
         snapshot_cache_checkbox_layout = QHBoxLayout(
             self.browser_folder_snapshot_cache_checkbox_row
@@ -2563,6 +2573,26 @@ class SettingsDialog(QDialog):
             tr('文字色の切替しきい値:'),
             self.browser_tag_text_luminance_threshold_spin,
         )
+        self.browser_tag_font_size_spin = QSpinBox(overlay_group)
+        self.browser_tag_font_size_spin.setRange(0, 24)
+        self.browser_tag_font_size_spin.setSpecialValueText(tr('自動'))
+        self.browser_tag_font_size_spin.setSuffix(' pt')
+        overlay_form.addRow(tr('タグ文字の大きさ:'), self.browser_tag_font_size_spin)
+        self.browser_tag_max_characters_spin = QSpinBox(overlay_group)
+        self.browser_tag_max_characters_spin.setRange(0, 100)
+        self.browser_tag_max_characters_spin.setSpecialValueText(tr('制限なし'))
+        overlay_form.addRow(tr('タグの最大表示文字数:'), self.browser_tag_max_characters_spin)
+        self.browser_tag_text_color_edit = QLineEdit(overlay_group)
+        self.browser_tag_text_color_edit.setMaxLength(7)
+        self.browser_tag_text_color_edit.setToolTip(tr('自動調整をOFFにしたときの文字色。#RRGGBB形式で指定します。'))
+        self.browser_tag_text_color_button = QPushButton(tr('色を選択…'), overlay_group)
+        self.browser_tag_text_color_button.clicked.connect(self._choose_browser_tag_text_color)
+        color_row = QWidget(overlay_group)
+        color_layout = QHBoxLayout(color_row)
+        color_layout.setContentsMargins(0, 0, 0, 0)
+        color_layout.addWidget(self.browser_tag_text_color_edit)
+        color_layout.addWidget(self.browser_tag_text_color_button)
+        overlay_form.addRow(tr('タグ文字色:'), color_row)
         self.browser_overlay_restore_button = QPushButton(
             tr('レート・タグ表示を既定に戻す'), overlay_group
         )
@@ -3346,6 +3376,9 @@ class SettingsDialog(QDialog):
         self.browser_tag_text_luminance_threshold_spin.setValue(
             int(self.config.get("browser_tag_text_luminance_threshold", 150))
         )
+        self.browser_tag_font_size_spin.setValue(int(self.config.get("browser_tag_font_size", 0)))
+        self.browser_tag_max_characters_spin.setValue(int(self.config.get("browser_tag_max_characters", 0)))
+        self.browser_tag_text_color_edit.setText(str(self.config.get("browser_tag_text_color", "#ffffff")))
         self._sync_browser_overlay_controls()
         self.browser_filename_extension_checkbox.setChecked(
             bool(self.config.get("browser_filename_show_extension", True))
@@ -3366,6 +3399,9 @@ class SettingsDialog(QDialog):
         )
         self.browser_show_system_checkbox.setChecked(
             bool(self.config.get("browser_show_system_items", False))
+        )
+        self.browser_use_zippla_cover_checkbox.setChecked(
+            bool(self.config.get("browser_use_zippla_cover", False))
         )
         self.browser_folder_snapshot_cache_checkbox.setChecked(
             bool(
@@ -3664,12 +3700,24 @@ class SettingsDialog(QDialog):
             self.browser_folder_snapshot_cache_checkbox.isChecked()
         )
 
+    def _choose_browser_tag_text_color(self) -> None:
+        initial = QColor(self.browser_tag_text_color_edit.text())
+        if not initial.isValid():
+            initial = QColor('#ffffff')
+        chosen = QColorDialog.getColor(initial, self, tr('タグ文字色'))
+        if chosen.isValid():
+            self.browser_tag_text_color_edit.setText(chosen.name())
+
     def _sync_browser_overlay_controls(self, *_args: object) -> None:
         rating_visible = self.browser_show_rating_overlay_checkbox.isChecked()
         tags_visible = self.browser_show_tag_overlay_checkbox.isChecked()
         self.browser_rating_overlay_opacity_spin.setEnabled(rating_visible)
         self.browser_tag_overlay_opacity_spin.setEnabled(tags_visible)
         self.browser_tag_auto_text_color_checkbox.setEnabled(tags_visible)
+        self.browser_tag_font_size_spin.setEnabled(tags_visible)
+        self.browser_tag_max_characters_spin.setEnabled(tags_visible)
+        self.browser_tag_text_color_edit.setEnabled(tags_visible and not self.browser_tag_auto_text_color_checkbox.isChecked())
+        self.browser_tag_text_color_button.setEnabled(tags_visible and not self.browser_tag_auto_text_color_checkbox.isChecked())
         self.browser_tag_text_luminance_threshold_spin.setEnabled(
             tags_visible
             and self.browser_tag_auto_text_color_checkbox.isChecked()
@@ -3695,6 +3743,9 @@ class SettingsDialog(QDialog):
         self.browser_tag_text_luminance_threshold_spin.setValue(
             int(defaults["browser_tag_text_luminance_threshold"])
         )
+        self.browser_tag_font_size_spin.setValue(int(defaults["browser_tag_font_size"]))
+        self.browser_tag_max_characters_spin.setValue(int(defaults["browser_tag_max_characters"]))
+        self.browser_tag_text_color_edit.setText(str(defaults["browser_tag_text_color"]))
         self._sync_browser_overlay_controls()
 
     def _sync_delete_confirmation_controls(
@@ -4054,6 +4105,9 @@ class SettingsDialog(QDialog):
             "browser_tag_overlay_opacity": self.browser_tag_overlay_opacity_spin.value(),
             "browser_tag_auto_text_color": self.browser_tag_auto_text_color_checkbox.isChecked(),
             "browser_tag_text_luminance_threshold": self.browser_tag_text_luminance_threshold_spin.value(),
+            "browser_tag_font_size": self.browser_tag_font_size_spin.value(),
+            "browser_tag_max_characters": self.browser_tag_max_characters_spin.value(),
+            "browser_tag_text_color": self.browser_tag_text_color_edit.text(),
             "browser_item_spacing_x": self.browser_item_spacing_x_spin.value(),
             "browser_item_spacing_y": self.browser_item_spacing_y_spin.value(),
             "browser_cell_padding": self.browser_cell_padding_spin.value(),
@@ -4081,6 +4135,9 @@ class SettingsDialog(QDialog):
             ),
             "browser_show_system_items": (
                 self.browser_show_system_checkbox.isChecked()
+            ),
+            "browser_use_zippla_cover": (
+                self.browser_use_zippla_cover_checkbox.isChecked()
             ),
             "browser_folder_snapshot_cache_enabled": (
                 self.browser_folder_snapshot_cache_checkbox.isChecked()

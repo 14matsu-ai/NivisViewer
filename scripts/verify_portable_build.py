@@ -12,7 +12,6 @@ REQUIRED = (
     "PROJECT_LICENSE.md",
     "THIRD_PARTY_NOTICES.md",
     "README.md",
-    "licenses",
 )
 FORBIDDEN_NAMES = {
     "config.json",
@@ -36,6 +35,8 @@ def verify(bundle: Path, smoke_result: Path | None = None) -> list[str]:
     errors = [
         f"missing: {name}" for name in REQUIRED if not (bundle / name).exists()
     ]
+    if not ((bundle / "licenses").is_dir() or (bundle / "_internal" / "licenses").is_dir()):
+        errors.append("missing: licenses")
     paths = tuple(bundle.rglob("*")) if bundle.exists() else ()
     lower_names = {path.name.casefold() for path in paths}
     for name in FORBIDDEN_NAMES:

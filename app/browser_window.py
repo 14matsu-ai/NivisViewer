@@ -7,7 +7,7 @@ from .browser_download_policy import RefreshBurst
 from .browser_download_retry import BrowserDownloadRetry
 
 from .i18n import tr
-from .menu_icons import install_text_icon_menu_style, settings_icon
+from .menu_icons import install_text_icon_menu_style, selection_action_icon, settings_icon
 
 
 import os
@@ -97,6 +97,7 @@ from .browser_model import (
     BrowserItemModel,
     browser_item_from_scan_entry,
 )
+from .folder_cover import FolderCoverWorker, has_nivis_cover
 from .browser_directory_watcher import (
     BrowserDirectoryChange,
     BrowserDirectoryWatcher,
@@ -240,6 +241,7 @@ BROWSER_SHORTCUT_RUNTIME_IDS = frozenset(
         "browser_rename",
         "browser_delete",
         "browser_copy",
+        "browser_copy_full_paths",
         "browser_cut",
         "browser_paste",
         "browser_new_folder",
@@ -336,6 +338,7 @@ class _BrowserContextFilenameEdit(QLineEdit):
         self._menu = menu
         self.setObjectName("browser_context_filename")
         self.setReadOnly(True)
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
         self.setAccessibleName(tr('ファイル名（読み取り専用）'))
         self.setText(name)
@@ -348,6 +351,11 @@ class _BrowserContextFilenameEdit(QLineEdit):
         )
         text_width = self.fontMetrics().horizontalAdvance(name) + 24
         self.setFixedWidth(min(maximum, max(240, text_width)))
+        self.selectAll()
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        self.deselect()
 
     def copy_selected_text(self) -> bool:
         text = self.selectedText()
@@ -579,6 +587,8 @@ class BrowserWindow(QMainWindow):
         self.config = config_manager
         self.settings = config_manager.data
         self.metadata_store = metadata_store
+        if metadata_store is not None:
+            metadata_store.folder_cover_changed.connect(self._on_folder_cover_changed)
         self._open_path_handler = open_path_handler
         self._affected_viewers_handler = affected_viewers_handler
         self._close_affected_viewers_handler = close_affected_viewers_handler
@@ -782,6 +792,7 @@ class BrowserWindow(QMainWindow):
             int, tuple[FilePropertiesDialog, bool]
         ] = {}
         self._drop_probe_workers: set[FolderDropProbe] = set()
+        self._folder_cover_workers: set[FolderCoverWorker] = set()
         self.browser_main_drop = BrowserMainDropController(self)
         self.browser_main_drop.focus_request_ready.connect(
             self._begin_browser_drop_focus
@@ -914,6 +925,9 @@ class BrowserWindow(QMainWindow):
         self.browser_tag_auto_text_color = bool(
             self.settings.get("browser_tag_auto_text_color", True)
         )
+        self.browser_tag_font_size = int(self.settings.get("browser_tag_font_size", 0))
+        self.browser_tag_max_characters = int(self.settings.get("browser_tag_max_characters", 0))
+        self.browser_tag_text_color = str(self.settings.get("browser_tag_text_color", "#ffffff"))
         self.browser_tag_text_luminance_threshold = max(
             0,
             min(
@@ -962,6 +976,9 @@ class BrowserWindow(QMainWindow):
         )
         self.browser_show_system_items = bool(
             self.settings.get("browser_show_system_items", False)
+        )
+        self.browser_use_zippla_cover = bool(
+            self.settings.get("browser_use_zippla_cover", False)
         )
         self.browser_sidebar_layout = str(
             self.settings.get(
@@ -1143,6 +1160,7 @@ class BrowserWindow(QMainWindow):
                 f"hidden={int(self.browser_show_hidden_items)}:"
                 f"unsupported={int(self.browser_show_unsupported_files)}:"
                 f"system={int(self.browser_show_system_items)}:"
+                f"zippla_cover={int(self.browser_use_zippla_cover)}:"
                 f"search={self.browser_filter_state.search_text.casefold()!r}:"
                 f"rating={self.browser_filter_state.rating_mode.value}:"
                 f"reference={self.browser_filter_state.rating_reference}"
@@ -1800,6 +1818,7 @@ class BrowserWindow(QMainWindow):
             show_hidden_items=self.browser_show_hidden_items,
             show_unsupported_files=self.browser_show_unsupported_files,
             show_system_items=self.browser_show_system_items,
+            use_zippla_cover=self.browser_use_zippla_cover,
         )
 
     def _store_folder_snapshot(
@@ -2731,6 +2750,7 @@ class BrowserWindow(QMainWindow):
                 f"hidden={int(self.browser_show_hidden_items)}:"
                 f"unsupported={int(self.browser_show_unsupported_files)}:"
                 f"system={int(self.browser_show_system_items)}:"
+                f"zippla_cover={int(self.browser_use_zippla_cover)}:"
                 f"search={self.browser_filter_state.search_text.casefold()!r}:"
                 f"rating={self.browser_filter_state.rating_mode.value}:"
                 f"reference={self.browser_filter_state.rating_reference}"
@@ -2879,6 +2899,80 @@ class BrowserWindow(QMainWindow):
         QApplication.clipboard().setMimeData(mime)
         self._show_temporary_status(tr('{p0}項目の名前をコピーしました', p0=len(paths)))
         return True
+
+    def copy_selected_full_paths(self) -> bool:
+        paths = self.selected_file_operation_paths()
+        if not paths:
+            return False
+        QApplication.clipboard().setText("\n".join(paths))
+        self._show_temporary_status(tr('{p0}項目のフルパスをコピーしました', p0=len(paths)))
+        return True
+
+    def set_selected_parent_folder_cover(self) -> bool:
+        paths = self.selected_file_operation_paths()
+        if len(paths) != 1 or self._folder_cover_workers:
+            return False
+        image = Path(paths[0])
+        row = self.item_model.row_for_path(image)
+        item = self.item_model.item_at(row) if row >= 0 else None
+        if item is None or item.kind is not BrowserItemKind.IMAGE:
+            return False
+        return self._start_folder_cover_operation('set', image)
+
+    def clear_selected_folder_cover(self) -> bool:
+        paths = self.selected_file_operation_paths()
+        if len(paths) != 1 or self._folder_cover_workers:
+            return False
+        folder = Path(paths[0])
+        row = self.item_model.row_for_path(folder)
+        item = self.item_model.item_at(row) if row >= 0 else None
+        if item is None or item.kind is not BrowserItemKind.FOLDER:
+            return False
+        if not has_nivis_cover(folder):
+            return False
+        return self._start_folder_cover_operation('clear', folder)
+
+    def _start_folder_cover_operation(self, action: str, path: Path) -> bool:
+        worker = FolderCoverWorker(action, path)
+        self._folder_cover_workers.add(worker)
+
+        def finished(result) -> None:
+            self._folder_cover_workers.discard(worker)
+            if self._shutdown_prepared:
+                return
+            if result.succeeded:
+                if self.metadata_store is not None:
+                    self.metadata_store.folder_cover_changed.emit(str(result.folder))
+                else:
+                    self._on_folder_cover_changed(str(result.folder))
+                self._show_temporary_status(
+                    tr('親フォルダーの表紙に設定しました') if action == 'set'
+                    else tr('表紙設定を削除しました')
+                )
+            else:
+                self._show_temporary_status(
+                    tr('表紙を保存できませんでした') if action == 'set'
+                    else tr('表紙設定を削除できませんでした')
+                )
+
+        worker.signals.finished.connect(finished)
+        QThreadPool.globalInstance().start(worker)
+        return True
+
+    def _on_folder_cover_changed(self, folder_path: str) -> None:
+        disk_cache = self.thumbnail_provider.disk_cache
+        invalidate = getattr(disk_cache, 'invalidate_source', None)
+        if callable(invalidate):
+            invalidate(folder_path, BrowserItemKind.FOLDER)
+        else:
+            invalidate = getattr(disk_cache, 'invalidate_pending_writes', None)
+            if callable(invalidate):
+                invalidate()
+        self.thumbnail_provider.clear_memory_cache()
+        self._generation = self.thumbnail_provider.begin_generation()
+        if self.item_model.row_for_path(folder_path) >= 0:
+            self.item_model.clear_thumbnails()
+            self._schedule_thumbnail_requests(0)
 
     def cut_selected_items(self) -> bool:
         paths = self.selected_file_operation_paths()
@@ -4306,6 +4400,9 @@ class BrowserWindow(QMainWindow):
             "tag_overlay_opacity": self.browser_tag_overlay_opacity,
             "tag_auto_text_color": self.browser_tag_auto_text_color,
             "tag_text_luminance_threshold": self.browser_tag_text_luminance_threshold,
+            "tag_font_size": self.browser_tag_font_size,
+            "tag_max_characters": self.browser_tag_max_characters,
+            "tag_text_color": self.browser_tag_text_color,
         }
 
     def _apply_browser_overlay_settings(self, changed: dict[str, object]) -> None:
@@ -4316,6 +4413,9 @@ class BrowserWindow(QMainWindow):
             "browser_tag_overlay_opacity",
             "browser_tag_auto_text_color",
             "browser_tag_text_luminance_threshold",
+            "browser_tag_font_size",
+            "browser_tag_max_characters",
+            "browser_tag_text_color",
         }
         if not keys.intersection(changed):
             return
@@ -4334,6 +4434,9 @@ class BrowserWindow(QMainWindow):
         self.browser_tag_auto_text_color = bool(
             self.config.get("browser_tag_auto_text_color", True)
         )
+        self.browser_tag_font_size = int(self.config.get("browser_tag_font_size", 0))
+        self.browser_tag_max_characters = int(self.config.get("browser_tag_max_characters", 0))
+        self.browser_tag_text_color = str(self.config.get("browser_tag_text_color", "#ffffff"))
         self.browser_tag_text_luminance_threshold = max(
             0,
             min(
@@ -4834,6 +4937,7 @@ class BrowserWindow(QMainWindow):
                 "browser_show_hidden_items",
                 "browser_show_unsupported_files",
                 "browser_show_system_items",
+                "browser_use_zippla_cover",
             }.intersection(changed)
         )
         if "browser_show_hidden_items" in changed:
@@ -4847,6 +4951,12 @@ class BrowserWindow(QMainWindow):
         if "browser_show_system_items" in changed:
             self.browser_show_system_items = bool(
                 changed["browser_show_system_items"]
+            )
+        if "browser_use_zippla_cover" in changed:
+            self.browser_use_zippla_cover = bool(changed["browser_use_zippla_cover"])
+            self.item_model.clear_thumbnails()
+            self._generation = self.thumbnail_provider.set_zippla_cover_enabled(
+                self.browser_use_zippla_cover
             )
         if "browser_external_drop_behavior" in changed:
             self.browser_external_drop_behavior = str(
@@ -6239,6 +6349,7 @@ class BrowserWindow(QMainWindow):
             "browser_open_with": "open_with_shortcut",
             "browser_delete": "recycle_shortcut",
             "browser_copy": "copy_shortcut",
+            "browser_copy_full_paths": "copy_full_paths_shortcut",
             "browser_cut": "cut_shortcut",
             "browser_paste": "paste_shortcut",
             "browser_new_folder": "new_folder_shortcut",
@@ -6252,6 +6363,7 @@ class BrowserWindow(QMainWindow):
             "browser_open_with": self.open_selected_with_application_picker,
             "browser_delete": self.move_selected_to_recycle_bin,
             "browser_copy": self.copy_selected_items,
+            "browser_copy_full_paths": self.copy_selected_full_paths,
             "browser_cut": self.cut_selected_items,
             "browser_paste": self.paste_items,
             "browser_new_folder": self.create_new_folder,
@@ -7075,6 +7187,11 @@ class BrowserWindow(QMainWindow):
             Qt.ShortcutContext.WidgetWithChildrenShortcut
         )
         self.copy_shortcut.activated.connect(self.copy_selected_items)
+        self.copy_full_paths_shortcut = QShortcut(QKeySequence("Shift+C"), self.list_view)
+        self.copy_full_paths_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.copy_full_paths_shortcut.activated.connect(self.copy_selected_full_paths)
         self.cut_shortcut = QShortcut(QKeySequence("Ctrl+X"), self.list_view)
         self.cut_shortcut.setContext(
             Qt.ShortcutContext.WidgetWithChildrenShortcut
@@ -8527,11 +8644,31 @@ class BrowserWindow(QMainWindow):
             filename_action.setDefaultWidget(filename_edit)
             menu.addAction(filename_action)
             selected_text_copy = menu.addAction(tr('選択文字をコピー'))
-            selected_text_search = menu.addAction(tr('選択文字で検索'))
+            selected_text_search = menu.addAction(tr('選択文字でフィルタリング'))
+            if hasattr(selected_text_copy, 'setObjectName'):
+                selected_text_copy.setObjectName('browser_selected_text_copy')
+                selected_text_search.setObjectName('browser_selected_text_filter')
+            icon_edge = max(10, min(16, menu.fontMetrics().height() - 2))
+            for action, kind in ((selected_text_copy, 'copy'), (selected_text_search, 'search')):
+                if hasattr(action, 'setIcon'):
+                    action.setIcon(selection_action_icon(kind, icon_edge))
+                    action.setIconVisibleInMenu(True)
             def update_text_actions() -> None:
-                enabled = bool(filename_edit.selectedText())
+                selection = filename_edit.selectedText()
+                enabled = bool(selection)
                 selected_text_copy.setEnabled(enabled)
                 selected_text_search.setEnabled(enabled)
+                shown = QFontMetrics(menu.font()).elidedText(
+                    selection.replace('\n', ' '), Qt.TextElideMode.ElideRight, 190
+                )
+                if hasattr(selected_text_copy, 'setText'):
+                    selected_text_copy.setText(
+                        tr('"{p0}"をコピー', p0=shown) if enabled else tr('選択文字をコピー')
+                    )
+                    selected_text_search.setText(
+                        tr('"{p0}"でフィルタリング', p0=shown)
+                        if enabled else tr('選択文字でフィルタリング')
+                    )
             filename_edit.selectionChanged.connect(update_text_actions)
             update_text_actions()
             menu.addSeparator()
@@ -8588,6 +8725,22 @@ class BrowserWindow(QMainWindow):
             action = rating_menu.addAction(label)
             action.setEnabled(bool(rating_paths) and not busy)
             rating_actions[action] = value
+        folder_cover_action = (
+            menu.addAction(tr('これを親フォルダーの表紙に設定'))
+            if selection_count == 1 and item is not None
+            and item.kind is BrowserItemKind.IMAGE and not self._folder_cover_workers
+            else None
+        )
+        clear_folder_cover_action = (
+            menu.addAction(tr('表紙設定を削除'))
+            if selection_count == 1 and item is not None
+            and item.kind is BrowserItemKind.FOLDER
+            else None
+        )
+        if clear_folder_cover_action is not None:
+            clear_folder_cover_action.setEnabled(
+                has_nivis_cover(item.path) and not self._folder_cover_workers
+            )
         menu.addSeparator()
         recycle_action = menu.addAction(tr('削除'))
         recycle_action.setEnabled(selection_count > 0 and not busy)
@@ -8616,6 +8769,10 @@ class BrowserWindow(QMainWindow):
             self._open_with_application_picker(item)
         elif selected == location_action and item is not None:
             self._open_item_in_explorer(item)
+        elif folder_cover_action is not None and selected == folder_cover_action:
+            self.set_selected_parent_folder_cover()
+        elif clear_folder_cover_action is not None and selected == clear_folder_cover_action:
+            self.clear_selected_folder_cover()
         elif current_location_action is not None and selected == current_location_action:
             self._open_current_folder_in_explorer(item)
         elif selected == cut_action:

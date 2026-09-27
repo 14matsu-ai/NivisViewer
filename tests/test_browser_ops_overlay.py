@@ -34,6 +34,9 @@ def test_overlay_config_defaults_clamp_and_reject_invalid_booleans(tmp_path: Pat
     assert config.get("browser_tag_overlay_opacity") == 100
     assert config.get("browser_tag_auto_text_color") is True
     assert config.get("browser_tag_text_luminance_threshold") == 150
+    assert config.get("browser_tag_font_size") == 0
+    assert config.get("browser_tag_max_characters") == 0
+    assert config.get("browser_tag_text_color") == "#ffffff"
 
     config.apply(
         {
@@ -43,6 +46,9 @@ def test_overlay_config_defaults_clamp_and_reject_invalid_booleans(tmp_path: Pat
             "browser_tag_overlay_opacity": 120,
             "browser_tag_auto_text_color": 1,
             "browser_tag_text_luminance_threshold": 999,
+            "browser_tag_font_size": 99,
+            "browser_tag_max_characters": -3,
+            "browser_tag_text_color": "not-a-color",
         }
     )
     assert config.get("browser_show_rating_overlay") is True
@@ -51,6 +57,9 @@ def test_overlay_config_defaults_clamp_and_reject_invalid_booleans(tmp_path: Pat
     assert config.get("browser_tag_overlay_opacity") == 100
     assert config.get("browser_tag_auto_text_color") is True
     assert config.get("browser_tag_text_luminance_threshold") == 255
+    assert config.get("browser_tag_font_size") == 24
+    assert config.get("browser_tag_max_characters") == 0
+    assert config.get("browser_tag_text_color") == "#ffffff"
 
 
 def test_browser_startup_applies_persisted_overlay_options(
@@ -68,6 +77,9 @@ def test_browser_startup_applies_persisted_overlay_options(
             "browser_tag_overlay_opacity": 29,
             "browser_tag_auto_text_color": False,
             "browser_tag_text_luminance_threshold": 203,
+            "browser_tag_font_size": 13,
+            "browser_tag_max_characters": 4,
+            "browser_tag_text_color": "#ff00aa",
         }
     )
     window = BrowserWindow(config_manager=config)
@@ -78,6 +90,9 @@ def test_browser_startup_applies_persisted_overlay_options(
     assert window.item_delegate.tag_overlay_opacity == 29
     assert window.item_delegate.tag_auto_text_color is False
     assert window.item_delegate.tag_text_luminance_threshold == 203
+    assert window.item_delegate.tag_font_size == 13
+    assert window.item_delegate.tag_max_characters == 4
+    assert window.item_delegate.tag_text_color.name() == "#ff00aa"
     window.close()
     qapp.processEvents()
 
@@ -116,6 +131,8 @@ def test_overlay_delegate_visibility_hit_testing_and_tag_alpha(qapp) -> None:
         def __init__(self) -> None:
             self.pens: list[QColor] = []
             self.fills: list[QColor] = []
+            self.labels: list[str] = []
+            self.font_sizes: list[int] = []
 
         def save(self) -> None:
             pass
@@ -126,8 +143,8 @@ def test_overlay_delegate_visibility_hit_testing_and_tag_alpha(qapp) -> None:
         def setClipRect(self, _rect: QRect) -> None:
             pass
 
-        def setFont(self, _font) -> None:
-            pass
+        def setFont(self, font) -> None:
+            self.font_sizes.append(font.pointSize())
 
         def fillRect(self, _rect: QRect, color: QColor) -> None:
             self.fills.append(QColor(color))
@@ -135,8 +152,8 @@ def test_overlay_delegate_visibility_hit_testing_and_tag_alpha(qapp) -> None:
         def setPen(self, color: QColor) -> None:
             self.pens.append(QColor(color))
 
-        def drawText(self, *_args) -> None:
-            pass
+        def drawText(self, *args) -> None:
+            self.labels.append(args[-1])
 
     delegate.tag_registry = [{"name": "Bright", "color": "#ffffff"}]
     delegate.configure(
@@ -160,6 +177,14 @@ def test_overlay_delegate_visibility_hit_testing_and_tag_alpha(qapp) -> None:
     painter = Painter()
     delegate._paint_tags(painter, option, rect, item)
     assert painter.pens and painter.pens[-1].name() == "#ffffff"
+    delegate.configure(thumbnail_size=180, density=delegate.density,
+                       tag_font_size=14, tag_max_characters=3,
+                       tag_text_color="#ff00aa")
+    painter = Painter()
+    delegate._paint_tags(painter, option, rect, item)
+    assert 14 in painter.font_sizes
+    assert painter.labels and painter.labels[-1] == "Bri…"
+    assert painter.pens[-1].name() == "#ff00aa"
 
 
 def test_browser_live_overlay_settings_repaint_without_rescanning(
@@ -186,6 +211,9 @@ def test_browser_live_overlay_settings_repaint_without_rescanning(
             "browser_tag_overlay_opacity": 34,
             "browser_tag_auto_text_color": False,
             "browser_tag_text_luminance_threshold": 201,
+            "browser_tag_font_size": 15,
+            "browser_tag_max_characters": 5,
+            "browser_tag_text_color": "#336699",
         }
     )
     qapp.processEvents()
@@ -198,6 +226,9 @@ def test_browser_live_overlay_settings_repaint_without_rescanning(
     assert window.item_delegate.tag_overlay_opacity == 34
     assert window.item_delegate.tag_auto_text_color is False
     assert window.item_delegate.tag_text_luminance_threshold == 201
+    assert window.item_delegate.tag_font_size == 15
+    assert window.item_delegate.tag_max_characters == 5
+    assert window.item_delegate.tag_text_color.name() == "#336699"
     assert window._rating_hover_path is None
     window.close()
     qapp.processEvents()
@@ -264,6 +295,9 @@ def test_overlay_settings_dialog_roundtrip_and_resets(tmp_path: Path, qapp) -> N
             "browser_tag_overlay_opacity": 45,
             "browser_tag_auto_text_color": False,
             "browser_tag_text_luminance_threshold": 211,
+            "browser_tag_font_size": 16,
+            "browser_tag_max_characters": 8,
+            "browser_tag_text_color": "#123abc",
         }
     )
     dialog = SettingsDialog(config)
@@ -274,6 +308,9 @@ def test_overlay_settings_dialog_roundtrip_and_resets(tmp_path: Path, qapp) -> N
     assert values["browser_rating_overlay_opacity"] == 23
     assert values["browser_tag_overlay_opacity"] == 45
     assert values["browser_tag_text_luminance_threshold"] == 211
+    assert values["browser_tag_font_size"] == 16
+    assert values["browser_tag_max_characters"] == 8
+    assert values["browser_tag_text_color"] == "#123abc"
 
     dialog.browser_show_rating_overlay_checkbox.setChecked(True)
     assert dialog.browser_rating_overlay_opacity_spin.isEnabled()
@@ -287,6 +324,9 @@ def test_overlay_settings_dialog_roundtrip_and_resets(tmp_path: Path, qapp) -> N
     assert dialog.values()["browser_rating_overlay_opacity"] == 85
     assert dialog.values()["browser_tag_overlay_opacity"] == 100
     assert dialog.values()["browser_tag_text_luminance_threshold"] == 150
+    assert dialog.values()["browser_tag_font_size"] == 0
+    assert dialog.values()["browser_tag_max_characters"] == 0
+    assert dialog.values()["browser_tag_text_color"] == "#ffffff"
 
     dialog.browser_rating_overlay_opacity_spin.setValue(11)
     dialog.browser_tag_overlay_opacity_spin.setValue(22)

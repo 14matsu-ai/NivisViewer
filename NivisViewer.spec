@@ -1,4 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 from pathlib import Path
 
 from PyInstaller.utils.hooks import (
@@ -8,6 +9,7 @@ from PyInstaller.utils.hooks import (
 from app.version import windows_version_info_text
 
 root = Path(SPECPATH)
+license_dir = Path(os.environ.get("NIVIS_LICENSES_DIR", root / "licenses"))
 version_file = root / "build" / "NivisViewer_version_info.txt"
 version_file.parent.mkdir(parents=True, exist_ok=True)
 version_file.write_text(windows_version_info_text(), encoding="utf-8")
@@ -32,7 +34,7 @@ a = Analysis(
         (str(root / "PROJECT_LICENSE.md"), "."),
         (str(root / "THIRD_PARTY_NOTICES.md"), "."),
         (str(root / "portable.flag"), "."),
-        (str(root / "licenses"), "licenses"),
+        (str(license_dir), "licenses"),
         (str(root / "assets" / "icons"), "assets/icons"),
     ],
     hiddenimports=["pillow_jxl.JpegXLImagePlugin", "PySide6.QtSvg", "PIL.AvifImagePlugin"],

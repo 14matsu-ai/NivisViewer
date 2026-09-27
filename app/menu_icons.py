@@ -52,6 +52,48 @@ def settings_icon() -> QIcon:
     return QIcon(_GearIconEngine())
 
 
+class _SelectionActionIconEngine(QIconEngine):
+    def __init__(self, kind: str, edge: int):
+        super().__init__()
+        self.kind = kind
+        self.edge = edge
+
+    def clone(self):
+        return _SelectionActionIconEngine(self.kind, self.edge)
+
+    def paint(self, painter, rect, mode, state):
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.translate(QRectF(rect).center())
+        edge = min(rect.width(), rect.height(), self.edge)
+        painter.scale(edge / 16, edge / 16)
+        painter.translate(-8, -8)
+        group = QPalette.ColorGroup.Disabled if mode == QIcon.Mode.Disabled else QPalette.ColorGroup.Active
+        role = QPalette.ColorRole.HighlightedText if mode == QIcon.Mode.Selected else QPalette.ColorRole.WindowText
+        painter.setPen(QApplication.palette().color(group, role))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if self.kind == "copy":
+            painter.drawRoundedRect(QRectF(4, 4, 9, 10), 1, 1)
+            painter.drawLine(QPointF(2, 11), QPointF(2, 2))
+            painter.drawLine(QPointF(2, 2), QPointF(10, 2))
+        else:
+            painter.drawEllipse(QRectF(2, 2, 9, 9))
+            painter.drawLine(QPointF(9, 9), QPointF(14, 14))
+        painter.restore()
+
+    def pixmap(self, size, mode, state):
+        pixmap = QPixmap(size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        self.paint(painter, QRectF(0, 0, size.width(), size.height()), mode, state)
+        painter.end()
+        return pixmap
+
+
+def selection_action_icon(kind: str, edge: int) -> QIcon:
+    return QIcon(_SelectionActionIconEngine(kind, edge))
+
+
 def _menu_icon_metrics(font_metrics) -> tuple[int, int]:
     # Use the line height, not a fixed toolbar-sized icon. The gear's ink
     # occupies about 5/6 of this box (roughly 2/3 of the menu text line).

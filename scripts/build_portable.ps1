@@ -21,6 +21,7 @@ if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
 }
 
 $PreviousBuildPath = $env:PATH
+$PreviousLicensesDir = $env:NIVIS_LICENSES_DIR
 Push-Location $RepoRoot
 try {
     $Architecture = & $Python -c "import platform,sys; print(f'{sys.version_info.major}.{sys.version_info.minor}|{platform.architecture()[0]}')"
@@ -62,15 +63,16 @@ try {
         & $Python -m pytest -q
         if ($LASTEXITCODE -ne 0) { throw "Tests failed." }
     }
-    & $Python scripts\collect_licenses.py --output licenses
+    $ReleaseLicensesDir = Join-Path $BuildDir ("licenses-" + [guid]::NewGuid().ToString("N"))
+    & $Python scripts\collect_licenses.py --output $ReleaseLicensesDir
     if ($LASTEXITCODE -ne 0) { throw "License collection failed." }
+    $env:NIVIS_LICENSES_DIR = $ReleaseLicensesDir
     & $Python -m PyInstaller --noconfirm NivisViewer.spec
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed." }
 
     foreach ($Name in @("portable.flag", "LICENSE", "PROJECT_LICENSE.md", "THIRD_PARTY_NOTICES.md", "README.md")) {
         Copy-Item -LiteralPath (Join-Path $RepoRoot $Name) -Destination $BundleDir -Force
     }
-    Copy-Item -LiteralPath (Join-Path $RepoRoot "licenses") -Destination $BundleDir -Recurse -Force
 
     $SmokeResult = Join-Path $BuildDir "frozen-smoke.json"
     if ($RunSmoke) {
@@ -114,5 +116,6 @@ try {
 }
 finally {
     $env:PATH = $PreviousBuildPath
+    $env:NIVIS_LICENSES_DIR = $PreviousLicensesDir
     Pop-Location
 }

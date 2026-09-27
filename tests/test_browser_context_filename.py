@@ -42,7 +42,16 @@ def populate(window, tmp_path, names, kind=BrowserItemKind.IMAGE):
 
 
 def actions(menu):
-    return {action.text(): action for action in menu.actions() if not isinstance(action, QWidgetAction)}
+    choices = {
+        action.text().split('「', 1)[0]: action
+        for action in menu.actions() if not isinstance(action, QWidgetAction)
+    }
+    for action in menu.actions():
+        if action.objectName() == 'browser_selected_text_copy':
+            choices['選択文字をコピー'] = action
+        elif action.objectName() == 'browser_selected_text_filter':
+            choices['選択文字でフィルタリング'] = action
+    return choices
 
 
 def invoke(window, monkeypatch, qapp, callback, row=0, keyboard=False):
@@ -74,15 +83,25 @@ def test_single_filename_is_canonical_readonly_and_partial_copy(browser, tmp_pat
         assert edit.text() == name and edit.isReadOnly()
         assert qapp.clipboard().text() == "untouched"
         choices = actions(menu)
-        assert not choices["選択文字をコピー"].isEnabled()
-        assert not choices["選択文字で検索"].isEnabled()
+        assert edit.selectedText() == name
+        assert choices["選択文字をコピー"].isEnabled()
+        assert choices["選択文字でフィルタリング"].isEnabled()
+        assert choices["選択文字をコピー"].text() == f'"{name}"をコピー'
+        assert choices["選択文字でフィルタリング"].text() == f'"{name}"でフィルタリング'
         edit.setFocus()
+        assert edit.selectedText() == ''
+        assert not choices["選択文字をコピー"].isEnabled()
+        assert not choices["選択文字でフィルタリング"].isEnabled()
         QTest.keyClick(edit, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
         assert qapp.clipboard().text() == "untouched"
         edit.setSelection(1, 3)
         selected = edit.selectedText()
+        assert choices["選択文字をコピー"].text() == f'"{selected}"をコピー'
+        assert choices["選択文字でフィルタリング"].text() == f'"{selected}"でフィルタリング'
+        assert not choices["選択文字をコピー"].icon().isNull()
+        assert not choices["選択文字でフィルタリング"].icon().isNull()
         assert choices["選択文字をコピー"].isEnabled()
-        assert choices["選択文字で検索"].isEnabled()
+        assert choices["選択文字でフィルタリング"].isEnabled()
         QTest.keyClick(edit, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
         assert qapp.clipboard().text() == selected
         assert qapp.clipboard().mimeData().formats() == ["text/plain"]
@@ -95,6 +114,24 @@ def test_single_filename_is_canonical_readonly_and_partial_copy(browser, tmp_pat
     invoke(browser, monkeypatch, qapp, inspect)
     assert qapp.clipboard().text() == name[1:4]
     assert qapp.clipboard().mimeData().formats() == ["text/plain"]
+
+
+@pytest.mark.parametrize('action_name', ['選択文字をコピー', '選択文字でフィルタリング'])
+def test_initial_whole_filename_action(browser, tmp_path, qapp, monkeypatch, action_name):
+    name = '全体 test.zip'
+    populate(browser, tmp_path, [name])
+
+    def choose(menu, edit):
+        assert edit.selectedText() == name
+        action = actions(menu)[action_name]
+        assert action.isEnabled()
+        return action
+
+    invoke(browser, monkeypatch, qapp, choose)
+    if action_name == '選択文字をコピー':
+        assert qapp.clipboard().text() == name
+    else:
+        assert browser.active_search_query == name
 
 
 @pytest.mark.parametrize("literal", ['+r=3', '[abc]*?', '"quoted"', 'A OR B', '名前😀'])
@@ -115,7 +152,7 @@ def test_selected_search_uses_literal_existing_pipeline_mru_and_edit_lifecycle(b
         start = len("prefix ".encode("utf-16-le")) // 2
         edit.setSelection(start, len(literal.encode("utf-16-le")) // 2)
         assert edit.selectedText() == literal
-        return actions(menu)["選択文字で検索"]
+        return actions(menu)["選択文字でフィルタリング"]
     invoke(browser, monkeypatch, qapp, search)
     assert browser.browser_search_edit.text() == literal
     assert browser.active_search_query == literal
@@ -184,7 +221,7 @@ def test_mouse_drag_selects_without_closing_menu_and_deselection_disables_action
         assert actions(menu)["選択文字をコピー"].isEnabled()
         edit.deselect()
         assert not actions(menu)["選択文字をコピー"].isEnabled()
-        assert not actions(menu)["選択文字で検索"].isEnabled()
+        assert not actions(menu)["選択文字でフィルタリング"].isEnabled()
     invoke(browser, monkeypatch, qapp, inspect)
 
 
@@ -219,7 +256,7 @@ def test_rightclick_retargets_but_multi_selection_keeps_whole_name_copy(browser,
     def multiple(menu, edit):
         assert edit is None
         assert "選択文字をコピー" not in actions(menu)
-        assert "選択文字で検索" not in actions(menu)
+        assert "選択文字でフィルタリング" not in actions(menu)
         return actions(menu)["名前をコピー"]
     invoke(browser, monkeypatch, qapp, multiple, row=1)
     assert qapp.clipboard().text() == "a.zip\nFolder.Name"
@@ -243,7 +280,19 @@ def test_background_no_header_and_keyboard_context_targets_current_item(browser,
     assert seen == [None, "current.zip"]
 
 
-@pytest.mark.parametrize("action_label", ["選択文字をコピー", "選択文字で検索"])
+def test_full_path_copy_shortcut_without_context_action(browser, tmp_path, qapp, monkeypatch):
+    paths = populate(browser, tmp_path, ["日本語.zip"])
+    browser.list_view.setFocus()
+    QTest.keyClick(browser.list_view, Qt.Key.Key_C, Qt.KeyboardModifier.ShiftModifier)
+    assert qapp.clipboard().text() == str(paths[0].path)
+    assert qapp.clipboard().mimeData().formats() == ["text/plain"]
+    def inspect(menu, edit):
+        assert "ファイルのフルパスをコピー" not in actions(menu)
+    invoke(browser, monkeypatch, qapp, inspect)
+    assert qapp.clipboard().text() == str(paths[0].path)
+
+
+@pytest.mark.parametrize("action_label", ["選択文字をコピー", "選択文字でフィルタリング"])
 def test_real_menu_action_click_preserves_selected_text(browser, tmp_path, qapp, monkeypatch, action_label):
     populate(browser, tmp_path, ["prefix foo.zip"])
     qapp.clipboard().setText("unchanged")

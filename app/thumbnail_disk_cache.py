@@ -1,5 +1,6 @@
 from __future__ import annotations
 from .cloud_files import require_local
+from .folder_cover import is_zippla_cover_name
 
 from .i18n import tr
 
@@ -381,6 +382,55 @@ class ThumbnailDiskCache:
             self._write_epoch += 1
             return self._write_epoch
 
+    def invalidate_source(self, path: str | Path, item_kind: BrowserItemKind) -> bool:
+        """Remove stale thumbnails for one source after its cover choice changes."""
+        with self._lock:
+            self._write_epoch += 1
+            was_enabled = self.enabled
+            if not was_enabled:
+                if not self.index_path.exists():
+                    return True
+                self.set_enabled(True)
+                if not self.enabled:
+                    return False
+            try:
+                rows = self._connection.execute(
+                    """SELECT cache_key, file_name FROM entries
+                       WHERE source_path = ? AND item_kind = ?""",
+                    (self._normalize_path(Path(path)), item_kind.value),
+                ).fetchall()
+                if rows:
+                    self._remove_entries([(str(key), str(name)) for key, name in rows])
+                return True
+            except (OSError, sqlite3.DatabaseError) as exc:
+                self.last_error = str(exc)
+                return False
+            finally:
+                if not was_enabled:
+                    self.set_enabled(False)
+
+    def invalidate_page_counts_for_kind(self, item_kind: BrowserItemKind) -> None:
+        """Discard page counts when a listing policy changes without changing files."""
+        with self._lock:
+            was_enabled = self.enabled
+            if not was_enabled:
+                if not self.index_path.exists():
+                    return
+                self.set_enabled(True)
+                if not self.enabled:
+                    return
+            try:
+                self._connection.execute(
+                    "UPDATE entries SET page_count = NULL WHERE item_kind = ?",
+                    (item_kind.value,),
+                )
+                self._connection.commit()
+            except sqlite3.DatabaseError as exc:
+                self.last_error = str(exc)
+            finally:
+                if not was_enabled:
+                    self.set_enabled(False)
+
     def set_limit_mb(self, limit_mb: int) -> None:
         self.limit_bytes = max(128, min(4096, int(limit_mb))) * 1024 * 1024
 
@@ -430,6 +480,8 @@ class ThumbnailDiskCache:
         thumbnail_size: int,
         *,
         entry_path: str | None = None,
+        required_cover_path: Path | None = None,
+        forbid_zippla_cover: bool = False,
     ) -> QImage | None:
         with self._lock:
             if not self.enabled or self._connection is None:
@@ -481,6 +533,10 @@ class ThumbnailDiskCache:
                     cover_mtime_ns,
                     cover_signature,
                 ) = row
+                if required_cover_path is not None and cover_path != self._normalize_path(required_cover_path):
+                    continue
+                if forbid_zippla_cover and cover_path and is_zippla_cover_name(Path(cover_path).name):
+                    continue
                 if source != (source_size, source_mtime_ns, source_ctime_ns):
                     invalid.append((key, file_name))
                     continue
@@ -518,6 +574,8 @@ class ThumbnailDiskCache:
         spec: ThumbnailRenderSpec,
         *,
         entry_path: str | None = None,
+        required_cover_path: Path | None = None,
+        forbid_zippla_cover: bool = False,
     ) -> CachedThumbnail | None:
         """Return the smallest compatible resolution, or the best lower placeholder."""
         with self._lock:
@@ -591,6 +649,10 @@ class ThumbnailDiskCache:
                     frame_height,
                     page_count,
                 ) = row
+                if required_cover_path is not None and cover_path != self._normalize_path(required_cover_path):
+                    continue
+                if forbid_zippla_cover and cover_path and is_zippla_cover_name(Path(cover_path).name):
+                    continue
                 if source != (source_size, source_mtime_ns, source_ctime_ns):
                     invalid.append((key, file_name))
                     continue

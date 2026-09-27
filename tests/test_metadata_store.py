@@ -472,7 +472,7 @@ def test_future_metadata_schema_is_preserved_and_requires_newer_app(
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE future_data (value TEXT)")
         connection.execute("INSERT INTO future_data VALUES ('keep')")
-        connection.execute("PRAGMA user_version=2")
+        connection.execute(f"PRAGMA user_version={METADATA_SCHEMA_VERSION + 1}")
     before = database.read_bytes()
 
     store = MetadataStore(database)
@@ -482,7 +482,7 @@ def test_future_metadata_schema_is_preserved_and_requires_newer_app(
         assert "新しい" in (store.last_error or "")
         assert database.read_bytes() == before
         with sqlite3.connect(database) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == METADATA_SCHEMA_VERSION + 1
             assert connection.execute("SELECT value FROM future_data").fetchone()[0] == "keep"
     finally:
         store.close()

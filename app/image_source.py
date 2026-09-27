@@ -47,6 +47,7 @@ from .creative_image_decoder import (
     probe_creative_image_size,
     probe_xcf_size_from_header,
 )
+from .folder_cover import is_cover_artifact_name
 from .psd_decoder import (
     PSD_HEADER_SIZE,
     decode_psd_image,
@@ -792,6 +793,7 @@ class FolderImageSource(ImageSource):
         *,
         recursive: bool = False,
         sort_descending: bool = False,
+        use_zippla_cover: bool = False,
         image_snapshot: tuple[str, ...] | None = None,
         file_size_snapshot: tuple[tuple[str, int | None], ...] | None = None,
         listing_snapshot: FolderListingSnapshot | None = None,
@@ -800,8 +802,15 @@ class FolderImageSource(ImageSource):
         require_local(folder_path)
         self.recursive = recursive
         self.sort_descending = sort_descending
+        self.use_zippla_cover = bool(use_zippla_cover)
         self._image_snapshot = (
-            tuple(path for path in image_snapshot if local_image_candidate(path))
+            tuple(
+                path for path in image_snapshot
+                if local_image_candidate(path)
+                and not is_cover_artifact_name(
+                    Path(path).name, use_zippla_cover=self.use_zippla_cover,
+                )
+            )
             if image_snapshot is not None else None
         )
         # Browser order is a book topology snapshot, not merely an open-time
@@ -848,6 +857,9 @@ class FolderImageSource(ImageSource):
                     if (
                         path.is_file()
                         and path.suffix.lower() in SUPPORTED_EXTENSIONS
+                        and not is_cover_artifact_name(
+                            path.name, use_zippla_cover=self.use_zippla_cover,
+                        )
                     )
                 ]
             else:
@@ -858,6 +870,9 @@ class FolderImageSource(ImageSource):
                         if (
                             os.path.splitext(entry.name)[1].lower()
                             not in SUPPORTED_EXTENSIONS
+                            or is_cover_artifact_name(
+                                entry.name, use_zippla_cover=self.use_zippla_cover,
+                            )
                         ):
                             continue
                         try:
@@ -1160,6 +1175,7 @@ class FolderImageSource(ImageSource):
             self.source_path,
             recursive=self.recursive,
             sort_descending=self.sort_descending,
+            use_zippla_cover=self.use_zippla_cover,
             image_snapshot=tuple(self.list_images()),
             listing_snapshot=self.listing_snapshot,
         )
@@ -2235,6 +2251,7 @@ def _create_image_source(
     *,
     recursive_folder: bool = False,
     sort_descending: bool = False,
+    use_zippla_cover: bool = False,
     archive_backend_registry=None,
     pdfium_service=None,
     pdf_render_base_dpi: int = 96,
@@ -2250,7 +2267,10 @@ def _create_image_source(
     selected_image: str | None = None
 
     if target.is_dir():
-        return FolderImageSource(target, recursive=recursive_folder, sort_descending=sort_descending), None
+        return FolderImageSource(
+            target, recursive=recursive_folder, sort_descending=sort_descending,
+            use_zippla_cover=use_zippla_cover,
+        ), None
 
     suffix = target.suffix.lower()
     if suffix in PDF_EXTENSIONS:
@@ -2324,6 +2344,7 @@ def _create_image_source(
             target.parent,
             recursive=recursive_folder,
             sort_descending=sort_descending,
+            use_zippla_cover=use_zippla_cover,
             image_snapshot=snapshot_paths,
             file_size_snapshot=snapshot_file_sizes,
             listing_snapshot=(

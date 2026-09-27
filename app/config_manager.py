@@ -185,6 +185,9 @@ class ConfigManager(QObject):
         "browser_tag_overlay_opacity": 100,
         "browser_tag_auto_text_color": True,
         "browser_tag_text_luminance_threshold": 150,
+        "browser_tag_font_size": 0,
+        "browser_tag_max_characters": 0,
+        "browser_tag_text_color": "#ffffff",
         "browser_preserve_search_for_viewer_roundtrip": True,
         "browser_display_density": "standard",
         "browser_item_spacing_x": 0,
@@ -199,6 +202,7 @@ class ConfigManager(QObject):
         "browser_show_hidden_items": True,
         "browser_show_unsupported_files": True,
         "browser_show_system_items": False,
+        "browser_use_zippla_cover": False,
         "browser_folder_snapshot_cache_enabled": True,
         "browser_folder_snapshot_cache_max_entries": (
             DEFAULT_BROWSER_FOLDER_SNAPSHOT_CACHE_MAX_ENTRIES
@@ -568,6 +572,7 @@ class ConfigManager(QObject):
             "browser_tag_auto_text_color",
             "browser_show_unsupported_files",
             "browser_show_system_items",
+            "browser_use_zippla_cover",
             "browser_folder_snapshot_cache_enabled",
             "text_preview_enabled",
             "video_thumbnail_enabled",
@@ -594,6 +599,16 @@ class ConfigManager(QObject):
             default=150,
             minimum=0,
             maximum=255,
+        )
+        normalized["browser_tag_font_size"] = cls._clamped_int(
+            normalized.get("browser_tag_font_size"), default=0, minimum=0, maximum=24,
+        )
+        normalized["browser_tag_max_characters"] = cls._clamped_int(
+            normalized.get("browser_tag_max_characters"), default=0, minimum=0, maximum=100,
+        )
+        color = str(normalized.get("browser_tag_text_color", "#ffffff")).strip().casefold()
+        normalized["browser_tag_text_color"] = (
+            color if re.fullmatch(r"#[0-9a-f]{6}", color) else "#ffffff"
         )
         normalized[
             "browser_folder_snapshot_cache_max_entries"

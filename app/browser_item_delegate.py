@@ -528,6 +528,9 @@ class BrowserItemDelegate(QStyledItemDelegate):
         tag_overlay_opacity: int = BROWSER_TAG_OVERLAY_DEFAULT_OPACITY,
         tag_auto_text_color: bool = True,
         tag_text_luminance_threshold: int = BROWSER_TAG_TEXT_LUMINANCE_THRESHOLD_DEFAULT,
+        tag_font_size: int = 0,
+        tag_max_characters: int = 0,
+        tag_text_color: str = "#ffffff",
     ) -> None:
         super().__init__(parent)
         self.thumbnail_size = int(thumbnail_size)
@@ -592,6 +595,9 @@ class BrowserItemDelegate(QStyledItemDelegate):
         self.tag_text_luminance_threshold = max(
             0, min(255, int(tag_text_luminance_threshold))
         )
+        self.tag_font_size = max(0, min(24, int(tag_font_size)))
+        self.tag_max_characters = max(0, min(100, int(tag_max_characters)))
+        self.tag_text_color = QColor(tag_text_color) if QColor(tag_text_color).isValid() else QColor('#ffffff')
         self._badge_inset_cache: OrderedDict[
             tuple[str, int, int], tuple[int, int]
         ] = OrderedDict()
@@ -682,6 +688,9 @@ class BrowserItemDelegate(QStyledItemDelegate):
         tag_overlay_opacity: int | None = None,
         tag_auto_text_color: bool | None = None,
         tag_text_luminance_threshold: int | None = None,
+        tag_font_size: int | None = None,
+        tag_max_characters: int | None = None,
+        tag_text_color: str | None = None,
     ) -> None:
         previous_surface_geometry = (
             self.thumbnail_size,
@@ -710,6 +719,12 @@ class BrowserItemDelegate(QStyledItemDelegate):
             self.tag_text_luminance_threshold = max(
                 0, min(255, int(tag_text_luminance_threshold))
             )
+        if tag_font_size is not None:
+            self.tag_font_size = max(0, min(24, int(tag_font_size)))
+        if tag_max_characters is not None:
+            self.tag_max_characters = max(0, min(100, int(tag_max_characters)))
+        if tag_text_color is not None and QColor(tag_text_color).isValid():
+            self.tag_text_color = QColor(tag_text_color)
         if thumbnail_display_mode is not None:
             self.thumbnail_display_mode = (
                 thumbnail_display_mode
@@ -1202,7 +1217,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
         try:
             painter.setClipRect(rect)
             font = QFont(option.font)
-            font.setPointSize(max(7, min(10, self.profile.font_size)))
+            font.setPointSize(self.tag_font_size or max(7, min(10, self.profile.font_size)))
             painter.setFont(font)
             metrics = QFontMetrics(font)
             ink = metrics.tightBoundingRect(''.join(tag['name'] for tag in tags))
@@ -1215,13 +1230,16 @@ class BrowserItemDelegate(QStyledItemDelegate):
             x, y = right, rect.bottom() - height - 3
             badge = self._type_badge_rect(rect, item)
             for tag in tags:
+                text = tag['name']
+                if self.tag_max_characters and len(text) > self.tag_max_characters:
+                    text = text[:self.tag_max_characters] + '…'
                 tag_band = QRect(rect.left(), y, rect.width(), height)
                 left = (
                     badge.right() + 7
                     if tag_band.intersects(badge)
                     else rect.left() + 2
                 )
-                desired = metrics.horizontalAdvance(tag['name']) + 6
+                desired = metrics.horizontalAdvance(text) + 6
                 if x < right and x - left < desired:
                     x, y = right, y - height - 3
                     tag_band = QRect(rect.left(), y, rect.width(), height)
@@ -1235,7 +1253,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
                 available = x - left
                 if available < 12:
                     break
-                label = metrics.elidedText(tag['name'], Qt.TextElideMode.ElideRight, available - 6)
+                label = metrics.elidedText(text, Qt.TextElideMode.ElideRight, available - 6)
                 width = min(available, metrics.horizontalAdvance(label) + 6)
                 box = QRect(x - width, y, width, height)
                 opaque = QColor(tag['color'])
@@ -1254,7 +1272,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
                         else 'white'
                     )
                 else:
-                    text_color = 'white'
+                    text_color = self.tag_text_color
                 painter.setPen(QColor(text_color))
                 painter.drawText(box.left() + 3, box.top() + 2 - ink.top(), label)
                 x -= width + 3

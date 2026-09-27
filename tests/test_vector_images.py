@@ -318,6 +318,51 @@ def test_internal_gradient_and_embedded_raster(qapp):
     assert not image.isNull() and image.pixelColor(10,10).blue()>200
 
 
+def test_wrapped_embedded_png_keeps_strict_reference_validation(qapp):
+    from PIL import Image
+    import base64
+    buffer = io.BytesIO()
+    with Image.new('RGB', (32, 24), 'red') as source:
+        source.save(buffer, format='PNG')
+    encoded = base64.b64encode(buffer.getvalue())
+    wrapped = b'\n  '.join(encoded[index:index + 48] for index in range(0, len(encoded), 48))
+    prefix = b'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="24"><image width="32" height="24" href="data:image/png;base64,'
+    payload = prefix + wrapped + b'"/></svg>'
+    image, logical = render_vector(payload, '.svg', (128, 128))
+    assert logical == (32, 24) and image.pixelColor(50, 40).red() > 200
+    with pytest.raises(VectorImageError):
+        render_vector(prefix + wrapped + b'!"/></svg>', '.svg', (128, 128))
+
+
+def test_inkscape_flowed_text_fallback_image_uses_xlink_without_black_region(qapp):
+    import base64
+    from PIL import Image
+
+    pixels = Image.new('RGBA', (20, 10), (0, 0, 0, 0))
+    for x in range(20):
+        for y in range(5):
+            pixels.putpixel((x, y), (255, 0, 0, 255))
+    buffer = io.BytesIO()
+    pixels.save(buffer, format='PNG')
+    encoded = base64.b64encode(buffer.getvalue())
+    svg = (
+        b'<svg xmlns="http://www.w3.org/2000/svg" '
+        b'xmlns:xlink="http://www.w3.org/1999/xlink" width="20" height="10">'
+        b'<flowRoot><flowRegion><rect width="20" height="10"/></flowRegion>'
+        b'<flowPara>sample</flowPara></flowRoot>'
+        b'<image width="20" height="10" xlink:href="data:image/png;base64,'
+        + encoded + b'"/></svg>'
+    )
+    image, logical = render_vector(svg, '.svg', (80, 40))
+    assert logical == (20, 10)
+    assert image.pixelColor(20, 8).red() > 200
+    assert image.pixelColor(20, 32).alpha() == 0
+
+    unsafe = svg.replace(b'data:image/png;base64,' + encoded, b'file:///C:/missing.png')
+    with pytest.raises(VectorImageError):
+        render_vector(unsafe, '.svg', (80, 40))
+
+
 def test_svg_editor_metadata_preserves_pixels_and_external_reference_blocking(qapp, monkeypatch):
     import app.vector_image_decoder as decoder
     plain = b'<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><rect width="20" height="20" fill="red"/></svg>'

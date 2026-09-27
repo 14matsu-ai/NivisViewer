@@ -32,6 +32,9 @@ from .archive_backend import MAX_IMAGE_ENTRY_BYTES
 from .gimp_xcf_backend import gimp_cancellation
 from .xcf_raster_reader import DeferXcf, xcf_worker_scope
 from .file_preview import PreviewResult, PreviewResultKind, PreviewSource
+from .folder_cover import (
+    ZIPPLA_COVER_NAME, cover_candidates, is_cover_artifact_name, resolve_folder_cover,
+)
 from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
 from .image_source import EXTERNAL_ARCHIVE_EXTENSIONS, SUPPORTED_EXTENSIONS, SevenZipImageSource
 from .pdf_backend import PageRenderSpec, PdfRenderPriority
@@ -385,6 +388,9 @@ class BrowserThumbnailProvider(QObject):
         self._loader = self._load_pipeline
         self._disk_cache = disk_cache
         self._disk_cache_enabled = bool(disk_cache_enabled)
+        self._zippla_cover_enabled = bool(
+            (preview_settings or {}).get('browser_use_zippla_cover', False)
+        )
         self._disk_cache_health_lock = Lock()
         # None means that the configured route has not been exercised yet.
         # An observed failure blocks unbounded far generation; a later
@@ -1499,6 +1505,13 @@ class BrowserThumbnailProvider(QObject):
         self._preview_registry.update_settings(settings)
         return self.begin_generation()
 
+    def set_zippla_cover_enabled(self, enabled: bool) -> int:
+        self._zippla_cover_enabled = bool(enabled)
+        if self._disk_cache is not None:
+            self._disk_cache.invalidate_page_counts_for_kind(BrowserItemKind.FOLDER)
+        self.clear_memory_cache()
+        return self.begin_generation()
+
     def clear_all_caches_async(self) -> None:
         self.clear_memory_cache()
         disk_cache = self._disk_cache
@@ -1576,13 +1589,15 @@ class BrowserThumbnailProvider(QObject):
         smart_crop_cache: SmartCropCache | None = None,
         page_count_callback: Callable[[int], None] | None = None,
         capture_source_identity: bool = False,
+        preferred_folder_cover: Path | None = None,
+        use_zippla_cover: bool = False,
     ) -> ThumbnailLoadResult:
         from .vector_image_decoder import vector_context
         with vector_context(pdfium_service, cancel_token, pdf_render_priority):
             return BrowserThumbnailProvider._load_thumbnail_result_bound(
                 item, size, archive_backend_registry, cancel_token, pdfium_service,
                 pdf_render_priority, smart_crop_cache, page_count_callback,
-                capture_source_identity,
+                capture_source_identity, preferred_folder_cover, use_zippla_cover,
             )
 
     @staticmethod
@@ -1596,6 +1611,8 @@ class BrowserThumbnailProvider(QObject):
         smart_crop_cache: SmartCropCache | None = None,
         page_count_callback: Callable[[int], None] | None = None,
         capture_source_identity: bool = False,
+        preferred_folder_cover: Path | None = None,
+        use_zippla_cover: bool = False,
     ) -> ThumbnailLoadResult:
         spec = (
             size
@@ -1620,6 +1637,8 @@ class BrowserThumbnailProvider(QObject):
                     page_count_callback,
                     cancel_token,
                     source_item=item if capture_source_identity else None,
+                    preferred_cover=preferred_folder_cover,
+                    use_zippla_cover=use_zippla_cover,
                 )
             if item.kind == BrowserItemKind.ARCHIVE:
                 if item.path.suffix.lower() in EXTERNAL_ARCHIVE_EXTENSIONS:
@@ -1717,6 +1736,12 @@ class BrowserThumbnailProvider(QObject):
             if item.kind is BrowserItemKind.OTHER
             else None
         )
+        preferred_cover = (
+            resolve_folder_cover(
+                item.path, use_zippla_cover=self._zippla_cover_enabled,
+            )
+            if item.kind is BrowserItemKind.FOLDER else None
+        )
 
         try:
             require_local(item.path)
@@ -1768,6 +1793,8 @@ class BrowserThumbnailProvider(QObject):
                         item,
                         size,
                         entry_path=disk_entry_path,
+                        required_cover_path=preferred_cover,
+                        forbid_zippla_cover=not self._zippla_cover_enabled,
                     )
                 except TypeError:
                     cached_result = disk_cache.get_suitable(item, size)
@@ -1796,6 +1823,8 @@ class BrowserThumbnailProvider(QObject):
                         item,
                         cache_token,
                         entry_path=disk_entry_path,
+                        required_cover_path=preferred_cover,
+                        forbid_zippla_cover=not self._zippla_cover_enabled,
                     )
                 except TypeError:
                     cached = disk_cache.get(item, cache_token)
@@ -1910,6 +1939,8 @@ class BrowserThumbnailProvider(QObject):
                     self._smart_crop_cache,
                     publish_page_count,
                     capture_source_identity=capture_save_identity,
+                    preferred_folder_cover=preferred_cover,
+                    use_zippla_cover=self._zippla_cover_enabled,
                 )
         else:
             source_identity = (
@@ -2104,7 +2135,10 @@ class BrowserThumbnailProvider(QObject):
             require_local(item.path)
             if item.kind is BrowserItemKind.FOLDER:
                 page_count = len(
-                    self._folder_image_candidates(item.path, cancel_token)
+                    self._folder_image_candidates(
+                        item.path, cancel_token,
+                        include_zippla_image=not self._zippla_cover_enabled,
+                    )
                 )
             elif item.path.suffix.lower() in EXTERNAL_ARCHIVE_EXTENSIONS:
                 if self._archive_backend_registry is None:
@@ -2795,6 +2829,8 @@ class BrowserThumbnailProvider(QObject):
     def _folder_image_candidates(
         folder: Path,
         cancel_token=None,
+        *,
+        include_zippla_image: bool = False,
     ) -> list[Path]:
         candidates: list[Path] = []
         require_local(folder)
@@ -2802,6 +2838,10 @@ class BrowserThumbnailProvider(QObject):
             for entry in entries:
                 if BrowserThumbnailProvider._is_cancelled(cancel_token):
                     raise InterruptedError
+                if is_cover_artifact_name(
+                    entry.name, use_zippla_cover=not include_zippla_image,
+                ):
+                    continue
                 if (
                     Path(entry.name).suffix.lower()
                     not in BROWSER_IMAGE_EXTENSIONS
@@ -2839,6 +2879,8 @@ class BrowserThumbnailProvider(QObject):
         page_count_callback: Callable[[int], None] | None = None,
         cancel_token=None,
         source_item: BrowserItem | None = None,
+        preferred_cover: Path | None = None,
+        use_zippla_cover: bool = False,
     ) -> ThumbnailLoadResult:
         try:
             candidates = BrowserThumbnailProvider._folder_image_candidates(
@@ -2857,15 +2899,31 @@ class BrowserThumbnailProvider(QObject):
                 result_kind=PreviewResultKind.FAILED,
                 persist_to_disk=False,
             )
+        zippla_path = folder / ZIPPLA_COVER_NAME
+        page_count = len(candidates) + int(
+            not use_zippla_cover
+            and local_image_candidate(zippla_path)
+            and zippla_path.is_file()
+        )
         if page_count_callback is not None:
-            page_count_callback(len(candidates))
-        for path in candidates:
+            page_count_callback(page_count)
+        special_covers = list(cover_candidates(folder, use_zippla_cover=use_zippla_cover))
+        if preferred_cover is not None and local_image_candidate(preferred_cover):
+            special_covers.insert(0, preferred_cover)
+        seen: set[str] = set()
+        ordered = []
+        for path in (*special_covers, *candidates):
+            key = BrowserThumbnailProvider._path_key(path)
+            if key not in seen:
+                ordered.append(path)
+                seen.add(key)
+        for path in ordered:
             if BrowserThumbnailProvider._is_cancelled(cancel_token):
                 return ThumbnailLoadResult(
                     None,
                     result_kind=PreviewResultKind.CANCELLED,
                     persist_to_disk=False,
-                    page_count=len(candidates),
+                    page_count=page_count,
                 )
             source_identity = (
                 ThumbnailSourceIdentity.capture(source_item, cover_path=path)
@@ -2881,14 +2939,14 @@ class BrowserThumbnailProvider(QObject):
                 return ThumbnailLoadResult(
                     image,
                     path,
-                    page_count=len(candidates),
+                    page_count=page_count,
                     source_identity=source_identity,
                 )
         return ThumbnailLoadResult(
             None,
             result_kind=PreviewResultKind.NO_CONTENT,
             persist_to_disk=False,
-            page_count=len(candidates),
+            page_count=page_count,
         )
 
     @staticmethod

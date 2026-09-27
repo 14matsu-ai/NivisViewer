@@ -22,6 +22,7 @@ from .browser_visibility import (
 )
 from .image_source import ARCHIVE_EXTENSIONS, PDF_EXTENSIONS, SUPPORTED_EXTENSIONS
 from .file_operation_artifact import FileOperationArtifactPolicy
+from .folder_cover import is_cover_artifact_name, is_zippla_cover_name
 from .performance_trace import performance_trace
 from .zippla_filename_metadata import ZipPlaFilenameMetadata
 
@@ -146,6 +147,8 @@ def scan_entry_from_dir_entry(
     name = entry.name
     if name in {".", ".."} or name.startswith("~$"):
         return None
+    if is_cover_artifact_name(name, use_zippla_cover=visibility_policy.use_zippla_cover):
+        return None
     if FileOperationArtifactPolicy.is_internal_operation_artifact(name):
         FileOperationArtifactPolicy.record_orphan(entry.path)
         return None
@@ -157,6 +160,8 @@ def scan_entry_from_dir_entry(
     except OSError:
         entry_stat = None
     hidden, system = filesystem_visibility_flags(name, attributes)
+    if is_zippla_cover_name(name):
+        hidden = True
 
     suffix = os.path.splitext(name)[1]
     if suffix == ".":

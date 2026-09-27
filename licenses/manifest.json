@@ -4,7 +4,7 @@
   "runtime": [
     {
       "name": "PySide6",
-      "version": "6.11.1",
+      "version": "6.11.2",
       "files": [
         "LicenseRef-Qt-Commercial.txt"
       ],
@@ -15,11 +15,14 @@
       "declared_license_files": [
         "LicenseRef-Qt-Commercial.txt"
       ],
-      "supplement": null
+      "supplement": {
+        "path": "Qt/6.11.2/SOURCES.json",
+        "scope": "license texts and limited attribution, not complete source/module compliance"
+      }
     },
     {
       "name": "PySide6_Addons",
-      "version": "6.11.1",
+      "version": "6.11.2",
       "files": [
         "LicenseRef-Qt-Commercial.txt"
       ],
@@ -30,11 +33,14 @@
       "declared_license_files": [
         "LicenseRef-Qt-Commercial.txt"
       ],
-      "supplement": null
+      "supplement": {
+        "path": "Qt/6.11.2/SOURCES.json",
+        "scope": "license texts and limited attribution, not complete source/module compliance"
+      }
     },
     {
       "name": "PySide6_Essentials",
-      "version": "6.11.1",
+      "version": "6.11.2",
       "files": [
         "LicenseRef-Qt-Commercial.txt"
       ],
@@ -45,11 +51,14 @@
       "declared_license_files": [
         "LicenseRef-Qt-Commercial.txt"
       ],
-      "supplement": null
+      "supplement": {
+        "path": "Qt/6.11.2/SOURCES.json",
+        "scope": "license texts and limited attribution, not complete source/module compliance"
+      }
     },
     {
       "name": "shiboken6",
-      "version": "6.11.1",
+      "version": "6.11.2",
       "files": [
         "LicenseRef-Qt-Commercial.txt"
       ],
@@ -60,16 +69,19 @@
       "declared_license_files": [
         "LicenseRef-Qt-Commercial.txt"
       ],
-      "supplement": null
+      "supplement": {
+        "path": "Qt/6.11.2/SOURCES.json",
+        "scope": "license texts and limited attribution, not complete source/module compliance"
+      }
     },
     {
       "name": "Pillow",
-      "version": "12.1.1",
+      "version": "12.3.0",
       "files": [
-        "LICENSE__926df5f888a7337fd4126a435202edf2847312be81a167df91a6d70cfa3f2ed3"
+        "LICENSE"
       ],
       "file_sha256": {
-        "LICENSE__926df5f888a7337fd4126a435202edf2847312be81a167df91a6d70cfa3f2ed3": "926df5f888a7337fd4126a435202edf2847312be81a167df91a6d70cfa3f2ed3"
+        "LICENSE": "4f7866a74802c6326f81faff59a56546b6aec2b10b91973e0e9308de95e79857"
       },
       "declared_license": "MIT-CMU",
       "declared_license_files": [
@@ -313,8 +325,8 @@
         "LICENSE.APACHE",
         "LICENSE.BSD",
         "__init__.py",
-        "__pycache______init__.cpython-311__9945d440c196b190ff558e0427d15242615d9e417c0dd297acc6d648ecc6010c.pyc",
-        "__pycache_____spdx.cpython-311__1990c28c0f95041b0c687205368f8be1186aac6fa9c767a0b638bf482b76799b.pyc",
+        "__pycache______init__.cpython-311.pyc",
+        "__pycache_____spdx.cpython-311.pyc",
         "_spdx.py"
       ],
       "file_sha256": {
@@ -322,8 +334,8 @@
         "LICENSE.APACHE": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
         "LICENSE.BSD": "b70e7e9b742f1cc6f948b34c16aa39ffece94196364bc88ff0d2180f0028fac5",
         "__init__.py": "590d12eee73ddbec53b4e9ee5bfc64d9cb3aacb4940e8ebcba260757ce56740b",
-        "__pycache______init__.cpython-311__9945d440c196b190ff558e0427d15242615d9e417c0dd297acc6d648ecc6010c.pyc": "9945d440c196b190ff558e0427d15242615d9e417c0dd297acc6d648ecc6010c",
-        "__pycache_____spdx.cpython-311__1990c28c0f95041b0c687205368f8be1186aac6fa9c767a0b638bf482b76799b.pyc": "1990c28c0f95041b0c687205368f8be1186aac6fa9c767a0b638bf482b76799b",
+        "__pycache______init__.cpython-311.pyc": "4d3469877d4a3ba0504afd2d32181a7a9bd7e0a8bb70a3122914a89a1f5177c2",
+        "__pycache_____spdx.cpython-311.pyc": "81f7b4da480bb411e30c41fb039dbef40113a36265be77dd9e92a21515139f11",
         "_spdx.py": "596ec35e2ca0ebcba9fd8343ff0a51625af548786257815f24b41f7e08613314"
       },
       "declared_license": "Apache-2.0 OR BSD-2-Clause",
@@ -351,7 +363,7 @@
     },
     {
       "name": "pypdfium2",
-      "version": "5.12.1",
+      "version": "5.13.0",
       "files": [
         "LICENSES__Apache-2.0.txt",
         "LICENSES__BSD-3-Clause.txt",
@@ -422,7 +434,7 @@
   "build_tools": [
     {
       "name": "PyInstaller",
-      "version": "6.20.0",
+      "version": "6.22.2",
       "files": [
         "COPYING.txt"
       ],
@@ -437,10 +449,14 @@
     }
   ],
   "warnings": [
-    "PySide6 6.11.1: wheel has only a commercial reference; open-source texts missing; inspect metadata and official sources, not a commercial-only conclusion",
-    "PySide6_Addons 6.11.1: wheel has only a commercial reference; open-source texts missing; inspect metadata and official sources, not a commercial-only conclusion",
-    "PySide6_Essentials 6.11.1: wheel has only a commercial reference; open-source texts missing; inspect metadata and official sources, not a commercial-only conclusion",
-    "shiboken6 6.11.1: wheel has only a commercial reference; open-source texts missing; inspect metadata and official sources, not a commercial-only conclusion"
+    "PySide6 6.11.2: wheel has only a commercial reference; official open-source texts supplemented, but module/third-party/source review remains",
+    "PySide6: installed 6.11.2 differs from release pin 6.11.1",
+    "PySide6_Addons 6.11.2: wheel has only a commercial reference; official open-source texts supplemented, but module/third-party/source review remains",
+    "PySide6_Essentials 6.11.2: wheel has only a commercial reference; official open-source texts supplemented, but module/third-party/source review remains",
+    "shiboken6 6.11.2: wheel has only a commercial reference; official open-source texts supplemented, but module/third-party/source review remains",
+    "Pillow: installed 12.3.0 differs from release pin 12.1.1",
+    "pypdfium2: installed 5.13.0 differs from release pin 5.12.1",
+    "PyInstaller: installed 6.22.2 differs from release pin 6.20.0"
   ],
   "interpreter": {
     "name": "CPython",

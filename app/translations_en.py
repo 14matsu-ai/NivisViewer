@@ -1161,5 +1161,28 @@ ENGLISH.update({
 })
 
 ENGLISH.update({'AI・SVG画像': 'AI / SVG images', 'AI画像の読み込みを有効にする（再起動後に反映）': 'Enable AI image loading (restart required)', 'SVG画像の読み込みを有効にする（再起動後に反映）': 'Enable SVG image loading (restart required)', 'PDF互換で保存されたAIの先頭ページだけを表示します。非互換AIはIllustratorで「PDF互換ファイルを作成」を有効にして再保存してください。編集データや全アートボードを再現する機能ではありません。': 'Displays only the first page of PDF-compatible AI files. For other AI files, save again in Illustrator with Create PDF Compatible File enabled. Editing data and all artboards are not reproduced.', '外部参照を含まない静止画SVGを表示します。外部ファイル参照・アニメーション・一部の効果は非対応です。フォントや描画結果が元のアプリと異なる場合があります。': 'Displays static SVG files without external references. External files, animation and some effects are unsupported. Fonts and rendering may differ from the original application.'})
+ENGLISH.update({
+    'ZipPlaの表紙補助ファイルを利用する': 'Use ZipPla cover files',
+    'ON: ZipPlaの表紙補助ファイルを一覧から隠し、NivisViewerの表紙がない場合に使用します。OFF: ZipPlaの補助ファイルを通常の隠し画像として表示します。': 'On: hide ZipPla cover files and use them when there is no NivisViewer cover. Off: show them as ordinary hidden images.',
+    '選択文字でフィルタリング': 'Filter by selected text',
+    'ファイルのフルパスをコピー': 'Copy full file path',
+    '{p0}項目のフルパスをコピーしました': 'Copied full paths for {p0} items',
+    'Illustrator（.ai）画像の読み込みを有効にする（再起動後に反映）': 'Enable Illustrator (.ai) images (restart required)',
+    'タグ文字の大きさ:': 'Tag text size:',
+    'タグの最大表示文字数:': 'Maximum tag characters:',
+    'タグ文字色:': 'Tag text color:',
+    '自動調整をOFFにしたときの文字色。#RRGGBB形式で指定します。': 'Text color when automatic contrast is off. Enter #RRGGBB.',
+    '色を選択…': 'Choose color…',
+    '制限なし': 'No limit',
+    'タグ文字色': 'Tag text color',
+    'これを親フォルダーの表紙に設定': 'Set as parent folder cover',
+    '親フォルダーの表紙に設定しました': 'Set as parent folder cover',
+    '表紙を保存できませんでした': 'Could not save the folder cover',
+    '表紙設定を削除': 'Remove folder cover setting',
+    '表紙設定を削除しました': 'Removed the folder cover setting',
+    '表紙設定を削除できませんでした': 'Could not remove the folder cover setting',
+    '"{p0}"をコピー': 'Copy "{p0}"',
+    '"{p0}"でフィルタリング': 'Filter by "{p0}"',
+})
 
 ENGLISH.update({'PDF互換で保存されたAIに対応しています。非互換または破損したAIは表示できません。': 'PDF-compatible AI files are supported. Incompatible or damaged AI files cannot be displayed.', '外部参照を含まない静止画SVGに対応しています。': 'Only static SVG files without external references are supported.'})

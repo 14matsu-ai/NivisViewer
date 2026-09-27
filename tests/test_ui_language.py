@@ -248,10 +248,13 @@ def test_browser_late_filename_menu_and_status_preserve_user_data(tmp_path, qapp
                 editor.setFocus()
                 editor.setSelection(0, 2)
                 assert editor.selectedText() == "設定"
-                source = "選択文字をコピー" if operation == "copy" else "選択文字で検索"
+                source = (
+                    tr('"{p0}"をコピー', p0="設定") if operation == "copy"
+                    else tr('"{p0}"でフィルタリング', p0="設定")
+                )
                 choices = {a.text(): a for a in menu.actions() if not isinstance(a, QWidgetAction)}
                 assert tr("コピー") in choices and tr("名前をコピー") in choices
-                action = choices[tr(source)]
+                action = choices[source]
                 QTest.mouseClick(menu, Qt.MouseButton.LeftButton, pos=menu.actionGeometry(action).center())
             except Exception as error:
                 errors.append(error)

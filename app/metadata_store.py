@@ -17,7 +17,7 @@ from PySide6.QtCore import QCoreApplication, QObject, QTimer, Signal
 from .image_source import ARCHIVE_EXTENSIONS, PDF_EXTENSIONS, SUPPORTED_EXTENSIONS
 
 
-METADATA_SCHEMA_VERSION = 1
+METADATA_SCHEMA_VERSION = 2
 _BUSY_RETRY_MAX_ATTEMPTS = 6
 _BUSY_RETRY_BASE_MSECS = 100
 
@@ -74,6 +74,7 @@ class MetadataStore(QObject):
     history_changed = Signal()
     bookmarks_changed = Signal()
     metadata_changed = Signal(str)
+    folder_cover_changed = Signal(str)
 
     def __init__(
         self,
@@ -921,7 +922,7 @@ class MetadataStore(QObject):
     def _migrate_schema(self) -> None:
         assert self._connection is not None
         version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
-        if version not in (0, METADATA_SCHEMA_VERSION):
+        if version not in (0, 1, METADATA_SCHEMA_VERSION):
             raise UnsupportedMetadataSchemaError(version)
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.executescript(
@@ -979,6 +980,7 @@ class MetadataStore(QObject):
                 ON browser_bookmarks(sort_order);
             """
         )
+        self._connection.execute("DROP TABLE IF EXISTS folder_covers")
         self._connection.execute(
             f"PRAGMA user_version={METADATA_SCHEMA_VERSION}"
         )

@@ -275,6 +275,7 @@ class ViewerWindow(QMainWindow):
             self,
             source_factory=lambda source_path, **kwargs: create_image_source(
                 source_path,
+                use_zippla_cover=bool(self.settings.get("browser_use_zippla_cover", False)),
                 archive_backend_registry=self.archive_backend_registry,
                 pdfium_service=self.pdfium_service,
                 pdf_render_base_dpi=int(
