@@ -2288,7 +2288,9 @@ class SettingsDialog(QDialog):
     def _build_browser_tab(self) -> QWidget:
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
-        self.browser_workflow_settings = BrowserWorkflowSettings(tab)
+        self.browser_workflow_settings = BrowserWorkflowSettings(
+            tab, help_button_class=_CircularHelpButton
+        )
         layout.addWidget(self.browser_workflow_settings)
 
         list_group = QGroupBox(tr('一覧表示'), tab)

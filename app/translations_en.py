@@ -1107,7 +1107,19 @@ ENGLISH.update({
     "画面数を指定": "Specify screen count",
     "無制限（現在の一覧全体）": "Unlimited (current listing)",
     " 画面分": " screens",
-    "サムネイル背景生成の範囲:": "Background thumbnail generation range:",
+    "サムネイルの先読み範囲:": "Thumbnail prefetch range:",
+    "サムネイルの先読み範囲の説明": "About thumbnail prefetch range",
+    "表示中の項目を優先し、スクロール停止後に画面外のサムネイルを指定範囲まで作ります。": (
+        "Prioritize visible items, then generate offscreen thumbnails within the selected range after scrolling stops."
+    ),
+    (
+        "表示中のサムネイルを優先して作ります。スクロールが止まると、選んだ範囲の未作成サムネイルを順に作ります。\n"
+        "「表示範囲のみ」は画面外を先読みしません。「画面数を指定」は現在位置の前後に指定した画面数、"
+        "「無制限」は現在の一覧全体が対象です。メモリとディスクの上限はどの設定でも守ります。"
+    ): (
+        "Visible thumbnails are generated first. After scrolling stops, missing thumbnails in the selected range are generated in turn.\n"
+        "Visible items only does not prefetch offscreen items. Specify screen count covers the chosen number of screens before and after the current position; Unlimited covers the entire current listing. Memory and disk limits apply in every mode."
+    ),
     (
         "画面内を最優先し、停止後に前後の指定画面数を生成します。"
         "無制限でも待機ジョブ・メモリ・ディスクの上限は維持します。"

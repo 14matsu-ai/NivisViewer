@@ -4,13 +4,14 @@ from __future__ import annotations
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QFormLayout,
-    QGroupBox, QHBoxLayout, QLabel, QPushButton, QSpinBox, QWidget, QToolTip)
+    QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPushButton, QSpinBox,
+    QToolButton, QWidget, QToolTip)
 from .browser_workflow_policy import normalize_workflow_settings, WORKFLOW_DEFAULTS
 from .i18n import tr
 
 
 class BrowserWorkflowSettings(QGroupBox):
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, help_button_class=None) -> None:
         super().__init__(tr("背景生成・選択表示"), parent)
         form = QFormLayout(self)
         self.mode = QComboBox(self)
@@ -27,7 +28,32 @@ class BrowserWorkflowSettings(QGroupBox):
         layout.addWidget(self.screens)
         self.mode.currentIndexChanged.connect(
             lambda _index: self.screens.setEnabled(self.mode.currentData() == "bounded"))
-        form.addRow(tr("サムネイル背景生成の範囲:"), row)
+        tooltip = tr(
+            "表示中の項目を優先し、スクロール停止後に画面外のサムネイルを指定範囲まで作ります。"
+        )
+        self.mode.setToolTip(tooltip)
+        self.screens.setToolTip(tooltip)
+        label_row = QWidget(self)
+        label_layout = QHBoxLayout(label_row)
+        label_layout.setContentsMargins(0, 0, 0, 0)
+        label_layout.setSpacing(4)
+        label = QLabel(tr("サムネイルの先読み範囲:"), label_row)
+        label.setBuddy(self.mode)
+        label.setToolTip(tooltip)
+        label_layout.addWidget(label)
+        self.thumbnail_prefetch_help_button = (help_button_class or QToolButton)(label_row)
+        self.thumbnail_prefetch_help_button.setText("?")
+        self.thumbnail_prefetch_help_button.setFixedSize(20, 20)
+        self.thumbnail_prefetch_help_button.setAutoRaise(True)
+        self.thumbnail_prefetch_help_button.setToolTip(tooltip)
+        self.thumbnail_prefetch_help_button.setAccessibleName(
+            tr("サムネイルの先読み範囲の説明")
+        )
+        self.thumbnail_prefetch_help_button.clicked.connect(
+            self._show_thumbnail_prefetch_help
+        )
+        label_layout.addWidget(self.thumbnail_prefetch_help_button)
+        form.addRow(label_row, row)
         note = QLabel(tr("画面内を最優先し、停止後に前後の指定画面数を生成します。"
                          "無制限でも待機ジョブ・メモリ・ディスクの上限は維持します。"
                          "画像・フォルダ・書庫・PDFが対象です。"), self)
@@ -117,6 +143,17 @@ class BrowserWorkflowSettings(QGroupBox):
         form.addRow(self.rounded_selection_frame)
         self._color = "#308cc6"
         self.load(WORKFLOW_DEFAULTS)
+
+    def _show_thumbnail_prefetch_help(self) -> None:
+        QMessageBox.information(
+            self,
+            tr("サムネイルの先読み範囲の説明"),
+            tr(
+                "表示中のサムネイルを優先して作ります。スクロールが止まると、選んだ範囲の未作成サムネイルを順に作ります。\n"
+                "「表示範囲のみ」は画面外を先読みしません。「画面数を指定」は現在位置の前後に指定した画面数、"
+                "「無制限」は現在の一覧全体が対象です。メモリとディスクの上限はどの設定でも守ります。"
+            ),
+        )
 
     def _choose_color(self) -> None:
         color = QColorDialog.getColor(QColor(self._color), self, tr("選択色"))

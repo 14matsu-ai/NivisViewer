@@ -82,7 +82,7 @@ def test_explicit_language_is_not_replaced_by_os_detection(tmp_path: Path, monke
 
 def test_catalogs_have_same_inventory_and_format_fields():
     formatter = Formatter()
-    assert len(ENGLISH) == 1096
+    assert len(ENGLISH) == 1099
     for catalog in (SIMPLIFIED_CHINESE, TRADITIONAL_CHINESE):
         assert set(catalog) == set(ENGLISH)
         for source, translated in catalog.items():
