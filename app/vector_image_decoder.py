@@ -22,7 +22,7 @@ from .pdf_backend import is_cancelled
 from .i18n import tr
 
 VECTOR_SUFFIXES = frozenset({'.svg', '.ai'})
-RENDERER_VERSION = 3
+RENDERER_VERSION = 4
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 MAX_SVG_BYTES = 8 * 1024 * 1024
 MAX_PIXELS = 16 * 1024 * 1024
@@ -197,8 +197,18 @@ def _svg(data):
     parser.ExternalEntityRefHandler = reject
     parser.ProcessingInstructionHandler = reject
     depth = elements = 0
-    def start_element(*args):
-        nonlocal depth, elements
+    root_start = None
+    root_attributes = None
+    editor_prefixes = set()
+    def start_element(name, attributes):
+        nonlocal depth, elements, root_start, root_attributes
+        if root_start is None:
+            root_start = parser.CurrentByteIndex
+            root_attributes = attributes
+        for qualified in (name, *attributes):
+            prefix = qualified.partition(':')[0]
+            if prefix in {'inkscape', 'sodipodi'}:
+                editor_prefixes.add(prefix)
         depth += 1
         elements += 1
         if depth > 128 or elements > 50000:
@@ -210,7 +220,31 @@ def _svg(data):
     parser.EndElementHandler = end_element
     try:
         parser.Parse(data, True)
-        root = ET.fromstring(data)
+        try:
+            root = ET.fromstring(data)
+        except ET.ParseError as exc:
+            # Some Illustrator exports contain an Inkscape editing attribute
+            # without declaring its namespace. Bind only known editor prefixes,
+            # then remove those attributes before the drawing reaches Qt.
+            missing = editor_prefixes.difference(
+                prefix for prefix in editor_prefixes
+                if root_attributes is not None and f'xmlns:{prefix}' in root_attributes
+            )
+            if (exc.code != expat.errors.codes[expat.errors.XML_ERROR_UNBOUND_PREFIX]
+                    or not missing or root_start is None):
+                raise
+            opening = re.match(br'<[A-Za-z_][\w.:-]*', data[root_start:])
+            if opening is None:
+                raise
+            declarations = b''.join(
+                b' xmlns:' + prefix.encode('ascii') + b'="' + namespace.encode('ascii') + b'"'
+                for prefix, namespace in (
+                    ('inkscape', 'http://www.inkscape.org/namespaces/inkscape'),
+                    ('sodipodi', 'http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd'),
+                ) if prefix in missing
+            )
+            insert_at = root_start + opening.end()
+            root = ET.fromstring(data[:insert_at] + declarations + data[insert_at:])
         if root.tag not in {'svg', '{http://www.w3.org/2000/svg}svg'}:
             raise VectorImageError(tr(SVG_ERROR))
         _remove_svg_metadata(root)

@@ -348,3 +348,29 @@ def test_svg_editor_metadata_preserves_pixels_and_external_reference_blocking(qa
         with pytest.raises(VectorImageError):
             render_vector(annotated.replace(b'</svg>', unsafe+b'</svg>'), '.svg', (40,40))
         assert not received
+
+
+def test_illustrator_svg_with_undeclared_editor_attribute(qapp, monkeypatch):
+    import app.vector_image_decoder as decoder
+    plain = b'<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><rect width="20" height="20" fill="red"/></svg>'
+    exported = plain.replace(b'<rect ', b'<rect inkscape:connector-curvature="0" ')
+    original = decoder.QSvgRenderer
+    received = []
+    class CaptureRenderer(original):
+        def load(self, data):
+            received.append(bytes(data))
+            return super().load(data)
+    monkeypatch.setattr(decoder, 'QSvgRenderer', CaptureRenderer)
+    expected, logical = render_vector(plain, '.svg', (40, 40))
+    actual, actual_logical = render_vector(exported, '.svg', (40, 40))
+    assert actual_logical == logical and actual == expected
+    assert b'inkscape' not in received[-1]
+    for unsafe in (
+        exported.replace(b'<rect ', b'<image href="file:///C:/outside.png"/><rect '),
+        exported.replace(b'<rect ', b'<script/><rect '),
+        exported.replace(b'inkscape:connector-curvature', b'unknown:connector-curvature'),
+    ):
+        received.clear()
+        with pytest.raises(VectorImageError):
+            render_vector(unsafe, '.svg', (40, 40))
+        assert not received
