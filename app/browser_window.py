@@ -208,7 +208,7 @@ from .drag_drop import (
     is_lexically_supported_viewer_path,
 )
 from .explorer_list_view import ExplorerListView, PathDropTreeView
-from .favorite_item_delegate import FavoriteItemDelegate
+from .favorite_item_delegate import FavoriteItemDelegate, HistoryItemDelegate
 from .favorite_row_metrics import FavoriteRowMetrics
 from .folder_bookmark_model import FolderBookmarkModel
 from .favorite_tabs import FavoriteTabs
@@ -7769,7 +7769,7 @@ class BrowserWindow(QMainWindow):
         if not hasattr(self, "history_view"):
             return
         view = self.history_view
-        view.setItemDelegate(FavoriteItemDelegate(view, metrics=self.favorite_row_metrics))
+        view.setItemDelegate(HistoryItemDelegate(view, metrics=self.favorite_row_metrics))
         view.setIconSize(QSize(self.favorite_row_metrics.icon_size, self.favorite_row_metrics.icon_size))
         view.setSpacing(self.favorite_row_metrics.spacing)
         view.setUniformItemSizes(True)

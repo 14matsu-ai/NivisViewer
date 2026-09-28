@@ -428,7 +428,7 @@ class MetadataStore(QObject):
                 self._disable(exc)
                 return [(1, tr("フォルダ"))]
 
-    def _favorite_write(self, sql, values=()) -> bool:
+    def _favorite_write(self, sql, values=(), *, notify_bookmarks=True) -> bool:
         with self._lock:
             if not self._available:
                 return False
@@ -439,7 +439,7 @@ class MetadataStore(QObject):
                 self._connection.rollback()
                 self._disable(exc)
                 return False
-        if cursor.rowcount:
+        if cursor.rowcount and notify_bookmarks:
             self.bookmarks_changed.emit()
         return cursor.rowcount > 0
 
@@ -447,13 +447,14 @@ class MetadataStore(QObject):
         if not name.strip():
             return None
         with self._lock:
-            if not self._favorite_write("INSERT INTO favorite_groups(name) VALUES (?)", (name.strip(),)):
+            if not self._favorite_write("INSERT INTO favorite_groups(name) VALUES (?)", (name.strip(),), notify_bookmarks=False):
                 return None
             return int(self._connection.execute("SELECT last_insert_rowid()").fetchone()[0])
 
     def rename_favorite_group(self, group_id: int, name: str) -> bool:
         return bool(name.strip()) and self._favorite_write(
-            "UPDATE favorite_groups SET name = ? WHERE id = ? AND active = 1", (name.strip(), group_id)
+            "UPDATE favorite_groups SET name = ? WHERE id = ? AND active = 1", (name.strip(), group_id),
+            notify_bookmarks=False
         )
 
     def delete_favorite_group(self, group_id: int) -> bool:

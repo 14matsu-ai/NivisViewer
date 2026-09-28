@@ -82,6 +82,7 @@ class SidebarLayoutController(QObject):
 
         for widget in self._content_widgets:
             widget.setParent(self.container)
+            widget.hide()
         if self.bookmarks_view is not None:
             self.bookmarks_view.hide()
         self._clear_container()
@@ -130,6 +131,8 @@ class SidebarLayoutController(QObject):
                 splitter.setChildrenCollapsible(False)
                 splitter.addWidget(visible[0])
                 splitter.addWidget(visible[1])
+                visible[0].show()
+                visible[1].show()
                 splitter.setSizes(sizes)
                 splitter.splitterMoved.connect(
                     lambda _position, _index: self._record_splitter_sizes(
@@ -144,6 +147,7 @@ class SidebarLayoutController(QObject):
                 root = QWidget(self.container)
 
         self.container.layout().addWidget(root)
+        root.show()
         self.apply_tab_settings()
 
     def apply_tab_settings(self):

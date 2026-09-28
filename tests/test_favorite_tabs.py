@@ -9,6 +9,97 @@ from app.metadata_store import MetadataStore
 from app.sidebar_layout import SidebarLayoutController
 
 
+def test_removing_favorite_tab_keeps_history_visible(tmp_path, qapp):
+    store = MetadataStore(tmp_path / "metadata.db")
+    tabs = FavoriteTabs(QListView(), store)
+    history = QListView()
+    tabs.set_history(history)
+    tabs.add_group()
+    tabs.setCurrentWidget(history)
+    tabs.show()
+    qapp.processEvents()
+    first_page = tabs.widget(0)
+    tabs.delete_group(1)
+    qapp.processEvents()
+    assert tabs.currentWidget() is history
+    assert history.isVisible()
+    assert tabs.widget(0) is first_page
+    assert tabs.group_id == 1
+    tabs.close()
+    tabs.deleteLater()
+    qapp.processEvents()
+    store.close()
+
+
+def test_tab_name_and_creation_do_not_reset_favorite_entries(tmp_path, qapp):
+    store = MetadataStore(tmp_path / "metadata.db")
+    model = FolderBookmarkModel(store)
+    resets = []
+    model.modelReset.connect(lambda: resets.append(True))
+    group = store.create_favorite_group("フォルダ2")
+    store.rename_favorite_group(group, "仕事")
+    assert resets == []
+    model.deleteLater()
+    qapp.processEvents()
+    store.close()
+
+
+def test_history_only_to_favorites_only_hides_previous_content(qapp):
+    container = QWidget()
+    history = QListView(container)
+    favorites = FavoriteTabs(QListView(), None, container)
+    controller = SidebarLayoutController(container, favorites_view=favorites,
+                                         folder_tree=QTreeView(container), history_view=history)
+    container.show()
+    controller.apply("favorites_top_tree_bottom", show_favorites=False,
+                     show_tree=False, show_history=True)
+    qapp.processEvents()
+    assert history.isVisible()
+    controller.apply("favorites_top_tree_bottom", show_favorites=True,
+                     show_tree=False, show_history=False)
+    qapp.processEvents()
+    assert not history.isVisible()
+    assert favorites.isVisible()
+    controller.apply("favorites_top_tree_bottom", show_favorites=False,
+                     show_tree=False, show_history=True)
+    qapp.processEvents()
+    assert history.isVisible()
+    assert not favorites.isVisible()
+    container.close()
+    container.deleteLater()
+
+
+def test_hidden_tree_stays_hidden_when_sidebar_first_shown(qapp):
+    # A fresh parent show must not expose unused children over the tab bar.
+    for initial_history in (False, True):
+        container = QWidget()
+        tree = QTreeView(container)
+        history = QListView(container)
+        favorites = FavoriteTabs(QListView(), None, container)
+        controller = SidebarLayoutController(
+            container, favorites_view=favorites, folder_tree=tree, history_view=history)
+        controller.apply("favorites_top_tree_bottom", show_tree=False,
+                         show_history=initial_history)
+        container.show()
+        qapp.processEvents()
+        assert not tree.isVisible()
+        assert favorites.isVisible()
+        for show_history in (True, False, True):
+            controller.apply("favorites_top_tree_bottom", show_tree=False,
+                             show_history=show_history)
+            qapp.processEvents()
+            assert not tree.isVisible()
+            assert favorites.isVisible()
+        controller.apply("favorites_top_tree_bottom", show_tree=True)
+        qapp.processEvents()
+        assert tree.isVisible()
+        controller.apply("favorites_top_tree_bottom", show_tree=False)
+        qapp.processEvents()
+        assert not tree.isVisible()
+        container.close()
+        container.deleteLater()
+
+
 def test_group_persistence_isolation_and_deletion(tmp_path, qapp):
     path = str(tmp_path / "画像")
     db = tmp_path / "metadata.db"

@@ -4,13 +4,11 @@ from .i18n import tr
 
 
 from datetime import datetime
-from pathlib import Path
 
 from PySide6.QtCore import QAbstractListModel, QModelIndex, QObject, Qt, Slot
 from PySide6.QtGui import QColor
 
 from .metadata_store import HistoryEntry, MetadataStore
-from .shell_icon_provider import ShellAssociatedIconProvider
 from .path_availability import (
     PathAvailability,
     PathAvailabilityResult,
@@ -41,7 +39,6 @@ class HistoryModel(QAbstractListModel):
     ) -> None:
         super().__init__(parent)
         self.metadata_store = metadata_store
-        self.shell_icon_provider = ShellAssociatedIconProvider()
         self.limit = max(1, min(5000, int(limit)))
         self._owns_availability_service = availability_service is None
         self.availability_service = (
@@ -71,10 +68,6 @@ class HistoryModel(QAbstractListModel):
             return None
         if role == int(Qt.ItemDataRole.DisplayRole):
             return entry.display_name + self._availability_suffix(self._state(entry.path))
-        if role == int(Qt.ItemDataRole.DecorationRole):
-            return self.shell_icon_provider.icon_for_extension(
-                Path(entry.path).suffix, folder=entry.item_type in {"folder", "book_folder"},
-            )
         if role == int(Qt.ItemDataRole.ToolTipRole):
             opened = datetime.fromtimestamp(entry.last_opened_at).strftime("%Y-%m-%d %H:%M")
             page = str(entry.page_index + 1)

@@ -91,27 +91,50 @@ class FavoriteTabs(QTabWidget):
             self.addTab(history, tr("履歴"))
 
     def reload(self, selected=None):
+        # Keep surviving pages and the history view attached. Rebuilding every
+        # tab discards the current history selection and creates layout churn.
+        keep_history = selected is None and self._history is not None and self.currentWidget() is self._history
         selected = self.group_id if selected is None else selected
-        self.view.setParent(self)
-        self.blockSignals(True)
-        while self.count():
-            page = self.widget(0)
-            self.removeTab(0)
-            if page is not self._history:
-                page.deleteLater()
         groups = self.store.list_favorite_groups() if self.store else [(1, tr("フォルダ"))]
-        for group_id, name in groups:
-            page = QWidget(self)
-            layout = QVBoxLayout(page)
-            layout.setContentsMargins(0, 0, 0, 0)
-            index = self.addTab(page, name)
-            self.tabBar().setTabData(index, group_id)
-            if group_id == selected:
-                self.setCurrentIndex(index)
-        if self._history is not None:
-            self.addTab(self._history, tr("履歴"))
-        self.blockSignals(False)
-        self._activate(self.currentIndex())
+        group_ids = {group_id for group_id, _ in groups}
+        if selected not in group_ids:
+            selected = groups[0][0]
+        previous_group = self._group_id
+        pages = {self.tabBar().tabData(i): self.widget(i) for i in range(self.count())
+                 if self.tabBar().tabData(i) is not None}
+        blocked = self.blockSignals(True)
+        try:
+            for group_id, page in pages.items():
+                if group_id not in group_ids:
+                    if self.view.parentWidget() is page:
+                        self.view.setParent(self)
+                    self.removeTab(self.indexOf(page))
+                    page.hide()
+                    page.deleteLater()
+            for position, (group_id, name) in enumerate(groups):
+                page = pages.get(group_id)
+                if page is None:
+                    page = QWidget(self)
+                    layout = QVBoxLayout(page)
+                    layout.setContentsMargins(0, 0, 0, 0)
+                    index = self.insertTab(position, page, name)
+                    self.tabBar().setTabData(index, group_id)
+                    pages[group_id] = page
+                else:
+                    index = self.indexOf(page)
+                    self.setTabText(index, name)
+            if self._history is not None and self.indexOf(self._history) < 0:
+                self.addTab(self._history, tr("履歴"))
+            page = pages[selected]
+            if self.view.parentWidget() is not page:
+                page.layout().addWidget(self.view)
+            self._group_id = selected
+            self.setCurrentWidget(self._history if keep_history else page)
+            self.view.show()
+        finally:
+            self.blockSignals(blocked)
+        if selected != previous_group:
+            self.group_changed.emit(selected)
 
     def _activate(self, index):
         if index < 0:
