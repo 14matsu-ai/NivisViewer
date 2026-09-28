@@ -716,15 +716,15 @@ def test_status_omits_redundant_view_state_and_uses_stable_metadata_slots(
         restore_initial_location=False,
     )
     window.current_path = tmp_path
+    window.resize(1100, 760)
+    window.show()
+    qapp.processEvents()
     window.item_model.set_items(
         [
             _item(image, BrowserItemKind.IMAGE),
             _item(folder, BrowserItemKind.FOLDER, page_count=120),
         ]
     )
-    window.resize(1100, 760)
-    window.show()
-    qapp.processEvents()
     try:
         window._update_status()
         message = window.statusBar().currentMessage()

@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PySide6.QtCore import QPoint, QRect
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QRect
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QLabel, QStyleOptionViewItem
 
@@ -15,6 +15,18 @@ from app.config_manager import ConfigManager
 from app.file_operation_service import FileOperationKind
 from app.i18n import install_ui_language
 from app.settings_dialog import SettingsDialog
+
+
+@pytest.fixture(autouse=True)
+def _release_test_windows(qapp):
+    existing = {id(widget) for widget in qapp.topLevelWidgets()}
+    yield
+    for widget in tuple(qapp.topLevelWidgets()):
+        if id(widget) not in existing:
+            widget.close()
+            widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    qapp.processEvents()
 
 
 def make_config(tmp_path: Path, folder: Path | None = None) -> ConfigManager:
@@ -93,6 +105,7 @@ def test_browser_startup_applies_persisted_overlay_options(
     assert window.item_delegate.tag_font_size == 13
     assert window.item_delegate.tag_max_characters == 4
     assert window.item_delegate.tag_text_color.name() == "#ff00aa"
+    assert window.prepare_shutdown()
     window.close()
     qapp.processEvents()
 
@@ -230,6 +243,7 @@ def test_browser_live_overlay_settings_repaint_without_rescanning(
     assert window.item_delegate.tag_max_characters == 5
     assert window.item_delegate.tag_text_color.name() == "#336699"
     assert window._rating_hover_path is None
+    assert window.prepare_shutdown()
     window.close()
     qapp.processEvents()
 
@@ -281,6 +295,8 @@ def test_snapshot_reconcile_allows_committed_path_and_blocks_other_path(
         new_name="blocked",
     )
     assert len(execute_calls) == 2
+    window._pending_scan = None
+    assert window.prepare_shutdown()
     window.close()
     qapp.processEvents()
 

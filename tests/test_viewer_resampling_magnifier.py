@@ -1426,6 +1426,8 @@ def test_z_shortcut_toggles_from_child_focus_escape_cancels_and_m_does_nothing(
     _finish_display(window.viewer, qapp)
     image_rect = window.viewer._last_image_layout[0][0]
     QTest.mouseMove(window.viewer, image_rect.center())
+    window.activateWindow()
+    qapp.processEvents()
     window.slider.setFocus()
 
     assert window.magnifier_action.text() == "拡大鏡の切り替え"

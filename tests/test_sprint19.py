@@ -522,35 +522,6 @@ def test_planner_stops_before_copy_when_disk_space_is_clearly_insufficient(
     assert "空き容量" in plan.errors[0]
 
 
-def test_cross_volume_source_delete_failure_is_partial_success(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    source = tmp_path / "source" / "book.cbz"
-    destination = tmp_path / "destination"
-    source.parent.mkdir()
-    destination.mkdir()
-    source.write_bytes(b"book")
-    original_rename = os.rename
-
-    def exdev(old, new):
-        if Path(old) == source:
-            raise OSError(errno.EXDEV, "cross-volume")
-        return original_rename(old, new)
-
-    monkeypatch.setattr("app.file_operation_service.os.rename", exdev)
-    monkeypatch.setattr(
-        FileOperationService,
-        "_remove_source",
-        staticmethod(lambda _path: (_ for _ in ()).throw(PermissionError("locked"))),
-    )
-    result = FileOperationService().move([source], destination)
-    assert result.failures[0].partial_success
-    assert result.failures[0].error_code == "partial_success"
-    assert source.exists()
-    assert (destination / source.name).exists()
-
-
 def test_progress_has_byte_aliases_ewma_and_final_update(tmp_path: Path) -> None:
     source = tmp_path / "large.bin"
     destination = tmp_path / "destination"

@@ -7,6 +7,7 @@ from .translations_zh_part1 import SIMPLIFIED as _S1, TRADITIONAL as _T1
 from .translations_zh_part2 import SIMPLIFIED as _S2, TRADITIONAL as _T2
 from .translations_zh_part3 import SIMPLIFIED as _S3, TRADITIONAL as _T3
 from .translations_zh_part4 import SIMPLIFIED as _S4, TRADITIONAL as _T4
+from .translations_zh_recent import SIMPLIFIED as _SR, TRADITIONAL as _TR
 
 
 def _complete_catalog(*parts: dict[str, str]) -> dict[str, str]:
@@ -55,8 +56,8 @@ _PARALLEL_TRADITIONAL = {
     '同時読み込み数は画像フォルダとZIPに適用します。ZIPの並列展開は最大1ページ分です。読み込み数を増やすと、ページを戻す操作が遅くなる場合があります。変更は次にファイルを開いたときから適用します。':
         '同時載入數適用於影像資料夾和ZIP檔案。ZIP最多提前解壓縮一頁。增加同時載入數可能會減慢向後翻頁。變更將於下次開啟檔案時生效。',
 }
-SIMPLIFIED_CHINESE = _complete_catalog(_S1, _S2, _S3, _S4, _ICON_LOCATION_SIMPLIFIED, _PARALLEL_SIMPLIFIED)
-TRADITIONAL_CHINESE = _complete_catalog(_T1, _T2, _T3, _T4, _ICON_LOCATION_TRADITIONAL, _PARALLEL_TRADITIONAL)
+SIMPLIFIED_CHINESE = _complete_catalog(_S1, _S2, _S3, _S4, _ICON_LOCATION_SIMPLIFIED, _PARALLEL_SIMPLIFIED, _SR)
+TRADITIONAL_CHINESE = _complete_catalog(_T1, _T2, _T3, _T4, _ICON_LOCATION_TRADITIONAL, _PARALLEL_TRADITIONAL, _TR)
 
 SIMPLIFIED_CHINESE_DISAMBIGUATED = {
     ("縮小", "resampling"): "缩小采样",

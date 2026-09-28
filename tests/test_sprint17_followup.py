@@ -335,6 +335,10 @@ def test_delayed_wide_size_keeps_requested_identity_and_single_unit(
 
 def test_folder_source_identity_uses_normalized_absolute_paths(tmp_path: Path) -> None:
     images = tuple(str((tmp_path / name).absolute()) for name in ("1.jpg", "2.jpg", "10.jpg"))
+    # Snapshots retain only existing local files. This test concerns path
+    # identity, so provide those files without involving image decoding.
+    for image in images:
+        Path(image).touch()
     source = FolderImageSource(tmp_path, image_snapshot=images)
     assert source.index_for_path(images[1]) == 1
     assert source.path_for_index(2) == images[2]
@@ -563,7 +567,8 @@ def test_favorite_delegate_height_ignores_long_unc_missing_text(qapp) -> None:
     view.setUniformItemSizes(True)
     view.show()
     qapp.processEvents()
-    assert [view.sizeHintForRow(row) for row in range(3)] == [18, 18, 18]
+    expected_height = metrics.row_height(view.fontMetrics().height())
+    assert [view.sizeHintForRow(row) for row in range(3)] == [expected_height] * 3
     view.close()
 
 

@@ -2199,7 +2199,9 @@ def test_window_cold_display_demand_coalesces_to_latest_after_input_idle(
         # set_pages starts the final resize but is not a presentation commit.
         assert window._applied_display_request_id != window._active_request_id
         assert window.presentation_state.displayed_page == 0
-        assert window.slider.value() == 0
+        # The slider previews the accepted destination; read progress still
+        # tracks the committed frame until rendering finishes.
+        assert window.slider.value() == 3
         assert window.viewer.wait_for_rendering()
         qapp.processEvents()
         assert window._applied_display_request_id == window._active_request_id

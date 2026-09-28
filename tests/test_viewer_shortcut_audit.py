@@ -4,7 +4,7 @@ from zipfile import ZipFile
 from PIL import Image
 import pytest
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt, QTimer
-from PySide6.QtGui import QAction, QKeyEvent, QKeySequence, QPixmap, QShortcut, QWheelEvent
+from PySide6.QtGui import QAction, QImage, QKeyEvent, QKeySequence, QPixmap, QShortcut, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
@@ -148,11 +148,12 @@ def test_next_previous_book_chords(book, qapp):
     assert wait_until(qapp, lambda: window.book_session.current_path == paths[1], timeout=4)
 
 
-def test_clipboard_and_page_info_chords(book, monkeypatch):
+def test_clipboard_and_page_info_chords(book, monkeypatch, qapp):
     window, _ = book
     clipboard = QApplication.clipboard()
     clipboard.clear()
     key(window, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+    assert wait_until(qapp, lambda: clipboard.image().size().width() == 800, timeout=5)
     assert not clipboard.image().isNull()
     assert clipboard.image().size().width() == 800
     clipboard.clear()
@@ -167,6 +168,34 @@ def test_clipboard_and_page_info_chords(book, monkeypatch):
     assert len(info) == 1 and '800 x 1200' in info[0][2]
 
 
+def test_late_clipboard_decode_does_not_replace_new_page_clipboard(book, qapp):
+    window, _paths = book
+    key(window, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+    old_identity = window._clipboard_image_identity
+    window.next_page()
+    settle(qapp, window, 1)
+    clipboard = QApplication.clipboard()
+    clipboard.clear()
+    window._clipboard_image_decoded(
+        old_identity, QImage(800, 1200, QImage.Format.Format_RGB888), None
+    )
+    qapp.processEvents()
+    assert clipboard.image().isNull()
+
+
+def test_late_image_copy_does_not_replace_new_clipboard_text(book, qapp):
+    window, _paths = book
+    key(window, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+    old_identity = window._clipboard_image_identity
+    clipboard = QApplication.clipboard()
+    clipboard.setText('new clipboard contents')
+    window._clipboard_image_decoded(
+        old_identity, QImage(800, 1200, QImage.Format.Format_RGB888), None
+    )
+    qapp.processEvents()
+    assert clipboard.text() == 'new clipboard contents'
+
+
 def test_fullscreen_escape_magnifier_and_doubleclick(book, qapp):
     window, _ = book
     key(window, Qt.Key.Key_F)
@@ -179,6 +208,9 @@ def test_fullscreen_escape_magnifier_and_doubleclick(book, qapp):
     assert not window.fullscreen_chrome.fullscreen
     window.viewer.setFocus()
     QTest.mouseMove(window.viewer, window.viewer.rect().center())
+    window.activateWindow()
+    window.viewer.setFocus()
+    qapp.processEvents()
     key(window, Qt.Key.Key_Z)
     assert window.viewer.magnifier_active or window.viewer.magnifier_selecting
     key(window, Qt.Key.Key_Z)
@@ -194,6 +226,9 @@ def test_escape_cancels_loupe_before_fullscreen(book):
     key(window, Qt.Key.Key_F)
     window.viewer.setFocus()
     QTest.mouseMove(window.viewer, window.viewer.rect().center())
+    window.activateWindow()
+    window.viewer.setFocus()
+    QApplication.processEvents()
     key(window, Qt.Key.Key_Z)
     assert window.viewer.magnifier_active or window.viewer.magnifier_selecting
     key(window, Qt.Key.Key_Escape)

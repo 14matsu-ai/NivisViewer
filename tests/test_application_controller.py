@@ -7,6 +7,7 @@ from time import monotonic
 from zipfile import ZipFile
 from PIL import Image
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidget
 
@@ -45,7 +46,16 @@ def close_controller(controller: ApplicationController, qapp: QApplication) -> N
     if browser is not None:
         browser.close()
     qapp.processEvents()
-    controller.shutdown()
+    # A close may be deferred while a worker drains.  Leaving that window
+    # alive contaminates the shortcut context of later offscreen tests.
+    assert wait_until(qapp, controller.shutdown, timeout=10)
+    for window in tuple(controller.viewer_windows):
+        window.close()
+    browser = controller.get_browser_window()
+    if browser is not None:
+        browser.close()
+    qapp.processEvents()
+    assert all(not window.isVisible() for window in controller.viewer_windows)
 
 
 def wait_until(qapp: QApplication, predicate, timeout: float = 2.0) -> bool:
@@ -66,6 +76,9 @@ def finish_viewer_open(qapp: QApplication, viewer) -> None:
         viewer._pending_book_open_projection is not None
         and monotonic() < deadline
     ):
+        # Raster books commit the projection after the first painted frame.
+        # Offscreen Qt does not always schedule that paint automatically.
+        viewer.viewer.render(QPixmap(viewer.viewer.size()))
         qapp.processEvents()
         QTest.qWait(5)
     qapp.processEvents()

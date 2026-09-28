@@ -53,6 +53,11 @@ def test_page_sync_preserves_multiselection_filters_and_avoids_open_loop(tmp_pat
         history = len(browser.navigation_history)
         viewer.next_page()
         settle_page(qapp, viewer, paths[1])
+        assert wait_until(
+            qapp,
+            lambda: browser.item_model.item_at(browser.list_view.currentIndex()).path == paths[1],
+            timeout=5,
+        )
         assert selected(browser) == set(paths[:2])
         assert browser.item_model.item_at(browser.list_view.currentIndex()).path == paths[1]
         assert browser._scan_generation == generation

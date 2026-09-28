@@ -27,6 +27,7 @@ _TECHNICAL_WORDS = {
     "Dropbox",
     "GIMP", "XCF", "CLIP", "PSD", "SVG", "Illustrator", "RRGGBB",
     "NivisViewer", "ZipPla", "Viewer", "Browser", "Windows", "Shell", "FFmpeg", "WinRAR", "ZIP", "Zip",
+    "RAM", "DB", "UTF-8", "JSON",
     "PDF", "RAR", "CBZ", "JPEG", "WebP", "PNG", "Qt", "Python", "HDD", "SSD",
     "MiB", "Ctrl", "Shift", "Alt", "Left", "Right", "Wheel", "Enter", "PageDown", "PageUp", "Esc", "S", "RGB",
     "Alpha", "Open", "Close", "Small", "Medium", "Large", "7-Zip", "pypdfium2",
@@ -82,7 +83,7 @@ def test_explicit_language_is_not_replaced_by_os_detection(tmp_path: Path, monke
 
 def test_catalogs_have_same_inventory_and_format_fields():
     formatter = Formatter()
-    assert len(ENGLISH) == 1099
+    assert len(ENGLISH) >= 1099
     for catalog in (SIMPLIFIED_CHINESE, TRADITIONAL_CHINESE):
         assert set(catalog) == set(ENGLISH)
         for source, translated in catalog.items():

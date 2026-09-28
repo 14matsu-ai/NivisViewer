@@ -74,6 +74,10 @@ class BrowserWorkflowController(QObject):
 
     def _settings_changed(self, _changes=None) -> None:
         options = normalize_workflow_settings(self.window.config.data)
+        appearance_changed = (
+            SelectionAppearance.from_settings(options)
+            != SelectionAppearance.from_settings(self.options)
+        )
         memory_mode_changed = (
             options["browser_thumbnail_memory_mode"]
             != self.options["browser_thumbnail_memory_mode"]
@@ -83,7 +87,8 @@ class BrowserWorkflowController(QObject):
         self.options = options
         if memory_mode_changed and self._memory_broker is not None:
             self._memory_broker.rebalance()
-        self._apply_appearance()
+        if appearance_changed:
+            self._apply_appearance()
 
     def _apply_memory_grant(self, grant) -> None:
         configure = getattr(self.window.thumbnail_provider, "configure_browser_memory", None)

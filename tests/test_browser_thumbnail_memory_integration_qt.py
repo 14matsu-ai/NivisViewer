@@ -122,7 +122,7 @@ class _Window(QWidget):
         app.processEvents()
 
 
-def _mixed_items(root, count):
+def _mixed_items(root, count, *, materialize=False):
     kinds = (
         (BrowserItemKind.IMAGE, ".jpg"),
         (BrowserItemKind.FOLDER, ""),
@@ -133,8 +133,15 @@ def _mixed_items(root, count):
     for row in range(count):
         kind, extension = kinds[row % len(kinds)]
         name = f"{row:04d}-{kind.value}{extension}"
+        path = root / name
+        if materialize:
+            if kind is BrowserItemKind.FOLDER:
+                path.mkdir(parents=True, exist_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"loader fixture")
         items.append(BrowserItem(
-            name, root / name, kind, float(row),
+            name, path, kind, float(row),
             file_size=row + 1, modified_time_ns=row + 1,
         ))
     return items
@@ -241,7 +248,7 @@ def test_scrolls_forward_and_back_over_mixed_kinds_with_finite_ram_window(
         image.fill(0xFF2367A1)
         return image
 
-    window = _Window(tmp_path, _mixed_items(tmp_path, 240), loader=loader)
+    window = _Window(tmp_path, _mixed_items(tmp_path, 240, materialize=True), loader=loader)
     try:
         positions = [(first, first + 9) for first in range(0, 100, 10)]
         for index, region in enumerate([*positions, *reversed(positions[:-1])]):
@@ -264,7 +271,12 @@ def test_scrolls_forward_and_back_over_mixed_kinds_with_finite_ram_window(
                 item = window.item_model.item_at(row)
                 assert window.thumbnail_provider.has_memory_thumbnail(
                     item, window.thumbnail_render_spec
-                ), f"next viewport row {row} was not ready from RAM"
+                ), (
+                    f"next viewport row {row} was not ready from RAM; "
+                    f"position={index} region={region} "
+                    f"stop={window.workflow.stop_reason} "
+                    f"memory={window.thumbnail_provider.browser_memory_diagnostics()}"
+                )
             assert len(window.item_model._thumbnail_images) <= 10
             diagnostics = window.thumbnail_provider.browser_memory_diagnostics()
             assert diagnostics["bytes"] <= diagnostics["limit_bytes"]
@@ -290,7 +302,7 @@ def test_unlimited_work_stops_after_hot_window_when_disk_route_is_unavailable(
         image.fill(0xFF884422)
         return image
 
-    window = _Window(tmp_path, _mixed_items(tmp_path, 300), loader=loader)
+    window = _Window(tmp_path, _mixed_items(tmp_path, 300, materialize=True), loader=loader)
     try:
         window._range = (100, 109)
         window.workflow.recenter_cache_retention()

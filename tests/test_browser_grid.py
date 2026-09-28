@@ -1114,7 +1114,7 @@ def test_ten_thousand_items_request_only_visible_and_prefetch_ranges(
 
 @pytest.mark.parametrize(
     ("item_count", "expected_requests"),
-    [(20, 20), (200, 40), (1000, 40)],
+    [(20, 20), (200, 20), (1000, 20)],
 )
 def test_ready_thumbnails_are_not_requested_again(
     tmp_path,
@@ -1203,14 +1203,17 @@ def test_scroll_requests_only_new_items_and_does_not_request_ready_items_again(
         return paths
 
     first_paths = request_and_apply()
-    assert len(first_paths) == 20
+    assert len(first_paths) == 10
 
     visible_range[:] = [40, 49]
     second_paths = request_and_apply()
-    assert len(second_paths) == 23
+    assert len(second_paths) == 10
     assert first_paths.isdisjoint(second_paths)
 
     visible_range[:] = [0, 9]
+    # A distant scroll may release old in-memory thumbnails; revisiting them
+    # requests the band once, then leaves the ready band alone.
+    assert request_and_apply() == first_paths
     assert request_and_apply() == set()
     window.close()
     qapp.processEvents()

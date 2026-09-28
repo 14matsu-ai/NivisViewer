@@ -1183,7 +1183,7 @@ def test_sort_and_density_preserve_multiple_selection_and_thumbnail_cache(
     current = window.item_model.item_at(window.list_view.currentIndex())
     assert restored_names == selected_names
     assert current is not None and current.display_name == "book10.jpg"
-    assert window.list_view.gridSize() == QSize(131, 193)
+    assert window.list_view.gridSize() == window.item_delegate.grid_metrics.grid_size
     assert window.thumbnail_provider.generation == initial_generation
     assert len(window.navigation_history) == initial_history_length
     window.close()
@@ -1267,17 +1267,15 @@ def test_display_density_changes_layout_without_changing_thumbnail_size(
     )
     finish_scan(window, qapp)
 
-    expectations = {
-        "compact": QSize(131, 191),
-        "standard": QSize(131, 192),
-        "comfortable": QSize(131, 193),
-        "large": QSize(131, 195),
-    }
-    for density, grid_size in expectations.items():
+    heights = []
+    for density in ("compact", "standard", "comfortable", "large"):
         window.config.apply({"browser_display_density": density})
         qapp.processEvents()
-        assert window.list_view.gridSize() == grid_size
+        grid_size = window.list_view.gridSize()
+        assert grid_size == window.item_delegate.grid_metrics.grid_size
+        heights.append(grid_size.height())
         assert window.list_view.iconSize() == QSize(180, 180)
+    assert heights == sorted(heights) and len(set(heights)) == len(heights)
 
     window.close()
     qapp.processEvents()

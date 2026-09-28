@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import errno
 import os
+import time
 from pathlib import Path
 from threading import Event
 
@@ -1664,6 +1665,10 @@ def test_context_menu_opens_current_folder_independently_of_selection(
         if case in {"empty", "uninitialized"}:
             assert calls == []
         else:
+            deadline = time.monotonic() + 2.0
+            while not calls and time.monotonic() < deadline:
+                qapp.processEvents()
+                time.sleep(0.005)
             assert calls == [(str(first if case == "single" else second), False)]
             if case == "failure":
                 assert "error 5" in window.statusBar().currentMessage()
@@ -1974,6 +1979,10 @@ def test_slow_operation_shows_progress_and_keeps_qtimer_running(
         QTimer.singleShot(0, lambda: ticks.append(True))
         qapp.processEvents()
         assert ticks == [True]
+        deadline = time.monotonic() + 2.0
+        while "1 / 2" not in window.statusBar().currentMessage() and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.005)
         assert "1 / 2" in window.statusBar().currentMessage()
         assert window.cancel_operation_button.isVisible()
     finally:

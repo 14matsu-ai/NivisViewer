@@ -5,7 +5,7 @@ from time import monotonic
 
 import pytest
 from PIL import Image
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, QRect, Qt
 from PySide6.QtGui import (
     QCursor,
     QMouseEvent,
@@ -31,6 +31,19 @@ from app.settings_dialog import SettingsDialog
 from app.viewer_page_navigation import ViewerPageNavigationController
 from app.viewer_page_slider import ViewerPageSlider
 from app.viewer_window import ViewerWindow
+
+
+@pytest.fixture(autouse=True)
+def _release_test_windows(qapp):
+    """Do not carry native Qt windows and event filters into the next case."""
+    existing = {id(widget) for widget in qapp.topLevelWidgets()}
+    yield
+    for widget in tuple(qapp.topLevelWidgets()):
+        if id(widget) not in existing:
+            widget.close()
+            widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    qapp.processEvents()
 
 
 class _MemorySource(ImageSource):
@@ -130,6 +143,7 @@ def _viewer_with_pages(
             "view_mode": "spread",
             "single_first_page": True,
             "viewer_canvas_left_click_action": "next_single_page",
+            "viewer_canvas_click_direction": "right_next",
         }
     )
     window = ViewerWindow(config_manager=config)
@@ -1208,12 +1222,16 @@ def test_bottom_wheel_remainder_tracks_input_region_across_receivers(
     controller.set_active(False)
     controller.shutdown()
     window.close()
+    window.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    qapp.processEvents()
 
 
 def test_hidden_bottom_overlay_does_not_claim_qwindow_then_viewer_wheel(
     tmp_path: Path,
     qapp,
     monkeypatch,
+    request,
 ) -> None:
     next_page_calls = 0
     next_or_scroll_calls = 0
@@ -1238,6 +1256,7 @@ def test_hidden_bottom_overlay_does_not_claim_qwindow_then_viewer_wheel(
     )
     window, _pages = _viewer_with_pages(tmp_path, qapp, page_count=5)
     controller = window.fullscreen_chrome
+    request.addfinalizer(lambda: (controller.set_active(False), window.close(), qapp.processEvents()))
     monkeypatch.setattr(
         controller,
         "_apply_native_fullscreen_frame",
@@ -1352,19 +1371,16 @@ def test_hidden_bottom_overlay_does_not_claim_qwindow_then_viewer_wheel(
     assert viewer_calls == ["next"]
     assert next_page_calls == 2
     assert next_or_scroll_calls == 1
-    assert display_move_calls == 2
+    # The second wheel turn reaches Viewer, but an unrendered destination
+    # consumes further forward turns until that frame is ready.
+    assert display_move_calls == 1
     qapp.processEvents()
     assert process_calls == 1
     assert lower_calls == ["next"]
     assert viewer_calls == ["next"]
     assert next_page_calls == 2
     assert next_or_scroll_calls == 1
-    assert display_move_calls == 2
-
-    controller.set_active(False)
-    window.close()
-    qapp.processEvents()
-
+    assert display_move_calls == 1
 
 @pytest.mark.parametrize("size", [(640, 480), (641, 479)])
 def test_fullscreen_overlays_are_flush_with_parent_edges(
@@ -1561,7 +1577,9 @@ def test_hidden_bottom_overlay_uses_same_region_for_reveal_and_hover(
     qapp.processEvents()
 
     visible_region = controller._bottom_hover_region_global()
-    assert visible_region.bottom() == window.frameGeometry().bottom()
+    assert visible_region.bottom() == max(
+        window.frameGeometry().bottom(), window.screen().geometry().bottom() + 1
+    )
     controller.hide_overlays()
     assert not controller.bottom_overlay.isVisible()
     hidden_region = controller._bottom_hover_region_global()
@@ -2154,12 +2172,14 @@ def test_slider_wheel_setting_is_applied_immediately(
     window, _pages = _viewer_with_pages(tmp_path, qapp)
     window.next_page()
     assert window.model.focused_index == 1
+    _wait_for_applied_display(window, qapp)
 
     _wheel(window.slider, angle_y=-120)
     qapp.processEvents()
     assert window.model.focused_index == 3
 
     window.page_navigation.go_to_focused_page_index(1)
+    _wait_for_applied_display(window, qapp)
     window.config.apply({"viewer_slider_wheel_single_page_enabled": True})
     _wheel(window.slider, angle_y=-120)
     qapp.processEvents()

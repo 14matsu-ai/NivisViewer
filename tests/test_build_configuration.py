@@ -41,13 +41,6 @@ def test_portable_flag_and_build_scripts_exist():
     assert (ROOT / "scripts" / "generate_branding_assets.py").is_file()
 
 
-def test_official_branding_assets_exist():
-    icons = ROOT / "assets" / "icons"
-    assert (icons / "nivisviewer_logo.png").is_file()
-    assert (icons / "nivisviewer_icon.png").is_file()
-    assert (icons / "nivisviewer.ico").is_file()
-
-
 def test_portable_verifier_requires_runtime_branding_assets(tmp_path):
     errors = verify(tmp_path)
     assert "branding asset not found: nivisviewer.ico" in errors

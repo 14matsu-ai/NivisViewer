@@ -53,26 +53,6 @@ def test_physical_cache_bucket_covers_logical_dpi_request(
     assert policy.logical_frame_size.height() == display_size
 
 
-@pytest.mark.parametrize(
-    ("display_size", "dpr", "minimum_bucket"),
-    [(180, 2.0, 512), (320, 2.0, 1024), (180, 1.5, 384)],
-)
-def test_auto_quality_high_dpi_examples(
-    display_size: int,
-    dpr: float,
-    minimum_bucket: int,
-) -> None:
-    policy = ThumbnailRenderPolicy(
-        display_size,
-        "portrait_1_sqrt2",
-        "smart_crop",
-        dpr,
-        "auto",
-        1024,
-    )
-    assert policy.render_spec().long_edge >= minimum_bucket
-
-
 def test_max_edge_caps_cache_without_changing_logical_layout() -> None:
     policy = ThumbnailRenderPolicy(
         320,

@@ -13,10 +13,22 @@ from app.settings_dialog import SettingsDialog
 from tests.test_browser_grid import AlphaShellIconProvider, RecordingThumbnailProvider, make_item, make_window
 
 
-@pytest.mark.parametrize("kind", [BrowserItemKind.OTHER, BrowserItemKind.IMAGE, BrowserItemKind.PDF, BrowserItemKind.ARCHIVE])
-@pytest.mark.parametrize("state", ["unsupported", "pending", "cancelled", "error"])
-@pytest.mark.parametrize("dpr", [1., 1.25, 1.5, 2.])
-@pytest.mark.parametrize("mode,density", [("fit", BrowserDisplayDensity.COMPACT), ("center_crop", BrowserDisplayDensity.STANDARD)])
+# File kind/status select the fallback; DPI and layout control its shared
+# painting geometry. Cover every kind/status pair, then every DPI/layout pair
+# on one representative file instead of repeating their Cartesian product.
+_FILE_FALLBACK_CASES = [
+    (kind, state, 1., "fit", BrowserDisplayDensity.COMPACT)
+    for kind in (BrowserItemKind.OTHER, BrowserItemKind.IMAGE, BrowserItemKind.PDF, BrowserItemKind.ARCHIVE)
+    for state in ("unsupported", "pending", "cancelled", "error")
+] + [
+    (BrowserItemKind.OTHER, "pending", dpr, mode, density)
+    for dpr in (1., 1.25, 1.5, 2.)
+    for mode, density in (("fit", BrowserDisplayDensity.COMPACT), ("center_crop", BrowserDisplayDensity.STANDARD))
+    if (dpr, mode) != (1., "fit")
+]
+
+
+@pytest.mark.parametrize("kind,state,dpr,mode,density", _FILE_FALLBACK_CASES)
 def test_file_fallback_pixels_and_success_transition(qapp, tmp_path, kind, state, dpr, mode, density):
     delegate = BrowserItemDelegate(file_fallback_background="#31597d", folder_fallback_background="#804020",
                                    thumbnail_display_mode=mode, density=density,

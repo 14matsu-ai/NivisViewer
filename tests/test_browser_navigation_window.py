@@ -1327,16 +1327,21 @@ def test_refresh_gesture_clears_missing_selection_without_adding_history(
     index = window.item_model.index(window.item_model.row_for_path(selected), 0)
     window.list_view.setCurrentIndex(index)
     history_size = len(window.navigation_history)
-    selected.unlink()
+    try:
+        # The visible thumbnail may still be reading this file on Windows.
+        assert window.thumbnail_provider.wait_for_done(5000)
+        selected.unlink()
 
-    window._on_browser_folder_gesture("D")
-    finish_scan(window, qapp)
+        window._on_browser_folder_gesture("D")
+        finish_scan(window, qapp)
 
-    assert len(window.navigation_history) == history_size
-    assert window.item_model.row_for_path(selected) < 0
-    assert not window.list_view.currentIndex().isValid()
-    window.close()
-    qapp.processEvents()
+        assert len(window.navigation_history) == history_size
+        assert window.item_model.row_for_path(selected) < 0
+        assert not window.list_view.currentIndex().isValid()
+    finally:
+        window.prepare_shutdown()
+        window.close()
+        qapp.processEvents()
 
 
 def test_address_input_handles_missing_supported_and_unsupported_files(

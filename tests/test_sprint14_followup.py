@@ -1825,9 +1825,9 @@ def test_selected_delegate_keeps_thumbnail_center_visible(qapp, tmp_path):
         None,
     )
     model.set_items([item])
-    thumbnail = QPixmap(127, 180)
+    thumbnail = QImage(127, 180, QImage.Format.Format_RGB32)
     thumbnail.fill(QColor("#d02020"))
-    model.set_thumbnail(item.path, QIcon(thumbnail))
+    model.set_thumbnail_image(item.path, thumbnail)
     shell_pixmap = QPixmap(16, 16)
     shell_pixmap.fill(QColor("green"))
 

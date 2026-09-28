@@ -14,6 +14,7 @@ from app.archive_backend import ArchiveEntry, ArchiveListing
 from app.browser_model import BrowserItem, BrowserItemKind
 from app.file_preview import PreviewResult, PreviewSource
 from app.preview_provider_registry import PreviewProviderRegistry
+from app.browser_thumbnail_scheduler import ThumbnailPriority
 from app.thumbnail_disk_cache import ThumbnailDiskCache
 from app.thumbnail_provider import BrowserThumbnailProvider
 from app.thumbnail_render import ThumbnailRenderSpec, pil_to_qimage, render_pil_thumbnail
@@ -179,6 +180,11 @@ def test_shared_pipeline_encodes_configured_quality_for_all_preview_routes(tmp_p
             assert not list(cache.files_dir.iterdir())
             return
         assert result.image is not None and not result.image.isNull()
+        assert result.persist_to_disk
+        assert provider._queue_thumbnail_save(
+            item_for(path, kind), spec, result, ThumbnailPriority.VISIBLE
+        )
+        assert provider.wait_for_done(5000)
         row = cache._connection.execute("SELECT file_name, format_version, thumbnail_size FROM entries").fetchone()
         assert row[1] == "3-webp-q40-rgb-lossy-v1-matteffffff" and row[2] == spec.cache_token
         data = (cache.files_dir / row[0]).read_bytes()

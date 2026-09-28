@@ -1161,16 +1161,16 @@ def test_partial_move_replace_resets_destination_and_keeps_source_metadata(
     original_replace = os.replace
 
     def exdev(old, new):
-        if os.path.normcase(os.fspath(old)) == os.path.normcase(str(source)):
+        if Path(old).name == source.name and Path(old).parent.name == source.parent.name:
             raise OSError(errno.EXDEV, "cross volume")
         return original_replace(old, new)
 
     monkeypatch.setattr(os, "replace", exdev)
     monkeypatch.setattr(
         FileOperationService,
-        "_remove_source",
+        "_remove_source_receipt",
         staticmethod(
-            lambda _path: (_ for _ in ()).throw(PermissionError("locked"))
+            lambda *_args: (_ for _ in ()).throw(PermissionError("locked"))
         ),
     )
     result = FileOperationService().move(
@@ -1179,7 +1179,7 @@ def test_partial_move_replace_resets_destination_and_keeps_source_metadata(
         collision_policy=FileCollisionPolicy.REPLACE,
     )
     item = result.items[0]
-    assert item.replaced_existing and item.destination_published
+    assert item.replaced_existing and item.destination_published, item
     assert item.state is FileOperationItemState.SOURCE_REMOVAL_FAILED
     FileOperationCoordinator(store)._on_completed(result)
 

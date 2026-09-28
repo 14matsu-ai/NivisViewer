@@ -14,7 +14,6 @@ from app.settings_dialog import SettingsDialog
 from app.shortcut_catalog import canonical_key, normalize_shortcut_bindings
 from tests.test_application_controller import (
     close_controller,
-    finish_viewer_open,
     make_controller,
     write_image,
 )
@@ -731,11 +730,14 @@ def test_viewer_shortcut_bindings_are_isolated_between_windows(tmp_path: Path, q
     write_image(second_path)
     controller = make_controller(tmp_path / "profile", qapp)
     controller.settings["open_viewer_behavior"] = "always_new"
-    first = controller.open_path(first_path)
-    second = controller.open_path(second_path)
-    finish_viewer_open(qapp, first)
-    finish_viewer_open(qapp, second)
     try:
+        first = controller.open_path(first_path)
+        second = controller.open_path(second_path)
+        # Shortcut ownership is independent of the first-frame projection.
+        # The first window may be covered while the second one opens.
+        assert first.book_session.wait_for_async(5000)
+        assert second.book_session.wait_for_async(5000)
+        qapp.processEvents()
         first.apply_settings(
             {"shortcut_bindings": {"viewer": {"viewer_toggle_spread": ["T"]}}}
         )

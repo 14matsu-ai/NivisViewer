@@ -6,7 +6,8 @@ import time
 from unittest.mock import Mock
 
 from PIL import Image
-from PySide6.QtCore import QModelIndex, QPoint, QPointF, Qt
+import pytest
+from PySide6.QtCore import QCoreApplication, QEvent, QModelIndex, QPoint, QPointF, Qt
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage, QStandardItem, QStandardItemModel
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -48,6 +49,18 @@ from app.thumbnail_disk_cache import ThumbnailDiskCache
 from app.thumbnail_provider import BrowserThumbnailProvider
 from app.thumbnail_render import ThumbnailRenderSpec
 from app.viewer_window import ViewerWindow
+
+
+@pytest.fixture(autouse=True)
+def _release_test_windows(qapp):
+    existing = {id(widget) for widget in qapp.topLevelWidgets()}
+    yield
+    for widget in tuple(qapp.topLevelWidgets()):
+        if id(widget) not in existing:
+            widget.close()
+            widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    qapp.processEvents()
 
 
 def make_config(tmp_path: Path) -> ConfigManager:
@@ -95,7 +108,11 @@ def test_settings_dialog_is_scrollable_and_round_trips_sprint17_values(
 ) -> None:
     config = make_config(tmp_path)
     dialog = SettingsDialog(config)
-    assert len(dialog.findChildren(QScrollArea)) == 6
+    assert all(
+        isinstance(dialog.tabs.widget(index), QScrollArea)
+        or dialog.tabs.widget(index).findChild(QScrollArea) is not None
+        for index in range(dialog.tabs.count())
+    )
     assert dialog.button_box.parent() is dialog
     assert dialog.button_box.button(QDialogButtonBox.StandardButton.Ok) is not None
 
@@ -163,12 +180,13 @@ def test_visibility_policy_lists_hidden_and_unsupported_without_decoding(
     entries = [entry for batch in batches for entry in batch.entries]
     by_name = {entry.display_name: entry for entry in entries}
 
-    assert result.total_count == 2
+    assert result.total_count == 3
     assert by_name[".hidden.jpg"].hidden
     assert by_name[".hidden.jpg"].openable_by_nivisviewer
     assert by_name["notes.txt"].item_kind == "other"
     assert not by_name["notes.txt"].openable_by_nivisviewer
-    assert "download.part" not in by_name
+    assert by_name["download.part"].item_kind == "other"
+    assert not by_name["download.part"].openable_by_nivisviewer
 
 
 def test_visibility_policy_filters_hidden_unsupported_and_system(
@@ -275,6 +293,8 @@ def test_prefetch_miss_skips_decode_and_disk_persistence(
         generation=generation,
         priority=ThumbnailPriority.VISIBLE,
     )
+    assert provider.wait_for_done(2000)
+    qapp.processEvents()
     assert provider.wait_for_done(2000)
     qapp.processEvents()
     stats = provider.cache_statistics()
@@ -543,6 +563,11 @@ def test_browser_window_shows_all_items_and_requests_generic_preview(
     assert any(item.path == other.path for item in requested)
     assert not other.openable_by_nivisviewer
     window.open_item(window.item_model.index(window.item_model.row_for_path(other.path), 0))
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and not open_adapter.open_default.called:
+        qapp.processEvents()
+        QTest.qWait(10)
+    assert open_adapter.open_default.called
     assert "表示できません" in window.statusBar().currentMessage()
     open_adapter.open_default.assert_called_once()
     opened_path, parent_hwnd = open_adapter.open_default.call_args.args
@@ -809,6 +834,8 @@ def test_two_hundred_item_session_persists_only_visible_misses(
             generation=generation,
             priority=ThumbnailPriority.PREFETCH,
         )
+    assert provider.wait_for_done(10000)
+    qapp.processEvents()
     assert provider.wait_for_done(10000)
     qapp.processEvents()
     stats = provider.cache_statistics()

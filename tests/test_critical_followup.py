@@ -530,6 +530,7 @@ def test_unsupported_browser_activation_opens_system_once_without_viewer(
     else:
         QTest.keyClick(window.list_view, Qt.Key.Key_Return)
     qapp.processEvents()
+    assert wait_until(qapp, lambda: bool(adapter.default_calls))
     assert [Path(call[0]) for call in adapter.default_calls] == [target.absolute()]
     assert internal_opens == []
     _close_browser(window, coordinator, qapp)
@@ -558,6 +559,7 @@ def test_supported_file_stays_internal_and_explicit_external_open_is_available(
     assert adapter.default_calls == []
 
     assert window._open_system_file(target)
+    assert wait_until(qapp, lambda: bool(adapter.default_calls))
     assert [Path(call[0]) for call in adapter.default_calls] == [target.absolute()]
     _close_browser(window, coordinator, qapp)
 
@@ -609,8 +611,9 @@ def test_browser_picker_and_explorer_do_not_launch_for_disappeared_target(
     assert item is not None
     target.unlink()
 
-    assert not window._open_with_application_picker(item)
-    assert not window._open_item_in_explorer(item)
+    assert window._open_with_application_picker(item)
+    assert window._open_item_in_explorer(item)
+    assert wait_until(qapp, lambda: window._pending_system_open is None)
     assert adapter.picker_calls == []
     assert adapter.explorer_calls == []
     _close_browser(window, coordinator, qapp)
@@ -649,6 +652,7 @@ def test_browser_explorer_passes_file_or_folder_kind_to_adapter(
     assert item is not None
 
     assert window._open_item_in_explorer(item)
+    assert wait_until(qapp, lambda: bool(adapter.explorer_calls))
 
     assert adapter.explorer_calls == [
         (str(target.absolute()), is_directory)

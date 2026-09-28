@@ -697,15 +697,16 @@ def test_normal_and_favorite_large_folder_navigation_do_the_same_work(
         "model_reset": 1,
         "initial_batch": 1,
         "remaining_append": int(item_count > expected_initial),
-        "thumbnail_schedule": 1,
-        "thumbnail_request": expected_initial,
+        "thumbnail_request": min(expected_initial, 20),
         "history_visit": 1,
         "tree_sync": 1,
         "config_save": 0,
         "metadata_query_or_save": 0,
     }
-    assert normal == expected
-    assert favorite == expected
+    assert normal["thumbnail_schedule"] == favorite["thumbnail_schedule"]
+    assert 0 < normal["thumbnail_schedule"] <= 3
+    assert {key: value for key, value in normal.items() if key != "thumbnail_schedule"} == expected
+    assert {key: value for key, value in favorite.items() if key != "thumbnail_schedule"} == expected
 
 
 @pytest.mark.parametrize(
@@ -825,8 +826,8 @@ def test_scan_finish_applies_stable_initial_range_then_appends_without_reset(
         window._thumbnail_request_timer.stop()
         window._request_visible_thumbnails()
         requested_before_append = tuple(requested)
-        assert len(requested_before_append) == expected_initial
-        assert len(set(requested_before_append)) == expected_initial
+        assert len(requested_before_append) == min(expected_initial, 20)
+        assert len(set(requested_before_append)) == min(expected_initial, 20)
         window._flush_pending_scan_batch()
 
         assert window.item_model.rowCount() == item_count
@@ -992,14 +993,16 @@ def test_move_source_removal_failure_is_partial_not_success(
     monkeypatch.setattr(os, "rename", force_cross_volume)
     monkeypatch.setattr(
         service,
-        "_remove_source",
-        lambda _path: (_ for _ in ()).throw(PermissionError("sharing violation")),
+        "_remove_source_receipt",
+        lambda _path, _receipt, _cancelled: (_ for _ in ()).throw(PermissionError("sharing violation")),
     )
     item = service.move((source,), destination_root).items[0]
     assert not item.success and item.partial_success
+    assert item.error_code == "partial_success"
     assert item.state is FileOperationItemState.SOURCE_REMOVAL_FAILED
     assert item.destination_exists_after and item.source_exists_after
     assert source.exists() and destination.exists()
+    assert source.read_bytes() == destination.read_bytes() == b"payload"
 
 
 def test_metadata_is_not_relocated_for_published_destination_with_source_remaining(

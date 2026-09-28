@@ -656,21 +656,25 @@ def test_shell_shutdown_joins_normal_worker() -> None:
     assert service.shutdown(join_timeout=0)
 
 
-def test_shell_shutdown_cancels_pending_and_reports_stuck() -> None:
+def test_shell_shutdown_cancels_pending_and_reports_stuck(tmp_path: Path) -> None:
     release = Event()
     adapter = ShellAdapter(release)
     service = WindowsShellPreviewService(adapter)
     executor = ThreadPoolExecutor(max_workers=2)
+    active_path = tmp_path / "active.mp4"
+    pending_path = tmp_path / "pending.mp4"
+    active_path.write_bytes(b"shell fixture")
+    pending_path.write_bytes(b"shell fixture")
     active = executor.submit(
         service.request_thumbnail,
-        "active.mp4",
+        str(active_path),
         shell_spec(),
         cache_only=False,
     )
     assert adapter.started.wait(1)
     pending = executor.submit(
         service.request_thumbnail,
-        "pending.mp4",
+        str(pending_path),
         shell_spec(),
         cache_only=False,
     )

@@ -32,6 +32,13 @@ from app.thumbnail_render import ThumbnailRenderSpec
 from PIL import Image
 
 
+def _materialize_loader_paths(items):
+    """The source-availability guard runs before a test-injected loader."""
+    for item in items:
+        item.path.parent.mkdir(parents=True, exist_ok=True)
+        item.path.write_bytes(b"loader fixture")
+
+
 class _ClipboardCleanupHarness:
     def __init__(self):
         self._internal_clipboard_state = InternalClipboardState()
@@ -648,6 +655,7 @@ def test_rolling_read_ahead_replenishes_next_screen_and_survives_reversal(
         )
         for row in range(180)
     ]
+    _materialize_loader_paths(items)
     source_decodes = []
 
     def loader(item, _size, _cancel_token):
@@ -771,6 +779,7 @@ def test_full_configured_horizon_finishes_when_current_and_both_sides_fit(
                     modified_time_ns=row + 1)
         for row in range(80)
     ]
+    _materialize_loader_paths(items)
     decoded = []
 
     def loader(item, _size, _cancel_token):
@@ -907,6 +916,7 @@ def test_stale_folder_cache_does_not_truncate_configured_background_range(
                     modified_time_ns=row + 1)
         for row in range(20)
     ]
+    _materialize_loader_paths([*items, *stale_items])
     decoded = []
 
     def loader(item, _size, _cancel_token):
@@ -1202,6 +1212,7 @@ def test_near_band_capacity_stops_after_one_nonresident_completion(tmp_path, qap
                     modified_time_ns=row + 1)
         for row in range(2)
     ]
+    _materialize_loader_paths(items)
     source_decodes = []
 
     def loader(item, _size, _cancel_token):
@@ -1272,6 +1283,7 @@ def test_paused_provider_resumes_browser_warmup_without_polling(tmp_path, qapp):
                     modified_time_ns=row + 1)
         for row in range(2)
     ]
+    _materialize_loader_paths(items)
 
     def loader(_item, _size, _cancel_token):
         image = QImage(12, 12, QImage.Format.Format_RGBA8888)
@@ -1342,6 +1354,7 @@ def test_sort_filter_and_render_revisions_recenter_without_losing_cache(
                     modified_time_ns=row + 1)
         for row in range(12)
     ]
+    _materialize_loader_paths(items)
     decoded = []
 
     def loader(item, _size, _cancel_token):

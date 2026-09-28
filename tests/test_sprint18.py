@@ -893,10 +893,12 @@ def test_viewer_left_click_moves_one_logical_page_but_next_is_display_unit(
             "view_mode": "spread",
             "single_first_page": True,
             "treat_wide_image_as_single": True,
+            "viewer_canvas_click_direction": "right_next",
         }
     )
     window = ViewerWindow(config_manager=config)
     assert window.open_path(pages[0])
+    assert window.book_session.wait_for_async(2000)
     window.resize(640, 480)
     window.show()
     qapp.processEvents()

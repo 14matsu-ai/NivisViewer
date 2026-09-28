@@ -315,6 +315,8 @@ class ViewerWindow(QMainWindow):
             tuple[str, AdjacentBookBrowserSnapshot | None] | None
         ) = None
         self._shutdown_prepared = False
+        self._clipboard_change_serial = 0
+        QApplication.clipboard().dataChanged.connect(self._clipboard_changed)
         self._shutdown_cleanup_phase = 0
         self._shutdown_cleanup_complete = False
         self._reload_page_index: int | None = None
@@ -2650,17 +2652,85 @@ class ViewerWindow(QMainWindow):
             self._set_status_override(result.error_message or tr(' 関連付けアプリで開けませんでした').strip(), 3000)
 
     def copy_current_image(self) -> None:
-        if self.model.total_pages <= 0:
+        displayed = self.presentation_state.displayed
+        source = self.book_session.source
+        if self.model.total_pages <= 0 or displayed is None or source is None:
             return
         page_index = self.presentation_state.displayed_page
-        if page_index is not None:
-            snapshot = self.viewer.displayed_source_snapshot(page_index)
-            if snapshot is not None and snapshot[0] is not None:
-                QApplication.clipboard().setImage(snapshot[0])
-                return
-        cached = self.image_cache.get(self.model.focused_index)
-        if cached is not None and cached.qimage is not None:
-            QApplication.clipboard().setImage(cached.qimage)
+        page = next(
+            (item for item in displayed.unit.pages if item.index == page_index),
+            None,
+        )
+        if page is None:
+            return
+        snapshot = self.viewer.displayed_source_snapshot(page.index)
+        if (
+            snapshot is not None
+            and snapshot[0] is not None
+            and snapshot[1] is not None
+            and (snapshot[0].width(), snapshot[0].height()) == snapshot[1]
+        ):
+            QApplication.clipboard().setImage(snapshot[0])
+            return
+
+        from .viewer_clipboard_image import ClipboardImageDecode
+
+        previous = getattr(self, '_clipboard_image_worker', None)
+        if previous is not None:
+            previous.cancelled.set()
+        identity = (
+            self.book_session.generation,
+            id(source),
+            displayed.token,
+            page.image_id,
+            self._clipboard_change_serial,
+            object(),
+        )
+        self._clipboard_image_identity = identity
+        worker = ClipboardImageDecode(
+            identity,
+            source.source_path,
+            page.image_id,
+            source_options={
+                'recursive_folder': self.recursive_folder,
+                'sort_descending': self.sort_descending,
+                'use_zippla_cover': bool(self.settings.get('browser_use_zippla_cover', False)),
+                'archive_backend_registry': self.archive_backend_registry,
+                'pdfium_service': self.pdfium_service,
+                'pdf_render_base_dpi': int(self.settings.get('pdf_render_base_dpi', 96)),
+                'pdf_render_annotations': bool(self.settings.get('pdf_render_annotations', True)),
+            },
+        )
+        self._clipboard_image_worker = worker
+        worker.signals.finished.connect(self._clipboard_image_decoded)
+        QThreadPool.globalInstance().start(worker)
+
+    def _clipboard_changed(self) -> None:
+        self._clipboard_change_serial += 1
+        worker = getattr(self, '_clipboard_image_worker', None)
+        if worker is not None:
+            worker.cancelled.set()
+
+    def _clipboard_image_decoded(self, identity, image, error) -> None:
+        if identity != getattr(self, '_clipboard_image_identity', None):
+            return
+        self._clipboard_image_worker = None
+        displayed = self.presentation_state.displayed
+        if (
+            self._shutdown_prepared
+            or displayed is None
+            or self.book_session.generation != identity[0]
+            or id(self.book_session.source) != identity[1]
+            or displayed.token != identity[2]
+            or self._clipboard_change_serial != identity[4]
+        ):
+            return
+        if image is None or image.isNull():
+            self._set_status_override(
+                tr('画像のコピーに失敗しました: {p0}', p0=error or '-'), 3000
+            )
+            return
+        QApplication.clipboard().setImage(image)
 
     def copy_current_view(self) -> None:
         if self.model.total_pages <= 0:
@@ -7397,6 +7467,10 @@ class ViewerWindow(QMainWindow):
         export = getattr(self, '_external_open_worker', None)
         if export is not None:
             export.cancelled.set()
+        clipboard_decode = getattr(self, '_clipboard_image_worker', None)
+        if clipboard_decode is not None:
+            clipboard_decode.cancelled.set()
+            self._clipboard_image_identity = None
         if self._shutdown_cleanup_complete:
             return True
         # This flag fences all new input/work on the first attempt and stays
