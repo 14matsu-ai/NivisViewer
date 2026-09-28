@@ -245,7 +245,7 @@ def test_explicit_image_selection_wins_over_saved_folder_progress(
     close_controller(controller, qapp)
 
 
-def test_history_tab_opens_viewer_at_saved_progress(
+def test_history_tab_opens_folder_and_explicit_viewer_resumes_progress(
     tmp_path: Path,
     qapp: QApplication,
 ) -> None:
@@ -263,6 +263,12 @@ def test_history_tab_opens_viewer_at_saved_progress(
     qapp.processEvents()
 
     browser.open_history(browser.history_model.index(0, 0))
+    assert browser.wait_for_scan()
+    qapp.processEvents()
+    assert browser.current_path == book.absolute()
+    assert controller.get_active_viewer() is None
+
+    browser.open_history(browser.history_model.index(0, 0), open_in_new_window=True)
     viewer = controller.get_active_viewer()
 
     assert viewer is not None

@@ -4186,6 +4186,9 @@ class BrowserWindow(QMainWindow):
         if availability == "missing":
             self.statusBar().showMessage(tr('履歴の項目が見つかりません'), 3000)
             return
+        if entry.item_type in {"folder", "book_folder"} and not open_in_new_window:
+            self.navigate_to(entry.path)
+            return
         if self._open_path_handler is not None:
             self._invoke_open_path_handler(entry.path, open_in_new_window)
 

@@ -1658,6 +1658,11 @@ def test_history_is_recent_first_opens_items_and_selection_does_not(
     window.history_view.setCurrentIndex(window.history_model.index(0, 0))
     assert opened == []
 
+    window.open_history(window.history_model.index(0, 0))
+    finish_scan(window, qapp)
+    assert window.current_path == second.absolute()
+    assert opened == []
+
     window.open_history(
         window.history_model.index(0, 0),
         open_in_new_window=True,
