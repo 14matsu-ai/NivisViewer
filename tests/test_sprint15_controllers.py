@@ -279,7 +279,7 @@ def test_sidebar_component_visibility_removes_hidden_tabs(sidebar_container) -> 
     assert controller.tabs.tabText(0) == "フォルダ"
 
 
-def test_sidebar_keeps_existing_book_bookmarks_accessible(sidebar_container) -> None:
+def test_sidebar_removes_obsolete_book_tab(sidebar_container) -> None:
     container = sidebar_container
     favorites = QListView()
     bookmarks = QListView()
@@ -296,9 +296,5 @@ def test_sidebar_keeps_existing_book_bookmarks_accessible(sidebar_container) -> 
     controller.apply("favorites_only")
 
     panel = container.layout().itemAt(0).widget()
-    assert isinstance(panel, QTabWidget)
-    assert [
-        panel.tabText(index)
-        for index in range(panel.count())
-    ] == ["フォルダ", "本"]
-    assert panel.widget(1) is bookmarks
+    assert panel is favorites
+    assert not bookmarks.isVisible()

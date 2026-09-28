@@ -44,6 +44,7 @@ class FolderBookmarkModel(QAbstractListModel):
     ) -> None:
         super().__init__(parent)
         self.metadata_store = metadata_store
+        self.group_id = 1
         self.shell_icon_provider = (
             shell_icon_provider or ShellAssociatedIconProvider()
         )
@@ -124,7 +125,7 @@ class FolderBookmarkModel(QAbstractListModel):
 
     def refresh(self) -> None:
         bookmarks = (
-            self.metadata_store.list_folder_bookmarks()
+            self.metadata_store.list_group_favorites(self.group_id)
             if self.metadata_store is not None
             else []
         )
@@ -158,6 +159,11 @@ class FolderBookmarkModel(QAbstractListModel):
                     generation,
                     path_key(entry.path),
                 )
+
+    def set_group(self, group_id: int) -> None:
+        if group_id != self.group_id:
+            self.group_id = group_id
+            self.refresh()
 
     def refresh_availability(self) -> None:
         self.availability_service.invalidate()

@@ -215,6 +215,13 @@ class ConfigManager(QObject):
         "browser_show_favorites": True,
         "browser_show_folder_tree": True,
         "browser_show_history": True,
+        "favorite_add_button_transparency": 0,
+        "favorite_tabs_wrap_wheel": False,
+        "history_double_click_to_open": False,
+        "sidebar_tab_padding_top": -1,
+        "sidebar_tab_padding_bottom": -1,
+        "sidebar_tab_padding_left": -1,
+        "sidebar_tab_padding_right": -1,
         "favorite_row_padding_y": 1,
         "favorite_row_spacing": 0,
         "favorite_icon_size": 16,
@@ -857,6 +864,12 @@ class ConfigManager(QObject):
             minimum=0,
             maximum=12,
         )
+        normalized["favorite_add_button_transparency"] = cls._clamped_int(
+            normalized.get("favorite_add_button_transparency"), default=0, minimum=0, maximum=100,
+        )
+        for side in ("top", "bottom", "left", "right"):
+            key = f"sidebar_tab_padding_{side}"
+            normalized[key] = cls._clamped_int(normalized.get(key), default=cls.DEFAULTS[key], minimum=-1, maximum=24)
         normalized["favorite_row_padding_y"] = cls._clamped_int(
             normalized.get("favorite_row_padding_y"),
             default=int(cls.DEFAULTS["favorite_row_padding_y"]),
@@ -960,6 +973,8 @@ class ConfigManager(QObject):
             maximum=SLIDESHOW_INTERVAL_MAX_MS,
         )
         for key in (
+            "favorite_tabs_wrap_wheel",
+            "history_double_click_to_open",
             "bring_viewer_to_front_on_open",
             "loop_book_navigation",
             "slideshow_repeat",

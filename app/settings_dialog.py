@@ -362,6 +362,8 @@ TAB_SETTING_KEYS: dict[str, tuple[str, ...]] = {
         "browser_folder_snapshot_cache_enabled", "browser_folder_snapshot_cache_max_entries",
         "browser_sidebar_layout", "folder_tree_sync_mode", "folder_tree_collapse_unrelated",
         "folder_tree_focus_rebase", "folder_tree_context_ancestor_levels", "favorite_row_padding_y",
+        "favorite_add_button_transparency", "favorite_tabs_wrap_wheel", "history_double_click_to_open",
+        "sidebar_tab_padding_top", "sidebar_tab_padding_bottom", "sidebar_tab_padding_left", "sidebar_tab_padding_right",
         "favorite_row_spacing", "favorite_icon_size", "browser_preserve_search_for_viewer_roundtrip",
         "browser_center_folder_icon_size", "browser_center_folder_icon_custom_percent",
         "browser_center_file_icon_size", "browser_center_file_icon_custom_percent",
@@ -1201,6 +1203,23 @@ class SettingsDialog(QDialog):
         self.fullscreen_hide_delay_spin.setValue(int(defaults["fullscreen_ui_hide_delay_ms"]))
         self._sync_gap_enabled(self.join_spread_checkbox.isChecked())
 
+    def _reset_sidebar_scope(self) -> None:
+        """Reset the sidebar group's draft only; Apply/OK commits it."""
+        defaults = ConfigManager.DEFAULTS
+        self._select_data(self.browser_sidebar_layout_combo, defaults["browser_sidebar_layout"])
+        self._select_data(self.folder_tree_sync_mode_combo, defaults["folder_tree_sync_mode"])
+        self.folder_tree_collapse_checkbox.setChecked(bool(defaults["folder_tree_collapse_unrelated"]))
+        self.folder_tree_focus_rebase_checkbox.setChecked(bool(defaults["folder_tree_focus_rebase"]))
+        self.folder_tree_ancestor_levels_spin.setValue(int(defaults["folder_tree_context_ancestor_levels"]))
+        self.favorite_add_button_transparency_spin.setValue(int(defaults["favorite_add_button_transparency"]))
+        self.favorite_tabs_wrap_checkbox.setChecked(bool(defaults["favorite_tabs_wrap_wheel"]))
+        self.history_double_click_checkbox.setChecked(bool(defaults["history_double_click_to_open"]))
+        for side, spin in self.sidebar_tab_padding_spins.items():
+            spin.setValue(int(defaults[f"sidebar_tab_padding_{side}"]))
+        self.favorite_row_padding_spin.setValue(int(defaults["favorite_row_padding_y"]))
+        self.favorite_row_spacing_spin.setValue(int(defaults["favorite_row_spacing"]))
+        self.favorite_icon_size_spin.setValue(int(defaults["favorite_icon_size"]))
+
     def _reset_browser_scope(self) -> None:
         defaults = ConfigManager.DEFAULTS
         for key, spin in self.browser_icon_margin_spins.items():
@@ -1254,14 +1273,7 @@ class SettingsDialog(QDialog):
         self.browser_item_spacing_x_spin.setValue(int(defaults["browser_item_spacing_x"]))
         self.browser_item_spacing_y_spin.setValue(int(defaults["browser_item_spacing_y"]))
         self.browser_cell_padding_spin.setValue(int(defaults["browser_cell_padding"]))
-        self._select_data(self.browser_sidebar_layout_combo, defaults["browser_sidebar_layout"])
-        self._select_data(self.folder_tree_sync_mode_combo, defaults["folder_tree_sync_mode"])
-        self.folder_tree_collapse_checkbox.setChecked(bool(defaults["folder_tree_collapse_unrelated"]))
-        self.folder_tree_focus_rebase_checkbox.setChecked(bool(defaults["folder_tree_focus_rebase"]))
-        self.folder_tree_ancestor_levels_spin.setValue(int(defaults["folder_tree_context_ancestor_levels"]))
-        self.favorite_row_padding_spin.setValue(int(defaults["favorite_row_padding_y"]))
-        self.favorite_row_spacing_spin.setValue(int(defaults["favorite_row_spacing"]))
-        self.favorite_icon_size_spin.setValue(int(defaults["favorite_icon_size"]))
+        self._reset_sidebar_scope()
         self.disk_cache_checkbox.setChecked(bool(defaults["thumbnail_disk_cache_enabled"]))
         self.cache_limit_spin.setValue(int(defaults["thumbnail_cache_limit_mb"]))
         unused_days = int(defaults["thumbnail_cache_max_unused_days"])
@@ -3052,6 +3064,27 @@ class SettingsDialog(QDialog):
             tr('現在フォルダの上位階層:'),
             self.folder_tree_ancestor_levels_spin,
         )
+        self.favorite_tabs_wrap_checkbox = QCheckBox(tr('お気に入りタブのホイール切替を循環させる'), sidebar_group)
+        self.favorite_tabs_wrap_checkbox.setToolTip(tr('OFFでは最初と最後のタブで止まります。ONでは端から反対側のタブへ移動します。'))
+        sidebar_form.addRow(self.favorite_tabs_wrap_checkbox)
+        self.history_double_click_checkbox = QCheckBox(tr('履歴をダブルクリックで開く'), sidebar_group)
+        self.history_double_click_checkbox.setToolTip(tr('OFFではシングルクリックで開きます。'))
+        sidebar_form.addRow(self.history_double_click_checkbox)
+        self.favorite_add_button_transparency_spin = QSpinBox(sidebar_group)
+        self.favorite_add_button_transparency_spin.setRange(0, 100)
+        self.favorite_add_button_transparency_spin.setSuffix(" %")
+        self.favorite_add_button_transparency_spin.setToolTip(tr('「＋」ボタン全体の透明度です。0%で不透明、100%で完全に透明になります。透明でもクリックできます。'))
+        sidebar_form.addRow(tr('「＋」ボタンの透明度:'), self.favorite_add_button_transparency_spin)
+        self.sidebar_tab_padding_spins = {}
+        for side, label in (("top", "タブ文字の上余白:"), ("bottom", "タブ文字の下余白:"),
+                            ("left", "タブ文字の左余白:"), ("right", "タブ文字の右余白:")):
+            spin = QSpinBox(sidebar_group)
+            spin.setRange(-1, 24)
+            spin.setSpecialValueText(tr("標準"))
+            spin.setSuffix(" px")
+            spin.setToolTip(tr('サイドバーのタブ文字まわりの余白です。「標準」は以前の標準表示、0は最小の余白です。'))
+            self.sidebar_tab_padding_spins[side] = spin
+            sidebar_form.addRow(tr(label), spin)
         self.favorite_row_padding_spin = QSpinBox(sidebar_group)
         self.favorite_row_padding_spin.setRange(0, 8)
         sidebar_form.addRow(
@@ -3076,6 +3109,11 @@ class SettingsDialog(QDialog):
         )
         tree_focus_note.setWordWrap(True)
         sidebar_form.addRow(tree_focus_note)
+        self.sidebar_reset_button = QPushButton(tr('この項目を既定に戻す'), sidebar_group)
+        self.sidebar_reset_button.setObjectName("reset_sidebar_group")
+        self.sidebar_reset_button.setToolTip(tr('サイドバー欄の設定だけを既定に戻します。タブの余白は「標準」になります。「適用」または「OK」で反映します。お気に入りの登録は削除しません。'))
+        self.sidebar_reset_button.clicked.connect(self._reset_sidebar_scope)
+        sidebar_form.addRow(self.sidebar_reset_button)
         layout.addWidget(sidebar_group)
         layout.addWidget(self._make_tab_reset_button("browser", tab))
         layout.addStretch(1)
@@ -3497,6 +3535,11 @@ class SettingsDialog(QDialog):
         self.folder_tree_ancestor_levels_spin.setValue(
             int(self.config.get("folder_tree_context_ancestor_levels", 3))
         )
+        self.favorite_add_button_transparency_spin.setValue(int(self.config.get("favorite_add_button_transparency", 0)))
+        self.favorite_tabs_wrap_checkbox.setChecked(bool(self.config.get("favorite_tabs_wrap_wheel", False)))
+        self.history_double_click_checkbox.setChecked(bool(self.config.get("history_double_click_to_open", False)))
+        for side, spin in self.sidebar_tab_padding_spins.items():
+            spin.setValue(int(self.config.get(f"sidebar_tab_padding_{side}", -1)))
         self.favorite_row_padding_spin.setValue(
             int(self.config.get("favorite_row_padding_y", 1))
         )
@@ -4164,6 +4207,10 @@ class SettingsDialog(QDialog):
             "folder_tree_context_ancestor_levels": (
                 self.folder_tree_ancestor_levels_spin.value()
             ),
+            "favorite_add_button_transparency": self.favorite_add_button_transparency_spin.value(),
+            "favorite_tabs_wrap_wheel": self.favorite_tabs_wrap_checkbox.isChecked(),
+            "history_double_click_to_open": self.history_double_click_checkbox.isChecked(),
+            **{f"sidebar_tab_padding_{side}": spin.value() for side, spin in self.sidebar_tab_padding_spins.items()},
             "favorite_row_padding_y": self.favorite_row_padding_spin.value(),
             "favorite_row_spacing": self.favorite_row_spacing_spin.value(),
             "favorite_icon_size": self.favorite_icon_size_spin.value(),

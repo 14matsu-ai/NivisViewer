@@ -1465,7 +1465,71 @@ def test_sidebar_has_folder_bookmark_and_history_tabs(
     assert [
         favorites_panel.tabText(index)
         for index in range(favorites_panel.count())
-    ] == ["フォルダ", "本"]
+    ] == ["フォルダ"]
+    window.close()
+    store.close()
+    qapp.processEvents()
+
+
+def test_sidebar_section_reset_applies_native_tabs_without_resetting_other_settings(tmp_path, qapp):
+    from app.settings_dialog import SettingsDialog
+    from PySide6.QtWidgets import QWidget
+
+    folder = tmp_path / "sidebar-reset"
+    folder.mkdir()
+    config = make_config(tmp_path, folder)
+    config.apply({"sidebar_tab_padding_top": 0, "sidebar_tab_padding_bottom": 0,
+                  "sidebar_tab_padding_left": 0, "sidebar_tab_padding_right": 0,
+                  "favorite_tabs_wrap_wheel": True, "favorite_add_button_transparency": 60,
+                  "history_double_click_to_open": True, "thumbnail_size": 220})
+    store = MetadataStore(tmp_path / "metadata.sqlite3")
+    store.add_folder_bookmark(str(folder))
+    window = BrowserWindow(config_manager=config, metadata_store=store)
+    finish_scan(window, qapp)
+    assert window.favorite_tabs.tabBar().styleSheet()
+    dialog = SettingsDialog(config)
+    dialog.sidebar_reset_button.click()
+    assert all(spin.value() == -1 for spin in dialog.sidebar_tab_padding_spins.values())
+    assert config.get("sidebar_tab_padding_top") == 0  # Draft until Apply.
+    dialog.apply_settings()
+    qapp.processEvents()
+    assert window.favorite_tabs.tabBar().styleSheet() == ""
+    assert not window.favorite_tabs.tabBar().wrap_wheel
+    assert window.favorite_tabs.add_button.graphicsEffect().opacity() == 1
+    assert not window.history_view.double_click_to_open
+    assert config.get("thumbnail_size") == 220
+    assert len(store.list_folder_bookmarks()) == 1
+    native = QTabWidget()
+    native.addTab(QWidget(), window.favorite_tabs.tabText(0))
+    assert window.favorite_tabs.tabBar().tabSizeHint(0) == native.tabBar().tabSizeHint(0)
+    dialog.close()
+    window.close()
+    store.close()
+    qapp.processEvents()
+
+
+def test_favorite_tab_routes_registration_and_history_is_compact(tmp_path, qapp):
+    folder = tmp_path / "favorite"
+    folder.mkdir()
+    store = MetadataStore(tmp_path / "metadata.sqlite3")
+    window = BrowserWindow(config_manager=make_config(tmp_path, folder), metadata_store=store)
+    finish_scan(window, qapp)
+    window.favorite_tabs.add_group()
+    group = window.favorite_tabs.group_id
+    window.add_current_folder_bookmark()
+    assert [entry.path for entry in store.list_group_favorites(group)] == [str(folder)]
+    assert store.list_folder_bookmarks() == []
+    window.favorite_tabs.setCurrentIndex(0)
+    window.add_current_folder_bookmark()
+    window.favorite_tabs.setCurrentIndex(1)
+    window.toggle_current_folder_bookmark()
+    assert store.list_group_favorites(group) == []
+    assert len(store.list_folder_bookmarks()) == 1
+    store.record_book_opened(str(folder), item_type="folder", start_page_index=2, total_pages=9)
+    index = window.history_model.index(0, 0)
+    assert "\n" not in window.history_model.data(index)
+    assert "3 / 9" in window.history_model.data(index, Qt.ItemDataRole.ToolTipRole)
+    assert window.history_view.itemDelegate().metrics == window.favorite_view.itemDelegate().metrics
     window.close()
     store.close()
     qapp.processEvents()
@@ -1523,7 +1587,8 @@ def test_folder_bookmark_navigates_browser_without_opening_viewer(
     finish_scan(window, qapp)
     window.add_browser_bookmark(target, item_type="folder")
 
-    window.open_bookmark(window.bookmark_model.index(0, 0))
+    assert window.bookmark_model.rowCount() == 0
+    window.open_folder_bookmark(window.folder_bookmark_model.index(0, 0))
     finish_scan(window, qapp)
 
     assert window.current_path == target.absolute()
@@ -1548,10 +1613,11 @@ def test_current_folder_can_be_added_to_bookmarks(
 
     window.add_current_folder_bookmark()
 
-    assert window.bookmark_model.rowCount() == 1
-    entry = window.bookmark_model.entries[0]
+    assert window.bookmark_model.rowCount() == 0
+    assert window.folder_bookmark_model.rowCount() == 1
+    entry = window.folder_bookmark_model.entries[0]
     assert Path(entry.path) == folder.absolute()
-    assert entry.item_type == "folder"
+    assert store.list_folder_bookmarks()[0].item_type == "folder"
     window.close()
     store.close()
     qapp.processEvents()
@@ -1610,10 +1676,10 @@ def test_missing_metadata_items_are_nonmodal_and_removable(
 ) -> None:
     folder = tmp_path / "shelf"
     folder.mkdir()
-    missing_bookmark = tmp_path / "missing-book"
+    missing_bookmark = tmp_path / "missing-book.zip"
     missing_history = tmp_path / "missing-history.zip"
     store = MetadataStore(tmp_path / "data" / "metadata.sqlite3")
-    store.add_browser_bookmark(str(missing_bookmark), item_type="folder")
+    store.add_browser_bookmark(str(missing_bookmark), item_type="archive")
     store.record_book_opened(
         str(missing_history),
         item_type="archive",

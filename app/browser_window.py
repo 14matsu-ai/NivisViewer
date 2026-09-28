@@ -211,6 +211,8 @@ from .explorer_list_view import ExplorerListView, PathDropTreeView
 from .favorite_item_delegate import FavoriteItemDelegate
 from .favorite_row_metrics import FavoriteRowMetrics
 from .folder_bookmark_model import FolderBookmarkModel
+from .favorite_tabs import FavoriteTabs
+from .sidebar_history_view import SidebarHistoryView
 from .folder_tree_sync import FolderTreeSyncController
 from .history_model import HistoryModel
 from .image_work_coordinator import ImageWorkCoordinator
@@ -4004,7 +4006,7 @@ class BrowserWindow(QMainWindow):
     def add_current_folder_bookmark(self) -> None:
         if self.current_path is None or self.metadata_store is None:
             return
-        if self.metadata_store.add_folder_bookmark(str(self.current_path)):
+        if self.metadata_store.add_group_favorite(self.folder_bookmark_model.group_id, str(self.current_path)):
             self._show_temporary_status(tr('現在のフォルダをお気に入りへ追加しました'))
         else:
             self._show_temporary_status(tr('このフォルダは登録済みです'))
@@ -4017,8 +4019,8 @@ class BrowserWindow(QMainWindow):
             or self.metadata_store is None
         ):
             return False
-        added = self.metadata_store.add_folder_bookmark(
-            str(item.path),
+        added = self.metadata_store.add_group_favorite(
+            self.folder_bookmark_model.group_id, str(item.path),
             label=item.display_name,
         )
         self._show_temporary_status(
@@ -4033,9 +4035,9 @@ class BrowserWindow(QMainWindow):
             return
         if any(
             self._same_path(Path(entry.path), self.current_path)
-            for entry in self.metadata_store.list_folder_bookmarks()
+            for entry in self.metadata_store.list_group_favorites(self.folder_bookmark_model.group_id)
         ):
-            self.metadata_store.remove_folder_bookmark(str(self.current_path))
+            self.metadata_store.remove_group_favorite(self.folder_bookmark_model.group_id, str(self.current_path))
             self._show_temporary_status(tr('現在のフォルダをお気に入りから削除しました'))
         else:
             self.add_current_folder_bookmark()
@@ -4119,7 +4121,7 @@ class BrowserWindow(QMainWindow):
             )
             if not accepted:
                 return False
-        return self.metadata_store.rename_bookmark_label(entry.path, label)
+        return self.metadata_store.rename_group_favorite(self.folder_bookmark_model.group_id, entry.path, label)
 
     def move_folder_bookmark(self, index: QModelIndex, offset: int) -> bool:
         entry = self.folder_bookmark_model.entry_at(index)
@@ -4131,7 +4133,7 @@ class BrowserWindow(QMainWindow):
         if new_row == old_row:
             return False
         paths.insert(new_row, paths.pop(old_row))
-        changed = self.metadata_store.reorder_folder_bookmarks(paths)
+        changed = self.metadata_store.reorder_group_favorites(self.folder_bookmark_model.group_id, paths)
         if changed:
             QTimer.singleShot(
                 0,
@@ -4527,6 +4529,12 @@ class BrowserWindow(QMainWindow):
         self.list_view.viewport().update()
 
     def apply_settings(self, changed: dict[str, object]) -> None:
+        if "history_double_click_to_open" in changed:
+            self.history_view.double_click_to_open = bool(changed["history_double_click_to_open"])
+        if {"favorite_tabs_wrap_wheel", "favorite_add_button_transparency"}.intersection(changed) or any(key.startswith("sidebar_tab_padding_") for key in changed):
+            self.sidebar_layout_controller.tab_settings.update(changed)
+            self.favorite_tabs.configure(self.sidebar_layout_controller.tab_settings)
+            self.sidebar_layout_controller.apply_tab_settings()
         if "shortcut_bindings" in changed:
             self.shortcut_bindings = normalize_shortcut_bindings(
                 changed["shortcut_bindings"]
@@ -6848,6 +6856,7 @@ class BrowserWindow(QMainWindow):
             self.metadata_store,
             self,
             availability_service=self.path_availability_service,
+            book_entries_only=True,
         )
         self.bookmark_view = QListView(self)
         self.bookmark_view.setModel(self.bookmark_model)
@@ -6902,24 +6911,31 @@ class BrowserWindow(QMainWindow):
             self,
             availability_service=self.path_availability_service,
         )
-        self.history_view = QListView(self)
+        self.history_view = SidebarHistoryView(self)
+        self.history_view.double_click_to_open = bool(self.settings.get("history_double_click_to_open", False))
         self.history_view.setModel(self.history_model)
-        self.history_view.activated.connect(self.open_history)
+        self.history_view.open_requested.connect(self.open_history)
         self.history_view.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
         )
         self.history_view.customContextMenuRequested.connect(
             self._show_history_context_menu
         )
+        self._apply_history_row_metrics()
+        self.favorite_tabs = FavoriteTabs(self.favorite_view, self.metadata_store, self)
+        self.favorite_tabs.configure(self.settings)
+        self.favorite_tabs.group_changed.connect(self.folder_bookmark_model.set_group)
+        self.folder_bookmark_model.set_group(self.favorite_tabs.group_id)
+        self.bookmark_view.hide()
         self.sidebar = QWidget(self)
         self.sidebar.setObjectName("browser_sidebar")
         self.sidebar_layout_controller = SidebarLayoutController(
             self.sidebar,
-            favorites_view=self.favorite_view,
+            favorites_view=self.favorite_tabs,
             folder_tree=self.folder_tree,
             history_view=self.history_view,
-            bookmarks_view=self.bookmark_view,
         )
+        self.sidebar_layout_controller.tab_settings = dict(self.settings)
         self.sidebar_layout_controller.splitter_sizes_changed.connect(
             self._on_sidebar_splitter_sizes_changed
         )
@@ -7747,6 +7763,19 @@ class BrowserWindow(QMainWindow):
         )
         self.favorite_view.setSpacing(self.favorite_row_metrics.spacing)
         self.favorite_view.doItemsLayout()
+        self._apply_history_row_metrics()
+
+    def _apply_history_row_metrics(self) -> None:
+        if not hasattr(self, "history_view"):
+            return
+        view = self.history_view
+        view.setItemDelegate(FavoriteItemDelegate(view, metrics=self.favorite_row_metrics))
+        view.setIconSize(QSize(self.favorite_row_metrics.icon_size, self.favorite_row_metrics.icon_size))
+        view.setSpacing(self.favorite_row_metrics.spacing)
+        view.setUniformItemSizes(True)
+        view.setWordWrap(False)
+        view.setTextElideMode(Qt.TextElideMode.ElideRight)
+        view.doItemsLayout()
 
     def _sync_tree_to_path(self, path: Path) -> None:
         self.folder_tree_sync.sync(
@@ -8682,12 +8711,15 @@ class BrowserWindow(QMainWindow):
             target_row = index.row() if index.isValid() else len(ordered)
             for offset, path in enumerate(paths):
                 ordered.insert(min(len(ordered), target_row + offset), path)
-            self.metadata_store.reorder_folder_bookmarks(ordered)
+            self.metadata_store.reorder_group_favorites(self.folder_bookmark_model.group_id, ordered)
             return
         if entry is not None:
             self._start_drop_operation(paths, entry.path, modifiers)
             return
-        self._probe_dropped_folders(paths, self._add_dropped_folder_bookmarks)
+        group_id = self.folder_bookmark_model.group_id
+        self._probe_dropped_folders(
+            paths, lambda folders: self._add_dropped_folder_bookmarks(folders, group_id=group_id)
+        )
 
     def _on_tree_paths_dropped(
         self,
@@ -8763,12 +8795,13 @@ class BrowserWindow(QMainWindow):
         worker.signals.finished.connect(finished)
         QThreadPool.globalInstance().start(worker)
 
-    def _add_dropped_folder_bookmarks(self, folders: tuple[str, ...]) -> None:
+    def _add_dropped_folder_bookmarks(self, folders: tuple[str, ...], *, group_id: int | None = None) -> None:
         if self.metadata_store is None:
             return
+        group_id = self.folder_bookmark_model.group_id if group_id is None else group_id
         added = 0
         for folder in folders:
-            if self.metadata_store.add_folder_bookmark(folder):
+            if self.metadata_store.add_group_favorite(group_id, folder):
                 added += 1
         if added:
             self._show_temporary_status(tr('{p0}件をお気に入りへ追加しました', p0=added))
@@ -9022,7 +9055,7 @@ class BrowserWindow(QMainWindow):
         elif selected == move_down_action:
             self.move_folder_bookmark(index, 1)
         elif selected == remove_action and self.metadata_store is not None:
-            self.metadata_store.remove_folder_bookmark(entry.path)
+            self.metadata_store.remove_group_favorite(self.folder_bookmark_model.group_id, entry.path)
         elif selected == copy_here_action:
             self.copy_selected_to_folder_bookmark(index)
         elif selected == move_here_action:

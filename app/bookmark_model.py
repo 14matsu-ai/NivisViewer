@@ -33,9 +33,11 @@ class BookmarkModel(QAbstractListModel):
         parent: QObject | None = None,
         *,
         availability_service: PathAvailabilityService | None = None,
+        book_entries_only: bool = False,
     ) -> None:
         super().__init__(parent)
         self.metadata_store = metadata_store
+        self.book_entries_only = book_entries_only
         self._owns_availability_service = availability_service is None
         self.availability_service = (
             availability_service or PathAvailabilityService(self)
@@ -103,7 +105,10 @@ class BookmarkModel(QAbstractListModel):
         generation = self._probe_generation
         self._pending_requests.clear()
         self.beginResetModel()
-        self._entries = list(entries)
+        self._entries = [
+            entry for entry in entries
+            if not self.book_entries_only or entry.item_type != "folder"
+        ]
         self._availability = {
             path_key(entry.path): PathAvailability.UNKNOWN
             for entry in self._entries

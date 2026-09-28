@@ -416,6 +416,144 @@ class MetadataStore(QObject):
             if entry.item_type == "folder"
         ]
 
+    def list_favorite_groups(self) -> list[tuple[int, str]]:
+        with self._lock:
+            if not self._available:
+                return [(1, tr("フォルダ"))]
+            try:
+                return [(int(row[0]), str(row[1])) for row in self._connection.execute(
+                    "SELECT id, name FROM favorite_groups WHERE active = 1 ORDER BY id"
+                )]
+            except sqlite3.DatabaseError as exc:
+                self._disable(exc)
+                return [(1, tr("フォルダ"))]
+
+    def _favorite_write(self, sql, values=()) -> bool:
+        with self._lock:
+            if not self._available:
+                return False
+            try:
+                cursor = self._connection.execute(sql, values)
+                self._connection.commit()
+            except sqlite3.DatabaseError as exc:
+                self._connection.rollback()
+                self._disable(exc)
+                return False
+        if cursor.rowcount:
+            self.bookmarks_changed.emit()
+        return cursor.rowcount > 0
+
+    def create_favorite_group(self, name: str) -> int | None:
+        if not name.strip():
+            return None
+        with self._lock:
+            if not self._favorite_write("INSERT INTO favorite_groups(name) VALUES (?)", (name.strip(),)):
+                return None
+            return int(self._connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+    def rename_favorite_group(self, group_id: int, name: str) -> bool:
+        return bool(name.strip()) and self._favorite_write(
+            "UPDATE favorite_groups SET name = ? WHERE id = ? AND active = 1", (name.strip(), group_id)
+        )
+
+    def delete_favorite_group(self, group_id: int) -> bool:
+        with self._lock:
+            groups = self.list_favorite_groups()
+            if len(groups) <= 1 or group_id not in {key for key, _ in groups}:
+                return False
+            if not self._available:
+                return False
+            try:
+                if group_id == 1:
+                    self._connection.execute("DELETE FROM browser_bookmarks WHERE item_type = 'folder'")
+                self._connection.execute("DELETE FROM grouped_favorites WHERE group_id = ?", (group_id,))
+                return self._favorite_write("UPDATE favorite_groups SET active = 0 WHERE id = ?", (group_id,))
+            except sqlite3.DatabaseError as exc:
+                self._connection.rollback()
+                self._disable(exc)
+                return False
+
+    def list_group_favorites(self, group_id: int) -> list[BrowserBookmark]:
+        if group_id == 1:
+            return self.list_folder_bookmarks()
+        with self._lock:
+            if not self._available:
+                return []
+            try:
+                rows = self._connection.execute(
+                    "SELECT i.display_path, f.label, f.sort_order, f.created_at "
+                    "FROM grouped_favorites f JOIN library_items i ON i.id = f.library_item_id "
+                    "WHERE f.group_id = ? ORDER BY f.sort_order, f.created_at", (group_id,)
+                ).fetchall()
+            except sqlite3.DatabaseError as exc:
+                self._disable(exc)
+                return []
+        return [BrowserBookmark(str(p), str(label), "folder", int(order), float(created))
+                for p, label, order, created in rows]
+
+    def add_group_favorite(self, group_id: int, path: str, *, label=None) -> bool:
+        with self._lock:
+            if not self._available or group_id not in {key for key, _ in self.list_favorite_groups()}:
+                return False
+            if group_id == 1:
+                return self.add_folder_bookmark(path, label=label)
+            try:
+                item_id = self._ensure_library_item(path, item_type="folder")
+                return self._favorite_write(
+                    "INSERT OR IGNORE INTO grouped_favorites "
+                    "(group_id, library_item_id, label, sort_order, created_at) "
+                    "VALUES (?, ?, ?, (SELECT COALESCE(MAX(sort_order), -1) + 1 "
+                    "FROM grouped_favorites WHERE group_id = ?), ?)",
+                    (group_id, item_id, label or "", group_id, time.time()),
+                )
+            except sqlite3.DatabaseError as exc:
+                self._connection.rollback()
+                self._disable(exc)
+                return False
+
+    def remove_group_favorite(self, group_id: int, path: str) -> bool:
+        if group_id == 1:
+            return self.remove_folder_bookmark(path)
+        return self._favorite_write(
+            "DELETE FROM grouped_favorites WHERE group_id = ? AND library_item_id = "
+            "(SELECT id FROM library_items WHERE normalized_path = ?)",
+            (group_id, self.normalize_path(path)),
+        )
+
+    def rename_group_favorite(self, group_id: int, path: str, label: str) -> bool:
+        if group_id == 1:
+            return self.rename_bookmark_label(path, label)
+        return bool(label.strip()) and self._favorite_write(
+            "UPDATE grouped_favorites SET label = ? WHERE group_id = ? AND library_item_id = "
+            "(SELECT id FROM library_items WHERE normalized_path = ?)",
+            (label.strip(), group_id, self.normalize_path(path)),
+        )
+
+    def reorder_group_favorites(self, group_id: int, paths: Iterable[str]) -> bool:
+        if group_id == 1:
+            return self.reorder_folder_bookmarks(paths)
+        entries = self.list_group_favorites(group_id)
+        by_key = {self.normalize_path(entry.path): entry for entry in entries}
+        keys = list(dict.fromkeys(self.normalize_path(path) for path in paths))
+        keys = [key for key in keys if key in by_key]
+        keys.extend(key for key in by_key if key not in keys)
+        with self._lock:
+            if not self._available:
+                return False
+            try:
+                self._connection.executemany(
+                    "UPDATE grouped_favorites SET sort_order = ? WHERE group_id = ? AND "
+                    "library_item_id = (SELECT id FROM library_items WHERE normalized_path = ?)",
+                    [(order, group_id, key) for order, key in enumerate(keys)],
+                )
+                self._connection.commit()
+            except sqlite3.DatabaseError as exc:
+                self._connection.rollback()
+                self._disable(exc)
+                return False
+        self.bookmarks_changed.emit()
+        return True
+
     def add_folder_bookmark(
         self,
         path: str,
@@ -960,6 +1098,21 @@ class MetadataStore(QObject):
                 created_at REAL NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS favorite_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            );
+            INSERT OR IGNORE INTO favorite_groups(id, name) VALUES (1, 'フォルダ');
+            CREATE TABLE IF NOT EXISTS grouped_favorites (
+                group_id INTEGER NOT NULL REFERENCES favorite_groups(id),
+                library_item_id INTEGER NOT NULL REFERENCES library_items(id) ON DELETE CASCADE,
+                label TEXT NOT NULL,
+                sort_order INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (group_id, library_item_id)
+            );
+
             CREATE TABLE IF NOT EXISTS tags (
                 id INTEGER PRIMARY KEY,
                 normalized_name TEXT NOT NULL UNIQUE,
@@ -1266,6 +1419,13 @@ class MetadataStore(QObject):
                 ),
             )
         self._connection.execute(
+            "INSERT OR IGNORE INTO grouped_favorites "
+            "(group_id, library_item_id, label, sort_order, created_at) "
+            "SELECT group_id, ?, label, sort_order, created_at "
+            "FROM grouped_favorites WHERE library_item_id = ?",
+            (destination_id, source_id),
+        )
+        self._connection.execute(
             "DELETE FROM library_items WHERE id = ?",
             (source_id,),
         )
@@ -1371,6 +1531,13 @@ class MetadataStore(QObject):
                 """,
                 (destination_id, *source_bookmark),
             )
+        self._connection.execute(
+            "INSERT OR IGNORE INTO grouped_favorites "
+            "(group_id, library_item_id, label, sort_order, created_at) "
+            "SELECT group_id, ?, label, sort_order, created_at "
+            "FROM grouped_favorites WHERE library_item_id = ?",
+            (destination_id, source_id),
+        )
         self._connection.execute(
             "DELETE FROM library_items WHERE id = ?",
             (source_id,),
