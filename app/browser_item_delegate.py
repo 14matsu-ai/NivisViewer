@@ -1207,10 +1207,27 @@ class BrowserItemDelegate(QStyledItemDelegate):
         if not self.show_tag_overlay or self.tag_overlay_opacity <= 0:
             return
         from .browser_tags import filename_tags
-        registered = {tag['name']: tag for tag in self.tag_registry}
-        # ZipPlaFork CatalogForm.drawTags (07955f5, AGPL-3.0-or-later):
-        # filename order, reversed from bottom right; see ZIPPLAFORK_COMPARISON.md.
-        tags = [registered[name] for name in reversed(filename_tags(str(item.path))) if name in registered]
+        registered = {}
+        for tag in self.tag_registry:
+            tokens = tag.get("tokens")
+            if not isinstance(tokens, list):
+                tokens = [tag.get("name")]
+            for token in tokens:
+                if token:
+                    registered[str(token)] = tag
+        # Filename order is retained, but multiple physical strings belonging
+        # to one logical tag paint only one display badge.
+        tags = []
+        seen_ids = set()
+        for token in reversed(filename_tags(str(item.path))):
+            tag = registered.get(token)
+            if tag is None:
+                continue
+            tag_id = str(tag.get("id", tag.get("name", "")))
+            if tag_id in seen_ids:
+                continue
+            tags.append(tag)
+            seen_ids.add(tag_id)
         if not tags:
             return
         painter.save()
@@ -1220,7 +1237,12 @@ class BrowserItemDelegate(QStyledItemDelegate):
             font.setPointSize(self.tag_font_size or max(7, min(10, self.profile.font_size)))
             painter.setFont(font)
             metrics = QFontMetrics(font)
-            ink = metrics.tightBoundingRect(''.join(tag['name'] for tag in tags))
+            ink = metrics.tightBoundingRect(
+                ''.join(
+                    str(tag.get("display_name", tag.get("name", "")))
+                    for tag in tags
+                )
+            )
             height = max(1, ink.height()) + 4  # Small rasterization guard, not line spacing.
             rating_font = QFont(option.font)
             rating_font.setPointSize(max(8, min(11, self.profile.font_size)))
@@ -1230,7 +1252,9 @@ class BrowserItemDelegate(QStyledItemDelegate):
             x, y = right, rect.bottom() - height - 3
             badge = self._type_badge_rect(rect, item)
             for tag in tags:
-                text = tag['name']
+                text = str(
+                    tag.get("display_name", tag.get("name", ""))
+                )
                 if self.tag_max_characters and len(text) > self.tag_max_characters:
                     text = text[:self.tag_max_characters] + '…'
                 tag_band = QRect(rect.left(), y, rect.width(), height)

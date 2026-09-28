@@ -104,11 +104,13 @@ def test_item_tags_apply_first_default_enter_and_escape_cancel(qapp):
         cancel_dialog.close()
 
 
-def test_registry_rename_delete_reregister_has_no_history(qapp):
+def test_registry_display_rename_preserves_physical_tag_identity(qapp):
     path = 'a {zpi$t=旧}.zip'
     dialog = TagManagerDialog(REGISTRY)
     dialog.table.item(0, 0).setText('変更')
-    assert visible_tags(path, dialog.registry()) == []
+    assert visible_tags(path, dialog.registry()) == [
+        {'name': '変更', 'color': '#ff8080'}
+    ]
     dialog.table.setCurrentCell(0, 0)
     dialog.remove_row()
     dialog.add_row('旧', '#123456')
@@ -428,3 +430,37 @@ def test_dialogs_translate_and_registry_drafts_do_not_touch_files(library, qapp,
         assert path.exists()
     finally:
         install_ui_language('ja')
+
+
+def test_logical_alias_change_is_checked_before_viewer_close(library, qapp, monkeypatch):
+    controller, browser, root = library
+    registry = [{'name': '表示', 'display_name': '表示', 'write_token': 'new',
+                 'tokens': ['new', 'old'], 'color': '#80bfff'}]
+    controller.config.apply({'browser_tag_registry': registry})
+    path = root / 'a {zpi$t=old}.png'
+    write_image(path)
+    load(browser, root)
+    close = Mock(return_value=True)
+    monkeypatch.setattr(browser, '_confirm_and_close_affected_viewers', close)
+
+    assert not browser.set_rating_for_paths((str(path),), None, tag_changes={'new': True})
+    close.assert_not_called()
+    assert browser.set_rating_for_paths((str(path),), None, tag_changes={'new': False})
+    assert wait_until(qapp, lambda: browser._rating_batch is None, timeout=5)
+    assert (root / 'a.png').exists()
+
+
+def test_search_replacement_keeps_logical_aliases_without_view_restore(library, qapp):
+    controller, browser, root = library
+    registry = [{'name': '表示', 'display_name': '表示', 'write_token': 'new',
+                 'tokens': ['new', 'old'], 'color': '#80bfff'}]
+    controller.config.apply({'browser_tag_registry': registry})
+    write_image(root / 'match {zpi$t=old}.png')
+    load(browser, root)
+    browser._set_browser_filter(BrowserFilterState.normalized(
+        search_text='match', include_tags=('new',), tag_registry=registry,
+    ))
+    assert browser.item_model.rowCount() == 1
+    browser._replace_active_search_query('', preserve_view_state=False)
+    assert browser.item_model.rowCount() == 1
+    assert browser.browser_filter_state.tag_token_groups

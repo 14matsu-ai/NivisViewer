@@ -152,6 +152,14 @@ from .browser_sort import (
     normalize_browser_sort_order,
 )
 from .browser_filter import BrowserFilterState, RatingFilterMode
+from .browser_tags import (
+    canonical_tag_key,
+    expand_logical_tag_changes,
+    filename_tags,
+    new_tag_entry,
+    normalize_tag_registry,
+    unmanaged_tag_counts,
+)
 from .browser_rating_filter_widget import BrowserRatingFilterWidget
 from .browser_tag_quick_filters import BrowserTagQuickFilterStrip, TagFilterMenuButton
 from .browser_search_history import BrowserSearchHistory
@@ -4241,9 +4249,16 @@ class BrowserWindow(QMainWindow):
             max(40, min(4000, int(value)))
             for value in sizes[:2]
         ]
-        self.config.set(
-            "browser_sidebar_splitter_sizes",
-            list(self.browser_sidebar_splitter_sizes),
+        self._sidebar_splitter_save_timer.start()
+
+    def _persist_sidebar_splitter_sizes(self) -> None:
+        self.config.apply(
+            {
+                "browser_sidebar_splitter_sizes": list(
+                    self.browser_sidebar_splitter_sizes
+                )
+            },
+            save=True,
         )
 
     def set_sidebar_layout(self, layout_name: str) -> None:
@@ -4532,6 +4547,11 @@ class BrowserWindow(QMainWindow):
             self.list_view.viewport().update()
             self._rebuild_tag_menu()
             self._sync_tag_quick_filter_registry()
+            if (
+                self.browser_filter_state.include_tags
+                or self.browser_filter_state.exclude_tags
+            ):
+                self._set_browser_filter(self.browser_filter_state)
         wheel_settings_changed = bool(
             {
                 "browser_wheel_scroll_mode",
@@ -4843,29 +4863,27 @@ class BrowserWindow(QMainWindow):
             self._update_status()
             if geometry_changed:
                 self._schedule_thumbnail_requests()
-        sidebar_keys = {
+        if "browser_sidebar_splitter_sizes" in changed:
+            raw_sizes = changed["browser_sidebar_splitter_sizes"]
+            if isinstance(raw_sizes, list) and len(raw_sizes) == 2:
+                self.browser_sidebar_splitter_sizes = [
+                    max(40, min(4000, int(value)))
+                    for value in raw_sizes
+                ]
+
+        sidebar_structure_keys = {
             "browser_sidebar_layout",
-            "browser_sidebar_splitter_sizes",
             "browser_show_favorites",
             "browser_show_folder_tree",
             "browser_show_history",
         }
-        if sidebar_keys.intersection(changed):
+        if sidebar_structure_keys.intersection(changed):
             self.browser_sidebar_layout = str(
                 changed.get(
                     "browser_sidebar_layout",
                     self.browser_sidebar_layout,
                 )
             )
-            raw_sizes = changed.get(
-                "browser_sidebar_splitter_sizes",
-                self.browser_sidebar_splitter_sizes,
-            )
-            if isinstance(raw_sizes, list) and len(raw_sizes) == 2:
-                self.browser_sidebar_splitter_sizes = [
-                    max(40, min(4000, int(value)))
-                    for value in raw_sizes
-                ]
             self.browser_show_favorites = bool(
                 changed.get(
                     "browser_show_favorites",
@@ -5128,6 +5146,7 @@ class BrowserWindow(QMainWindow):
             include_tags=self.browser_filter_state.include_tags,
             exclude_tags=self.browser_filter_state.exclude_tags,
             tag_match=self.browser_filter_state.tag_match,
+            tag_token_groups=self.browser_filter_state.tag_token_groups,
         )
         if preserve_view_state:
             return self._set_browser_filter(state)
@@ -5263,15 +5282,27 @@ class BrowserWindow(QMainWindow):
         )
 
     def _set_browser_filter(self, state: BrowserFilterState) -> bool:
+        registry = self.config.get('browser_tag_registry', [])
         normalized = BrowserFilterState.normalized(
             search_text=state.search_text,
             rating_mode=state.rating_mode,
             rating_reference=state.rating_reference,
-            include_tags=state.include_tags,
-            exclude_tags=state.exclude_tags,
+            include_tags=tuple(
+                canonical_tag_key(name, registry)
+                for name in state.include_tags
+            ),
+            exclude_tags=tuple(
+                canonical_tag_key(name, registry)
+                for name in state.exclude_tags
+            ),
             tag_match=state.tag_match,
+            tag_registry=registry,
         )
-        if normalized == self.browser_filter_state:
+        if (
+            normalized == self.browser_filter_state
+            and normalized.tag_token_groups
+            == self.browser_filter_state.tag_token_groups
+        ):
             self._sync_browser_filter_controls()
             return False
         view_state = self._capture_list_view_state()
@@ -5342,23 +5373,28 @@ class BrowserWindow(QMainWindow):
             return
         menu.clear()
         self._grouped_tag_actions: dict[str, QAction] = {}
-        registry = self.config.get('browser_tag_registry', [])
+        self._grouped_tag_labels: dict[str, str] = {}
+        registry = normalize_tag_registry(
+            self.config.get('browser_tag_registry', [])
+        )
         if self.browser_tag_grouped:
             for entry in registry:
-                name = entry['name']
-                action = menu.addAction(name.replace('&', '&&'))
+                key = str(entry['write_token'])
+                label = str(entry['display_name'])
+                action = menu.addAction(label.replace('&', '&&'))
                 action.setCheckable(True)
                 pixmap = QPixmap(10, 10)
-                pixmap.fill(QColor(entry['color']))
+                pixmap.fill(QColor(str(entry['color'])))
                 action.setIcon(QIcon(pixmap))
                 action.triggered.connect(
-                    lambda _checked=False, tag=name: self._on_tag_quick_filter_activated(
+                    lambda _checked=False, tag=key: self._on_tag_quick_filter_activated(
                         tag,
                         QApplication.keyboardModifiers(),
                         Qt.MouseButton.LeftButton,
                     )
                 )
-                self._grouped_tag_actions[name] = action
+                self._grouped_tag_actions[key] = action
+                self._grouped_tag_labels[key] = label
             if self._grouped_tag_actions:
                 menu.addSeparator()
         menu.addAction(tr('選択項目のタグ'), lambda: self.edit_selected_tags())
@@ -5372,16 +5408,18 @@ class BrowserWindow(QMainWindow):
 
     def _sync_grouped_tag_menu_actions(self) -> None:
         actions = getattr(self, '_grouped_tag_actions', {})
+        labels = getattr(self, '_grouped_tag_labels', {})
         include = set(self.browser_filter_state.include_tags)
         exclude = set(self.browser_filter_state.exclude_tags)
         for name, action in actions.items():
+            label = labels.get(name, name)
             action.setChecked(name in include)
-            label = f'− {name}' if name in exclude else name
-            action.setText(label.replace('&', '&&'))
+            shown = f'− {label}' if name in exclude else label
+            action.setText(shown.replace('&', '&&'))
             action.setToolTip(
-                tr('タグを除外中: {p0}', p0=name)
+                tr('タグを除外中: {p0}', p0=label)
                 if name in exclude
-                else tr('クリックでタグ絞り込み: {p0}', p0=name)
+                else tr('クリックでタグ絞り込み: {p0}', p0=label)
             )
         clear_action = getattr(self, '_tag_clear_action', None)
         if clear_action is not None:
@@ -5741,11 +5779,21 @@ class BrowserWindow(QMainWindow):
             )
         if not existing_items:
             return False
+        tag_registry = (
+            self.config.get('browser_tag_registry', [])
+            if tag_changes is not None else None
+        )
         if tag_changes is not None:
             # A draft applied without edits must not close an open Viewer.
-            existing_items = [(path, kind) for path, kind in existing_items
-                              if ZipPlaFilenameMetadata.parse(path).with_tag_changes(tag_changes)
-                              != ZipPlaFilenameMetadata.parse(path)]
+            changed_items = []
+            for path, kind in existing_items:
+                metadata = ZipPlaFilenameMetadata.parse(path)
+                physical_changes = expand_logical_tag_changes(
+                    metadata.tags or (), tag_changes, tag_registry,
+                )
+                if metadata.with_tag_changes(physical_changes) != metadata:
+                    changed_items.append((path, kind))
+            existing_items = changed_items
             if not existing_items:
                 return False
         existing = tuple(path for path, _kind in existing_items)
@@ -5789,8 +5837,17 @@ class BrowserWindow(QMainWindow):
         pending_metadata_relocation: tuple[str, str] | None = None
         for path, kind in existing_items:
             original_metadata = ZipPlaFilenameMetadata.parse(path)
-            metadata = (original_metadata.with_tag_changes(tag_changes) if tag_changes is not None
-                        else original_metadata.with_rating(normalized_rating))
+            if tag_changes is not None:
+                physical_changes = expand_logical_tag_changes(
+                    original_metadata.tags or (),
+                    tag_changes,
+                    tag_registry,
+                )
+                metadata = original_metadata.with_tag_changes(
+                    physical_changes
+                )
+            else:
+                metadata = original_metadata.with_rating(normalized_rating)
             if tag_changes is not None and metadata == original_metadata:
                 continue
             if kind is BrowserItemKind.FOLDER:
@@ -5940,12 +5997,113 @@ class BrowserWindow(QMainWindow):
 
     def manage_tags(self, new_names=()) -> None:
         from .browser_tag_dialogs import TagManagerDialog
-        registry = list(self.config.get('browser_tag_registry', []))
-        registry.extend({'name': name, 'color': '#80bfff'} for name in new_names
-                        if name not in {tag['name'] for tag in registry})
-        dialog = TagManagerDialog(registry, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.config.apply({'browser_tag_registry': dialog.registry()}, save=True)
+
+        registry = normalize_tag_registry(
+            self.config.get('browser_tag_registry', [])
+        )
+        known_tokens = {
+            str(token)
+            for entry in registry
+            for token in entry['tokens']
+        }
+        for name in new_names:
+            if name not in known_tokens:
+                registry.append(new_tag_entry(name))
+                known_tokens.add(name)
+
+        unmanaged = unmanaged_tag_counts(
+            (str(item.path) for item in self.item_model.source_items),
+            registry,
+        )
+        dialog = TagManagerDialog(
+            registry,
+            self,
+            unmanaged_counts=unmanaged,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        updated = normalize_tag_registry(dialog.registry())
+        operation = dialog.unmanaged_operation
+
+        if operation is not None:
+            kind = str(operation.get("kind", ""))
+            token = str(operation.get("token", ""))
+            target_id = str(operation.get("target_id", ""))
+
+            if kind == "register" and token:
+                known = {
+                    str(value)
+                    for entry in updated
+                    for value in entry["tokens"]
+                }
+                if token not in known:
+                    updated.append(new_tag_entry(token))
+            elif kind == "attach" and token:
+                target = next(
+                    (
+                        entry
+                        for entry in updated
+                        if str(entry["id"]) == target_id
+                    ),
+                    None,
+                )
+                if (
+                    target is not None
+                    and token not in target["tokens"]
+                ):
+                    target["tokens"].append(token)
+
+        self.config.apply(
+            {'browser_tag_registry': updated},
+            save=True,
+        )
+
+        if operation is None:
+            return
+
+        kind = str(operation.get("kind", ""))
+        token = str(operation.get("token", ""))
+        target_id = str(operation.get("target_id", ""))
+        if not token:
+            return
+
+        if kind == "filter":
+            self._set_browser_filter(
+                BrowserFilterState.normalized(
+                    search_text=self.browser_search_edit.text(),
+                    rating_mode=self.browser_filter_state.rating_mode,
+                    rating_reference=self.browser_filter_state.rating_reference,
+                    include_tags=(token,),
+                    tag_registry=updated,
+                )
+            )
+            return
+
+        paths = tuple(
+            str(item.path)
+            for item in self.item_model.source_items
+            if token in filename_tags(str(item.path))
+        )
+        if kind == "delete":
+            self.set_tags_for_paths(paths, {token: False})
+        elif kind == "convert":
+            target = next(
+                (
+                    entry
+                    for entry in updated
+                    if str(entry["id"]) == target_id
+                ),
+                None,
+            )
+            if target is not None:
+                self.set_tags_for_paths(
+                    paths,
+                    {
+                        token: False,
+                        str(target["write_token"]): True,
+                    },
+                )
 
     def edit_selected_tags(self, paths=None) -> None:
         from .browser_tag_dialogs import ItemTagsDialog
@@ -6764,6 +6922,12 @@ class BrowserWindow(QMainWindow):
         )
         self.sidebar_layout_controller.splitter_sizes_changed.connect(
             self._on_sidebar_splitter_sizes_changed
+        )
+        self._sidebar_splitter_save_timer = QTimer(self)
+        self._sidebar_splitter_save_timer.setSingleShot(True)
+        self._sidebar_splitter_save_timer.setInterval(250)
+        self._sidebar_splitter_save_timer.timeout.connect(
+            self._persist_sidebar_splitter_sizes
         )
         self._apply_sidebar_layout()
 

@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QLineEdit, QMenu, QPushButton
+from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QInputDialog, QLineEdit, QMenu, QPushButton
 
 from app.browser_filter import BrowserFilterState
 from app.browser_tag_quick_filters import BrowserTagQuickFilterStrip
@@ -72,7 +72,7 @@ def test_mixed_actual_click_cycle_apply(library, qapp, clicks, expected):
 
 
 @pytest.mark.parametrize('mode', ['outside', 'escape', 'left'])
-def test_context_right_click_batch_and_escape(library, qapp, mode):
+def test_context_tag_menu_stays_open_for_batch_and_escape(library, qapp, mode):
     _, browser, root = library
     write_image(root / 'a {zpi$t=旧,未知}.png')
     load(browser, root)
@@ -89,14 +89,21 @@ def test_context_right_click_batch_and_escape(library, qapp, mode):
             qapp.processEvents()
             for name in ('旧', '新'):
                 action = next(a for a,n in tags.tag_actions.items() if n == name)
-                left = mode == 'left' and name == '新'
-                QTest.mouseClick(tags, Qt.MouseButton.LeftButton if left else Qt.MouseButton.RightButton,
-                                 pos=tags.actionGeometry(action).center())
-                assert tags.isVisible() != left
+                button = (
+                    Qt.MouseButton.LeftButton
+                    if mode == 'left'
+                    else Qt.MouseButton.RightButton
+                )
+                QTest.mouseClick(
+                    tags,
+                    button,
+                    pos=tags.actionGeometry(action).center(),
+                )
+                assert tags.isVisible()
             assert filename_tags(str(next(root.iterdir()))) == ('旧', '未知')
             if mode == 'escape':
                 QTest.keyClick(tags, Qt.Key.Key_Escape)
-            elif mode == 'outside':
+            else:
                 menu.close()
         except Exception as exc:
             errors.append(exc)
@@ -221,7 +228,8 @@ def test_grouped_tag_menu_clears_only_tag_filters_and_updates_immediately(librar
     ] == ['bcd', 'asd']
 
 
-def test_tag_manager_add_starts_editing_new_name(library, qapp):
+def test_tag_manager_add_starts_editing_new_name(library, qapp, monkeypatch):
+    monkeypatch.setattr(QInputDialog, 'getText', lambda *args, **kwargs: ('新規', True))
     dialog = TagManagerDialog([{'name': '既存', 'color': '#80bfff'}])
     dialog.show()
     qapp.processEvents()
@@ -517,7 +525,8 @@ def test_quick_tag_strip_translates_fixed_labels_in_english(qapp):
         strip.deleteLater()
 
 
-def test_filter_and_registry_lifecycle_real_events(library, qapp):
+def test_filter_and_registry_lifecycle_real_events(library, qapp, monkeypatch):
+    monkeypatch.setattr(QInputDialog, 'getText', lambda *args, **kwargs: ('旧', True))
     controller, browser, root = library
     path = root / 'a {zpi$t=旧}.png'
     write_image(path)
@@ -551,17 +560,7 @@ def test_filter_and_registry_lifecycle_real_events(library, qapp):
             QTest.mouseClick(delete, Qt.MouseButton.LeftButton)
             add = next(b for b in dialog.findChildren(QPushButton) if b.text() == '追加')
             QTest.mouseClick(add, Qt.MouseButton.LeftButton)
-            dialog.table.editItem(dialog.table.item(dialog.table.rowCount()-1, 0))
             qapp.processEvents()
-            from PySide6.QtWidgets import QLineEdit
-            editor = dialog.table.findChild(QLineEdit)
-            assert editor is not None
-            # Unicode key input is delivered through Qt's input method event.
-            from PySide6.QtGui import QInputMethodEvent
-            event = QInputMethodEvent()
-            event.setCommitString('旧')
-            QApplication.sendEvent(editor, event)
-            QTest.keyClick(editor, Qt.Key.Key_Return)
             QTest.mouseClick(dialog.buttons.button(QDialogButtonBox.StandardButton.Ok), Qt.MouseButton.LeftButton)
         except Exception as exc:
             errors.append(exc)

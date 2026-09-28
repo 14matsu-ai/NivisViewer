@@ -32,13 +32,15 @@ def normalize_rating_filter_mode(value: object) -> RatingFilterMode:
 
 @dataclass(frozen=True)
 class BrowserSearchPredicate:
-    """Phase-one plain-text predicate; replaceable by a future parser."""
-
     query: str = ""
     _normalized_query: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "_normalized_query", self.query.strip().casefold())
+        object.__setattr__(
+            self,
+            "_normalized_query",
+            self.query.strip().casefold(),
+        )
 
     @property
     def normalized_query(self) -> str:
@@ -74,7 +76,12 @@ class BrowserFilterState:
     rating_reference: int = 0
     include_tags: tuple[str, ...] = ()
     exclude_tags: tuple[str, ...] = ()
-    tag_match: str = 'all'
+    tag_match: str = "all"
+    _tag_token_groups: tuple[tuple[str, tuple[str, ...]], ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
     _predicates: tuple[BrowserItemPredicate, ...] = field(
         init=False,
         repr=False,
@@ -94,9 +101,21 @@ class BrowserFilterState:
         object.__setattr__(self, "search_text", str(self.search_text))
         object.__setattr__(self, "rating_mode", mode)
         object.__setattr__(self, "rating_reference", reference)
-        object.__setattr__(self, 'include_tags', tuple(dict.fromkeys(self.include_tags)))
-        object.__setattr__(self, 'exclude_tags', tuple(dict.fromkeys(self.exclude_tags)))
-        object.__setattr__(self, 'tag_match', 'any' if self.tag_match == 'any' else 'all')
+        object.__setattr__(
+            self,
+            "include_tags",
+            tuple(dict.fromkeys(self.include_tags)),
+        )
+        object.__setattr__(
+            self,
+            "exclude_tags",
+            tuple(dict.fromkeys(self.exclude_tags)),
+        )
+        object.__setattr__(
+            self,
+            "tag_match",
+            "any" if self.tag_match == "any" else "all",
+        )
         object.__setattr__(
             self,
             "_predicates",
@@ -115,8 +134,14 @@ class BrowserFilterState:
         rating_reference: object = 0,
         include_tags: tuple[str, ...] = (),
         exclude_tags: tuple[str, ...] = (),
-        tag_match: str = 'all',
+        tag_match: str = "all",
+        tag_registry: object = None,
+        tag_token_groups: tuple[
+            tuple[str, tuple[str, ...]], ...
+        ] | None = None,
     ) -> BrowserFilterState:
+        from .browser_tags import tag_token_groups as groups_from_registry
+
         mode = normalize_rating_filter_mode(rating_mode)
         try:
             reference = int(rating_reference)
@@ -126,11 +151,34 @@ class BrowserFilterState:
             reference = max(1, min(5, reference))
         else:
             reference = 0
-        return cls(str(search_text), mode, reference, include_tags, exclude_tags, tag_match)
+        return cls(
+            str(search_text),
+            mode,
+            reference,
+            include_tags,
+            exclude_tags,
+            tag_match,
+            (
+                tuple(tag_token_groups)
+                if tag_token_groups is not None
+                else groups_from_registry(tag_registry)
+            ),
+        )
+
+    @property
+    def tag_token_groups(self) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        return self._tag_token_groups
 
     @property
     def active(self) -> bool:
-        return bool(self.search_text.strip() or self.include_tags or self.exclude_tags) or self.rating_mode is not RatingFilterMode.OFF
+        return (
+            bool(
+                self.search_text.strip()
+                or self.include_tags
+                or self.exclude_tags
+            )
+            or self.rating_mode is not RatingFilterMode.OFF
+        )
 
     def predicates(self) -> tuple[BrowserItemPredicate, ...]:
         return self._predicates
@@ -140,13 +188,26 @@ class BrowserFilterState:
             return False
         if not self.include_tags and not self.exclude_tags:
             return True
+
         from .browser_tags import filename_tags
+
         tags = set(filename_tags(str(item.path)))
+        groups = dict(self._tag_token_groups)
+
+        def has_tag(key: str) -> bool:
+            return any(
+                token in tags
+                for token in groups.get(key, (key,))
+            )
+
         include = not self.include_tags or (
-            any(name in tags for name in self.include_tags) if self.tag_match == 'any'
-            else all(name in tags for name in self.include_tags)
+            any(has_tag(name) for name in self.include_tags)
+            if self.tag_match == "any"
+            else all(has_tag(name) for name in self.include_tags)
         )
-        return include and not any(name in tags for name in self.exclude_tags)
+        return include and not any(
+            has_tag(name) for name in self.exclude_tags
+        )
 
 
 __all__ = [

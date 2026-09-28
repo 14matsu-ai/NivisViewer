@@ -2,16 +2,10 @@ from __future__ import annotations
 
 from .i18n import tr
 
-
 from collections.abc import Iterable
 
 from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtWidgets import (
-    QSplitter,
-    QTabWidget,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtWidgets import QSplitter, QTabWidget, QVBoxLayout, QWidget
 
 
 SIDEBAR_LAYOUTS = {
@@ -59,12 +53,15 @@ class SidebarLayoutController(QObject):
         show_history: bool = True,
     ) -> None:
         normalized = (
-            layout_name if layout_name in SIDEBAR_LAYOUTS else "favorites_top_tree_bottom"
+            layout_name
+            if layout_name in SIDEBAR_LAYOUTS
+            else "favorites_top_tree_bottom"
         )
         sizes = [max(40, min(4000, int(value))) for value in splitter_sizes]
         if len(sizes) != 2:
             sizes = [220, 420]
         self._splitter_sizes = sizes
+
         for widget in self._content_widgets:
             widget.setParent(self.container)
         self._clear_container()
@@ -79,56 +76,49 @@ class SidebarLayoutController(QObject):
                 show_history=show_history,
             )
         elif normalized == "favorites_only":
-            root = self._favorites_panel(
-                show_favorites,
-                show_history=False,
-            )
+            root = self._favorites_panel(show_favorites, show_history=False)
         elif normalized == "tree_only":
-            root = (
-                self.folder_tree
-                if show_tree
-                else QWidget(self.container)
-            )
+            root = self.folder_tree if show_tree else QWidget(self.container)
         else:
-            splitter = QSplitter(Qt.Orientation.Vertical, self.container)
-            first, second = (
+            favorites_panel = self._favorites_panel(
+                show_favorites,
+                show_history,
+            )
+            favorites_visible = show_favorites or show_history
+            ordered = (
                 (
-                    self._favorites_panel(show_favorites, show_history),
-                    self.folder_tree,
+                    (favorites_panel, favorites_visible),
+                    (self.folder_tree, show_tree),
                 )
                 if normalized == "favorites_top_tree_bottom"
                 else (
-                    self.folder_tree,
-                    self._favorites_panel(show_favorites, show_history),
+                    (self.folder_tree, show_tree),
+                    (favorites_panel, favorites_visible),
                 )
             )
-            first.setVisible(
-                show_tree if first is self.folder_tree else show_favorites or show_history
-            )
-            second.setVisible(
-                show_tree if second is self.folder_tree else show_favorites or show_history
-            )
-            splitter.addWidget(first)
-            splitter.addWidget(second)
-            splitter.setCollapsible(0, True)
-            splitter.setCollapsible(1, True)
-            splitter.setSizes(sizes)
-            splitter.splitterMoved.connect(
-                lambda _position, _index: self._record_splitter_sizes(splitter)
-            )
-            self.splitter = splitter
-            root = splitter
+            visible = [widget for widget, enabled in ordered if enabled]
+
+            if len(visible) == 2:
+                splitter = QSplitter(Qt.Orientation.Vertical, self.container)
+                splitter.setChildrenCollapsible(False)
+                splitter.addWidget(visible[0])
+                splitter.addWidget(visible[1])
+                splitter.setSizes(sizes)
+                splitter.splitterMoved.connect(
+                    lambda _position, _index: self._record_splitter_sizes(
+                        splitter
+                    )
+                )
+                self.splitter = splitter
+                root = splitter
+            elif len(visible) == 1:
+                root = visible[0]
+            else:
+                root = QWidget(self.container)
 
         self.container.layout().addWidget(root)
 
     def current_splitter_sizes(self) -> list[int]:
-        if self.splitter is not None:
-            sizes = self.splitter.sizes()
-            if len(sizes) >= 2 and all(value > 0 for value in sizes[:2]):
-                self._splitter_sizes = [
-                    max(40, min(4000, int(value)))
-                    for value in sizes[:2]
-                ]
         return list(self._splitter_sizes)
 
     def _tabs(
@@ -140,14 +130,14 @@ class SidebarLayoutController(QObject):
     ) -> QWidget:
         tabs = QTabWidget(self.container)
         if show_tree:
-            tabs.addTab(self.folder_tree, tr('フォルダ'))
+            tabs.addTab(self.folder_tree, tr("フォルダ"))
         if show_favorites:
             tabs.addTab(
                 self._favorites_panel(True, show_history=False),
-                tr('お気に入り'),
+                tr("お気に入り"),
             )
         if show_history:
-            tabs.addTab(self.history_view, tr('履歴'))
+            tabs.addTab(self.history_view, tr("履歴"))
         self.tabs = tabs
         return tabs
 
@@ -163,18 +153,19 @@ class SidebarLayoutController(QObject):
             return self.history_view
         if not show_favorites and not show_history:
             return QWidget(self.container)
+
         tabs = QTabWidget(self.container)
         if show_favorites:
-            tabs.addTab(self.favorites_view, tr('フォルダ'))
+            tabs.addTab(self.favorites_view, tr("フォルダ"))
             if self.bookmarks_view is not None:
-                tabs.addTab(self.bookmarks_view, tr('本'))
+                tabs.addTab(self.bookmarks_view, tr("本"))
         if show_history:
-            tabs.addTab(self.history_view, tr('履歴'))
+            tabs.addTab(self.history_view, tr("履歴"))
         return tabs
 
     def _record_splitter_sizes(self, splitter: QSplitter) -> None:
         sizes = splitter.sizes()
-        if len(sizes) >= 2:
+        if len(sizes) >= 2 and all(value > 0 for value in sizes[:2]):
             self._splitter_sizes = [
                 max(40, min(4000, int(value)))
                 for value in sizes[:2]

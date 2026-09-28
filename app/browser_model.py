@@ -553,8 +553,13 @@ class BrowserItemModel(QAbstractListModel):
             include_tags=state.include_tags,
             exclude_tags=state.exclude_tags,
             tag_match=state.tag_match,
+            tag_token_groups=state.tag_token_groups,
         )
-        if normalized == self._filter_state:
+        if (
+            normalized == self._filter_state
+            and normalized.tag_token_groups
+            == self._filter_state.tag_token_groups
+        ):
             return False
         empty = BrowserFilterState.normalized()
         if (
