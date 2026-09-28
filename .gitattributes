@@ -7,3 +7,5 @@
 # Preserve local historical artifacts but omit them from release source archives.
 /portable-backups export-ignore
 /NivisViewer_review.zip export-ignore
+/licenses/brackettree/LICENSE -text
+/licenses/loguru/LICENSE -text
