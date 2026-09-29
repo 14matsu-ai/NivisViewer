@@ -373,7 +373,11 @@ def test_delete_confirmation_settings_are_in_file_operations_and_persist_live(
         dialog.tabs.tabText(index) == "ファイル"
         for index in range(dialog.tabs.count())
     )
-    assert dialog.file_operation_group.title() == "ファイル操作"
+    assert dialog.file_operation_group.title() == "ファイル操作（Browser）"
+    assert dialog.viewer_file_operation_group.title() == "ファイル操作（Viewer）"
+    assert dialog.viewer_delete_mode_combo.currentData() == "disabled"
+    assert not dialog.viewer_delete_skip_confirmation_checkbox.isChecked()
+    assert not dialog.viewer_delete_confirm_focus_yes_checkbox.isChecked()
     assert dialog.delete_confirm_focus_yes_checkbox.text() == (
         "削除確認で「はい」を初期選択"
     )
@@ -406,6 +410,34 @@ def test_delete_confirmation_settings_are_in_file_operations_and_persist_live(
     assert reopened.delete_confirm_focus_yes_checkbox.isChecked()
     reopened.reject()
 
+
+def test_viewer_delete_settings_are_independent_and_file_reset_restores_both(
+    tmp_path: Path, qapp: QApplication,
+) -> None:
+    config = make_config(tmp_path)
+    dialog = SettingsDialog(config)
+    try:
+        dialog.viewer_delete_mode_combo.setCurrentIndex(
+            dialog.viewer_delete_mode_combo.findData('spread_back')
+        )
+        dialog.viewer_delete_skip_confirmation_checkbox.setChecked(True)
+        dialog.viewer_delete_confirm_focus_yes_checkbox.setChecked(True)
+        assert not dialog.viewer_delete_confirm_focus_yes_checkbox.isEnabled()
+        assert dialog.values()['file_operation_delete_skip_confirmation'] is False
+        assert dialog.values()['viewer_delete_mode'] == 'spread_back'
+        assert dialog.values()['viewer_delete_skip_confirmation'] is True
+        dialog.apply_settings()
+        persisted = ConfigManager(config.path)
+        persisted.load()
+        assert persisted.get('viewer_delete_mode') == 'spread_back'
+        assert persisted.get('viewer_delete_skip_confirmation') is True
+        assert persisted.get('file_operation_delete_skip_confirmation') is False
+        dialog._reset_tab_draft('file')
+        assert dialog.values()['viewer_delete_mode'] == 'disabled'
+        assert dialog.values()['viewer_delete_skip_confirmation'] is False
+        assert dialog.values()['viewer_delete_confirm_focus_yes'] is False
+    finally:
+        dialog.reject()
 
 def test_resampling_controls_expose_backend_authority_and_apply(
     tmp_path: Path,

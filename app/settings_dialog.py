@@ -405,6 +405,7 @@ TAB_SETTING_KEYS: dict[str, tuple[str, ...]] = {
     ),
     "file": (
         "file_operation_delete_confirm_focus_yes", "file_operation_delete_skip_confirmation",
+        "viewer_delete_mode", "viewer_delete_skip_confirmation", "viewer_delete_confirm_focus_yes",
     ),
     "archive": ("archive_backend_preference", "winrar_executable", "seven_zip_executable", "gimp_executable", "xcf_loading_enabled", "ai_loading_enabled", "svg_loading_enabled"),
     "mouse": (
@@ -1158,6 +1159,14 @@ class SettingsDialog(QDialog):
                 bool(ConfigManager.DEFAULTS["file_operation_delete_skip_confirmation"])
             )
             self._sync_delete_confirmation_controls()
+            self._select_data(self.viewer_delete_mode_combo, ConfigManager.DEFAULTS["viewer_delete_mode"])
+            self.viewer_delete_skip_confirmation_checkbox.setChecked(
+                bool(ConfigManager.DEFAULTS["viewer_delete_skip_confirmation"])
+            )
+            self.viewer_delete_confirm_focus_yes_checkbox.setChecked(
+                bool(ConfigManager.DEFAULTS["viewer_delete_confirm_focus_yes"])
+            )
+            self._sync_viewer_delete_confirmation_controls()
         elif scope == "archive":
             self._select_data(
                 self.archive_backend_combo,
@@ -2378,7 +2387,7 @@ class SettingsDialog(QDialog):
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
 
-        self.file_operation_group = QGroupBox(tr('ファイル操作'), tab)
+        self.file_operation_group = QGroupBox(tr('ファイル操作（Browser）'), tab)
         file_operation_layout = QVBoxLayout(self.file_operation_group)
         self.delete_skip_confirmation_checkbox = QCheckBox(
             tr('削除確認を表示せずゴミ箱へ移動'),
@@ -2400,6 +2409,31 @@ class SettingsDialog(QDialog):
         recycle_note.setWordWrap(True)
         file_operation_layout.addWidget(recycle_note)
         layout.addWidget(self.file_operation_group)
+        self.viewer_file_operation_group = QGroupBox(tr('ファイル操作（Viewer）'), tab)
+        viewer_file_layout = QVBoxLayout(self.viewer_file_operation_group)
+        viewer_file_layout.addWidget(QLabel(tr('Deleteキーの動作:'), self.viewer_file_operation_group))
+        self.viewer_delete_mode_combo = QComboBox(self.viewer_file_operation_group)
+        for label, value in (
+            (tr('無効'), 'disabled'),
+            (tr('1枚表示時のみ削除'), 'single'),
+            (tr('1枚表示＋見開き時はソート順の前方側を削除'), 'spread_front'),
+            (tr('1枚表示＋見開き時はソート順の後方側を削除'), 'spread_back'),
+            (tr('1枚表示＋見開き時はマウスカーソルがある画像を削除'), 'spread_cursor'),
+        ):
+            self.viewer_delete_mode_combo.addItem(label, value)
+        viewer_file_layout.addWidget(self.viewer_delete_mode_combo)
+        self.viewer_delete_skip_confirmation_checkbox = QCheckBox(
+            tr('削除確認を表示せずゴミ箱へ移動'), self.viewer_file_operation_group,
+        )
+        self.viewer_delete_confirm_focus_yes_checkbox = QCheckBox(
+            tr('削除確認で「はい」を初期選択'), self.viewer_file_operation_group,
+        )
+        self.viewer_delete_skip_confirmation_checkbox.toggled.connect(
+            self._sync_viewer_delete_confirmation_controls
+        )
+        viewer_file_layout.addWidget(self.viewer_delete_skip_confirmation_checkbox)
+        viewer_file_layout.addWidget(self.viewer_delete_confirm_focus_yes_checkbox)
+        layout.addWidget(self.viewer_file_operation_group)
         layout.addWidget(self._make_tab_reset_button("file", tab))
         layout.addStretch(1)
         return tab
@@ -3341,6 +3375,17 @@ class SettingsDialog(QDialog):
             )
         )
         self._sync_delete_confirmation_controls()
+        self._select_data(
+            self.viewer_delete_mode_combo,
+            self.config.get("viewer_delete_mode", "disabled"),
+        )
+        self.viewer_delete_skip_confirmation_checkbox.setChecked(
+            bool(self.config.get("viewer_delete_skip_confirmation", False))
+        )
+        self.viewer_delete_confirm_focus_yes_checkbox.setChecked(
+            bool(self.config.get("viewer_delete_confirm_focus_yes", False))
+        )
+        self._sync_viewer_delete_confirmation_controls()
         self.loop_navigation_checkbox.setChecked(
             bool(self.config.get("loop_book_navigation", False))
         )
@@ -3923,6 +3968,11 @@ class SettingsDialog(QDialog):
             not self.delete_skip_confirmation_checkbox.isChecked()
         )
 
+    def _sync_viewer_delete_confirmation_controls(self, *_args: object) -> None:
+        self.viewer_delete_confirm_focus_yes_checkbox.setEnabled(
+            not self.viewer_delete_skip_confirmation_checkbox.isChecked()
+        )
+
     def _sync_folder_fallback_background_controls(self, *_args: object) -> None:
         self._fallback_background_editors["browser_folder_fallback_background"].sync_controls()
 
@@ -4153,6 +4203,9 @@ class SettingsDialog(QDialog):
             "file_operation_delete_skip_confirmation": (
                 self.delete_skip_confirmation_checkbox.isChecked()
             ),
+            "viewer_delete_mode": str(self.viewer_delete_mode_combo.currentData()),
+            "viewer_delete_skip_confirmation": self.viewer_delete_skip_confirmation_checkbox.isChecked(),
+            "viewer_delete_confirm_focus_yes": self.viewer_delete_confirm_focus_yes_checkbox.isChecked(),
             "loop_book_navigation": self.loop_navigation_checkbox.isChecked(),
             "join_spread_pages": self.join_spread_checkbox.isChecked(),
             "gap": self.gap_spin.value(),

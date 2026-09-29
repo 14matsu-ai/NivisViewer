@@ -305,6 +305,12 @@ class ApplicationController(QObject):
         if browser is not None:
             browser.select_path(path)
 
+    def _on_viewer_file_recycled(self, path: str) -> None:
+        browser = self.get_browser_window()
+        if (browser is not None and browser.current_path is not None
+                and Path(browser.current_path) == Path(path).parent):
+            browser.refresh_current_folder()
+
     def create_viewer_window(self) -> ViewerWindow:
         if self._shutdown:
             raise RuntimeError("application is shutting down")
@@ -317,6 +323,7 @@ class ApplicationController(QObject):
             pdfium_service=self.pdfium_service,
             image_work_coordinator=self.image_work_coordinator,
             path_availability_service=self.path_availability_service,
+            file_operation_coordinator=self.file_operation_coordinator,
         )
         self._viewer_windows.append(window)
         window.set_close_request_handler(self.close_viewer_window)
@@ -329,6 +336,7 @@ class ApplicationController(QObject):
             lambda target: self._cancel_adjacent_search(target, clear_status=True),
         )
         window.book_changed.connect(self._on_viewer_book_changed)
+        window.file_recycled.connect(self._on_viewer_file_recycled)
         window.displayed_item_changed.connect(self._on_viewer_displayed_item_changed)
         window.side_folder_requested.connect(self.open_side_folder)
         window.book_session.async_opened.connect(

@@ -8,6 +8,7 @@ from .menu_icons import install_text_icon_menu_style, settings_icon
 import inspect
 import logging
 import math
+from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter_ns
 from typing import Callable
@@ -91,6 +92,9 @@ from .path_availability import (
 )
 from .performance_trace import performance_trace
 from .freeze_diagnostics import trace_gui_phase
+from .file_operation_coordinator import FileOperationCoordinator
+from .file_operation_artifact import FileOperationArtifactPolicy
+from .file_operation_service import FileOperationKind, FileOperationRequest
 from .raster_book_runtime import (
     RasterBookRuntime,
     RasterDisplayUnit,
@@ -128,6 +132,7 @@ from .viewer_display_unit import (
     ViewerDisplayUnit,
     ViewerSlotState,
 )
+from .viewer_delete_policy import select_delete_page
 from .viewer_presentation_state import (
     PresentationBook,
     PresentationCommit,
@@ -161,6 +166,18 @@ _RASTER_VIEWPORT_DEBOUNCE_MS = 120
 _ZIP_RUNTIME_BROWSER_RESUME_GRACE_MS = 500
 _PAGE_LIST_MAX_AHEAD_ROWS = 96
 _PAGE_LIST_MAX_REAR_ROWS = 48
+
+
+@dataclass(frozen=True)
+class _PendingViewerDelete:
+    request_id: int
+    source_identity: int
+    book_generation: int
+    opened_path: str
+    page_index: int
+    path: str
+    image_ids: tuple[str, ...]
+    snapshot: FolderListingSnapshot | None
 
 
 class _PageModelRasterTopology:
@@ -226,6 +243,7 @@ class ViewerWindow(QMainWindow):
     first_frame_ready = Signal(object)
     interactive_open_cancelled = Signal(object)
     presentationCommitted = Signal(object)
+    file_recycled = Signal(str)
 
     def __init__(
         self,
@@ -239,6 +257,7 @@ class ViewerWindow(QMainWindow):
         pdfium_service=None,
         image_work_coordinator: ImageWorkCoordinator | None = None,
         path_availability_service: PathAvailabilityService | None = None,
+        file_operation_coordinator: FileOperationCoordinator | None = None,
     ) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -249,6 +268,15 @@ class ViewerWindow(QMainWindow):
         self.config = config_manager
         self.settings = self.config.data
         self.metadata_store = metadata_store
+        self._owns_file_operation_coordinator = file_operation_coordinator is None
+        self.file_operation_coordinator = (
+            file_operation_coordinator or FileOperationCoordinator(metadata_store)
+        )
+        self._viewer_delete_request_id = 0
+        self._pending_viewer_delete: _PendingViewerDelete | None = None
+        self.file_operation_coordinator.operation_completed.connect(
+            self._on_viewer_delete_completed
+        )
         self._owns_archive_backend_registry = archive_backend_registry is None
         self.archive_backend_registry = (
             archive_backend_registry
@@ -712,6 +740,159 @@ class ViewerWindow(QMainWindow):
             return ""
         return str(self.book_session.current_path)
 
+    def _viewer_delete_page_index(self) -> int | None:
+        displayed = self.presentation_state.displayed
+        mode = str(self.config.get("viewer_delete_mode", "disabled"))
+        if (displayed is None or mode == "disabled"
+                or displayed.token.book.source_identity != id(self.book_session.source)
+                or displayed.token.book.epoch != self.book_session.generation):
+            return None
+        indexes = tuple(page.index for page in displayed.unit.pages)
+        if mode != "spread_cursor" or len(indexes) == 1:
+            return select_delete_page(indexes, mode)
+        if mode == "spread_cursor":
+            point = self.viewer.mapFromGlobal(QCursor.pos())
+            cursor_page = next((image.page_index for rect, image, pixmap in reversed(
+                self.viewer._last_image_layout
+            ) if rect.contains(point) and not pixmap.isNull()
+                and image.page_index in indexes), None)
+            return select_delete_page(indexes, mode, cursor_page)
+        return None
+
+    def _handle_viewer_delete_key(self, event: QKeyEvent) -> bool:
+        if event.key() != Qt.Key.Key_Delete or event.modifiers() != Qt.KeyboardModifier.NoModifier:
+            return False
+        if str(self.config.get("viewer_delete_mode", "disabled")) == "disabled":
+            return False
+        event.accept()
+        if event.type() != QEvent.Type.KeyPress or event.isAutoRepeat():
+            return True
+        self.delete_current_image_to_recycle_bin()
+        return True
+
+    def _delete_from_shortcut(self) -> None:
+        if isinstance(QApplication.focusWidget(), (
+            QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox,
+        )):
+            return
+        self.delete_current_image_to_recycle_bin()
+
+    def delete_current_image_to_recycle_bin(self) -> bool:
+        mode = str(self.config.get("viewer_delete_mode", "disabled"))
+        if mode == "disabled" or self._shutdown_prepared or self._pending_viewer_delete:
+            return False
+        source = self.book_session.source
+        if isinstance(source, PdfImageSource):
+            QMessageBox.information(self, tr('削除'), tr('PDF内のページなので削除キーは無効になっています'),
+                                    QMessageBox.StandardButton.Ok, QMessageBox.StandardButton.Ok)
+            return False
+        if source is not None and not isinstance(source, FolderImageSource):
+            QMessageBox.information(self, tr('削除'), tr('書庫ファイルなので削除キーは無効になっています'),
+                                    QMessageBox.StandardButton.Ok, QMessageBox.StandardButton.Ok)
+            return False
+        if not isinstance(source, FolderImageSource):
+            return False
+        page_index = self._viewer_delete_page_index()
+        if page_index is None:
+            return False
+        image_id = self.model.image_id_at(page_index)
+        if not image_id:
+            return False
+        path = str(Path(image_id).absolute())
+        if FileOperationArtifactPolicy.is_internal_operation_artifact(path):
+            return False
+        if not bool(self.config.get("viewer_delete_skip_confirmation", False)):
+            default = (QMessageBox.StandardButton.Yes
+                if self.config.get("viewer_delete_confirm_focus_yes", False)
+                else QMessageBox.StandardButton.No)
+            answer = QMessageBox.question(
+                self, tr('削除'), tr('「{p0}」をごみ箱へ移動しますか？', p0=Path(path).name),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, default,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+        self._viewer_delete_request_id += 1
+        request_id = (id(self) << 32) | self._viewer_delete_request_id
+        request = FileOperationRequest(request_id, FileOperationKind.RECYCLE, (path,))
+        self._pending_viewer_delete = _PendingViewerDelete(
+            request_id, id(source), self.book_session.generation,
+            self._opened_path, page_index, path,
+            tuple(self.model.image_ids), self.book_session.folder_listing_snapshot,
+        )
+        if not self.file_operation_coordinator.execute(request):
+            self._pending_viewer_delete = None
+            return False
+        return True
+
+    def _on_viewer_delete_completed(self, result: object) -> None:
+        pending = self._pending_viewer_delete
+        if pending is None or getattr(result, 'request_id', None) != pending.request_id:
+            return
+        self._pending_viewer_delete = None
+        removed = any(item.source_path == pending.path and item.success and item.source_removed
+                      for item in result.items)
+        if removed:
+            self.file_recycled.emit(pending.path)
+        if (self._shutdown_prepared
+                or id(self.book_session.source) != pending.source_identity
+                or self.book_session.generation != pending.book_generation
+                or self._opened_path != pending.opened_path):
+            return
+        if not removed:
+            self.statusBar().showMessage(tr('ごみ箱へ移動できません'), 5000)
+            return
+        source = self.book_session.source
+        if not isinstance(source, FolderImageSource):
+            return
+        survivors = tuple(
+            image_id for image_id in pending.image_ids
+            if str(Path(image_id).absolute()).casefold() != pending.path.casefold()
+        )
+        if not survivors:
+            self.book_session.close_book()
+            self._metadata_book_path = ""
+            self._metadata_book_item_type = ""
+            self._pending_progress_seed = None
+            self.presentation_state.clear_book()
+            self._project_presentation_surface()
+            self._activate_page_list_runtime(None)
+            self._update_slider()
+            self._update_status()
+            self._set_status_override(tr('表示可能な画像がありません'), 5000)
+            return
+        if pending.snapshot is not None:
+            next_index = min(pending.page_index, len(survivors) - 1)
+            next_path = survivors[next_index]
+            snapshot = replace(
+                pending.snapshot,
+                image_ids=survivors,
+                selected_image=next_path,
+                selected_index=next_index,
+                fingerprints=tuple(
+                    entry for entry in pending.snapshot.fingerprints
+                    if str(Path(entry[0]).absolute()).casefold() != pending.path.casefold()
+                ),
+            )
+            browser_snapshot = self._browser_navigation_snapshot
+            if browser_snapshot is not None:
+                browser_snapshot = replace(
+                    browser_snapshot,
+                    entries=tuple(
+                        entry for entry in browser_snapshot.entries
+                        if adjacent_path_key(entry.absolute_path)
+                        != adjacent_path_key(pending.path)
+                    ),
+                )
+            self._reload_page_index = None
+            self.open_path(
+                next_path,
+                folder_snapshot=snapshot,
+                browser_snapshot=browser_snapshot,
+            )
+            return
+        self._reload_page_index = min(pending.page_index, max(0, len(survivors) - 1))
+        self.open_path(source.source_path, preserve_current_page=True)
+
     def _is_fullscreen_mode(self) -> bool:
         chrome = getattr(self, "fullscreen_chrome", None)
         return bool(
@@ -975,6 +1156,13 @@ class ViewerWindow(QMainWindow):
         # virtual page list. Those remain discrete UI commands. The canvas is
         # the only surface that needs press/repeat/release identity.
         self._navigation_key_targets = (self.viewer, central)
+        self.viewer_delete_shortcut = QShortcut(QKeySequence("Delete"), self)
+        self.viewer_delete_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.viewer_delete_shortcut.setAutoRepeat(False)
+        self.viewer_delete_shortcut.activated.connect(self._delete_from_shortcut)
+        self.viewer_delete_shortcut.setEnabled(
+            self.config.get("viewer_delete_mode", "disabled") != "disabled"
+        )
         for target in drop_targets:
             target.setAcceptDrops(True)
             target.installEventFilter(self)
@@ -1538,6 +1726,10 @@ class ViewerWindow(QMainWindow):
         self._update_status()
 
     def apply_settings(self, changed: dict[str, object]) -> None:
+        if "viewer_delete_mode" in changed:
+            self.viewer_delete_shortcut.setEnabled(
+                str(changed["viewer_delete_mode"]) != "disabled"
+            )
         refresh = False
         fullscreen_policy_changed = False
         normal_resampling_changed = False
@@ -6499,6 +6691,13 @@ class ViewerWindow(QMainWindow):
         return True
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
+        if (
+            watched in getattr(self, "_navigation_key_targets", ())
+            and event.type() in {QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress, QEvent.Type.KeyRelease}
+            and isinstance(event, QKeyEvent)
+            and self._handle_viewer_delete_key(event)
+        ):
+            return True
         if self._handle_viewer_close_key_event(watched, event):
             return True
         if (
@@ -7582,4 +7781,6 @@ class ViewerWindow(QMainWindow):
             event.ignore()
             return
         self.closing.emit(self)
+        if self._owns_file_operation_coordinator:
+            self.file_operation_coordinator.close()
         super().closeEvent(event)

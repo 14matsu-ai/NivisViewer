@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 from io import BytesIO
 from pathlib import Path
 from time import monotonic
@@ -15,6 +16,12 @@ from app.application_controller import ApplicationController
 from app.browser_filter import BrowserFilterState, RatingFilterMode
 from app.browser_model import BrowserItemKind
 from app.config_manager import ConfigManager
+
+
+def test_viewer_recycle_notification_ignores_browser_without_current_folder(tmp_path: Path) -> None:
+    browser = SimpleNamespace(current_path=None, refresh_current_folder=lambda: (_ for _ in ()).throw(AssertionError('unexpected refresh')))
+    controller = SimpleNamespace(get_browser_window=lambda: browser)
+    ApplicationController._on_viewer_file_recycled(controller, str(tmp_path / 'page.png'))
 
 
 def write_image(path: Path) -> None:

@@ -170,6 +170,9 @@ class ConfigManager(QObject):
         "file_operation_destinations": [],
         "file_operation_delete_confirm_focus_yes": False,
         "file_operation_delete_skip_confirmation": False,
+        "viewer_delete_mode": "disabled",
+        "viewer_delete_skip_confirmation": False,
+        "viewer_delete_confirm_focus_yes": False,
         "browser_sort_key": "name",
         "browser_sort_order": "ascending",
         "browser_random_seed": 0,
@@ -588,6 +591,8 @@ class ConfigManager(QObject):
             "video_thumbnail_shell_placeholder",
             "file_operation_delete_confirm_focus_yes",
             "file_operation_delete_skip_confirmation",
+            "viewer_delete_skip_confirmation",
+            "viewer_delete_confirm_focus_yes",
         ):
             if not isinstance(normalized.get(key), bool):
                 normalized[key] = cls.DEFAULTS[key]
@@ -692,6 +697,10 @@ class ConfigManager(QObject):
             normalized["browser_filename_display"] = cls.DEFAULTS[
                 "browser_filename_display"
             ]
+        if normalized.get("viewer_delete_mode") not in {
+            "disabled", "single", "spread_front", "spread_back", "spread_cursor",
+        }:
+            normalized["viewer_delete_mode"] = "disabled"
         normalized["browser_filename_gap"] = cls._clamped_int(
             normalized.get("browser_filename_gap"),
             default=0,
