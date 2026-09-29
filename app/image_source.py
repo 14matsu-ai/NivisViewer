@@ -1836,23 +1836,46 @@ class ZipImageSource(ImageSource):
     def configure_read_ahead(self, chain: tuple[str, ...], byte_budget: int) -> None:
         from .zip_read_ahead import ZipReadAhead
 
+        # One cumulative byte budget owns both already-completed near payloads
+        # and the next encoded read. Keeping current chain entries here lets a
+        # prefetched page survive reconfiguration when it becomes current.
         budget = min(max(0, int(byte_budget)), 32 * 1024 * 1024)
-        next_reads = {}
-        keep = set()
+        next_reads: dict[str, tuple[str, int]] = {}
+        keep: set[str] = set()
+
         for image_id in chain:
             info = self._zip.NameToInfo.get(image_id)
-            if info is not None and 0 < info.file_size <= budget:
+            if (
+                info is not None
+                and 0 < info.file_size <= budget
+                and info.compress_type == zipfile.ZIP_DEFLATED
+                and Path(image_id).suffix.casefold()
+                in {".jpg", ".jpeg", ".jpe"}
+            ):
                 keep.add(image_id)
+
         for trigger, next_id in zip(chain, chain[1:]):
             info = self._zip.NameToInfo.get(next_id)
-            if (next_id in keep and info is not None
-                    and info.compress_type == zipfile.ZIP_DEFLATED
-                    and Path(next_id).suffix.casefold() in {".jpg", ".jpeg", ".jpe"}):
-                next_reads[trigger] = (next_id, info.file_size)
+            eligible = bool(
+                next_id in keep
+                and info is not None
+            )
+            if not eligible:
+                # Never leapfrog a nearer non-ring-compatible page.
+                break
+            next_reads[trigger] = (next_id, int(info.file_size))
+
         if self._read_ahead is None and next_reads and not self._closed.is_set():
-            self._read_ahead = ZipReadAhead(self._read_ahead_payload)
+            self._read_ahead = ZipReadAhead(
+                self._read_ahead_payload,
+                max_items=4,
+            )
         if self._read_ahead is not None:
-            self._read_ahead.configure(next_reads, keep)
+            self._read_ahead.configure(
+                next_reads,
+                keep,
+                byte_budget=budget,
+            )
 
     def _read_ahead_payload(self, image_id: str, cancelled: threading.Event) -> tuple[QByteArray, int]:
         with self._active_lock:

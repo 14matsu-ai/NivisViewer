@@ -920,12 +920,17 @@ def test_settings_probe_shutdown_uses_one_deadline_and_deduplicates_dialogs(
             self.waits.append(wait_msecs)
             return self.result
 
+    config = object()
     first = FakeDialog(False)
+    first.config = config
     second = FakeDialog(True)
+    unrelated = FakeDialog(False)
+    unrelated.config = object()
     browser = SimpleNamespace(
         findChildren=lambda _dialog_type: [first, second, first]
     )
     owner = SimpleNamespace(
+        config=config,
         _settings_probe_shutdown_timeout_msecs=250,
         get_browser_window=lambda: browser,
     )
@@ -936,12 +941,15 @@ def test_settings_probe_shutdown_uses_one_deadline_and_deduplicates_dialogs(
         lambda: next(times),
     )
     application_controller_module._RETIRED_SETTINGS_DIALOGS.add(first)
+    application_controller_module._RETIRED_SETTINGS_DIALOGS.add(unrelated)
     try:
         assert not ApplicationController._shutdown_settings_probes(owner)
     finally:
         application_controller_module._RETIRED_SETTINGS_DIALOGS.discard(first)
+        application_controller_module._RETIRED_SETTINGS_DIALOGS.discard(unrelated)
 
     assert first.waits == [250]
+    assert unrelated.waits == []
     assert len(second.waits) == 1
     assert 0 <= second.waits[0] <= 50
 

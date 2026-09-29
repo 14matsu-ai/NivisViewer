@@ -589,7 +589,11 @@ def test_extensionless_and_normal_tmp_files_are_generic_browser_items(
     assert entries[0].display_name == name
     assert entries[0].item_kind == "other"
     assert not entries[0].openable_by_nivisviewer
-    assert entries[0].preview_kind == "windows_shell"
+    if name.endswith(".tmp"):
+        assert entries[0].preview_kind == ""
+        assert not entries[0].can_generate_preview
+    else:
+        assert entries[0].preview_kind == "windows_shell"
 
 
 def test_internal_artifacts_are_hidden_with_all_visibility_flags(

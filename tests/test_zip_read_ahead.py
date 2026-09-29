@@ -211,3 +211,48 @@ def test_runtime_overlaps_read_with_one_decoder_and_notifies_idle_after_cancel(t
         wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
         assert runtime.shutdown()
         source.close()
+
+
+def test_budget_shrink_cancels_pending_before_it_exceeds_cached_budget(qapp):
+    second_started, release = Event(), Event()
+    tokens = {}
+
+    def read(image_id, cancelled):
+        tokens[image_id] = cancelled
+        if image_id == "p2":
+            second_started.set()
+            assert release.wait(5)
+        return QByteArray(b"x" * 80), 1
+
+    ahead = ZipReadAhead(read, max_items=4)
+    try:
+        chain = {"p0": ("p1", 80), "p1": ("p2", 80)}
+        ahead.configure(chain, {"p1", "p2"}, byte_budget=160)
+        ahead.kick("p0")
+        assert second_started.wait(2)
+        assert ahead.reserved_bytes == 160
+        ahead.configure(chain, {"p1", "p2"}, byte_budget=100)
+        assert tokens["p2"].is_set()
+        release.set()
+        assert ahead.wait(2)
+        assert ahead.reserved_bytes == 80
+        assert ahead.take("p1") is not None
+        assert ahead.take("p2") is None
+    finally:
+        release.set()
+        ahead.close()
+
+
+def test_completed_payload_rechecks_actual_bytes_against_live_budget(qapp):
+    del qapp
+    ahead = ZipReadAhead(
+        lambda _image_id, _cancelled: (QByteArray(b"x" * 120), 1)
+    )
+    try:
+        ahead.configure({"p0": ("p1", 80)}, {"p1"}, byte_budget=100)
+        ahead.kick("p0")
+        assert ahead.wait(2)
+        assert ahead.cached_count == 0
+        assert ahead.reserved_bytes == 0
+    finally:
+        ahead.close()

@@ -77,6 +77,13 @@ _FIT_PREVIEW_MODES = frozenset(
 _UNKNOWN_JPEG_ASPECT_LIMIT = 4
 _MAX_EXACT_RENDER_PIXELS = 64 * 1024 * 1024
 _WARMUP_SCAN_SLICE_UNITS = 64
+_BASE_READY_AHEAD_UNITS = 4
+_MAX_READY_AHEAD_UNITS = 12
+_READY_AHEAD_OPPOSITE_UNITS = 1
+_READY_AHEAD_BUDGET_FRACTION = 0.35
+_HEAVY_NEAR_MIN_PIXELS = 12_000_000
+_HEAVY_NEAR_MIN_BYTES = 48 * 1024 * 1024
+_ZIP_ENCODED_RING_UNITS = 4
 DecoderMaximumSize = tuple[int | None, int | None]
 
 
@@ -624,10 +631,13 @@ class ZipRasterRequest:
     render_spec: ZipRasterRenderSpec
     navigation_direction: int = 0
     resolve_layout_metadata: bool = False
+    next_display_units: tuple[ZipRasterDisplayUnit, ...] = ()
 
     def __post_init__(self) -> None:
         if self.warmup_plan.current_identity != self.current.identity:
             raise ValueError("warm-up plan current must match request current")
+        if len(self.next_display_units) > 2:
+            raise ValueError("next display runway must contain at most two units")
         object.__setattr__(self, "source_epoch", int(self.source_epoch))
         object.__setattr__(self, "request_id", int(self.request_id))
         direction = int(self.navigation_direction)
@@ -2750,6 +2760,133 @@ class RasterBookRuntime(QObject):
         planner = self._warmup_planner
         return planner.unprocessed_hint if planner is not None else 0
 
+    def _ready_ahead_preferred_units(
+        self,
+        request: ZipRasterRequest,
+    ) -> int:
+        """Choose a bounded forward runway without ever reordering distance.
+
+        Cheap known pages can extend the ready band inside a fraction of the
+        soft target. A known expensive page extends the band *through* that
+        page so preparation starts early. Every nearer unit remains ahead of
+        it in RasterWarmupPlan's real pixel work order.
+        """
+
+        plan = request.warmup_plan
+        if not plan.background_enabled or not len(plan.topology):
+            return 0
+
+        base = _BASE_READY_AHEAD_UNITS
+        maximum = _MAX_READY_AHEAD_UNITS
+        step = plan.direction or 1
+        anchor = max(
+            0,
+            min(
+                plan.anchor_ordinal,
+                max(0, len(plan.topology) - 1),
+            ),
+        )
+        current_pages = frozenset(plan.current_page_indexes)
+        viewport_width, viewport_height = request.render_spec.viewport_size
+        dpr = request.render_spec.device_pixel_ratio
+        viewport_bytes = max(
+            1,
+            round(
+                viewport_width
+                * viewport_height
+                * dpr
+                * dpr
+                * 4
+            ),
+        )
+        adaptive_budget = min(
+            self._cache_soft_target_bytes,
+            max(
+                viewport_bytes * 2,
+                int(
+                    self._cache_soft_target_bytes
+                    * _READY_AHEAD_BUDGET_FRACTION
+                ),
+            ),
+        )
+        heavy_byte_threshold = max(
+            _HEAVY_NEAR_MIN_BYTES,
+            viewport_bytes * 2,
+        )
+
+        preferred_count = 0
+        cumulative_known_bytes = 0
+        all_costs_known = True
+        adaptive_units = base
+        heavy_units = base
+
+        for distance in range(1, len(plan.topology) + 1):
+            ordinal = anchor + step * distance
+            if not 0 <= ordinal < len(plan.topology):
+                break
+            identity = plan.topology.identity_at(ordinal)
+            if identity == plan.current_identity:
+                continue
+            page_indexes = tuple(
+                plan.topology.page_indexes_at(ordinal)
+            )
+            if current_pages.intersection(page_indexes):
+                continue
+
+            unit = plan.topology.unit_at(ordinal)
+            preferred_count += 1
+            if preferred_count > maximum:
+                break
+
+            hint = self._prefetch_retained_cost_hint(
+                unit,
+                request.render_spec,
+            )
+            if hint is None:
+                all_costs_known = False
+            else:
+                cumulative_known_bytes += max(0, int(hint))
+                if (
+                    preferred_count > base
+                    and all_costs_known
+                    and cumulative_known_bytes <= adaptive_budget
+                ):
+                    adaptive_units = preferred_count
+
+            maximum_pixels = max(
+                (
+                    size[0] * size[1]
+                    for page in unit.pages
+                    if (size := page.known_size) is not None
+                ),
+                default=0,
+            )
+            if (
+                preferred_count > base
+                and (
+                    maximum_pixels >= _HEAVY_NEAR_MIN_PIXELS
+                    or (
+                        hint is not None
+                        and hint >= heavy_byte_threshold
+                    )
+                )
+            ):
+                heavy_units = preferred_count
+
+        return min(
+            maximum,
+            max(base, adaptive_units, heavy_units),
+        )
+
+    def _urgent_priority_identities(
+        self,
+        request: ZipRasterRequest,
+    ) -> tuple[tuple[tuple[int, str], ...], ...]:
+        return request.warmup_plan.priority_band_identities(
+            preferred_units=self._ready_ahead_preferred_units(request),
+            opposite_units=_READY_AHEAD_OPPOSITE_UNITS,
+        )
+
     def cache_debug_values(self) -> dict[str, int | str | bool]:
         """Expose population state to offscreen benchmarks without logging."""
 
@@ -2758,10 +2895,7 @@ class RasterBookRuntime(QObject):
         planner = self._warmup_planner
         request = self._current_request
         priority_identities = (
-            request.warmup_plan.priority_band_identities(
-                preferred_units=4,
-                opposite_units=1,
-            )
+            self._urgent_priority_identities(request)
             if request is not None
             else ()
         )
@@ -3244,10 +3378,7 @@ class RasterBookRuntime(QObject):
         self._capacity_retry_after_completion.discard(current_key)
         planner.discard_capacity_skip(request.current.identity)
         urgent_identities = set(
-            request.warmup_plan.priority_band_identities(
-                preferred_units=4,
-                opposite_units=1,
-            )
+            self._urgent_priority_identities(request)
         )
         for declined_key in tuple(self._admission_declined_prefetch):
             if (
@@ -3262,6 +3393,36 @@ class RasterBookRuntime(QObject):
                 self._capacity_retry_after_completion.discard(declined_key)
                 planner.discard_capacity_skip(declined_key.unit_identity)
 
+        near_keys = {
+            self._key_for(unit, request.render_spec)
+            for unit in request.next_display_units
+        }
+        needs_near = bool(
+            request.warmup_plan.background_enabled
+            and any(
+                key not in self._frame_store
+                and key not in self._failed_prefetch
+                for key in near_keys
+            )
+        )
+        if needs_near and self._zip_read_ahead_enabled:
+            # Recenter the existing encoded ring without throwing away useful
+            # current/near payloads. A distant running entry is cooperatively
+            # cancelled by ZipReadAhead.configure.
+            chain = tuple(
+                page.image_id
+                for unit in (request.current, *request.next_display_units)
+                for page in unit.pages
+            )
+            available = max(
+                0,
+                self._cache_soft_target_bytes
+                - self.cache_bytes
+                + self.source.read_ahead_reserved_bytes
+                - sum(self._inflight_reservations.values()),
+            )
+            self.source.configure_read_ahead(chain, available)
+
         self._release_finished_active_slot()
         for active in self._active_slots():
             active_cancelled = active.cancelled.is_set()
@@ -3274,6 +3435,7 @@ class RasterBookRuntime(QObject):
             elif (
                 not active_cancelled
                 and self._active_job_is_artifact_compatible(active, request)
+                and (not needs_near or active.key in near_keys)
                 and (
                     current_is_ready_or_pending
                     or (
@@ -3582,6 +3744,10 @@ class RasterBookRuntime(QObject):
             or self._dispatch_suspended
         ):
             return
+        planner.set_priority_band(
+            preferred_units=self._ready_ahead_preferred_units(request),
+            opposite_units=_READY_AHEAD_OPPOSITE_UNITS,
+        )
         self._release_finished_active_slot()
         if self._current_key not in self._frame_store:
             if (
@@ -3594,32 +3760,68 @@ class RasterBookRuntime(QObject):
             return
         remaining = _WARMUP_SCAN_SLICE_UNITS
         while self._free_slot_available():
-            if remaining <= 0:
-                self._schedule_warmup_continuation()
-                return
-            unit = planner.next_candidate(
-                identity_of=lambda candidate: candidate.identity,
-                is_ready=lambda candidate: (
-                    (
-                        key := self._key_for(candidate, request.render_spec)
-                    )
-                    in self._frame_store
-                    or self._has_pending_completion(key)
-                    or any(job.key == key for job in self._active_slots())
-                ),
-                is_terminal_failure=lambda candidate: (
-                    self._key_for(candidate, request.render_spec)
-                    in self._failed_prefetch
-                ),
-                scan_limit=remaining,
+            near_only = False
+            near_units = (
+                request.next_display_units
+                if planner.background_released
+                and request.warmup_plan.background_enabled
+                else ()
             )
-            remaining -= planner.last_scan_count
-            if unit is None:
-                if planner.stop_reason is WarmupStopReason.YIELDED:
+            unresolved_near = [
+                unit for unit in near_units
+                if (
+                    (key := self._key_for(unit, request.render_spec))
+                    not in self._frame_store
+                    and key not in self._failed_prefetch
+                )
+            ]
+            if unresolved_near:
+                # Do not let the planner's reverse-safety unit, distant header
+                # corridor or encoded ring run ahead of the next two screens.
+                # Completion/navigation calls _drive again; no polling owner.
+                near_only = True
+                unit = next(
+                    (candidate for candidate in unresolved_near
+                     if not self._has_pending_completion(
+                         self._key_for(candidate, request.render_spec)
+                     )
+                     and not any(
+                         job.key == self._key_for(candidate, request.render_spec)
+                         for job in self._active_slots()
+                     )),
+                    None,
+                )
+                if unit is None:
+                    return
+            else:
+                if remaining <= 0:
                     self._schedule_warmup_continuation()
-                return
+                    return
+                unit = planner.next_candidate(
+                    identity_of=lambda candidate: candidate.identity,
+                    is_ready=lambda candidate: (
+                        (
+                            key := self._key_for(candidate, request.render_spec)
+                        )
+                        in self._frame_store
+                        or self._has_pending_completion(key)
+                        or any(job.key == key for job in self._active_slots())
+                    ),
+                    is_terminal_failure=lambda candidate: (
+                        self._key_for(candidate, request.render_spec)
+                        in self._failed_prefetch
+                    ),
+                    scan_limit=remaining,
+                )
+                remaining -= planner.last_scan_count
+                if unit is None:
+                    if planner.stop_reason is WarmupStopReason.YIELDED:
+                        self._schedule_warmup_continuation()
+                    return
             key = self._key_for(unit, request.render_spec)
-            metadata_pages = self._layout_metadata_pages_for(key)
+            metadata_pages = self._layout_metadata_pages_for(
+                key, near_only=near_only,
+            )
             decision = (
                 None
                 if metadata_pages
@@ -3633,6 +3835,7 @@ class RasterBookRuntime(QObject):
                     decision.action is RasterAdmissionAction.SOFT_TARGET_REACHED
                     and self.cache_bytes + sum(self._inflight_reservations.values())
                     >= decision.target_bytes
+                    and not near_only
                 ):
                     planner.stop_for_soft_target()
                     return
@@ -3655,17 +3858,15 @@ class RasterBookRuntime(QObject):
                 continue
             priority = (
                 ImageWorkPriority.VIEWER_NEXT
-                if unit.identity
-                in request.warmup_plan.priority_band_identities(
-                    preferred_units=4,
-                    opposite_units=1,
-                )
+                if near_only or unit.identity
+                in self._urgent_priority_identities(request)
                 else ImageWorkPriority.VIEWER_PREVIOUS
             )
             if not self._submit(
                 key,
                 priority,
                 layout_metadata_pages=metadata_pages,
+                allow_encoded_prefetch=not near_only,
             ):
                 planner.recenter(request.warmup_plan)
                 return
@@ -3713,10 +3914,7 @@ class RasterBookRuntime(QObject):
         request = self._current_request
         if rank is None or request is None:
             return rank
-        if key.unit_identity in request.warmup_plan.priority_band_identities(
-            preferred_units=4,
-            opposite_units=1,
-        ):
+        if key.unit_identity in self._urgent_priority_identities(request):
             return min(rank, self._admission_policy.minimum_protected_rank)
         return rank
 
@@ -3734,6 +3932,8 @@ class RasterBookRuntime(QObject):
     def _layout_metadata_pages_for(
         self,
         key: _UnitKey,
+        *,
+        near_only: bool = False,
     ) -> tuple[ZipRasterPage, ...]:
         request = self._current_request
         unit = self._unit_for_key(key)
@@ -3745,13 +3945,16 @@ class RasterBookRuntime(QObject):
             self._layout_metadata_attempted,
             maximum_pages=(
                 len(unit.pages)
-                if key == self._current_key
+                if key == self._current_key or near_only
                 else LAYOUT_METADATA_BATCH_PAGES
             ),
             # Resolve just the visible spread before painting. Neighbor
             # headers are useful for admission, but must not delay the first
             # current-unit decode on a cold book.
-            include_nearby=key != self._current_key,
+            include_nearby=key != self._current_key and not near_only,
+            directional_bias=(
+                0.75 if key != self._current_key else None
+            ),
         )
 
     def _prefetch_admission_decision(
@@ -4148,23 +4351,78 @@ class RasterBookRuntime(QObject):
                 or not planner.background_released or not request.warmup_plan.background_enabled):
             self.source.cancel_read_ahead()
             return
+
+        # Keep display/decode distance order. The source may retain up to four
+        # cheap encoded JPEG payloads, but it never leapfrogs an incompatible
+        # or over-budget nearer page.
         chain = [page.image_id for page in unit.pages]
+        near_keys = {
+            self._key_for(candidate, spec)
+            for candidate in request.next_display_units
+        }
+        if request.next_display_units and any(
+            key not in self._frame_store and key not in self._failed_prefetch
+            for key in near_keys
+        ):
+            # A cold current may be submitted after navigation. Keep its
+            # encoded ring inside the same two-screen runway as the decoder.
+            chain.extend(
+                page.image_id
+                for candidate in request.next_display_units
+                for page in candidate.pages
+            )
+            following_allowed = False
+        else:
+            following_allowed = True
         direction = -1 if request.navigation_direction < 0 else 1
-        boundary = (min if direction < 0 else max)(page.page_index for page in unit.pages)
-        following = request.warmup_plan.unit_for_page(boundary + direction)
-        if following is not None and following.identity != unit.identity:
-            page = following.pages[0]
-            if self._source_store.find(page, spec, unit=following, touch=False) is None:
-                chain.append(page.image_id)
+        boundary = (min if direction < 0 else max)(
+            page.page_index for page in unit.pages
+        )
+        seen_units = {unit.identity}
+        for _unused in range(
+            _ZIP_ENCODED_RING_UNITS if following_allowed else 0
+        ):
+            following = request.warmup_plan.unit_for_page(
+                boundary + direction
+            )
+            if (
+                following is None
+                or following.identity in seen_units
+            ):
+                break
+            seen_units.add(following.identity)
+            for page in following.pages:
+                if (
+                    self._source_store.find(
+                        page,
+                        spec,
+                        unit=following,
+                        touch=False,
+                    )
+                    is None
+                ):
+                    chain.append(page.image_id)
+            boundary = (min if direction < 0 else max)(
+                page.page_index for page in following.pages
+            )
+
         # Charge both reading and completed encoded bytes against the same
-        # book budget. The existing slot is credited only to replace/reuse it;
-        # the source never starts a second encoded read while that slot lives.
-        available = max(0, self._cache_soft_target_bytes - self.cache_bytes
-            + self.source.read_ahead_reserved_bytes - sum(self._inflight_reservations.values()))
+        # book budget. Existing ring bytes are credited only so reconfiguration
+        # can retain still-near payloads rather than double-reserving them.
+        available = max(
+            0,
+            self._cache_soft_target_bytes
+            - self.cache_bytes
+            + self.source.read_ahead_reserved_bytes
+            - sum(self._inflight_reservations.values()),
+        )
         self.source.configure_read_ahead(tuple(chain), available)
         signal = self.source.read_ahead_completed
         if not self._zip_read_ahead_connected and signal is not None:
-            signal.connect(self._on_zip_read_ahead_completed, Qt.ConnectionType.QueuedConnection)
+            signal.connect(
+                self._on_zip_read_ahead_completed,
+                Qt.ConnectionType.QueuedConnection,
+            )
             self._zip_read_ahead_connected = True
 
     def _on_zip_read_ahead_completed(self) -> None:
@@ -4177,6 +4435,7 @@ class RasterBookRuntime(QObject):
         priority: ImageWorkPriority,
         *,
         layout_metadata_pages: tuple[ZipRasterPage, ...] | None = None,
+        allow_encoded_prefetch: bool = True,
     ) -> bool:
         request = self._current_request
         unit = self._unit_for_key(key)
@@ -4256,10 +4515,11 @@ class RasterBookRuntime(QObject):
             self._secondary_job = job
         self._jobs.add(job)
         self._inflight_reservations[job] = max(1, reservation)
-        self._configure_zip_read_ahead(
-            unit, key.render_spec,
-            allow=not metadata_pages and len(cached_sources) < len(unit.pages),
-        )
+        if allow_encoded_prefetch:
+            self._configure_zip_read_ahead(
+                unit, key.render_spec,
+                allow=not metadata_pages and len(cached_sources) < len(unit.pages),
+            )
         if self._coordinator is not None:
             started = (
                 self._coordinator.start_folder_viewer(job, int(priority))

@@ -1426,9 +1426,14 @@ def test_z_shortcut_toggles_from_child_focus_escape_cancels_and_m_does_nothing(
     _finish_display(window.viewer, qapp)
     image_rect = window.viewer._last_image_layout[0][0]
     QTest.mouseMove(window.viewer, image_rect.center())
+    # Offscreen Qt may elide a move when the global cursor is already there.
+    window.viewer._mouse_pos = image_rect.center()
+    window.slider.set_page_state(1, 0)
     window.activateWindow()
     qapp.processEvents()
     window.slider.setFocus()
+    qapp.processEvents()
+    assert window.slider.hasFocus()
 
     assert window.magnifier_action.text() == "拡大鏡の切り替え"
     assert window.magnifier_action.shortcut().toString() == "Z"

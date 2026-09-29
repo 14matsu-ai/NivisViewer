@@ -37,3 +37,42 @@ def test_current_metadata_preflight_does_not_read_a_neighbor_batch():
     assert [page.page_index for page in current] == [48]
     assert len(background) == 32
     assert [page.page_index for page in background[:5]] == [48, 49, 47, 50, 46]
+
+
+def test_directional_header_corridor_has_constant_visit_and_distance_bound():
+    from types import SimpleNamespace
+
+    anchor = 50_000
+    current = _unit(anchor)
+
+    class CountingTopology:
+        def __init__(self):
+            self.visits = []
+
+        def __len__(self):
+            return 100_000
+
+        def ordinal_for_identity(self, _identity):
+            return anchor
+
+        def ordinal_for_page(self, _page_index):
+            return anchor
+
+        def unit_at(self, ordinal):
+            self.visits.append(ordinal)
+            assert len(self.visits) <= 300, "header selection scanned the book"
+            return ZipRasterDisplayUnit(
+                ordinal,
+                (ZipRasterPage(ordinal, f"page-{ordinal}.jpg", (100, 100)),),
+                True,
+            )
+
+    topology = CountingTopology()
+    plan = SimpleNamespace(topology=topology, direction=1)
+    pages = select_layout_metadata_pages(
+        current, plan, set(), maximum_pages=32,
+        include_nearby=True, directional_bias=0.75,
+    )
+    assert [page.page_index for page in pages] == [anchor]
+    assert len(topology.visits) <= 256
+    assert max(abs(ordinal - anchor) for ordinal in topology.visits) <= 128

@@ -507,6 +507,38 @@ class RasterWarmupPlanner(Generic[UnitT, IdentityT]):
             opposite_units=opposite_units,
         )
 
+    def set_priority_band(
+        self,
+        *,
+        preferred_units: int,
+        opposite_units: int,
+    ) -> bool:
+        """Resize the urgent prefix without changing distance ordering.
+
+        Header metadata can reveal that a nearby future page is expensive.
+        Expanding this band starts the path toward that page earlier; it does
+        not allow the expensive page to leapfrog any nearer display unit.
+        """
+
+        preferred = max(0, int(preferred_units))
+        opposite = max(0, int(opposite_units))
+        if (
+            preferred == self._preferred_units
+            and opposite == self._opposite_units
+        ):
+            return False
+        self._preferred_units = preferred
+        self._opposite_units = opposite
+        self._deferred_by_target = 0
+        self._last_candidate_identity = None
+        self._iterator = self._new_iterator()
+        if (
+            self._released
+            and self._stop_reason is not WarmupStopReason.SUSPENDED
+        ):
+            self._stop_reason = WarmupStopReason.RUNNING
+        return True
+
     def release_after_paint(self) -> None:
         # Paint transfers displayed-frame ownership at the runtime boundary.
         # It is deliberately not a scheduler release or resume signal.

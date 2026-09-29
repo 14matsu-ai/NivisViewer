@@ -43,6 +43,27 @@ _VIDEO_PREVIEW_EXTENSIONS = {
 }
 
 
+_TRANSIENT_DOWNLOAD_SUFFIXES = frozenset(
+    {
+        ".crdownload",
+        ".part",
+        ".partial",
+        ".download",
+        ".tmp",
+        ".aria2",
+        ".opdownload",
+    }
+)
+
+
+def _is_transient_download_name(name: str) -> bool:
+    lowered = str(name).casefold()
+    return any(
+        lowered.endswith(suffix)
+        for suffix in _TRANSIENT_DOWNLOAD_SUFFIXES
+    )
+
+
 class BrowserScanStatus(str, Enum):
     NORMAL_DIRECTORY = "normal_directory"
     EMPTY_DIRECTORY = "empty_directory"
@@ -211,6 +232,16 @@ def scan_entry_from_dir_entry(
             return None
     except OSError:
         return None
+
+    transient_download = (
+        not is_directory and _is_transient_download_name(name)
+    )
+    if transient_download:
+        # Keep the file visible when unsupported files are enabled, but never
+        # ask Windows Shell/archive/image preview backends to inspect an
+        # actively written temporary payload.
+        preview_kind = ""
+
     if not visibility_policy.allows(
         hidden=hidden,
         system=system,
@@ -243,7 +274,7 @@ def scan_entry_from_dir_entry(
         hidden=hidden,
         system=system,
         openable_by_nivisviewer=supported,
-        can_generate_preview=True,
+        can_generate_preview=not transient_download,
         preview_kind=preview_kind,
         online_only=requires_download(attributes),
         rating=filename_metadata.rating,

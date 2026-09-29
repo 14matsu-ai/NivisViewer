@@ -207,10 +207,14 @@ def test_fullscreen_escape_magnifier_and_doubleclick(book, qapp):
     key(window, Qt.Key.Key_Escape)
     assert not window.fullscreen_chrome.fullscreen
     window.viewer.setFocus()
-    QTest.mouseMove(window.viewer, window.viewer.rect().center())
+    position = window.viewer.rect().center()
+    QTest.mouseMove(window.viewer, position)
+    window.viewer._mouse_pos = position
     window.activateWindow()
+    qapp.setActiveWindow(window)
     window.viewer.setFocus()
     qapp.processEvents()
+    assert qapp.focusWidget() is window.viewer
     key(window, Qt.Key.Key_Z)
     assert window.viewer.magnifier_active or window.viewer.magnifier_selecting
     key(window, Qt.Key.Key_Z)
@@ -225,10 +229,14 @@ def test_escape_cancels_loupe_before_fullscreen(book):
     window, _ = book
     key(window, Qt.Key.Key_F)
     window.viewer.setFocus()
-    QTest.mouseMove(window.viewer, window.viewer.rect().center())
+    position = window.viewer.rect().center()
+    QTest.mouseMove(window.viewer, position)
+    window.viewer._mouse_pos = position
     window.activateWindow()
+    QApplication.setActiveWindow(window)
     window.viewer.setFocus()
     QApplication.processEvents()
+    assert QApplication.focusWidget() is window.viewer
     key(window, Qt.Key.Key_Z)
     assert window.viewer.magnifier_active or window.viewer.magnifier_selecting
     key(window, Qt.Key.Key_Escape)

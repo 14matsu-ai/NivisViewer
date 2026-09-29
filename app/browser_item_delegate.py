@@ -523,6 +523,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
         badge_icon_left_margin: int = -1,
         badge_icon_bottom_margin: int = -1,
         show_rating_overlay: bool = True,
+        show_type_badge: bool = True,
         show_tag_overlay: bool = True,
         rating_overlay_opacity: int = BROWSER_RATING_OVERLAY_DEFAULT_OPACITY,
         tag_overlay_opacity: int = BROWSER_TAG_OVERLAY_DEFAULT_OPACITY,
@@ -588,6 +589,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
         self.badge_icon_left_margin = normalize_browser_icon_margin(badge_icon_left_margin)
         self.badge_icon_bottom_margin = normalize_browser_icon_margin(badge_icon_bottom_margin)
         self.show_rating_overlay = bool(show_rating_overlay)
+        self.show_type_badge = bool(show_type_badge)
         self.show_tag_overlay = bool(show_tag_overlay)
         self.rating_overlay_opacity = max(0, min(100, int(rating_overlay_opacity)))
         self.tag_overlay_opacity = max(0, min(100, int(tag_overlay_opacity)))
@@ -683,6 +685,7 @@ class BrowserItemDelegate(QStyledItemDelegate):
         badge_icon_left_margin: int | None = None,
         badge_icon_bottom_margin: int | None = None,
         show_rating_overlay: bool | None = None,
+        show_type_badge: bool | None = None,
         show_tag_overlay: bool | None = None,
         rating_overlay_opacity: int | None = None,
         tag_overlay_opacity: int | None = None,
@@ -707,6 +710,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
             self.badge_icon_bottom_margin = normalize_browser_icon_margin(badge_icon_bottom_margin)
         if show_rating_overlay is not None:
             self.show_rating_overlay = bool(show_rating_overlay)
+        if show_type_badge is not None:
+            self.show_type_badge = bool(show_type_badge)
         if show_tag_overlay is not None:
             self.show_tag_overlay = bool(show_tag_overlay)
         if rating_overlay_opacity is not None:
@@ -896,7 +901,8 @@ class BrowserItemDelegate(QStyledItemDelegate):
                         dpr,
                     )
                 )
-            self._paint_type_icon(painter, thumbnail_rect, item)
+            if self.show_type_badge:
+                self._paint_type_icon(painter, thumbnail_rect, item)
             if item.online_only:
                 badge = QRect(thumbnail_rect.right() - 24, thumbnail_rect.top() + 3, 22, 20)
                 painter.fillRect(badge, option.palette.base())

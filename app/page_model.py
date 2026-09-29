@@ -524,6 +524,32 @@ class PageModel:
             return 0
         return self.spread_start_for_index(start_index - 1)
 
+    def next_display_spreads(
+        self, *, direction: int = 1, count: int = 2,
+    ) -> tuple[DisplaySpread, ...]:
+        """Return the next normal page-turn screens without moving the model.
+
+        This follows the same edge/alignment rule as an actual next/previous
+        command. A spread is one display unit, regardless of its page count.
+        """
+        if not self.total_pages:
+            return ()
+        step = -1 if int(direction) < 0 else 1
+        index, sliding = self.current_index, self._sliding_spread
+        result: list[DisplaySpread] = []
+        for _ in range(max(0, min(2, int(count)))):
+            target = (
+                self.next_index_from(index) if step > 0
+                else self.previous_index_from(index, preserve_alignment=sliding)
+            )
+            if target == index:
+                break
+            index = target
+            if sliding:
+                sliding = self._uses_shifted_spread_anchor(index)
+            result.append(self.spread_at(index))
+        return tuple(result)
+
     def prefetch_spreads(
         self,
         *,

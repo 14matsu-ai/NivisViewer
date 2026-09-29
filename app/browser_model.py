@@ -375,6 +375,86 @@ class BrowserItemModel(QAbstractListModel):
                     index = self.index(row, 0)
                     self.dataChanged.emit(index, index, [])
 
+    def update_sorted_items_in_place(
+        self,
+        items: tuple[BrowserItem, ...] | list[BrowserItem],
+        *,
+        preserve_thumbnails: bool = True,
+    ) -> bool:
+        """Refresh metadata without resetting an unchanged visible row order.
+
+        Files that are merely growing should not rebuild the whole QListView.
+        Path-order changes, additions/removals, or filter-membership changes
+        deliberately fall back to the existing reset path.
+        """
+
+        new_source = list(items)
+        if len(new_source) != len(self._source_items):
+            return False
+        if [
+            self._key(item.path) for item in new_source
+        ] != [
+            self._key(item.path) for item in self._source_items
+        ]:
+            return False
+
+        new_visible = [
+            item
+            for item in new_source
+            if self._filter_state.matches(item)
+        ]
+        if [
+            self._key(item.path) for item in new_visible
+        ] != [
+            self._key(item.path) for item in self._items
+        ]:
+            return False
+
+        old_source = self._source_items
+        old_visible = self._items
+        revision_changed: set[str] = set()
+        icon_changed: set[str] = set()
+        for old, new in zip(old_source, new_source):
+            key = self._key(new.path)
+            if old.thumbnail_revision != new.thumbnail_revision:
+                revision_changed.add(key)
+            if old.kind != new.kind or old.extension != new.extension:
+                icon_changed.add(key)
+
+        self._source_items = new_source
+        self._items = new_visible
+        self._unfiltered_view = None
+        self._scan_generation = None
+        self._rating_previews.clear()
+
+        if preserve_thumbnails:
+            # Same path order means only changed source fingerprints need
+            # eviction; do not rebuild/filter every retained cache dictionary.
+            for key in revision_changed:
+                self._thumbnail_images.pop(key, None)
+                self._thumbnail_signatures.pop(key, None)
+                self._low_resolution_thumbnails.discard(key)
+                # Preserve the settled failure/status while a growing file
+                # changes revision. The provider's finite retry ledger owns
+                # when replacement work may start and will replace the status.
+                self._image_dimensions.pop(key, None)
+            for key in icon_changed:
+                self._icons.pop(key, None)
+        else:
+            self._icons.clear()
+            self._thumbnail_images.clear()
+            self._thumbnail_signatures.clear()
+            self._low_resolution_thumbnails.clear()
+            self._thumbnail_errors.clear()
+            self._preview_statuses.clear()
+            self._image_dimensions.clear()
+
+        for row, (old, new) in enumerate(zip(old_visible, self._items)):
+            if old != new:
+                index = self.index(row, 0)
+                self.dataChanged.emit(index, index, [])
+        return True
+
     def reuse_known_page_counts(
         self,
         items: tuple[BrowserItem, ...] | list[BrowserItem],

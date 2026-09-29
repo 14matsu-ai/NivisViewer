@@ -20,7 +20,6 @@ from typing import Callable
 from PySide6.QtCore import (
     QByteArray,
     QCoreApplication,
-    QDir,
     QEvent,
     QItemSelectionModel,
     QModelIndex,
@@ -60,7 +59,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFileDialog,
-    QFileSystemModel,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -214,6 +212,7 @@ from .folder_bookmark_model import FolderBookmarkModel
 from .favorite_tabs import FavoriteTabs
 from .sidebar_history_view import SidebarHistoryView
 from .folder_tree_sync import FolderTreeSyncController
+from .folder_tree_model import FolderTreeModel
 from .history_model import HistoryModel
 from .image_work_coordinator import ImageWorkCoordinator
 from .image_source import FolderListingSnapshot
@@ -764,6 +763,7 @@ class BrowserWindow(QMainWindow):
         self._favorite_release_navigated = False
         self._location_restore_token = 0
         self._list_view_restore_token = 0
+        self._list_scroll_epoch = 0
         self._restoring_list_view_state = False
         self._status_message_token = 0
         self._temporary_status_message: str | None = None
@@ -922,6 +922,9 @@ class BrowserWindow(QMainWindow):
         )
         self.browser_show_rating_overlay = bool(
             self.settings.get("browser_show_rating_overlay", True)
+        )
+        self.browser_show_type_badge = bool(
+            self.settings.get("browser_show_type_badge", True)
         )
         self.browser_show_tag_overlay = bool(
             self.settings.get("browser_show_tag_overlay", True)
@@ -1455,19 +1458,40 @@ class BrowserWindow(QMainWindow):
                     self._generation = self.thumbnail_provider.begin_generation(
                         retry_failed=retry_failed_requested,
                     )
-                self.item_model.set_sorted_items(
-                    items,
-                    preserve_thumbnails=True,
-                )
-                if self._pending_browser_focus is None:
-                    self._schedule_list_view_state_restore(
-                        state,
-                        update_navigation_history=True,
+
+                updated_in_place = bool(
+                    filesystem_change
+                    and self.item_model.update_sorted_items_in_place(
+                        items,
+                        preserve_thumbnails=True,
                     )
-                self._restore_location(
-                    pending.restore_location,
-                    update_status=False,
                 )
+                if not updated_in_place:
+                    self.item_model.set_sorted_items(
+                        items,
+                        preserve_thumbnails=True,
+                    )
+
+                if self._pending_browser_focus is None:
+                    if updated_in_place:
+                        self._update_current_navigation_state()
+                    else:
+                        self._schedule_list_view_state_restore(
+                            state,
+                            update_navigation_history=True,
+                            prefer_anchor=filesystem_change,
+                            respect_user_scroll=filesystem_change,
+                        )
+
+                # A filesystem-watch refresh is passive. Its restore_location
+                # was captured when the scan started and may already be stale
+                # after a fast user scroll. The completion-time anchor above is
+                # authoritative for passive refreshes.
+                if not filesystem_change:
+                    self._restore_location(
+                        pending.restore_location,
+                        update_status=False,
+                    )
             elif retry_failed:
                 # A finished external write may make a previously failed
                 # thumbnail readable even when listing metadata is unchanged.
@@ -2236,6 +2260,17 @@ class BrowserWindow(QMainWindow):
 
     def _flush_directory_changes(self) -> None:
         self._directory_change_timer.stop()
+        if (
+            self._fast_scrolling
+            and self._directory_change_pending
+            and not self._shutdown_prepared
+        ):
+            # Do not start an O(N) directory reconciliation while a fast
+            # viewport gesture is in progress. Scroll-idle releases it.
+            self._directory_change_timer.start(
+                max(50, self._scroll_idle_timer.interval())
+            )
+            return
         self._directory_change_burst.reset()
         if not self._directory_change_pending or self._shutdown_prepared:
             return
@@ -3538,7 +3573,8 @@ class BrowserWindow(QMainWindow):
         operation: FileOperationKind,
     ) -> None:
         menu.clear()
-        recent_menu = menu.addMenu(tr('最近使った移動先'))
+        recent_menu = QMenu(tr('最近使った移動先'), menu)
+        menu.addMenu(recent_menu)
         recent = self.destination_history.entries()
         if not recent:
             empty = recent_menu.addAction(tr('（履歴なし）'))
@@ -3553,7 +3589,8 @@ class BrowserWindow(QMainWindow):
                     else self.move_selected_to(path)
                 )
             )
-        favorite_menu = menu.addMenu(tr('お気に入り'))
+        favorite_menu = QMenu(tr('お気に入り'), menu)
+        menu.addMenu(favorite_menu)
         favorite_entries = tuple(getattr(self.folder_bookmark_model, "entries", ()))
         if not favorite_entries:
             empty = favorite_menu.addAction(tr('（お気に入りなし）'))
@@ -4418,6 +4455,7 @@ class BrowserWindow(QMainWindow):
     def _browser_overlay_delegate_options(self) -> dict[str, object]:
         return {
             "show_rating_overlay": self.browser_show_rating_overlay,
+            "show_type_badge": self.browser_show_type_badge,
             "show_tag_overlay": self.browser_show_tag_overlay,
             "rating_overlay_opacity": self.browser_rating_overlay_opacity,
             "tag_overlay_opacity": self.browser_tag_overlay_opacity,
@@ -4431,6 +4469,7 @@ class BrowserWindow(QMainWindow):
     def _apply_browser_overlay_settings(self, changed: dict[str, object]) -> None:
         keys = {
             "browser_show_rating_overlay",
+            "browser_show_type_badge",
             "browser_show_tag_overlay",
             "browser_rating_overlay_opacity",
             "browser_tag_overlay_opacity",
@@ -4444,6 +4483,9 @@ class BrowserWindow(QMainWindow):
             return
         self.browser_show_rating_overlay = bool(
             self.config.get("browser_show_rating_overlay", True)
+        )
+        self.browser_show_type_badge = bool(
+            self.config.get("browser_show_type_badge", True)
         )
         self.browser_show_tag_overlay = bool(
             self.config.get("browser_show_tag_overlay", True)
@@ -6824,10 +6866,7 @@ class BrowserWindow(QMainWindow):
         # Keep only the top-level menu row compact. Popup QMenu geometry and
         # application fonts remain owned by the active platform style.
         install_text_icon_menu_style(self.menuBar(), compact=True)
-        self.file_system_model = QFileSystemModel(self)
-        self.file_system_model.setFilter(
-            QDir.Filter.AllDirs | QDir.Filter.NoDotAndDotDot | QDir.Filter.Drives
-        )
+        self.file_system_model = FolderTreeModel(self)
         self.file_system_model.setRootPath("")
 
         self.folder_tree = PathDropTreeView(self)
@@ -8029,6 +8068,7 @@ class BrowserWindow(QMainWindow):
             return
         raw_delta = int(value) - self._last_scroll_value
         if raw_delta:
+            self._list_scroll_epoch += 1
             self._thumbnail_scroll_direction = 1 if raw_delta > 0 else -1
         delta = abs(raw_delta)
         elapsed = now - self._last_scroll_time
@@ -8051,6 +8091,13 @@ class BrowserWindow(QMainWindow):
     def _on_scroll_idle(self) -> None:
         self._fast_scrolling = False
         self._schedule_thumbnail_requests(0)
+        if (
+            self._directory_change_pending
+            and not self._shutdown_prepared
+        ):
+            # A passive directory refresh deferred during fast scrolling can
+            # now run without fighting the user's viewport ownership.
+            self._directory_change_timer.start(0)
 
     def _on_thumbnail_ready(self, path: str, generation: int, qimage) -> None:
         if (
@@ -8283,15 +8330,35 @@ class BrowserWindow(QMainWindow):
         *,
         request_thumbnails: bool = True,
         update_navigation_history: bool = False,
+        prefer_anchor: bool = False,
+        respect_user_scroll: bool = False,
     ) -> None:
         self._list_view_restore_token += 1
         token = self._list_view_restore_token
-        self._restore_list_view_state(state)
+        scroll_epoch = self._list_scroll_epoch
+        self._restore_list_view_state(
+            state,
+            prefer_anchor=prefer_anchor,
+        )
 
         def restore_after_layout() -> None:
             if token != self._list_view_restore_token:
                 return
-            self._restore_list_view_state(state)
+            if (
+                respect_user_scroll
+                and scroll_epoch != self._list_scroll_epoch
+            ):
+                # Model layout completed after the user scrolled again. Keep
+                # that newer viewport rather than replaying a stale refresh.
+                if update_navigation_history:
+                    self._update_current_navigation_state()
+                if request_thumbnails:
+                    self._schedule_thumbnail_requests()
+                return
+            self._restore_list_view_state(
+                state,
+                prefer_anchor=prefer_anchor,
+            )
             if update_navigation_history:
                 self._update_current_navigation_state()
             if request_thumbnails:
@@ -8299,7 +8366,12 @@ class BrowserWindow(QMainWindow):
 
         QTimer.singleShot(0, restore_after_layout)
 
-    def _restore_list_view_state(self, state: _ListViewState) -> None:
+    def _restore_list_view_state(
+        self,
+        state: _ListViewState,
+        *,
+        prefer_anchor: bool = False,
+    ) -> None:
         selection_model = self.list_view.selectionModel()
         if selection_model is None:
             return
@@ -8329,7 +8401,11 @@ class BrowserWindow(QMainWindow):
                 QItemSelectionModel.SelectionFlag.NoUpdate,
             )
 
-            if restored_selection and current.isValid():
+            if (
+                restored_selection
+                and current.isValid()
+                and not prefer_anchor
+            ):
                 current_rect = self.list_view.visualRect(current)
                 visible_rect = self.list_view.viewport().rect().adjusted(
                     1,
@@ -8887,6 +8963,7 @@ class BrowserWindow(QMainWindow):
             selection_count == 1
             and item is not None
             and item.kind is not BrowserItemKind.FOLDER
+            and item.path.is_file()
         )
         location_action.setEnabled(item is not None)
         if current_location_action is not None:
@@ -9050,7 +9127,9 @@ class BrowserWindow(QMainWindow):
         if selected == open_action:
             self.open_folder_bookmark(index)
         elif selected == location_action:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(entry.path))
+            self._queue_system_open_probe(
+                entry.path, action="explorer", is_directory=True
+            )
         elif selected == rename_action:
             self.rename_folder_bookmark(index)
         elif selected == move_up_action:

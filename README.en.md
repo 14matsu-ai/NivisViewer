@@ -15,7 +15,7 @@
 <a id="overview"></a>
 ## Overview
 
-NivisViewer is a comic and image viewer for Windows. It takes inspiration from ZipPla's controls and behavior while using its own implementation without reusing ZipPla source code.
+NivisViewer is a comic and image viewer for Windows. It draws on ZipPla's controls and behavior, and parts of its Viewer processing structure are ported from AGPL-3.0-or-later ZipPlaFork. The provenance and corresponding code are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 It includes a folder tree synchronized with favorite folders, a BrowserWindow with a fixed-cell thumbnail grid, a separate ViewerWindow for books, settings, flush two-page spreads, a portable thumbnail cache, folder and single-image viewing, ZIP/CBZ, RAR/7z-family archive and PDF support, natural sorting, and asynchronous image loading. ViewerWindow also supports moving between books with the mouse Back/Forward buttons, configurable right-button drag gestures, and UI that appears at the screen edge in fullscreen mode.
 
@@ -109,3 +109,5 @@ Dropping from Explorer onto the Browser center means “show this location,” n
 ## License
 
 The current project license for NivisViewer is **GNU AGPL version 3 or later (`AGPL-3.0-or-later`)**. The full license text is in [LICENSE](LICENSE); [PROJECT_LICENSE.md](PROJECT_LICENSE.md) contains the application notice and copyright information. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the [ZipPlaFork comparison record](docs/ZIPPLAFORK_COMPARISON.md) for the provenance of structures migrated from ZipPlaFork. Licenses of dependencies, including MIT, BSD, Apache, LGPL, and GPL, are retained.
+
+In Settings → Browser → Thumbnail information, Show icon controls only the small file type badge at the lower left of a thumbnail. Show filename controls the filename below it and uses the existing Filename line-count setting. Both are on by default.

@@ -184,7 +184,8 @@ def test_explorer_assume_available_skips_duplicate_exists(tmp_path: Path, monkey
 
 @pytest.mark.parametrize(
     "state",
-    [PathAvailability.MISSING, PathAvailability.UNAVAILABLE, PathAvailability.ERROR],
+    [PathAvailability.MISSING, PathAvailability.UNAVAILABLE, PathAvailability.ERROR,
+     PathAvailability.ONLINE_ONLY],
 )
 def test_unavailable_shell_target_never_launches(
     tmp_path: Path, qapp: QApplication, state: PathAvailability
@@ -204,6 +205,44 @@ def test_unavailable_shell_target_never_launches(
     try:
         assert window._open_system_file(tmp_path / "absent.bin")
         assert _spin(qapp, lambda: window._pending_system_open is None)
+    finally:
+        window.close()
+        service.close()
+        qapp.processEvents()
+
+
+def test_favorite_explorer_action_blocks_online_only_target(tmp_path, qapp, monkeypatch):
+    from types import SimpleNamespace
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QMenu
+    from app.i18n import tr
+
+    class Filesystem:
+        def probe(self, _path):
+            return PathAvailability.ONLINE_ONLY
+
+    class Opener:
+        def open_in_explorer(self, *args, **kwargs):
+            raise AssertionError("Explorer launched for online-only favorite")
+
+    service = PathAvailabilityService(filesystem=Filesystem())
+    window = _window(tmp_path, qapp, path_availability_service=service,
+                     system_file_opener=Opener())
+    try:
+        entry = SimpleNamespace(path=str(tmp_path / "online"), exists=True)
+        monkeypatch.setattr(window.folder_bookmark_model, "entry_at", lambda _: entry)
+        class TestMenu(QMenu):
+            def exec(self, *_):
+                return next(action for action in self.actions()
+                            if action.text() == tr('エクスプローラーで場所を開く'))
+
+        monkeypatch.setattr("app.browser_window.QMenu", TestMenu)
+        window._show_folder_bookmark_context_menu(QPoint())
+        assert window._pending_system_open is not None
+        assert window._pending_system_open.action == "explorer"
+        assert _spin(qapp, lambda: window._pending_system_open is None)
+        from app.cloud_files import online_only_message
+        assert window.statusBar().currentMessage() == online_only_message()
     finally:
         window.close()
         service.close()

@@ -4,6 +4,8 @@ from .browser_workflow_settings import BrowserWorkflowSettings, gesture_help_row
 from .browser_workflow_policy import WORKFLOW_DEFAULTS
 
 from .i18n import UI_LANGUAGE_CHOICES, active_ui_language, tr
+from .release_updates import REPOSITORY_URL, fetch_latest_release, numeric_version
+from .version import __version__
 
 
 from collections.abc import Callable
@@ -19,6 +21,7 @@ from PySide6.QtCore import (
     QRunnable,
     QSize,
     QThreadPool,
+    QUrl,
     Qt,
     Signal,
     Slot,
@@ -26,6 +29,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QColor,
     QGuiApplication,
+    QDesktopServices,
     QFontMetrics,
     QKeyEvent,
     QKeySequence,
@@ -206,6 +210,30 @@ class _CircularHelpButton(QToolButton):
         painter.drawText(circle, Qt.AlignmentFlag.AlignCenter, '?')
 
 
+class _ReleaseCheckSignals(QObject):
+    completed = Signal(int, object, object)
+
+
+class _ReleaseCheckWorker(QRunnable):
+    def __init__(self, generation: int) -> None:
+        super().__init__()
+        self.generation = generation
+        self.signals = _ReleaseCheckSignals()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            release = fetch_latest_release()
+            error = None
+        except Exception as exc:
+            release = None
+            error = exc
+        try:
+            self.signals.completed.emit(self.generation, release, error)
+        except RuntimeError:
+            pass
+
+
 class _SevenZipProbeWorker(QRunnable):
     def __init__(
         self,
@@ -351,7 +379,7 @@ TAB_SETTING_KEYS: dict[str, tuple[str, ...]] = {
         "browser_display_density", "browser_item_spacing_x", "browser_item_spacing_y", "browser_cell_padding",
         "browser_sort_key", "browser_sort_order", "browser_random_seed", "browser_folders_first",
         "browser_location_history_limit", "browser_search_history_limit", "browser_tag_grouped",
-        "browser_show_rating_overlay", "browser_show_tag_overlay",
+        "browser_show_rating_overlay", "browser_show_tag_overlay", "browser_show_type_badge",
         "browser_rating_overlay_opacity", "browser_tag_overlay_opacity",
         "browser_tag_auto_text_color", "browser_tag_text_luminance_threshold",
         "browser_tag_font_size", "browser_tag_max_characters", "browser_tag_text_color",
@@ -660,6 +688,9 @@ class SettingsDialog(QDialog):
         self._delete_scheduled = False
         self._probe_generation = 0
         self._probe_workers: dict[int, _SevenZipProbeWorker] = {}
+        self._release_check_generation = 0
+        self._release_check_workers: dict[int, _ReleaseCheckWorker] = {}
+        self._release_url: str | None = None
         self._pending_explicit_path: str | None = None
         self._accept_after_probe = False
         self._winrar_probe_generation = 0
@@ -1245,6 +1276,9 @@ class SettingsDialog(QDialog):
         self.browser_filename_gap_spin.setValue(int(defaults["browser_filename_gap"]))
         self.browser_filename_padding_y_spin.setValue(int(defaults["browser_filename_padding_y"]))
         self.browser_tag_grouped_checkbox.setChecked(bool(defaults["browser_tag_grouped"]))
+        self.browser_show_type_badge_checkbox.setChecked(
+            bool(defaults["browser_show_type_badge"])
+        )
         self._restore_browser_overlay_defaults()
         self.browser_filename_extension_checkbox.setChecked(bool(defaults["browser_filename_show_extension"]))
         self._select_data(self.browser_filename_elide_combo, defaults["browser_filename_elide_mode"])
@@ -1652,6 +1686,27 @@ class SettingsDialog(QDialog):
         )
         self.ui_language_restart_note.setWordWrap(True)
         form.addRow(self.ui_language_restart_note)
+        update_group = QGroupBox(tr('アプリの更新'), tab)
+        update_layout = QVBoxLayout(update_group)
+        self.check_updates_button = QPushButton(tr('更新を確認'), update_group)
+        self.github_page_button = QPushButton(tr('GitHubページを開く'), update_group)
+        self.release_page_button = QPushButton(tr('リリースページを開く'), update_group)
+        self.release_page_button.setVisible(False)
+        self.update_status_label = QLabel(update_group)
+        self.update_status_label.setWordWrap(True)
+        self.check_updates_button.clicked.connect(self._check_for_updates)
+        self.github_page_button.clicked.connect(
+            lambda: self._open_external_url(REPOSITORY_URL)
+        )
+        self.release_page_button.clicked.connect(
+            lambda: self._open_external_url(self._release_url) if self._release_url else None
+        )
+        for widget in (
+            self.check_updates_button, self.github_page_button,
+            self.release_page_button, self.update_status_label,
+        ):
+            update_layout.addWidget(widget)
+        form.addRow(update_group)
         help_group = QGroupBox(tr('ヘルプ'), tab)
         help_layout = QVBoxLayout(help_group)
         self.shortcuts_help_button = QPushButton(tr('ショートカット一覧'), help_group)
@@ -1664,6 +1719,58 @@ class SettingsDialog(QDialog):
         help_layout.addWidget(self.diagnostics_button)
         form.addRow(help_group)
         return tab
+
+    def _check_for_updates(self) -> None:
+        if self._probes_closed or self._release_check_workers:
+            return
+        self._release_check_generation += 1
+        generation = self._release_check_generation
+        self._release_url = None
+        self.release_page_button.setVisible(False)
+        self.check_updates_button.setEnabled(False)
+        self.update_status_label.setText(tr('更新を確認しています…'))
+        worker = _ReleaseCheckWorker(generation)
+        worker.signals.completed.connect(self._on_release_check_completed)
+        self._release_check_workers[generation] = worker
+        self._probe_pool.start(worker)
+
+    def _on_release_check_completed(
+        self, generation: int, release: object, error: object,
+    ) -> None:
+        self._release_check_workers.pop(generation, None)
+        if self._probes_closed or generation != self._release_check_generation:
+            self._delete_when_probes_finish()
+            return
+        self.check_updates_button.setEnabled(True)
+        if isinstance(error, ValueError) or (error is None and not isinstance(release, tuple)):
+            self.update_status_label.setText(tr('更新を確認できませんでした。リリース情報が不正です。'))
+            return
+        if error is not None:
+            self.update_status_label.setText(tr('更新を確認できませんでした。ネットワーク接続を確認して再試行してください。'))
+            return
+        tag, url = release
+        try:
+            release_version = numeric_version(tag)
+            installed_version = numeric_version(__version__)
+        except ValueError:
+            self.update_status_label.setText(tr('更新を確認できませんでした。リリース情報が不正です。'))
+            return
+        if release_version > installed_version:
+            self._release_url = url
+            self.release_page_button.setVisible(True)
+            self.update_status_label.setText(tr('新しいバージョン {p0} が公開されています。', p0=tag))
+        elif release_version == installed_version:
+            self.update_status_label.setText(tr('現在のバージョンは最新版です（{p0}）。', p0=__version__))
+        else:
+            self.update_status_label.setText(tr('インストール済みのバージョン（{p0}）は公開版より新しいです。', p0=__version__))
+
+    def _open_external_url(self, url: str) -> None:
+        try:
+            opened = QDesktopServices.openUrl(QUrl(url))
+        except Exception:
+            opened = False
+        if not opened:
+            self.update_status_label.setText(tr('ページを開けませんでした。'))
 
     def show_shortcuts_help(self) -> None:
         from .shortcuts_help import show_shortcuts_help
@@ -2543,8 +2650,19 @@ class SettingsDialog(QDialog):
         )
         self._sync_browser_folder_snapshot_cache_controls()
 
-        overlay_group = QGroupBox(tr('サムネイル上の情報'), tab)
+        overlay_group = QGroupBox(tr('サムネイル情報'), tab)
         overlay_form = QFormLayout(overlay_group)
+        self.browser_show_type_badge_checkbox = QCheckBox(tr('アイコンを表示'), overlay_group)
+        self.browser_show_type_badge_checkbox.setToolTip(
+            tr('サムネイル左下の小さなファイル種別アイコンを表示します。')
+        )
+        overlay_form.addRow(self.browser_show_type_badge_checkbox)
+        self.browser_show_filename_checkbox = QCheckBox(tr('ファイル名を表示'), overlay_group)
+        self.browser_show_filename_checkbox.setToolTip(
+            tr('サムネイルの下にファイル名を表示します。表示する行数は「ファイル名」で設定します。')
+        )
+        self.browser_show_filename_checkbox.toggled.connect(self._set_browser_filename_visible)
+        overlay_form.addRow(self.browser_show_filename_checkbox)
         self.browser_show_rating_overlay_checkbox = QCheckBox(
             tr('レートを表示する'), overlay_group
         )
@@ -3389,6 +3507,10 @@ class SettingsDialog(QDialog):
             self.browser_filename_display_combo,
             self.config.get("browser_filename_display", "one_line"),
         )
+        self.browser_show_type_badge_checkbox.setChecked(
+            bool(self.config.get("browser_show_type_badge", True))
+        )
+        self._sync_browser_filename_controls()
         self.browser_filename_gap_spin.setValue(
             int(self.config.get("browser_filename_gap", 0))
         )
@@ -3847,11 +3969,29 @@ class SettingsDialog(QDialog):
 
     def _sync_browser_filename_controls(self) -> None:
         visible = self.browser_filename_display_combo.currentData() != "hidden"
+        if visible:
+            self._last_browser_filename_display = self.browser_filename_display_combo.currentData()
+        if hasattr(self, 'browser_show_filename_checkbox'):
+            old = self.browser_show_filename_checkbox.blockSignals(True)
+            self.browser_show_filename_checkbox.setChecked(visible)
+            self.browser_show_filename_checkbox.blockSignals(old)
         self.browser_filename_gap_spin.setEnabled(visible)
         self.browser_filename_padding_y_spin.setEnabled(visible)
         self.browser_filename_extension_checkbox.setEnabled(visible)
         self.browser_filename_elide_combo.setEnabled(visible)
         self.browser_filename_font_size_combo.setEnabled(visible)
+
+    def _set_browser_filename_visible(self, visible: bool) -> None:
+        if visible:
+            self._select_data(
+                self.browser_filename_display_combo,
+                getattr(self, '_last_browser_filename_display', 'one_line'),
+            )
+        else:
+            current = self.browser_filename_display_combo.currentData()
+            if current != 'hidden':
+                self._last_browser_filename_display = current
+            self._select_data(self.browser_filename_display_combo, 'hidden')
 
     def refresh_registration_status(self) -> None:
         service = self._file_registration_service
@@ -4145,6 +4285,7 @@ class SettingsDialog(QDialog):
             ),
             "browser_tag_grouped": self.browser_tag_grouped_checkbox.isChecked(),
             "browser_show_rating_overlay": self.browser_show_rating_overlay_checkbox.isChecked(),
+            "browser_show_type_badge": self.browser_show_type_badge_checkbox.isChecked(),
             "browser_show_tag_overlay": self.browser_show_tag_overlay_checkbox.isChecked(),
             "browser_rating_overlay_opacity": self.browser_rating_overlay_opacity_spin.value(),
             "browser_tag_overlay_opacity": self.browser_tag_overlay_opacity_spin.value(),
@@ -4366,6 +4507,7 @@ class SettingsDialog(QDialog):
         if self._probes_closed:
             return
         self._probes_closed = True
+        self._release_check_generation += 1
         self._invalidate_gimp_probe()
         self._probe_generation += 1
         self._winrar_probe_generation += 1
@@ -4379,6 +4521,7 @@ class SettingsDialog(QDialog):
             self._winrar_probe_workers,
             self._ffmpeg_probe_workers,
             self._gimp_probe_workers,
+            self._release_check_workers,
         ):
             for generation, worker in tuple(workers.items()):
                 try:
@@ -4394,6 +4537,7 @@ class SettingsDialog(QDialog):
             or self._winrar_probe_workers
             or self._ffmpeg_probe_workers
             or self._gimp_probe_workers
+            or self._release_check_workers
         )
 
     def _delete_when_probes_finish(self) -> None:
@@ -4421,6 +4565,7 @@ class SettingsDialog(QDialog):
             self._probe_workers,
             self._winrar_probe_workers,
             self._ffmpeg_probe_workers,
+            self._release_check_workers,
         ):
             workers.clear()
         self._gimp_probe_workers.clear()

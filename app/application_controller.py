@@ -731,7 +731,9 @@ class ApplicationController(QObject):
 
     def _shutdown_settings_probes(self) -> bool:
         dialogs_by_id = {
-            id(dialog): dialog for dialog in tuple(_RETIRED_SETTINGS_DIALOGS)
+            id(dialog): dialog
+            for dialog in tuple(_RETIRED_SETTINGS_DIALOGS)
+            if getattr(dialog, "config", None) is self.config
         }
         browser = self.get_browser_window()
         if browser is not None:

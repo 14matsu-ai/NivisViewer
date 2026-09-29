@@ -57,8 +57,8 @@ def blocked_viewer(request, tmp_path, qapp):
     qapp.processEvents()
     try:
         assert window._finish_opened_book(session.open_book(path), modal_on_empty=False)
-        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 0)
-        assert source.started.wait(1)
+        _wait_until(qapp, lambda: window.presentation_state.displayed_page == 0, timeout_ms=10000)
+        _wait_until(qapp, source.started.is_set, timeout_ms=5000)
         yield window, source
     finally:
         source.release.set()

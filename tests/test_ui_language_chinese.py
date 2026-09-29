@@ -24,7 +24,7 @@ from app.translations_zh import (
 )
 
 _TECHNICAL_WORDS = {
-    "Dropbox",
+    "Dropbox", "GitHub",
     "GIMP", "XCF", "CLIP", "PSD", "SVG", "Illustrator", "RRGGBB",
     "NivisViewer", "ZipPla", "Viewer", "Browser", "Windows", "Shell", "FFmpeg", "WinRAR", "ZIP", "Zip",
     "RAM", "DB", "UTF-8", "JSON",

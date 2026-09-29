@@ -15,7 +15,7 @@
 <a id="overview"></a>
 ## 项目简介
 
-NivisViewer 是一款适用于 Windows 的漫画与图片阅读器。它参考了 ZipPla 的操作方式与行为，但采用独立实现，不复用 ZipPla 的源代码。
+NivisViewer 是一款适用于 Windows 的漫画与图片阅读器。它参考了 ZipPla 的操作方式与行为，Viewer 的部分处理结构移植自采用 AGPL-3.0-or-later 许可证的 ZipPlaFork。来源及对应代码记录在 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 中。
 
 它提供与收藏文件夹同步的文件夹树、采用固定大小网格显示缩略图的 BrowserWindow、独立的书籍阅读窗口 ViewerWindow、设置界面、无间隙双页显示、便携式缩略图缓存、文件夹及单张图片浏览、ZIP/CBZ、RAR/7z 系列压缩包与 PDF 阅读、自然排序和异步图片加载。ViewerWindow 还支持用鼠标前进／后退侧键切换前后书籍、可配置的右键拖动手势，以及全屏时通过屏幕边缘显示界面控件。
 
@@ -107,3 +107,5 @@ python -m pytest -q
 ## 许可证
 
 NivisViewer 当前的项目许可证为 **GNU AGPL 第 3 版或更高版本（`AGPL-3.0-or-later`）**。正式许可文本见 [LICENSE](LICENSE)，项目许可声明及版权信息见 [PROJECT_LICENSE.md](PROJECT_LICENSE.md)。有关从 ZipPlaFork 移植的结构来源，请参阅 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 和 [ZipPlaFork 对比记录](docs/ZIPPLAFORK_COMPARISON.md)。依赖库各自的 MIT、BSD、Apache、LGPL、GPL 等许可证保持不变。
+
+在“设置 → Browser → 缩略图信息”中，“显示图标”仅控制缩略图左下角的小型文件类型图标；“显示文件名”控制缩略图下方的文件名，并与现有的“文件名”行数设置联动。两项默认开启。

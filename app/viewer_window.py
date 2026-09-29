@@ -3884,19 +3884,29 @@ class ViewerWindow(QMainWindow):
             warmup_plan,
             render_spec,
             navigation_direction=direction,
-            resolve_layout_metadata=(
-                (
-                    isinstance(source, FolderImageSource)
-                    # A background unit can still become a single page after
-                    # its header proves it is wide. Keep the geometry
-                    # boundary in the same worker lane even when the
-                    # currently visible unit is already provisional
-                    # single-page; otherwise that unit may be decoded as a
-                    # spread and decoded again after the layout repair.
-                    or isinstance(source, ZipImageSource)
+            next_display_units=(
+                tuple(
+                    self._zip_display_unit(
+                        tuple(slot.page_index for slot in candidate.slots),
+                        start_index=candidate.start_index,
+                        is_single=candidate.is_single,
+                    )
+                    for candidate in self.model.next_display_spreads(direction=direction)
                 )
-                and self.view_mode == "spread"
-                and self.treat_wide_image_as_single
+                if isinstance(source, ZipImageSource) else ()
+            ),
+            resolve_layout_metadata=(
+                # ZIP header reconnaissance is cheap relative to full decode
+                # and is also useful in single-page mode for cost-aware early
+                # start of an approaching heavy page.
+                isinstance(source, ZipImageSource)
+                or (
+                    isinstance(source, FolderImageSource)
+                    # Folder header I/O remains limited to the layout-sensitive
+                    # spread case that originally required metadata preflight.
+                    and self.view_mode == "spread"
+                    and self.treat_wide_image_as_single
+                )
             ),
         )
 

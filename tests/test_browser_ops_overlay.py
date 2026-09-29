@@ -360,9 +360,9 @@ def test_overlay_settings_dialog_roundtrip_and_resets(tmp_path: Path, qapp) -> N
 @pytest.mark.parametrize(
     ("language", "group", "rating", "tag", "rating_opacity", "tag_opacity", "reset"),
     [
-        ("en", "Thumbnail overlays", "Show ratings", "Show tags", "Rating background opacity:", "Tag background opacity:", "Reset rating/tag display to defaults"),
-        ("zh_CN", "缩略图上的信息", "显示评分", "显示标签", "评分背景不透明度：", "标签背景不透明度：", "将评分/标签显示恢复为默认值"),
-        ("zh_TW", "縮圖上的資訊", "顯示評分", "顯示標籤", "評分背景不透明度：", "標籤背景不透明度：", "將評分／標籤顯示還原為預設值"),
+        ("en", "Thumbnail information", "Show ratings", "Show tags", "Rating background opacity:", "Tag background opacity:", "Reset rating/tag display to defaults"),
+        ("zh_CN", "缩略图信息", "显示评分", "显示标签", "评分背景不透明度：", "标签背景不透明度：", "将评分/标签显示恢复为默认值"),
+        ("zh_TW", "縮圖資訊", "顯示評分", "顯示標籤", "評分背景不透明度：", "標籤背景不透明度：", "將評分／標籤顯示還原為預設值"),
     ],
 )
 def test_overlay_settings_labels_are_translated(

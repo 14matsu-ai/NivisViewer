@@ -132,6 +132,13 @@ def reconcile(
     watcher.notify()
     assert window._directory_change_timer.isActive()
     window._flush_directory_changes()
+    # A fast viewport movement defers passive reconciliation until scroll idle.
+    for _ in range(50):
+        qapp.processEvents()
+        if not window._directory_change_pending:
+            break
+        QTest.qWait(10)
+    assert not window._directory_change_pending
     assert window.wait_for_scan()
     qapp.processEvents()
 
@@ -776,6 +783,9 @@ def test_selected_item_deletion_does_not_select_same_row_replacement(
     )
 
     try:
+        # Selection may start a Pillow header probe; release its Windows
+        # handle before simulating an external deletion.
+        window.image_detail_probe.close()
         selected.unlink()
         reconcile(window, watcher, qapp)
         assert window.item_model.row_for_path(selected) < 0

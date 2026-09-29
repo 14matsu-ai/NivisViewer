@@ -976,7 +976,7 @@ def test_rapid_wheel_holds_unready_target_and_finishes_started_work(
             lambda: window.presentation_state.displayed is not None
             and window.presentation_state.displayed.unit.focused_index == 0,
         )
-        assert source.page_one_started.wait(1.0)
+        _wait_until(qapp, source.page_one_started.is_set, timeout_ms=1000)
         planner = runtime._warmup_planner
         assert planner is not None
         monkeypatch.setattr(type(planner), "next_candidate", lambda *_args, **_kwargs: None)

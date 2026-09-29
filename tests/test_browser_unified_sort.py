@@ -513,8 +513,8 @@ def test_random_selection_filter_rename_and_open_time_snapshot(
         restored_states = []
         restore = browser._restore_list_view_state
 
-        def observe_restore(state):
-            restore(state)
+        def observe_restore(state, **kwargs):
+            restore(state, **kwargs)
             restored_states.append(state)
 
         restore_patches.setattr(browser, "_restore_list_view_state", observe_restore)

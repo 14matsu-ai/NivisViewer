@@ -277,3 +277,28 @@ def test_repeated_navigation_neither_skips_nor_duplicates_pages() -> None:
         if model.current_index == previous:
             break
     assert backward_units == list(reversed(forward_units))
+
+
+def test_next_display_spreads_follow_real_single_spread_wide_and_direction_edges():
+    single = make_model([(800, 1200)] * 7, view_mode="single")
+    assert [tuple(slot.page_index for slot in spread.slots)
+            for spread in single.next_display_spreads()] == [(1,), (2,)]
+    single.go_to_index(4)
+    assert [tuple(slot.page_index for slot in spread.slots)
+            for spread in single.next_display_spreads(direction=-1)] == [(3,), (2,)]
+    single.go_to_index(6)
+    assert single.next_display_spreads() == ()
+
+    for reading_direction, first_slots in (("ltr", (1, 2)), ("rtl", (2, 1))):
+        spread = make_model(
+            [(800, 1200)] * 3 + [(1600, 900)] + [(800, 1200)] * 3,
+            view_mode="spread", reading_direction=reading_direction,
+            single_first_page=True,
+        )
+        next_two = spread.next_display_spreads()
+        assert tuple(slot.page_index for slot in next_two[0].slots) == first_slots
+        assert tuple(slot.page_index for slot in next_two[1].slots) == (3,)
+        spread.go_to_index(3)
+        reverse = spread.next_display_spreads(direction=-1)
+        assert tuple(sorted(slot.page_index for slot in reverse[0].slots)) == (1, 2)
+        assert tuple(slot.page_index for slot in reverse[1].slots) == (0,)

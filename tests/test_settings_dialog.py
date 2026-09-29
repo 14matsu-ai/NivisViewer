@@ -257,6 +257,45 @@ def test_file_type_icon_size_controls_are_independent_and_persist(
     dialog.reject()
 
 
+def test_thumbnail_information_controls_share_existing_filename_setting(
+    tmp_path: Path, qapp: QApplication,
+) -> None:
+    config = make_config(tmp_path)
+    dialog = SettingsDialog(config)
+    try:
+        assert dialog.browser_show_type_badge_checkbox.isChecked()
+        assert dialog.browser_show_filename_checkbox.isChecked()
+        dialog.browser_filename_display_combo.setCurrentIndex(
+            dialog.browser_filename_display_combo.findData('two_lines')
+        )
+        dialog.browser_show_filename_checkbox.setChecked(False)
+        assert dialog.values()['browser_filename_display'] == 'hidden'
+        dialog.browser_show_filename_checkbox.setChecked(True)
+        assert dialog.values()['browser_filename_display'] == 'two_lines'
+        dialog.browser_show_type_badge_checkbox.setChecked(False)
+        changed = dialog.apply_settings()
+        assert changed['browser_show_type_badge'] is False
+        assert ConfigManager(config.path).load()['browser_show_type_badge'] is False
+    finally:
+        dialog.reject()
+
+
+def test_rating_tag_reset_leaves_type_badge_but_browser_reset_restores_it(
+    tmp_path: Path, qapp: QApplication,
+) -> None:
+    dialog = SettingsDialog(make_config(tmp_path))
+    try:
+        dialog.browser_show_type_badge_checkbox.setChecked(False)
+        dialog.browser_show_rating_overlay_checkbox.setChecked(False)
+        dialog.browser_overlay_restore_button.click()
+        assert not dialog.browser_show_type_badge_checkbox.isChecked()
+        assert dialog.browser_show_rating_overlay_checkbox.isChecked()
+        dialog._reset_browser_scope()
+        assert dialog.browser_show_type_badge_checkbox.isChecked()
+    finally:
+        dialog.reject()
+
+
 def test_folder_snapshot_cache_controls_persist_and_disable_cap(
     tmp_path: Path,
     qapp: QApplication,
