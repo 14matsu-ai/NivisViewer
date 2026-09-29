@@ -307,9 +307,8 @@ class ApplicationController(QObject):
 
     def _on_viewer_file_recycled(self, path: str) -> None:
         browser = self.get_browser_window()
-        if (browser is not None and browser.current_path is not None
-                and Path(browser.current_path) == Path(path).parent):
-            browser.refresh_current_folder()
+        if browser is not None:
+            browser.reconcile_external_file_change(path)
 
     def create_viewer_window(self) -> ViewerWindow:
         if self._shutdown:

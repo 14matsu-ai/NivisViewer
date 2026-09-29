@@ -844,6 +844,7 @@ class ViewerWindow(QMainWindow):
         source = self.book_session.source
         if not isinstance(source, FolderImageSource):
             return
+        focused_image_id = self.model.image_id_at(self.model.focused_index)
         survivors = tuple(
             image_id for image_id in pending.image_ids
             if str(Path(image_id).absolute()).casefold() != pending.path.casefold()
@@ -860,8 +861,12 @@ class ViewerWindow(QMainWindow):
             self._update_status()
             self._set_status_override(tr('表示可能な画像がありません'), 5000)
             return
+        next_index = (
+            survivors.index(focused_image_id)
+            if focused_image_id in survivors
+            else min(pending.page_index, len(survivors) - 1)
+        )
         if pending.snapshot is not None:
-            next_index = min(pending.page_index, len(survivors) - 1)
             next_path = survivors[next_index]
             snapshot = replace(
                 pending.snapshot,
@@ -890,7 +895,7 @@ class ViewerWindow(QMainWindow):
                 browser_snapshot=browser_snapshot,
             )
             return
-        self._reload_page_index = min(pending.page_index, max(0, len(survivors) - 1))
+        self._reload_page_index = next_index
         self.open_path(source.source_path, preserve_current_page=True)
 
     def _is_fullscreen_mode(self) -> bool:

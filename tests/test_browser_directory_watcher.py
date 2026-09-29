@@ -82,6 +82,109 @@ class FakeFileOperationCoordinator(QObject):
         pass
 
 
+def test_foreign_viewer_operation_does_not_own_browser_operation_ui(
+    tmp_path: Path, qapp: QApplication,
+) -> None:
+    folder = tmp_path / 'folder'
+    write_item(folder / 'page.jpg')
+    coordinator = FakeFileOperationCoordinator()
+    window, _watcher = make_window(tmp_path, folder, qapp, coordinator=coordinator)
+    try:
+        before = window.statusBar().currentMessage()
+        request = FileOperationRequest(987654321, FileOperationKind.RECYCLE,
+                                       (str(folder / 'page.jpg'),))
+        coordinator.operation_started.emit(request)
+        assert window._active_file_operation_id is None
+        assert window.statusBar().currentMessage() == before
+        assert not window.cancel_operation_button.isVisible()
+        coordinator.operation_completed.emit(FileOperationResult(
+            FileOperationKind.RECYCLE, (), request_id=request.request_id,
+        ))
+        assert window._active_file_operation_id is None
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_viewer_recycle_passive_refresh_coalesces_watch_without_manual_side_effects(
+    tmp_path: Path, qapp: QApplication,
+) -> None:
+    folder = tmp_path / 'folder'
+    deleted = folder / 'deleted.jpg'
+    write_item(deleted)
+    write_item(folder / 'remaining.jpg')
+    window, watcher = make_window(tmp_path, folder, qapp)
+    try:
+        with patch.object(window, 'invalidate_windows_shell_thumbnails') as invalidate, \
+             patch.object(window._download_retry, 'reset') as retry_reset, \
+             patch.object(window.scanner, 'start', wraps=window.scanner.start) as start:
+            deleted.unlink()
+            assert window.reconcile_external_file_change(deleted)
+            watcher.notify()
+            window._flush_directory_changes()
+            assert window.wait_for_scan()
+            qapp.processEvents()
+            assert start.call_count == 1
+            invalidate.assert_not_called()
+            retry_reset.assert_not_called()
+            assert window.item_model.row_for_path(deleted) < 0
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_viewer_recycle_passive_refresh_works_without_active_watcher(
+    tmp_path: Path, qapp: QApplication,
+) -> None:
+    folder = tmp_path / 'folder'
+    deleted = folder / 'deleted.jpg'
+    write_item(deleted)
+    window, _watcher = make_window(tmp_path, folder, qapp)
+    try:
+        window._clear_active_directory_watch()
+        deleted.unlink()
+        assert window.reconcile_external_file_change(deleted)
+        window._flush_directory_changes()
+        assert window.wait_for_scan()
+        qapp.processEvents()
+        assert window.item_model.row_for_path(deleted) < 0
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_viewer_recycle_during_scan_reconciles_without_active_watcher(
+    tmp_path: Path, qapp: QApplication,
+) -> None:
+    folder = tmp_path / 'folder'
+    deleted = folder / 'deleted.jpg'
+    write_item(deleted)
+    window, watcher = make_window(tmp_path, folder, qapp)
+    try:
+        with patch.object(window.scanner, 'start', wraps=window.scanner.start) as start, \
+             patch.object(watcher, 'watch', return_value=False):
+            assert window._refresh_current_folder(navigation_source='filesystem_watch')
+            pending = window._pending_scan
+            assert pending is not None
+            window._clear_active_directory_watch()
+            deleted.unlink()
+            assert window.reconcile_external_file_change(deleted)
+            assert pending.directory_watch_dirty
+            assert window._passive_reconcile_pending
+            assert window.wait_for_scan()
+            qapp.processEvents()
+            assert window._directory_watch_path is None
+            assert window._directory_change_timer.isActive()
+            window._flush_directory_changes()
+            assert window.wait_for_scan()
+            qapp.processEvents()
+            assert start.call_count == 2
+            assert window.item_model.row_for_path(deleted) < 0
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
 class NoopThumbnailProvider(BrowserThumbnailProvider):
     def __init__(self) -> None:
         super().__init__(disk_cache_enabled=False)
@@ -264,6 +367,10 @@ def test_external_rename_removes_stale_selection_and_history_path(
     )
     window.list_view.setCurrentIndex(old_index)
     window._update_current_navigation_state()
+    # Selection starts an independent image-dimension probe. On Windows its
+    # Image.open handle can briefly deny the external rename simulated below.
+    assert window.image_detail_probe._pool.waitForDone(5000)
+    qapp.processEvents()
 
     try:
         old_path.rename(new_path)

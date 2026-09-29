@@ -95,7 +95,9 @@ def test_viewer_admits_leading_slider_target_before_release(tmp_path, qapp):
         qapp.processEvents()
         assert window._finish_opened_book(session.open_book(archive), modal_on_empty=False)
         _wait_until(qapp, lambda: window.presentation_state.displayed_page == 0)
-        assert source.started.wait(1)
+        # The next-page warmup is scheduled through Qt after the first frame.
+        # Keep processing queued events while waiting for its worker to start.
+        _wait_until(qapp, source.started.is_set)
         runtime = session.viewer_runtime
         window.slider.setSliderDown(True)
         window._go_to_index_with_history(1, input_kind=NavigationInputKind.SLIDER_SCRUB)

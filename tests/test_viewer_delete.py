@@ -5,6 +5,7 @@ from threading import Event
 from time import monotonic, sleep
 
 from PIL import Image
+import pytest
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtTest import QTest
@@ -189,6 +190,57 @@ def test_late_delete_completion_does_not_replace_new_book(
         assert window._opened_path == str(folders[1])
         assert window.model.total_pages == 1
         assert recycled == recycle.paths
+    finally:
+        recycle.release.set()
+        window.close()
+        coordinator.close()
+
+
+@pytest.mark.parametrize('use_snapshot', (False, True))
+def test_delete_completion_keeps_page_navigated_to_while_recycle_was_running(
+    tmp_path: Path, qapp, use_snapshot: bool,
+) -> None:
+    folder = tmp_path / 'images'
+    folder.mkdir()
+    paths = tuple(folder / f'{index:03d}.png' for index in range(3))
+    for path in paths:
+        Image.new('RGB', (80, 120), 'navy').save(path)
+    config = ConfigManager(tmp_path / 'config.json')
+    config.load()
+    config.apply({'viewer_delete_mode': 'single', 'viewer_delete_skip_confirmation': True})
+    recycle = GatedRecycleBin(tmp_path / 'trash')
+    coordinator = FileOperationCoordinator(None, service=FileOperationService(recycle))
+    session = BookSession()
+    window = ViewerWindow(config_manager=config, book_session=session,
+                          file_operation_coordinator=coordinator)
+    try:
+        window.set_view_mode('single')
+        window.show()
+        snapshot = (
+            FolderListingSnapshot(folder, tuple(str(path) for path in paths), str(paths[0]))
+            if use_snapshot else None
+        )
+        opened = session.open_book(
+            paths[0] if use_snapshot else folder, folder_snapshot=snapshot,
+        )
+        assert window._finish_opened_book(opened, modal_on_empty=False)
+        deadline = monotonic() + 5
+        while window.presentation_state.displayed is None and monotonic() < deadline:
+            qapp.processEvents()
+            sleep(0.01)
+        assert window.delete_current_image_to_recycle_bin()
+        assert recycle.started.wait(2)
+        window.next_page()
+        assert window.model.image_id_at(window.model.focused_index) == str(paths[1])
+        recycle.release.set()
+        deadline = monotonic() + 5
+        while (window._pending_viewer_delete is not None
+               or window.model.total_pages != 2) and monotonic() < deadline:
+            qapp.processEvents()
+            sleep(0.01)
+        assert window.model.total_pages == 2
+        assert window.model.image_id_at(window.model.focused_index) == str(paths[1])
+        assert recycle.paths == [str(paths[0])]
     finally:
         recycle.release.set()
         window.close()

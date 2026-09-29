@@ -1753,6 +1753,7 @@ def test_zip_operation_shows_progress_dialog_and_closes_on_completion(
         "large.zip.zip",
     )
 
+    window._file_operation_requests[request.request_id] = request
     window._on_file_operation_started(request)
     dialog = window._zip_progress_dialog
     assert dialog is not None

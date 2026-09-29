@@ -754,6 +754,7 @@ class BrowserWindow(QMainWindow):
         self._directory_watch_generation = 0
         self._directory_watch_path: Path | None = None
         self._directory_change_pending = False
+        self._passive_reconcile_pending = False
         self._pending_tree_navigation_path: Path | None = None
         self._deferred_tree_sync_generation: int | None = None
         self._first_paint_pending_generation: int | None = None
@@ -2143,6 +2144,21 @@ class BrowserWindow(QMainWindow):
     def refresh_current_folder(self) -> bool:
         return self._refresh_current_folder(navigation_source="manual_refresh")
 
+    def reconcile_external_file_change(self, path: str | Path) -> bool:
+        """Coalesce a known external change with filesystem watch refreshes."""
+        if (self._shutdown_prepared or self.current_path is None
+                or not self._same_path(self.current_path, Path(path).parent)):
+            return False
+        pending = self._pending_scan
+        if pending is not None and self._same_path(pending.path, self.current_path):
+            self._passive_reconcile_pending = True
+            pending.directory_watch_dirty = True
+            return True
+        self._passive_reconcile_pending = True
+        self._directory_change_pending = True
+        self._arm_directory_change_timer()
+        return True
+
     def invalidate_windows_shell_thumbnails(
         self,
         *,
@@ -2199,6 +2215,7 @@ class BrowserWindow(QMainWindow):
         self._directory_watch_generation += 1
         self._directory_watch_path = None
         self._directory_change_pending = False
+        self._passive_reconcile_pending = False
         if hasattr(self, "_directory_change_timer"):
             self._directory_change_timer.stop()
         if hasattr(self, "_directory_change_burst"):
@@ -2243,10 +2260,11 @@ class BrowserWindow(QMainWindow):
     def _schedule_directory_reconciliation(self) -> None:
         if self._shutdown_prepared or self.current_path is None:
             return
-        if not self._same_path(
-            self.current_path,
-            self._directory_watch_path,
-        ):
+        if (not self._passive_reconcile_pending
+                and not self._same_path(
+                    self.current_path,
+                    self._directory_watch_path,
+                )):
             return
         self._directory_change_pending = True
         self._arm_directory_change_timer()
@@ -2276,19 +2294,23 @@ class BrowserWindow(QMainWindow):
             return
         if self.file_operation_coordinator.busy:
             return
-        if self.current_path is None or not self._same_path(
-            self.current_path,
-            self._directory_watch_path,
+        if self.current_path is None or (
+            not self._passive_reconcile_pending
+            and not self._same_path(self.current_path, self._directory_watch_path)
         ):
             self._directory_change_pending = False
+            self._passive_reconcile_pending = False
             return
         pending = self._pending_scan
         if pending is not None:
             if self._same_path(pending.path, self.current_path):
                 pending.directory_watch_dirty = True
+            else:
+                self._passive_reconcile_pending = False
             self._directory_change_pending = False
             return
         self._directory_change_pending = False
+        self._passive_reconcile_pending = False
         self._refresh_current_folder(navigation_source="filesystem_watch")
 
     def _release_deferred_directory_change(
@@ -2307,6 +2329,7 @@ class BrowserWindow(QMainWindow):
             # reconciliation of this directory, so it absorbs notifications
             # accumulated while that operation was running.
             self._directory_change_pending = False
+            self._passive_reconcile_pending = False
             return
         self._arm_directory_change_timer()
 
@@ -3668,7 +3691,7 @@ class BrowserWindow(QMainWindow):
             self.clear_file_clipboard()
 
     def _on_file_operation_started(self, request: FileOperationRequest) -> None:
-        if self._shutdown_prepared:
+        if self._shutdown_prepared or request.request_id not in self._file_operation_requests:
             return
         if request.operation is FileOperationKind.CREATE_ZIP:
             self._close_zip_progress_dialog()

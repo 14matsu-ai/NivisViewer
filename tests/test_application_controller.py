@@ -18,10 +18,16 @@ from app.browser_model import BrowserItemKind
 from app.config_manager import ConfigManager
 
 
-def test_viewer_recycle_notification_ignores_browser_without_current_folder(tmp_path: Path) -> None:
-    browser = SimpleNamespace(current_path=None, refresh_current_folder=lambda: (_ for _ in ()).throw(AssertionError('unexpected refresh')))
+def test_viewer_recycle_notification_delegates_folder_validation_to_browser(tmp_path: Path) -> None:
+    seen: list[str] = []
+    browser = SimpleNamespace(
+        current_path=None,
+        reconcile_external_file_change=seen.append,
+    )
     controller = SimpleNamespace(get_browser_window=lambda: browser)
-    ApplicationController._on_viewer_file_recycled(controller, str(tmp_path / 'page.png'))
+    path = str(tmp_path / 'page.png')
+    ApplicationController._on_viewer_file_recycled(controller, path)
+    assert seen == [path]
 
 
 def write_image(path: Path) -> None:
