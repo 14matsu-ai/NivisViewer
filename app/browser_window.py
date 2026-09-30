@@ -7055,7 +7055,8 @@ class BrowserWindow(QMainWindow):
             )
         )
         self.favorite_view.setSpacing(self.favorite_row_metrics.spacing)
-        self.favorite_view.setUniformItemSizes(True)
+        # Separators can be shorter than folder rows; keep per-row size hints.
+        self.favorite_view.setUniformItemSizes(False)
         self.favorite_view.setWordWrap(False)
         self.favorite_view.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.favorite_view.clicked.connect(self._on_favorite_clicked)
@@ -8965,9 +8966,17 @@ class BrowserWindow(QMainWindow):
                 "text": self.favorite_color_show_text,
             },
         )
+        dialog.apply_requested.connect(
+            lambda: self._save_favorite_editor(dialog, group_id)
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        self._save_favorite_editor(dialog, group_id)
 
+    def _save_favorite_editor(self, dialog, group_id: int) -> None:
+        if self.metadata_store is None:
+            return
+        favorites = self.metadata_store.list_group_favorites(group_id)
         rows = dialog.favorite_rows()
         surviving = {self._path_key(row["path"]) for row in rows}
         for entry in favorites:

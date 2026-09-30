@@ -30,6 +30,7 @@ class FolderBookmarkItem:
     accent_color: str = ""
     separator_id: str = ""
     separator_alignment: str = "center"
+    separator_style: str = "standard"
 
 
 class FolderBookmarkModel(QAbstractListModel):
@@ -40,6 +41,7 @@ class FolderBookmarkModel(QAbstractListModel):
     KindRole = AvailabilityRole + 1
     AccentColorRole = KindRole + 1
     SeparatorAlignmentRole = AccentColorRole + 1
+    SeparatorStyleRole = SeparatorAlignmentRole + 1
 
     def __init__(
         self,
@@ -128,6 +130,8 @@ class FolderBookmarkModel(QAbstractListModel):
             return entry.accent_color
         if role == self.SeparatorAlignmentRole:
             return entry.separator_alignment
+        if role == self.SeparatorStyleRole:
+            return entry.separator_style
         return None
 
     def entry_at(
@@ -161,11 +165,17 @@ class FolderBookmarkModel(QAbstractListModel):
                 alignment = str(raw.get("alignment", "center"))
                 if alignment not in {"left", "center", "right"}:
                     alignment = "center"
+                style = str(raw.get("style", "standard"))
+                if style not in {"standard", "compact"}:
+                    style = "standard"
+                color = QColor(str(raw.get("color", "")))
                 normalized_separators.append(
                     {
                         "id": str(raw.get("id", "")),
                         "label": str(raw.get("label", "")),
                         "alignment": alignment,
+                        "style": style,
+                        "color": color.name() if color.isValid() else "",
                         "before_path": str(raw.get("before_path", "")),
                     }
                 )
@@ -205,6 +215,8 @@ class FolderBookmarkModel(QAbstractListModel):
                 kind="separator",
                 separator_id=str(raw.get("id", "")),
                 separator_alignment=str(raw.get("alignment", "center")),
+                separator_style=str(raw.get("style", "standard")),
+                accent_color=str(raw.get("color", "")),
             )
             before_path = str(raw.get("before_path", ""))
             anchor = path_key(before_path) if before_path else ""

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QRect, QSize, Qt
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QPen
-from PySide6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
+from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPalette, QPen
+from PySide6.QtWidgets import QApplication, QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
 from .favorite_row_metrics import FavoriteRowMetrics
 
@@ -34,6 +34,16 @@ class FavoriteItemDelegate(QStyledItemDelegate):
         self.show_color_text = bool(text)
 
     def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:  # noqa: N802
+        model = index.model()
+        kind_role = getattr(model, "KindRole", -1)
+        style_role = getattr(model, "SeparatorStyleRole", -1)
+        if (
+            kind_role >= 0 and style_role >= 0
+            and index.data(kind_role) == "separator"
+            and index.data(style_role) == "compact"
+        ):
+            # An odd height gives the one-pixel line equal space above/below.
+            return QSize(max(1, option.rect.width()), 9)
         return QSize(
             max(1, option.rect.width()),
             self.metrics.row_height(option.fontMetrics.height()),
@@ -44,6 +54,7 @@ class FavoriteItemDelegate(QStyledItemDelegate):
         kind_role = getattr(model, "KindRole", -1)
         color_role = getattr(model, "AccentColorRole", -1)
         alignment_role = getattr(model, "SeparatorAlignmentRole", -1)
+        style_role = getattr(model, "SeparatorStyleRole", -1)
         kind = index.data(kind_role) if kind_role >= 0 else "folder"
         if kind == "separator":
             self._paint_separator(
@@ -51,6 +62,8 @@ class FavoriteItemDelegate(QStyledItemDelegate):
                 option,
                 str(index.data(Qt.ItemDataRole.DisplayRole) or ""),
                 str(index.data(alignment_role) or "center"),
+                str(index.data(style_role) or "standard"),
+                QColor(str(index.data(color_role) or "")) if color_role >= 0 else QColor(),
             )
             return
 
@@ -64,10 +77,15 @@ class FavoriteItemDelegate(QStyledItemDelegate):
         prepared.features &= ~QStyleOptionViewItem.ViewItemFeature.WrapText
         accent = QColor(str(index.data(color_role) or "")) if color_role >= 0 else QColor()
         selected = bool(prepared.state & QStyle.StateFlag.State_Selected)
-        if accent.isValid() and self.show_color_background and not selected:
-            background = QColor(accent)
-            background.setAlpha(36)
-            prepared.backgroundBrush = background
+        if accent.isValid() and self.show_color_background:
+            base = prepared.palette.color(
+                QPalette.ColorRole.Highlight if selected else QPalette.ColorRole.Base
+            )
+            blended = self._blend(base, accent, 0.42 if selected else 0.32)
+            if selected:
+                prepared.palette.setColor(QPalette.ColorRole.Highlight, blended)
+            else:
+                prepared.backgroundBrush = QBrush(blended)
         if accent.isValid() and self.show_color_text and not selected:
             prepared.palette.setColor(QPalette.ColorRole.Text, accent)
         if accent.isValid() and self.show_color_icon and not prepared.icon.isNull():
@@ -80,7 +98,10 @@ class FavoriteItemDelegate(QStyledItemDelegate):
             emphasized = QFont(prepared.font)
             emphasized.setBold(True)
             prepared.font = emphasized
-        super().paint(painter, prepared, index)
+        # QStyledItemDelegate.paint reinitializes the option from model roles,
+        # losing the custom icon and brush. Draw the prepared option directly.
+        style = prepared.widget.style() if prepared.widget is not None else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, prepared, painter, prepared.widget)
 
         if accent.isValid() and self.show_color_left_bar:
             painter.save()
@@ -89,6 +110,15 @@ class FavoriteItemDelegate(QStyledItemDelegate):
                 accent,
             )
             painter.restore()
+
+    @staticmethod
+    def _blend(base: QColor, accent: QColor, amount: float) -> QColor:
+        keep = 1.0 - amount
+        return QColor(
+            round(base.red() * keep + accent.red() * amount),
+            round(base.green() * keep + accent.green() * amount),
+            round(base.blue() * keep + accent.blue() * amount),
+        )
 
     @staticmethod
     def _tinted_icon(icon: QIcon, size: QSize, color: QColor) -> QIcon:
@@ -107,17 +137,25 @@ class FavoriteItemDelegate(QStyledItemDelegate):
         option: QStyleOptionViewItem,
         label: str,
         alignment: str,
+        separator_style: str,
+        accent: QColor,
     ) -> None:
         rect = option.rect.adjusted(4, 0, -4, 0)
         painter.save()
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         if selected:
             painter.fillRect(option.rect, option.palette.highlight())
-            color = option.palette.highlightedText().color()
+            text_color = option.palette.highlightedText().color()
         else:
-            color = option.palette.mid().color()
-        painter.setPen(QPen(color, 1))
+            text_color = accent if accent.isValid() else option.palette.text().color()
+        line_color = QColor(text_color)
+        line_color.setAlpha(160)
+        painter.setPen(QPen(line_color, 1))
         y = rect.center().y()
+        if separator_style == "compact":
+            painter.drawLine(rect.left(), y, rect.right(), y)
+            painter.restore()
+            return
         text = label.strip()
         if not text:
             painter.drawLine(rect.left(), y, rect.right(), y)
@@ -128,18 +166,24 @@ class FavoriteItemDelegate(QStyledItemDelegate):
         gap = 7
         if alignment == "left":
             text_rect = QRect(rect.left(), rect.top(), width, rect.height())
+            painter.setPen(text_color)
             painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
+            painter.setPen(QPen(line_color, 1))
             start = min(rect.right(), text_rect.right() + gap)
             painter.drawLine(start, y, rect.right(), y)
         elif alignment == "right":
             text_rect = QRect(rect.right() - width + 1, rect.top(), width, rect.height())
+            painter.setPen(text_color)
             painter.drawText(text_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, text)
+            painter.setPen(QPen(line_color, 1))
             end = max(rect.left(), text_rect.left() - gap)
             painter.drawLine(rect.left(), y, end, y)
         else:
             left = rect.center().x() - width // 2
             text_rect = QRect(left, rect.top(), width, rect.height())
+            painter.setPen(text_color)
             painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, text)
+            painter.setPen(QPen(line_color, 1))
             painter.drawLine(rect.left(), y, max(rect.left(), text_rect.left() - gap), y)
             painter.drawLine(min(rect.right(), text_rect.right() + gap), y, rect.right(), y)
         painter.restore()

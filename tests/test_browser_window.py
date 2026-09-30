@@ -1698,7 +1698,7 @@ def test_missing_metadata_items_are_nonmodal_and_removable(
     finish_scan(window, qapp)
 
     window.open_bookmark(window.bookmark_model.index(0, 0))
-    assert window.statusBar().currentMessage() == "ブックマーク先が見つかりません"
+    assert window.statusBar().currentMessage() == "お気に入り先が見つかりません"
     window.open_history(window.history_model.index(0, 0))
     assert window.statusBar().currentMessage() == "履歴の項目が見つかりません"
     assert opened == []

@@ -1367,4 +1367,10 @@ ENGLISH.update({
     '背景': 'Background',
     '文字': 'Text',
     'お気に入りの色': 'Favorite color',
+    '表示形式:': 'Display style:',
+    '標準（文字付き）': 'Standard (with label)',
+    'コンパクト（線のみ）': 'Compact (line only)',
+    '適用': 'Apply',
+    'お気に入りフォルダの色表示（全体）': 'Favorite folder color display (global)',
+    '区切り線の色は、区切り線を選択して「色を設定…」で変更できます。': 'Select a separator and use “Set color…” to change its color.',
 })

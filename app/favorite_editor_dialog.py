@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 
-from PySide6.QtCore import QPoint, QRect, Qt
+from PySide6.QtCore import QPoint, QRect, Qt, Signal
 from PySide6.QtGui import QColor, QMouseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -91,6 +91,8 @@ class FavoriteEditorList(QListWidget):
 
 
 class FavoriteEditorDialog(QDialog):
+    apply_requested = Signal()
+
     def __init__(
         self,
         favorites,
@@ -144,6 +146,8 @@ class FavoriteEditorDialog(QDialog):
                 "id": str(raw.get("id", "")) or f"sep-{uuid4().hex[:12]}",
                 "label": str(raw.get("label", "")),
                 "alignment": alignment,
+                "style": "compact" if raw.get("style") == "compact" else "standard",
+                "color": str(raw.get("color", "")),
             }
             anchor = str(raw.get("before_path", "")).casefold()
             if anchor and anchor in folder_keys:
@@ -179,17 +183,22 @@ class FavoriteEditorDialog(QDialog):
         self.separator_alignment.addItem(tr("左端"), "left")
         self.separator_alignment.addItem(tr("中央"), "center")
         self.separator_alignment.addItem(tr("右端"), "right")
+        self.separator_style = QComboBox(separator_group)
+        self.separator_style.addItem(tr("標準（文字付き）"), "standard")
+        self.separator_style.addItem(tr("コンパクト（線のみ）"), "compact")
         separator_form.addRow(tr("区切り名:"), self.separator_label)
         separator_form.addRow(tr("位置:"), self.separator_alignment)
+        separator_form.addRow(tr("表示形式:"), self.separator_style)
         layout.addWidget(separator_group)
 
-        display_group = QGroupBox(tr("色アクセントの表示"), self)
-        display_layout = QHBoxLayout(display_group)
+        self.color_display_group = QGroupBox(tr("お気に入りフォルダの色表示（全体）"), self)
+        self.color_display_group.setToolTip(tr("区切り線の色は、区切り線を選択して「色を設定…」で変更できます。"))
+        display_layout = QHBoxLayout(self.color_display_group)
         display = dict(color_display or {})
-        self.show_icon = QCheckBox(tr("アイコン"), display_group)
-        self.show_bar = QCheckBox(tr("左端バー"), display_group)
-        self.show_background = QCheckBox(tr("背景"), display_group)
-        self.show_text = QCheckBox(tr("文字"), display_group)
+        self.show_icon = QCheckBox(tr("アイコン"), self.color_display_group)
+        self.show_bar = QCheckBox(tr("左端バー"), self.color_display_group)
+        self.show_background = QCheckBox(tr("背景"), self.color_display_group)
+        self.show_text = QCheckBox(tr("文字"), self.color_display_group)
         self.show_icon.setChecked(bool(display.get("icon", True)))
         self.show_bar.setChecked(bool(display.get("left_bar", True)))
         self.show_background.setChecked(bool(display.get("background", False)))
@@ -197,26 +206,33 @@ class FavoriteEditorDialog(QDialog):
         for widget in (self.show_icon, self.show_bar, self.show_background, self.show_text):
             display_layout.addWidget(widget)
         display_layout.addStretch(1)
-        layout.addWidget(display_group)
+        layout.addWidget(self.color_display_group)
 
         self.list.itemSelectionChanged.connect(self._sync_separator_controls)
         self.separator_label.textEdited.connect(self._separator_label_changed)
         self.separator_alignment.currentIndexChanged.connect(self._separator_alignment_changed)
+        self.separator_style.currentIndexChanged.connect(self._separator_style_changed)
         self._sync_separator_controls()
 
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel,
+            | QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.Apply,
             parent=self,
         )
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
+        apply_button = self.buttons.button(QDialogButtonBox.StandardButton.Apply)
+        apply_button.setText(tr("適用"))
+        apply_button.clicked.connect(self.apply_requested.emit)
         layout.addWidget(self.buttons)
 
     @staticmethod
     def _display_text(data: dict[str, object]) -> str:
         if data.get("kind") == "separator":
             label = str(data.get("label", "")).strip()
+            if data.get("style") == "compact":
+                return f"{tr('コンパクト（線のみ）')} — {label}" if label else tr("コンパクト（線のみ）")
             return f"── {label} ──" if label else "────────"
         return str(data.get("label", ""))
 
@@ -229,19 +245,19 @@ class FavoriteEditorDialog(QDialog):
         return list(self.list.selectedItems())
 
     def _choose_color(self) -> None:
-        folders = [
+        color_targets = [
             item for item in self._selected_items()
-            if dict(item.data(Qt.ItemDataRole.UserRole) or {}).get("kind") == "folder"
+            if dict(item.data(Qt.ItemDataRole.UserRole) or {}).get("kind") in {"folder", "separator"}
         ]
-        if not folders:
+        if not color_targets:
             return
         initial = QColor(
-            str(dict(folders[0].data(Qt.ItemDataRole.UserRole) or {}).get("color", "#80bfff"))
+            str(dict(color_targets[0].data(Qt.ItemDataRole.UserRole) or {}).get("color", "#80bfff"))
         )
         color = QColorDialog.getColor(initial, self, tr("お気に入りの色"))
         if not color.isValid():
             return
-        for item in folders:
+        for item in color_targets:
             data = dict(item.data(Qt.ItemDataRole.UserRole))
             data["color"] = color.name()
             item.setData(Qt.ItemDataRole.UserRole, data)
@@ -249,7 +265,7 @@ class FavoriteEditorDialog(QDialog):
     def _clear_color(self) -> None:
         for item in self._selected_items():
             data = dict(item.data(Qt.ItemDataRole.UserRole) or {})
-            if data.get("kind") == "folder":
+            if data.get("kind") in {"folder", "separator"}:
                 data["color"] = ""
                 item.setData(Qt.ItemDataRole.UserRole, data)
 
@@ -261,6 +277,8 @@ class FavoriteEditorDialog(QDialog):
             "id": f"sep-{uuid4().hex[:12]}",
             "label": "",
             "alignment": "center",
+            "style": "standard",
+            "color": "",
         }
         item = QListWidgetItem(self._display_text(data))
         item.setData(Qt.ItemDataRole.UserRole, data)
@@ -310,16 +328,26 @@ class FavoriteEditorDialog(QDialog):
         enabled = item is not None
         self.separator_label.setEnabled(enabled)
         self.separator_alignment.setEnabled(enabled)
+        self.separator_style.setEnabled(enabled)
+        selected_has_separator = any(
+            dict(selected.data(Qt.ItemDataRole.UserRole) or {}).get("kind") == "separator"
+            for selected in self._selected_items()
+        )
+        self.color_display_group.setEnabled(not selected_has_separator)
         self.separator_label.blockSignals(True)
         self.separator_alignment.blockSignals(True)
+        self.separator_style.blockSignals(True)
         try:
             self.separator_label.setText(str(data.get("label", "")) if data else "")
             alignment = str(data.get("alignment", "center")) if data else "center"
             index = self.separator_alignment.findData(alignment)
             self.separator_alignment.setCurrentIndex(max(0, index))
+            style = str(data.get("style", "standard")) if data else "standard"
+            self.separator_style.setCurrentIndex(max(0, self.separator_style.findData(style)))
         finally:
             self.separator_label.blockSignals(False)
             self.separator_alignment.blockSignals(False)
+            self.separator_style.blockSignals(False)
 
     def _separator_label_changed(self, value: str) -> None:
         item, data = self._current_separator()
@@ -335,6 +363,14 @@ class FavoriteEditorDialog(QDialog):
             return
         data["alignment"] = str(self.separator_alignment.currentData() or "center")
         item.setData(Qt.ItemDataRole.UserRole, data)
+
+    def _separator_style_changed(self, _index: int) -> None:
+        item, data = self._current_separator()
+        if item is None:
+            return
+        data["style"] = str(self.separator_style.currentData() or "standard")
+        item.setData(Qt.ItemDataRole.UserRole, data)
+        item.setText(self._display_text(data))
 
     def favorite_rows(self) -> list[dict[str, str]]:
         result = []
@@ -372,6 +408,8 @@ class FavoriteEditorDialog(QDialog):
                     "id": str(data.get("id", "")) or f"sep-{uuid4().hex[:12]}",
                     "label": str(data.get("label", "")),
                     "alignment": alignment,
+                    "style": "compact" if data.get("style") == "compact" else "standard",
+                    "color": str(data.get("color", "")),
                     "before_path": before_path,
                 }
             )
