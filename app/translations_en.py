@@ -1372,5 +1372,7 @@ ENGLISH.update({
     'コンパクト（線のみ）': 'Compact (line only)',
     '適用': 'Apply',
     'お気に入りフォルダの色表示（全体）': 'Favorite folder color display (global)',
+    '背景の透明度:': 'Background transparency:',
+    '0%で不透明、100%で完全に透明になります。': '0% is opaque; 100% is fully transparent.',
     '区切り線の色は、区切り線を選択して「色を設定…」で変更できます。': 'Select a separator and use “Set color…” to change its color.',
 })

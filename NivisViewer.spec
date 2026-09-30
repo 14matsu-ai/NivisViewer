@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import (
@@ -7,8 +8,15 @@ from PyInstaller.utils.hooks import (
 )
 
 from app.version import windows_version_info_text
+from scripts.portable_build_policy import prepare_binaries
 
 root = Path(SPECPATH)
+# Set this inside Python as well: process launch environments may override the
+# shell's PATH. The source audit below rejects any external toolchain leakage.
+os.environ["PATH"] = os.pathsep.join([
+    sys.base_prefix, str(Path(sys.base_prefix) / "DLLs"),
+    str(Path(os.environ["SystemRoot"]) / "System32"), os.environ["SystemRoot"],
+])
 license_dir = Path(os.environ.get("NIVIS_LICENSES_DIR", root / "licenses"))
 version_file = root / "build" / "NivisViewer_version_info.txt"
 version_file.parent.mkdir(parents=True, exist_ok=True)
@@ -44,6 +52,10 @@ a = Analysis(
     excludes=["pytest"],
     noarchive=False,
     optimize=0,
+)
+a.binaries = prepare_binaries(
+    a.binaries,
+    allowed_roots=[root, sys.base_prefix, sys.prefix, os.environ["SystemRoot"]],
 )
 pyz = PYZ(a.pure)
 

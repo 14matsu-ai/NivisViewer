@@ -179,6 +179,7 @@ class ConfigManager(QObject):
         "favorite_color_show_icon": True,
         "favorite_color_show_left_bar": True,
         "favorite_color_show_background": False,
+        "favorite_color_background_transparency": 68,
         "favorite_color_show_text": False,
         "sidebar_drop_folders_to_favorites": False,
         "sidebar_shift_drop_folders_to_favorites": True,
@@ -645,6 +646,10 @@ class ConfigManager(QObject):
         )
         if not isinstance(normalized.get("favorite_item_colors"), dict):
             normalized["favorite_item_colors"] = {}
+        normalized["favorite_color_background_transparency"] = cls._clamped_int(
+            normalized.get("favorite_color_background_transparency"),
+            default=68, minimum=0, maximum=100,
+        )
         if not isinstance(normalized.get("favorite_separators"), dict):
             normalized["favorite_separators"] = {}
         color = str(normalized.get("browser_tag_text_color", "#ffffff")).strip().casefold()

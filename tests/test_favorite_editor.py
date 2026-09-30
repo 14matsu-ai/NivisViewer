@@ -1,14 +1,17 @@
 from pathlib import Path
 
-from PySide6.QtCore import QRect, Qt
-from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPalette, QPixmap, QStandardItem, QStandardItemModel
-from PySide6.QtWidgets import QColorDialog, QDialog, QDialogButtonBox, QStyle, QStyleOptionViewItem
+from PySide6.QtCore import QEvent, QPointF, QRect, Qt
+from PySide6.QtGui import QColor, QHelpEvent, QIcon, QImage, QMouseEvent, QPainter, QPalette, QPixmap, QStandardItem, QStandardItemModel
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QColorDialog, QDialog, QDialogButtonBox, QStyle, QStyleOptionViewItem, QToolTip
 
 from app.browser_window import BrowserWindow
 from app.config_manager import ConfigManager
 from app.favorite_editor_dialog import FavoriteEditorDialog
 from app.favorite_item_delegate import FavoriteItemDelegate
 from app.metadata_store import MetadataStore
+from app.browser_model import BrowserItem, BrowserItemKind, BrowserItemModel
+from app.explorer_list_view import ExplorerListView
 
 
 def test_favorite_color_defaults_and_separator_editor(tmp_path: Path, qapp) -> None:
@@ -18,6 +21,7 @@ def test_favorite_color_defaults_and_separator_editor(tmp_path: Path, qapp) -> N
     assert values["favorite_color_show_left_bar"] is True
     assert values["favorite_color_show_background"] is False
     assert values["favorite_color_show_text"] is False
+    assert values["favorite_color_background_transparency"] == 68
 
     folder = tmp_path / "folder"
     folder.mkdir()
@@ -246,3 +250,149 @@ def test_compact_separator_uses_less_sidebar_height(tmp_path: Path, qapp) -> Non
     finally:
         window.close()
         store.close()
+
+
+def test_accent_bar_yields_to_selection_and_background_transparency(qapp) -> None:
+    class ItemModel(QStandardItemModel):
+        AccentColorRole = int(Qt.ItemDataRole.UserRole) + 1
+
+    model = ItemModel()
+    item = QStandardItem("Folder")
+    item.setData("#ff0000", model.AccentColorRole)
+    model.appendRow(item)
+    option = QStyleOptionViewItem()
+    option.rect = QRect(0, 0, 180, 24)
+    option.state = QStyle.StateFlag.State_Enabled
+    option.palette.setColor(QPalette.ColorRole.Base, QColor("#202020"))
+    option.palette.setColor(QPalette.ColorRole.Highlight, QColor("#0088ff"))
+    delegate = FavoriteItemDelegate(show_color_background=True)
+
+    def render() -> QImage:
+        image = QImage(180, 24, QImage.Format.Format_ARGB32)
+        image.fill(QColor("#202020"))
+        painter = QPainter(image)
+        delegate.paint(painter, option, model.index(0, 0))
+        painter.end()
+        return image
+
+    assert render().pixelColor(2, 12) == QColor("#ff0000")
+    option.state |= QStyle.StateFlag.State_Selected
+    selected = render()
+    delegate.show_color_left_bar = False
+    assert render() == selected
+    option.state = QStyle.StateFlag.State_Enabled
+    delegate.background_transparency = 0
+    assert render().pixelColor(140, 12) == QColor("#ff0000")
+    delegate.background_transparency = 100
+    assert render().pixelColor(140, 12) == QColor("#202020")
+
+
+def test_background_transparency_apply_persists_and_reaches_delegate(tmp_path: Path, qapp) -> None:
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    store = MetadataStore(tmp_path / "metadata.sqlite3")
+    window = BrowserWindow(config_manager=config, metadata_store=store, restore_initial_location=False)
+    dialog = FavoriteEditorDialog([], {}, [], color_display={"background": True})
+    try:
+        dialog.background_transparency.setValue(25)
+        window._save_favorite_editor(dialog, 1)
+        assert window.favorite_item_delegate.background_transparency == 25
+        reloaded = ConfigManager(tmp_path / "config.json")
+        assert reloaded.load()["favorite_color_background_transparency"] == 25
+        reloaded.apply({"favorite_color_background_transparency": 200})
+        assert reloaded.get("favorite_color_background_transparency") == 100
+    finally:
+        dialog.reject()
+        window.close()
+        store.close()
+
+
+def test_sidebar_path_tooltips_hide_on_movement_and_thumbnail_notices_remain(tmp_path: Path, qapp, monkeypatch) -> None:
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    store = MetadataStore(tmp_path / "metadata.sqlite3")
+    store.add_folder_bookmark(str(folder))
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    window = BrowserWindow(config_manager=config, metadata_store=store, restore_initial_location=False)
+    try:
+        index = window.folder_bookmark_model.index(0, 0)
+        assert index.data(Qt.ItemDataRole.ToolTipRole) == str(folder)
+        path = folder / "image.png"
+        model = BrowserItemModel()
+        model.set_items([BrowserItem(path=path, kind=BrowserItemKind.IMAGE, display_name=path.name, modified_at=None)])
+        index = model.index(0, 0)
+        assert index.data(Qt.ItemDataRole.ToolTipRole) is None
+        model.set_thumbnail_error(path, "decode failed")
+        assert "decode failed" in index.data(Qt.ItemDataRole.ToolTipRole)
+        model.set_items([BrowserItem(path=path, kind=BrowserItemKind.IMAGE, display_name=path.name, modified_at=None, online_only=True)])
+        assert model.index(0, 0).data(Qt.ItemDataRole.ToolTipRole)
+        hidden = []
+        monkeypatch.setattr(QToolTip, "hideText", lambda: hidden.append(True))
+        for view in (window.favorite_view, window.history_view, window.folder_tree, window.list_view):
+            assert view.hasMouseTracking()
+            hidden.clear()
+            move = QMouseEvent(
+                QEvent.Type.MouseMove, QPointF(10, 10), QPointF(10, 10),
+                Qt.MouseButton.NoButton, Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+            )
+            qapp.sendEvent(view.viewport(), move)
+            assert hidden
+            hidden.clear()
+            qapp.sendEvent(view.viewport(), QEvent(QEvent.Type.Leave))
+            assert hidden
+    finally:
+        window.close()
+        store.close()
+
+
+def test_qt_tooltip_events_cannot_revive_tip_before_mouse_stops(qapp, monkeypatch) -> None:
+    view = ExplorerListView()
+    model = QStandardItemModel(view)
+    for name in ("first", "second"):
+        item = QStandardItem(name)
+        item.setToolTip(f"C:/{name}")
+        model.appendRow(item)
+    view.setModel(model)
+    view.resize(200, 100)
+    view._item_tooltips._timer.setInterval(80)
+    shown = []
+    monkeypatch.setattr(QToolTip, "showText", lambda _pos, text, _widget, rect: shown.append((text, rect)))
+    monkeypatch.setattr(QToolTip, "hideText", lambda: None)
+    # Keep this timer/input test independent of platform-generated enter/leave
+    # events from other offscreen test windows. Inject only our own movement.
+    view.doItemsLayout()
+    monkeypatch.setattr(view.viewport(), "isVisible", lambda: True)
+
+    def move_and_send_qt_tooltip(row):
+        point = view.visualRect(model.index(row, 0)).center()
+        global_point = view.viewport().mapToGlobal(point)
+        move = QMouseEvent(
+            QEvent.Type.MouseMove, QPointF(point), QPointF(global_point),
+            Qt.MouseButton.NoButton, Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+        )
+        qapp.sendEvent(view.viewport(), move)
+        qapp.sendEvent(view.viewport(), QHelpEvent(QEvent.Type.ToolTip, point, global_point))
+
+    try:
+        move_and_send_qt_tooltip(0)
+        QTest.qWait(110)
+        assert shown == [("C:/first", view.visualRect(model.index(0, 0)))]
+        shown.clear()
+        # Simulate Qt's short reactivation delay after a previously visible tip.
+        move_and_send_qt_tooltip(1)
+        QTest.qWait(30)
+        assert shown == []
+        move_and_send_qt_tooltip(0)
+        QTest.qWait(30)
+        assert shown == []
+        move_and_send_qt_tooltip(1)
+        QTest.qWait(110)
+        assert shown == [("C:/second", view.visualRect(model.index(1, 0)))]
+        shown.clear()
+        move_and_send_qt_tooltip(0)
+        qapp.sendEvent(view.viewport(), QEvent(QEvent.Type.Leave))
+        QTest.qWait(110)
+        assert shown == []
+    finally:
+        view.close()

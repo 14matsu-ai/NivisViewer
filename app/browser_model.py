@@ -285,7 +285,7 @@ class BrowserItemModel(QAbstractListModel):
                 from .cloud_files import online_only_message
                 return f"{item.path}\n{online_only_message()}"
             error = self._thumbnail_errors.get(self._key(item.path))
-            return str(item.path) if not error else f"{item.path}\n{error}"
+            return f"{item.path}\n{error}" if error else None
         return None
 
     def set_items(

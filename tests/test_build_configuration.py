@@ -9,9 +9,32 @@ import sys
 import pytest
 
 from scripts.verify_portable_build import verify
+from scripts.portable_build_policy import prepare_binaries
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_binary_policy_rejects_external_toolchain_and_removes_only_same_package_dll(tmp_path):
+    runtime = tmp_path / "runtime"
+    external = tmp_path / "poppler"
+    dll = runtime / "numpy.libs" / "blas.dll"
+    entries = [("blas.dll", str(dll), "BINARY"), ("numpy.libs/blas.dll", str(dll), "BINARY")]
+    assert prepare_binaries(entries, allowed_roots=[runtime]) == [entries[1]]
+    other = runtime / "other" / "blas.dll"
+    entries[0] = ("blas.dll", str(other), "BINARY")
+    assert prepare_binaries(entries, allowed_roots=[runtime]) == entries
+    with pytest.raises(ValueError, match="Unapproved binary source"):
+        prepare_binaries([("icuuc.dll", str(external / "icuuc.dll"), "BINARY")], allowed_roots=[runtime])
+
+
+def test_portable_verifier_detects_duplicate_package_dll(tmp_path):
+    internal = tmp_path / "_internal"
+    libs = internal / "numpy.libs"
+    libs.mkdir(parents=True)
+    (internal / "blas.dll").write_bytes(b"identical DLL")
+    (libs / "blas.dll").write_bytes(b"identical DLL")
+    assert "duplicate package DLL at bundle root: blas.dll" in verify(tmp_path)
 
 
 def test_spec_is_windowed_onedir_and_contains_portable_resources():

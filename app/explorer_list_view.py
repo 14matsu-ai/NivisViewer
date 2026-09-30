@@ -28,6 +28,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QApplication, QListView, QRubberBand, QTreeView
 
+from .item_tooltip_controller import ItemTooltipController
+
 from .browser_pointer_controller import (
     BrowserPointerController,
     BrowserPointerState,
@@ -81,6 +83,7 @@ class ExplorerListView(QListView):
         self._folder_gesture_right_button_down = False
         self._suppress_folder_gesture_context_menu = False
         self._wheel_scroll = BrowserWheelScrollAccumulator()
+        self._item_tooltips = ItemTooltipController(self)
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
         # All source drags are created by start_path_drag(). Qt's standard
@@ -797,6 +800,7 @@ class PathDropTreeView(QTreeView):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.pointer_controller = FolderTreePointerController()
+        self._item_tooltips = ItemTooltipController(self)
         self._drop_hover_index = QModelIndex()
         self._shift_favorite_drop_enabled = False
         self._sidebar_file_operations_disabled = False

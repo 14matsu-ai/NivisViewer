@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
 from pathlib import Path
 
 
@@ -38,6 +39,16 @@ def verify(bundle: Path, smoke_result: Path | None = None) -> list[str]:
     if not ((bundle / "licenses").is_dir() or (bundle / "_internal" / "licenses").is_dir()):
         errors.append("missing: licenses")
     paths = tuple(bundle.rglob("*")) if bundle.exists() else ()
+    package_dlls = {
+        path.name.casefold(): path for path in paths
+        if path.is_file() and path.suffix.casefold() == ".dll"
+        and path.parent.name.endswith(".libs")
+    }
+    for path in paths:
+        duplicate = package_dlls.get(path.name.casefold())
+        if duplicate is not None and path.parent == bundle / "_internal":
+            if hashlib.sha256(path.read_bytes()).digest() == hashlib.sha256(duplicate.read_bytes()).digest():
+                errors.append(f"duplicate package DLL at bundle root: {path.name}")
     lower_names = {path.name.casefold() for path in paths}
     for name in FORBIDDEN_NAMES:
         if name.casefold() in lower_names:

@@ -1045,6 +1045,9 @@ class BrowserWindow(QMainWindow):
         self.favorite_color_show_background = bool(
             self.settings.get("favorite_color_show_background", False)
         )
+        self.favorite_color_background_transparency = int(
+            self.settings.get("favorite_color_background_transparency", 68)
+        )
         self.favorite_color_show_text = bool(
             self.settings.get("favorite_color_show_text", False)
         )
@@ -7046,6 +7049,7 @@ class BrowserWindow(QMainWindow):
             show_color_left_bar=self.favorite_color_show_left_bar,
             show_color_background=self.favorite_color_show_background,
             show_color_text=self.favorite_color_show_text,
+            background_transparency=self.favorite_color_background_transparency,
         )
         self.favorite_view.setItemDelegate(self.favorite_item_delegate)
         self.favorite_view.setIconSize(
@@ -7936,6 +7940,7 @@ class BrowserWindow(QMainWindow):
             show_color_left_bar=self.favorite_color_show_left_bar,
             show_color_background=self.favorite_color_show_background,
             show_color_text=self.favorite_color_show_text,
+            background_transparency=self.favorite_color_background_transparency,
         )
         self.favorite_view.setItemDelegate(self.favorite_item_delegate)
         self.favorite_view.setIconSize(
@@ -8939,6 +8944,7 @@ class BrowserWindow(QMainWindow):
                 left_bar=self.favorite_color_show_left_bar,
                 background=self.favorite_color_show_background,
                 text=self.favorite_color_show_text,
+                background_transparency=self.favorite_color_background_transparency,
             )
         if hasattr(self, "favorite_view"):
             self.favorite_view.viewport().update()
@@ -8964,6 +8970,7 @@ class BrowserWindow(QMainWindow):
                 "left_bar": self.favorite_color_show_left_bar,
                 "background": self.favorite_color_show_background,
                 "text": self.favorite_color_show_text,
+                "background_transparency": self.favorite_color_background_transparency,
             },
         )
         dialog.apply_requested.connect(
@@ -9009,12 +9016,14 @@ class BrowserWindow(QMainWindow):
             "favorite_color_show_left_bar": display["left_bar"],
             "favorite_color_show_background": display["background"],
             "favorite_color_show_text": display["text"],
+            "favorite_color_background_transparency": display["background_transparency"],
         }
         self.config.apply(changed, save=True)
         self.favorite_color_show_icon = display["icon"]
         self.favorite_color_show_left_bar = display["left_bar"]
         self.favorite_color_show_background = display["background"]
         self.favorite_color_show_text = display["text"]
+        self.favorite_color_background_transparency = display["background_transparency"]
         if group_id == self.folder_bookmark_model.group_id:
             self._apply_favorite_customization()
 

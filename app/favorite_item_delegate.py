@@ -19,6 +19,7 @@ class FavoriteItemDelegate(QStyledItemDelegate):
         show_color_left_bar: bool = True,
         show_color_background: bool = False,
         show_color_text: bool = False,
+        background_transparency: int = 68,
     ) -> None:
         super().__init__(parent)
         self.metrics = metrics or FavoriteRowMetrics()
@@ -26,12 +27,15 @@ class FavoriteItemDelegate(QStyledItemDelegate):
         self.show_color_left_bar = bool(show_color_left_bar)
         self.show_color_background = bool(show_color_background)
         self.show_color_text = bool(show_color_text)
+        self.background_transparency = max(0, min(100, int(background_transparency)))
 
-    def configure_color_display(self, *, icon: bool, left_bar: bool, background: bool, text: bool) -> None:
+    def configure_color_display(self, *, icon: bool, left_bar: bool, background: bool, text: bool, background_transparency: int | None = None) -> None:
         self.show_color_icon = bool(icon)
         self.show_color_left_bar = bool(left_bar)
         self.show_color_background = bool(background)
         self.show_color_text = bool(text)
+        if background_transparency is not None:
+            self.background_transparency = max(0, min(100, int(background_transparency)))
 
     def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:  # noqa: N802
         model = index.model()
@@ -81,7 +85,7 @@ class FavoriteItemDelegate(QStyledItemDelegate):
             base = prepared.palette.color(
                 QPalette.ColorRole.Highlight if selected else QPalette.ColorRole.Base
             )
-            blended = self._blend(base, accent, 0.42 if selected else 0.32)
+            blended = self._blend(base, accent, 1.0 - self.background_transparency / 100.0)
             if selected:
                 prepared.palette.setColor(QPalette.ColorRole.Highlight, blended)
             else:
@@ -103,7 +107,8 @@ class FavoriteItemDelegate(QStyledItemDelegate):
         style = prepared.widget.style() if prepared.widget is not None else QApplication.style()
         style.drawControl(QStyle.ControlElement.CE_ItemViewItem, prepared, painter, prepared.widget)
 
-        if accent.isValid() and self.show_color_left_bar:
+        # The native style may paint its own selection stripe at this position.
+        if accent.isValid() and self.show_color_left_bar and not selected:
             painter.save()
             painter.fillRect(
                 QRect(option.rect.left() + 1, option.rect.top() + 1, 3, max(1, option.rect.height() - 2)),

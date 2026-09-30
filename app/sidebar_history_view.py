@@ -2,6 +2,8 @@ from PySide6.QtCore import QModelIndex, Qt, Signal
 from PySide6.QtGui import QDragEnterEvent, QDragLeaveEvent, QDropEvent
 from PySide6.QtWidgets import QListView
 
+from .item_tooltip_controller import ItemTooltipController
+
 from .drag_drop import paths_from_mime_data
 
 
@@ -11,6 +13,7 @@ class SidebarHistoryView(QListView):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._item_tooltips = ItemTooltipController(self)
         self.double_click_to_open = False
         self._ignore_release = False
         self._folder_drop_enabled = False

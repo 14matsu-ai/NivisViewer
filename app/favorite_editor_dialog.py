@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPushButton,
     QRubberBand,
+    QSpinBox,
     QVBoxLayout,
 )
 
@@ -193,7 +194,8 @@ class FavoriteEditorDialog(QDialog):
 
         self.color_display_group = QGroupBox(tr("お気に入りフォルダの色表示（全体）"), self)
         self.color_display_group.setToolTip(tr("区切り線の色は、区切り線を選択して「色を設定…」で変更できます。"))
-        display_layout = QHBoxLayout(self.color_display_group)
+        display_layout = QVBoxLayout(self.color_display_group)
+        display_options = QHBoxLayout()
         display = dict(color_display or {})
         self.show_icon = QCheckBox(tr("アイコン"), self.color_display_group)
         self.show_bar = QCheckBox(tr("左端バー"), self.color_display_group)
@@ -204,8 +206,21 @@ class FavoriteEditorDialog(QDialog):
         self.show_background.setChecked(bool(display.get("background", False)))
         self.show_text.setChecked(bool(display.get("text", False)))
         for widget in (self.show_icon, self.show_bar, self.show_background, self.show_text):
-            display_layout.addWidget(widget)
-        display_layout.addStretch(1)
+            display_options.addWidget(widget)
+        display_options.addStretch(1)
+        display_layout.addLayout(display_options)
+        transparency_layout = QHBoxLayout()
+        transparency_layout.addWidget(QLabel(tr("背景の透明度:"), self.color_display_group))
+        self.background_transparency = QSpinBox(self.color_display_group)
+        self.background_transparency.setRange(0, 100)
+        self.background_transparency.setSuffix(" %")
+        self.background_transparency.setValue(int(display.get("background_transparency", 68)))
+        self.background_transparency.setToolTip(tr("0%で不透明、100%で完全に透明になります。"))
+        self.background_transparency.setEnabled(self.show_background.isChecked())
+        self.show_background.toggled.connect(self.background_transparency.setEnabled)
+        transparency_layout.addWidget(self.background_transparency)
+        transparency_layout.addStretch(1)
+        display_layout.addLayout(transparency_layout)
         layout.addWidget(self.color_display_group)
 
         self.list.itemSelectionChanged.connect(self._sync_separator_controls)
@@ -415,10 +430,11 @@ class FavoriteEditorDialog(QDialog):
             )
         return result
 
-    def color_display(self) -> dict[str, bool]:
+    def color_display(self) -> dict[str, bool | int]:
         return {
             "icon": self.show_icon.isChecked(),
             "left_bar": self.show_bar.isChecked(),
             "background": self.show_background.isChecked(),
             "text": self.show_text.isChecked(),
+            "background_transparency": self.background_transparency.value(),
         }
