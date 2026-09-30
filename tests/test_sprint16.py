@@ -419,6 +419,7 @@ def test_folder_favorite_and_tree_drops_route_copy_move(
     store = MetadataStore(tmp_path / "metadata.sqlite3")
     config = ConfigManager(tmp_path / "config.json")
     config.load()
+    config.apply({"favorite_drop_confirm_move": False})
     window = BrowserWindow(
         config_manager=config,
         metadata_store=store,
@@ -450,7 +451,7 @@ def test_folder_favorite_and_tree_drops_route_copy_move(
     window._on_favorite_paths_dropped(
         (source,),
         favorite_index,
-        Qt.KeyboardModifier.ShiftModifier,
+        Qt.KeyboardModifier.ControlModifier,
         None,
     )
     assert calls[-1][0].value == "move"

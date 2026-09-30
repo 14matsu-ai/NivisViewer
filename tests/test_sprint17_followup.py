@@ -36,6 +36,7 @@ from app.browser_window import BrowserWindow
 from app.config_manager import ConfigManager
 from app.drag_drop import build_path_mime_data
 from app.explorer_list_view import ExplorerListView, PathDropTreeView
+from app.file_operation_service import FileOperationKind
 from app.favorite_item_delegate import FavoriteItemDelegate
 from app.favorite_row_metrics import FavoriteRowMetrics
 from app.folder_tree_pointer import (
@@ -49,6 +50,7 @@ from app.image_source import (
     create_image_source,
 )
 from app.settings_dialog import SettingsDialog
+from app.sidebar_history_view import SidebarHistoryView
 from app.metadata_store import MetadataStore
 from app.page_model import PageModel
 from app.viewer_window import ViewerWindow
@@ -578,11 +580,18 @@ def test_favorite_config_round_trip_and_normalization(tmp_path: Path) -> None:
     assert defaults["favorite_row_padding_y"] == 1
     assert defaults["favorite_row_spacing"] == 0
     assert defaults["favorite_icon_size"] == 16
+    assert defaults["favorite_drop_default_operation"] == "copy"
+    assert defaults["favorite_drop_ctrl_inverts_operation"] is True
+    assert defaults["favorite_drop_confirm_move"] is True
+    assert defaults["favorite_drop_confirm_focus_yes"] is False
+    assert defaults["sidebar_drop_folders_to_favorites"] is False
     config.apply(
         {
             "favorite_row_padding_y": 99,
             "favorite_row_spacing": -1,
             "favorite_icon_size": 99,
+            "favorite_drop_default_operation": "invalid",
+            "favorite_drop_ctrl_inverts_operation": "invalid",
         },
         save=True,
     )
@@ -591,6 +600,8 @@ def test_favorite_config_round_trip_and_normalization(tmp_path: Path) -> None:
     assert reopened.get("favorite_row_padding_y") == 8
     assert reopened.get("favorite_row_spacing") == 0
     assert reopened.get("favorite_icon_size") == 24
+    assert reopened.get("favorite_drop_default_operation") == "copy"
+    assert reopened.get("favorite_drop_ctrl_inverts_operation") is True
 
 
 def test_favorite_settings_round_trip_and_existing_window_apply(
@@ -607,16 +618,79 @@ def test_favorite_settings_round_trip_and_existing_window_apply(
     dialog.favorite_row_padding_spin.setValue(0)
     dialog.favorite_row_spacing_spin.setValue(3)
     dialog.favorite_icon_size_spin.setValue(24)
+    dialog.favorite_drop_default_operation_combo.setCurrentIndex(
+        dialog.favorite_drop_default_operation_combo.findData("move")
+    )
+    dialog.favorite_drop_ctrl_inverts_checkbox.setChecked(False)
+    dialog.favorite_drop_confirm_move_checkbox.setChecked(False)
+    dialog.favorite_drop_confirm_focus_yes_checkbox.setChecked(True)
+    dialog.sidebar_drop_folders_to_favorites_checkbox.setChecked(True)
     changed = dialog.apply_settings()
     assert changed["favorite_row_padding_y"] == 0
     assert changed["favorite_row_spacing"] == 3
     assert changed["favorite_icon_size"] == 24
+    assert changed["favorite_drop_default_operation"] == "move"
+    assert changed["favorite_drop_ctrl_inverts_operation"] is False
+    assert changed["favorite_drop_confirm_move"] is False
+    assert changed["favorite_drop_confirm_focus_yes"] is True
+    assert changed["sidebar_drop_folders_to_favorites"] is True
     assert window.favorite_row_metrics == FavoriteRowMetrics(0, 3, 24)
     assert window.favorite_view.spacing() == 3
     assert window.favorite_view.iconSize() == QSize(24, 24)
+    assert window.favorite_drop_default_operation == "move"
+    assert window.favorite_drop_ctrl_inverts_operation is False
+    assert window.favorite_drop_confirm_move is False
+    assert window.favorite_drop_confirm_focus_yes is True
+    assert window.sidebar_drop_folders_to_favorites is True
+    assert window.history_view.acceptDrops()
     dialog.reject()
     window.close()
     qapp.processEvents()
+
+
+def test_favorite_drop_default_copy_and_ctrl_inversion(
+    qapp,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    source = tmp_path / "source.txt"
+    source.write_text("x", encoding="utf-8")
+    store = MetadataStore(tmp_path / "metadata.sqlite3")
+    store.add_folder_bookmark(str(target))
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.apply({"favorite_drop_confirm_move": False})
+    window = BrowserWindow(
+        config_manager=config,
+        metadata_store=store,
+        restore_initial_location=False,
+    )
+    calls: list[tuple[FileOperationKind, dict[str, object]]] = []
+    window._start_file_operation = (
+        lambda operation, **kwargs: calls.append((operation, kwargs)) or True
+    )
+    index = window.folder_bookmark_model.index(0, 0)
+
+    window._on_favorite_paths_dropped(
+        (str(source),),
+        index,
+        Qt.KeyboardModifier.NoModifier,
+        window.list_view,
+    )
+    assert calls[-1][0] is FileOperationKind.COPY
+
+    window._on_favorite_paths_dropped(
+        (str(source),),
+        index,
+        Qt.KeyboardModifier.ControlModifier,
+        window.list_view,
+    )
+    assert calls[-1][0] is FileOperationKind.MOVE
+
+    window.close()
+    qapp.processEvents()
+    store.close()
 
 
 def test_favorite_actual_release_navigation_and_double_click_once(
@@ -752,3 +826,412 @@ def test_browser_to_viewer_wide_open_matches_clicked_path(
     browser.close()
     qapp.processEvents()
     store.close()
+
+@pytest.mark.parametrize(
+    ("allowed", "default", "modifiers", "expected_action", "expected_operation"),
+    [
+        (Qt.DropAction.CopyAction, "move", Qt.KeyboardModifier.NoModifier,
+         Qt.DropAction.CopyAction, FileOperationKind.COPY),
+        (Qt.DropAction.MoveAction, "copy", Qt.KeyboardModifier.NoModifier,
+         None, None),
+        (Qt.DropAction.CopyAction | Qt.DropAction.MoveAction, "copy",
+         Qt.KeyboardModifier.ControlModifier,
+         Qt.DropAction.MoveAction, FileOperationKind.MOVE),
+    ],
+)
+def test_favorite_qt_drop_action_matches_operation(
+    qapp, tmp_path: Path, monkeypatch, allowed, default, modifiers,
+    expected_action, expected_operation,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    source = tmp_path / "source.txt"
+    source.write_text("x", encoding="utf-8")
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.apply({"favorite_drop_default_operation": default,
+                  "favorite_drop_confirm_move": False})
+    store = MetadataStore(tmp_path / "metadata.sqlite3")
+    store.add_folder_bookmark(str(target))
+    window = BrowserWindow(config_manager=config, metadata_store=store,
+                           restore_initial_location=False)
+    window.show()
+    qapp.processEvents()
+    operations = []
+    monkeypatch.setattr(window, "_start_file_operation",
+                        lambda operation, **kwargs: operations.append(operation) or True)
+    view = window.favorite_view
+    position = view.visualRect(view.model().index(0, 0)).center()
+    mime = build_path_mime_data((str(source),))
+    enter = QDragEnterEvent(position, allowed, mime,
+                            Qt.MouseButton.LeftButton, modifiers)
+    qapp.sendEvent(view.viewport(), enter)
+    move = QDragMoveEvent(position, allowed, mime,
+                          Qt.MouseButton.LeftButton, modifiers)
+    qapp.sendEvent(view.viewport(), move)
+    drop = QDropEvent(QPointF(position), allowed, mime,
+                      Qt.MouseButton.LeftButton, modifiers)
+    qapp.sendEvent(view.viewport(), drop)
+    if expected_action is None:
+        assert not drop.isAccepted()
+        assert operations == []
+    else:
+        assert drop.isAccepted()
+        assert drop.dropAction() == expected_action
+        assert operations == [expected_operation]
+    window.close()
+    qapp.processEvents()
+    store.close()
+
+def test_shift_sidebar_folder_add_overrides_favorite_operation(
+    qapp, tmp_path: Path, monkeypatch,
+) -> None:
+    target = tmp_path / "target"
+    source = tmp_path / "source"
+    target.mkdir()
+    source.mkdir()
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    assert config.get("sidebar_shift_drop_folders_to_favorites") is True
+    config.apply({"sidebar_shift_drop_folders_to_favorites": True,
+                  "favorite_drop_default_operation": "move",
+                  "favorite_drop_confirm_move": False})
+    store = MetadataStore(tmp_path / "metadata.sqlite3")
+    store.add_folder_bookmark(str(target))
+    window = BrowserWindow(config_manager=config, metadata_store=store,
+                           restore_initial_location=False)
+    window.item_model.set_items([_browser_item(source, BrowserItemKind.FOLDER)])
+    assert window._shift_favorite_drop_requested(
+        Qt.KeyboardModifier.ShiftModifier, window.favorite_view,
+    )
+    operations = []
+    monkeypatch.setattr(window, "_start_file_operation",
+                        lambda operation, **kwargs: operations.append(operation) or True)
+    index = window.folder_bookmark_model.index(0, 0)
+    window._on_favorite_paths_dropped(
+        (str(source),), index, Qt.KeyboardModifier.ShiftModifier,
+        window.list_view, Qt.DropAction.CopyAction,
+    )
+    assert str(source) in [item.path for item in store.list_folder_bookmarks()]
+    assert not operations
+    window._on_favorite_paths_dropped(
+        (str(source),), index, Qt.KeyboardModifier.NoModifier,
+        window.list_view, Qt.DropAction.MoveAction,
+    )
+    assert operations == [FileOperationKind.MOVE]
+    window.sidebar_shift_drop_folders_to_favorites = False
+    window._on_favorite_paths_dropped(
+        (str(source),), index, Qt.KeyboardModifier.ShiftModifier,
+        window.list_view, Qt.DropAction.MoveAction,
+    )
+    assert operations == [FileOperationKind.MOVE, FileOperationKind.MOVE]
+    window.close()
+    qapp.processEvents()
+    store.close()
+
+
+@pytest.mark.parametrize("allowed, accepted", [
+    (Qt.DropAction.CopyAction | Qt.DropAction.MoveAction, True),
+    (Qt.DropAction.MoveAction, False),
+])
+def test_shift_external_favorite_drop_never_reports_move(
+    qapp, tmp_path: Path, monkeypatch, allowed, accepted,
+) -> None:
+    target = tmp_path / "target"
+    source = tmp_path / "source"
+    target.mkdir()
+    source.mkdir()
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.apply({"sidebar_shift_drop_folders_to_favorites": True,
+                  "favorite_drop_default_operation": "move"})
+    store = MetadataStore(tmp_path / "metadata.sqlite3")
+    store.add_folder_bookmark(str(target))
+    window = BrowserWindow(config_manager=config, metadata_store=store,
+                           restore_initial_location=False)
+    window.show()
+    qapp.processEvents()
+    monkeypatch.setattr(window, "_probe_dropped_folders",
+                        lambda paths, callback: callback(paths))
+    operations = []
+    monkeypatch.setattr(window, "_start_file_operation",
+                        lambda *args, **kwargs: operations.append(args))
+    view = window.favorite_view
+    position = view.visualRect(view.model().index(0, 0)).center()
+    mime = build_path_mime_data((str(source),))
+    enter = QDragEnterEvent(position, allowed, mime,
+                            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ShiftModifier)
+    qapp.sendEvent(view.viewport(), enter)
+    drop = QDropEvent(QPointF(position), allowed, mime,
+                      Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ShiftModifier)
+    qapp.sendEvent(view.viewport(), drop)
+    assert drop.isAccepted() is accepted
+    if accepted:
+        assert drop.dropAction() == Qt.DropAction.CopyAction
+        assert str(source) in [item.path for item in store.list_folder_bookmarks()]
+    else:
+        assert str(source) not in [item.path for item in store.list_folder_bookmarks()]
+    assert not operations
+    window.close()
+    qapp.processEvents()
+    store.close()
+
+
+@pytest.mark.parametrize("view_kind", ["tree", "history"])
+def test_shift_sidebar_drop_reports_copy_or_rejects_move_only(
+    qapp, view_kind: str, tmp_path: Path,
+) -> None:
+    view = PathDropTreeView() if view_kind == "tree" else SidebarHistoryView()
+    view.set_shift_favorite_drop_enabled(True)
+    if view_kind == "history":
+        view.set_folder_drop_enabled(True)
+    mime = build_path_mime_data((str(tmp_path),))
+    accepted = QDropEvent(
+        QPointF(1, 1), Qt.DropAction.CopyAction | Qt.DropAction.MoveAction,
+        mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ShiftModifier,
+    )
+    resolver = view._accept_tree_drop if view_kind == "tree" else view._accept_history_drop
+    assert resolver(accepted)
+    assert accepted.dropAction() == Qt.DropAction.CopyAction
+    move_only = QDropEvent(
+        QPointF(1, 1), Qt.DropAction.MoveAction,
+        mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ShiftModifier,
+    )
+    assert not resolver(move_only)
+    assert not move_only.isAccepted()
+    view.close()
+
+def test_internal_favorite_reorder_keeps_move_action(
+    qapp, tmp_path: Path, monkeypatch,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    store = MetadataStore(tmp_path / "metadata.sqlite3")
+    store.add_folder_bookmark(str(first))
+    store.add_folder_bookmark(str(second))
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.apply({"sidebar_shift_drop_folders_to_favorites": True,
+                  "sidebar_drop_disable_file_operations": True})
+    window = BrowserWindow(config_manager=config,
+                           metadata_store=store, restore_initial_location=False)
+    index = window.folder_bookmark_model.index(1, 0)
+    assert window._favorite_drop_qt_action(
+        index, Qt.KeyboardModifier.ShiftModifier, window.favorite_view,
+    ) == Qt.DropAction.MoveAction
+    operations = []
+    monkeypatch.setattr(window, "_start_file_operation",
+                        lambda *args, **kwargs: operations.append(args))
+    window._on_favorite_paths_dropped(
+        (str(first),), index, Qt.KeyboardModifier.ShiftModifier,
+        window.favorite_view, Qt.DropAction.MoveAction,
+    )
+    assert [item.path for item in store.list_folder_bookmarks()] == [str(second), str(first)]
+    assert not operations
+    window.close()
+    qapp.processEvents()
+    store.close()
+
+def test_shift_file_drop_keeps_file_operation_for_favorite_and_tree(
+    qapp, tmp_path: Path, monkeypatch,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    source = tmp_path / "source.txt"
+    source.write_text("x", encoding="utf-8")
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.apply({"favorite_drop_default_operation": "move",
+                  "favorite_drop_confirm_move": False})
+    store = MetadataStore(tmp_path / "metadata.sqlite3")
+    store.add_folder_bookmark(str(target))
+    window = BrowserWindow(config_manager=config, metadata_store=store,
+                           restore_initial_location=False)
+    window.item_model.set_items([_browser_item(source, BrowserItemKind.OTHER)])
+    operations = []
+    monkeypatch.setattr(window, "_start_file_operation",
+                        lambda operation, **kwargs: operations.append(operation) or True)
+    monkeypatch.setattr(window, "_probe_dropped_folders",
+                        lambda paths, callback: callback(()))
+    monkeypatch.setattr(window.file_system_model, "filePath",
+                        lambda index: str(target))
+    favorite_index = window.folder_bookmark_model.index(0, 0)
+    tree_index = window.item_model.index(0, 0)
+    window._on_favorite_paths_dropped(
+        (str(source),), favorite_index, Qt.KeyboardModifier.ShiftModifier,
+        window.list_view, Qt.DropAction.MoveAction,
+    )
+    window._on_favorite_paths_dropped(
+        (str(source),), favorite_index, Qt.KeyboardModifier.ShiftModifier,
+        None, Qt.DropAction.CopyAction,
+    )
+    window._on_tree_paths_dropped(
+        (str(source),), tree_index, Qt.KeyboardModifier.ShiftModifier,
+        window.list_view, Qt.DropAction.MoveAction,
+    )
+    window._on_tree_paths_dropped(
+        (str(source),), tree_index, Qt.KeyboardModifier.ShiftModifier,
+        None, Qt.DropAction.CopyAction,
+    )
+    assert operations == [
+        FileOperationKind.MOVE, FileOperationKind.COPY,
+        FileOperationKind.MOVE, FileOperationKind.COPY,
+    ]
+    assert len(store.list_folder_bookmarks()) == 1
+    window.close()
+    qapp.processEvents()
+    store.close()
+
+def test_sidebar_operation_block_priority_and_execution_guard(
+    qapp, tmp_path: Path, monkeypatch,
+) -> None:
+    target = tmp_path / "target"
+    ordinary_folder = tmp_path / "ordinary"
+    shift_folder = tmp_path / "shift"
+    file_path = tmp_path / "file.txt"
+    for folder in (target, ordinary_folder, shift_folder):
+        folder.mkdir()
+    file_path.write_text("x", encoding="utf-8")
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    assert config.get("sidebar_drop_disable_file_operations") is False
+    store = MetadataStore(tmp_path / "metadata.sqlite3")
+    store.add_folder_bookmark(str(target))
+    window = BrowserWindow(config_manager=config, metadata_store=store,
+                           restore_initial_location=False)
+    operations = []
+    monkeypatch.setattr(window, "_start_file_operation",
+                        lambda operation, **kwargs: operations.append(operation) or True)
+    changed = config.apply({"sidebar_drop_disable_file_operations": True})
+    window.apply_settings(changed)
+    assert window.folder_tree._sidebar_file_operations_disabled
+    assert window.history_view._sidebar_file_operations_disabled
+    index = window.folder_bookmark_model.index(0, 0)
+    window.item_model.set_items([
+        _browser_item(ordinary_folder, BrowserItemKind.FOLDER),
+        _browser_item(shift_folder, BrowserItemKind.FOLDER),
+        _browser_item(file_path, BrowserItemKind.OTHER),
+    ])
+    window._on_favorite_paths_dropped(
+        (str(ordinary_folder),), index, Qt.KeyboardModifier.NoModifier,
+        window.list_view, Qt.DropAction.CopyAction,
+    )
+    assert len(store.list_folder_bookmarks()) == 1
+    window._on_favorite_paths_dropped(
+        (str(shift_folder),), index, Qt.KeyboardModifier.ShiftModifier,
+        window.list_view, Qt.DropAction.CopyAction,
+    )
+    assert str(shift_folder) in [item.path for item in store.list_folder_bookmarks()]
+    window._on_favorite_paths_dropped(
+        (str(file_path),), index, Qt.KeyboardModifier.ShiftModifier,
+        window.list_view, Qt.DropAction.CopyAction,
+    )
+    assert not operations
+    assert not window._start_favorite_drop_operation(
+        (str(file_path),), target, "target", Qt.KeyboardModifier.NoModifier,
+    )
+    assert not window._start_drop_operation(
+        (str(file_path),), target, Qt.KeyboardModifier.NoModifier,
+        sidebar_drop=True,
+    )
+    assert not operations
+    assert window._start_drop_operation(
+        (str(file_path),), target, Qt.KeyboardModifier.NoModifier,
+    )
+    assert operations == [FileOperationKind.MOVE]
+    changed = config.apply({"sidebar_drop_folders_to_favorites": True})
+    window.apply_settings(changed)
+    window._on_favorite_paths_dropped(
+        (str(ordinary_folder),), index, Qt.KeyboardModifier.NoModifier,
+        window.list_view, Qt.DropAction.CopyAction,
+    )
+    assert str(ordinary_folder) in [item.path for item in store.list_folder_bookmarks()]
+    assert operations == [FileOperationKind.MOVE]
+    window.close()
+    qapp.processEvents()
+    store.close()
+
+
+@pytest.mark.parametrize("view_kind", ["favorite", "tree", "history"])
+def test_sidebar_operation_block_rejects_move_only_qt_drop(
+    qapp, view_kind: str, tmp_path: Path,
+) -> None:
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.apply({"sidebar_drop_disable_file_operations": True})
+    window = BrowserWindow(config_manager=config, restore_initial_location=False)
+    mime = build_path_mime_data((str(tmp_path),))
+    if view_kind == "favorite":
+        event = QDropEvent(QPointF(1, 1), Qt.DropAction.MoveAction, mime,
+                           Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        assert window.favorite_view._accept_path_drop(event, QModelIndex()) is None
+    else:
+        view = window.folder_tree if view_kind == "tree" else window.history_view
+        event = QDropEvent(QPointF(1, 1), Qt.DropAction.MoveAction, mime,
+                           Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        resolver = view._accept_tree_drop if view_kind == "tree" else view._accept_history_drop
+        assert not resolver(event)
+    assert not event.isAccepted()
+    window.close()
+    qapp.processEvents()
+
+@pytest.mark.parametrize("view_kind", ["favorite", "tree", "history"])
+def test_sidebar_block_without_add_condition_ignores_qt_events(
+    qapp, view_kind: str, tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    source = tmp_path / "source"
+    target.mkdir()
+    source.mkdir()
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.apply({"sidebar_drop_disable_file_operations": True,
+                  "sidebar_shift_drop_folders_to_favorites": False})
+    store = MetadataStore(tmp_path / "metadata.sqlite3")
+    store.add_folder_bookmark(str(target))
+    window = BrowserWindow(config_manager=config, metadata_store=store,
+                           restore_initial_location=False)
+    window.show()
+    qapp.processEvents()
+    view = {"favorite": window.favorite_view, "tree": window.folder_tree,
+            "history": window.history_view}[view_kind]
+    position = QPoint(2, 2)
+    mime = build_path_mime_data((str(source),))
+    for event_type in (QDragEnterEvent, QDragMoveEvent):
+        event = event_type(position, Qt.DropAction.CopyAction, mime,
+                           Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        qapp.sendEvent(view.viewport(), event)
+        assert not event.isAccepted()
+    drop = QDropEvent(QPointF(position), Qt.DropAction.CopyAction, mime,
+                      Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    qapp.sendEvent(view.viewport(), drop)
+    assert not drop.isAccepted()
+    assert len(store.list_folder_bookmarks()) == 1
+    window.close()
+    qapp.processEvents()
+    store.close()
+
+
+def test_sidebar_block_global_add_rejects_known_browser_file(
+    qapp, tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "file.txt"
+    file_path.write_text("x", encoding="utf-8")
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.apply({"sidebar_drop_disable_file_operations": True,
+                  "sidebar_drop_folders_to_favorites": True})
+    window = BrowserWindow(config_manager=config, restore_initial_location=False)
+    window.item_model.set_items([_browser_item(file_path, BrowserItemKind.OTHER)])
+    paths = (str(file_path),)
+    assert not window._sidebar_add_candidate(
+        paths, Qt.KeyboardModifier.NoModifier, window.list_view,
+    )
+    assert window._favorite_drop_qt_action(
+        QModelIndex(), Qt.KeyboardModifier.NoModifier,
+        window.list_view, build_path_mime_data(paths),
+    ) == Qt.DropAction.IgnoreAction
+    window.close()
+    qapp.processEvents()

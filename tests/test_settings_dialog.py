@@ -12,7 +12,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QPushButton, Q
 from app.browser_model import BrowserItem, BrowserItemKind
 from app.config_manager import ConfigManager
 from app.seven_zip_locator import SevenZipInfo
-from app.settings_dialog import SettingsDialog, _RETIRED_SETTINGS_DIALOGS
+from app.settings_dialog import SettingsDialog, _RETIRED_SETTINGS_DIALOGS, _wrap_tooltip_text
 from app.thumbnail_disk_cache import ThumbnailDiskCache
 from app.thumbnail_provider import BrowserThumbnailProvider
 from app.viewer_render import (
@@ -25,6 +25,29 @@ def make_config(tmp_path: Path) -> ConfigManager:
     config = ConfigManager(tmp_path / "config.json")
     config.load()
     return config
+
+
+def test_plain_tooltip_wrap_preserves_content_and_explicit_lines() -> None:
+    text = "長い設定の説明です。" * 12 + "\n" + "別の説明です。" * 8
+    wrapped = _wrap_tooltip_text(text, max_chars=32)
+    assert wrapped != text
+    assert wrapped.replace("\n", "") == text.replace("\n", "")
+    assert all(len(line) <= 32 for line in wrapped.split("\n"))
+    assert _wrap_tooltip_text("<b>HTML tooltip</b>", max_chars=8) == "<b>HTML tooltip</b>"
+
+
+def test_settings_dialog_wraps_long_tooltip_on_construction(tmp_path: Path, qapp) -> None:
+    dialog = SettingsDialog(make_config(tmp_path))
+    original = (
+        '1行表示と2行表示の末尾行で使う省略方式です。'
+        '先頭優先は先頭側を残し、後方に省略記号を表示します。'
+        '2行表示の折り返し位置は変えません。'
+    )
+    tooltip = dialog.browser_filename_elide_combo.toolTip()
+    assert "\n" in tooltip
+    assert tooltip.replace("\n", "") == original
+    assert all(len(line) <= 52 for line in tooltip.split("\n"))
+    dialog.close()
 
 
 def test_badge_position_settings_roundtrip_and_browser_reset(tmp_path, qapp):

@@ -126,6 +126,35 @@ from .windows_file_registration import WindowsFileRegistrationService
 
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _wrap_tooltip_text(text: str, max_chars: int = 52) -> str:
+    """Wrap plain-text tooltips while preserving their text and explicit lines."""
+    if not text or max_chars < 8 or text.lstrip().startswith("<"):
+        return text
+
+    wrapped_lines: list[str] = []
+    for explicit_line in text.split("\n"):
+        remaining = explicit_line
+        while len(remaining) > max_chars:
+            window = remaining[:max_chars]
+            cut = 0
+            for marker in ("。", "！", "？", ". ", "! ", "? ", "、", "；", "; ", ", "):
+                position = window.rfind(marker)
+                if position >= max_chars // 2:
+                    cut = max(cut, position + len(marker))
+            if cut == 0:
+                space = window.rfind(" ")
+                if space >= max_chars // 2:
+                    cut = space + 1
+            if cut == 0:
+                cut = max_chars
+            wrapped_lines.append(remaining[:cut])
+            remaining = remaining[cut:]
+        wrapped_lines.append(remaining)
+    return "\n".join(wrapped_lines)
+
+
 _FOLDER_SNAPSHOT_CACHE_TOOLTIP_TEXT = (
     'ファイル数の多いフォルダの再表示を高速化します。\n'
     '前回の一覧をメモリから先に表示し、あとで変更を確認します。\n'
@@ -405,6 +434,11 @@ TAB_SETTING_KEYS: dict[str, tuple[str, ...]] = {
     ),
     "file": (
         "file_operation_delete_confirm_focus_yes", "file_operation_delete_skip_confirmation",
+        "favorite_drop_default_operation", "favorite_drop_ctrl_inverts_operation",
+        "favorite_drop_confirm_move", "favorite_drop_confirm_focus_yes",
+        "sidebar_drop_folders_to_favorites",
+        "sidebar_shift_drop_folders_to_favorites",
+        "sidebar_drop_disable_file_operations",
         "viewer_delete_mode", "viewer_delete_skip_confirmation", "viewer_delete_confirm_focus_yes",
     ),
     "archive": ("archive_backend_preference", "winrar_executable", "seven_zip_executable", "gimp_executable", "xcf_loading_enabled", "ai_loading_enabled", "svg_loading_enabled"),
@@ -725,6 +759,14 @@ class SettingsDialog(QDialog):
 
         self._build_ui()
         self.load_current_values()
+        self._normalize_tooltip_layout()
+
+    def _normalize_tooltip_layout(self) -> None:
+        """Keep Settings tooltips readable without changing their wording."""
+        for widget in self.findChildren(QWidget):
+            tooltip = widget.toolTip()
+            if tooltip:
+                widget.setToolTip(_wrap_tooltip_text(tooltip))
 
     def _build_ui(self) -> None:
         self.tabs = QTabWidget(self)
@@ -1159,6 +1201,29 @@ class SettingsDialog(QDialog):
                 bool(ConfigManager.DEFAULTS["file_operation_delete_skip_confirmation"])
             )
             self._sync_delete_confirmation_controls()
+            self._select_data(
+                self.favorite_drop_default_operation_combo,
+                ConfigManager.DEFAULTS["favorite_drop_default_operation"],
+            )
+            self.favorite_drop_ctrl_inverts_checkbox.setChecked(
+                bool(ConfigManager.DEFAULTS["favorite_drop_ctrl_inverts_operation"])
+            )
+            self.favorite_drop_confirm_move_checkbox.setChecked(
+                bool(ConfigManager.DEFAULTS["favorite_drop_confirm_move"])
+            )
+            self.favorite_drop_confirm_focus_yes_checkbox.setChecked(
+                bool(ConfigManager.DEFAULTS["favorite_drop_confirm_focus_yes"])
+            )
+            self.sidebar_drop_folders_to_favorites_checkbox.setChecked(
+                bool(ConfigManager.DEFAULTS["sidebar_drop_folders_to_favorites"])
+            )
+            self.sidebar_shift_drop_folders_to_favorites_checkbox.setChecked(
+                bool(ConfigManager.DEFAULTS["sidebar_shift_drop_folders_to_favorites"])
+            )
+            self.sidebar_drop_disable_file_operations_checkbox.setChecked(
+                bool(ConfigManager.DEFAULTS["sidebar_drop_disable_file_operations"])
+            )
+            self._sync_favorite_drop_confirmation_controls()
             self._select_data(self.viewer_delete_mode_combo, ConfigManager.DEFAULTS["viewer_delete_mode"])
             self.viewer_delete_skip_confirmation_checkbox.setChecked(
                 bool(ConfigManager.DEFAULTS["viewer_delete_skip_confirmation"])
@@ -2409,6 +2474,69 @@ class SettingsDialog(QDialog):
         recycle_note.setWordWrap(True)
         file_operation_layout.addWidget(recycle_note)
         layout.addWidget(self.file_operation_group)
+
+        self.favorite_drop_group = QGroupBox(
+            tr('お気に入りへのドラッグ＆ドロップ'),
+            tab,
+        )
+        favorite_drop_form = QFormLayout(self.favorite_drop_group)
+        self.favorite_drop_default_operation_combo = QComboBox(
+            self.favorite_drop_group
+        )
+        self.favorite_drop_default_operation_combo.addItem(tr('コピー'), 'copy')
+        self.favorite_drop_default_operation_combo.addItem(tr('移動'), 'move')
+        favorite_drop_form.addRow(
+            tr('お気に入りフォルダーへの既定操作:'),
+            self.favorite_drop_default_operation_combo,
+        )
+        self.favorite_drop_ctrl_inverts_checkbox = QCheckBox(
+            tr('Ctrlキーでコピー／移動を一時的に切り替える'),
+            self.favorite_drop_group,
+        )
+        self.favorite_drop_ctrl_inverts_checkbox.setToolTip(
+            tr(
+                'ドラッグ中にCtrlキーを押すと、設定した既定操作とは逆の操作へ\n'
+                '一時的に切り替えます。'
+            )
+        )
+        favorite_drop_form.addRow(self.favorite_drop_ctrl_inverts_checkbox)
+        self.favorite_drop_confirm_move_checkbox = QCheckBox(
+            tr('移動する前に確認する'),
+            self.favorite_drop_group,
+        )
+        self.favorite_drop_confirm_focus_yes_checkbox = QCheckBox(
+            tr('移動確認で「はい」を初期選択'),
+            self.favorite_drop_group,
+        )
+        self.favorite_drop_confirm_move_checkbox.toggled.connect(
+            self._sync_favorite_drop_confirmation_controls
+        )
+        favorite_drop_form.addRow(self.favorite_drop_confirm_move_checkbox)
+        favorite_drop_form.addRow(self.favorite_drop_confirm_focus_yes_checkbox)
+        self.sidebar_drop_folders_to_favorites_checkbox = QCheckBox(
+            tr('サイドバーへのフォルダードロップをお気に入り追加として扱う'),
+            self.favorite_drop_group,
+        )
+        self.sidebar_drop_folders_to_favorites_checkbox.setToolTip(
+            tr(
+                'ONにすると、Browser一覧や外部からサイドバーへフォルダーを\n'
+                'ドロップした場合、お気に入りへの追加として扱います。\n'
+                '既存のお気に入りフォルダー上では、そのフォルダーへの\n'
+                'コピー／移動を優先します。'
+            ) + '\n' + tr('コピー／移動禁止がONの場合は、既存のお気に入り行でも追加を優先します。')
+        )
+        favorite_drop_form.addRow(self.sidebar_drop_folders_to_favorites_checkbox)
+        self.sidebar_shift_drop_folders_to_favorites_checkbox = QCheckBox(
+            tr('Shiftキーでサイドバーへのフォルダードロップをお気に入り追加にする'),
+            self.favorite_drop_group,
+        )
+        favorite_drop_form.addRow(self.sidebar_shift_drop_folders_to_favorites_checkbox)
+        self.sidebar_drop_disable_file_operations_checkbox = QCheckBox(
+            tr('サイドバーへのドロップではファイルやフォルダーをコピー／移動しない'),
+            self.favorite_drop_group,
+        )
+        favorite_drop_form.addRow(self.sidebar_drop_disable_file_operations_checkbox)
+
         self.viewer_file_operation_group = QGroupBox(tr('ファイル操作（Viewer）'), tab)
         viewer_file_layout = QVBoxLayout(self.viewer_file_operation_group)
         viewer_file_layout.addWidget(QLabel(tr('Deleteキーの動作:'), self.viewer_file_operation_group))
@@ -2434,6 +2562,7 @@ class SettingsDialog(QDialog):
         viewer_file_layout.addWidget(self.viewer_delete_skip_confirmation_checkbox)
         viewer_file_layout.addWidget(self.viewer_delete_confirm_focus_yes_checkbox)
         layout.addWidget(self.viewer_file_operation_group)
+        layout.addWidget(self.favorite_drop_group)
         layout.addWidget(self._make_tab_reset_button("file", tab))
         layout.addStretch(1)
         return tab
@@ -3376,6 +3505,29 @@ class SettingsDialog(QDialog):
         )
         self._sync_delete_confirmation_controls()
         self._select_data(
+            self.favorite_drop_default_operation_combo,
+            self.config.get("favorite_drop_default_operation", "copy"),
+        )
+        self.favorite_drop_ctrl_inverts_checkbox.setChecked(
+            bool(self.config.get("favorite_drop_ctrl_inverts_operation", True))
+        )
+        self.favorite_drop_confirm_move_checkbox.setChecked(
+            bool(self.config.get("favorite_drop_confirm_move", True))
+        )
+        self.favorite_drop_confirm_focus_yes_checkbox.setChecked(
+            bool(self.config.get("favorite_drop_confirm_focus_yes", False))
+        )
+        self.sidebar_drop_folders_to_favorites_checkbox.setChecked(
+            bool(self.config.get("sidebar_drop_folders_to_favorites", False))
+        )
+        self.sidebar_shift_drop_folders_to_favorites_checkbox.setChecked(
+            bool(self.config.get("sidebar_shift_drop_folders_to_favorites", True))
+        )
+        self.sidebar_drop_disable_file_operations_checkbox.setChecked(
+            bool(self.config.get("sidebar_drop_disable_file_operations", False))
+        )
+        self._sync_favorite_drop_confirmation_controls()
+        self._select_data(
             self.viewer_delete_mode_combo,
             self.config.get("viewer_delete_mode", "disabled"),
         )
@@ -3968,6 +4120,14 @@ class SettingsDialog(QDialog):
             not self.delete_skip_confirmation_checkbox.isChecked()
         )
 
+    def _sync_favorite_drop_confirmation_controls(
+        self,
+        *_args: object,
+    ) -> None:
+        self.favorite_drop_confirm_focus_yes_checkbox.setEnabled(
+            self.favorite_drop_confirm_move_checkbox.isChecked()
+        )
+
     def _sync_viewer_delete_confirmation_controls(self, *_args: object) -> None:
         self.viewer_delete_confirm_focus_yes_checkbox.setEnabled(
             not self.viewer_delete_skip_confirmation_checkbox.isChecked()
@@ -4202,6 +4362,27 @@ class SettingsDialog(QDialog):
             ),
             "file_operation_delete_skip_confirmation": (
                 self.delete_skip_confirmation_checkbox.isChecked()
+            ),
+            "favorite_drop_default_operation": str(
+                self.favorite_drop_default_operation_combo.currentData() or "copy"
+            ),
+            "favorite_drop_ctrl_inverts_operation": (
+                self.favorite_drop_ctrl_inverts_checkbox.isChecked()
+            ),
+            "favorite_drop_confirm_move": (
+                self.favorite_drop_confirm_move_checkbox.isChecked()
+            ),
+            "favorite_drop_confirm_focus_yes": (
+                self.favorite_drop_confirm_focus_yes_checkbox.isChecked()
+            ),
+            "sidebar_drop_folders_to_favorites": (
+                self.sidebar_drop_folders_to_favorites_checkbox.isChecked()
+            ),
+            "sidebar_shift_drop_folders_to_favorites": (
+                self.sidebar_shift_drop_folders_to_favorites_checkbox.isChecked()
+            ),
+            "sidebar_drop_disable_file_operations": (
+                self.sidebar_drop_disable_file_operations_checkbox.isChecked()
             ),
             "viewer_delete_mode": str(self.viewer_delete_mode_combo.currentData()),
             "viewer_delete_skip_confirmation": self.viewer_delete_skip_confirmation_checkbox.isChecked(),

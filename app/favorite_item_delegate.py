@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtWidgets import QStyledItemDelegate, QStyleOptionViewItem
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
 from .favorite_row_metrics import FavoriteRowMetrics
 
@@ -33,6 +34,13 @@ class FavoriteItemDelegate(QStyledItemDelegate):
         )
         prepared.textElideMode = Qt.TextElideMode.ElideRight
         prepared.features &= ~QStyleOptionViewItem.ViewItemFeature.WrapText
+        view = self.parent()
+        is_drop_hover = getattr(view, "is_drop_hover_index", None)
+        if callable(is_drop_hover) and is_drop_hover(index):
+            prepared.state |= QStyle.StateFlag.State_MouseOver
+            emphasized = QFont(prepared.font)
+            emphasized.setBold(True)
+            prepared.font = emphasized
         super().paint(painter, prepared, index)
 
 

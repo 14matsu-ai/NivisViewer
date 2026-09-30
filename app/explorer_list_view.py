@@ -47,6 +47,7 @@ class ExplorerListView(QListView):
     """Path-based Explorer input with no standard drag/rubber-band overlap."""
 
     paths_dropped = Signal(object, object, object, object)
+    resolved_paths_dropped = Signal(object, object, object, object, object)
     enterActivated = Signal(QModelIndex)
     itemPressCaptured = Signal(str)
     itemReleaseConfirmed = Signal(str)
@@ -62,6 +63,9 @@ class ExplorerListView(QListView):
         self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self.viewport())
         self._drag_started = False
         self._drop_in_progress = False
+        self._drop_hover_enabled = False
+        self._drop_hover_path: str | None = None
+        self.drop_action_resolver = None
         self._notify_after_next_paint = False
         self.browser_folder_gestures_enabled = True
         self.mouse_gesture_show_trail = True
@@ -166,6 +170,64 @@ class ExplorerListView(QListView):
     def ensure_viewport_drop_target(self) -> None:
         """Reapply drop routing after QListView replaces/configures its viewport."""
         self.viewport().setAcceptDrops(True)
+
+    def set_drop_hover_enabled(self, enabled: bool) -> None:
+        self._drop_hover_enabled = bool(enabled)
+        if not self._drop_hover_enabled:
+            self._clear_drop_hover()
+
+    def is_drop_hover_index(self, index: QModelIndex) -> bool:
+        return bool(
+            self._drop_hover_path
+            and self._path_for_index(index) == self._drop_hover_path
+        )
+
+    @property
+    def drop_hover_index(self) -> QModelIndex:
+        return self._index_for_path(self._drop_hover_path)
+
+    def _set_drop_hover_index(self, index: QModelIndex) -> None:
+        path = self._path_for_index(index) if self._drop_hover_enabled else None
+        if path == self._drop_hover_path:
+            return
+        old_index = self._index_for_path(self._drop_hover_path)
+        self._drop_hover_path = path
+        if old_index.isValid():
+            self.viewport().update(self.visualRect(old_index))
+        new_index = self._index_for_path(path)
+        if new_index.isValid():
+            self.viewport().update(self.visualRect(new_index))
+
+    def _clear_drop_hover(self) -> None:
+        self._set_drop_hover_index(QModelIndex())
+
+    def _accept_path_drop(self, event, index: QModelIndex) -> Qt.DropAction | None:
+        resolver = self.drop_action_resolver
+        if callable(resolver):
+            action = resolver(index, event.modifiers(), event.source(), event.mimeData())
+            if action == Qt.DropAction.IgnoreAction:
+                event.ignore()
+                return None
+            if action in {
+                Qt.DropAction.CopyAction,
+                Qt.DropAction.MoveAction,
+            }:
+                if not event.possibleActions() & action:
+                    # A copy-only external source must never acquire a move
+                    # operation just because the favorite default is move.
+                    if event.possibleActions() & Qt.DropAction.CopyAction:
+                        action = Qt.DropAction.CopyAction
+                    else:
+                        event.ignore()
+                        return None
+                event.setDropAction(action)
+                if event.dropAction() == action:
+                    event.accept()
+                    return action
+                event.ignore()
+                return None
+        event.acceptProposedAction()
+        return event.dropAction() if event.isAccepted() else None
 
     def notify_after_next_paint(self) -> None:
         self._notify_after_next_paint = True
@@ -523,30 +585,40 @@ class ExplorerListView(QListView):
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # type: ignore[override]
         if paths_from_mime_data(event.mimeData()):
             self._drop_in_progress = True
+            index = self.indexAt(event.position().toPoint())
+            self._set_drop_hover_index(index)
             self._debug_drop("dragEnter", event, accepted=True)
-            event.acceptProposedAction()
+            if self._accept_path_drop(event, index) is None:
+                self._clear_drop_hover()
             return
+        self._clear_drop_hover()
         self._debug_drop("dragEnter", event, accepted=False)
         event.ignore()
 
     def dragMoveEvent(self, event) -> None:  # type: ignore[override]
         if paths_from_mime_data(event.mimeData()):
-            event.acceptProposedAction()
+            index = self.indexAt(event.position().toPoint())
+            self._set_drop_hover_index(index)
+            if self._accept_path_drop(event, index) is None:
+                self._clear_drop_hover()
             return
+        self._clear_drop_hover()
         event.ignore()
 
     def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:  # type: ignore[override]
         self._drop_in_progress = False
+        self._clear_drop_hover()
         event.accept()
 
     def dropEvent(self, event: QDropEvent) -> None:  # type: ignore[override]
         paths = paths_from_mime_data(event.mimeData())
         self._drop_in_progress = False
+        index: QModelIndex = self.indexAt(event.position().toPoint())
+        self._clear_drop_hover()
         if not paths:
             self._debug_drop("drop", event, accepted=False)
             event.ignore()
             return
-        index: QModelIndex = self.indexAt(event.position().toPoint())
         source = event.source()
         internal = bool(
             is_internal_path_mime(event.mimeData())
@@ -559,13 +631,18 @@ class ExplorerListView(QListView):
             internal=internal,
             path_count=len(paths),
         )
+        action = self._accept_path_drop(event, index)
+        if action is None:
+            return
         self.paths_dropped.emit(
             paths,
             index,
             event.modifiers(),
-            self if internal else None,
+            self if internal else source,
         )
-        event.acceptProposedAction()
+        self.resolved_paths_dropped.emit(
+            paths, index, event.modifiers(), self if internal else source, action,
+        )
 
     @property
     def drop_in_progress(self) -> bool:
@@ -714,15 +791,59 @@ class ExplorerListView(QListView):
 
 class PathDropTreeView(QTreeView):
     paths_dropped = Signal(object, object, object, object)
+    resolved_paths_dropped = Signal(object, object, object, object, object)
     navigationConfirmed = Signal(QModelIndex)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.pointer_controller = FolderTreePointerController()
         self._drop_hover_index = QModelIndex()
+        self._shift_favorite_drop_enabled = False
+        self._sidebar_file_operations_disabled = False
+        self.shift_favorite_candidate_resolver = None
+        self.sidebar_add_candidate_resolver = None
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
         self.setAutoExpandDelay(-1)
+
+    def set_shift_favorite_drop_enabled(self, enabled: bool) -> None:
+        self._shift_favorite_drop_enabled = bool(enabled)
+
+    def set_sidebar_file_operations_disabled(self, disabled: bool) -> None:
+        self._sidebar_file_operations_disabled = bool(disabled)
+
+    def _accept_tree_drop(self, event) -> bool:
+        if self._sidebar_file_operations_disabled:
+            if not self._sidebar_add_candidate(event):
+                event.ignore()
+                return False
+        if self._sidebar_file_operations_disabled or self._shift_favorite_candidate(event):
+            if not event.possibleActions() & Qt.DropAction.CopyAction:
+                event.ignore()
+                return False
+            event.setDropAction(Qt.DropAction.CopyAction)
+            if event.dropAction() != Qt.DropAction.CopyAction:
+                event.ignore()
+                return False
+            event.accept()
+            return True
+        event.acceptProposedAction()
+        return event.isAccepted()
+
+    def _shift_favorite_candidate(self, event) -> bool:
+        if not (self._shift_favorite_drop_enabled
+                and event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            return False
+        resolver = self.shift_favorite_candidate_resolver
+        return not callable(resolver) or bool(
+            resolver(paths_from_mime_data(event.mimeData()), event.source())
+        )
+
+    def _sidebar_add_candidate(self, event) -> bool:
+        resolver = self.sidebar_add_candidate_resolver
+        return callable(resolver) and bool(resolver(
+            paths_from_mime_data(event.mimeData()), event.modifiers(), event.source(),
+        ))
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         if event.button() != Qt.MouseButton.LeftButton:
@@ -797,7 +918,7 @@ class PathDropTreeView(QTreeView):
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # type: ignore[override]
         if paths_from_mime_data(event.mimeData()):
-            event.acceptProposedAction()
+            self._accept_tree_drop(event)
         else:
             event.ignore()
 
@@ -805,7 +926,7 @@ class PathDropTreeView(QTreeView):
         if paths_from_mime_data(event.mimeData()):
             self._drop_hover_index = self.indexAt(event.position().toPoint())
             self.viewport().update()
-            event.acceptProposedAction()
+            self._accept_tree_drop(event)
         else:
             self._clear_drop_hover()
             event.ignore()
@@ -818,11 +939,18 @@ class PathDropTreeView(QTreeView):
         paths = paths_from_mime_data(event.mimeData())
         index = self.indexAt(event.position().toPoint())
         self._clear_drop_hover()
-        if not paths or not index.isValid():
+        shift_add = self._shift_favorite_candidate(event) or (
+            self._sidebar_file_operations_disabled and self._sidebar_add_candidate(event)
+        )
+        if not paths or (not index.isValid() and not shift_add):
             event.ignore()
             return
+        if not self._accept_tree_drop(event):
+            return
         self.paths_dropped.emit(paths, index, event.modifiers(), event.source())
-        event.acceptProposedAction()
+        self.resolved_paths_dropped.emit(
+            paths, index, event.modifiers(), event.source(), event.dropAction(),
+        )
 
     def paintEvent(self, event: QPaintEvent) -> None:  # type: ignore[override]
         super().paintEvent(event)

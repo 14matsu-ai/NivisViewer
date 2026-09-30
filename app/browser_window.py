@@ -204,6 +204,7 @@ from .drag_drop import (
     choose_drop_operation,
     is_invalid_drop_target,
     is_lexically_supported_viewer_path,
+    paths_from_mime_data,
 )
 from .explorer_list_view import ExplorerListView, PathDropTreeView
 from .favorite_item_delegate import FavoriteItemDelegate, HistoryItemDelegate
@@ -1017,6 +1018,32 @@ class BrowserWindow(QMainWindow):
         )
         self.browser_show_history = bool(
             self.settings.get("browser_show_history", True)
+        )
+        favorite_drop_operation = str(
+            self.settings.get("favorite_drop_default_operation", "copy")
+        )
+        self.favorite_drop_default_operation = (
+            favorite_drop_operation
+            if favorite_drop_operation in {"copy", "move"}
+            else "copy"
+        )
+        self.favorite_drop_ctrl_inverts_operation = bool(
+            self.settings.get("favorite_drop_ctrl_inverts_operation", True)
+        )
+        self.favorite_drop_confirm_move = bool(
+            self.settings.get("favorite_drop_confirm_move", True)
+        )
+        self.favorite_drop_confirm_focus_yes = bool(
+            self.settings.get("favorite_drop_confirm_focus_yes", False)
+        )
+        self.sidebar_drop_folders_to_favorites = bool(
+            self.settings.get("sidebar_drop_folders_to_favorites", False)
+        )
+        self.sidebar_shift_drop_folders_to_favorites = bool(
+            self.settings.get("sidebar_shift_drop_folders_to_favorites", True)
+        )
+        self.sidebar_drop_disable_file_operations = bool(
+            self.settings.get("sidebar_drop_disable_file_operations", False)
         )
         self.folder_tree_sync_mode = str(
             self.settings.get("folder_tree_sync_mode", "focus_current")
@@ -4597,6 +4624,57 @@ class BrowserWindow(QMainWindow):
         self.list_view.viewport().update()
 
     def apply_settings(self, changed: dict[str, object]) -> None:
+        favorite_drop_keys = {
+            "favorite_drop_default_operation",
+            "favorite_drop_ctrl_inverts_operation",
+            "favorite_drop_confirm_move",
+            "favorite_drop_confirm_focus_yes",
+            "sidebar_drop_folders_to_favorites",
+            "sidebar_shift_drop_folders_to_favorites",
+            "sidebar_drop_disable_file_operations",
+        }
+        if favorite_drop_keys.intersection(changed):
+            operation = str(
+                self.config.get("favorite_drop_default_operation", "copy")
+            )
+            self.favorite_drop_default_operation = (
+                operation if operation in {"copy", "move"} else "copy"
+            )
+            self.favorite_drop_ctrl_inverts_operation = bool(
+                self.config.get("favorite_drop_ctrl_inverts_operation", True)
+            )
+            self.favorite_drop_confirm_move = bool(
+                self.config.get("favorite_drop_confirm_move", True)
+            )
+            self.favorite_drop_confirm_focus_yes = bool(
+                self.config.get("favorite_drop_confirm_focus_yes", False)
+            )
+            self.sidebar_drop_folders_to_favorites = bool(
+                self.config.get("sidebar_drop_folders_to_favorites", False)
+            )
+            self.sidebar_shift_drop_folders_to_favorites = bool(
+                self.config.get("sidebar_shift_drop_folders_to_favorites", True)
+            )
+            self.sidebar_drop_disable_file_operations = bool(
+                self.config.get("sidebar_drop_disable_file_operations", False)
+            )
+            if hasattr(self, "history_view"):
+                self.history_view.set_folder_drop_enabled(
+                    self.sidebar_drop_folders_to_favorites
+                )
+                self.history_view.set_shift_favorite_drop_enabled(
+                    self.sidebar_shift_drop_folders_to_favorites
+                )
+                self.history_view.set_sidebar_file_operations_disabled(
+                    self.sidebar_drop_disable_file_operations
+                )
+            if hasattr(self, "folder_tree"):
+                self.folder_tree.set_shift_favorite_drop_enabled(
+                    self.sidebar_shift_drop_folders_to_favorites
+                )
+                self.folder_tree.set_sidebar_file_operations_disabled(
+                    self.sidebar_drop_disable_file_operations
+                )
         if "history_double_click_to_open" in changed:
             self.history_view.double_click_to_open = bool(changed["history_double_click_to_open"])
         if {"favorite_tabs_wrap_wheel", "favorite_add_button_transparency"}.intersection(changed) or any(key.startswith("sidebar_tab_padding_") for key in changed):
@@ -6902,7 +6980,15 @@ class BrowserWindow(QMainWindow):
         self.folder_tree.customContextMenuRequested.connect(
             self._show_folder_tree_context_menu
         )
-        self.folder_tree.paths_dropped.connect(self._on_tree_paths_dropped)
+        self.folder_tree.resolved_paths_dropped.connect(self._on_tree_paths_dropped)
+        self.folder_tree.shift_favorite_candidate_resolver = self._shift_drop_candidate_paths
+        self.folder_tree.sidebar_add_candidate_resolver = self._sidebar_add_candidate
+        self.folder_tree.set_shift_favorite_drop_enabled(
+            self.sidebar_shift_drop_folders_to_favorites
+        )
+        self.folder_tree.set_sidebar_file_operations_disabled(
+            self.sidebar_drop_disable_file_operations
+        )
         for column in range(1, self.file_system_model.columnCount()):
             self.folder_tree.hideColumn(column)
         self.folder_tree.navigationConfirmed.connect(
@@ -6940,6 +7026,8 @@ class BrowserWindow(QMainWindow):
         self.favorite_view = ExplorerListView(self)
         self.favorite_view.setObjectName("folder_favorite_view")
         self.favorite_view.setModel(self.folder_bookmark_model)
+        self.favorite_view.set_drop_hover_enabled(True)
+        self.favorite_view.drop_action_resolver = self._favorite_drop_qt_action
         self.favorite_view.setItemDelegate(
             FavoriteItemDelegate(
                 self.favorite_view,
@@ -6969,7 +7057,7 @@ class BrowserWindow(QMainWindow):
         self.favorite_view.customContextMenuRequested.connect(
             self._show_folder_bookmark_context_menu
         )
-        self.favorite_view.paths_dropped.connect(self._on_favorite_paths_dropped)
+        self.favorite_view.resolved_paths_dropped.connect(self._on_favorite_paths_dropped)
 
         self.history_model = HistoryModel(
             self.metadata_store,
@@ -6978,8 +7066,20 @@ class BrowserWindow(QMainWindow):
         )
         self.history_view = SidebarHistoryView(self)
         self.history_view.double_click_to_open = bool(self.settings.get("history_double_click_to_open", False))
+        self.history_view.set_folder_drop_enabled(
+            self.sidebar_drop_folders_to_favorites
+        )
+        self.history_view.set_shift_favorite_drop_enabled(
+            self.sidebar_shift_drop_folders_to_favorites
+        )
+        self.history_view.set_sidebar_file_operations_disabled(
+            self.sidebar_drop_disable_file_operations
+        )
+        self.history_view.shift_favorite_candidate_resolver = self._shift_drop_candidate_paths
+        self.history_view.sidebar_add_candidate_resolver = self._sidebar_add_candidate
         self.history_view.setModel(self.history_model)
         self.history_view.open_requested.connect(self.open_history)
+        self.history_view.paths_dropped.connect(self._on_sidebar_paths_dropped)
         self.history_view.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
         )
@@ -8801,6 +8901,7 @@ class BrowserWindow(QMainWindow):
         index: QModelIndex,
         modifiers: Qt.KeyboardModifier,
         source: object,
+        action: Qt.DropAction | None = None,
     ) -> None:
         entry = self.folder_bookmark_model.entry_at(index)
         if source is self.favorite_view and self.metadata_store is not None:
@@ -8815,8 +8916,31 @@ class BrowserWindow(QMainWindow):
                 ordered.insert(min(len(ordered), target_row + offset), path)
             self.metadata_store.reorder_group_favorites(self.folder_bookmark_model.group_id, ordered)
             return
+        if self.sidebar_drop_disable_file_operations:
+            if (self._shift_favorite_drop_requested(modifiers, source, paths)
+                    or self.sidebar_drop_folders_to_favorites):
+                self._add_shift_dropped_folders(paths, source)
+            else:
+                self._show_temporary_status(tr('この場所にはドロップできません'))
+            return
+        if self._shift_favorite_drop_requested(modifiers, source, paths):
+            self._add_shift_dropped_folders(
+                paths, source,
+                fallback=(
+                    (lambda: self._start_favorite_drop_operation(
+                        paths, entry.path, entry.label, modifiers, action=action,
+                    )) if entry is not None else None
+                ),
+            )
+            return
         if entry is not None:
-            self._start_drop_operation(paths, entry.path, modifiers)
+            self._start_favorite_drop_operation(
+                paths,
+                entry.path,
+                entry.label,
+                modifiers,
+                action=action,
+            )
             return
         group_id = self.folder_bookmark_model.group_id
         self._probe_dropped_folders(
@@ -8828,14 +8952,240 @@ class BrowserWindow(QMainWindow):
         paths: tuple[str, ...],
         index: QModelIndex,
         modifiers: Qt.KeyboardModifier,
-        _source: object,
+        source: object,
+        action: Qt.DropAction | None = None,
     ) -> None:
+        if self.sidebar_drop_disable_file_operations:
+            if (self._shift_favorite_drop_requested(modifiers, source, paths)
+                    or self.sidebar_drop_folders_to_favorites):
+                self._add_shift_dropped_folders(paths, source)
+            else:
+                self._show_temporary_status(tr('この場所にはドロップできません'))
+            return
+        if self._shift_favorite_drop_requested(modifiers, source, paths):
+            destination = self.file_system_model.filePath(index) if index.isValid() else None
+            self._add_shift_dropped_folders(
+                paths, source,
+                fallback=(
+                    (lambda: self._start_drop_operation(
+                        paths, destination, modifiers, action=action or Qt.DropAction.CopyAction,
+                        sidebar_drop=True,
+                    )) if destination is not None else None
+                ),
+            )
+            return
         if not index.isValid():
             return
-        self._start_drop_operation(
+        destination = self.file_system_model.filePath(index)
+        if self.sidebar_drop_folders_to_favorites:
+            if source is self.list_view:
+                if self._browser_drop_paths_are_all_folders(paths):
+                    self._add_dropped_folder_bookmarks(paths)
+                    return
+            else:
+                self._probe_dropped_folders(
+                    paths,
+                    lambda folders, destination=destination: (
+                        self._add_dropped_folder_bookmarks(folders)
+                        if len(folders) == len(paths)
+                        else self._start_drop_operation(
+                            paths, destination, modifiers, sidebar_drop=True,
+                        )
+                    ),
+                )
+                return
+        self._start_drop_operation(paths, destination, modifiers, sidebar_drop=True)
+
+    def _on_sidebar_paths_dropped(
+        self,
+        paths: tuple[str, ...],
+        modifiers: Qt.KeyboardModifier,
+        source: object,
+    ) -> None:
+        if self._shift_favorite_drop_requested(modifiers, source, paths):
+            self._add_shift_dropped_folders(paths, source)
+            return
+        if not self.sidebar_drop_folders_to_favorites:
+            return
+        if source is self.list_view:
+            if self._browser_drop_paths_are_all_folders(paths):
+                self._add_dropped_folder_bookmarks(paths)
+            else:
+                self._show_temporary_status(tr('この場所にはドロップできません'))
+            return
+        self._probe_dropped_folders(
             paths,
-            self.file_system_model.filePath(index),
-            modifiers,
+            lambda folders: (
+                self._add_dropped_folder_bookmarks(folders)
+                if len(folders) == len(paths)
+                else self._show_temporary_status(tr('この場所にはドロップできません'))
+            ),
+        )
+
+    def _browser_drop_paths_are_all_folders(
+        self,
+        paths: tuple[str, ...],
+    ) -> bool:
+        if not paths:
+            return False
+        for path in paths:
+            row = self.item_model.row_for_path(path)
+            item = self.item_model.item_at(row) if row >= 0 else None
+            if item is None or item.kind is not BrowserItemKind.FOLDER:
+                return False
+        return True
+
+    def _shift_favorite_drop_requested(
+        self, modifiers: Qt.KeyboardModifier, source: object,
+        paths: tuple[str, ...] = (),
+    ) -> bool:
+        return bool(
+            self.sidebar_shift_drop_folders_to_favorites
+            and modifiers & Qt.KeyboardModifier.ShiftModifier
+            and self._shift_drop_candidate_paths(paths, source)
+        )
+
+    def _shift_drop_candidate_paths(
+        self, paths: tuple[str, ...], source: object,
+    ) -> bool:
+        return source is not self.list_view or self._browser_drop_paths_are_all_folders(paths)
+
+    def _sidebar_add_candidate(
+        self, paths: tuple[str, ...], modifiers: Qt.KeyboardModifier,
+        source: object,
+    ) -> bool:
+        return bool(
+            paths
+            and (self._shift_favorite_drop_requested(modifiers, source, paths)
+                 or self.sidebar_drop_folders_to_favorites)
+            and self._shift_drop_candidate_paths(paths, source)
+        )
+
+    def _add_shift_dropped_folders(
+        self, paths: tuple[str, ...], source: object,
+        fallback: Callable[[], object] | None = None,
+    ) -> None:
+        group_id = self.folder_bookmark_model.group_id
+        if source is self.list_view:
+            if self._browser_drop_paths_are_all_folders(paths):
+                self._add_dropped_folder_bookmarks(paths, group_id=group_id)
+            else:
+                fallback() if fallback is not None else self._show_temporary_status(tr('この場所にはドロップできません'))
+            return
+        self._probe_dropped_folders(
+            paths,
+            lambda folders: (
+                self._add_dropped_folder_bookmarks(folders, group_id=group_id)
+                if len(folders) == len(paths) and paths
+                else (fallback() if fallback is not None
+                      else self._show_temporary_status(tr('この場所にはドロップできません')))
+            ),
+        )
+
+    def _favorite_drop_operation_name(
+        self,
+        modifiers: Qt.KeyboardModifier,
+    ) -> str:
+        operation = self.favorite_drop_default_operation
+        if (
+            self.favorite_drop_ctrl_inverts_operation
+            and modifiers & Qt.KeyboardModifier.ControlModifier
+        ):
+            operation = "move" if operation == "copy" else "copy"
+        return operation
+
+    def _favorite_drop_qt_action(
+        self,
+        index: QModelIndex,
+        modifiers: Qt.KeyboardModifier,
+        source: object,
+        mime=None,
+    ) -> Qt.DropAction:
+        if source in {self.favorite_view, self.favorite_view.viewport()}:
+            return Qt.DropAction.MoveAction
+        if self.sidebar_drop_disable_file_operations:
+            paths = paths_from_mime_data(mime) if mime is not None else ()
+            return (Qt.DropAction.CopyAction
+                    if self._sidebar_add_candidate(paths, modifiers, source)
+                    else Qt.DropAction.IgnoreAction)
+        if self._shift_favorite_drop_requested(
+            modifiers, source,
+            paths_from_mime_data(mime) if mime is not None else (),
+        ):
+            paths = paths_from_mime_data(mime) if mime is not None else ()
+            if source is not self.list_view or self._browser_drop_paths_are_all_folders(paths):
+                return Qt.DropAction.CopyAction
+        if self.folder_bookmark_model.entry_at(index) is None:
+            return Qt.DropAction.CopyAction
+        return (
+            Qt.DropAction.MoveAction
+            if self._favorite_drop_operation_name(modifiers) == "move"
+            else Qt.DropAction.CopyAction
+        )
+
+    def _start_favorite_drop_operation(
+        self,
+        paths: tuple[str, ...],
+        destination: str | Path,
+        destination_label: str,
+        modifiers: Qt.KeyboardModifier,
+        *,
+        action: Qt.DropAction | None = None,
+    ) -> bool:
+        if self.sidebar_drop_disable_file_operations:
+            self._show_temporary_status(tr('この場所にはドロップできません'))
+            return False
+        if not paths or any(
+            is_invalid_drop_target(path, destination) for path in paths
+        ):
+            self._show_temporary_status(tr('この場所にはドロップできません'))
+            return False
+        operation = (
+            FileOperationKind.MOVE
+            if (action == Qt.DropAction.MoveAction if action is not None
+                else self._favorite_drop_operation_name(modifiers) == "move")
+            else FileOperationKind.COPY
+        )
+        if (
+            operation is FileOperationKind.MOVE
+            and all(
+                self._same_path(Path(path).parent, Path(destination))
+                for path in paths
+            )
+        ):
+            self._show_temporary_status(tr('同じフォルダへの移動は行いません'))
+            return False
+        if operation is FileOperationKind.MOVE and self.favorite_drop_confirm_move:
+            if len(paths) == 1:
+                prompt = tr(
+                    '「{p0}」を「{p1}」へ移動します。よろしいですか？',
+                    p0=Path(paths[0]).name,
+                    p1=destination_label,
+                )
+            else:
+                prompt = tr(
+                    '{p0}項目を「{p1}」へ移動します。よろしいですか？',
+                    p0=len(paths),
+                    p1=destination_label,
+                )
+            default_button = (
+                QMessageBox.StandardButton.Yes
+                if self.favorite_drop_confirm_focus_yes
+                else QMessageBox.StandardButton.No
+            )
+            answer = QMessageBox.question(
+                self,
+                tr('移動'),
+                prompt,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                default_button,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+        return self._start_file_operation(
+            operation,
+            sources=paths,
+            destination=destination,
         )
 
     def _start_drop_operation(
@@ -8843,13 +9193,21 @@ class BrowserWindow(QMainWindow):
         paths: tuple[str, ...],
         destination: str | Path,
         modifiers: Qt.KeyboardModifier,
+        *,
+        action: Qt.DropAction | None = None,
+        sidebar_drop: bool = False,
     ) -> bool:
+        if sidebar_drop and self.sidebar_drop_disable_file_operations:
+            self._show_temporary_status(tr('この場所にはドロップできません'))
+            return False
         if not paths or any(
             is_invalid_drop_target(path, destination) for path in paths
         ):
             self._show_temporary_status(tr('この場所にはドロップできません'))
             return False
-        operation_name = choose_drop_operation(paths, destination, modifiers)
+        operation_name = (
+            "move" if action == Qt.DropAction.MoveAction else "copy"
+        ) if action is not None else choose_drop_operation(paths, destination, modifiers)
         operation = (
             FileOperationKind.MOVE
             if operation_name == "move"

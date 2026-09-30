@@ -170,6 +170,13 @@ class ConfigManager(QObject):
         "file_operation_destinations": [],
         "file_operation_delete_confirm_focus_yes": False,
         "file_operation_delete_skip_confirmation": False,
+        "favorite_drop_default_operation": "copy",
+        "favorite_drop_ctrl_inverts_operation": True,
+        "favorite_drop_confirm_move": True,
+        "favorite_drop_confirm_focus_yes": False,
+        "sidebar_drop_folders_to_favorites": False,
+        "sidebar_shift_drop_folders_to_favorites": True,
+        "sidebar_drop_disable_file_operations": False,
         "viewer_delete_mode": "disabled",
         "viewer_delete_skip_confirmation": False,
         "viewer_delete_confirm_focus_yes": False,
@@ -591,6 +598,12 @@ class ConfigManager(QObject):
             "video_thumbnail_shell_placeholder",
             "file_operation_delete_confirm_focus_yes",
             "file_operation_delete_skip_confirmation",
+            "favorite_drop_ctrl_inverts_operation",
+            "favorite_drop_confirm_move",
+            "favorite_drop_confirm_focus_yes",
+            "sidebar_drop_folders_to_favorites",
+            "sidebar_shift_drop_folders_to_favorites",
+            "sidebar_drop_disable_file_operations",
             "viewer_delete_skip_confirmation",
             "viewer_delete_confirm_focus_yes",
         ):
@@ -656,6 +669,13 @@ class ConfigManager(QObject):
         }:
             normalized["browser_external_drop_behavior"] = cls.DEFAULTS[
                 "browser_external_drop_behavior"
+            ]
+        if normalized.get("favorite_drop_default_operation") not in {
+            "copy",
+            "move",
+        }:
+            normalized["favorite_drop_default_operation"] = cls.DEFAULTS[
+                "favorite_drop_default_operation"
             ]
         normalized["browser_sidebar_width"] = cls._clamped_int(
             normalized.get("browser_sidebar_width"),

@@ -1323,8 +1323,24 @@ ENGLISH_RECENT_ADDITIONS = {
     'この項目を既定に戻す': 'Reset these settings to defaults',
     'サイドバー欄の設定だけを既定に戻します。タブの余白は「標準」になります。「適用」または「OK」で反映します。お気に入りの登録は削除しません。': 'Reset only the sidebar settings. Tab spacing returns to Standard. Apply or OK saves the changes. Favorite entries are not deleted.',
     'サイドバーのタブ文字まわりの余白です。「標準」は以前の標準表示、0は最小の余白です。': 'Spacing around sidebar tab labels. Standard uses the previous default appearance; 0 is the minimum spacing.',
+    'お気に入りへのドラッグ＆ドロップ': 'Drag and drop to favorites',
+    'お気に入りフォルダーへの既定操作:': 'Default action for favorite folders:',
+    'Ctrlキーでコピー／移動を一時的に切り替える': 'Temporarily switch copy/move with Ctrl',
+    'ドラッグ中にCtrlキーを押すと、設定した既定操作とは逆の操作へ\n一時的に切り替えます。': 'Hold Ctrl while dragging to temporarily use the opposite of the configured default action.',
+    '移動する前に確認する': 'Confirm before moving',
+    '移動確認で「はい」を初期選択': 'Preselect Yes in move confirmation',
+    'サイドバーへのフォルダードロップをお気に入り追加として扱う': 'Add dropped folders to favorites',
+    'ONにすると、Browser一覧や外部からサイドバーへフォルダーを\nドロップした場合、お気に入りへの追加として扱います。\n既存のお気に入りフォルダー上では、そのフォルダーへの\nコピー／移動を優先します。': 'When enabled, dropping folders from the Browser list or externally onto the sidebar adds them to favorites.\nDropping onto an existing favorite folder still performs copy/move into that folder.',
+    '「{p0}」を「{p1}」へ移動します。よろしいですか？': 'Move “{p0}” to “{p1}”?',
+    '{p0}項目を「{p1}」へ移動します。よろしいですか？': 'Move {p0} items to “{p1}”?',
     'JPEGの縮小読み込みに失敗し、安全な元画像サイズを確認できません。': 'Reduced JPEG decoding failed and the original image size could not be verified safely.',
     '画像が大きすぎるため、安全な縮小読み込みに失敗しました。': 'The image is too large for safe reduced-size decoding.',
 }
 ENGLISH.update(ENGLISH_RECENT_ADDITIONS)
 ENGLISH['SVG画像の読み込みを有効にする（再起動後に反映）'] = 'SVG images (restart required)'
+
+ENGLISH.update({'Shiftキーでサイドバーへのフォルダードロップをお気に入り追加にする': 'Shift+drop adds folders to favorites'})
+
+ENGLISH.update({'サイドバーへのドロップではファイルやフォルダーをコピー／移動しない': 'Disable sidebar drop copy and move'})
+
+ENGLISH.update({'コピー／移動禁止がONの場合は、既存のお気に入り行でも追加を優先します。': 'When copy/move is disabled, adding to favorites takes priority even on an existing favorite row.'})
