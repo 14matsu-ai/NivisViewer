@@ -1036,6 +1036,18 @@ class BrowserWindow(QMainWindow):
         self.favorite_drop_confirm_focus_yes = bool(
             self.settings.get("favorite_drop_confirm_focus_yes", False)
         )
+        self.favorite_color_show_icon = bool(
+            self.settings.get("favorite_color_show_icon", True)
+        )
+        self.favorite_color_show_left_bar = bool(
+            self.settings.get("favorite_color_show_left_bar", True)
+        )
+        self.favorite_color_show_background = bool(
+            self.settings.get("favorite_color_show_background", False)
+        )
+        self.favorite_color_show_text = bool(
+            self.settings.get("favorite_color_show_text", False)
+        )
         self.sidebar_drop_folders_to_favorites = bool(
             self.settings.get("sidebar_drop_folders_to_favorites", False)
         )
@@ -4131,7 +4143,7 @@ class BrowserWindow(QMainWindow):
 
     def open_folder_bookmark(self, index: QModelIndex) -> None:
         entry = self.folder_bookmark_model.entry_at(index)
-        if entry is None:
+        if entry is None or entry.kind != "folder":
             return
         self.navigate_to(
             entry.path,
@@ -4164,7 +4176,7 @@ class BrowserWindow(QMainWindow):
         ):
             return
         entry = self.folder_bookmark_model.entry_at(index)
-        if entry is None:
+        if entry is None or entry.kind != "folder":
             return
         trace_id = self._favorite_trace_id
         if trace_id:
@@ -4197,7 +4209,7 @@ class BrowserWindow(QMainWindow):
         label: str | None = None,
     ) -> bool:
         entry = self.folder_bookmark_model.entry_at(index)
-        if entry is None or self.metadata_store is None:
+        if entry is None or entry.kind != "folder" or self.metadata_store is None:
             return False
         if label is None:
             label, accepted = QInputDialog.getText(
@@ -4212,10 +4224,10 @@ class BrowserWindow(QMainWindow):
 
     def move_folder_bookmark(self, index: QModelIndex, offset: int) -> bool:
         entry = self.folder_bookmark_model.entry_at(index)
-        if entry is None or self.metadata_store is None:
+        if entry is None or entry.kind != "folder" or self.metadata_store is None:
             return False
-        paths = [candidate.path for candidate in self.folder_bookmark_model.entries]
-        old_row = index.row()
+        paths = [candidate.path for candidate in self.folder_bookmark_model.entries if candidate.kind == "folder"]
+        old_row = paths.index(entry.path)
         new_row = max(0, min(len(paths) - 1, old_row + int(offset)))
         if new_row == old_row:
             return False
@@ -4249,7 +4261,7 @@ class BrowserWindow(QMainWindow):
             self.bookmark_model.AvailabilityRole,
         )
         if availability == "missing":
-            self.statusBar().showMessage(tr('ブックマーク先が見つかりません'), 3000)
+            self.statusBar().showMessage(tr('お気に入り先が見つかりません'), 3000)
             return
         if entry.item_type == "folder":
             self.navigate_to(entry.path)
@@ -7028,12 +7040,14 @@ class BrowserWindow(QMainWindow):
         self.favorite_view.setModel(self.folder_bookmark_model)
         self.favorite_view.set_drop_hover_enabled(True)
         self.favorite_view.drop_action_resolver = self._favorite_drop_qt_action
-        self.favorite_view.setItemDelegate(
-            FavoriteItemDelegate(
-                self.favorite_view,
-                metrics=self.favorite_row_metrics,
-            )
+        self.favorite_item_delegate = FavoriteItemDelegate(
+            self.favorite_view, metrics=self.favorite_row_metrics,
+            show_color_icon=self.favorite_color_show_icon,
+            show_color_left_bar=self.favorite_color_show_left_bar,
+            show_color_background=self.favorite_color_show_background,
+            show_color_text=self.favorite_color_show_text,
         )
+        self.favorite_view.setItemDelegate(self.favorite_item_delegate)
         self.favorite_view.setIconSize(
             QSize(
                 self.favorite_row_metrics.icon_size,
@@ -7089,8 +7103,9 @@ class BrowserWindow(QMainWindow):
         self._apply_history_row_metrics()
         self.favorite_tabs = FavoriteTabs(self.favorite_view, self.metadata_store, self)
         self.favorite_tabs.configure(self.settings)
-        self.favorite_tabs.group_changed.connect(self.folder_bookmark_model.set_group)
-        self.folder_bookmark_model.set_group(self.favorite_tabs.group_id)
+        self.favorite_tabs.group_changed.connect(self._on_favorite_group_changed)
+        self.favorite_tabs.edit_requested.connect(self.edit_favorites)
+        self._on_favorite_group_changed(self.favorite_tabs.group_id)
         self.bookmark_view.hide()
         self.sidebar = QWidget(self)
         self.sidebar.setObjectName("browser_sidebar")
@@ -7684,7 +7699,7 @@ class BrowserWindow(QMainWindow):
         )
         self._sync_sidebar_actions()
 
-        bookmark_menu = self.menuBar().addMenu(tr('ブックマーク'))
+        bookmark_menu = self.menuBar().addMenu(tr('お気に入り'))
         self.add_folder_bookmark_action = QAction(tr('現在のフォルダを追加'), self)
         self.add_folder_bookmark_action.triggered.connect(
             self.add_current_folder_bookmark
@@ -7914,12 +7929,14 @@ class BrowserWindow(QMainWindow):
     def _apply_favorite_row_metrics(self) -> None:
         if not hasattr(self, "favorite_view"):
             return
-        self.favorite_view.setItemDelegate(
-            FavoriteItemDelegate(
-                self.favorite_view,
-                metrics=self.favorite_row_metrics,
-            )
+        self.favorite_item_delegate = FavoriteItemDelegate(
+            self.favorite_view, metrics=self.favorite_row_metrics,
+            show_color_icon=self.favorite_color_show_icon,
+            show_color_left_bar=self.favorite_color_show_left_bar,
+            show_color_background=self.favorite_color_show_background,
+            show_color_text=self.favorite_color_show_text,
         )
+        self.favorite_view.setItemDelegate(self.favorite_item_delegate)
         self.favorite_view.setIconSize(
             QSize(
                 self.favorite_row_metrics.icon_size,
@@ -8895,6 +8912,103 @@ class BrowserWindow(QMainWindow):
         self._pending_browser_focus = None
         self.browser_main_drop.cancel()
 
+    def _favorite_group_colors(self, group_id: int) -> dict[str, str]:
+        raw = self.config.get("favorite_item_colors", {})
+        if not isinstance(raw, dict):
+            return {}
+        group = raw.get(str(group_id), {})
+        return dict(group) if isinstance(group, dict) else {}
+
+    def _favorite_group_separators(self, group_id: int) -> list[dict[str, object]]:
+        raw = self.config.get("favorite_separators", {})
+        if not isinstance(raw, dict):
+            return []
+        group = raw.get(str(group_id), [])
+        return [dict(item) for item in group if isinstance(item, dict)] if isinstance(group, list) else []
+
+    def _apply_favorite_customization(self) -> None:
+        group_id = self.folder_bookmark_model.group_id
+        self.folder_bookmark_model.configure_customization(
+            self._favorite_group_colors(group_id),
+            self._favorite_group_separators(group_id),
+        )
+        if hasattr(self, "favorite_item_delegate"):
+            self.favorite_item_delegate.configure_color_display(
+                icon=self.favorite_color_show_icon,
+                left_bar=self.favorite_color_show_left_bar,
+                background=self.favorite_color_show_background,
+                text=self.favorite_color_show_text,
+            )
+        if hasattr(self, "favorite_view"):
+            self.favorite_view.viewport().update()
+
+    def _on_favorite_group_changed(self, group_id: int) -> None:
+        self.folder_bookmark_model.set_group(int(group_id))
+        self._apply_favorite_customization()
+
+    def edit_favorites(self, group_id: int | None = None) -> None:
+        if self.metadata_store is None:
+            return
+        from .favorite_editor_dialog import FavoriteEditorDialog
+
+        group_id = int(group_id or self.folder_bookmark_model.group_id)
+        favorites = self.metadata_store.list_group_favorites(group_id)
+        dialog = FavoriteEditorDialog(
+            favorites,
+            self._favorite_group_colors(group_id),
+            self._favorite_group_separators(group_id),
+            self,
+            color_display={
+                "icon": self.favorite_color_show_icon,
+                "left_bar": self.favorite_color_show_left_bar,
+                "background": self.favorite_color_show_background,
+                "text": self.favorite_color_show_text,
+            },
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        rows = dialog.favorite_rows()
+        surviving = {self._path_key(row["path"]) for row in rows}
+        for entry in favorites:
+            if self._path_key(entry.path) not in surviving:
+                self.metadata_store.remove_group_favorite(group_id, entry.path)
+        for row in rows:
+            if row["label"].strip():
+                self.metadata_store.rename_group_favorite(
+                    group_id, row["path"], row["label"]
+                )
+        self.metadata_store.reorder_group_favorites(
+            group_id, [row["path"] for row in rows]
+        )
+
+        all_colors = self.config.get("favorite_item_colors", {})
+        all_colors = dict(all_colors) if isinstance(all_colors, dict) else {}
+        all_colors[str(group_id)] = {
+            row["path"]: row["color"]
+            for row in rows
+            if row["color"]
+        }
+        all_separators = self.config.get("favorite_separators", {})
+        all_separators = dict(all_separators) if isinstance(all_separators, dict) else {}
+        all_separators[str(group_id)] = dialog.separators()
+        display = dialog.color_display()
+        changed = {
+            "favorite_item_colors": all_colors,
+            "favorite_separators": all_separators,
+            "favorite_color_show_icon": display["icon"],
+            "favorite_color_show_left_bar": display["left_bar"],
+            "favorite_color_show_background": display["background"],
+            "favorite_color_show_text": display["text"],
+        }
+        self.config.apply(changed, save=True)
+        self.favorite_color_show_icon = display["icon"]
+        self.favorite_color_show_left_bar = display["left_bar"]
+        self.favorite_color_show_background = display["background"]
+        self.favorite_color_show_text = display["text"]
+        if group_id == self.folder_bookmark_model.group_id:
+            self._apply_favorite_customization()
+
     def _on_favorite_paths_dropped(
         self,
         paths: tuple[str, ...],
@@ -8904,14 +9018,26 @@ class BrowserWindow(QMainWindow):
         action: Qt.DropAction | None = None,
     ) -> None:
         entry = self.folder_bookmark_model.entry_at(index)
+        if entry is not None and entry.kind != "folder":
+            entry = None
         if source is self.favorite_view and self.metadata_store is not None:
+            drag_keys = {self._path_key(path) for path in paths}
+            model_entries = list(self.folder_bookmark_model.entries)
             ordered = [
                 item.path
-                for item in self.folder_bookmark_model.entries
-                if self._path_key(item.path)
-                not in {self._path_key(path) for path in paths}
+                for item in model_entries
+                if item.kind == "folder" and self._path_key(item.path) not in drag_keys
             ]
-            target_row = index.row() if index.isValid() else len(ordered)
+            target_model_row = index.row() if index.isValid() else len(model_entries)
+            target_row = sum(
+                1
+                for item in model_entries[:target_model_row]
+                if item.kind == "folder" and self._path_key(item.path) not in drag_keys
+            )
+            drag_rows = [row for row, item in enumerate(model_entries) if item.kind == "folder" and self._path_key(item.path) in drag_keys]
+            if (drag_rows and target_model_row > min(drag_rows) and entry is not None
+                    and self._path_key(entry.path) not in drag_keys):
+                target_row += 1
             for offset, path in enumerate(paths):
                 ordered.insert(min(len(ordered), target_row + offset), path)
             self.metadata_store.reorder_group_favorites(self.folder_bookmark_model.group_id, ordered)
@@ -9115,7 +9241,8 @@ class BrowserWindow(QMainWindow):
             paths = paths_from_mime_data(mime) if mime is not None else ()
             if source is not self.list_view or self._browser_drop_paths_are_all_folders(paths):
                 return Qt.DropAction.CopyAction
-        if self.folder_bookmark_model.entry_at(index) is None:
+        target_entry = self.folder_bookmark_model.entry_at(index)
+        if target_entry is None or target_entry.kind != "folder":
             return Qt.DropAction.CopyAction
         return (
             Qt.DropAction.MoveAction
@@ -9468,7 +9595,7 @@ class BrowserWindow(QMainWindow):
         if entry.item_type == "folder":
             new_action.setEnabled(False)
         menu.addSeparator()
-        remove_action = menu.addAction(tr('ブックマークから削除'))
+        remove_action = menu.addAction(tr('お気に入りから削除'))
         selected = menu.exec(self.bookmark_view.viewport().mapToGlobal(position))
         if selected == open_action:
             self.open_bookmark(index)
@@ -9483,6 +9610,13 @@ class BrowserWindow(QMainWindow):
         if entry is None:
             return
         menu = QMenu(self)
+        edit_action = menu.addAction(tr('お気に入りを編集…'))
+        if entry.kind == "separator":
+            selected = menu.exec(self.favorite_view.viewport().mapToGlobal(position))
+            if selected == edit_action:
+                self.edit_favorites()
+            return
+        menu.addSeparator()
         open_action = menu.addAction(tr('移動'))
         location_action = menu.addAction(tr('エクスプローラーで場所を開く'))
         menu.addSeparator()
@@ -9505,7 +9639,9 @@ class BrowserWindow(QMainWindow):
             0 <= index.row() < self.folder_bookmark_model.rowCount() - 1
         )
         selected = menu.exec(self.favorite_view.viewport().mapToGlobal(position))
-        if selected == open_action:
+        if selected == edit_action:
+            self.edit_favorites()
+        elif selected == open_action:
             self.open_folder_bookmark(index)
         elif selected == location_action:
             self._queue_system_open_probe(

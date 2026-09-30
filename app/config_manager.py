@@ -174,6 +174,12 @@ class ConfigManager(QObject):
         "favorite_drop_ctrl_inverts_operation": True,
         "favorite_drop_confirm_move": True,
         "favorite_drop_confirm_focus_yes": False,
+        "favorite_item_colors": {},
+        "favorite_separators": {},
+        "favorite_color_show_icon": True,
+        "favorite_color_show_left_bar": True,
+        "favorite_color_show_background": False,
+        "favorite_color_show_text": False,
         "sidebar_drop_folders_to_favorites": False,
         "sidebar_shift_drop_folders_to_favorites": True,
         "sidebar_drop_disable_file_operations": False,
@@ -601,6 +607,10 @@ class ConfigManager(QObject):
             "favorite_drop_ctrl_inverts_operation",
             "favorite_drop_confirm_move",
             "favorite_drop_confirm_focus_yes",
+            "favorite_color_show_icon",
+            "favorite_color_show_left_bar",
+            "favorite_color_show_background",
+            "favorite_color_show_text",
             "sidebar_drop_folders_to_favorites",
             "sidebar_shift_drop_folders_to_favorites",
             "sidebar_drop_disable_file_operations",
@@ -633,6 +643,10 @@ class ConfigManager(QObject):
         normalized["browser_tag_max_characters"] = cls._clamped_int(
             normalized.get("browser_tag_max_characters"), default=0, minimum=0, maximum=100,
         )
+        if not isinstance(normalized.get("favorite_item_colors"), dict):
+            normalized["favorite_item_colors"] = {}
+        if not isinstance(normalized.get("favorite_separators"), dict):
+            normalized["favorite_separators"] = {}
         color = str(normalized.get("browser_tag_text_color", "#ffffff")).strip().casefold()
         normalized["browser_tag_text_color"] = (
             color if re.fullmatch(r"#[0-9a-f]{6}", color) else "#ffffff"

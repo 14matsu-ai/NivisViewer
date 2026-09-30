@@ -26,6 +26,10 @@ class FolderBookmarkItem:
     exists: bool | None
     sort_order: int
     availability: PathAvailability = PathAvailability.UNKNOWN
+    kind: str = "folder"
+    accent_color: str = ""
+    separator_id: str = ""
+    separator_alignment: str = "center"
 
 
 class FolderBookmarkModel(QAbstractListModel):
@@ -33,6 +37,9 @@ class FolderBookmarkModel(QAbstractListModel):
     PathRole = EntryRole + 1
     ExistsRole = PathRole + 1
     AvailabilityRole = ExistsRole + 1
+    KindRole = AvailabilityRole + 1
+    AccentColorRole = KindRole + 1
+    SeparatorAlignmentRole = AccentColorRole + 1
 
     def __init__(
         self,
@@ -54,6 +61,8 @@ class FolderBookmarkModel(QAbstractListModel):
         )
         self._entries: list[FolderBookmarkItem] = []
         self._row_by_path: dict[str, int] = {}
+        self._favorite_colors: dict[str, str] = {}
+        self._favorite_separators: tuple[dict[str, object], ...] = ()
         self._probe_generation = 0
         self._pending_requests: dict[int, tuple[int, str]] = {}
         self.availability_service.result_ready.connect(self._on_probe_finished)
@@ -75,6 +84,8 @@ class FolderBookmarkModel(QAbstractListModel):
         if entry is None:
             return None
         if role == int(Qt.ItemDataRole.DisplayRole):
+            if entry.kind == "separator":
+                return entry.label
             if entry.availability is PathAvailability.CHECKING:
                 suffix = tr(' — 確認中')
             elif entry.availability is PathAvailability.MISSING:
@@ -88,8 +99,10 @@ class FolderBookmarkModel(QAbstractListModel):
                 suffix = ""
             return f"{entry.label}{suffix}"
         if role == int(Qt.ItemDataRole.ToolTipRole):
-            return entry.path
+            return entry.path if entry.kind == "folder" else None
         if role == int(Qt.ItemDataRole.DecorationRole):
+            if entry.kind == "separator":
+                return None
             return self.shell_icon_provider.icon_for_extension("", folder=True)
         if (
             role == int(Qt.ItemDataRole.ForegroundRole)
@@ -109,6 +122,12 @@ class FolderBookmarkModel(QAbstractListModel):
             return entry.exists
         if role == self.AvailabilityRole:
             return entry.availability.value
+        if role == self.KindRole:
+            return entry.kind
+        if role == self.AccentColorRole:
+            return entry.accent_color
+        if role == self.SeparatorAlignmentRole:
+            return entry.separator_alignment
         return None
 
     def entry_at(
@@ -123,6 +142,37 @@ class FolderBookmarkModel(QAbstractListModel):
     def row_for_path(self, path: str | Path) -> int:
         return self._row_by_path.get(path_key(path), -1)
 
+    def configure_customization(
+        self,
+        colors: object,
+        separators: object,
+    ) -> None:
+        normalized_colors: dict[str, str] = {}
+        if isinstance(colors, dict):
+            for raw_path, raw_color in colors.items():
+                color = str(raw_color).strip().lower()
+                if color.startswith("#") and len(color) == 7:
+                    normalized_colors[path_key(str(raw_path))] = color
+        normalized_separators: list[dict[str, object]] = []
+        if isinstance(separators, list):
+            for raw in separators:
+                if not isinstance(raw, dict):
+                    continue
+                alignment = str(raw.get("alignment", "center"))
+                if alignment not in {"left", "center", "right"}:
+                    alignment = "center"
+                normalized_separators.append(
+                    {
+                        "id": str(raw.get("id", "")),
+                        "label": str(raw.get("label", "")),
+                        "alignment": alignment,
+                        "before_path": str(raw.get("before_path", "")),
+                    }
+                )
+        self._favorite_colors = normalized_colors
+        self._favorite_separators = tuple(normalized_separators)
+        self.refresh()
+
     def refresh(self) -> None:
         bookmarks = (
             self.metadata_store.list_group_favorites(self.group_id)
@@ -132,23 +182,53 @@ class FolderBookmarkModel(QAbstractListModel):
         self._probe_generation += 1
         generation = self._probe_generation
         self._pending_requests.clear()
-        self.beginResetModel()
-        self._entries = [
+        folder_entries = [
             FolderBookmarkItem(
                 label=entry.display_name,
                 path=entry.path,
                 exists=None,
                 sort_order=entry.sort_order,
                 availability=PathAvailability.UNKNOWN,
+                accent_color=self._favorite_colors.get(path_key(entry.path), ""),
             )
             for entry in bookmarks
         ]
+        by_anchor: dict[str, list[FolderBookmarkItem]] = {}
+        trailing: list[FolderBookmarkItem] = []
+        folder_keys = {path_key(entry.path) for entry in folder_entries}
+        for order, raw in enumerate(self._favorite_separators):
+            separator = FolderBookmarkItem(
+                label=str(raw.get("label", "")),
+                path="",
+                exists=None,
+                sort_order=order,
+                kind="separator",
+                separator_id=str(raw.get("id", "")),
+                separator_alignment=str(raw.get("alignment", "center")),
+            )
+            before_path = str(raw.get("before_path", ""))
+            anchor = path_key(before_path) if before_path else ""
+            if anchor and anchor in folder_keys:
+                by_anchor.setdefault(anchor, []).append(separator)
+            else:
+                trailing.append(separator)
+        merged: list[FolderBookmarkItem] = []
+        for entry in folder_entries:
+            merged.extend(by_anchor.get(path_key(entry.path), ()))
+            merged.append(entry)
+        merged.extend(trailing)
+
+        self.beginResetModel()
+        self._entries = merged
         self._row_by_path = {
             path_key(entry.path): row
             for row, entry in enumerate(self._entries)
+            if entry.kind == "folder"
         }
         self.endResetModel()
         for row, entry in enumerate(self._entries):
+            if entry.kind != "folder":
+                continue
             request_id = self.availability_service.probe(entry.path)
             if request_id:
                 self._entries[row] = replace(
@@ -171,6 +251,8 @@ class FolderBookmarkModel(QAbstractListModel):
         generation = self._probe_generation
         self._pending_requests.clear()
         for row, entry in enumerate(self._entries):
+            if entry.kind != "folder":
+                continue
             self._entries[row] = replace(
                 entry,
                 exists=None,

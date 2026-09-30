@@ -42,6 +42,7 @@ class FavoriteTabs(QTabWidget):
     """Persistent favorite groups sharing the existing compact folder view."""
 
     group_changed = Signal(int)
+    edit_requested = Signal(int)
 
     def __init__(self, view, store, parent=None):
         super().__init__(parent)
@@ -173,11 +174,15 @@ class FavoriteTabs(QTabWidget):
         if index < 0 or self.store is None or self.tabBar().tabData(index) is None:
             return
         menu = QMenu(self)
+        edit = menu.addAction(tr("お気に入りを編集…"))
+        menu.addSeparator()
         rename = menu.addAction(tr("名前を変更"))
         delete = menu.addAction(tr("タブを削除"))
         delete.setEnabled(len(self.store.list_favorite_groups()) > 1)
         action = menu.exec(self.tabBar().mapToGlobal(self.tabBar().tabRect(index).bottomLeft()))
-        if action is rename:
+        if action is edit:
+            self.edit_requested.emit(int(self.tabBar().tabData(index)))
+        elif action is rename:
             name, accepted = QInputDialog.getText(self, tr("タブの名前"), tr("名前:"), text=self.tabText(index))
             if accepted and name.strip():
                 self.rename_group(index, name)

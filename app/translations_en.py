@@ -1344,3 +1344,27 @@ ENGLISH.update({'Shiftキーでサイドバーへのフォルダードロップ�
 ENGLISH.update({'サイドバーへのドロップではファイルやフォルダーをコピー／移動しない': 'Disable sidebar drop copy and move'})
 
 ENGLISH.update({'コピー／移動禁止がONの場合は、既存のお気に入り行でも追加を優先します。': 'When copy/move is disabled, adding to favorites takes priority even on an existing favorite row.'})
+
+ENGLISH.update({
+    'お気に入りを編集…': 'Edit favorites…',
+    'お気に入りを編集': 'Edit favorites',
+    'お気に入り先が見つかりません': 'Favorite location not found',
+    'Ctrl/Shiftクリックまたは空白部分のドラッグで複数選択できます。項目をドラッグすると並び替えできます。': 'Use Ctrl/Shift-click or drag across blank space to select multiple items. Drag items to reorder them.',
+    '色を設定…': 'Set color…',
+    '色を解除': 'Clear color',
+    '区切りを追加': 'Add separator',
+    '選択項目を削除': 'Remove selected',
+    '区切り': 'Separator',
+    '区切り名:': 'Separator label:',
+    '区切り名': 'Separator label',
+    '位置:': 'Position:',
+    '左端': 'Left edge',
+    '中央': 'Center',
+    '右端': 'Right edge',
+    '色アクセントの表示': 'Color accent display',
+    'アイコン': 'Icon',
+    '左端バー': 'Left bar',
+    '背景': 'Background',
+    '文字': 'Text',
+    'お気に入りの色': 'Favorite color',
+})
