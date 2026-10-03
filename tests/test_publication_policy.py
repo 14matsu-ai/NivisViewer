@@ -13,3 +13,9 @@ def test_build_source_and_legal_provenance_remain_publishable():
     for name in ("app/viewer_widget.py", "scripts/build_portable.ps1", "LICENSE",
                  "docs/ZIPPLAFORK_COMPARISON.md", "licenses/ZipPlaFork/About.txt"):
         assert publishable(name)
+
+
+def test_private_profiles_environments_and_new_internal_notes_are_excluded():
+    for name in ("config.json", "data/favorites.json", ".venv313/pyvenv.cfg",
+                 "out/report.json", "INTERNAL_NOTES.md", ".codex/settings.json"):
+        assert not publishable(name)

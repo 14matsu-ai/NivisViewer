@@ -8,8 +8,17 @@ PUBLIC_DOCS = {
     "docs/ZIPPLAFORK_COMPARISON.md",
     "docs/RELEASE_LICENSE_AUDIT.md",
 }
-PRIVATE_FILES = {"AGENTS.md", "_folder_worker_probe.py", "_wheel_trace_probe.py"}
-PRIVATE_PREFIXES = ("portable-backups/", "assets/screenshots/", "assets/branding/README.md")
+PRIVATE_FILES = {"AGENTS.md", "config.json", "_folder_worker_probe.py", "_wheel_trace_probe.py"}
+PRIVATE_PREFIXES = (
+    "portable-backups/", "assets/screenshots/", "assets/branding/README.md",
+    "data/", "cache/", "logs/", "build/", "dist/", "out/",
+    ".venv", "venv/", ".codex/", ".agents/", ".vscode/", ".idea/",
+)
+PUBLIC_ROOT_DOCUMENTS = {
+    "README.md", "README.en.md", "README.zh-CN.md", "README.zh-TW.md",
+    "PROJECT_LICENSE.md", "THIRD_PARTY_NOTICES.md", "PUBLICATION_POLICY.md",
+    "requirements.txt", "requirements-build.txt", "requirements-dev.txt", "requirements-release.txt",
+}
 PRIVATE_SCRIPT_PREFIXES = (
     "review_", "diagnose_", "measure_", "generate_stress_",
     "thumbnail_quality_",
@@ -22,6 +31,9 @@ def publishable(filename: str) -> bool:
         return False
     if name.casefold().endswith((".zip", ".pyc", ".pyo", ".log", ".tmp")) or "__pycache__" in name:
         return False
+    if "/" not in name and Path(name).suffix.casefold() in {".md", ".txt", ".rst"}:
+        if name not in PUBLIC_ROOT_DOCUMENTS and not name.startswith(("LICENSE", "COPYING", "NOTICE")):
+            return False
     if name.startswith("docs/") and name not in PUBLIC_DOCS:
         return False
     if name.startswith("scripts/"):
