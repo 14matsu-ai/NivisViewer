@@ -12,7 +12,7 @@ PRIVATE_FILES = {"AGENTS.md", "_folder_worker_probe.py", "_wheel_trace_probe.py"
 PRIVATE_PREFIXES = ("portable-backups/", "assets/screenshots/", "assets/branding/README.md")
 PRIVATE_SCRIPT_PREFIXES = (
     "review_", "diagnose_", "measure_", "generate_stress_",
-    "thumbnail_quality_", "generate_branding_",
+    "thumbnail_quality_",
 )
 
 
@@ -38,5 +38,10 @@ def find_publication_violations(root: Path) -> list[str]:
         result = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True, check=True)
         names = [name.decode("utf-8") for name in result.stdout.split(b"\0") if name]
     else:
-        names = [file.relative_to(root).as_posix() for file in root.rglob("*") if file.is_file()]
+        local_outputs = {"build", "dist", "out", "data", "cache", "logs", "__pycache__", "venv"}
+        names = [file.relative_to(root).as_posix() for file in root.rglob("*")
+                 if file.is_file()
+                 and not any(part in local_outputs or part.startswith(".venv")
+                             for part in file.relative_to(root).parts)
+                 and file.suffix.casefold() not in {".pyc", ".pyo"}]
     return sorted(name for name in names if not publishable(name))
