@@ -104,6 +104,23 @@ def test_collector_preserves_colliding_existing_and_wheel_notices(tmp_path, monk
         assert hashlib.sha256((existing.parent / file).read_bytes()).hexdigest() == digest
 
 
+def test_collector_excludes_generated_caches_without_dropping_license_text(tmp_path, monkeypatch):
+    distribution = fake_distribution(tmp_path / "wheel", {
+        "package/licenses/NOTICE": b"upstream copyright and license notice",
+        "package/licenses/__pycache__/license.cpython-313.pyc": b"local compiler path",
+        "package/licenses/__pycache__/LICENSE.txt": b"cache content",
+        "package/licenses/NOTICE.pyc": b"local compiler path",
+        "package/licenses/NOTICE.pyo": b"local compiler path",
+    })
+    only_distribution(monkeypatch, distribution)
+    output = tmp_path / "notices"
+    result = collector.collect(output, strict=True)
+    assert result["runtime"][0]["files"] == ["NOTICE"]
+    assert (output / "PySide6/NOTICE").read_bytes() == b"upstream copyright and license notice"
+    assert not list(output.rglob("*.pyc"))
+    assert not list(output.rglob("*.pyo"))
+
+
 def test_qt_supplement_rejects_modified_text_without_overwriting_it(tmp_path):
     changed = tmp_path / "Qt/6.11.2/GPL-2.0-only.txt"
     changed.parent.mkdir(parents=True)

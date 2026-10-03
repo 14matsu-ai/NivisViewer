@@ -25,6 +25,8 @@ $PreviousBuildPath = $env:PATH
 $PreviousLicensesDir = $env:NIVIS_LICENSES_DIR
 Push-Location $RepoRoot
 try {
+    & $Python scripts\check_docs_privacy.py
+    if ($LASTEXITCODE -ne 0) { throw "Private user paths must be removed from public documentation before building." }
     $RuntimeDetails = & $Python scripts\python_runtime_policy.py --require-venv --release-dependencies requirements-release.txt
     if ($LASTEXITCODE -ne 0) { throw "Build runtime does not meet the Python 3.13.16+ x64 baseline." }
     & $Python -c "import PyInstaller; print(PyInstaller.__version__)"

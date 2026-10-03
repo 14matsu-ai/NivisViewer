@@ -118,6 +118,12 @@ def collect(output: Path, *, strict: bool = False) -> dict[str, object]:
             for file in distribution.files or ():
                 base = Path(str(file)).name.casefold()
                 file_text = str(file).replace("\\", "/")
+                parts = Path(file_text).parts
+                lower_parts = [part.casefold() for part in parts]
+                # Installed bytecode records local compiler paths. It is not
+                # license text, even when generated inside a licenses package.
+                if "__pycache__" in lower_parts or Path(file_text).suffix.casefold() in {".pyc", ".pyo"}:
+                    continue
                 is_declared = any(
                     file_text.endswith(item.replace("\\", "/"))
                     for item in declared
@@ -136,8 +142,6 @@ def collect(output: Path, *, strict: bool = False) -> dict[str, object]:
                 if digest in digests:
                     continue
                 digests.add(digest)
-                parts = Path(file_text).parts
-                lower_parts = [part.casefold() for part in parts]
                 if "licenses" in lower_parts:
                     start = lower_parts.index("licenses") + 1
                     target_name = "__".join(parts[start:])
