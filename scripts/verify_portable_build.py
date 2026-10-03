@@ -3,6 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import hashlib
+import os
+import re
+import sys
+import importlib.util
+import zipfile
 from pathlib import Path
 
 
@@ -30,6 +35,84 @@ FORBIDDEN_EXECUTABLES = {
     "ffmpeg.exe",
     "ffprobe.exe",
 }
+
+
+def audit_runtime_files(bundle: Path, expected_python: str) -> list[str]:
+    errors = []
+    if tuple(map(int, expected_python.split(".")[:2])) != sys.version_info[:2]:
+        errors.append("bytecode audit must use the target Python interpreter series")
+    expected_abi = "cp" + "".join(expected_python.split(".")[:2])
+    paths = [path for path in bundle.rglob("*") if path.is_file()]
+    readmes = [path for path in paths if path.name.casefold() == "readme.md"]
+    if readmes != [bundle / "README.md"]:
+        errors.append("bundle must contain exactly one README.md at its root")
+    for path in paths:
+        for abi in re.findall(r"(?:^|[._-])(cp\d{2,3}t?)(?=[._-]|$)", path.name.casefold()):
+            if abi != expected_abi:
+                errors.append(f"unexpected Python ABI tag: {path.relative_to(bundle)}")
+        if path.suffix.lower() == ".pyc" and path.read_bytes()[:4] != importlib.util.MAGIC_NUMBER:
+            errors.append(f"unexpected bytecode magic: {path.relative_to(bundle)}")
+        if path.name == "base_library.zip":
+            with zipfile.ZipFile(path) as archive:
+                for name in archive.namelist():
+                    if name.endswith(".pyc"):
+                        with archive.open(name) as entry:
+                            if entry.read(4) != importlib.util.MAGIC_NUMBER:
+                                errors.append(f"unexpected bytecode magic: base_library.zip/{name}")
+    return errors
+
+
+def audit_native(bundle: Path, expected_python: str, *, system_dir: Path | None = None) -> dict[str, object]:
+    """Static PE import presence/version check; never loads or runs a binary."""
+    import pefile
+
+    binaries = sorted(path for path in bundle.rglob("*") if path.is_file() and path.suffix.lower() in {".exe", ".dll", ".pyd"})
+    available = {path.name.casefold() for path in binaries}
+    system_dir = system_dir or Path(os.environ["SystemRoot"]) / "System32"
+    system_names = {path.name.casefold() for path in system_dir.glob("*.dll")}
+    expected_name = "python" + "".join(expected_python.split(".")[:2]) + ".dll"
+    errors = audit_runtime_files(bundle, expected_python)
+    python_version = None
+    missing = []
+    for path in binaries:
+        name = path.name.casefold()
+        if re.fullmatch(r"python\d+\.dll", name) and name not in {expected_name, "python3.dll"}:
+            errors.append(f"unexpected interpreter DLL: {path.relative_to(bundle)}")
+        pe = None
+        try:
+            pe = pefile.PE(str(path))
+            if pe.FILE_HEADER.Machine != 0x8664:
+                errors.append(f"non-x64 binary: {path.relative_to(bundle)}")
+            if name == expected_name:
+                for group in getattr(pe, "FileInfo", ()):
+                    for info in group:
+                        for table in getattr(info, "StringTable", ()):
+                            value = table.entries.get(b"ProductVersion")
+                            if value:
+                                python_version = value.decode("ascii").strip()
+            for attribute in ("DIRECTORY_ENTRY_IMPORT", "DIRECTORY_ENTRY_DELAY_IMPORT"):
+                for entry in getattr(pe, attribute, ()):
+                    dependency = entry.dll.decode("ascii").casefold()
+                    if dependency.startswith(("api-ms-", "ext-ms-")):
+                        continue  # Windows API-set contracts, not loose DLLs.
+                    if dependency not in available and dependency not in system_names:
+                        missing.append({"binary": str(path.relative_to(bundle)), "dependency": dependency})
+        except (OSError, pefile.PEFormatError) as exc:
+            errors.append(f"invalid native binary {path.relative_to(bundle)}: {exc}")
+        finally:
+            if pe is not None:
+                pe.close()
+    if expected_name not in available:
+        errors.append(f"interpreter DLL not found: {expected_name}")
+    if python_version != expected_python:
+        errors.append(f"interpreter ProductVersion mismatch: expected {expected_python}, found {python_version}")
+    errors.extend(f"missing native import: {entry['binary']}: {entry['dependency']}" for entry in missing)
+    return {
+        "scope": "static PE version/architecture/import-presence check; not a native loader or executable smoke test",
+        "expected_python": expected_python, "python_dll": expected_name,
+        "python_product_version": python_version,
+        "native_binary_count": len(binaries), "missing_imports": missing, "errors": errors,
+    }
 
 
 def verify(bundle: Path, smoke_result: Path | None = None) -> list[str]:
@@ -92,8 +175,17 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("bundle", type=Path)
     parser.add_argument("--smoke-result", type=Path)
+    parser.add_argument("--expected-python")
+    parser.add_argument("--native-report", type=Path)
     arguments = parser.parse_args()
     errors = verify(arguments.bundle, arguments.smoke_result)
+    if arguments.native_report and not arguments.expected_python:
+        parser.error("--native-report requires --expected-python")
+    if arguments.expected_python:
+        report = audit_native(arguments.bundle, arguments.expected_python)
+        errors.extend(report["errors"])
+        if arguments.native_report:
+            arguments.native_report.write_text(json.dumps(report, indent=2), encoding="utf-8")
     for error in errors:
         print(error)
     return 1 if errors else 0

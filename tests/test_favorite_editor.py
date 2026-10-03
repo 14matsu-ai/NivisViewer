@@ -2,7 +2,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QEvent, QPointF, QRect, Qt
 from PySide6.QtGui import QColor, QHelpEvent, QIcon, QImage, QMouseEvent, QPainter, QPalette, QPixmap, QStandardItem, QStandardItemModel
-from PySide6.QtTest import QTest
+from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import QColorDialog, QDialog, QDialogButtonBox, QStyle, QStyleOptionViewItem, QToolTip
 
 from app.browser_window import BrowserWindow
@@ -363,6 +363,8 @@ def test_qt_tooltip_events_cannot_revive_tip_before_mouse_stops(qapp, monkeypatc
     # events from other offscreen test windows. Inject only our own movement.
     view.doItemsLayout()
     monkeypatch.setattr(view.viewport(), "isVisible", lambda: True)
+    timer = view._item_tooltips._timer
+    expired = QSignalSpy(timer.timeout)
 
     def move_and_send_qt_tooltip(row):
         point = view.visualRect(model.index(row, 0)).center()
@@ -372,27 +374,45 @@ def test_qt_tooltip_events_cannot_revive_tip_before_mouse_stops(qapp, monkeypatc
             Qt.MouseButton.NoButton, Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
         )
         qapp.sendEvent(view.viewport(), move)
+        assert timer.isActive()
+        assert timer.interval() == 80
+        assert view._item_tooltips._position == point
+        timer_id = timer.timerId()
         qapp.sendEvent(view.viewport(), QHelpEvent(QEvent.Type.ToolTip, point, global_point))
+        # Qt's reactivation event cannot show a tip or replace the movement
+        # timer. Check state rather than assuming 30 ms of wall-clock wait
+        # stays below the 80 ms timer under system load.
+        assert timer.isActive() and timer.timerId() == timer_id
+
+    def wait_for_expiry(count):
+        assert expired.wait(1000), "movement timer did not emit timeout"
+        assert expired.count() == count
+        assert not timer.isActive()
 
     try:
         move_and_send_qt_tooltip(0)
-        QTest.qWait(110)
+        assert shown == []
+        wait_for_expiry(1)
         assert shown == [("C:/first", view.visualRect(model.index(0, 0)))]
         shown.clear()
         # Simulate Qt's short reactivation delay after a previously visible tip.
         move_and_send_qt_tooltip(1)
-        QTest.qWait(30)
         assert shown == []
+        previous_timer_id = timer.timerId()
         move_and_send_qt_tooltip(0)
-        QTest.qWait(30)
+        assert timer.timerId() != previous_timer_id
         assert shown == []
         move_and_send_qt_tooltip(1)
-        QTest.qWait(110)
+        assert shown == []
+        wait_for_expiry(2)
         assert shown == [("C:/second", view.visualRect(model.index(1, 0)))]
         shown.clear()
         move_and_send_qt_tooltip(0)
         qapp.sendEvent(view.viewport(), QEvent(QEvent.Type.Leave))
-        QTest.qWait(110)
+        assert not timer.isActive()
+        assert view._item_tooltips._position is None
+        # An already queued timeout must also be harmless after Leave.
+        timer.timeout.emit()
         assert shown == []
     finally:
         view.close()

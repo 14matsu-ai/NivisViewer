@@ -703,14 +703,21 @@ def test_browser_chrome_controls_are_unclipped_at_process_dpi(
         _close(window, qapp)
 
 
+@pytest.mark.parametrize("count_before_selection", [False, True])
 def test_status_omits_redundant_view_state_and_uses_stable_metadata_slots(
     tmp_path: Path,
     qapp: QApplication,
+    count_before_selection: bool,
 ) -> None:
     image = tmp_path / "image.jpg"
-    image.write_bytes(b"probe mocked")
+    with Image.new("RGB", (640, 480), "white") as source:
+        source.save(image)
     folder = tmp_path / "folder"
     folder.mkdir()
+    # The real background listing must agree with the seeded metadata. An
+    # empty folder was previously allowed to replace 120 with 0 at any yield.
+    for page in range(120):
+        (folder / f"{page:03}.jpg").write_bytes(b"header listing only")
     window = BrowserWindow(
         config_manager=_config(tmp_path),
         restore_initial_location=False,
@@ -751,10 +758,23 @@ def test_status_omits_redundant_view_state_and_uses_stable_metadata_slots(
             == BROWSER_STATUS_DETAIL_SPACING
         )
 
+        def complete_visible_requests():
+            window._request_visible_thumbnails()
+            assert window.thumbnail_provider.wait_for_done()
+            qapp.processEvents()
+            assert window.item_model.page_count(folder) == 120
+
+        if count_before_selection:
+            complete_visible_requests()
         _select(window, folder, qapp)
         assert window.browser_selected_path_edit.text() == str(folder)
         assert window.file_size_label.text() == "—"
         assert window.file_detail_label.text() == "120 ページ"
+        if not count_before_selection:
+            complete_visible_requests()
+            assert window.file_detail_label.text() == "120 ページ"
+        assert window.file_size_label.geometry() == size_geometry
+        assert window.file_detail_label.geometry() == detail_geometry
 
         _select(window, image, qapp)
         generation = window._detail_generation

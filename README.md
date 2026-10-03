@@ -72,7 +72,7 @@ PDFは読み取り専用で扱い、通常ページと注釈を表示します�
 ## 動作環境
 
 - Windows
-- Python 3.11以上
+- Python 3.13.16以上の安定版3.13（Windows x64・通常GIL版、ソース実行時）
 
 <a id="setup"></a>
 ## セットアップと起動
@@ -80,10 +80,15 @@ PDFは読み取り専用で扱い、通常ページと注釈を表示します�
 PowerShellでリポジトリのルートへ移動し、依存関係をインストールします。
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python main.py
+.\scripts\setup_python.ps1 -PythonPath python
+.\.venv313\Scripts\python.exe main.py
+```
+
+独立した`.venv313`へ実際の1.1.13と同じ依存バージョンを導入します。既存環境は変更しません。`python`が対象バージョンを指さない場合は`-PythonPath`へ公式Pythonの絶対パスを指定してください。開発・ビルド手順と更新案は[ビルド手順](docs/PORTABLE_BUILD.md)を参照してください。
+
+```powershell
+# Interpreter and pinned-dependency validation
+.\.venv313\Scripts\python.exe scripts/python_runtime_policy.py --require-venv --release-dependencies requirements-release.txt
 ```
 
 コマンドラインではファイル、フォルダ、複数パスを指定できます。2件目以降は別Viewerで開きます。
@@ -97,11 +102,11 @@ NivisViewer.exe --browser-only "D:\Books"
 
 `--new-window`と`--reuse`は同時指定できません。`--no-restore`はその起動だけ前回位置の復元を抑止します。
 
-テストを実行する場合は、開発用依存もインストールします。
+setupスクリプトは開発用依存も導入します。テストはoffscreenで実行します。
 
 ```powershell
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
+$env:QT_QPA_PLATFORM = 'offscreen'
+.\.venv313\Scripts\python.exe -m pytest -q
 ```
 
 <a id="drop"></a>

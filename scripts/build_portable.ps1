@@ -4,30 +4,29 @@ param(
     [switch]$RunTests,
     [switch]$RunSmoke,
     [switch]$CreateZip,
-    [switch]$Force
+    [switch]$Force,
+    [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9_-]+$')]
+    [string]$OutputName = ("candidate-python313-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
-$BuildDir = Join-Path $RepoRoot "build"
-$DistDir = Join-Path $RepoRoot "dist"
+$BuildRoot = Join-Path $RepoRoot "build"
+$DistRoot = Join-Path $RepoRoot "dist"
+$BuildDir = Join-Path $BuildRoot $OutputName
+$DistDir = Join-Path $DistRoot $OutputName
 $BundleDir = Join-Path $DistDir "NivisViewer"
-$Python = Join-Path $RepoRoot ".venv311\Scripts\python.exe"
+$Python = Join-Path $RepoRoot ".venv313\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
-    $Python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
-}
-if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
-    $Python = "python"
+    throw "Independent .venv313 runtime not found. Run scripts\setup_python.ps1 first."
 }
 
 $PreviousBuildPath = $env:PATH
 $PreviousLicensesDir = $env:NIVIS_LICENSES_DIR
 Push-Location $RepoRoot
 try {
-    $Architecture = & $Python -c "import platform,sys; print(f'{sys.version_info.major}.{sys.version_info.minor}|{platform.architecture()[0]}')"
-    if ($LASTEXITCODE -ne 0 -or $Architecture.Trim() -ne "3.11|64bit") {
-        throw "Python 3.11 x64 is required. Detected: $Architecture"
-    }
+    $RuntimeDetails = & $Python scripts\python_runtime_policy.py --require-venv --release-dependencies requirements-release.txt
+    if ($LASTEXITCODE -ne 0) { throw "Build runtime does not meet the Python 3.13.16+ x64 baseline." }
     & $Python -c "import PyInstaller; print(PyInstaller.__version__)"
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller is missing. Run: python -m pip install -r requirements-build.txt"
@@ -48,7 +47,7 @@ try {
     if ($Clean) {
         foreach ($Target in @($BuildDir, $DistDir)) {
             $ResolvedParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $Target))
-            if ($ResolvedParent -ne $RepoRoot) {
+            if ($ResolvedParent -ne $BuildRoot -and $ResolvedParent -ne $DistRoot) {
                 throw "Refusing to clean outside repository: $Target"
             }
             if (Test-Path -LiteralPath $Target) {
@@ -59,6 +58,10 @@ try {
     elseif ((Test-Path -LiteralPath $BundleDir) -and -not $Force) {
         throw "Build output already exists. Use -Clean or explicitly use -Force."
     }
+    New-Item -ItemType Directory -Path $BuildDir -Force | Out-Null
+    $RuntimeDetails | Set-Content -LiteralPath (Join-Path $BuildDir "runtime.json") -Encoding utf8
+    & $Python -m pip freeze --all | Set-Content -LiteralPath (Join-Path $BuildDir "environment-lock.txt") -Encoding utf8
+    if ($LASTEXITCODE -ne 0) { throw "Environment inventory failed." }
     if ($RunTests) {
         & $Python -m pytest -q
         if ($LASTEXITCODE -ne 0) { throw "Tests failed." }
@@ -67,7 +70,7 @@ try {
     & $Python scripts\collect_licenses.py --output $ReleaseLicensesDir
     if ($LASTEXITCODE -ne 0) { throw "License collection failed." }
     $env:NIVIS_LICENSES_DIR = $ReleaseLicensesDir
-    & $Python -m PyInstaller --noconfirm NivisViewer.spec
+    & $Python -m PyInstaller --noconfirm --workpath $BuildDir --distpath $DistDir NivisViewer.spec
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed." }
 
     foreach ($Name in @("portable.flag", "LICENSE", "PROJECT_LICENSE.md", "THIRD_PARTY_NOTICES.md", "README.md")) {
@@ -98,6 +101,9 @@ try {
         }
     }
     $VerifyArguments = @("scripts\verify_portable_build.py", $BundleDir)
+    $RuntimeVersion = & $Python -c "import sys; print('.'.join(map(str, sys.version_info[:3])))"
+    if ($LASTEXITCODE -ne 0) { throw "Cannot identify build runtime version." }
+    $VerifyArguments += @("--expected-python", $RuntimeVersion.Trim(), "--native-report", (Join-Path $BuildDir "native-audit.json"))
     if ($RunSmoke) { $VerifyArguments += @("--smoke-result", $SmokeResult) }
     & $Python @VerifyArguments
     if ($LASTEXITCODE -ne 0) { throw "Portable bundle verification failed." }

@@ -1612,7 +1612,9 @@ class BrowserWindow(QMainWindow):
         self._pending_scan = None
         self.directory_scan_committed.emit(str(pending.path))
         self._update_status()
-        if pending.refresh and pending.navigation_source != "filesystem_watch":
+        # Cached navigation and other internal reconciliations are passive;
+        # acknowledge only a refresh explicitly requested by the user.
+        if pending.refresh and pending.navigation_source == "manual_refresh":
             QTimer.singleShot(
                 0,
                 lambda: (
@@ -2222,10 +2224,12 @@ class BrowserWindow(QMainWindow):
         self._schedule_thumbnail_requests(0)
         return cleared
 
-    def _refresh_current_folder(self, *, navigation_source: str) -> bool:
+    def _refresh_current_folder(
+        self, *, navigation_source: str, retry_failed_thumbnails: bool = False,
+    ) -> bool:
         if self.current_path is None:
             return False
-        explicit_retry = navigation_source == "manual_refresh"
+        explicit_retry = navigation_source == "manual_refresh" or retry_failed_thumbnails
         if explicit_retry:
             self.invalidate_windows_shell_thumbnails()
         if self._snapshot_reconcile_pending:
@@ -5176,7 +5180,10 @@ class BrowserWindow(QMainWindow):
                 if snapshot_scan and reloaded:
                     self._snapshot_reconcile_pending = True
             elif self.current_path is not None:
-                self.refresh_current_folder()
+                self._refresh_current_folder(
+                    navigation_source="visibility_change",
+                    retry_failed_thumbnails=True,
+                )
         if "browser_folder_snapshot_cache_enabled" in changed:
             self.folder_snapshot_cache.set_enabled(
                 bool(changed["browser_folder_snapshot_cache_enabled"])

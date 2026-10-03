@@ -908,11 +908,17 @@ def test_fast_cold_wheel_commits_each_page_before_next_rapid_packet(
         _wait_until(qapp, lambda: runtime.cached_unit_count == 6)
         _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
 
-        # Hold only background warmup. Every target below is a genuine cold
-        # request through the production runtime and decoder.
-        planner = runtime._warmup_planner
-        assert planner is not None
-        monkeypatch.setattr(type(planner), "next_candidate", lambda *_args, **_kwargs: None)
+        # Hold all background admission, including next_display_units which
+        # bypass planner.next_candidate. Foreground work still uses the real
+        # scheduler and decoder; each packet must start from a cold target.
+        original_submit = runtime._submit
+
+        def submit_current_only(key, *args, **kwargs):
+            if key != runtime._current_key:
+                return False
+            return original_submit(key, *args, **kwargs)
+
+        monkeypatch.setattr(runtime, "_submit", submit_current_only)
         for frame in tuple(runtime._frame_store.values()):
             if frame.unit.pages[0].page_index in (1, 2, 3, 4):
                 runtime._frame_store.take(frame.key)

@@ -66,7 +66,7 @@ PDFs are read-only: normal pages and annotations are displayed. Editing, text se
 ## Requirements
 
 - Windows
-- Python 3.11 or later (for running from source)
+- Stable Python 3.13.16 or a later 3.13 update (standard Windows x64 build with the GIL; for source execution)
 
 <a id="setup"></a>
 ## Setup and launch
@@ -74,10 +74,15 @@ PDFs are read-only: normal pages and annotations are displayed. Editing, text se
 In PowerShell, go to the repository root, install dependencies, and launch the application:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python main.py
+.\scripts\setup_python.ps1 -PythonPath python
+.\.venv313\Scripts\python.exe main.py
+```
+
+Setup creates a separate `.venv313` using the actual 1.1.13 dependency versions and preserves existing environments. If `python` selects another version, pass the official interpreter’s absolute path to `-PythonPath`. See the [build instructions](docs/PORTABLE_BUILD.md) for build verification and the update proposal.
+
+```powershell
+# Interpreter and pinned-dependency validation
+.\.venv313\Scripts\python.exe scripts/python_runtime_policy.py --require-venv --release-dependencies requirements-release.txt
 ```
 
 The command line accepts files, folders, and multiple paths. Paths after the first open in separate Viewer windows.
@@ -91,11 +96,11 @@ NivisViewer.exe --browser-only "D:\Books"
 
 `--new-window` and `--reuse` cannot be combined. `--no-restore` suppresses restoration of the last location for that launch only.
 
-To run tests, install the development dependencies as well:
+The setup script also installs development dependencies. Run tests offscreen:
 
 ```powershell
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
+$env:QT_QPA_PLATFORM = 'offscreen'
+.\.venv313\Scripts\python.exe -m pytest -q
 ```
 
 <a id="drop"></a>

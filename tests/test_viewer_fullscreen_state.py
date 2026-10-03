@@ -5,8 +5,8 @@ import ctypes
 import pytest
 
 from PySide6.QtCore import QByteArray, QCoreApplication, QEvent, QPoint, QPointF, QRect, Qt
-from PySide6.QtGui import QMouseEvent
-from PySide6.QtWidgets import QMainWindow, QSlider, QStatusBar, QVBoxLayout, QWidget
+from PySide6.QtGui import QMouseEvent, QWindow
+from PySide6.QtWidgets import QDialog, QMainWindow, QSlider, QStatusBar, QVBoxLayout, QWidget
 
 from app import fullscreen_chrome as fullscreen_module
 from app.fullscreen_chrome import FullscreenChromeController
@@ -14,8 +14,21 @@ from app.windows_fullscreen import (
     FULLSCREEN_POSITION_FLAGS,
     HWND_TOP,
     WindowsFullscreenAdapter,
+    WindowsTaskbarFullscreenAdapter,
     _MonitorInfo,
 )
+
+
+@pytest.fixture(autouse=True)
+def fake_shell_marking(monkeypatch):
+    # A fake Windows platform must never call the actual desktop shell.
+    calls = []
+    monkeypatch.setattr(FullscreenChromeController, "_apply_native_fullscreen_frame", lambda *_: None)
+    monkeypatch.setattr(
+        fullscreen_module, "WindowsTaskbarFullscreenAdapter",
+        lambda: SimpleNamespace(mark=lambda hwnd, active: calls.append((hwnd, active)) or True),
+    )
+    return calls
 
 
 class _ObservedWindow(QMainWindow):
@@ -220,7 +233,7 @@ def test_windowed_fullscreen_cycles_restore_flags_and_geometry_without_drift(
     _dispose_window(qapp, window, controller)
 
 
-def test_windows_borderless_maximized_state_preserves_bottom_reveal(
+def test_windows_fullscreen_state_preserves_bottom_reveal(
     qapp,
     monkeypatch,
 ) -> None:
@@ -256,8 +269,11 @@ def test_windows_borderless_maximized_state_preserves_bottom_reveal(
     controller.enter_true_fullscreen()
     qapp.processEvents()
     assert calls == [("bounds", 77)]
-    assert window.isMaximized()
-    assert not window.isFullScreen()
+    assert not window.isMaximized()
+    assert window.isFullScreen()
+    names = [name for name, _ in window.transitions]
+    assert "maximized" not in names
+    assert "geometry" not in names[names.index("fullscreen") + 1:]
     assert window.windowFlags() & Qt.WindowType.FramelessWindowHint
     controller.set_fullscreen_state(
         True,
@@ -341,6 +357,7 @@ def test_windows_native_projection_uses_monitor_native_bounds(
         MonitorFromWindow=Function(monitor_for_window),
         GetMonitorInfoW=Function(get_info),
         SetWindowPos=Function(lambda *args: calls.append(args) or 1),
+        GetWindowRect=Function(lambda *_args: 1),
     )
     adapter = WindowsFullscreenAdapter(api)
 
@@ -373,3 +390,274 @@ def test_windows_native_projection_uses_monitor_native_bounds(
     assert len(calls) == 1
 
     _dispose_window(qapp, window, controller)
+
+
+def test_post_show_geometry_change_clears_qt_fullscreen(qapp):
+    # Reproduce the precise Qt-widget hazard without a native window.
+    window, controller = _make_controller()
+    window.showFullScreen()
+    qapp.processEvents()
+    window.setGeometry(window.geometry().adjusted(0, 0, 0, -2))
+    assert not window.isFullScreen()
+    _dispose_window(qapp, window, controller)
+
+
+@pytest.mark.parametrize("maximized", [False, True])
+def test_windows_fullscreen_restore_and_native_lifecycle(
+    qapp, monkeypatch, fake_shell_marking, maximized,
+):
+    window, controller = _make_controller()
+    monkeypatch.setattr(fullscreen_module, "_is_native_windows_platform", lambda: True)
+    monkeypatch.setattr(controller, "_apply_native_fullscreen_frame", lambda _active: None)
+    monkeypatch.setattr(controller, "_native_window_id", lambda: 1234)
+    monkeypatch.setattr(controller, "_capture_native_fullscreen_monitor", lambda: 77)
+    bounds = []
+    monkeypatch.setattr(controller, "_apply_native_fullscreen_bounds", bounds.append)
+    original = QRect(90, 80, 820, 630)
+    window.setGeometry(original)
+    if maximized:
+        window.showMaximized()
+    # Otherwise exercise initial fullscreen on an as-yet unshown Viewer.
+    saved = controller.standard_window_geometry()
+    controller.enter_true_fullscreen()
+    qapp.processEvents()
+    assert window.isFullScreen() and not window.isMaximized()
+    assert fake_shell_marking == [(1234, True)]
+    assert controller.standard_window_geometry() == saved
+    bounds.clear()
+    QCoreApplication.sendEvent(window, QEvent(QEvent.Type.WindowDeactivate))
+    qapp.processEvents()
+    assert bounds == []  # No raise/correction on loss of activation.
+    window.showMinimized()
+    qapp.processEvents()
+    assert window.isMinimized()
+    assert fake_shell_marking[-1] == (1234, False)
+    assert bounds == []
+    window.showNormal()  # Native restore lost fullscreen, but ownership persists.
+    qapp.processEvents()
+    assert window.isFullScreen() and not window.isMaximized()
+    assert fake_shell_marking[-1] == (1234, True)
+    bounds.clear()
+    QCoreApplication.sendEvent(window, QEvent(QEvent.Type.ScreenChangeInternal))
+    QCoreApplication.sendEvent(window, QEvent(QEvent.Type.DevicePixelRatioChange))
+    qapp.processEvents()
+    assert bounds == [77]  # Coalesce notifications after Qt processes them.
+    bounds.clear()
+    window.resize(window.width(), window.height() - 2)
+    qapp.processEvents()
+    assert bounds == []  # No Resize -> SetWindowPos feedback loop.
+    QCoreApplication.sendEvent(window, QEvent(QEvent.Type.WindowActivate))
+    qapp.processEvents()
+    assert window.isFullScreen()
+    assert bounds == [77]
+    controller.leave_true_fullscreen()
+    qapp.processEvents()
+    assert fake_shell_marking[-1] == (1234, False)
+    assert window.isMaximized() == maximized
+    assert window.normalGeometry() == original
+    _dispose_window(qapp, window, controller)
+
+
+def test_native_surface_mark_is_released_before_destroy_and_shutdown(qapp, monkeypatch, fake_shell_marking):
+    window, controller = _make_controller()
+    monkeypatch.setattr(fullscreen_module, "_is_native_windows_platform", lambda: True)
+    monkeypatch.setattr(controller, "_apply_native_fullscreen_frame", lambda _active: None)
+    monkeypatch.setattr(controller, "_capture_native_fullscreen_monitor", lambda: None)
+    monkeypatch.setattr(controller, "_native_window_id", lambda: 1234)
+    controller.enter_true_fullscreen()
+    qapp.processEvents()
+    surface = window.windowHandle()
+    surface.destroy()  # Delivers Qt's real offscreen SurfaceAboutToBeDestroyed.
+    assert fake_shell_marking == [(1234, True), (1234, False)]
+    monkeypatch.setattr(controller, "_native_window_id", lambda: 5678)
+    surface.create()
+    window.show()
+    QCoreApplication.sendEvent(window, QEvent(QEvent.Type.WinIdChange))
+    qapp.processEvents()
+    assert fake_shell_marking[-1] == (5678, True)
+    QCoreApplication.sendEvent(window, QEvent(QEvent.Type.WindowActivate))
+    controller.shutdown()
+    qapp.processEvents()
+    assert fake_shell_marking[-1] == (5678, False)
+    assert controller._marked_fullscreen_hwnd is None
+    _dispose_window(qapp, window, controller)
+
+
+def test_fullscreen_cleanup_does_not_remark_or_touch_other_viewer(qapp, monkeypatch, fake_shell_marking):
+    monkeypatch.setattr(fullscreen_module, "_is_native_windows_platform", lambda: True)
+    viewers = [_make_controller(), _make_controller()]
+    for index, (window, controller) in enumerate(viewers):
+        monkeypatch.setattr(controller, "_apply_native_fullscreen_frame", lambda _active: None)
+        monkeypatch.setattr(controller, "_capture_native_fullscreen_monitor", lambda: None)
+        monkeypatch.setattr(controller, "_native_window_id", lambda index=index: 100 + index)
+        controller.enter_true_fullscreen()
+    qapp.processEvents()
+    first, second = viewers
+    assert second[1]._marked_fullscreen_hwnd == 101
+    before_exit = len(fake_shell_marking)
+    first[1]._schedule_native_fullscreen_reconcile()
+    first[1].leave_true_fullscreen()
+    assert fake_shell_marking[before_exit:] == [(100, False)]
+    qapp.processEvents()
+    # Qt may activate the other Viewer as this surface is replaced. Its own
+    # activation can renew TRUE; the exiting controller must never remark 100.
+    assert [call for call in fake_shell_marking[before_exit:] if call[0] == 100] == [(100, False)]
+    assert second[1]._marked_fullscreen_hwnd == 101
+    assert second[0].isFullScreen()
+    for window, controller in viewers:
+        _dispose_window(qapp, window, controller)
+
+
+def test_hidden_viewer_and_owned_dialog_do_not_force_fullscreen_reactivation(qapp, monkeypatch, fake_shell_marking):
+    window, controller = _make_controller()
+    monkeypatch.setattr(fullscreen_module, "_is_native_windows_platform", lambda: True)
+    monkeypatch.setattr(controller, "_native_window_id", lambda: 1234)
+    monkeypatch.setattr(controller, "_capture_native_fullscreen_monitor", lambda: None)
+    controller.enter_true_fullscreen()
+    qapp.processEvents()
+    window.hide()
+    qapp.processEvents()
+    assert fake_shell_marking[-1] == (1234, False)
+    controller._schedule_native_fullscreen_reconcile()
+    qapp.processEvents()
+    assert not window.isVisible()
+    window.show()
+    qapp.processEvents()
+    assert fake_shell_marking[-1] == (1234, True)
+    dialog = QDialog(window)
+    dialog.show()
+    qapp.processEvents()
+    # A missing state must not be restored through Qt's HWND_TOP path while
+    # a menu or dialog has focus. Activation of the Viewer is the retry point.
+    monkeypatch.setattr(window, "isActiveWindow", lambda: False)
+    window.resize(window.width(), window.height() - 2)
+    window.transitions.clear()
+    controller._schedule_native_fullscreen_reconcile()
+    qapp.processEvents()
+    assert not window.isFullScreen()
+    assert not any(name == "state" for name, _ in window.transitions)
+    assert dialog.isVisible()
+    dialog.close()
+    dialog.deleteLater()
+    monkeypatch.setattr(window, "isActiveWindow", lambda: True)
+    QCoreApplication.sendEvent(window, QEvent(QEvent.Type.WindowActivate))
+    qapp.processEvents()
+    assert window.isFullScreen()
+    _dispose_window(qapp, window, controller)
+
+
+def test_taskbar_mark_failure_preserves_fullscreen_and_retries_on_activation(qapp, monkeypatch):
+    window, controller = _make_controller()
+    monkeypatch.setattr(fullscreen_module, "_is_native_windows_platform", lambda: True)
+    monkeypatch.setattr(controller, "_native_window_id", lambda: 1234)
+    monkeypatch.setattr(controller, "_capture_native_fullscreen_monitor", lambda: None)
+    calls = []
+
+    def mark(hwnd, active):
+        calls.append((hwnd, active))
+        return len(calls) > 1
+
+    monkeypatch.setattr(fullscreen_module, "WindowsTaskbarFullscreenAdapter", lambda: SimpleNamespace(mark=mark))
+    controller.enter_true_fullscreen()
+    assert window.isFullScreen()
+    assert controller._marked_fullscreen_hwnd is None
+    QCoreApplication.sendEvent(window, QEvent(QEvent.Type.WindowActivate))
+    qapp.processEvents()
+    assert controller._marked_fullscreen_hwnd == 1234
+    controller.leave_true_fullscreen()
+    assert calls[-1] == (1234, False)
+    _dispose_window(qapp, window, controller)
+
+
+def test_deleted_qwindow_reference_is_released(qapp):
+    window, controller = _make_controller()
+    surface = QWindow()  # No native surface is created.
+    controller._native_surface = surface
+    surface.destroyed.connect(controller._native_surface_deleted)
+    surface.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    assert controller._native_surface is None
+    _dispose_window(qapp, window, controller)
+
+
+def test_same_hwnd_renews_shell_mark_after_monitor_change_and_activation(qapp, monkeypatch):
+    window, controller = _make_controller()
+    monkeypatch.setattr(fullscreen_module, "_is_native_windows_platform", lambda: True)
+    monkeypatch.setattr(controller, "_native_window_id", lambda: 1234)
+    monitor = [77]
+    monkeypatch.setattr(controller, "_capture_native_fullscreen_monitor", lambda: monitor[0])
+    corrections = []
+    monkeypatch.setattr(controller, "_apply_native_fullscreen_bounds", corrections.append)
+    calls = []
+    shell = {}
+
+    def mark(hwnd, active):
+        calls.append((hwnd, active, monitor[0]))
+        if active:
+            shell[hwnd] = monitor[0]
+        else:
+            shell.pop(hwnd, None)
+        return True
+
+    monkeypatch.setattr(fullscreen_module, "WindowsTaskbarFullscreenAdapter", lambda: SimpleNamespace(mark=mark))
+    try:
+        controller.enter_true_fullscreen()
+        qapp.processEvents()
+        assert shell == {1234: 77}
+        calls.clear()
+        corrections.clear()
+        monitor[0] = 88
+        # The QWindow signal and widget screen/DPI notifications coalesce.
+        window.windowHandle().screenChanged.emit(window.screen())
+        QCoreApplication.sendEvent(window, QEvent(QEvent.Type.ScreenChangeInternal))
+        QCoreApplication.sendEvent(window, QEvent(QEvent.Type.DevicePixelRatioChange))
+        qapp.processEvents()
+        assert corrections == [88]
+        assert calls == [(1234, True, 88)]
+        assert shell == {1234: 88}
+        shell.clear()  # A previous successful call is not current shell state.
+        calls.clear()
+        QCoreApplication.sendEvent(window, QEvent(QEvent.Type.WindowDeactivate))
+        qapp.processEvents()
+        assert calls == []
+        QCoreApplication.sendEvent(window, QEvent(QEvent.Type.WindowActivate))
+        qapp.processEvents()
+        assert calls == [(1234, True, 88)]
+        assert shell == {1234: 88}
+        controller.leave_true_fullscreen()
+        assert calls[-1] == (1234, False, 88)
+        assert shell == {}
+        controller.enter_true_fullscreen()
+        qapp.processEvents()
+        assert shell == {1234: 88}
+    finally:
+        _dispose_window(qapp, window, controller)
+
+
+def test_failed_mark_renewal_retains_cleanup_ownership_and_retries(qapp, monkeypatch):
+    window, controller = _make_controller()
+    monkeypatch.setattr(fullscreen_module, "_is_native_windows_platform", lambda: True)
+    monkeypatch.setattr(controller, "_native_window_id", lambda: 1234)
+    monkeypatch.setattr(controller, "_capture_native_fullscreen_monitor", lambda: None)
+    calls = []
+    succeeds = [True]
+    monkeypatch.setattr(fullscreen_module, "WindowsTaskbarFullscreenAdapter", lambda: SimpleNamespace(
+        mark=lambda hwnd, active: calls.append((hwnd, active)) or succeeds[0],
+    ))
+    try:
+        controller.enter_true_fullscreen()
+        qapp.processEvents()
+        succeeds[0] = False
+        calls.clear()
+        QCoreApplication.sendEvent(window, QEvent(QEvent.Type.WindowActivate))
+        qapp.processEvents()
+        assert calls == [(1234, True)]
+        assert controller._marked_fullscreen_hwnd == 1234
+        succeeds[0] = True
+        QCoreApplication.sendEvent(window, QEvent(QEvent.Type.WindowActivate))
+        qapp.processEvents()
+        assert calls == [(1234, True), (1234, True)]
+        controller.leave_true_fullscreen()
+        assert calls[-1] == (1234, False)
+    finally:
+        _dispose_window(qapp, window, controller)

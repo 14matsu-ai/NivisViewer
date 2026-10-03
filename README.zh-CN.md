@@ -64,7 +64,7 @@ PDF 以只读方式处理，可显示普通页面和注释。不支持编辑、�
 ## 运行环境
 
 - Windows
-- Python 3.11 或更高版本（从源代码运行时需要）
+- Python 3.13.16 或之后的稳定 3.13 版本（Windows x64 标准 GIL 版本；从源代码运行时需要）
 
 <a id="setup"></a>
 ## 安装与启动
@@ -72,10 +72,15 @@ PDF 以只读方式处理，可显示普通页面和注释。不支持编辑、�
 在 PowerShell 中进入仓库根目录，安装依赖并启动程序：
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python main.py
+.\scripts\setup_python.ps1 -PythonPath python
+.\.venv313\Scripts\python.exe main.py
+```
+
+安装脚本在独立的 `.venv313` 中使用实际 1.1.13 的依赖版本，保留原有环境。如果 `python` 指向其他版本，请通过 `-PythonPath` 指定官方解释器的绝对路径。构建验证和更新方案见[构建说明](docs/PORTABLE_BUILD.md)。
+
+```powershell
+# Interpreter and pinned-dependency validation
+.\.venv313\Scripts\python.exe scripts/python_runtime_policy.py --require-venv --release-dependencies requirements-release.txt
 ```
 
 命令行可以指定文件、文件夹或多个路径。第二个及后续路径会在独立的 Viewer 窗口中打开。
@@ -89,11 +94,11 @@ NivisViewer.exe --browser-only "D:\Books"
 
 `--new-window` 与 `--reuse` 不能同时使用。`--no-restore` 仅在本次启动时阻止恢复上次位置。
 
-如需运行测试，还要安装开发依赖：
+安装脚本也会安装开发依赖。测试使用 offscreen 模式：
 
 ```powershell
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
+$env:QT_QPA_PLATFORM = 'offscreen'
+.\.venv313\Scripts\python.exe -m pytest -q
 ```
 
 <a id="drop"></a>

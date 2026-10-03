@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from PIL import Image
+import pytest
 from PySide6.QtCore import (
     QEvent,
     QItemSelectionModel,
@@ -349,6 +350,62 @@ def test_history_snapshot_reconcile_rearms_visible_thumbnail_requests(
             assert visible.intersection(requested_paths)
             assert len(requested_paths) <= 30
     finally:
+        window.close()
+        qapp.processEvents()
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_cached_navigation_reconciles_silently_without_manual_refresh_notice(
+    tmp_path: Path, qapp: QApplication, changed: bool,
+) -> None:
+    first, second = tmp_path / "A", tmp_path / "B"
+    write_image(first / "first.jpg")
+    write_image(second / "second.jpg")
+    window = make_window(tmp_path, first, qapp)
+    try:
+        assert window.navigate_to(second)
+        finish_scan(window, qapp)
+        added = first / "added.jpg"
+        if changed:
+            write_image(added)
+        with patch.object(window, "_show_temporary_status", wraps=window._show_temporary_status) as notice:
+            for navigate, expected in (
+                (window.go_back, first),
+                (window.go_forward, second),
+                (window.go_back, first),
+            ):
+                assert navigate()
+                assert window._snapshot_reconcile_pending
+                finish_scan(window, qapp)
+                assert window.current_path == expected.absolute()
+                assert not window._snapshot_reconcile_pending
+            assert (window.item_model.row_for_path(added) >= 0) == changed
+            assert "フォルダを更新しました" not in [call.args[0] for call in notice.call_args_list]
+    finally:
+        window.prepare_shutdown()
+        window.close()
+        qapp.processEvents()
+
+
+def test_visibility_setting_reloads_items_without_manual_refresh_notice(
+    tmp_path: Path, qapp: QApplication,
+) -> None:
+    folder = tmp_path / "visibility"
+    write_image(folder / "visible.jpg")
+    hidden = folder / ".hidden.jpg"
+    write_image(hidden)
+    window = make_window(tmp_path, folder, qapp)
+    try:
+        window.config.apply({"browser_show_hidden_items": False})
+        finish_scan(window, qapp)
+        assert window.item_model.row_for_path(hidden) < 0
+        with patch.object(window, "_show_temporary_status", wraps=window._show_temporary_status) as notice:
+            window.config.apply({"browser_show_hidden_items": True})
+            finish_scan(window, qapp)
+            assert window.item_model.row_for_path(hidden) >= 0
+            assert "フォルダを更新しました" not in [call.args[0] for call in notice.call_args_list]
+    finally:
+        window.prepare_shutdown()
         window.close()
         qapp.processEvents()
 

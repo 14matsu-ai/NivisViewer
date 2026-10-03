@@ -30,6 +30,7 @@ out/
 Thumbs.db
 Desktop.ini
 .venv311/
+.venv313/
 
 # Private development records (kept locally, never published)
 AGENTS.md

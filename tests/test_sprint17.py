@@ -9,9 +9,10 @@ from PIL import Image
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent, QModelIndex, QPoint, QPointF, Qt
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage, QStandardItem, QStandardItemModel
-from PySide6.QtTest import QTest
+from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QDialogButtonBox,
     QMainWindow,
     QScrollArea,
@@ -411,6 +412,80 @@ def test_cursor_blank_state_does_not_leak_between_viewers(qapp) -> None:
     assert QApplication.overrideCursor() is None
     first_window.close()
     second_window.close()
+
+
+@pytest.mark.parametrize("hide_ui", [False, True])
+def test_idle_cursor_hides_over_viewer_with_visible_chrome_and_returns_on_hover(
+    qapp, hide_ui,
+) -> None:
+    _app, window, central, viewer, controller = make_fullscreen_controller()
+    try:
+        controller.set_fullscreen_state(True, hide_ui=hide_ui, hide_cursor=True)
+        center = viewer.mapToGlobal(viewer.rect().center())
+        controller.process_pointer(center)
+        expired = QSignalSpy(controller._cursor_timer.timeout)
+        assert controller._cursor_timer.isActive()
+        assert controller._cursor_timer.interval() == 800
+        assert expired.wait(1500)
+        assert controller.cursor_hidden
+        assert viewer.cursor().shape() == Qt.CursorShape.BlankCursor
+        if not hide_ui:
+            assert controller.top_overlay_visible and controller.bottom_overlay_visible
+
+        for point in (
+            central.mapToGlobal(QPoint(central.width() // 2, 0)),
+            central.mapToGlobal(QPoint(central.width() // 2, central.height() - 1)),
+        ):
+            controller.process_pointer(point)
+            assert not controller.cursor_hidden
+            assert not controller._cursor_timer.isActive()
+            controller._hide_cursor_if_idle()  # Late timeout cannot hide on UI.
+            assert not controller.cursor_hidden
+            controller.process_pointer(center)
+            controller._hide_cursor_if_idle()
+            assert controller.cursor_hidden
+
+        controller.set_hide_cursor_enabled(False)
+        controller._hide_cursor_if_idle()
+        assert not controller.cursor_hidden
+        assert not controller._cursor_timer.isActive()
+        assert QApplication.overrideCursor() is None
+    finally:
+        controller.shutdown()
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
+
+
+@pytest.mark.parametrize("interaction", ["slider", "mouse", "popup", "modal"])
+def test_visible_chrome_idle_cursor_stays_visible_during_interaction(
+    qapp, monkeypatch, interaction,
+) -> None:
+    _app, window, _central, viewer, controller = make_fullscreen_controller()
+    dialog = QDialog(window)
+    try:
+        controller.set_fullscreen_state(True, hide_ui=False, hide_cursor=True)
+        controller.process_pointer(viewer.mapToGlobal(viewer.rect().center()))
+        assert controller._cursor_timer.isActive()
+        if interaction == "slider":
+            controller.slider.setSliderDown(True)
+        elif interaction == "mouse":
+            monkeypatch.setattr(QApplication, "mouseButtons", lambda: Qt.MouseButton.LeftButton)
+        elif interaction == "popup":
+            monkeypatch.setattr(QApplication, "activePopupWidget", lambda: controller.fullscreen_menu_bar)
+        else:
+            monkeypatch.setattr(QApplication, "activeModalWidget", lambda: dialog)
+        # A timeout queued before the interaction must remain harmless.
+        controller._hide_cursor_if_idle()
+        assert not controller.cursor_hidden
+        controller.reconcile_state()
+        assert not controller._cursor_timer.isActive()
+    finally:
+        controller.shutdown()
+        dialog.close()
+        window.close()
+        window.deleteLater()
+        qapp.processEvents()
 
 
 def test_focused_root_index_context_depths() -> None:

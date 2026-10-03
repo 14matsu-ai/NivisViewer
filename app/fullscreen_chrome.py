@@ -11,6 +11,7 @@ from PySide6.QtGui import (
     QGuiApplication,
     QMouseEvent,
     QPalette,
+    QPlatformSurfaceEvent,
     QScreen,
     QWheelEvent,
     QWindow,
@@ -27,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.viewer_page_slider import ViewerPageSlider
-from app.windows_fullscreen import WindowsFullscreenAdapter
+from app.windows_fullscreen import WindowsFullscreenAdapter, WindowsTaskbarFullscreenAdapter
 from app.menu_icons import install_text_icon_menu_style
 
 
@@ -94,6 +95,7 @@ class FullscreenChromeController(QObject):
         self.pointer_in_bottom_trigger = False
         self.pointer_in_top_overlay = False
         self.pointer_in_bottom_overlay = False
+        self._pointer_position = QCursor.pos()
         self.menu_popup_or_modal_open = False
         self.slider_dragging = False
         self.mouse_button_down = False
@@ -106,6 +108,14 @@ class FullscreenChromeController(QObject):
         self._scheduled_cursor_generation = 0
         self._last_bottom_overlay_height = 1
         self._fullscreen_restore_state: _FullscreenRestoreState | None = None
+        self._fullscreen_transitioning = False
+        self._shutdown = False
+        self._marked_fullscreen_hwnd: int | None = None
+        self._native_surface: QWindow | None = None
+        self._native_surface_destroying = False
+        self._native_reconcile_timer = QTimer(self)
+        self._native_reconcile_timer.setSingleShot(True)
+        self._native_reconcile_timer.timeout.connect(self._reconcile_native_fullscreen)
 
         parent = window.centralWidget()
         if parent is None:
@@ -196,7 +206,8 @@ class FullscreenChromeController(QObject):
         """
 
         if (
-            self.window.isFullScreen()
+            self._shutdown
+            or self.window.isFullScreen()
             or self._fullscreen_restore_state is not None
         ):
             return
@@ -217,6 +228,7 @@ class FullscreenChromeController(QObject):
             else QRect(self.window.geometry())
         )
         native_monitor = self._capture_native_fullscreen_monitor()
+        self._fullscreen_transitioning = True
 
         # setWindowFlags recreates the native surface and hides it.  Hide an
         # already visible maximized window first so neither the neutral state
@@ -230,17 +242,14 @@ class FullscreenChromeController(QObject):
         )
         self._set_target_screen(screen)
         self.window.setGeometry(target_geometry)
-        if _is_native_windows_platform():
-            # Keep Win32's maximized state on a borderless HWND. This matches
-            # the shell-recognized transition used by ZipPla; Qt's separate
-            # WindowFullScreen state does not set WS_MAXIMIZE.
-            self.window.showMaximized()
-        else:
-            self.window.showFullScreen()
-        # The explicit full-monitor projection prevents stale Qt work-area
-        # bounds from leaving the native taskbar edge uncovered.
-        self.window.setGeometry(target_geometry)
+        # Qt 6.11.2 deliberately restricts frameless maximization to rcWork.
+        # Enter its distinct fullscreen state from neutral instead. Do not
+        # call QWidget.setGeometry after this: a changed rect clears that state.
+        self.window.showFullScreen()
+        self._watch_native_surface()
         self._apply_native_fullscreen_bounds(native_monitor)
+        self._mark_native_fullscreen()
+        self._fullscreen_transitioning = False
 
     @property
     def owns_true_fullscreen_transition(self) -> bool:
@@ -255,6 +264,9 @@ class FullscreenChromeController(QObject):
                 self.window.showNormal()
             return
 
+        self._fullscreen_transitioning = True
+        self._native_reconcile_timer.stop()
+        self._clear_native_fullscreen_mark()
         self.window.hide()
         self.window.setWindowState(Qt.WindowState.WindowNoState)
         self.window.setWindowFlags(restore.window_flags)
@@ -266,6 +278,7 @@ class FullscreenChromeController(QObject):
             self.window.showNormal()
             self.window.setGeometry(restore.normal_geometry)
         self._fullscreen_restore_state = None
+        self._fullscreen_transitioning = False
 
     def standard_window_geometry(self) -> QByteArray:
         """Return geometry for persistence without saving fullscreen bounds."""
@@ -293,9 +306,8 @@ class FullscreenChromeController(QObject):
     def _apply_native_fullscreen_bounds(self, monitor: int | None) -> None:
         """Project full-monitor bounds onto the borderless native window.
 
-        On Windows the caller has already entered Qt's maximized state. Keep
-        that OS-visible state while correcting the bounds for mixed-DPI
-        monitors; z-order is left to the foreground window and Windows shell.
+        Qt fullscreen owns the native style; no WS_MAXIMIZE is added. Only a
+        differing native rectangle is corrected, without changing z-order.
         """
 
         if not _is_native_windows_platform() or not self.window.isVisible():
@@ -315,6 +327,100 @@ class FullscreenChromeController(QObject):
 
     def _native_window_id(self) -> int:
         return int(self.window.winId())
+
+    def _watch_native_surface(self) -> None:
+        if not _is_native_windows_platform():
+            return
+        handle = self.window.windowHandle()
+        if handle is not None and handle is not self._native_surface:
+            if self._native_surface is not None:
+                self._native_surface.removeEventFilter(self)
+                self._native_surface.destroyed.disconnect(self._native_surface_deleted)
+                self._native_surface.screenChanged.disconnect(self._native_screen_changed)
+            self._native_surface = handle
+            self._native_surface_destroying = False
+            handle.installEventFilter(self)
+            handle.destroyed.connect(self._native_surface_deleted)
+            handle.screenChanged.connect(self._native_screen_changed)
+
+    def _native_screen_changed(self, _screen: QScreen | None) -> None:
+        self._schedule_native_fullscreen_reconcile()
+
+    def _native_surface_deleted(self) -> None:
+        # destroyed(QObject*) can use a different Python wrapper after the
+        # QWindow destructor. Only the currently watched handle is connected.
+        self._native_surface = None
+        self._native_surface_destroying = True
+        self._native_reconcile_timer.stop()
+
+    def _mark_native_fullscreen(self, *, refresh: bool = False) -> None:
+        if not _is_native_windows_platform():
+            return
+        hwnd = self._native_window_id()
+        if self._marked_fullscreen_hwnd == hwnd and not refresh:
+            return
+        # A successful call is a local cleanup obligation, not proof that the
+        # shell still associates this HWND with the current active monitor.
+        # Renew TRUE after lifecycle changes without briefly unmarking it.
+        if self._marked_fullscreen_hwnd != hwnd:
+            self._clear_native_fullscreen_mark()
+        try:
+            marked = WindowsTaskbarFullscreenAdapter().mark(hwnd, True)
+        except (AttributeError, OSError):
+            marked = False
+        if marked:
+            self._marked_fullscreen_hwnd = hwnd
+        else:
+            logging.getLogger(__name__).warning("Shell fullscreen marking unavailable")
+
+    def _clear_native_fullscreen_mark(self) -> None:
+        hwnd = self._marked_fullscreen_hwnd
+        self._marked_fullscreen_hwnd = None
+        if hwnd is None:
+            return
+        try:
+            cleared = WindowsTaskbarFullscreenAdapter().mark(hwnd, False)
+        except (AttributeError, OSError):
+            cleared = False
+        if not cleared:
+            logging.getLogger(__name__).warning("Shell fullscreen marking could not be cleared")
+
+    def _schedule_native_fullscreen_reconcile(self) -> None:
+        if (
+            _is_native_windows_platform()
+            and self.owns_true_fullscreen_transition
+            and not self._fullscreen_transitioning
+            and not self._shutdown
+            and not self._native_reconcile_timer.isActive()
+        ):
+            self._native_reconcile_timer.start(0)
+
+    def _reconcile_native_fullscreen(self) -> None:
+        if (
+            self._shutdown or self._fullscreen_transitioning or self._native_surface_destroying
+            or not self.owns_true_fullscreen_transition
+            or not _is_native_windows_platform()
+        ):
+            return
+        if not self.window.isVisible() or self.window.isMinimized():
+            self._clear_native_fullscreen_mark()
+            return
+        self._fullscreen_transitioning = True
+        try:
+            # Restore external state loss after activation/unminimize without
+            # showing a hidden window, raising above a dialog, or a resize loop.
+            if not self.window.isFullScreen() or self.window.isMaximized():
+                if not self.window.isActiveWindow():
+                    return  # Activation will retry; leave owned dialogs alone.
+                self.window.setWindowState(
+                    (self.window.windowState() & ~Qt.WindowState.WindowMaximized)
+                    | Qt.WindowState.WindowFullScreen
+                )
+            self._watch_native_surface()
+            self._apply_native_fullscreen_bounds(self._capture_native_fullscreen_monitor())
+            self._mark_native_fullscreen(refresh=True)
+        finally:
+            self._fullscreen_transitioning = False
 
     def configure(
         self,
@@ -363,6 +469,7 @@ class FullscreenChromeController(QObject):
             self._attach_chrome()
             self._update_geometry()
             self._update_reveal_strip_visibility()
+            self._update_pointer_state(QCursor.pos())
         else:
             self._reset_bottom_wheel_accumulator()
             self.bottom_reveal_strip.hide()
@@ -436,9 +543,7 @@ class FullscreenChromeController(QObject):
 
         if (
             not self.hide_cursor_enabled
-            or self.top_overlay_visible
-            or self.bottom_overlay_visible
-            or self._interaction_blocks_hide()
+            or self._cursor_hide_blocked()
         ):
             self._invalidate_cursor_timer()
             self._set_cursor_hidden(False)
@@ -496,6 +601,9 @@ class FullscreenChromeController(QObject):
         self.reconcile_state()
 
     def shutdown(self) -> None:
+        self._shutdown = True
+        self._native_reconcile_timer.stop()
+        self._clear_native_fullscreen_mark()
         self._invalidate_hide_timer()
         self._invalidate_cursor_timer()
         self._reset_bottom_wheel_accumulator()
@@ -510,6 +618,28 @@ class FullscreenChromeController(QObject):
         if not hasattr(self, "top_overlay"):
             return False
         event_type = event.type()
+        if watched is self._native_surface and isinstance(event, QPlatformSurfaceEvent):
+            if event.surfaceEventType() == QPlatformSurfaceEvent.SurfaceEventType.SurfaceAboutToBeDestroyed:
+                self._native_surface_destroying = True
+                self._native_reconcile_timer.stop()
+                self._clear_native_fullscreen_mark()
+            else:
+                self._native_surface_destroying = False
+                self._schedule_native_fullscreen_reconcile()
+        if watched is self.window:
+            if event_type == QEvent.Type.Hide:
+                self._native_reconcile_timer.stop()
+                self._clear_native_fullscreen_mark()
+            elif event_type == QEvent.Type.WindowDeactivate:
+                self._native_reconcile_timer.stop()
+            elif event_type in {
+                QEvent.Type.Show, QEvent.Type.WindowActivate,
+                QEvent.Type.WindowStateChange, QEvent.Type.WinIdChange,
+                QEvent.Type.ScreenChangeInternal, QEvent.Type.DevicePixelRatioChange,
+            }:
+                if event_type == QEvent.Type.Show:
+                    self._watch_native_surface()
+                self._schedule_native_fullscreen_reconcile()
         if watched in self._filtered_widgets and event_type in {
             QEvent.Type.Resize,
             QEvent.Type.Move,
@@ -798,11 +928,20 @@ class FullscreenChromeController(QObject):
         if (
             self.fullscreen
             and self.hide_cursor_enabled
-            and not self.top_overlay_visible
-            and not self.bottom_overlay_visible
-            and not self._interaction_blocks_hide()
+            and not self._cursor_hide_blocked()
         ):
             self._set_cursor_hidden(True)
+
+    def _cursor_hide_blocked(self) -> bool:
+        # Chrome can stay visible while the pointer rests over the image.
+        # Recheck its hit regions after visibility/geometry changes using the
+        # last pointer event, including one that has just revealed an overlay.
+        self._update_pointer_state(self._pointer_position)
+        return bool(
+            (self.top_overlay_visible and self.pointer_in_top_overlay)
+            or (self.bottom_overlay_visible and self.pointer_in_bottom_overlay)
+            or self._interaction_blocks_hide()
+        )
 
     def _set_cursor_hidden(self, hidden: bool) -> None:
         normalized = bool(hidden)
@@ -825,6 +964,7 @@ class FullscreenChromeController(QObject):
         self.cursor_hidden = normalized
 
     def _update_pointer_state(self, global_position: QPoint) -> None:
+        self._pointer_position = QPoint(global_position)
         local = self.overlay_parent.mapFromGlobal(global_position)
         inside = self.overlay_parent.rect().contains(local)
         self.pointer_in_top_trigger = bool(
@@ -917,12 +1057,13 @@ class FullscreenChromeController(QObject):
         )
         popup = QApplication.activePopupWidget()
         modal = QApplication.activeModalWidget()
+        # QWidget.isAncestorOf stops at a window boundary, including an owned
+        # QDialog. Follow widget parents so its modal interaction still counts.
+        while modal is not None and modal is not self.window:
+            modal = modal.parentWidget()
         self.menu_popup_or_modal_open = bool(
             popup is not None
-            or (
-                modal is not None
-                and (modal is self.window or self.window.isAncestorOf(modal))
-            )
+            or modal is self.window
         )
 
     def _interaction_blocks_hide(self) -> bool:
