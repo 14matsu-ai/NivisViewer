@@ -4,6 +4,11 @@ import argparse
 import re
 from pathlib import Path
 
+try:
+    from .publication_policy import find_publication_violations
+except ImportError:
+    from publication_policy import find_publication_violations
+
 
 PRIVATE_PATH = re.compile(
     r"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]+Users[\\/]+|/(?:home|Users)/)"
@@ -46,10 +51,13 @@ def main() -> int:
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     arguments = parser.parse_args()
     findings = find_private_paths(arguments.root)
+    violations = find_publication_violations(arguments.root)
     for filename, number in findings:
         # Report the location, never repeat the private value in a build log.
         print(f"Private user path in documentation: {filename}:{number}")
-    if findings:
+    for filename in violations:
+        print(f"Private development material in publication: {filename}")
+    if findings or violations:
         return 1
     print("Documentation privacy check: OK")
     return 0
