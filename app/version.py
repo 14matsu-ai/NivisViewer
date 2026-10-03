@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-__version__ = "1.1.14"
-VERSION_TUPLE = (1, 1, 14, 0)
+__version__ = "1.2.0"
+VERSION_TUPLE = (1, 2, 0, 0)
 COMPANY_NAME = "14matsu-ai"
 PRODUCT_NAME = "NivisViewer"
 APP_USER_MODEL_ID = "14matsu-ai.NivisViewer"
