@@ -212,9 +212,9 @@ def test_unavailable_shell_target_never_launches(
 
 
 def test_favorite_explorer_action_blocks_online_only_target(tmp_path, qapp, monkeypatch):
-    from types import SimpleNamespace
     from PySide6.QtCore import QPoint
     from PySide6.QtWidgets import QMenu
+    from app.folder_bookmark_model import FolderBookmarkItem
     from app.i18n import tr
 
     class Filesystem:
@@ -229,7 +229,9 @@ def test_favorite_explorer_action_blocks_online_only_target(tmp_path, qapp, monk
     window = _window(tmp_path, qapp, path_availability_service=service,
                      system_file_opener=Opener())
     try:
-        entry = SimpleNamespace(path=str(tmp_path / "online"), exists=True)
+        entry = FolderBookmarkItem(
+            label="online", path=str(tmp_path / "online"), exists=True, sort_order=0,
+        )
         monkeypatch.setattr(window.folder_bookmark_model, "entry_at", lambda _: entry)
         class TestMenu(QMenu):
             def exec(self, *_):

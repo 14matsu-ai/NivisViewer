@@ -659,23 +659,24 @@ def test_visibility_setting_refreshes_without_growing_history(
 ) -> None:
     folder = tmp_path / "表示更新"
     folder.mkdir()
+    unsupported = folder / "文書.txt"
+    unsupported.write_text("表示設定の確認", encoding="utf-8")
     config = make_config(tmp_path)
     config.set("last_browser_path", str(folder))
     window = BrowserWindow(config_manager=config)
     assert window.wait_for_scan()
     qapp.processEvents()
     history_count = len(window.navigation_history)
-    refreshes: list[bool] = []
-    original = window.refresh_current_folder
-    window.refresh_current_folder = lambda: refreshes.append(True) or True
+    assert window.item_model.row_for_path(unsupported) >= 0
     try:
         config.apply({"browser_show_unsupported_files": False})
+        assert window.wait_for_scan()
+        qapp.processEvents()
+        assert window.item_model.row_for_path(unsupported) < 0
+        assert len(window.navigation_history) == history_count
     finally:
-        window.refresh_current_folder = original
-    assert refreshes == [True]
-    assert len(window.navigation_history) == history_count
-    window.close()
-    qapp.processEvents()
+        window.close()
+        qapp.processEvents()
 
 
 def test_favorite_single_click_and_double_click_navigate_once(

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import shutil
 from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,7 +54,12 @@ def only_distribution(monkeypatch, distribution):
     monkeypatch.setattr(collector.metadata, "distribution", lambda _: distribution)
 
 
-def test_qt_supplement_is_offline_version_matched_and_not_a_compliance_claim(tmp_path, monkeypatch):
+@pytest.mark.parametrize("release_pin", ["6.11.2", "6.11.1"])
+def test_qt_supplement_is_offline_version_matched_and_not_a_compliance_claim(tmp_path, monkeypatch, release_pin):
+    source_root = tmp_path / "source"
+    shutil.copytree(ROOT / "licenses/Qt/6.11.2", source_root / "licenses/Qt/6.11.2")
+    (source_root / "requirements-release.txt").write_text(f"PySide6=={release_pin}\n", encoding="utf-8")
+    monkeypatch.setattr(collector, "ROOT", source_root)
     distribution = fake_distribution(tmp_path / "wheel", {
         "example.dist-info/licenses/LicenseRef-Qt-Commercial.txt": b"commercial reference fixture",
     })
@@ -69,7 +75,7 @@ def test_qt_supplement_is_offline_version_matched_and_not_a_compliance_claim(tmp
     for item in index["files"]:
         assert hashlib.sha256((output / "Qt/6.11.2" / item["file"]).read_bytes()).hexdigest() == item["sha256"]
     assert any("module/third-party/source review remains" in warning for warning in result["warnings"])
-    assert any("differs from release pin" in warning for warning in result["warnings"])
+    assert any("differs from release pin" in warning for warning in result["warnings"]) == (release_pin != "6.11.2")
     distribution.version = "99.0.0"
     future = collector.collect(tmp_path / "future")
     assert future["runtime"][0]["supplement"] is None

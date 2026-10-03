@@ -467,6 +467,13 @@ class FullscreenChromeController(QObject):
         self._apply_native_fullscreen_frame(self.fullscreen)
         if self.fullscreen:
             self._attach_chrome()
+            # WindowStateChange can arrive before the first Show/layout pass.
+            # Resolve the central widget bounds before using them for hover
+            # hit testing; its initial 100x30 rect would span the whole monitor
+            # when the bottom region is extended to the physical screen edge.
+            layout = self.window.layout()
+            if layout is not None:
+                layout.activate()
             self._update_geometry()
             self._update_reveal_strip_visibility()
             self._update_pointer_state(QCursor.pos())

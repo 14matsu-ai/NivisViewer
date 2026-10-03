@@ -110,6 +110,63 @@ class _ScreenGeometry:
         return QRect(self._available)
 
 
+@pytest.mark.parametrize("hide_cursor", [False, True])
+@pytest.mark.parametrize("hide_ui", [False, True])
+@pytest.mark.parametrize("pointer_area", ["image", "top", "bottom"])
+@pytest.mark.parametrize("was_maximized", [False, True])
+def test_initial_fullscreen_respects_ui_setting_and_pointer_position(
+    tmp_path, qapp, monkeypatch, hide_cursor, hide_ui, pointer_area, was_maximized,
+) -> None:
+    from PySide6.QtGui import QCursor
+    from app.config_manager import ConfigManager
+    from app.viewer_window import ViewerWindow
+
+    screen_rect = qapp.primaryScreen().geometry()
+    pointer_y = {
+        "image": screen_rect.bottom() - 100,
+        "top": screen_rect.top() + 1,
+        "bottom": screen_rect.bottom(),
+    }[pointer_area]
+    pointer = QPoint(screen_rect.center().x(), pointer_y)
+    monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: QPoint(pointer)))
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.apply({
+        "fullscreen": True,
+        "hide_ui_in_fullscreen": hide_ui,
+        "hide_cursor_in_fullscreen": hide_cursor,
+    })
+    window = ViewerWindow(config_manager=config)
+    controller = window.fullscreen_chrome
+    monkeypatch.setattr(controller, "_capture_native_fullscreen_monitor", lambda: None)
+    monkeypatch.setattr(controller, "_apply_native_fullscreen_bounds", lambda *_: None)
+    reveals: list[str] = []
+    original_show_overlay = controller._show_overlay
+
+    def observe_reveal(side: str) -> None:
+        reveals.append(side)
+        original_show_overlay(side)
+
+    monkeypatch.setattr(controller, "_show_overlay", observe_reveal)
+    try:
+        if was_maximized:
+            window.setWindowState(Qt.WindowState.WindowMaximized)
+        window.show_initial()
+        expected_top = not hide_ui or pointer_area == "top"
+        expected_bottom = not hide_ui or pointer_area == "bottom"
+        assert controller.top_overlay_visible == expected_top
+        assert controller.bottom_overlay_visible == expected_bottom
+        qapp.processEvents()
+        assert window.isFullScreen()
+        assert controller.top_overlay_visible == expected_top
+        assert controller.bottom_overlay_visible == expected_bottom
+        if hide_ui and pointer_area == "image":
+            # No initial flash followed by a delayed hide is permitted either.
+            assert reveals == []
+    finally:
+        _dispose_window(qapp, window, controller)
+
+
 def test_true_fullscreen_projects_full_monitor_not_working_area(
     qapp,
     monkeypatch,
