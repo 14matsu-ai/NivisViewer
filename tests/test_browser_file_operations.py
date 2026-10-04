@@ -1,0 +1,2059 @@
+from __future__ import annotations
+
+import hashlib
+import errno
+import os
+import time
+from pathlib import Path
+from threading import Event
+
+import pytest
+from PySide6.QtCore import QItemSelectionModel, QPoint, QTimer, Qt
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QLineEdit, QMenu, QMessageBox
+
+from app.browser_window import BrowserWindow
+from app.browser_navigation import BrowserLocation
+from app.config_manager import ConfigManager
+from app.file_operation_coordinator import FileOperationCoordinator
+from app.file_operation_queue import FileOperationQueue
+from app.file_operation_service import (
+    FileOperationKind,
+    FileOperationProgress,
+    FileOperationRequest,
+    FileOperationResult,
+    FileOperationService,
+)
+from app.file_operation_worker import FileOperationExecutor
+from app.metadata_store import MetadataStore
+from app.settings_dialog import SettingsDialog
+from app.system_file_opener import SystemFileOpener
+from app.windows_recycle_bin import RecycleBinResult
+from app.zippla_filename_metadata import ZipPlaFilenameMetadata
+
+
+class MovingRecycleBin:
+    def __init__(self, trash: Path, *, fail: bool = False) -> None:
+        self.trash = trash
+        self.fail = fail
+        self.paths: list[str] = []
+        trash.mkdir()
+
+    def recycle(self, path) -> RecycleBinResult:
+        source = Path(path)
+        self.paths.append(str(source))
+        if self.fail:
+            return RecycleBinResult(
+                False,
+                error_code="shell_error",
+                error_message="failed",
+            )
+        source.rename(self.trash / source.name)
+        return RecycleBinResult(True)
+
+
+class SelectiveMovingRecycleBin(MovingRecycleBin):
+    def __init__(self, trash: Path, failed_names: set[str]) -> None:
+        super().__init__(trash)
+        self.failed_names = failed_names
+
+    def recycle(self, path) -> RecycleBinResult:
+        source = Path(path)
+        self.paths.append(str(source))
+        if source.name in self.failed_names:
+            return RecycleBinResult(
+                False,
+                error_code="shell_error",
+                error_message=f"{source.name}を削除できません",
+            )
+        source.rename(self.trash / source.name)
+        return RecycleBinResult(True)
+
+
+def write_file(path: Path, content: str = "data") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def make_window(
+    tmp_path: Path,
+    qapp: QApplication,
+    folder: Path,
+    *,
+    recycle_bin=None,
+) -> tuple[BrowserWindow, FileOperationCoordinator]:
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.set("last_browser_path", str(folder))
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    service = FileOperationService(recycle_bin)
+    coordinator = FileOperationCoordinator(
+        metadata,
+        executor=FileOperationExecutor(service),
+    )
+    window = BrowserWindow(
+        config_manager=config,
+        metadata_store=metadata,
+        file_operation_coordinator=coordinator,
+    )
+    window.resize(700, 480)
+    window.show()
+    assert window.wait_for_scan()
+    qapp.processEvents()
+    return window, coordinator
+
+
+def close_window(
+    window: BrowserWindow,
+    coordinator: FileOperationCoordinator,
+    qapp: QApplication,
+) -> None:
+    window.close()
+    coordinator.close()
+    coordinator.metadata_store.close()
+    qapp.processEvents()
+
+
+def select_paths(window: BrowserWindow, paths: list[Path]) -> None:
+    selection = window.list_view.selectionModel()
+    selection.clearSelection()
+    for position, path in enumerate(paths):
+        row = window.item_model.row_for_path(path)
+        assert row >= 0
+        index = window.item_model.index(row, 0)
+        selection.select(index, QItemSelectionModel.SelectionFlag.Select)
+        if position == 0:
+            window.list_view.setCurrentIndex(index)
+
+
+def finish_operation(
+    window: BrowserWindow,
+    coordinator: FileOperationCoordinator,
+    qapp: QApplication,
+) -> None:
+    assert coordinator.wait_for_done(3000)
+    for _ in range(5):
+        qapp.processEvents()
+    if window._pending_scan is not None:
+        assert window.wait_for_scan()
+    for _ in range(5):
+        qapp.processEvents()
+
+
+def test_f2_rename_refreshes_and_selects_new_path_without_history_or_open(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "old.cbz"
+    write_file(source)
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [source])
+    opened = []
+    window._open_path_handler = lambda *args: opened.append(args)
+    monkeypatch.setattr(
+        window,
+        "_prompt_for_filename",
+        lambda *_args: "新しい.cbz",
+    )
+    history_size = len(window.navigation_history)
+    window.list_view.setFocus()
+
+    QTest.keyClick(window.list_view, Qt.Key.Key_F2)
+    finish_operation(window, coordinator, qapp)
+
+    destination = folder / "新しい.cbz"
+    assert destination.exists()
+    assert not source.exists()
+    current = window.item_model.item_at(window.list_view.currentIndex())
+    assert current is not None and current.path == destination.absolute()
+    assert len(window.navigation_history) == history_size
+    assert opened == []
+    close_window(window, coordinator, qapp)
+
+
+def test_browser_shutdown_retries_probe_drain_without_unfencing(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    folder.mkdir()
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    original_close = window.image_detail_probe.close
+    workflow = window._browser_workflow
+    original_workflow_shutdown = workflow.shutdown
+    probe_calls = 0
+    workflow_calls = 0
+
+    def fail_probe_once(msecs=-1):
+        nonlocal probe_calls
+        probe_calls += 1
+        if probe_calls == 1:
+            return False
+        return original_close(msecs)
+
+    def count_workflow_shutdown():
+        nonlocal workflow_calls
+        workflow_calls += 1
+        return original_workflow_shutdown()
+
+    monkeypatch.setattr(window.image_detail_probe, "close", fail_probe_once)
+    monkeypatch.setattr(workflow, "shutdown", count_workflow_shutdown)
+    try:
+        assert window.prepare_shutdown() is False
+        assert window._shutdown_prepared
+        assert not window._shutdown_cleanup_complete
+        assert workflow_calls == 1
+
+        assert window.prepare_shutdown() is True
+        assert window._shutdown_prepared
+        assert window._shutdown_cleanup_complete
+        assert probe_calls == 2
+        assert workflow_calls == 1
+    finally:
+        close_window(window, coordinator, qapp)
+
+
+@pytest.mark.parametrize("is_directory", [False, True])
+def test_properties_rename_file_or_folder_updates_metadata_history_and_selection(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+    is_directory: bool,
+) -> None:
+    folder = tmp_path / "books"
+    folder.mkdir()
+    source = folder / ("old folder" if is_directory else "old.cbz")
+    if is_directory:
+        source.mkdir()
+        write_file(source / "child.txt")
+        new_name = "new folder"
+    else:
+        write_file(source)
+        new_name = "new.cbz"
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [source])
+    window.navigation_history.update_current_view_state(
+        selected_path=str(source),
+        vertical_scroll=0,
+        horizontal_scroll=0,
+    )
+    metadata_calls: list[tuple[str, str]] = []
+    history_calls: list[tuple[str, str]] = []
+    relocate_metadata = window.metadata_store.relocate_tree
+    relocate_history = window.navigation_history.relocate_tree
+
+    def record_metadata(old_path: str, new_path: str) -> bool:
+        metadata_calls.append((old_path, new_path))
+        return relocate_metadata(old_path, new_path)
+
+    def record_history(old_path: str, new_path: str) -> bool:
+        history_calls.append((old_path, new_path))
+        return relocate_history(old_path, new_path)
+
+    monkeypatch.setattr(window.metadata_store, "relocate_tree", record_metadata)
+    monkeypatch.setattr(
+        window.navigation_history,
+        "relocate_tree",
+        record_history,
+    )
+
+    assert window.show_selected_properties()
+    dialog = next(iter(window._properties_dialogs))
+    assert dialog.name_edit.text() == source.name
+    dialog.name_edit.setText(new_name)
+    if is_directory:
+        dialog.ok_button.click()
+    else:
+        dialog.apply_button.click()
+    finish_operation(window, coordinator, qapp)
+
+    destination = folder / new_name
+    assert destination.exists()
+    assert not source.exists()
+    assert dialog.isVisible() is not is_directory
+    assert dialog.path == destination
+    assert metadata_calls == [(str(source.absolute()), str(destination))]
+    assert history_calls == [(str(source.absolute()), str(destination))]
+    current = window.item_model.item_at(window.list_view.currentIndex())
+    assert current is not None and current.path == destination.absolute()
+    dialog.reject()
+    close_window(window, coordinator, qapp)
+
+
+def test_folder_rating_uses_safe_rename_and_preserves_tree_state_and_content(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "books"
+    folder.mkdir()
+    source = folder / "Folder.Name {zpi$t=foo}"
+    source.mkdir()
+    child = source / "日本語 child.bin"
+    payload = b"folder-rating-content-must-not-change"
+    child.write_bytes(payload)
+    child_mtime_ns = 1_654_321_987_654_321_000
+    directory_mtime_ns = 1_654_322_987_654_321_000
+    os.utime(child, ns=(child_mtime_ns, child_mtime_ns))
+    os.utime(source, ns=(directory_mtime_ns, directory_mtime_ns))
+    child_digest = hashlib.sha256(payload).hexdigest()
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [source])
+    window.metadata_store.set_comment(str(child), "relocate child metadata")
+    window.metadata_store.add_browser_bookmark(
+        str(source),
+        label="folder bookmark",
+        item_type="folder",
+    )
+    window.navigation_history.update_current_view_state(
+        selected_path=str(source),
+        vertical_scroll=17,
+        horizontal_scroll=3,
+    )
+    window.navigation_history.mark_recent(
+        BrowserLocation(str(source), selected_path=str(child))
+    )
+    scan_generation = window._scan_generation
+    thumbnail_generation = window.thumbnail_provider.generation
+
+    assert window.set_rating_for_paths((str(source),), 3)
+    finish_operation(window, coordinator, qapp)
+
+    rated = folder / "Folder.Name {zpi$r=3;t=foo}"
+    rated_child = rated / child.name
+    assert rated.is_dir()
+    assert not source.exists()
+    assert ZipPlaFilenameMetadata.parse(rated).rating == 3
+    assert ZipPlaFilenameMetadata.parse(rated).tags == ("foo",)
+    assert rated.stat().st_mtime_ns == directory_mtime_ns
+    assert rated_child.stat().st_mtime_ns == child_mtime_ns
+    assert hashlib.sha256(rated_child.read_bytes()).hexdigest() == child_digest
+    assert window.metadata_store.get_comment(str(rated_child)) == (
+        "relocate child metadata"
+    )
+    assert window.metadata_store.is_browser_bookmarked(str(rated))
+    current_location = window.navigation_history.current()
+    assert current_location is not None
+    assert current_location.selected_path == str(rated.absolute())
+    recent = tuple(
+        location for _index, location in window.navigation_history.recent_unique()
+    )
+    assert any(
+        location.path == str(rated.absolute())
+        and location.selected_path == str(rated_child.absolute())
+        for location in recent
+    )
+    current = window.item_model.item_at(window.list_view.currentIndex())
+    assert current is not None and current.path == rated.absolute()
+    assert window._scan_generation == scan_generation
+    assert window.thumbnail_provider.generation == thumbnail_generation
+
+    assert window.set_rating_for_paths((str(rated),), 5)
+    finish_operation(window, coordinator, qapp)
+    changed = folder / "Folder.Name {zpi$r=5;t=foo}"
+    assert changed.is_dir()
+    assert window.set_rating_for_paths((str(changed),), None)
+    finish_operation(window, coordinator, qapp)
+    cleared = folder / "Folder.Name {zpi$t=foo}"
+    assert cleared.is_dir()
+    assert ZipPlaFilenameMetadata.parse(cleared).rating is None
+    assert ZipPlaFilenameMetadata.parse(cleared).tags == ("foo",)
+    assert cleared.stat().st_mtime_ns == directory_mtime_ns
+    assert (cleared / child.name).stat().st_mtime_ns == child_mtime_ns
+    assert hashlib.sha256((cleared / child.name).read_bytes()).hexdigest() == (
+        child_digest
+    )
+    close_window(window, coordinator, qapp)
+
+
+def test_folder_rating_collision_keeps_both_directories_unchanged(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "Folder.Name"
+    collision = folder / "Folder.Name {zpi$r=3}"
+    source.mkdir(parents=True)
+    collision.mkdir()
+    write_file(source / "source.txt", "source")
+    write_file(collision / "collision.txt", "collision")
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [source])
+
+    assert window.set_rating_for_paths((str(source),), 3)
+    finish_operation(window, coordinator, qapp)
+
+    assert (source / "source.txt").read_text(encoding="utf-8") == "source"
+    assert (collision / "collision.txt").read_text(encoding="utf-8") == (
+        "collision"
+    )
+    assert window.item_model.row_for_path(source) >= 0
+    assert window.item_model.row_for_path(collision) >= 0
+    close_window(window, coordinator, qapp)
+
+
+def test_folder_rating_applies_to_multiple_selected_folders(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "books"
+    first = folder / "First"
+    second = folder / "Second.Name {zpi$t=keep}"
+    first.mkdir(parents=True)
+    second.mkdir()
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [first, second])
+    scan_generation = window._scan_generation
+
+    assert window.set_rating_for_paths((str(first), str(second)), 4)
+    finish_operation(window, coordinator, qapp)
+    finish_operation(window, coordinator, qapp)
+
+    first_rated = folder / "First {zpi$r=4}"
+    second_rated = folder / "Second.Name {zpi$r=4;t=keep}"
+    assert first_rated.is_dir()
+    assert second_rated.is_dir()
+    assert {
+        item.path for item in window.item_model.items if item.path in {
+            first_rated.absolute(),
+            second_rated.absolute(),
+        }
+    } == {first_rated.absolute(), second_rated.absolute()}
+    assert {
+        window.item_model.item_at(index).path
+        for index in window.list_view.selectionModel().selectedIndexes()
+    } == {first_rated.absolute(), second_rated.absolute()}
+    assert window._scan_generation == scan_generation
+    close_window(window, coordinator, qapp)
+
+
+def test_folder_thumbnail_rating_hover_left_click_and_middle_clear(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "Hover Folder"
+    source.mkdir(parents=True)
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [source])
+
+    def star_position(path: Path, rating: int) -> QPoint:
+        index = window.item_model.index(window.item_model.row_for_path(path), 0)
+        cell = window.list_view.visualRect(index)
+        overlay = window.item_delegate.rating_overlay_rect(cell)
+        for x in range(overlay.left(), overlay.right() + 1):
+            position = QPoint(x, overlay.center().y())
+            if window.item_delegate.rating_at_position(cell, position) == rating:
+                return position
+        raise AssertionError(f"star {rating} has no hit position")
+
+    position = star_position(source, 3)
+    QTest.mouseMove(window.list_view.viewport(), position)
+    qapp.processEvents()
+    source_index = window.item_model.index(
+        window.item_model.row_for_path(source),
+        0,
+    )
+    assert window.item_model.data(
+        source_index,
+        window.item_model.RatingPreviewRole,
+    ) == 3
+
+    QTest.mouseClick(window.list_view.viewport(), Qt.MouseButton.LeftButton, pos=position)
+    finish_operation(window, coordinator, qapp)
+    rated = folder / "Hover Folder {zpi$r=3}"
+    assert rated.is_dir()
+
+    clear_position = star_position(rated, 3)
+    QTest.mouseClick(
+        window.list_view.viewport(),
+        Qt.MouseButton.MiddleButton,
+        pos=clear_position,
+    )
+    finish_operation(window, coordinator, qapp)
+    assert source.is_dir()
+    close_window(window, coordinator, qapp)
+
+
+def test_folder_context_menu_rating_action_is_enabled(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "Context Folder"
+    source.mkdir(parents=True)
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [source])
+    rating_actions: list[object] = []
+
+    class FakeAction:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.enabled = True
+
+        def setEnabled(self, enabled: bool) -> None:
+            self.enabled = enabled
+
+    class FakeMenu(QMenu):
+        def __init__(self, _parent=None, *, rating_menu: bool = False) -> None:
+            super().__init__(_parent)
+            self.rating_menu = rating_menu
+
+        def addAction(self, text: str):
+            action = FakeAction(text)
+            if self.rating_menu:
+                rating_actions.append(action)
+            return action
+
+        def addSeparator(self) -> None:
+            pass
+
+        def addMenu(self, _text: str):
+            return FakeMenu(rating_menu=True)
+
+        def exec(self, _position):
+            return None
+
+    monkeypatch.setattr("app.browser_window.QMenu", FakeMenu)
+    index = window.item_model.index(window.item_model.row_for_path(source), 0)
+    window._show_context_menu(window.list_view.visualRect(index).center())
+
+    assert [action.text for action in rating_actions] == [
+        "なし",
+        "★",
+        "★★",
+        "★★★",
+        "★★★★",
+        "★★★★★",
+    ]
+    assert all(action.enabled for action in rating_actions)
+    close_window(window, coordinator, qapp)
+
+
+def test_properties_rename_rejects_invalid_and_collision_without_closing(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "source.cbz"
+    collision = folder / "collision.cbz"
+    write_file(source, "source")
+    write_file(collision, "collision")
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [source])
+    metadata_calls = []
+    history_calls = []
+    monkeypatch.setattr(
+        window.metadata_store,
+        "relocate_tree",
+        lambda *args: metadata_calls.append(args),
+    )
+    monkeypatch.setattr(
+        window.navigation_history,
+        "relocate_tree",
+        lambda *args: history_calls.append(args),
+    )
+
+    assert window.show_selected_properties()
+    dialog = next(iter(window._properties_dialogs))
+    dialog.name_edit.setText("CON.txt")
+    dialog.apply_button.click()
+
+    assert dialog.isVisible()
+    assert "予約名" in dialog.error_label.text()
+    assert not coordinator.busy
+
+    dialog.name_edit.setText(collision.name)
+    dialog.apply_button.click()
+    finish_operation(window, coordinator, qapp)
+
+    assert dialog.isVisible()
+    assert "同じ名前" in dialog.error_label.text()
+    assert source.read_text(encoding="utf-8") == "source"
+    assert collision.read_text(encoding="utf-8") == "collision"
+    assert metadata_calls == []
+    assert history_calls == []
+    dialog.reject()
+    close_window(window, coordinator, qapp)
+
+
+def test_properties_cancel_and_unchanged_ok_do_not_start_rename(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "source.cbz"
+    write_file(source)
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [source])
+
+    assert window.show_selected_properties()
+    first_dialog = next(iter(window._properties_dialogs))
+    first_dialog.name_edit.setText("cancelled.cbz")
+    first_dialog.cancel_button.click()
+    qapp.processEvents()
+    assert source.exists()
+    assert not coordinator.busy
+
+    assert window.show_selected_properties()
+    second_dialog = next(iter(window._properties_dialogs))
+    second_dialog.ok_button.click()
+    qapp.processEvents()
+    assert source.exists()
+    assert not coordinator.busy
+    close_window(window, coordinator, qapp)
+
+
+def test_delete_uses_recycle_confirmation_and_refreshes_near_selection(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    first = folder / "1.cbz"
+    second = folder / "2.cbz"
+    write_file(first)
+    write_file(second)
+    recycle = MovingRecycleBin(tmp_path / "trash")
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    select_paths(window, [first])
+    prompts = []
+
+    def confirm(*args, **kwargs):
+        prompts.append((args, kwargs))
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", confirm)
+    window.list_view.setFocus()
+
+    QTest.keyClick(window.list_view, Qt.Key.Key_Delete)
+    finish_operation(window, coordinator, qapp)
+
+    assert len(prompts) == 1
+    assert recycle.paths == [str(first.absolute())]
+    assert not first.exists()
+    current = window.item_model.item_at(window.list_view.currentIndex())
+    assert current is not None and current.path == second.absolute()
+    close_window(window, coordinator, qapp)
+
+
+def test_delete_single_folder_uses_recycle_bin(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    selected_folder = folder / "selected"
+    selected_folder.mkdir(parents=True)
+    write_file(selected_folder / "child.txt")
+    recycle = MovingRecycleBin(tmp_path / "trash")
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    select_paths(window, [selected_folder])
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    assert window.move_selected_to_recycle_bin()
+    finish_operation(window, coordinator, qapp)
+
+    assert recycle.paths == [str(selected_folder.absolute())]
+    assert not selected_folder.exists()
+    assert window.item_model.row_for_path(selected_folder) == -1
+    close_window(window, coordinator, qapp)
+
+
+def test_delete_confirmation_cancel_and_viewer_refusal_do_not_call_adapter(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "source.cbz"
+    write_file(source)
+    recycle = MovingRecycleBin(tmp_path / "trash")
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    select_paths(window, [source])
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.No,
+    )
+
+    assert not window.move_selected_to_recycle_bin()
+    assert recycle.paths == []
+    assert source.exists()
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        window,
+        "_confirm_and_close_affected_viewers",
+        lambda _paths: False,
+    )
+    assert not window.move_selected_to_recycle_bin()
+    assert recycle.paths == []
+    assert source.exists()
+    close_window(window, coordinator, qapp)
+
+
+def test_delete_default_dialog_focuses_no_and_escape_cancels(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "source.cbz"
+    write_file(source)
+    recycle = MovingRecycleBin(tmp_path / "trash")
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    select_paths(window, [source])
+    started = []
+    coordinator.operation_started.connect(started.append)
+    observed: dict[str, object] = {}
+
+    def inspect_and_escape() -> None:
+        box = QApplication.activeModalWidget()
+        assert isinstance(box, QMessageBox)
+        no_button = box.button(QMessageBox.StandardButton.No)
+        observed["default"] = box.defaultButton()
+        observed["focused"] = box.focusWidget()
+        observed["no_button"] = no_button
+        QTest.keyClick(box, Qt.Key.Key_Escape)
+
+    QTimer.singleShot(0, inspect_and_escape)
+    assert not window.move_selected_to_recycle_bin()
+
+    assert observed["default"] is observed["no_button"]
+    assert observed["focused"] is observed["no_button"]
+    assert started == []
+    assert recycle.paths == []
+    assert source.exists()
+    close_window(window, coordinator, qapp)
+
+
+def test_delete_focus_yes_requires_acceptance_before_recycle(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "source.cbz"
+    write_file(source)
+    recycle = MovingRecycleBin(tmp_path / "trash")
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    window.config.apply({"file_operation_delete_confirm_focus_yes": True})
+    select_paths(window, [source])
+    started = []
+    coordinator.operation_started.connect(started.append)
+    observed: dict[str, object] = {}
+
+    def inspect_and_accept() -> None:
+        box = QApplication.activeModalWidget()
+        assert isinstance(box, QMessageBox)
+        yes_button = box.button(QMessageBox.StandardButton.Yes)
+        observed["default"] = box.defaultButton()
+        observed["focused"] = box.focusWidget()
+        observed["yes_button"] = yes_button
+        observed["started_before_accept"] = list(started)
+        QTest.keyClick(box, Qt.Key.Key_Return)
+
+    QTimer.singleShot(0, inspect_and_accept)
+    assert window.move_selected_to_recycle_bin()
+    finish_operation(window, coordinator, qapp)
+
+    assert observed["default"] is observed["yes_button"]
+    assert observed["focused"] is observed["yes_button"]
+    assert observed["started_before_accept"] == []
+    assert len(started) == 1
+    assert started[0].operation is FileOperationKind.RECYCLE
+    assert started[0].source_paths == (str(source.absolute()),)
+    assert recycle.paths == [str(source.absolute())]
+    close_window(window, coordinator, qapp)
+
+
+def test_delete_focus_yes_escape_still_cancels(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "source.cbz"
+    write_file(source)
+    recycle = MovingRecycleBin(tmp_path / "trash")
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    window.config.apply({"file_operation_delete_confirm_focus_yes": True})
+    select_paths(window, [source])
+
+    def escape() -> None:
+        box = QApplication.activeModalWidget()
+        assert isinstance(box, QMessageBox)
+        assert box.focusWidget() is box.button(QMessageBox.StandardButton.Yes)
+        QTest.keyClick(box, Qt.Key.Key_Escape)
+
+    QTimer.singleShot(0, escape)
+    assert not window.move_selected_to_recycle_bin()
+
+    assert recycle.paths == []
+    assert source.exists()
+    close_window(window, coordinator, qapp)
+
+
+@pytest.mark.parametrize("focus_yes", [False, True])
+def test_delete_skip_confirmation_wins_without_duplicate_action(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+    focus_yes: bool,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "source.cbz"
+    write_file(source)
+    recycle = MovingRecycleBin(tmp_path / "trash")
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    window.config.apply(
+        {
+            "file_operation_delete_confirm_focus_yes": focus_yes,
+            "file_operation_delete_skip_confirmation": True,
+        }
+    )
+    select_paths(window, [source])
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: pytest.fail(
+            "skip-confirmation must not create a delete question"
+        ),
+    )
+    started = []
+    coordinator.operation_started.connect(started.append)
+
+    assert window.move_selected_to_recycle_bin()
+    finish_operation(window, coordinator, qapp)
+
+    assert len(started) == 1
+    assert started[0].operation is FileOperationKind.RECYCLE
+    assert recycle.paths == [str(source.absolute())]
+    close_window(window, coordinator, qapp)
+
+
+def test_delete_settings_apply_live_to_open_browser(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "source.cbz"
+    write_file(source)
+    recycle = MovingRecycleBin(tmp_path / "trash")
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    select_paths(window, [source])
+    dialog = SettingsDialog(window.config, window)
+    dialog.delete_skip_confirmation_checkbox.setChecked(True)
+    changed = dialog.apply_settings()
+    dialog.reject()
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: pytest.fail(
+            "the open Browser must use the newly applied setting"
+        ),
+    )
+
+    assert changed["file_operation_delete_skip_confirmation"] is True
+    assert window.move_selected_to_recycle_bin()
+    finish_operation(window, coordinator, qapp)
+
+    assert recycle.paths == [str(source.absolute())]
+    close_window(window, coordinator, qapp)
+
+
+def test_delete_skip_confirmation_multi_selection_is_one_coordinated_request(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    first = folder / "1.cbz"
+    second = folder / "2.cbz"
+    write_file(first)
+    write_file(second)
+    recycle = MovingRecycleBin(tmp_path / "trash")
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    window.config.apply({"file_operation_delete_skip_confirmation": True})
+    select_paths(window, [first, second])
+    expected = window.selected_file_operation_paths()
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: pytest.fail("confirmation should be skipped"),
+    )
+    started = []
+    coordinator.operation_started.connect(started.append)
+
+    assert window.move_selected_to_recycle_bin()
+    finish_operation(window, coordinator, qapp)
+
+    assert len(started) == 1
+    assert started[0].operation is FileOperationKind.RECYCLE
+    assert started[0].source_paths == expected
+    assert set(recycle.paths) == set(expected)
+    close_window(window, coordinator, qapp)
+
+
+def test_delete_skip_confirmation_failure_stays_visible_and_in_model(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "source.cbz"
+    write_file(source)
+    recycle = MovingRecycleBin(tmp_path / "trash", fail=True)
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    window.config.apply({"file_operation_delete_skip_confirmation": True})
+    select_paths(window, [source])
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: pytest.fail("confirmation should be skipped"),
+    )
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args, **kwargs: warnings.append((args, kwargs)),
+    )
+
+    assert window.move_selected_to_recycle_bin()
+    finish_operation(window, coordinator, qapp)
+
+    assert recycle.paths == [str(source.absolute())]
+    assert source.exists()
+    assert window.item_model.row_for_path(source) >= 0
+    assert len(warnings) == 1
+    close_window(window, coordinator, qapp)
+
+
+def test_delete_mixed_selection_passes_all_paths_to_recycle_adapter(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    first = folder / "1.cbz"
+    second = folder / "2.cbz"
+    subfolder = folder / "folder"
+    write_file(first)
+    write_file(second)
+    subfolder.mkdir(parents=True)
+    write_file(subfolder / "child.txt")
+    recycle = MovingRecycleBin(tmp_path / "trash")
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    select_paths(window, [first, second, subfolder])
+    expected_paths = list(window.selected_file_operation_paths())
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    assert window.move_selected_to_recycle_bin()
+    finish_operation(window, coordinator, qapp)
+
+    assert set(recycle.paths) == set(expected_paths)
+    assert not first.exists()
+    assert not second.exists()
+    assert not subfolder.exists()
+    assert window.item_model.row_for_path(first) == -1
+    assert window.item_model.row_for_path(second) == -1
+    assert window.item_model.row_for_path(subfolder) == -1
+    close_window(window, coordinator, qapp)
+
+
+def test_delete_partial_failure_removes_only_successful_items(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    successful = folder / "success.cbz"
+    failed = folder / "failed"
+    write_file(successful)
+    failed.mkdir(parents=True)
+    recycle = SelectiveMovingRecycleBin(tmp_path / "trash", {failed.name})
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    select_paths(window, [successful, failed])
+    expected_paths = list(window.selected_file_operation_paths())
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args, **kwargs: warnings.append((args, kwargs)),
+    )
+
+    assert window.move_selected_to_recycle_bin()
+    finish_operation(window, coordinator, qapp)
+
+    assert set(recycle.paths) == set(expected_paths)
+    assert not successful.exists()
+    assert failed.exists()
+    assert window.item_model.row_for_path(successful) == -1
+    failed_row = window.item_model.row_for_path(failed)
+    assert failed_row >= 0
+    selected = window.selected_file_operation_paths()
+    assert selected == (str(failed.absolute()),)
+    assert len(warnings) == 1
+    close_window(window, coordinator, qapp)
+
+
+def test_copy_cut_paste_and_multiple_selection_use_absolute_paths(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    source_folder = tmp_path / "source"
+    destination = tmp_path / "destination"
+    first = source_folder / "1.cbz"
+    second = source_folder / "2.cbz"
+    write_file(first, "one")
+    write_file(second, "two")
+    destination.mkdir()
+    window, coordinator = make_window(tmp_path, qapp, source_folder)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *_args, **_kwargs: None)
+    select_paths(window, [first, second])
+
+    assert window.copy_selected_items()
+    assert window._clipboard_paths == (
+        str(first.absolute()),
+        str(second.absolute()),
+    )
+    assert window.navigate_to(destination)
+    assert window.wait_for_scan()
+    assert window.paste_items()
+    finish_operation(window, coordinator, qapp)
+
+    assert (destination / "1.cbz").read_text(encoding="utf-8") == "one"
+    assert (destination / "2.cbz").read_text(encoding="utf-8") == "two"
+    assert {
+        Path(item.path).name
+        for item in window.items
+    } == {"1.cbz", "2.cbz"}
+
+    assert window.navigate_to(source_folder)
+    assert window.wait_for_scan()
+    select_paths(window, [first])
+    assert window.cut_selected_items()
+    assert window.navigate_to(destination)
+    assert window.wait_for_scan()
+    assert window.paste_items()
+    finish_operation(window, coordinator, qapp)
+    # A collision is skipped; cut state remains and neither file is overwritten.
+    assert first.exists()
+    assert window._clipboard_cut
+    qapp.clipboard().clear()
+    qapp.processEvents()
+    close_window(window, coordinator, qapp)
+
+
+def test_specified_copy_move_and_new_folder_refresh_only_relevant_folder(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    source_folder = tmp_path / "source"
+    destination = tmp_path / "destination"
+    copied = source_folder / "copy.cbz"
+    moved = source_folder / "move.cbz"
+    write_file(copied)
+    write_file(moved)
+    destination.mkdir()
+    window, coordinator = make_window(tmp_path, qapp, source_folder)
+    history_size = len(window.navigation_history)
+
+    select_paths(window, [copied])
+    assert window.copy_selected_to(destination)
+    finish_operation(window, coordinator, qapp)
+    assert (destination / copied.name).exists()
+    assert copied.exists()
+
+    select_paths(window, [moved])
+    assert window.move_selected_to(destination)
+    finish_operation(window, coordinator, qapp)
+    assert not moved.exists()
+    assert (destination / moved.name).exists()
+
+    monkeypatch.setattr(
+        window,
+        "_prompt_for_filename",
+        lambda *_args: "新しいフォルダ",
+    )
+    assert window.create_new_folder()
+    finish_operation(window, coordinator, qapp)
+    created = source_folder / "新しいフォルダ"
+    assert created.is_dir()
+    selected = window.item_model.item_at(window.list_view.currentIndex())
+    assert selected is not None and selected.path == created.absolute()
+    assert len(window.navigation_history) == history_size
+    close_window(window, coordinator, qapp)
+
+
+def test_partial_failure_is_reported_once_and_successes_are_refreshed(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    first = source / "1.cbz"
+    second = source / "2.cbz"
+    write_file(first)
+    write_file(second)
+    destination.mkdir()
+    write_file(destination / "1.cbz", "collision")
+    window, coordinator = make_window(tmp_path, qapp, source)
+    select_paths(window, [first, second])
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args, **kwargs: warnings.append((args, kwargs)),
+    )
+
+    assert window.copy_selected_to(destination)
+    finish_operation(window, coordinator, qapp)
+
+    assert len(warnings) == 1
+    assert (destination / "1.cbz").read_text(encoding="utf-8") == "collision"
+    assert (destination / "2.cbz").exists()
+    close_window(window, coordinator, qapp)
+
+
+def test_shortcuts_do_not_steal_address_bar_text_editing(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "folder"
+    file_path = folder / "book.cbz"
+    write_file(file_path)
+    recycle = MovingRecycleBin(tmp_path / "trash")
+    window, coordinator = make_window(
+        tmp_path,
+        qapp,
+        folder,
+        recycle_bin=recycle,
+    )
+    window.address_bar.setText("abcdef")
+    window.focus_address_bar()
+    window.address_bar.setText("abcdef")
+    window.address_bar.setSelection(1, 2)
+
+    QTest.keyClick(
+        window.address_bar,
+        Qt.Key.Key_C,
+        Qt.KeyboardModifier.ControlModifier,
+    )
+    QTest.keyClick(window.address_bar, Qt.Key.Key_Delete)
+
+    assert window.address_bar.text() == "adef"
+    assert recycle.paths == []
+    close_window(window, coordinator, qapp)
+
+
+def test_context_menu_has_exact_labels_and_separator_order(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    items: list[str | None] = []
+    actions: dict[str, FakeAction] = {}
+
+    class FakeAction:
+        def __init__(self, text: str) -> None:
+            self._text = text
+            self.enabled = True
+
+        def setEnabled(self, enabled: bool) -> None:
+            self.enabled = enabled
+
+    class FakeMenu(QMenu):
+        def __init__(self, _parent=None) -> None:
+            super().__init__(_parent)
+
+        def addAction(self, text: str):
+            items.append(text)
+            action = FakeAction(text)
+            actions[text] = action
+            return action
+
+        def addSeparator(self) -> None:
+            items.append(None)
+
+        def addMenu(self, text: str):
+            items.append(text.title() if isinstance(text, QMenu) else text)
+
+            class FakeSubMenu:
+                @staticmethod
+                def addAction(label: str):
+                    return FakeAction(label)
+
+            return FakeSubMenu()
+
+        def exec(self, _position):
+            return None
+
+    monkeypatch.setattr("app.browser_window.QMenu", FakeMenu)
+
+    window._show_context_menu(QPoint(-10, -10))
+
+    assert items == [
+        "開く",
+        "関連付けで開く...",
+        "エクスプローラーで開く",
+        None,
+        "zipに圧縮",
+        None,
+        "切り取り",
+        "コピー",
+        "貼り付け",
+        None,
+        "レート",
+        "タグ",
+        None,
+        "削除",
+        None,
+        "プロパティ",
+    ]
+    for unwanted in (
+        "ごみ箱へ移動",
+        "名前の変更",
+        "指定先へコピー",
+        "指定先へ移動",
+    ):
+        assert unwanted not in items
+    assert not actions["削除"].enabled
+    assert not actions["zipに圧縮"].enabled
+    assert not actions["関連付けで開く..."].enabled
+    assert "名前をコピー" not in items
+    close_window(window, coordinator, qapp)
+
+
+def test_copy_selected_names_uses_canonical_basename_and_plain_text(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "folder"
+    archive = folder / "aaaaa.zip"
+    image = folder / "b.jpg"
+    dot_folder = folder / "Folder.Name"
+    write_file(archive)
+    write_file(image)
+    dot_folder.mkdir()
+    window, coordinator = make_window(tmp_path, qapp, folder)
+
+    select_paths(window, [archive])
+    assert window.copy_selected_names()
+    assert qapp.clipboard().text() == "aaaaa.zip"
+
+    select_paths(window, [dot_folder])
+    assert window.copy_selected_names()
+    assert qapp.clipboard().text() == "Folder.Name"
+
+    select_paths(window, [image, dot_folder, archive])
+    visible_paths = window.selected_file_operation_paths()
+    assert visible_paths == (
+        str(dot_folder.absolute()),
+        str(archive.absolute()),
+        str(image.absolute()),
+    )
+    assert window.copy_selected_names()
+    assert qapp.clipboard().text() == "Folder.Name\naaaaa.zip\nb.jpg"
+    mime = qapp.clipboard().mimeData()
+    assert mime is not None
+    assert mime.formats() == ["text/plain"]
+    assert mime.hasText()
+    assert not mime.hasUrls()
+    assert not mime.hasHtml()
+    assert not mime.hasImage()
+
+    # The existing file-operation Copy remains a URL/file clipboard action.
+    select_paths(window, [archive])
+    assert window.copy_selected_items()
+    assert window._clipboard_paths == (str(archive.absolute()),)
+    file_mime = qapp.clipboard().mimeData()
+    assert file_mime is not None and file_mime.hasUrls()
+    qapp.clipboard().clear()
+    qapp.processEvents()
+    close_window(window, coordinator, qapp)
+
+
+def test_context_menu_copy_name_is_selected_only_and_dispatches_separately(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "folder"
+    source = folder / "book.cbz"
+    write_file(source)
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [source])
+    menu_items: list[str | None] = []
+    actions: dict[str, object] = {}
+
+    class FakeAction:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+        def setEnabled(self, _enabled: bool) -> None:
+            pass
+
+    class FakeMenu(QMenu):
+        def __init__(self, _parent=None) -> None:
+            super().__init__(_parent)
+
+        def addAction(self, text: str):
+            menu_items.append(text)
+            action = FakeAction(text)
+            actions[text] = action
+            return action
+
+        def addSeparator(self) -> None:
+            menu_items.append(None)
+
+        def addMenu(self, text: str):
+            menu_items.append(text)
+
+            class FakeSubMenu:
+                @staticmethod
+                def addAction(label: str):
+                    return FakeAction(label)
+
+            return FakeSubMenu()
+
+        def exec(self, _position):
+            return actions["名前をコピー"]
+
+    file_copy_calls = []
+    monkeypatch.setattr("app.browser_window.QMenu", FakeMenu)
+    monkeypatch.setattr(
+        window,
+        "copy_selected_items",
+        lambda: file_copy_calls.append(True),
+    )
+    row = window.item_model.row_for_path(source)
+    index = window.item_model.index(row, 0)
+
+    window._show_context_menu(window.list_view.visualRect(index).center())
+
+    basic_start = menu_items.index("切り取り")
+    assert menu_items[basic_start : basic_start + 4] == [
+        "切り取り",
+        "コピー",
+        "名前をコピー",
+        "貼り付け",
+    ]
+    assert qapp.clipboard().text() == "book.cbz"
+    assert file_copy_calls == []
+
+    window.list_view.selectionModel().clearSelection()
+    assert not window.copy_selected_names()
+    assert qapp.clipboard().text() == "book.cbz"
+    qapp.clipboard().clear()
+    qapp.processEvents()
+    close_window(window, coordinator, qapp)
+
+
+def test_context_menu_open_calls_existing_open_item_not_system_opener(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "folder"
+    source = folder / "book.cbz"
+    write_file(source)
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [source])
+    actions: dict[str, object] = {}
+
+    class FakeAction:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+        def setEnabled(self, _enabled: bool) -> None:
+            pass
+
+    class FakeMenu(QMenu):
+        def __init__(self, _parent=None) -> None:
+            super().__init__(_parent)
+
+        def addAction(self, text: str):
+            action = FakeAction(text)
+            actions[text] = action
+            return action
+
+        def addSeparator(self) -> None:
+            pass
+
+        def addMenu(self, _text: str):
+            return self
+
+        def exec(self, _position):
+            return actions["開く"]
+
+    opened = []
+    system_opened = []
+    monkeypatch.setattr("app.browser_window.QMenu", FakeMenu)
+    monkeypatch.setattr(
+        window,
+        "open_item",
+        lambda index, **kwargs: opened.append((index, kwargs)),
+    )
+    monkeypatch.setattr(
+        window,
+        "_open_system_file",
+        lambda path: system_opened.append(path),
+    )
+    row = window.item_model.row_for_path(source)
+    index = window.item_model.index(row, 0)
+
+    window._show_context_menu(window.list_view.visualRect(index).center())
+
+    assert len(opened) == 1
+    assert opened[0][0] == index
+    assert system_opened == []
+    close_window(window, coordinator, qapp)
+
+
+def test_context_menu_open_with_picker_calls_explicit_picker_for_file(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "folder"
+    source = folder / "日本語 book.cbz"
+    write_file(source)
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [source])
+    actions: dict[str, object] = {}
+
+    class FakeAction:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.enabled = True
+
+        def setEnabled(self, enabled: bool) -> None:
+            self.enabled = enabled
+
+    class FakeMenu(QMenu):
+        def __init__(self, _parent=None) -> None:
+            super().__init__(_parent)
+
+        def addAction(self, text: str):
+            action = FakeAction(text)
+            actions[text] = action
+            return action
+
+        def addSeparator(self) -> None:
+            pass
+
+        def addMenu(self, _text: str):
+            return self
+
+        def exec(self, _position):
+            return actions["関連付けで開く..."]
+
+    opened = []
+    monkeypatch.setattr("app.browser_window.QMenu", FakeMenu)
+    monkeypatch.setattr(
+        window,
+        "_open_with_application_picker",
+        lambda item: opened.append(item),
+    )
+    row = window.item_model.row_for_path(source)
+    index = window.item_model.index(row, 0)
+
+    window._show_context_menu(window.list_view.visualRect(index).center())
+
+    assert actions["関連付けで開く..."].enabled
+    assert len(opened) == 1
+    assert opened[0].path == source
+    close_window(window, coordinator, qapp)
+
+
+def test_context_menu_open_with_picker_enablement(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "folder"
+    first = folder / "first.cbz"
+    second = folder / "second.pdf"
+    child = folder / "child"
+    write_file(first)
+    write_file(second)
+    child.mkdir()
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    menus: list[dict[str, object]] = []
+
+    class FakeAction:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.enabled = True
+
+        def setEnabled(self, enabled: bool) -> None:
+            self.enabled = enabled
+
+    class FakeMenu(QMenu):
+        def __init__(self, _parent=None) -> None:
+            super().__init__(_parent)
+            self.actions: dict[str, FakeAction] = {}
+            menus.append(self.actions)
+
+        def addAction(self, text: str):
+            action = FakeAction(text)
+            self.actions[text] = action
+            return action
+
+        def addSeparator(self) -> None:
+            pass
+
+        def addMenu(self, _text: str):
+            class FakeSubMenu:
+                @staticmethod
+                def addAction(label: str):
+                    return FakeAction(label)
+
+            return FakeSubMenu()
+
+        def exec(self, _position):
+            return None
+
+    monkeypatch.setattr("app.browser_window.QMenu", FakeMenu)
+
+    def show_for(path: Path, selected: list[Path]) -> FakeAction:
+        select_paths(window, selected)
+        row = window.item_model.row_for_path(path)
+        index = window.item_model.index(row, 0)
+        window._show_context_menu(window.list_view.visualRect(index).center())
+        return menus[-1]["関連付けで開く..."]  # type: ignore[return-value]
+
+    assert show_for(first, [first]).enabled
+    assert not show_for(child, [child]).enabled
+    assert not show_for(first, [first, second]).enabled
+    first.unlink()
+    assert not show_for(first, [first]).enabled
+    close_window(window, coordinator, qapp)
+
+
+@pytest.mark.parametrize("case", ["empty", "single", "multiple", "folder", "failure", "uninitialized"])
+def test_context_menu_opens_current_folder_independently_of_selection(
+    tmp_path: Path, qapp: QApplication, monkeypatch, case: str,
+) -> None:
+    folder = tmp_path / "現在の階層 日本語"
+    folder.mkdir()
+    first = folder / "最初.zip"
+    second = folder / "次のフォルダ"
+    if case in {"single", "multiple", "folder", "failure"}:
+        write_file(first)
+        second.mkdir()
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    calls = []
+
+    class Adapter:
+        def open_explorer(self, path, is_directory):
+            calls.append((path, is_directory))
+            return 5 if case == "failure" else 0
+
+    window.system_file_opener = SystemFileOpener(Adapter())
+    selections = {
+        "single": [first], "multiple": [first, second], "folder": [second], "failure": [second],
+    }.get(case, [])
+    select_paths(window, selections)
+    if case == "uninitialized":
+        window.current_path = None
+    position = QPoint(-10, -10)
+    if selections:
+        index = window.item_model.index(window.item_model.row_for_path(selections[-1]), 0)
+        position = window.list_view.visualRect(index).center()
+
+    class FakeMenu(QMenu):
+        def exec(self, _position):
+            actions = {action.text(): action for action in self.actions()}
+            current = actions.get("現在の階層をエクスプローラーで開く")
+            assert (current is not None) == (case in {"multiple", "folder", "failure"})
+            assert actions["エクスプローラーで開く"].isEnabled() == bool(selections)
+            return current if current is not None else (
+                actions["エクスプローラーで開く"] if case == "single" else None
+            )
+
+    monkeypatch.setattr("app.browser_window.QMenu", FakeMenu)
+    try:
+        window._show_context_menu(position)
+        if case in {"empty", "uninitialized"}:
+            assert calls == []
+        else:
+            deadline = time.monotonic() + 2.0
+            while not calls and time.monotonic() < deadline:
+                qapp.processEvents()
+                time.sleep(0.005)
+            assert calls == [(str(first if case == "single" else second), False)]
+            if case == "failure":
+                assert "error 5" in window.statusBar().currentMessage()
+            assert set(window.selected_file_operation_paths()) == set(map(str, selections))
+    finally:
+        close_window(window, coordinator, qapp)
+
+
+def test_context_menu_explorer_uses_clicked_item_with_multiple_selection(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "folder"
+    first = folder / "first.zip"
+    second = folder / "second.pdf"
+    write_file(first)
+    write_file(second)
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    select_paths(window, [first, second])
+    actions: dict[str, object] = {}
+
+    class FakeAction:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.enabled = True
+
+        def setEnabled(self, enabled: bool) -> None:
+            self.enabled = enabled
+
+    class FakeMenu(QMenu):
+        def __init__(self, _parent=None) -> None:
+            super().__init__(_parent)
+
+        def addAction(self, text: str):
+            action = FakeAction(text)
+            actions[text] = action
+            return action
+
+        def addSeparator(self) -> None:
+            pass
+
+        def addMenu(self, _text: str):
+            return self
+
+        def exec(self, _position):
+            return actions["エクスプローラーで開く"]
+
+    opened = []
+    monkeypatch.setattr("app.browser_window.QMenu", FakeMenu)
+    monkeypatch.setattr(
+        window,
+        "_open_item_in_explorer",
+        lambda item: opened.append(item),
+    )
+    row = window.item_model.row_for_path(second)
+    index = window.item_model.index(row, 0)
+
+    window._show_context_menu(window.list_view.visualRect(index).center())
+
+    assert len(opened) == 1
+    assert opened[0].path == second
+    close_window(window, coordinator, qapp)
+
+
+def test_zip_operation_shows_progress_dialog_and_closes_on_completion(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "folder"
+    source = folder / "large.zip"
+    write_file(source)
+    window, coordinator = make_window(tmp_path, qapp, folder)
+    cancelled: list[bool] = []
+    monkeypatch.setattr(coordinator, "cancel", lambda: cancelled.append(True))
+    request = FileOperationRequest(
+        88,
+        FileOperationKind.CREATE_ZIP,
+        (str(source),),
+        str(folder),
+        "large.zip.zip",
+    )
+
+    window._file_operation_requests[request.request_id] = request
+    window._on_file_operation_started(request)
+    dialog = window._zip_progress_dialog
+    assert dialog is not None
+    assert dialog.isVisible()
+    assert dialog.windowTitle() == "ZIPに圧縮中"
+    assert dialog.maximum() == 0
+
+    window._on_file_operation_progress(
+        FileOperationProgress(
+            88,
+            FileOperationKind.CREATE_ZIP,
+            0,
+            1,
+            str(source),
+            str(folder / "large.zip.zip"),
+            bytes_completed=3 * 1024 * 1024,
+            bytes_total=6 * 1024 * 1024,
+        )
+    )
+    assert "large.zip" in dialog.labelText()
+    assert "3.0 MiB" in dialog.labelText()
+    assert dialog.maximum() == 1000
+    assert dialog.value() == 500
+
+    dialog.canceled.emit()
+    qapp.processEvents()
+    assert cancelled == [True]
+    window._on_file_operation_completed(
+        FileOperationResult(
+            FileOperationKind.CREATE_ZIP,
+            (),
+            cancelled=True,
+            request_id=88,
+        )
+    )
+    qapp.processEvents()
+    assert window._zip_progress_dialog is None
+    close_window(window, coordinator, qapp)
+
+
+class SlowService(FileOperationService):
+    def __init__(self, started: Event, release: Event) -> None:
+        self.started = started
+        self.release = release
+
+    def execute(self, request, *, cancelled=None, progress=None):
+        self.started.set()
+        if progress is not None:
+            from app.file_operation_service import FileOperationProgress
+
+            progress(
+                FileOperationProgress(
+                    request.request_id,
+                    request.operation,
+                    1,
+                    2,
+                )
+            )
+        self.release.wait(2)
+        return FileOperationResult(
+            request.operation,
+            (),
+            cancelled=bool(cancelled and cancelled.is_set()),
+            request_id=request.request_id,
+        )
+
+
+def test_cancelled_cut_paste_keeps_source_and_cut_state(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    source_folder = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source = source_folder / "book.cbz"
+    write_file(source)
+    destination.mkdir()
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.set("last_browser_path", str(source_folder))
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    started = Event()
+    release = Event()
+    coordinator = FileOperationCoordinator(
+        metadata,
+        executor=FileOperationExecutor(SlowService(started, release)),
+    )
+    window = BrowserWindow(
+        config_manager=config,
+        metadata_store=metadata,
+        file_operation_coordinator=coordinator,
+    )
+    window.show()
+    assert window.wait_for_scan()
+    select_paths(window, [source])
+
+    try:
+        assert window.cut_selected_items()
+        assert window.navigate_to(destination)
+        assert window.wait_for_scan()
+        assert window.paste_items()
+        assert started.wait(1)
+
+        window.cancel_file_operation()
+        release.set()
+        finish_operation(window, coordinator, qapp)
+
+        assert source.exists()
+        assert not (destination / source.name).exists()
+        assert window._clipboard_cut
+        assert window._clipboard_paths == (str(source.absolute()),)
+        qapp.clipboard().clear()
+        qapp.processEvents()
+    finally:
+        release.set()
+        close_window(window, coordinator, qapp)
+
+
+def test_browser_keeps_metadata_warning_expanded_then_reuses_panel(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    folder = tmp_path / "books"
+    source = folder / "old.txt"
+    write_file(source)
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.set("last_browser_path", str(folder))
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    monkeypatch.setattr(metadata, "relocate_tree", lambda *_paths: False)
+    queue = FileOperationQueue(service=FileOperationService())
+    coordinator = FileOperationCoordinator(metadata, queue=queue)
+    window = BrowserWindow(
+        config_manager=config,
+        metadata_store=metadata,
+        file_operation_coordinator=coordinator,
+    )
+    window.resize(700, 480)
+    window.show()
+    assert window.wait_for_scan()
+    panel = window.file_operation_panel
+    status_bar = window.statusBar()
+    destroyed: list[bool] = []
+    panel.destroyed.connect(lambda _object=None: destroyed.append(True))
+
+    try:
+        assert window._start_file_operation(
+            FileOperationKind.RENAME,
+            sources=(str(source),),
+            new_name="renamed.txt",
+        )
+        finish_operation(window, coordinator, qapp)
+
+        assert (folder / "renamed.txt").exists()
+        assert panel.awaiting_result_acknowledgement
+        assert panel.details_view.isVisible()
+        assert "relocate_tree" in panel.details_view.toPlainText()
+        assert status_bar.maximumHeight() > 1000
+
+        QTest.qWait(3350)
+        qapp.processEvents()
+
+        assert panel.isVisible()
+        assert panel.details_view.isVisible()
+        assert panel.details_view.height() > 0
+        assert status_bar.maximumHeight() > 1000
+
+        panel.cancel_button.click()
+        qapp.processEvents()
+        expected_idle_height = max(
+            22,
+            status_bar.fontMetrics().height() + 6,
+        )
+        assert panel.isHidden()
+        assert not panel.awaiting_result_acknowledgement
+        assert status_bar.maximumHeight() == expected_idle_height
+        assert destroyed == []
+
+        second = folder / "second-operation"
+        assert window._start_file_operation(
+            FileOperationKind.CREATE_DIRECTORY,
+            destination=folder,
+            new_name=second.name,
+        )
+        assert panel.isVisible()
+        finish_operation(window, coordinator, qapp)
+
+        assert second.is_dir()
+        assert panel.summary_label.text() == "完了"
+        assert panel.isHidden()
+        assert panel._queue is queue
+        assert destroyed == []
+    finally:
+        close_window(window, coordinator, qapp)
+
+
+def test_slow_operation_shows_progress_and_keeps_qtimer_running(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    folder = tmp_path / "folder"
+    source = folder / "book.cbz"
+    write_file(source)
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.set("last_browser_path", str(folder))
+    started = Event()
+    release = Event()
+    coordinator = FileOperationCoordinator(
+        None,
+        executor=FileOperationExecutor(SlowService(started, release)),
+    )
+    window = BrowserWindow(
+        config_manager=config,
+        file_operation_coordinator=coordinator,
+    )
+    window.show()
+    assert window.wait_for_scan()
+    select_paths(window, [source])
+    try:
+        assert window.copy_selected_to(tmp_path)
+        assert started.wait(1)
+        ticks = []
+        QTimer.singleShot(0, lambda: ticks.append(True))
+        qapp.processEvents()
+        assert ticks == [True]
+        deadline = time.monotonic() + 2.0
+        while "1 / 2" not in window.statusBar().currentMessage() and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.005)
+        assert "1 / 2" in window.statusBar().currentMessage()
+        assert window.cancel_operation_button.isVisible()
+    finally:
+        release.set()
+        coordinator.wait_for_done(2000)
+        qapp.processEvents()
+        window.close()
+        coordinator.close()
+
+
+def test_partial_cross_volume_cut_refreshes_destination_and_keeps_clipboard(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch,
+) -> None:
+    source_folder = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source = source_folder / "book.cbz"
+    write_file(source, "payload")
+    destination.mkdir()
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.set("last_browser_path", str(source_folder))
+    metadata = MetadataStore(tmp_path / "metadata.sqlite3")
+    service = FileOperationService()
+    coordinator = FileOperationCoordinator(
+        metadata,
+        executor=FileOperationExecutor(service),
+    )
+    window = BrowserWindow(
+        config_manager=config,
+        metadata_store=metadata,
+        file_operation_coordinator=coordinator,
+    )
+    window.show()
+    assert window.wait_for_scan()
+    select_paths(window, [source])
+    original_rename = os.rename
+    target = destination / source.name
+
+    def inject_cross_volume(old, new, *args, **kwargs):
+        if (
+            os.path.abspath(os.fspath(old)) == os.path.abspath(source)
+            and os.path.abspath(os.fspath(new)) == os.path.abspath(target)
+        ):
+            raise OSError(errno.EXDEV, "injected cross-volume move")
+        return original_rename(old, new, *args, **kwargs)
+
+    original_copy = service._copy_atomic
+
+    def publish_then_cancel(src, dst, cancelled, **kwargs):
+        published = original_copy(src, dst, cancelled, **kwargs)
+        cancelled.set()
+        return published
+
+    monkeypatch.setattr("app.file_operation_service.os.rename", inject_cross_volume)
+    monkeypatch.setattr(service, "_copy_atomic", publish_then_cancel)
+    try:
+        assert window.cut_selected_items()
+        assert window.navigate_to(destination)
+        assert window.wait_for_scan()
+        assert window.paste_items()
+        finish_operation(window, coordinator, qapp)
+
+        assert source.read_text(encoding="utf-8") == "payload"
+        assert target.read_text(encoding="utf-8") == "payload"
+        assert window._clipboard_cut
+        assert window._clipboard_paths == (str(source.absolute()),)
+        assert window.item_model.row_for_path(target) >= 0
+        assert "キャンセル" in window.statusBar().currentMessage()
+    finally:
+        qapp.clipboard().clear()
+        close_window(window, coordinator, qapp)

@@ -1,0 +1,615 @@
+from __future__ import annotations
+
+import logging
+import threading
+import zipfile
+from pathlib import Path
+
+import pytest
+from PIL import Image
+from PySide6.QtCore import QObject
+from PySide6.QtWidgets import QApplication
+
+from app.book_session import (
+    BookSession,
+    _RETIRED_BOOK_OPEN_POOLS,
+    _RETIRED_BOOK_SESSIONS,
+)
+from app.image_work_coordinator import ImageWorkCoordinator
+from app.image_source import (
+    FolderImageSource,
+    FolderListingSnapshot,
+    ImageSource,
+    ImageSourceError,
+)
+
+
+def write_image(path: Path, *, size: tuple[int, int] = (8, 12)) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with Image.new("RGB", size, "white") as image:
+        image.save(path)
+
+
+def test_initial_state_has_no_open_book() -> None:
+    session = BookSession()
+
+    assert not session.is_open
+    assert session.current_path is None
+    assert session.source is None
+    assert session.model.total_pages == 0
+
+
+def test_open_folder_sets_source_model_and_current_path(tmp_path: Path) -> None:
+    write_image(tmp_path / "1.jpg")
+    session = BookSession()
+
+    opened = session.open_book(tmp_path)
+
+    assert session.is_open
+    assert isinstance(session.source, FolderImageSource)
+    assert session.current_path == tmp_path
+    assert session.model.total_pages == 1
+    assert opened.source_path == tmp_path
+    session.shutdown()
+
+
+def test_open_single_image_uses_parent_and_selected_start_page(tmp_path: Path) -> None:
+    write_image(tmp_path / "1.jpg")
+    selected = tmp_path / "2.jpg"
+    write_image(selected)
+    write_image(tmp_path / "3.jpg")
+    session = BookSession()
+
+    opened = session.open_book(selected)
+
+    assert session.current_path == selected
+    assert session.source is not None
+    assert session.source.source_path == tmp_path
+    assert opened.selected_image == str(selected)
+    assert session.model.current_index == 1
+    assert str(selected) in session.model.image_ids
+    session.shutdown()
+
+
+def test_switching_books_updates_generation(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    write_image(first / "1.jpg")
+    write_image(second / "1.jpg")
+    session = BookSession()
+
+    session.open_book(first)
+    first_generation = session.generation
+    first_runtime = session.viewer_runtime
+    assert first_runtime is not None
+    session.open_book(second)
+
+    assert session.generation > first_generation
+    assert session.viewer_runtime is not first_runtime
+    assert session.viewer_runtime is not None
+    assert session.viewer_runtime.source_epoch == session.generation
+    assert session.image_cache.source is None
+    assert session.current_path == second
+    session.shutdown()
+
+
+def test_close_book_clears_state(tmp_path: Path) -> None:
+    write_image(tmp_path / "1.jpg")
+    session = BookSession()
+    session.open_book(tmp_path)
+
+    session.close_book()
+
+    assert not session.is_open
+    assert session.current_path is None
+    assert session.source is None
+    assert session.model.source is None
+    assert session.model.image_ids == []
+    assert session.image_cache.source is None
+
+
+def test_invalid_path_preserves_current_book(tmp_path: Path) -> None:
+    valid = tmp_path / "valid"
+    write_image(valid / "1.jpg")
+    session = BookSession()
+    session.open_book(valid)
+    original_source = session.source
+    original_images = list(session.model.image_ids)
+
+    with pytest.raises(ImageSourceError):
+        session.open_book(tmp_path / "missing")
+
+    assert session.source is original_source
+    assert session.current_path == valid
+    assert session.model.image_ids == original_images
+    session.shutdown()
+
+
+def test_same_session_can_switch_books_repeatedly(tmp_path: Path) -> None:
+    paths = [tmp_path / name for name in ("一", "二", "三")]
+    for path in paths:
+        write_image(path / "1.jpg")
+    session = BookSession()
+
+    for path in paths + [paths[0]]:
+        session.open_book(path)
+        assert session.current_path == path
+        assert session.model.total_pages == 1
+
+    session.shutdown()
+
+
+def test_same_zip_can_be_reopened_quickly(tmp_path: Path) -> None:
+    image_path = tmp_path / "page.jpg"
+    write_image(image_path)
+    archive = tmp_path / "book.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.write(image_path, "page.jpg")
+    session = BookSession()
+
+    session.open_book(archive)
+    first_source = session.source
+    session.open_book(archive)
+
+    assert session.current_path == archive
+    assert session.source is not first_source
+    assert session.model.image_ids == ["page.jpg"]
+    session.shutdown()
+
+
+class BlockingImageSource(ImageSource):
+    def __init__(
+        self,
+        source_path: Path,
+        started: threading.Event,
+        release: threading.Event,
+    ) -> None:
+        super().__init__(source_path)
+        self.started = started
+        self.release = release
+        self.closed = False
+
+    def list_images(self) -> list[str]:
+        return ["page.png"]
+
+    def open_image(self, image_id: str) -> Image.Image:
+        self.started.set()
+        if not self.release.wait(2):
+            raise ImageSourceError("test image load timed out")
+        return Image.new("RGB", (8, 12), "white")
+
+    def display_path(self, image_id: str) -> str:
+        return image_id
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_source_close_is_deferred_until_old_load_finishes(qapp: QApplication) -> None:
+    first_started = threading.Event()
+    first_release = threading.Event()
+    second_started = threading.Event()
+    second_release = threading.Event()
+    second_release.set()
+    sources = {
+        "first": BlockingImageSource(Path("first"), first_started, first_release),
+        "second": BlockingImageSource(Path("second"), second_started, second_release),
+    }
+
+    def source_factory(path: Path, **_kwargs: object) -> tuple[ImageSource, str | None]:
+        return sources[path.name], None
+
+    session = BookSession(source_factory=source_factory)
+    delivered_pages: list[str] = []
+    session.image_cache.pageLoaded.connect(lambda cached: delivered_pages.append(cached.image_id))
+    session.open_book("first")
+    session.image_cache.ensure_loaded(0)
+    assert first_started.wait(1)
+
+    session.open_book("second")
+
+    assert not sources["first"].closed
+    first_release.set()
+    assert session.image_cache.wait_for_done(2000)
+    qapp.processEvents()
+    assert sources["first"].closed
+    assert delivered_pages == []
+    session.shutdown()
+
+
+def test_cancel_pending_open_releases_queued_worker_tracking(
+    qapp: QApplication,
+) -> None:
+    running_started = threading.Event()
+    release_running = threading.Event()
+    factory_calls: list[str] = []
+
+    def source_factory(path: Path, **_kwargs: object) -> tuple[ImageSource, str | None]:
+        factory_calls.append(path.name)
+        if path.name == "running":
+            running_started.set()
+            assert release_running.wait(2)
+        source = BlockingImageSource(path, threading.Event(), threading.Event())
+        return source, None
+
+    session = BookSession(source_factory=source_factory)
+    opened_generations: list[int] = []
+    failed_generations: list[int] = []
+    session.async_opened.connect(
+        lambda opened: opened_generations.append(opened.generation)
+    )
+    session.async_open_failed.connect(
+        lambda failed: failed_generations.append(failed.generation)
+    )
+    running_generation = session.open_book_async("running")
+    assert running_started.wait(1)
+    queued_generation = session.open_book_async("queued")
+    assert set(session._open_workers) == {
+        running_generation,
+        queued_generation,
+    }
+
+    session.cancel_pending_open()
+    session.cancel_pending_open()
+
+    assert running_generation in session._open_workers
+    assert queued_generation not in session._open_workers
+    assert factory_calls == ["running"]
+
+    release_running.set()
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+    assert session._open_workers == {}
+
+    session.open_book_async("queued")
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+    assert factory_calls == ["running", "queued"]
+    assert session._open_workers == {}
+    assert opened_generations == [session.generation]
+    assert failed_generations == []
+    session.shutdown()
+
+
+def test_async_folder_snapshot_avoids_directory_relisting(
+    tmp_path: Path,
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "1.jpg"
+    selected = tmp_path / "2.jpg"
+    write_image(first)
+    write_image(selected)
+    snapshot = FolderListingSnapshot(
+        tmp_path,
+        (str(first), str(selected)),
+        str(selected),
+    )
+    original_iterdir = Path.iterdir
+
+    def reject_book_relisting(path: Path):
+        if path == tmp_path:
+            raise AssertionError("Browser snapshot must avoid folder relisting")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", reject_book_relisting)
+    session = BookSession()
+
+    session.open_book_async(selected, folder_snapshot=snapshot)
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+
+    assert session.current_path == selected
+    assert session.model.image_ids == [str(first), str(selected)]
+    assert session.model.focused_index == 1
+    assert session._open_workers == {}
+    session.shutdown()
+
+
+def test_running_stale_open_closes_source_and_cannot_replace_latest(
+    qapp: QApplication,
+) -> None:
+    first_started = threading.Event()
+    release_first = threading.Event()
+    first_source = BlockingImageSource(
+        Path("first"),
+        threading.Event(),
+        threading.Event(),
+    )
+    second_source = BlockingImageSource(
+        Path("second"),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def source_factory(
+        path: Path,
+        **_kwargs: object,
+    ) -> tuple[ImageSource, str | None]:
+        if path.name == "first":
+            first_started.set()
+            assert release_first.wait(2)
+            return first_source, None
+        return second_source, None
+
+    session = BookSession(source_factory=source_factory)
+    opened_paths: list[Path] = []
+    session.async_opened.connect(
+        lambda opened: opened_paths.append(opened.requested_path)
+    )
+
+    session.open_book_async("first")
+    assert first_started.wait(1)
+    session.open_book_async("second")
+    release_first.set()
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+
+    assert first_source.closed
+    assert not second_source.closed
+    assert session.source is second_source
+    assert session.current_path == Path("second")
+    assert opened_paths == [Path("second")]
+    assert session._open_workers == {}
+    session.shutdown()
+
+
+def test_async_open_failure_preserves_current_book_and_clears_tracking(
+    qapp: QApplication,
+) -> None:
+    current_source = BlockingImageSource(
+        Path("current"),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def source_factory(
+        path: Path,
+        **_kwargs: object,
+    ) -> tuple[ImageSource, str | None]:
+        if path.name == "broken":
+            raise ImageSourceError("broken source")
+        return current_source, None
+
+    session = BookSession(source_factory=source_factory)
+    session.open_book("current")
+    original_images = list(session.model.image_ids)
+    failures = []
+    session.async_open_failed.connect(failures.append)
+
+    session.open_book_async("broken")
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+
+    assert session.source is current_source
+    assert session.current_path == Path("current")
+    assert session.model.image_ids == original_images
+    assert len(failures) == 1
+    assert failures[0].message == "broken source"
+    assert session._open_workers == {}
+    session.shutdown()
+
+
+def test_async_empty_replacement_preserves_current_book(
+    qapp: QApplication,
+) -> None:
+    current_source = BlockingImageSource(
+        Path("current"),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    class EmptyImageSource(BlockingImageSource):
+        def list_images(self) -> list[str]:
+            return []
+
+    empty_source = EmptyImageSource(
+        Path("empty"),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def source_factory(
+        path: Path,
+        **_kwargs: object,
+    ) -> tuple[ImageSource, str | None]:
+        return (empty_source if path.name == "empty" else current_source), None
+
+    session = BookSession(source_factory=source_factory)
+    session.open_book("current")
+    original_images = list(session.model.image_ids)
+    failures = []
+    session.async_open_failed.connect(failures.append)
+
+    session.open_book_async("empty")
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+
+    assert session.source is current_source
+    assert session.current_path == Path("current")
+    assert session.model.image_ids == original_images
+    assert empty_source.closed
+    assert len(failures) == 1
+    assert failures[0].code == "no_images"
+    session.shutdown()
+
+
+def test_async_non_raster_replacement_does_not_defer_raster_cleanup(
+    tmp_path: Path,
+    qapp: QApplication,
+) -> None:
+    write_image(tmp_path / "raster-a" / "page.jpg")
+    write_image(tmp_path / "raster-b" / "page.jpg")
+
+    class TrackingFolderSource(FolderImageSource):
+        def __init__(self, source_path: Path) -> None:
+            super().__init__(source_path)
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+            super().close()
+
+    rasters = {
+        name: TrackingFolderSource(tmp_path / name)
+        for name in ("raster-a", "raster-b")
+    }
+    legacy = BlockingImageSource(
+        Path("legacy"),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def source_factory(
+        path: Path,
+        **_kwargs: object,
+    ) -> tuple[ImageSource, str | None]:
+        return rasters.get(path.name, legacy), None
+
+    session = BookSession(source_factory=source_factory)
+    session.open_book(tmp_path / "raster-a")
+    assert session.viewer_runtime is not None
+
+    # B is installed but deliberately never painted, so A is in the deferred
+    # retirement maps when the non-raster C replacement arrives.
+    session.open_book_async(tmp_path / "raster-b")
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+    assert session._retired_viewer_runtimes
+    assert session._retired_page_list_runtimes
+
+    session.open_book_async("legacy")
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+
+    assert session.source is legacy
+    assert session.viewer_runtime is None
+    assert session._retired_viewer_runtimes == {}
+    assert session._retired_page_list_runtimes == {}
+    assert all(source.closed for source in rasters.values())
+    session.shutdown()
+
+
+def test_shutdown_uses_only_its_own_shared_pool_tracking(
+    qapp: QApplication,
+) -> None:
+    coordinator = ImageWorkCoordinator(max_workers=2)
+    running_started = threading.Event()
+    release_running = threading.Event()
+    source = BlockingImageSource(
+        Path("busy"),
+        running_started,
+        release_running,
+    )
+
+    idle_session = BookSession(image_work_coordinator=coordinator)
+    busy_session = BookSession(
+        source_factory=lambda *_args, **_kwargs: (source, None),
+        image_work_coordinator=coordinator,
+    )
+    busy_session.open_book("busy")
+    busy_session.image_cache.ensure_loaded(0)
+    assert running_started.wait(1)
+
+    idle_session.shutdown(wait_msecs=0)
+
+    assert idle_session not in _RETIRED_BOOK_SESSIONS
+    assert idle_session.image_cache._in_flight == {}
+
+    release_running.set()
+    assert coordinator.wait_for_viewer(2000)
+    qapp.processEvents()
+    busy_session.shutdown()
+    coordinator.shutdown()
+
+
+def test_cancelled_open_close_failure_still_completes_once(
+    qapp: QApplication,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    list_started = threading.Event()
+    release_list = threading.Event()
+
+    class CloseFailureSource(BlockingImageSource):
+        def __init__(self) -> None:
+            super().__init__(
+                Path("closing"),
+                threading.Event(),
+                threading.Event(),
+            )
+            self.close_attempts = 0
+
+        def list_images(self) -> list[str]:
+            list_started.set()
+            assert release_list.wait(2)
+            return ["page.png"]
+
+        def close(self) -> None:
+            self.close_attempts += 1
+            raise RuntimeError("close failed")
+
+    source = CloseFailureSource()
+    session = BookSession(
+        source_factory=lambda *_args, **_kwargs: (source, None),
+    )
+    failures = []
+    session.async_open_failed.connect(failures.append)
+
+    with caplog.at_level(logging.ERROR, logger="nivisviewer.book_session"):
+        session.open_book_async("closing")
+        assert list_started.wait(1)
+        session.cancel_pending_open()
+        release_list.set()
+        assert session.wait_for_async(2000)
+        qapp.processEvents()
+
+    assert source.close_attempts == 1
+    assert session._open_workers == {}
+    assert len(failures) == 1
+    assert failures[0].cancelled
+    assert sum(
+        record.name == "nivisviewer.book_session"
+        and "Prepared image source cleanup failed" in record.getMessage()
+        for record in caplog.records
+    ) == 1
+    session.shutdown()
+
+
+def test_shutdown_retains_running_open_until_owner_independent_cleanup(
+    qapp: QApplication,
+) -> None:
+    parent = QObject()
+    factory_started = threading.Event()
+    release_factory = threading.Event()
+    source = BlockingImageSource(
+        Path("running"),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def source_factory(*_args, **_kwargs):
+        factory_started.set()
+        assert release_factory.wait(2)
+        return source, None
+
+    session = BookSession(parent=parent, source_factory=source_factory)
+    session.open_book_async("running")
+    assert factory_started.wait(1)
+
+    session.shutdown(wait_msecs=0)
+    parent.deleteLater()
+    qapp.processEvents()
+
+    assert session.parent() is None
+    assert session in _RETIRED_BOOK_SESSIONS
+    assert session._open_pool in _RETIRED_BOOK_OPEN_POOLS
+    assert session._open_workers
+
+    release_factory.set()
+    assert session.wait_for_async(2000)
+    qapp.processEvents()
+
+    assert session._open_workers == {}
+    assert session not in _RETIRED_BOOK_SESSIONS
+    assert session._open_pool not in _RETIRED_BOOK_OPEN_POOLS
+    assert source.closed

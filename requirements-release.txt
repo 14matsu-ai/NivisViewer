@@ -1,0 +1,31 @@
+# Match the actual 1.1.13 dependency baseline when changing the interpreter.
+PySide6==6.11.2
+PySide6_Addons==6.11.2
+PySide6_Essentials==6.11.2
+shiboken6==6.11.2
+Pillow==12.3.0
+pillow-jxl-plugin==1.3.8
+psd-tools==1.19.0
+gimpformats==2025
+packaging==26.3
+natsort==8.4.0
+pypdfium2==5.13.0
+PyInstaller==6.22.2
+
+# Runtime dependencies, retained from the 1.1.13 license/environment inventory.
+attrs==26.1.0
+numpy==2.4.6
+typing-extensions==4.16.0
+aenum==3.1.17
+blendmodes==2025
+brackettree==0.2.5
+loguru==0.7.3
+colorama==0.4.6
+win32-setctime==1.2.0
+
+# Build dependencies. Modern setuptools supports the Python 3.13 toolchain.
+altgraph==0.17.5
+pefile==2024.8.26
+pyinstaller-hooks-contrib==2026.6
+pywin32-ctypes==0.2.3
+setuptools==84.0.0

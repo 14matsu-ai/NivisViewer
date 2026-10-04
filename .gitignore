@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+.venv-release/
+venv/
+
+# Application data
+config.json
+data/
+cache/
+logs/
+*.log
+*.tmp
+
+# Build output
+build/
+dist/
+out/
+*.zip.sha256
+
+# IDE / Windows
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.venv311/
+.venv313/
+
+# Private development records (kept locally, never published)
+AGENTS.md
+portable-backups/
+*.zip
+_folder_worker_probe.py
+_wheel_trace_probe.py
+assets/screenshots/
+assets/branding/README.md
+docs/*
+!docs/PORTABLE_BUILD.md
+!docs/ZIPPLAFORK_COMPARISON.md
+!docs/RELEASE_LICENSE_AUDIT.md
+scripts/benchmark_*.py
+!scripts/benchmark_viewer_navigation.py
+scripts/review_*.py
+scripts/diagnose_*.py
+scripts/measure_*.py
+scripts/generate_stress_*.py
+scripts/generate_branding_*.py
+scripts/thumbnail_quality_*.py

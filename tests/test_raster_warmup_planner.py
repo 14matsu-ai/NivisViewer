@@ -1,0 +1,267 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from app.raster_warmup_planner import (
+    RasterBookTopology,
+    RasterWarmupPlan,
+    RasterWarmupPlanner,
+    WarmupStopReason,
+)
+
+
+@dataclass(frozen=True)
+class Unit:
+    pages: tuple[int, ...]
+
+    @property
+    def identity(self) -> tuple[int, ...]:
+        return self.pages
+
+
+def topology(page_count: int) -> RasterBookTopology[Unit, tuple[int, ...]]:
+    return RasterBookTopology(
+        (Unit((index,)) for index in range(page_count)),
+        identity_of=lambda unit: unit.identity,
+        page_indexes_of=lambda unit: unit.pages,
+        page_count=page_count,
+    )
+
+
+def plan(
+    page_count: int,
+    current: int,
+    direction: int,
+) -> RasterWarmupPlan[Unit, tuple[int, ...]]:
+    return RasterWarmupPlan(
+        topology(page_count),
+        current=Unit((current,)),
+        identity_of=lambda unit: unit.identity,
+        page_indexes_of=lambda unit: unit.pages,
+        direction=direction,
+        background_enabled=True,
+    )
+
+
+def test_plan_is_book_wide_and_direction_centered_without_sorting() -> None:
+    forward = plan(8, 3, 1)
+    assert [unit.pages for unit in forward.iter_background_units()] == [
+        (4,),
+        (2,),
+        (5,),
+        (1,),
+        (6,),
+        (0,),
+        (7,),
+    ]
+    reverse = plan(8, 3, -1)
+    assert [unit.pages for unit in reverse.iter_background_units()] == [
+        (2,),
+        (4,),
+        (1,),
+        (5,),
+        (0,),
+        (6,),
+        (7,),
+    ]
+    assert forward.rank_for_identity((4,)) < forward.rank_for_identity((2,))
+    assert reverse.rank_for_identity((2,)) < reverse.rank_for_identity((4,))
+
+
+def test_sliding_current_skips_overlapping_topology_units() -> None:
+    spread_topology = RasterBookTopology(
+        (Unit((0, 1)), Unit((2, 3)), Unit((4, 5))),
+        identity_of=lambda unit: unit.identity,
+        page_indexes_of=lambda unit: unit.pages,
+        page_count=6,
+    )
+    sliding = RasterWarmupPlan(
+        spread_topology,
+        current=Unit((1, 2)),
+        identity_of=lambda unit: unit.identity,
+        page_indexes_of=lambda unit: unit.pages,
+        direction=1,
+        background_enabled=True,
+    )
+    assert [unit.pages for unit in sliding.iter_background_units()] == [(4, 5)]
+    assert sliding.rank_for_page(1) == 0
+    assert sliding.rank_for_page(2) == 0
+
+
+def test_planner_releases_one_continuous_book_wide_order_after_first_commit() -> None:
+    warmup = RasterWarmupPlanner(plan(8, 2, 1))
+    ready: set[tuple[int, ...]] = set()
+    assert warmup.next_candidate(
+        identity_of=lambda unit: unit.identity,
+        is_ready=lambda unit: unit.identity in ready,
+        is_terminal_failure=lambda _unit: False,
+    ) is None
+    assert warmup.stop_reason is WarmupStopReason.WAITING_FOR_COMMIT
+
+    # Paint acknowledges ownership only and cannot release raster scheduling.
+    warmup.release_after_paint()
+    assert warmup.next_candidate(
+        identity_of=lambda unit: unit.identity,
+        is_ready=lambda unit: unit.identity in ready,
+        is_terminal_failure=lambda _unit: False,
+    ) is None
+    assert warmup.stop_reason is WarmupStopReason.WAITING_FOR_COMMIT
+
+    assert warmup.release_after_first_commit(
+        preferred_units=4,
+        opposite_units=1,
+    )
+    assert not warmup.release_after_first_commit(
+        preferred_units=4,
+        opposite_units=1,
+    )
+    observed: list[tuple[int, ...]] = []
+    first = warmup.next_candidate(
+        identity_of=lambda unit: unit.identity,
+        is_ready=lambda unit: unit.identity in ready,
+        is_terminal_failure=lambda _unit: False,
+    )
+    assert first is not None
+    observed.append(first.pages)
+    ready.add(first.identity)
+    stop_reason_before_paint = warmup.stop_reason
+    warmup.release_after_paint()
+    assert warmup.stop_reason is stop_reason_before_paint
+    while True:
+        candidate = warmup.next_candidate(
+            identity_of=lambda unit: unit.identity,
+            is_ready=lambda unit: unit.identity in ready,
+            is_terminal_failure=lambda _unit: False,
+        )
+        if candidate is None:
+            break
+        observed.append(candidate.pages)
+        ready.add(candidate.identity)
+    # Four forward and one reverse units form only the priority band. The same
+    # iterator continues through the rest of the book with no phase boundary.
+    assert observed == [(3,), (1,), (4,), (5,), (6,), (0,), (7,)]
+    assert warmup.startup_target_count == 5
+    assert warmup.stop_reason is WarmupStopReason.COMPLETE
+    assert warmup.unprocessed_hint == 0
+
+
+def test_continuous_order_counts_complete_spreads_without_duplicates() -> None:
+    spread_topology = RasterBookTopology(
+        (
+            Unit((0, 1)),
+            Unit((2, 3)),
+            Unit((4, 5)),
+            Unit((6, 7)),
+            Unit((8, 9)),
+        ),
+        identity_of=lambda unit: unit.identity,
+        page_indexes_of=lambda unit: unit.pages,
+        page_count=10,
+    )
+    spread_plan = RasterWarmupPlan(
+        spread_topology,
+        current=Unit((2, 3)),
+        identity_of=lambda unit: unit.identity,
+        page_indexes_of=lambda unit: unit.pages,
+        direction=1,
+        background_enabled=True,
+    )
+    assert [
+        identity
+        for identity in spread_plan.priority_band_identities(
+            preferred_units=2,
+            opposite_units=1,
+        )
+    ] == [(4, 5), (0, 1), (6, 7)]
+    assert [
+        unit.pages
+        for unit in spread_plan.iter_continuous_units(
+            preferred_units=2,
+            opposite_units=1,
+        )
+    ] == [(4, 5), (0, 1), (6, 7), (8, 9)]
+
+
+def test_recenter_preserves_release_capacity_skips_and_visited_identities() -> None:
+    warmup = RasterWarmupPlanner(plan(6, 1, 1))
+    planner_identity = id(warmup)
+    assert warmup.release_after_first_commit()
+    first = warmup.next_candidate(
+        identity_of=lambda unit: unit.identity,
+        is_ready=lambda _unit: False,
+        is_terminal_failure=lambda _unit: False,
+    )
+    assert first is not None and first.identity == (2,)
+    warmup.mark_capacity_skip(first.identity)
+    visited_before = warmup.visited_identities
+
+    warmup.recenter(plan(6, 3, -1))
+
+    assert id(warmup) == planner_identity
+    assert warmup.background_released
+    assert not warmup.release_after_first_commit()
+    assert first.identity in warmup.capacity_skips
+    assert visited_before <= warmup.visited_identities
+    candidate = warmup.next_candidate(
+        identity_of=lambda unit: unit.identity,
+        is_ready=lambda _unit: False,
+        is_terminal_failure=lambda _unit: False,
+    )
+    # Page 2 is the new preferred neighbor, but its preserved capacity decline
+    # leaves the immediate opposite unit as the first eligible candidate.
+    assert candidate is not None and candidate.identity == (4,)
+
+    warmup.discard_capacity_skip(first.identity)
+    retried = warmup.next_candidate(
+        identity_of=lambda unit: unit.identity,
+        is_ready=lambda _unit: False,
+        is_terminal_failure=lambda _unit: False,
+    )
+    assert retried is not None and retried.identity == first.identity
+
+
+def test_capacity_reset_reconsiders_skipped_units_without_rebuilding_topology() -> None:
+    work_plan = plan(4, 1, 1)
+    warmup = RasterWarmupPlanner(work_plan)
+    assert warmup.release_after_first_commit()
+    first = warmup.next_candidate(
+        identity_of=lambda unit: unit.identity,
+        is_ready=lambda _unit: False,
+        is_terminal_failure=lambda _unit: False,
+    )
+    assert first is not None
+    warmup.mark_capacity_skip(first.identity)
+    warmup.reset_capacity()
+    retried = warmup.next_candidate(
+        identity_of=lambda unit: unit.identity,
+        is_ready=lambda _unit: False,
+        is_terminal_failure=lambda _unit: False,
+    )
+    assert retried is first
+    assert warmup.stop_reason is WarmupStopReason.RUNNING
+
+
+def test_soft_target_pauses_without_losing_the_deferred_unit() -> None:
+    warmup = RasterWarmupPlanner(plan(4, 0, 1))
+    assert warmup.release_after_first_commit()
+    deferred = warmup.next_candidate(
+        identity_of=lambda unit: unit.identity,
+        is_ready=lambda _unit: False,
+        is_terminal_failure=lambda _unit: False,
+    )
+    assert deferred is not None and deferred.pages == (1,)
+    warmup.stop_for_soft_target()
+    assert warmup.unprocessed_hint == 3
+    assert warmup.next_candidate(
+        identity_of=lambda unit: unit.identity,
+        is_ready=lambda _unit: False,
+        is_terminal_failure=lambda _unit: False,
+    ) is None
+
+    warmup.reset_capacity()
+    retried = warmup.next_candidate(
+        identity_of=lambda unit: unit.identity,
+        is_ready=lambda _unit: False,
+        is_terminal_failure=lambda _unit: False,
+    )
+    assert retried is not None and retried.identity == deferred.identity
