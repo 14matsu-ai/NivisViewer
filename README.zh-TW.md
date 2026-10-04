@@ -8,7 +8,6 @@
 - [Windows x64 可攜版](#portable)
 - [支援的輸入格式](#formats)
 - [執行環境](#requirements)
-- [安裝與啟動](#setup)
 - [從檔案總管拖放的檢查方式](#drop)
 - [授權條款](#license)
 
@@ -18,6 +17,10 @@
 NivisViewer 是一款適用於 Windows 的漫畫與圖片檢視器。它參考 ZipPla 的操作方式與行為，Viewer 的部分處理結構移植自採用 AGPL-3.0-or-later 授權條款的 ZipPlaFork。來源與對應程式碼記錄於 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 它提供與最愛資料夾同步的資料夾樹、以固定大小格位顯示縮圖的 BrowserWindow、獨立的書籍閱讀視窗 ViewerWindow、設定介面、無間距雙頁顯示、可攜式縮圖快取、資料夾及單張圖片瀏覽、ZIP/CBZ、RAR/7z 系列壓縮檔與 PDF 閱讀、自然排序和非同步圖片載入。ViewerWindow 也支援使用滑鼠上一頁／下一頁側鍵切換前後書籍、可設定的右鍵拖曳手勢，以及全螢幕時從螢幕邊緣顯示介面控制項。
+
+### 瀏覽器畫面範例
+
+![NivisViewer 瀏覽器畫面](assets/screenshots/browser-sample.png)
 
 NivisViewer 的名稱源自拉丁語中表示「雪」的 *nix, nivis*。\
 這個名字寄託了這樣的想法：瀏覽大量圖片時，也能像靜靜看著積雪一樣自然、從容。
@@ -63,43 +66,7 @@ PDF 以唯讀方式處理，可顯示一般頁面與註解。不支援編輯、�
 <a id="requirements"></a>
 ## 執行環境
 
-- Windows
-- Python 3.13.16 或之後的穩定 3.13 版本（Windows x64 標準 GIL 版本；從原始碼執行時需要）
-
-<a id="setup"></a>
-## 安裝與啟動
-
-在 PowerShell 中進入儲存庫根目錄，安裝相依套件並啟動程式：
-
-```powershell
-.\scripts\setup_python.ps1 -PythonPath python
-.\.venv313\Scripts\python.exe main.py
-```
-
-安裝指令在獨立的 `.venv313` 中使用實際 1.1.13 的相依版本，保留既有環境。如果 `python` 指向其他版本，請透過 `-PythonPath` 指定官方解譯器的絕對路徑。建置驗證與更新方案見[建置說明](docs/PORTABLE_BUILD.md)。
-
-```powershell
-# Interpreter and pinned-dependency validation
-.\.venv313\Scripts\python.exe scripts/python_runtime_policy.py --require-venv --release-dependencies requirements-release.txt
-```
-
-命令列可以指定檔案、資料夾或多個路徑。第二個及後續路徑會在獨立的 Viewer 視窗中開啟。
-
-```powershell
-NivisViewer.exe "D:\Comics\book.cbz"
-NivisViewer.exe --reuse "book1.cbz" "book2.pdf"
-NivisViewer.exe --new-window "C:\Images"
-NivisViewer.exe --browser-only "D:\Books"
-```
-
-`--new-window` 與 `--reuse` 不能同時使用。`--no-restore` 僅在本次啟動時阻止還原上次位置。
-
-安裝指令也會安裝開發用相依套件。測試使用 offscreen 模式：
-
-```powershell
-$env:QT_QPA_PLATFORM = 'offscreen'
-.\.venv313\Scripts\python.exe -m pytest -q
-```
+- Windows x64
 
 <a id="drop"></a>
 ## 從 Windows 檔案總管拖放至 Browser 中央區域的檢查方式

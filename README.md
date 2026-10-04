@@ -8,7 +8,6 @@
 - [Windows x64ポータブル版](#portable)
 - [対応入力形式](#formats)
 - [動作環境](#requirements)
-- [セットアップと起動](#setup)
 - [Explorerからのドロップ確認](#drop)
 - [ライセンス](#license)
 
@@ -21,6 +20,7 @@ NivisViewerは、Windows向けの漫画・画像ビューアです。ZipPlaの�
 
 ### ブラウザ画面の例
 
+![NivisViewerのブラウザ画面](assets/screenshots/browser-sample.png)
 
 Nivis はラテン語で「雪」を意味する nix, nivis に由来します。\
 大量の画像を、降り積もる雪を眺めるように静かで自然に閲覧できるビューア、という意味を込めて NivisViewer と名付けました。
@@ -71,43 +71,7 @@ PDFは読み取り専用で扱い、通常ページと注釈を表示します�
 <a id="requirements"></a>
 ## 動作環境
 
-- Windows
-- Python 3.13.16以上の安定版3.13（Windows x64・通常GIL版、ソース実行時）
-
-<a id="setup"></a>
-## セットアップと起動
-
-PowerShellでリポジトリのルートへ移動し、依存関係をインストールします。
-
-```powershell
-.\scripts\setup_python.ps1 -PythonPath python
-.\.venv313\Scripts\python.exe main.py
-```
-
-独立した`.venv313`へ実際の1.1.13と同じ依存バージョンを導入します。既存環境は変更しません。`python`が対象バージョンを指さない場合は`-PythonPath`へ公式Pythonの絶対パスを指定してください。開発・ビルド手順と更新案は[ビルド手順](docs/PORTABLE_BUILD.md)を参照してください。
-
-```powershell
-# Interpreter and pinned-dependency validation
-.\.venv313\Scripts\python.exe scripts/python_runtime_policy.py --require-venv --release-dependencies requirements-release.txt
-```
-
-コマンドラインではファイル、フォルダ、複数パスを指定できます。2件目以降は別Viewerで開きます。
-
-```powershell
-NivisViewer.exe "D:\漫画\book.cbz"
-NivisViewer.exe --reuse "book1.cbz" "book2.pdf"
-NivisViewer.exe --new-window "C:\画像集"
-NivisViewer.exe --browser-only "D:\Books"
-```
-
-`--new-window`と`--reuse`は同時指定できません。`--no-restore`はその起動だけ前回位置の復元を抑止します。
-
-setupスクリプトは開発用依存も導入します。テストはoffscreenで実行します。
-
-```powershell
-$env:QT_QPA_PLATFORM = 'offscreen'
-.\.venv313\Scripts\python.exe -m pytest -q
-```
+- Windows x64
 
 <a id="drop"></a>
 ## Windows ExplorerからBrowser中央へのドロップ確認

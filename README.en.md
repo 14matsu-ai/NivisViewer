@@ -8,7 +8,6 @@
 - [Windows x64 portable edition](#portable)
 - [Supported inputs](#formats)
 - [Requirements](#requirements)
-- [Setup and launch](#setup)
 - [Explorer drag-and-drop check](#drop)
 - [License](#license)
 
@@ -18,6 +17,10 @@
 NivisViewer is a comic and image viewer for Windows. It draws on ZipPla's controls and behavior, and parts of its Viewer processing structure are ported from AGPL-3.0-or-later ZipPlaFork. The provenance and corresponding code are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 It includes a folder tree synchronized with favorite folders, a BrowserWindow with a fixed-cell thumbnail grid, a separate ViewerWindow for books, settings, flush two-page spreads, a portable thumbnail cache, folder and single-image viewing, ZIP/CBZ, RAR/7z-family archive and PDF support, natural sorting, and asynchronous image loading. ViewerWindow also supports moving between books with the mouse Back/Forward buttons, configurable right-button drag gestures, and UI that appears at the screen edge in fullscreen mode.
+
+### Browser example
+
+![NivisViewer browser](assets/screenshots/browser-sample.png)
 
 The name NivisViewer comes from *nix, nivis*, Latin for “snow.”\
 It expresses the idea of viewing a large collection of images as quietly and naturally as watching snow accumulate.
@@ -65,43 +68,7 @@ PDFs are read-only: normal pages and annotations are displayed. Editing, text se
 <a id="requirements"></a>
 ## Requirements
 
-- Windows
-- Stable Python 3.13.16 or a later 3.13 update (standard Windows x64 build with the GIL; for source execution)
-
-<a id="setup"></a>
-## Setup and launch
-
-In PowerShell, go to the repository root, install dependencies, and launch the application:
-
-```powershell
-.\scripts\setup_python.ps1 -PythonPath python
-.\.venv313\Scripts\python.exe main.py
-```
-
-Setup creates a separate `.venv313` using the actual 1.1.13 dependency versions and preserves existing environments. If `python` selects another version, pass the official interpreter’s absolute path to `-PythonPath`. See the [build instructions](docs/PORTABLE_BUILD.md) for build verification and the update proposal.
-
-```powershell
-# Interpreter and pinned-dependency validation
-.\.venv313\Scripts\python.exe scripts/python_runtime_policy.py --require-venv --release-dependencies requirements-release.txt
-```
-
-The command line accepts files, folders, and multiple paths. Paths after the first open in separate Viewer windows.
-
-```powershell
-NivisViewer.exe "D:\Comics\book.cbz"
-NivisViewer.exe --reuse "book1.cbz" "book2.pdf"
-NivisViewer.exe --new-window "C:\Images"
-NivisViewer.exe --browser-only "D:\Books"
-```
-
-`--new-window` and `--reuse` cannot be combined. `--no-restore` suppresses restoration of the last location for that launch only.
-
-The setup script also installs development dependencies. Run tests offscreen:
-
-```powershell
-$env:QT_QPA_PLATFORM = 'offscreen'
-.\.venv313\Scripts\python.exe -m pytest -q
-```
+- Windows x64
 
 <a id="drop"></a>
 ## Checking drops from Windows Explorer onto the Browser center

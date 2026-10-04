@@ -10,6 +10,9 @@ Use relative paths or masked examples such as `C:/Users/User/` when a path is
 needed. Never publish personal usernames, directories, contact details or user
 profiles. Preserve third-party copyrights and required license notices.
 
+Allow screenshots individually by exact filename after reviewing visible text,
+image content and metadata. Other screenshots remain excluded from publication.
+
 `scripts/publication_policy.py` defines the publication exclusions and permitted
 documentation. Run `scripts/check_docs_privacy.py` before building or publishing,
 and inspect the complete source and binary archives, including generated caches.

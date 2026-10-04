@@ -19,3 +19,11 @@ def test_private_profiles_environments_and_new_internal_notes_are_excluded():
     for name in ("config.json", "data/favorites.json", ".venv313/pyvenv.cfg",
                  "out/report.json", "INTERNAL_NOTES.md", ".codex/settings.json"):
         assert not publishable(name)
+
+
+def test_reviewed_screenshot_does_not_allow_other_private_screenshots():
+    assert publishable("assets/screenshots/browser-sample.png")
+    for name in ("assets/screenshots/private-library.png",
+                 "assets/screenshots/browser-sample-backup.png",
+                 "assets/screenshots/raw/browser-sample.png"):
+        assert not publishable(name)

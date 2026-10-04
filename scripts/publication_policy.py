@@ -8,6 +8,7 @@ PUBLIC_DOCS = {
     "docs/ZIPPLAFORK_COMPARISON.md",
     "docs/RELEASE_LICENSE_AUDIT.md",
 }
+PUBLIC_SCREENSHOTS = {"assets/screenshots/browser-sample.png"}
 PRIVATE_FILES = {"AGENTS.md", "config.json", "_folder_worker_probe.py", "_wheel_trace_probe.py"}
 PRIVATE_PREFIXES = (
     "portable-backups/", "assets/screenshots/", "assets/branding/README.md",
@@ -27,6 +28,8 @@ PRIVATE_SCRIPT_PREFIXES = (
 
 def publishable(filename: str) -> bool:
     name = filename.replace("\\", "/")
+    if name in PUBLIC_SCREENSHOTS:
+        return True
     if name in PRIVATE_FILES or name.startswith(PRIVATE_PREFIXES):
         return False
     if name.casefold().endswith((".zip", ".pyc", ".pyo", ".log", ".tmp")) or "__pycache__" in name:

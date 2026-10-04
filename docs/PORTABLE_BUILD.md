@@ -4,9 +4,38 @@ Build the exact source revision corresponding to the desired application version
 Use the Python version and dependency pins required by that revision. Current
 sources require standard Windows x64 CPython 3.13.16 or later in the 3.13 series.
 
-For current sources, prepare an isolated environment with
-`scripts/setup_python.ps1 -PythonPath python`, then run
-`scripts/build_portable.ps1 -OutputName portable-candidate -CreateZip`.
+## Run from source
+
+In PowerShell, go to the repository root and prepare an isolated environment:
+
+```powershell
+.\scripts\setup_python.ps1 -PythonPath python
+.\.venv313\Scripts\python.exe main.py
+```
+
+The setup script installs the pinned release and development dependencies into
+`.venv313`. It preserves existing environments and refuses to overwrite an
+existing `.venv313`. If `python` selects a different interpreter, pass the path
+to a standard Windows x64 Python 3.13.16 or later 3.13 interpreter to `-PythonPath`.
+
+Verify the interpreter and dependency versions:
+
+```powershell
+.\.venv313\Scripts\python.exe scripts/python_runtime_policy.py --require-venv --release-dependencies requirements-release.txt
+```
+
+Run tests without displaying application windows:
+
+```powershell
+$env:QT_QPA_PLATFORM = 'offscreen'
+.\.venv313\Scripts\python.exe -m pytest -q
+```
+
+## Build the portable edition
+
+```powershell
+.\scripts\build_portable.ps1 -OutputName portable-candidate -CreateZip
+```
 Older revisions may use different environment names or script options; inspect
 the selected revision's setup/build scripts and requirements before building.
 
@@ -22,7 +51,24 @@ required assets, build scripts, version-matched dependency/source information,
 and license notices must remain available for the binary being distributed.
 See `PROJECT_LICENSE.md` and `docs/RELEASE_LICENSE_AUDIT.md`.
 
+## Update a portable copy
+
 To update a portable copy, close all NivisViewer windows, remove the old
 `_internal` directory, then copy the new executable and runtime files into the
 same folder. Preserve `config.json`, `data/`, and the existing portable/profile
 selection. Do not delete image folders or user settings.
+
+## Command-line launch
+
+The portable executable accepts files, folders, and multiple paths. Paths after
+the first open in separate Viewer windows.
+
+```powershell
+NivisViewer.exe "D:\Comics\book.cbz"
+NivisViewer.exe --reuse "book1.cbz" "book2.pdf"
+NivisViewer.exe --new-window "C:\Images"
+NivisViewer.exe --browser-only "D:\Books"
+```
+
+`--new-window` and `--reuse` cannot be combined. `--no-restore` suppresses
+restoration of the last location for that launch only.

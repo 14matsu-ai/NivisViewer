@@ -38,7 +38,8 @@ portable-backups/
 *.zip
 _folder_worker_probe.py
 _wheel_trace_probe.py
-assets/screenshots/
+assets/screenshots/*
+!assets/screenshots/browser-sample.png
 assets/branding/README.md
 docs/*
 !docs/PORTABLE_BUILD.md
