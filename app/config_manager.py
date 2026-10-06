@@ -14,6 +14,7 @@ from typing import Any
 
 from PySide6.QtCore import QObject, Signal
 from .browser_sort import normalize_browser_random_seed, normalize_browser_sort_key
+from .folder_sort_rules import SORT_RULES_KEY, normalize_folder_sort_rules
 from .thumbnail_render import THUMBNAIL_ENCODER_QUALITY, normalize_thumbnail_webp_quality
 from .i18n import detect_windows_ui_language, normalize_ui_language
 
@@ -189,6 +190,7 @@ class ConfigManager(QObject):
         "viewer_delete_confirm_focus_yes": False,
         "browser_sort_key": "name",
         "browser_sort_order": "ascending",
+        SORT_RULES_KEY: [],
         "browser_random_seed": 0,
         "browser_folders_first": True,
         "browser_location_history_limit": 50,
@@ -814,6 +816,7 @@ class ConfigManager(QObject):
             maximum=2048,
         )
         normalized["browser_sort_key"] = normalize_browser_sort_key(normalized.get("browser_sort_key")).value
+        normalized[SORT_RULES_KEY] = normalize_folder_sort_rules(normalized.get(SORT_RULES_KEY))
         normalized["browser_random_seed"] = normalize_browser_random_seed(normalized.get("browser_random_seed"))
         if normalized.get("browser_sort_order") not in {"ascending", "descending"}:
             normalized["browser_sort_order"] = cls.DEFAULTS["browser_sort_order"]

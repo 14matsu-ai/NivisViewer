@@ -17,7 +17,9 @@ def test_build_source_and_legal_provenance_remain_publishable():
 
 def test_private_profiles_environments_and_new_internal_notes_are_excluded():
     for name in ("config.json", "data/favorites.json", ".venv313/pyvenv.cfg",
-                 "out/report.json", "INTERNAL_NOTES.md", ".codex/settings.json"):
+                 "out/report.json", "out/internal/docs/notes.md",
+                 "out/internal/scripts/probe.py", "scripts/new_internal_probe.py",
+                 "INTERNAL_NOTES.md", ".codex/settings.json"):
         assert not publishable(name)
 
 

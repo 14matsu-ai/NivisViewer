@@ -302,6 +302,8 @@ class BrowserItemModel(QAbstractListModel):
     def sort_items(
         self,
         items: tuple[BrowserItem, ...] | list[BrowserItem],
+        *,
+        sort_policy: BrowserSortPolicy | None = None,
     ) -> tuple[BrowserItem, ...]:
         source_items = [
             item
@@ -310,7 +312,7 @@ class BrowserItemModel(QAbstractListModel):
                 item.path
             )
         ]
-        return tuple(self._sort_policy.sorted_items(source_items))
+        return tuple((sort_policy or self._sort_policy).sorted_items(source_items))
 
     def visible_items(
         self,
@@ -489,8 +491,11 @@ class BrowserItemModel(QAbstractListModel):
         items: tuple[BrowserItem, ...] | list[BrowserItem],
         *,
         generation: int,
+        sort_policy: BrowserSortPolicy | None = None,
     ) -> None:
         self.beginResetModel()
+        if sort_policy is not None:
+            self._sort_policy = sort_policy
         self._source_items = list(items)
         self._rebuild_source_index()
         self._items = [

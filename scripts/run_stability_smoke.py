@@ -62,7 +62,7 @@ def main() -> int:
         result = run(command, smoke_output, arguments.timeout)
     result["notes"] = [
         "This automated smoke covers startup, bundled formats, stores, and shutdown.",
-        "Use docs/PERFORMANCE_CHECKLIST.md for interactive 10,000-item and long-run checks.",
+        "Use the local out/internal/docs/PERFORMANCE_CHECKLIST.md for interactive 10,000-item and long-run checks.",
         "No telemetry or automatic upload is performed.",
     ]
     arguments.output.write_text(

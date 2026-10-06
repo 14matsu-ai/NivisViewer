@@ -5,6 +5,15 @@ tools, dependency information, user documentation and license/provenance notices
 Keep internal work instructions, personal environment records, validation reports,
 review archives, local backups, user media and diagnostic outputs private.
 
+Keep public documentation in `docs/` and public build/verification tools in
+`scripts/`. These directories permit only explicitly reviewed filenames.
+Store internal documentation in `out/internal/docs/`, investigation tools in
+`out/internal/scripts/`, and review archives/backups under `out/internal/`.
+The entire `out/` directory is excluded from Git and publication. Do not put
+new internal material alongside public files. Keep the local `AGENTS.md` at the
+repository root for agent discovery, and runtime settings/data at their required
+locations; they remain excluded from publication.
+
 Remove personal information from every published revision and artifact.
 Use relative paths or masked examples such as `C:/Users/User/` when a path is
 needed. Never publish personal usernames, directories, contact details or user

@@ -592,6 +592,7 @@ class ApplicationController(QObject):
             return "unavailable"
         current_folder = lexical_absolute(window.current_path)
         parent = lexical_absolute(os.path.dirname(current_folder))
+        sort_policy = window._browser_sort_policy_for_path(parent)
         if adjacent_path_key(parent) == adjacent_path_key(current_folder):
             return "boundary"
 
@@ -608,10 +609,10 @@ class ApplicationController(QObject):
             browser_snapshot=None,
             generation=generation,
             candidate_mode=SIBLING_FOLDERS,
-            sort_key=window.browser_sort_key.value,
-            sort_order=window.browser_sort_order.value,
-            folders_first=window.browser_folders_first,
-            random_seed=window.browser_random_seed,
+            sort_key=sort_policy.sort_key.value,
+            sort_order=sort_policy.sort_order.value,
+            folders_first=sort_policy.folders_first,
+            random_seed=sort_policy.random_seed,
         )
         self._adjacent_request_by_window[id(window)] = request_id
         self._adjacent_context[request_id] = (

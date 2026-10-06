@@ -150,6 +150,9 @@ from .browser_sort import (
     normalize_browser_sort_order,
 )
 from .browser_filter import BrowserFilterState, RatingFilterMode
+from .folder_sort_rules import (
+    SORT_RULES_KEY, folder_key, folder_sort_policy, matching_folder_sort_rule,
+)
 from .browser_tags import (
     canonical_tag_key,
     expand_logical_tag_changes,
@@ -913,6 +916,7 @@ class BrowserWindow(QMainWindow):
             )
         )
         self.browser_random_seed = normalize_browser_random_seed(self.settings.get("browser_random_seed"))
+        self._transient_folder_sort: tuple[str, BrowserSortPolicy] | None = None
         self.browser_folders_first = bool(
             self.settings.get("browser_folders_first", True)
         )
@@ -1314,7 +1318,7 @@ class BrowserWindow(QMainWindow):
             snapshot = self.folder_snapshot_cache.get(
                 target,
                 self._current_browser_visibility_policy(),
-                self._current_browser_sort_policy(),
+                self._browser_sort_policy_for_path(target),
             )
             if snapshot is not None:
                 return self._navigate_from_folder_snapshot(
@@ -1348,7 +1352,7 @@ class BrowserWindow(QMainWindow):
                 else BrowserScanPriority.INTERACTIVE_NAVIGATION
             ),
             trace_id=trace_id,
-            sort_policy=self._current_browser_sort_policy(),
+            sort_policy=self._browser_sort_policy_for_path(target),
             include_progress_entries=False,
         )
         self._pending_scan = _PendingDirectoryScan(
@@ -1458,7 +1462,7 @@ class BrowserWindow(QMainWindow):
             self._update_status()
             return
 
-        current_sort_policy = self._current_browser_sort_policy()
+        current_sort_policy = self._browser_sort_policy_for_path(pending.path)
         if result.prepared_items is not None:
             if result.sort_policy != current_sort_policy:
                 self._restart_pending_scan(pending)
@@ -1471,9 +1475,8 @@ class BrowserWindow(QMainWindow):
                 else pending.buffered_entries
             )
             items = self.item_model.sort_items(
-                self._items_from_scan_entries(
-                    tuple(buffered_entries)
-                )
+                self._items_from_scan_entries(tuple(buffered_entries)),
+                sort_policy=current_sort_policy,
             )
 
         self._store_folder_snapshot(result.path, items)
@@ -1572,6 +1575,7 @@ class BrowserWindow(QMainWindow):
             self.item_model.begin_final_directory_scan(
                 initial_items,
                 generation=pending.generation,
+                sort_policy=self._current_browser_sort_policy(),
             )
             if pending.atomic_restore:
                 # Model reset invalidates the scroll range until the view lays
@@ -1699,7 +1703,11 @@ class BrowserWindow(QMainWindow):
                 request_thumbnails=False,
             )
         pending.committed = True
+        if not self._same_path(previous_path, pending.path):
+            self._transient_folder_sort = None
         self.current_path = pending.path
+        self._set_effective_browser_sort(self._browser_sort_policy_for_path(pending.path))
+        self._sync_browser_controls()
         self.config.set("last_browser_path", str(pending.path))
         self._generation = self.thumbnail_provider.begin_generation()
         self._thumbnail_scroll_direction = 1
@@ -1892,6 +1900,40 @@ class BrowserWindow(QMainWindow):
             self.browser_random_seed,
         )
 
+    def _browser_sort_policy_for_path(self, path: str | Path | None) -> BrowserSortPolicy:
+        default = BrowserSortPolicy(
+            normalize_browser_sort_key(self.config.get("browser_sort_key")),
+            normalize_browser_sort_order(self.config.get("browser_sort_order")),
+            self.browser_folders_first,
+            normalize_browser_random_seed(self.config.get("browser_random_seed")),
+        )
+        transient = self._transient_folder_sort
+        if transient is not None and path is not None and transient[0] == folder_key(path):
+            policy = transient[1]
+            return BrowserSortPolicy(policy.sort_key, policy.sort_order, default.folders_first, policy.random_seed)
+        return folder_sort_policy(path, self.config.get(SORT_RULES_KEY, []), default)
+
+    def _set_effective_browser_sort(self, policy: BrowserSortPolicy) -> None:
+        self.browser_sort_key = policy.sort_key
+        self.browser_sort_order = policy.sort_order
+        self.browser_random_seed = policy.random_seed
+
+    def edit_folder_sort_rules(self) -> None:
+        from .folder_sort_dialog import FolderSortDialog
+
+        dialog = FolderSortDialog(self.config.get(SORT_RULES_KEY, []), self.current_path, self)
+        dialog.apply_requested.connect(self._save_folder_sort_rules)
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
+
+    def _save_folder_sort_rules(self, rules: object) -> None:
+        changed = self.config.apply({SORT_RULES_KEY: rules}, save=True)
+        if SORT_RULES_KEY not in changed and self._transient_folder_sort is not None:
+            self._transient_folder_sort = None
+            self.apply_settings({}, transient_sort_changed=True)
+
     def _current_browser_visibility_policy(self) -> BrowserVisibilityPolicy:
         return BrowserVisibilityPolicy(
             show_hidden_items=self.browser_show_hidden_items,
@@ -1908,7 +1950,7 @@ class BrowserWindow(QMainWindow):
         self.folder_snapshot_cache.put(
             path,
             self._current_browser_visibility_policy(),
-            self._current_browser_sort_policy(),
+            self._browser_sort_policy_for_path(path),
             items,
         )
 
@@ -1972,6 +2014,7 @@ class BrowserWindow(QMainWindow):
         self.item_model.begin_final_directory_scan(
             initial_items,
             generation=pending.generation,
+            sort_policy=self._current_browser_sort_policy(),
         )
         if atomic_restore:
             self.list_view.doItemsLayout()
@@ -4642,7 +4685,7 @@ class BrowserWindow(QMainWindow):
         )
         self.list_view.viewport().update()
 
-    def apply_settings(self, changed: dict[str, object]) -> None:
+    def apply_settings(self, changed: dict[str, object], *, transient_sort_changed: bool = False) -> None:
         favorite_drop_keys = {
             "favorite_drop_default_operation",
             "favorite_drop_ctrl_inverts_operation",
@@ -4810,6 +4853,7 @@ class BrowserWindow(QMainWindow):
                 min_distance=self.mouse_gesture_min_distance,
             )
         list_keys = {
+            SORT_RULES_KEY,
             "thumbnail_size",
             "thumbnail_frame_ratio",
             "thumbnail_crop_mode",
@@ -4830,7 +4874,7 @@ class BrowserWindow(QMainWindow):
             "browser_filename_gap",
             "browser_filename_padding_y",
         }
-        list_changed = bool(list_keys.intersection(changed))
+        list_changed = transient_sort_changed or bool(list_keys.intersection(changed))
         list_changed = list_changed or "browser_random_seed" in changed
         view_state = self._capture_list_view_state() if list_changed else None
 
@@ -4847,6 +4891,13 @@ class BrowserWindow(QMainWindow):
             )
         if "browser_folders_first" in changed:
             self.browser_folders_first = bool(changed["browser_folders_first"])
+        if SORT_RULES_KEY in changed:
+            self._transient_folder_sort = None
+        if transient_sort_changed or {
+            SORT_RULES_KEY, "browser_sort_key",
+            "browser_sort_order", "browser_random_seed", "browser_folders_first",
+        }.intersection(changed):
+            self._set_effective_browser_sort(self._browser_sort_policy_for_path(self.current_path))
         if "browser_display_density" in changed:
             self.browser_display_density = normalize_browser_display_density(
                 changed["browser_display_density"]
@@ -4885,8 +4936,9 @@ class BrowserWindow(QMainWindow):
             self.browser_filename_padding_y = max(
                 0, min(16, int(changed["browser_filename_padding_y"]))
             )
-        sort_changed = bool(
+        sort_changed = transient_sort_changed or bool(
             {
+                SORT_RULES_KEY,
                 "browser_random_seed",
                 "browser_sort_key",
                 "browser_sort_order",
@@ -5261,6 +5313,17 @@ class BrowserWindow(QMainWindow):
 
     def _apply_browser_controls(self, *_args: object) -> None:
         _, key, order = BROWSER_SORT_CHOICES[self.browser_sort_key_combo.currentIndex()]
+        if self.current_path is not None and matching_folder_sort_rule(
+            self.current_path, self.config.get(SORT_RULES_KEY, []),
+        ) is not None:
+            seed = (new_browser_random_seed(self.browser_random_seed)
+                    if key == BrowserSortKey.RANDOM.value else self.browser_random_seed)
+            self._transient_folder_sort = (
+                folder_key(self.current_path),
+                BrowserSortPolicy(BrowserSortKey(key), BrowserSortOrder(order), self.browser_folders_first, seed),
+            )
+            self.apply_settings({}, transient_sort_changed=True)
+            return
         values = {"browser_sort_key": key, "browser_sort_order": order}
         if key == BrowserSortKey.RANDOM.value:
             values["browser_random_seed"] = new_browser_random_seed(self.browser_random_seed)
@@ -5273,9 +5336,18 @@ class BrowserWindow(QMainWindow):
         for control in controls:
             control.blockSignals(True)
         try:
+            for index, (label, _key, _order) in enumerate(BROWSER_SORT_CHOICES):
+                self.browser_sort_key_combo.setItemText(index, tr(label))
             self.browser_sort_key_combo.setCurrentIndex(browser_sort_choice_index(
                 self.browser_sort_key, self.browser_sort_order,
             ))
+            rule = matching_folder_sort_rule(self.current_path, self.config.get(SORT_RULES_KEY, []))
+            if rule is not None:
+                index = self.browser_sort_key_combo.currentIndex()
+                label = self.browser_sort_key_combo.itemText(index)
+                template = (tr('{p0}〈一時変更〉', p0=label) if self._transient_folder_sort is not None
+                            else tr('{p0}<指定>', p0=label))
+                self.browser_sort_key_combo.setItemText(index, template)
         finally:
             for control in controls:
                 control.blockSignals(False)
@@ -7717,6 +7789,8 @@ class BrowserWindow(QMainWindow):
             self.add_current_folder_bookmark
         )
         bookmark_menu.addAction(self.add_folder_bookmark_action)
+        self.folder_sort_rules_action = bookmark_menu.addAction(tr('並び順変更指定…'))
+        self.folder_sort_rules_action.triggered.connect(self.edit_folder_sort_rules)
         self.toggle_folder_bookmark_shortcut = QShortcut(
             QKeySequence("Ctrl+B"),
             self,

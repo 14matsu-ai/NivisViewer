@@ -20,10 +20,24 @@ PUBLIC_ROOT_DOCUMENTS = {
     "PROJECT_LICENSE.md", "THIRD_PARTY_NOTICES.md", "PUBLICATION_POLICY.md",
     "requirements.txt", "requirements-build.txt", "requirements-dev.txt", "requirements-release.txt",
 }
-PRIVATE_SCRIPT_PREFIXES = (
-    "review_", "diagnose_", "measure_", "generate_stress_",
-    "thumbnail_quality_",
-)
+PUBLIC_SCRIPTS = {
+    "scripts/benchmark_viewer_navigation.py",
+    "scripts/build_portable.ps1",
+    "scripts/check_docs_privacy.py",
+    "scripts/check_public_refs.py",
+    "scripts/check_single_instance.py",
+    "scripts/collect_licenses.py",
+    "scripts/frozen_smoke_hook.py",
+    "scripts/generate_branding_assets.py",
+    "scripts/package_portable.py",
+    "scripts/plan_portable_update.py",
+    "scripts/portable_build_policy.py",
+    "scripts/publication_policy.py",
+    "scripts/python_runtime_policy.py",
+    "scripts/run_stability_smoke.py",
+    "scripts/setup_python.ps1",
+    "scripts/verify_portable_build.py",
+}
 
 
 def publishable(filename: str) -> bool:
@@ -39,12 +53,8 @@ def publishable(filename: str) -> bool:
             return False
     if name.startswith("docs/") and name not in PUBLIC_DOCS:
         return False
-    if name.startswith("scripts/"):
-        basename = name.rsplit("/", 1)[-1]
-        if basename.startswith(PRIVATE_SCRIPT_PREFIXES):
-            return False
-        if basename.startswith("benchmark_") and name != "scripts/benchmark_viewer_navigation.py":
-            return False
+    if name.startswith("scripts/") and name not in PUBLIC_SCRIPTS:
+        return False
     return True
 
 

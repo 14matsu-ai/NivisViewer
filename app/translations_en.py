@@ -1376,3 +1376,29 @@ ENGLISH.update({
     '0%で不透明、100%で完全に透明になります。': '0% is opaque; 100% is fully transparent.',
     '区切り線の色は、区切り線を選択して「色を設定…」で変更できます。': 'Select a separator and use “Set color…” to change its color.',
 })
+
+ENGLISH.update({
+    '並び順変更指定…': 'Folder sort rules…',
+    '並び順変更指定': 'Folder sort rules',
+    '指定が適用されるフォルダでは、一覧上部の並び替えは一時変更です。保存するにはこの画面で編集してください。':
+        'In folders with an active rule, sorting from the list toolbar is temporary. Edit here to save a rule.',
+    '並び順': 'Sort order',
+    '並び指定を編集': 'Edit folder sort rule',
+    '対象フォルダ:': 'Target folder:',
+    '対象フォルダ': 'Target folder',
+    '対象フォルダを選択': 'Select target folder',
+    '対象フォルダを絶対パスで指定してください。': 'Enter an absolute path for the target folder.',
+    '普段の並び順を使う': 'Use default sort order',
+    '適用範囲:': 'Scope:',
+    '適用範囲': 'Scope',
+    'このフォルダのみ': 'This folder only',
+    'このフォルダと階下': 'This folder and descendants',
+    'このフォルダを除いた階下': 'Descendants only',
+    'フォルダごとの並び順を指定します。指定が重なる場合は、近いフォルダの指定を優先します。お気に入りへの登録は不要です。':
+        'Set sort orders for folders. When rules overlap, the closest folder takes priority. Favorites registration is not required.',
+    '現在のフォルダを追加…': 'Add current folder…',
+    'フォルダを選んで追加…': 'Choose folder to add…',
+    '編集…': 'Edit…',
+    '{p0}〈一時変更〉': '{p0} (temporary)',
+    '{p0}<指定>': '{p0}<rule>',
+})
