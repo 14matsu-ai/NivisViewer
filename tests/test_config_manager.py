@@ -8,6 +8,34 @@ import pytest
 from app.config_manager import ConfigManager
 
 
+@pytest.mark.parametrize("value,expected", [
+    (None, 2), ("invalid", 2), (True, 2), (float("inf"), 2),
+    (-1, 1), (0, 1), (1, 1), (2, 2), (20, 20), (200, 20), ("7", 7),
+])
+def test_zip_priority_screens_normalizes_load_and_apply(tmp_path, value, expected):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"viewer_zip_priority_screens": value}), encoding="utf-8")
+    config = ConfigManager(path)
+    config.load()
+    assert config.get("viewer_zip_priority_screens") == expected
+    config.apply({"viewer_zip_priority_screens": value}, save=True)
+    assert ConfigManager(path).load()["viewer_zip_priority_screens"] == expected
+
+
+def test_existing_prefetch_values_migrate_independently_of_zip_priority(tmp_path):
+    values = {
+        "viewer_prefetch_preset": "custom",
+        "viewer_prefetch_image_forward_units": 9,
+        "viewer_prefetch_pdf_forward_units": 7,
+    }
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(values), encoding="utf-8")
+    config = ConfigManager(path)
+    config.load()
+    assert config.get("viewer_zip_priority_screens") == 2
+    assert all(config.get(key) == value for key, value in values.items())
+
+
 def test_missing_config_uses_defaults(tmp_path: Path) -> None:
     manager = ConfigManager(tmp_path / "config.json")
 

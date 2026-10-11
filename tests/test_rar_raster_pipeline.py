@@ -188,13 +188,13 @@ def test_multivolume_keeps_backend_but_does_not_cache_first_volume_identity(tmp_
 
 
 @contextmanager
-def viewer_fixture(tmp_path, qapp, backend):
-    archive = tmp_path / "book.rar"
+def viewer_fixture(tmp_path, qapp, backend, *, name="book.rar"):
+    archive = tmp_path / name
     archive.write_bytes(b"fake archive")
     config = ConfigManager(tmp_path / "settings.json")
     config.load()
     config.apply({"view_mode": "single", "viewer_memory_mode": "256"})
-    registry = ArchiveBackendRegistry(winrar_backend=backend)
+    registry = ArchiveBackendRegistry(winrar_backend=backend, seven_zip_backend=backend)
     window = ViewerWindow(config_manager=config, archive_backend_registry=registry)
     window.resize(640, 480)
     window.show()

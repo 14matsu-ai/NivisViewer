@@ -8,7 +8,7 @@ from PIL import Image
 from PySide6.QtCore import QByteArray
 import pytest
 
-from app.image_source import ZipImageSource
+from app.image_source import ImageSourceError, ZipImageSource
 from app.zip_read_ahead import ZipReadAhead
 
 
@@ -255,4 +255,196 @@ def test_completed_payload_rechecks_actual_bytes_against_live_budget(qapp):
         assert ahead.cached_count == 0
         assert ahead.reserved_bytes == 0
     finally:
+        ahead.close()
+
+
+def test_foreground_miss_claim_prevents_ring_duplicate_and_keeps_parallel_next_read(tmp_path, qapp):
+    source = make_source(tmp_path)
+    original = source._read_entry_qbytearray
+    started, release, next_started = Event(), Event(), Event()
+    calls = []
+
+    def read(image_id, cancelled):
+        calls.append(image_id)
+        if image_id == "2.jpg":
+            started.set()
+            assert release.wait(5)
+        if image_id == "3.jpg":
+            next_started.set()
+        return original(image_id, cancelled)
+
+    source._read_entry_qbytearray = read
+    try:
+        source.configure_read_ahead(("1.jpg", "2.jpg", "3.jpg"), 1024 * 1024)
+        with ThreadPoolExecutor(1) as decoder:
+            future = decoder.submit(source.open_compatible_jpeg_at_most, "2.jpg", (160, 240))
+            try:
+                assert started.wait(2)
+                # Deterministic original race: previous-page kick occurs only
+                # after the normal reader has missed take() and begun I/O.
+                source._read_ahead.kick("1.jpg")
+                assert next_started.wait(2)
+                assert source.wait_read_ahead(2)
+                assert calls == ["2.jpg", "3.jpg"]
+                assert not future.done()  # Different-entry overlap is retained.
+            finally:
+                release.set()
+            assert future.result(5) is not None
+        # A late predecessor kick must not re-read an already handed-off entry.
+        source._read_ahead.kick("1.jpg")
+        assert source.wait_read_ahead(2)
+        assert calls == ["2.jpg", "3.jpg"]
+        assert source._read_ahead._foreground_reads == {}
+        assert source._active_requests == {}
+        assert source.read_ahead_reserved_bytes == source._read_ahead._cache_bytes
+    finally:
+        release.set()
+        source.close()
+
+
+@pytest.mark.parametrize("interruption", ["error", "cancel", "close"])
+def test_foreground_claim_released_on_interruption_and_new_request_can_read(tmp_path, qapp, interruption):
+    source = make_source(tmp_path)
+    original = source._read_entry_qbytearray
+    started, release = Event(), Event()
+    fail_once = True
+
+    def read(image_id, cancelled):
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            started.set()
+            assert release.wait(5)
+            if interruption == "error":
+                raise OSError("injected foreground failure")
+        return original(image_id, cancelled)
+
+    source._read_entry_qbytearray = read
+    try:
+        source.configure_read_ahead(("0.jpg", "1.jpg"), 1024 * 1024)
+        ahead = source._read_ahead
+        with ThreadPoolExecutor(1) as decoder:
+            future = decoder.submit(source.open_compatible_jpeg_at_most, "1.jpg", (160, 240))
+            try:
+                assert started.wait(2)
+                assert "1.jpg" in ahead._foreground_reads
+                if interruption == "cancel":
+                    source.cancel_image_request("1.jpg")
+                    source.cancel_read_ahead()
+                elif interruption == "close":
+                    source.close()
+            finally:
+                release.set()
+            if interruption == "error":
+                assert future.result(5) is None
+            else:
+                with pytest.raises(ImageSourceError):
+                    future.result(5)
+            assert ahead._foreground_reads == {}
+            assert ahead._consumed == set()
+            assert source._active_requests == {}
+            assert source.read_ahead_reserved_bytes == 0
+            if interruption != "close":
+                source.configure_read_ahead(("0.jpg", "1.jpg"), 1024 * 1024)
+                ahead.kick("0.jpg")
+                assert source.wait_read_ahead(2)
+                assert decoder.submit(source.open_compatible_jpeg_at_most, "1.jpg", (160, 240)).result(5) is not None
+            else:
+                assert source._zip_closed
+                ahead.kick("0.jpg")
+                assert not ahead.busy
+                with pytest.raises(ImageSourceError):
+                    decoder.submit(source.open_compatible_jpeg_at_most, "1.jpg", (160, 240)).result(5)
+                reopened = ZipImageSource(source.source_path)
+                try:
+                    reopened.configure_read_ahead(("0.jpg", "1.jpg"), 1024 * 1024)
+                    assert decoder.submit(reopened.open_compatible_jpeg_at_most, "1.jpg", (160, 240)).result(5) is not None
+                    assert reopened._read_ahead._foreground_reads == {}
+                    assert reopened._active_requests == {}
+                finally:
+                    reopened.close()
+    finally:
+        release.set()
+        source.close()
+
+
+@pytest.mark.parametrize("interruption", ["cancel", "close"])
+def test_interrupted_foreground_wait_does_not_wait_for_speculative_reader(tmp_path, qapp, interruption):
+    source = make_source(tmp_path)
+    original = source._read_entry_qbytearray
+    started, release = Event(), Event()
+    calls = []
+
+    def read(image_id, cancelled):
+        source._raise_if_cancelled(cancelled)
+        calls.append(image_id)
+        started.set()
+        assert release.wait(5)
+        return original(image_id, cancelled)
+
+    source._read_entry_qbytearray = read
+    try:
+        source.configure_read_ahead(("0.jpg", "1.jpg"), 1024 * 1024)
+        ahead = source._read_ahead
+        ahead.kick("0.jpg")
+        assert started.wait(2)
+        with ThreadPoolExecutor(1) as decoder:
+            future = decoder.submit(source.open_compatible_jpeg_at_most, "1.jpg", (160, 240))
+            wait_until(qapp, lambda: len(source._active_requests.get("1.jpg", ())) == 2)
+            if interruption == "close":
+                source.close()
+            else:
+                source.cancel_image_request("1.jpg")
+            with pytest.raises(ImageSourceError):
+                future.result(2)  # Ring read is still blocked; waiting job exits.
+        assert ahead._foreground_reads == {}
+        assert calls == ["1.jpg"]  # Retry checks cancellation before ZIP I/O.
+        release.set()
+        assert source.wait_read_ahead(2)
+        assert source._active_requests == {}
+        assert source.read_ahead_reserved_bytes == 0
+    finally:
+        release.set()
+        source.close()
+
+
+def test_ring_cancel_keeps_live_claim_but_old_completion_cannot_mark_new_chain(qapp):
+    started, release = Event(), Event()
+    reads = []
+
+    def speculative(image_id, _cancelled):
+        reads.append(image_id)
+        return QByteArray(b"next"), 1
+
+    def foreground(_image_id, _cancelled):
+        started.set()
+        assert release.wait(5)
+        return QByteArray(b"old"), 1
+
+    ahead = ZipReadAhead(speculative)
+    try:
+        ahead.configure({"0": ("1", 4)}, {"1"}, byte_budget=4)
+        with ThreadPoolExecutor(1) as decoder:
+            future = decoder.submit(ahead.read_foreground, "1", Event(), foreground)
+            try:
+                assert started.wait(2)
+                ahead.cancel()
+                ahead.configure({"0": ("1", 4)}, {"1"}, byte_budget=4)
+                ahead.kick("0")
+                assert ahead.wait(2)
+                assert reads == []  # Old reader still owns the actual I/O.
+                assert "1" in ahead._foreground_reads
+            finally:
+                release.set()
+            assert bytes(future.result(5)[0]) == b"old"
+        assert ahead._foreground_reads == {}
+        assert ahead._consumed == set()  # No adoption into the new generation.
+        ahead.kick("0")
+        assert ahead.wait(2)
+        assert reads == ["1"]
+        assert ahead.reserved_bytes == 4
+        assert bytes(ahead.take("1")[0]) == b"next"
+        assert ahead.reserved_bytes == 0
+    finally:
+        release.set()
         ahead.close()

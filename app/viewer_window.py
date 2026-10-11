@@ -519,6 +519,13 @@ class ViewerWindow(QMainWindow):
         self._pdf_prefetch_timer.setSingleShot(True)
         self._pdf_prefetch_timer.setInterval(_PDF_PREFETCH_IDLE_GRACE_MS)
         self._pdf_prefetch_timer.timeout.connect(self._start_deferred_pdf_prefetch)
+        self._pdf_far_timer = QTimer(self)
+        self._pdf_far_timer.setSingleShot(True)
+        self._pdf_far_timer.setInterval(_PDF_PREFETCH_IDLE_GRACE_MS)
+        self._pdf_far_timer.timeout.connect(self._advance_pdf_far_prefetch)
+        self._pdf_far_units = None
+        self._pdf_far_near_units: tuple[tuple[int, ...], ...] = ()
+        self._pdf_far_indexes: set[int] = set()
         self._prepared_display_timer = QTimer(self)
         self._prepared_display_timer.setSingleShot(True)
         self._prepared_display_timer.setInterval(
@@ -1974,6 +1981,10 @@ class ViewerWindow(QMainWindow):
                 "viewer_memory_mode",
                 "viewer_decode_workers",
                 "viewer_zip_read_ahead_enabled",
+                "viewer_zip_priority_screens",
+                "viewer_prefetch_forward_screens", "viewer_prefetch_backward_screens",
+                "viewer_pdf_prefetch_individual", "viewer_pdf_prefetch_forward_screens",
+                "viewer_pdf_prefetch_backward_screens",
             }.intersection(changed)
         )
         if prefetch_settings_changed:
@@ -1996,8 +2007,16 @@ class ViewerWindow(QMainWindow):
         )
         self.image_prefetch_forward_units = int(values["image_forward_units"])
         self.image_prefetch_backward_units = int(values["image_backward_units"])
-        self.pdf_prefetch_forward_units = int(values["pdf_forward_units"])
-        self.pdf_prefetch_backward_units = int(values["pdf_backward_units"])
+        self.pdf_prefetch_individual = bool(self.config.get("viewer_pdf_prefetch_individual", True))
+        self.image_cache.set_memory_bound_prefetch(not self.pdf_prefetch_individual)
+        if not self.pdf_prefetch_individual:
+            self.prefetch_direction_priority_enabled = True
+        for direction in ("forward", "backward"):
+            key = (
+                f"viewer_pdf_prefetch_{direction}_screens"
+                if self.pdf_prefetch_individual else f"viewer_prefetch_{direction}_screens"
+            )
+            setattr(self, f"pdf_prefetch_{direction}_units", int(self.config.get(key)))
         memory_mode = self.config.viewer_memory_mode()
         memory_policy = getattr(
             self,
@@ -2173,6 +2192,11 @@ class ViewerWindow(QMainWindow):
         elif self._zip_runtime_active:
             if self._zip_runtime is not None:
                 self._apply_raster_memory_policy()
+                request = self._zip_runtime_request(self.model.spread_at())
+                if request is not None and self._zip_runtime.refresh_work_order(request):
+                    pending = self._pending_zip_runtime_request
+                    if pending is not None and pending.request_id == request.request_id:
+                        self._pending_zip_runtime_request = request
         else:
             self.image_cache.set_raster_decode_bounds(
                 self._current_raster_decode_bounds()
@@ -4024,6 +4048,25 @@ class ViewerWindow(QMainWindow):
         if self.viewer.magnifier_selecting or self.viewer.magnifier_active:
             decoder_bound = None
         background_enabled = self._raster_background_allowed()
+        next_units = (
+            tuple(
+                self._zip_display_unit(
+                    tuple(slot.page_index for slot in candidate.slots),
+                    start_index=candidate.start_index,
+                    is_single=candidate.is_single,
+                )
+                for candidate in (
+                    *self.model.next_display_spreads(
+                        direction=direction,
+                        count=int(self.config.get("viewer_prefetch_forward_screens", 2)),
+                    ),
+                    *self.model.next_display_spreads(
+                        direction=-(direction or 1),
+                        count=int(self.config.get("viewer_prefetch_backward_screens", 1)),
+                    ),
+                )
+            )
+        )
         warmup_plan = RasterWarmupPlan(
             self._raster_book_topology(source),
             current=current,
@@ -4037,12 +4080,12 @@ class ViewerWindow(QMainWindow):
             # The legacy PDF prefetch preset/count controls are unchanged.
             background_enabled=background_enabled,
             nearby_units=(
-                self._zip_display_unit(
+                *(self._zip_display_unit(
                     tuple(slot.page_index for slot in candidate.slots),
                     start_index=candidate.start_index,
                     is_single=candidate.is_single,
-                )
-                for candidate in self.model.prefetch_spreads(direction=direction)
+                ) for candidate in self.model.prefetch_spreads(direction=direction)),
+                *next_units,
             ),
         )
 
@@ -4081,17 +4124,8 @@ class ViewerWindow(QMainWindow):
             warmup_plan,
             render_spec,
             navigation_direction=direction,
-            next_display_units=(
-                tuple(
-                    self._zip_display_unit(
-                        tuple(slot.page_index for slot in candidate.slots),
-                        start_index=candidate.start_index,
-                        is_single=candidate.is_single,
-                    )
-                    for candidate in self.model.next_display_spreads(direction=direction)
-                )
-                if isinstance(source, ZipImageSource) else ()
-            ),
+            next_display_units=next_units,
+            reverse_priority_screens=int(self.config.get("viewer_prefetch_backward_screens", 1)),
             resolve_layout_metadata=(
                 # ZIP header reconnaissance is cheap relative to full decode
                 # and is also useful in single-page mode for cost-aware early
@@ -4964,6 +4998,7 @@ class ViewerWindow(QMainWindow):
         if not isinstance(source, PdfImageSource):
             return
         self._pdf_prefetch_timer.stop()
+        self._stop_pdf_far_prefetch()
         direction = self._navigation_prefetch_direction(
             center_index,
             visible_indexes,
@@ -5588,9 +5623,99 @@ class ViewerWindow(QMainWindow):
             ),
             prefetch_units=prefetch_units,
         )
+        if not self.pdf_prefetch_individual:
+            self._pdf_far_near_units = prefetch_units
+            self._pdf_far_units = self._iter_pdf_far_units(center_index)
+            self._pdf_far_timer.start()
+
+    def _iter_pdf_far_units(self, center_index: int):
+        """Walk actual display turns lazily; never queue an entire document."""
+        direction = self._pdf_prefetch_direction or 1
+        positions = [self.model.spread_start_for_index(center_index)] * 2
+        exhausted = [False, False]
+        seen = set(self._pdf_prefetch_visible_indexes)
+        seen.update(index for unit in self._pdf_far_near_units for index in unit)
+        while not all(exhausted):
+            for side, step in enumerate((direction, -direction)):
+                if exhausted[side]:
+                    continue
+                start = positions[side]
+                target = (self.model.next_index_from(start) if step > 0
+                          else self.model.previous_index_from(start))
+                if target == start:
+                    exhausted[side] = True
+                    continue
+                positions[side] = target
+                unit = tuple(slot.page_index for slot in self.model.spread_at(target).slots)
+                if set(unit).issubset(seen):
+                    continue
+                seen.update(unit)
+                yield unit
+
+    def _stop_pdf_far_prefetch(self) -> None:
+        self._pdf_far_timer.stop()
+        self._pdf_far_units = None
+        self._pdf_far_near_units = ()
+        self._pdf_far_indexes.clear()
+        self.image_cache.set_far_prefetch_indexes(())
+
+    def _advance_pdf_far_prefetch(self) -> None:
+        source = self._pdf_prefetch_source
+        if (
+            self._shutdown_prepared or self.pdf_prefetch_individual
+            or self._pdf_far_units is None or source is None
+            or self.image_cache.source is not source
+            or self.image_cache.generation != self._pdf_prefetch_generation
+            or self._pdf_prefetch_center not in {self.model.current_index, self.model.focused_index}
+        ):
+            self._stop_pdf_far_prefetch()
+            return
+        # Completion restarts the timer. There is never more than one distant
+        # display unit admitted, and native PDFium rendering is not preempted.
+        if self.image_cache.has_in_flight_for_source(source):
+            return
+        near = (*self._pdf_prefetch_visible_indexes,
+                *(index for unit in self._pdf_far_near_units for index in unit))
+        if any(not self.image_cache.contains(index) for index in near):
+            return
+        unit = next(self._pdf_far_units, None)
+        while unit is not None and all(self.image_cache.contains(index) for index in unit):
+            unit = next(self._pdf_far_units, None)
+        if unit is None:
+            self._pdf_far_units = None
+            return
+        specs = self._current_pdf_render_spec(extra_indexes=unit)
+        assert specs is not None
+        # Reserve both the incoming raster and its transient render buffer;
+        # do not evict the priority corridor to make room for far work.
+        incoming = sum(specs[index].target_pixel_size[0] * specs[index].target_pixel_size[1] * 8
+                       for index in unit)
+        used = self.image_cache.cache_bytes + self.viewer.render_cache_bytes()
+        if used + incoming > self.viewer_cache_budget_bytes:
+            self._pdf_far_units = None
+            return
+        if self.image_cache.set_render_spec(specs):
+            self._stop_pdf_far_prefetch()
+            self._prepare_deferred_pdf_prefetch(self.model.current_index, self._visible_page_indexes)
+            return
+        self._pdf_far_indexes.update(unit)
+        retained = tuple(sorted(index for index in self._pdf_far_indexes
+                                if self.image_cache.contains(index) or index in unit))
+        self.image_cache.set_far_prefetch_indexes(retained)
+        self.image_cache.preload_around(
+            self._pdf_prefetch_center, radius=0,
+            visible_indexes=self._pdf_prefetch_visible_indexes,
+            preferred_direction=self._pdf_prefetch_direction or 1,
+            prefetch_indexes=tuple(dict.fromkeys((*near, *retained))),
+            prefetch_units=(*self._pdf_far_near_units, *( (index,) for index in retained)),
+        )
+        if not self.image_cache.has_in_flight_for_source(source):
+            # Capacity admission may reject the unit; stop rather than spin.
+            self._pdf_far_units = None
 
     def _cancel_deferred_pdf_prefetch(self) -> None:
         self._pdf_prefetch_timer.stop()
+        self._stop_pdf_far_prefetch()
         self._pdf_prefetch_source = None
         self._pdf_prefetch_generation = -1
         self._pdf_prefetch_visible_indexes = tuple()
@@ -5918,6 +6043,8 @@ class ViewerWindow(QMainWindow):
         ):
             return
         self._enforce_combined_cache_budget()
+        if self._pdf_far_units is not None and not self.pdf_prefetch_individual:
+            self._pdf_far_timer.start()
         self.presentation_state.transition_slot(
             requested.token,
             page_index=cached.page_index,
@@ -7080,7 +7207,7 @@ class ViewerWindow(QMainWindow):
         ):
             self._refresh_view()
 
-    def _current_pdf_render_spec(self) -> dict[int, PageRenderSpec] | None:
+    def _current_pdf_render_spec(self, *, extra_indexes: tuple[int, ...] = ()) -> dict[int, PageRenderSpec] | None:
         if not isinstance(self.book_session.source, PdfImageSource):
             return None
         spread = self.model.spread_at()
@@ -7095,6 +7222,7 @@ class ViewerWindow(QMainWindow):
         spec_indexes = {
             slot.page_index for slot in spread.slots
         }
+        spec_indexes.update(extra_indexes)
         for unit in (
             self._display_units_from(
                 self.model.current_index,

@@ -325,16 +325,16 @@ def test_repeated_mixed_resolution_zip_warmup_reaches_past_size_changes(
         source.close()
 
 
-@pytest.mark.parametrize("direction,current_index,near_indexes", [
-    (1, 0, (1, 2)),
-    (-1, 4, (3, 2)),
-])
-def test_two_display_units_finish_before_distant_headers_or_pixels(
-    tmp_path: Path, qapp, direction, current_index, near_indexes,
+@pytest.mark.parametrize("direction", [1, -1])
+@pytest.mark.parametrize("screens", [1, 2, 20])
+def test_requested_display_units_finish_before_distant_headers_or_pixels(
+    tmp_path: Path, qapp, direction, screens,
 ):
+    current_index = 0 if direction > 0 else 23
+    near_indexes = tuple(current_index + direction * step for step in range(1, screens + 1))
     archive = tmp_path / "ordered.zip"
     with zipfile.ZipFile(archive, "w") as output:
-        for index in range(7):
+        for index in range(24):
             path = tmp_path / f"{index}.png"
             with Image.new("RGB", (80, 120), (index * 25, 70, 90)) as image:
                 image.save(path)
@@ -374,15 +374,66 @@ def test_two_display_units_finish_before_distant_headers_or_pixels(
         assert runtime.release_continuous_warmup(request_id=1)
         _wait(qapp, lambda: all(index in runtime.cached_page_indexes
                                 for index in near_indexes))
-        second_decode = events.index(("decode", names[near_indexes[1]]))
+        near_decodes = [events.index(("decode", names[index])) for index in near_indexes]
+        last_decode = near_decodes[-1]
         distant = [position for position, (_kind, image_id) in enumerate(events)
                    if image_id not in {names[current_index],
-                                       names[near_indexes[0]],
-                                       names[near_indexes[1]]}]
-        assert not distant or min(distant) > second_decode
-        assert events.index(("decode", names[near_indexes[0]])) < second_decode
+                                       *(names[index] for index in near_indexes)}]
+        assert not distant or min(distant) > last_decode
+        assert near_decodes == sorted(near_decodes)
+        last_key = runtime._key_for(units[near_indexes[-1]], request.render_spec)
+        assert runtime._admission_rank(last_key) <= runtime._admission_policy.minimum_protected_rank
     finally:
         runtime.cancel(clear_artifacts=True)
         _wait(qapp, lambda: not runtime.has_unfinished_tasks())
         assert runtime.shutdown(wait_msecs=3000)
         source.close()
+
+
+def test_twenty_priority_screens_respect_hard_budget_and_resume_on_increase(tmp_path, qapp):
+    archive = tmp_path / "budget.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        for index in range(24):
+            path = tmp_path / f"{index}.png"
+            Image.new("RGB", (80, 120), (index * 10, 70, 90)).save(path)
+            output.write(path, path.name)
+    source = ZipImageSource(archive)
+    units = tuple(_unit(index, (80, 120)) for index in range(24))
+    runtime = ZipRasterBookRuntime(source, 1, cache_byte_budget=64 << 20)
+    request = ZipRasterRequest(1, 1, units[0], _plan(units), ZipRasterRenderSpec((80, 120)),
+                               next_display_units=units[1:21])
+    frames = []
+    runtime.frameReady.connect(frames.append)
+    try:
+        assert runtime.request(request)
+        _wait(qapp, lambda: bool(frames))
+        limit = runtime.cache_bytes + 1
+        runtime.set_cache_limits(byte_budget=limit)
+        assert runtime.release_continuous_warmup(request_id=1)
+        _wait(qapp, lambda: not runtime.has_unfinished_tasks())
+        assert runtime.cached_page_indexes == (0,)
+        assert runtime.cache_bytes <= limit
+        assert runtime.metrics.prefetch_admission_stops > 0
+        runtime.set_cache_limits(byte_budget=64 << 20)
+        _wait(qapp, lambda: len(runtime.cached_page_indexes) == 24 and not runtime.has_unfinished_tasks())
+        # The range is a priority band, not a stop after 20 screens.
+        assert runtime.cache_bytes <= 64 << 20
+        assert runtime.metrics.terminal_errors == 0
+    finally:
+        runtime.cancel(clear_artifacts=True)
+        _wait(qapp, lambda: not runtime.has_unfinished_tasks())
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()
+
+
+def test_priority_and_local_navigation_request_bounds_are_finite():
+    units = tuple(_unit(index) for index in range(80))
+    with pytest.raises(ValueError, match="at most 40"):
+        ZipRasterRequest(1, 1, units[0], _plan(units), ZipRasterRenderSpec((80, 120)),
+                         next_display_units=units[1:42])
+    topology = _plan(units).topology
+    with pytest.raises(ValueError, match="bounded to 56"):
+        RasterWarmupPlan(topology, current=units[0], identity_of=lambda u: u.identity,
+                         page_indexes_of=lambda u: (p.page_index for p in u.pages),
+                         direction=1, background_enabled=True,
+                         nearby_units=units[1:58])

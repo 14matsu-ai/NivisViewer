@@ -632,14 +632,16 @@ class ZipRasterRequest:
     navigation_direction: int = 0
     resolve_layout_metadata: bool = False
     next_display_units: tuple[ZipRasterDisplayUnit, ...] = ()
+    reverse_priority_screens: int = _READY_AHEAD_OPPOSITE_UNITS
 
     def __post_init__(self) -> None:
         if self.warmup_plan.current_identity != self.current.identity:
             raise ValueError("warm-up plan current must match request current")
-        if len(self.next_display_units) > 2:
-            raise ValueError("next display runway must contain at most two units")
+        if len(self.next_display_units) > 40:
+            raise ValueError("priority display runway must contain at most 40 units")
         object.__setattr__(self, "source_epoch", int(self.source_epoch))
         object.__setattr__(self, "request_id", int(self.request_id))
+        object.__setattr__(self, "reverse_priority_screens", max(0, min(20, int(self.reverse_priority_screens))))
         direction = int(self.navigation_direction)
         object.__setattr__(
             self,
@@ -2882,10 +2884,15 @@ class RasterBookRuntime(QObject):
         self,
         request: ZipRasterRequest,
     ) -> tuple[tuple[tuple[int, str], ...], ...]:
-        return request.warmup_plan.priority_band_identities(
-            preferred_units=self._ready_ahead_preferred_units(request),
-            opposite_units=_READY_AHEAD_OPPOSITE_UNITS,
-        )
+        if not request.warmup_plan.background_enabled:
+            return ()
+        return tuple(dict.fromkeys((
+            *(unit.identity for unit in request.next_display_units),
+            *request.warmup_plan.priority_band_identities(
+                preferred_units=self._ready_ahead_preferred_units(request),
+                opposite_units=request.reverse_priority_screens,
+            ),
+        )))
 
     def cache_debug_values(self) -> dict[str, int | str | bool]:
         """Expose population state to offscreen benchmarks without logging."""
@@ -3746,7 +3753,7 @@ class RasterBookRuntime(QObject):
             return
         planner.set_priority_band(
             preferred_units=self._ready_ahead_preferred_units(request),
-            opposite_units=_READY_AHEAD_OPPOSITE_UNITS,
+            opposite_units=request.reverse_priority_screens,
         )
         self._release_finished_active_slot()
         if self._current_key not in self._frame_store:
@@ -3777,7 +3784,7 @@ class RasterBookRuntime(QObject):
             ]
             if unresolved_near:
                 # Do not let the planner's reverse-safety unit, distant header
-                # corridor or encoded ring run ahead of the next two screens.
+                # corridor or encoded ring run ahead of the requested screens.
                 # Completion/navigation calls _drive again; no polling owner.
                 near_only = True
                 unit = next(

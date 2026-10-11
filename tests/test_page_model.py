@@ -302,3 +302,26 @@ def test_next_display_spreads_follow_real_single_spread_wide_and_direction_edges
         reverse = spread.next_display_spreads(direction=-1)
         assert tuple(sorted(slot.page_index for slot in reverse[0].slots)) == (1, 2)
         assert tuple(slot.page_index for slot in reverse[1].slots) == (0,)
+
+
+def test_custom_next_screen_count_matches_actual_turns_without_changing_model():
+    sizes = [(800, 1200)] * 50
+    sizes[5] = sizes[12] = (1600, 900)
+    for mode in ("single", "spread"):
+        for reading in ("ltr", "rtl"):
+            for direction in (1, -1):
+                for count in (1, 2, 20):
+                    model = make_model(sizes, view_mode=mode, reading_direction=reading)
+                    model.go_to_index(0 if direction > 0 else 49)
+                    before = (model.current_index, model.focused_index, model._sliding_spread)
+                    preview = model.next_display_spreads(direction=direction, count=count)
+                    assert (model.current_index, model.focused_index, model._sliding_spread) == before
+                    actual = []
+                    for _ in range(count):
+                        previous = model.current_index
+                        (model.next if direction > 0 else model.previous)()
+                        if model.current_index == previous:
+                            break
+                        actual.append(model.spread_at())
+                    assert preview == tuple(actual)
+                    assert len(preview) == count

@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 from PIL import Image
 from PySide6.QtCore import QCoreApplication, QEvent
 from PySide6.QtGui import QImage, QKeySequence
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QPushButton, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QGroupBox, QPushButton, QWidget
 
 from app.browser_model import BrowserItem, BrowserItemKind
 from app.config_manager import ConfigManager
@@ -25,6 +25,45 @@ def make_config(tmp_path: Path) -> ConfigManager:
     config = ConfigManager(tmp_path / "config.json")
     config.load()
     return config
+
+
+def test_zip_priority_settings_apply_cancel_reset_and_preserve_hidden_image_values(tmp_path, qapp):
+    config = make_config(tmp_path)
+    config.apply({"viewer_prefetch_preset": "custom", "viewer_prefetch_image_forward_units": 9,
+                  "viewer_prefetch_image_backward_units": 8})
+    dialog = SettingsDialog(config)
+    try:
+        spin = dialog.viewer_zip_priority_screens_spin
+        assert (spin.minimum(), spin.maximum(), spin.value()) == (1, 20, 2)
+        assert spin.suffix().strip() == "画面分"
+        assert dialog.prefetch_image_forward_spin.isHidden()
+        assert dialog.prefetch_image_backward_spin.isHidden()
+        titles = [g.title() for g in dialog.findChildren(QGroupBox)]
+        assert "先読み設定" in titles and "ZIP・CBZの優先先読み" not in titles
+        assert "PDF・旧形式の先読み" not in titles
+        spin.setValue(20)
+        dialog.prefetch_pdf_forward_spin.setValue(5)
+        changed = dialog.apply_settings()
+        assert changed["viewer_zip_priority_screens"] == 20
+        loaded = ConfigManager(config.path).load()
+        assert loaded["viewer_zip_priority_screens"] == 20
+        assert loaded["viewer_prefetch_pdf_forward_units"] == 5
+        assert loaded["viewer_prefetch_image_forward_units"] == 9
+        assert loaded["viewer_prefetch_image_backward_units"] == 8
+        spin.setValue(1)
+        dialog.reject()
+        assert config.get("viewer_zip_priority_screens") == 20
+    finally:
+        dialog.close()
+    reset = SettingsDialog(config)
+    try:
+        reset._reset_viewer_scope()
+        assert reset.viewer_zip_priority_screens_spin.value() == 2
+        assert config.get("viewer_zip_priority_screens") == 20
+        reset.apply_settings()
+        assert ConfigManager(config.path).load()["viewer_zip_priority_screens"] == 2
+    finally:
+        reset.close()
 
 
 def test_plain_tooltip_wrap_preserves_content_and_explicit_lines() -> None:

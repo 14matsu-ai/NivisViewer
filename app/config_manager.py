@@ -312,6 +312,12 @@ class ConfigManager(QObject):
         "viewer_memory_mode": "auto",
         "viewer_decode_workers": 1,
         "viewer_zip_read_ahead_enabled": True,
+        "viewer_zip_priority_screens": 2,  # Legacy alias for forward priority.
+        "viewer_prefetch_forward_screens": 2,
+        "viewer_prefetch_backward_screens": 1,
+        "viewer_pdf_prefetch_individual": True,
+        "viewer_pdf_prefetch_forward_screens": 1,
+        "viewer_pdf_prefetch_backward_screens": 0,
         "rotation_angle": 0,
         "slideshow_interval_ms": 3000,
         "slideshow_repeat": False,
@@ -390,6 +396,7 @@ class ConfigManager(QObject):
             return self.data
 
         if isinstance(loaded, dict):
+            loaded = self._migrate_prefetch_settings(loaded)
             loaded = self._migrate_browser_item_spacing(loaded)
             loaded = self._migrate_legacy_resampling_settings(loaded)
             raw_shortcuts = loaded.get("shortcut_bindings")
@@ -514,6 +521,24 @@ class ConfigManager(QObject):
                 [] if legacy_close == "" else [legacy_close]
             )
             updates["shortcut_bindings"] = shortcut_bindings
+        # Resolve partial legacy updates against their saved preset/custom
+        # draft, without filling unrelated modern settings from defaults.
+        legacy_pdf_keys = {
+            "viewer_prefetch_preset", "viewer_prefetch_pdf_forward_units",
+            "viewer_prefetch_pdf_backward_units",
+        }
+        if legacy_pdf_keys.intersection(updates):
+            legacy_context = {key: self.data[key] for key in legacy_pdf_keys}
+            legacy_context.update(updates)
+            migrated = self._migrate_prefetch_settings(legacy_context)
+            updates = {
+                **updates,
+                **{key: migrated[key] for key in (
+                    "viewer_pdf_prefetch_forward_screens",
+                    "viewer_pdf_prefetch_backward_screens",
+                )},
+            }
+        updates = self._migrate_prefetch_settings(updates)
         merged = deepcopy(self.data)
         merged.update(self._migrate_browser_item_spacing(updates))
         merged.pop(self._LEGACY_VIEWER_CACHE_MEMORY_KEY, None)
@@ -1112,6 +1137,25 @@ class ConfigManager(QObject):
         normalized["viewer_decode_workers"] = cls._clamped_int(
             normalized.get("viewer_decode_workers"), default=1, minimum=1, maximum=2,
         )
+        normalized["viewer_zip_priority_screens"] = cls._clamped_int(
+            (None if isinstance(normalized.get("viewer_zip_priority_screens"), bool)
+             else normalized.get("viewer_zip_priority_screens")),
+            default=2, minimum=1, maximum=20,
+        )
+        for key, minimum in (
+            ("viewer_prefetch_forward_screens", 1),
+            ("viewer_prefetch_backward_screens", 0),
+            ("viewer_pdf_prefetch_forward_screens", 0),
+            ("viewer_pdf_prefetch_backward_screens", 0),
+        ):
+            value = normalized.get(key)
+            normalized[key] = cls._clamped_int(
+                None if isinstance(value, bool) else value,
+                default=int(cls.DEFAULTS[key]), minimum=minimum, maximum=20,
+            )
+        normalized["viewer_zip_priority_screens"] = normalized["viewer_prefetch_forward_screens"]
+        if not isinstance(normalized.get("viewer_pdf_prefetch_individual"), bool):
+            normalized["viewer_pdf_prefetch_individual"] = True
         if not isinstance(normalized.get("viewer_zip_read_ahead_enabled"), bool):
             normalized["viewer_zip_read_ahead_enabled"] = True
         normalized["thumbnail_cache_limit_mb"] = cls._clamped_int(
@@ -1188,6 +1232,27 @@ class ConfigManager(QObject):
             migrated.pop(key, None)
         return migrated
 
+    @classmethod
+    def _migrate_prefetch_settings(cls, values: dict[str, Any]) -> dict[str, Any]:
+        migrated = dict(values)
+        if "viewer_prefetch_forward_screens" not in migrated and "viewer_zip_priority_screens" in migrated:
+            migrated["viewer_prefetch_forward_screens"] = migrated["viewer_zip_priority_screens"]
+        legacy_pdf_keys = {
+            "viewer_prefetch_preset", "viewer_prefetch_pdf_forward_units",
+            "viewer_prefetch_pdf_backward_units",
+        }
+        if legacy_pdf_keys.intersection(migrated):
+            preset = str(migrated.get("viewer_prefetch_preset", "custom"))
+            preset_values = cls.VIEWER_PREFETCH_PRESETS.get(preset, {})
+            for direction in ("forward", "backward"):
+                new_key = f"viewer_pdf_prefetch_{direction}_screens"
+                if new_key not in migrated:
+                    migrated[new_key] = preset_values.get(
+                        f"pdf_{direction}_units",
+                        migrated.get(f"viewer_prefetch_pdf_{direction}_units", 3),
+                    )
+        return migrated
+
     def viewer_prefetch_settings(self) -> dict[str, int | bool | str]:
         preset = str(self.get("viewer_prefetch_preset", "standard"))
         if preset == "custom":
@@ -1233,6 +1298,6 @@ class ConfigManager(QObject):
     def _clamped_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
         try:
             number = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             number = default
         return max(minimum, min(maximum, number))

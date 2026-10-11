@@ -15,7 +15,7 @@ from PySide6.QtWidgets import QApplication
 
 from app.book_session import BookSession
 from app.config_manager import ConfigManager
-from app.image_source import ImageSourceError, ZipImageSource
+from app.image_source import FolderImageSource, ImageSourceError, ZipImageSource
 from app.raster_warmup_planner import RasterBookTopology, RasterWarmupPlan
 from app.viewer_navigation_policy import NavigationInputKind
 from app.viewer_presentation_state import PresentationSurfaceMode
@@ -68,6 +68,67 @@ def _window(
     window = ViewerWindow(config_manager=config, book_session=session)
     window.resize(640, 480)
     return window, session, source, archive
+
+
+def test_zip_priority_count_updates_open_request_and_shifted_spread_lookup(tmp_path, qapp):
+    window, session, source, archive = _window(tmp_path, pages=48, memory_mode="256")
+    try:
+        window.set_view_mode("single")
+        window.show()
+        qapp.processEvents()
+        assert window._finish_opened_book(session.open_book(archive), modal_on_empty=False)
+        runtime = session.viewer_runtime
+        _wait_until(qapp, lambda: runtime.cached_unit_count >= 1)
+        request_id = window._active_request_id
+        for screens in (1, 20, 2):
+            window.config.apply({"viewer_zip_priority_screens": screens})
+            request = runtime._current_request
+            assert request.request_id == request_id
+            assert len(request.next_display_units) == screens
+            assert [unit.start_index for unit in request.next_display_units] == list(range(1, screens + 1))
+            assert all(request.warmup_plan.unit_for_identity(unit.identity) is not None
+                       for unit in request.next_display_units)
+        window.config.apply({"viewer_zip_priority_screens": 20})
+        window.model.go_to_index(20)
+        window.presentation_state._direction = -1
+        reverse = window._zip_runtime_request(window.model.spread_at())
+        assert [u.start_index for u in reverse.next_display_units] == [*range(19, -1, -1), 21]
+
+        # An odd-parity spread is outside canonical topology; all 20 actual
+        # navigation units must still resolve for worker admission.
+        window.model.update_options(view_mode="spread", reading_direction="ltr", single_first_page=False)
+        window.model.set_image_sizes(tuple((i, (120 + i * 10, 180 + i * 10)) for i in range(48)))
+        window.model.go_to_raw_index(1)
+        window.presentation_state._direction = 1
+        shifted = window._zip_runtime_request(window.model.spread_at())
+        assert len(shifted.next_display_units) == 21
+        assert [u.start_index for u in shifted.next_display_units] == [*range(3, 43, 2), 0]
+        assert all(shifted.warmup_plan.unit_for_identity(u.identity) is not None
+                   for u in shifted.next_display_units)
+    finally:
+        window.prepare_shutdown(wait_msecs=5000)
+        window.close()
+        qapp.processEvents()
+
+
+def test_legacy_zip_priority_migrates_to_common_folder_priority(tmp_path, qapp):
+    _write_zip(tmp_path, pages=4)
+    source = FolderImageSource(tmp_path)
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.apply({"viewer_zip_priority_screens": 20})
+    session = BookSession(source_factory=lambda *_args, **_kwargs: (source, None))
+    window = ViewerWindow(config_manager=config, book_session=session)
+    try:
+        window.set_view_mode("single")
+        assert window._finish_opened_book(session.open_book(tmp_path), modal_on_empty=False)
+        request = window._zip_runtime_request(window.model.spread_at())
+        assert request is not None
+        assert [unit.start_index for unit in request.next_display_units] == [1, 2, 3]
+    finally:
+        window.prepare_shutdown(wait_msecs=5000)
+        window.close()
+        qapp.processEvents()
 
 
 def test_viewer_admits_leading_slider_target_before_release(tmp_path, qapp):

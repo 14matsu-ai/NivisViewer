@@ -145,9 +145,11 @@ class RasterWarmupPlan(Generic[UnitT, IdentityT]):
         # A bounded request-local view of PageModel navigation; not another
         # scheduler or a second full-book topology. Shared page->ordinal
         # mappings remain canonical and cannot be overwritten by overlaps.
-        supplied = tuple(islice(nearby_units, 17))
-        if len(supplied) > 16:
-            raise ValueError("nearby raster units must be bounded to 16")
+        # Up to 20 requested screens in each direction plus the 16 local
+        # navigation edges, including shifted/overlapping spreads.
+        supplied = tuple(islice(nearby_units, 57))
+        if len(supplied) > 56:
+            raise ValueError("nearby raster units must be bounded to 56")
         self._nearby_by_identity: dict[IdentityT, UnitT] = {}
         self._nearby_by_page: dict[int, UnitT] = {}
         self._nearby_page_rank: dict[int, int] = {}

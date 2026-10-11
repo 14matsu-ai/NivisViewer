@@ -393,6 +393,9 @@ TAB_SETTING_KEYS: dict[str, tuple[str, ...]] = {
         "viewer_slider_wheel_single_page_enabled", "magnifier_allow_outside_image",
         "viewer_prefetch_preset", "viewer_prefetch_direction_priority_enabled",
         "viewer_memory_mode", "viewer_decode_workers", "viewer_zip_read_ahead_enabled",
+        "viewer_zip_priority_screens", "viewer_prefetch_forward_screens",
+        "viewer_prefetch_backward_screens", "viewer_pdf_prefetch_individual",
+        "viewer_pdf_prefetch_forward_screens", "viewer_pdf_prefetch_backward_screens",
         "viewer_downscale_algorithm", "viewer_upscale_algorithm",
         "magnifier_downscale_algorithm", "magnifier_upscale_algorithm",
         "viewer_prefetch_image_forward_units", "viewer_prefetch_image_backward_units",
@@ -1292,6 +1295,12 @@ class SettingsDialog(QDialog):
         self._select_data(self.viewer_memory_mode_combo, defaults["viewer_memory_mode"])
         self._select_data(self.viewer_decode_workers_combo, defaults["viewer_decode_workers"])
         self.viewer_zip_read_ahead_checkbox.setChecked(defaults["viewer_zip_read_ahead_enabled"])
+        self.viewer_zip_priority_screens_spin.setValue(defaults["viewer_prefetch_forward_screens"])
+        self.viewer_prefetch_backward_spin.setValue(defaults["viewer_prefetch_backward_screens"])
+        self.viewer_pdf_prefetch_individual_checkbox.setChecked(defaults["viewer_pdf_prefetch_individual"])
+        self.viewer_pdf_prefetch_forward_spin.setValue(defaults["viewer_pdf_prefetch_forward_screens"])
+        self.viewer_pdf_prefetch_backward_spin.setValue(defaults["viewer_pdf_prefetch_backward_screens"])
+        self._update_pdf_prefetch_controls(self.viewer_pdf_prefetch_individual_checkbox.isChecked())
         self._select_data(self.viewer_downscale_algorithm_combo, defaults["viewer_downscale_algorithm"])
         self._select_data(self.viewer_upscale_algorithm_combo, defaults["viewer_upscale_algorithm"])
         self._select_data(self.magnifier_downscale_algorithm_combo, defaults["magnifier_downscale_algorithm"])
@@ -2028,6 +2037,44 @@ class SettingsDialog(QDialog):
         parallel_help.setWordWrap(True)
         memory_form.addRow(parallel_help)
 
+        zip_priority_group = QGroupBox(tr('先読み設定'), tab)
+        zip_priority_form = QFormLayout(zip_priority_group)
+        self.viewer_zip_priority_screens_spin = QSpinBox(zip_priority_group)
+        self.viewer_zip_priority_screens_spin.setRange(1, 20)
+        self.viewer_zip_priority_screens_spin.setSuffix(tr(' 画面分'))
+        zip_priority_form.addRow(
+            tr('進行方向に優先して準備する画面数:'),
+            self.viewer_zip_priority_screens_spin,
+        )
+        self.viewer_prefetch_backward_spin = QSpinBox(zip_priority_group)
+        self.viewer_prefetch_backward_spin.setRange(0, 20)
+        self.viewer_prefetch_backward_spin.setSuffix(tr(' 画面分'))
+        zip_priority_form.addRow(tr('逆方向に優先して準備する画面数:'), self.viewer_prefetch_backward_spin)
+        priority_help = QLabel(tr(
+            'フォルダー・ZIP／CBZ・RAR／7zに共通です。単ページでは1画面＝1ページ、見開きでは実際の1見開きです。'
+            '戻る操作では進行方向と逆方向を入れ替えます。指定範囲を遠方より先に準備し、その先もメモリ上限内で先読みを続けます。'
+            'メモリ使用量は総保持量、同時読み込み数は並列処理数を決めます。メモリ不足時は指定範囲をすべて準備できない場合があります。変更は開いている本にも適用します。'
+        ), zip_priority_group)
+        priority_help.setWordWrap(True)
+        zip_priority_form.addRow(priority_help)
+        self.viewer_pdf_prefetch_individual_checkbox = QCheckBox(tr('PDFは個別に設定する'), zip_priority_group)
+        zip_priority_form.addRow(self.viewer_pdf_prefetch_individual_checkbox)
+        self.viewer_pdf_prefetch_forward_spin = QSpinBox(zip_priority_group)
+        self.viewer_pdf_prefetch_backward_spin = QSpinBox(zip_priority_group)
+        for spin in (self.viewer_pdf_prefetch_forward_spin, self.viewer_pdf_prefetch_backward_spin):
+            spin.setRange(0, 20)
+            spin.setSuffix(tr(' 画面分'))
+            spin.setToolTip(tr('PDFはページによって読み込みに時間がかかります。先読み範囲を広げるとCPU・メモリの使用量が増えるため、初期設定では控えめにしています。'))
+        zip_priority_form.addRow(tr('PDFの進行方向:'), self.viewer_pdf_prefetch_forward_spin)
+        zip_priority_form.addRow(tr('PDFの逆方向:'), self.viewer_pdf_prefetch_backward_spin)
+        pdf_help = QLabel(tr(
+            '個別設定ONでは指定範囲だけを先読みします（初期値は進行方向1画面・逆方向0画面、両方0で無効）。'
+            'OFFでは上の共通優先範囲に従い、その先もメモリ上限内で少量ずつ準備します。PDFの読み込み中は新しい操作への応答が遅れる場合があります。'
+        ), zip_priority_group)
+        pdf_help.setWordWrap(True)
+        zip_priority_form.addRow(pdf_help)
+        self.viewer_pdf_prefetch_individual_checkbox.toggled.connect(self._update_pdf_prefetch_controls)
+
         resampling_group = QGroupBox(tr('画像の拡大縮小'), tab)
         resampling_layout = QVBoxLayout(resampling_group)
 
@@ -2086,7 +2133,7 @@ class SettingsDialog(QDialog):
         resampling_note.setWordWrap(True)
         resampling_layout.addWidget(resampling_note)
 
-        prefetch_group = QGroupBox(tr('PDF・旧形式の先読み'), tab)
+        prefetch_group = QGroupBox(tr('PDFの先読み'), tab)
         prefetch_layout = QVBoxLayout(prefetch_group)
         prefetch_form = QFormLayout()
         self.prefetch_preset_combo = QComboBox(prefetch_group)
@@ -2119,20 +2166,16 @@ class SettingsDialog(QDialog):
             self.prefetch_pdf_backward_spin,
         ):
             spin.setRange(0, 20)
-            spin.setSuffix(tr(' 表示単位'))
-        custom_form.addRow(
-            tr('ZIP・Folder以外 進行方向:'),
-            self.prefetch_image_forward_spin,
-        )
-        custom_form.addRow(
-            tr('ZIP・Folder以外 逆方向:'),
-            self.prefetch_image_backward_spin,
-        )
-        custom_form.addRow(tr('PDF 進行方向:'), self.prefetch_pdf_forward_spin)
-        custom_form.addRow(tr('PDF 逆方向:'), self.prefetch_pdf_backward_spin)
+            spin.setSuffix(tr(' 画面分'))
+        # Production folder/ZIP/RAR/7z sources all use the raster runtime.
+        # Keep legacy draft controls/keys for saved-value compatibility only.
+        self.prefetch_image_forward_spin.hide()
+        self.prefetch_image_backward_spin.hide()
+        custom_form.addRow(tr('進行方向:'), self.prefetch_pdf_forward_spin)
+        custom_form.addRow(tr('逆方向:'), self.prefetch_pdf_backward_spin)
         prefetch_layout.addWidget(self.prefetch_custom_group)
         display_unit_note = QLabel(
-            tr('ZIP・Folderは上のメモリ量だけで保持量を決めます。この先読み設定はPDFと旧pipeline形式だけに適用されます。\n単ページ表示では1表示単位＝1ページ、見開き表示では1表示単位＝1見開きです。'),
+            tr('この設定はPDFだけに適用します。単ページでは1画面＝1ページ、見開きでは1画面＝実際の1見開きです。\nZIP・CBZの優先範囲とは別の設定です。ZIP・フォルダーなどの総保持量はビューワーのメモリ使用量で決まります。'),
             prefetch_group,
         )
         display_unit_note.setWordWrap(True)
@@ -2185,8 +2228,9 @@ class SettingsDialog(QDialog):
         layout.addWidget(behavior_group)
         layout.addWidget(spread_group)
         layout.addWidget(memory_group)
+        layout.addWidget(zip_priority_group)
         layout.addWidget(resampling_group)
-        layout.addWidget(prefetch_group)
+        prefetch_group.hide()
         layout.addWidget(fullscreen_group)
         layout.addWidget(self._make_tab_reset_button("viewer", tab))
         layout.addStretch(1)
@@ -3467,6 +3511,10 @@ class SettingsDialog(QDialog):
         layout.addStretch(1)
         return tab
 
+    def _update_pdf_prefetch_controls(self, individual: bool) -> None:
+        self.viewer_pdf_prefetch_forward_spin.setEnabled(individual)
+        self.viewer_pdf_prefetch_backward_spin.setEnabled(individual)
+
     def load_current_values(self) -> None:
         self.browser_workflow_settings.load(self.config.data)
         for key, spin in self.browser_icon_margin_spins.items():
@@ -3599,6 +3647,12 @@ class SettingsDialog(QDialog):
         )
         self._select_data(self.viewer_decode_workers_combo, self.config.get("viewer_decode_workers", 1))
         self.viewer_zip_read_ahead_checkbox.setChecked(self.config.get("viewer_zip_read_ahead_enabled", True))
+        self.viewer_zip_priority_screens_spin.setValue(self.config.get("viewer_prefetch_forward_screens", 2))
+        self.viewer_prefetch_backward_spin.setValue(self.config.get("viewer_prefetch_backward_screens", 1))
+        self.viewer_pdf_prefetch_individual_checkbox.setChecked(self.config.get("viewer_pdf_prefetch_individual", True))
+        self.viewer_pdf_prefetch_forward_spin.setValue(self.config.get("viewer_pdf_prefetch_forward_screens", 1))
+        self.viewer_pdf_prefetch_backward_spin.setValue(self.config.get("viewer_pdf_prefetch_backward_screens", 0))
+        self._update_pdf_prefetch_controls(self.viewer_pdf_prefetch_individual_checkbox.isChecked())
         self._select_data(
             self.viewer_downscale_algorithm_combo,
             self.config.get("viewer_downscale_algorithm", "auto"),
@@ -4414,6 +4468,12 @@ class SettingsDialog(QDialog):
             ),
             "viewer_decode_workers": int(self.viewer_decode_workers_combo.currentData() or 1),
             "viewer_zip_read_ahead_enabled": self.viewer_zip_read_ahead_checkbox.isChecked(),
+            "viewer_zip_priority_screens": self.viewer_zip_priority_screens_spin.value(),
+            "viewer_prefetch_forward_screens": self.viewer_zip_priority_screens_spin.value(),
+            "viewer_prefetch_backward_screens": self.viewer_prefetch_backward_spin.value(),
+            "viewer_pdf_prefetch_individual": self.viewer_pdf_prefetch_individual_checkbox.isChecked(),
+            "viewer_pdf_prefetch_forward_screens": self.viewer_pdf_prefetch_forward_spin.value(),
+            "viewer_pdf_prefetch_backward_screens": self.viewer_pdf_prefetch_backward_spin.value(),
             "viewer_downscale_algorithm": str(
                 self.viewer_downscale_algorithm_combo.currentData() or "auto"
             ),

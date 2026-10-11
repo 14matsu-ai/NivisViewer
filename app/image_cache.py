@@ -280,6 +280,7 @@ class ImageCache(QObject):
         self._cache_entry_bytes: dict[int, int] = {}
         self._cache_bytes = 0
         self._cache_byte_budget = _DEFAULT_CACHE_BYTE_BUDGET
+        self._memory_bound_prefetch = False
         self._in_flight: dict[tuple[int, int], ImageSource] = {}
         self._tasks: dict[
             tuple[int, int],
@@ -287,6 +288,7 @@ class ImageCache(QObject):
         ] = {}
         self._cancel_requested_tasks: set[tuple[int, int]] = set()
         self._wanted_indexes: set[int] = set()
+        self._far_prefetch_indexes: frozenset[int] = frozenset()
         self._protected_indexes: set[int] = set()
         self._center_index = 0
         self._preferred_direction = 0
@@ -560,6 +562,15 @@ class ImageCache(QObject):
 
     def has_in_flight_for_source(self, source: ImageSource) -> bool:
         return any(active_source is source for active_source in self._in_flight.values())
+
+    def set_far_prefetch_indexes(self, indexes: tuple[int, ...]) -> None:
+        """Mark paced PDF work below all interactive and nearby work."""
+        self._far_prefetch_indexes = frozenset(indexes)
+
+    def set_memory_bound_prefetch(self, enabled: bool) -> None:
+        """PDF common mode retains completed work under the byte budget."""
+        self._memory_bound_prefetch = bool(enabled)
+        self._enforce_limit()
 
     def has_unfinished_tasks(self) -> bool:
         return any(
@@ -860,6 +871,8 @@ class ImageCache(QObject):
         self._start_task(task, work_priority)
 
     def _pdf_prefetch_priority(self, page_index: int) -> tuple[int, int]:
+        if page_index in self._far_prefetch_indexes:
+            return 1_000_000, 100
         queue_rank = self._pdf_prefetch_rank(page_index)
         render_rank = self._directional_prefetch_rank(page_index)
         return (
@@ -974,7 +987,7 @@ class ImageCache(QObject):
             self.cache_size,
             len(self._wanted_indexes),
         )
-        while len(self._cache) > active_count_limit:
+        while not self._memory_bound_prefetch and len(self._cache) > active_count_limit:
             candidate = self._oldest_evictable_index()
             if candidate is None:
                 break
@@ -1028,6 +1041,7 @@ class ImageCache(QObject):
         self._cache_bytes = max(0, self._cache_bytes)
 
     def _clear_cache(self) -> None:
+        self._far_prefetch_indexes = frozenset()
         self._cache.clear()
         self._cache_entry_bytes.clear()
         self._cache_bytes = 0

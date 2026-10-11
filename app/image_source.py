@@ -1438,9 +1438,9 @@ class ZipImageSource(ImageSource):
         cancelled = self._begin_request(image_id)
         try:
             ahead = self._read_ahead
-            prepared = ahead.take(image_id) if ahead is not None else None
             payload, read_calls = (
-                prepared if prepared is not None
+                ahead.read_foreground(image_id, cancelled, self._read_entry_qbytearray)
+                if ahead is not None
                 else self._read_entry_qbytearray(image_id, cancelled)
             )
             self._raise_if_cancelled(cancelled)

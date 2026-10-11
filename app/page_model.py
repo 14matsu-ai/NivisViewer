@@ -537,7 +537,7 @@ class PageModel:
         step = -1 if int(direction) < 0 else 1
         index, sliding = self.current_index, self._sliding_spread
         result: list[DisplaySpread] = []
-        for _ in range(max(0, min(2, int(count)))):
+        for _ in range(max(0, min(20, int(count)))):
             target = (
                 self.next_index_from(index) if step > 0
                 else self.previous_index_from(index, preserve_alignment=sliding)

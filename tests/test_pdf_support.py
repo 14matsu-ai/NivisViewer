@@ -541,7 +541,7 @@ def test_continuous_pdf_navigation_defers_far_prefetch_until_idle(
     window, session, service, backend = _open_many_page_pdf_window(
         tmp_path,
         qapp,
-        settings={"view_mode": "single", "cache_size": 10},
+        settings={"viewer_prefetch_preset": "standard", "view_mode": "single", "cache_size": 10},
         complete_prefetch=False,
     )
     try:
@@ -634,7 +634,7 @@ def test_backward_pdf_navigation_rolls_previous_page_without_far_prefetch(
 @pytest.mark.parametrize(
     ("settings", "immediate_pages", "completed_pages"),
     (
-        ({"view_mode": "single"}, [0, 1], [0, 1, 2, 3]),
+        ({"view_mode": "single"}, [0, 1], [0, 1]),
         (
             {
                 "view_mode": "spread",
@@ -642,7 +642,7 @@ def test_backward_pdf_navigation_rolls_previous_page_without_far_prefetch(
                 "reading_direction": "ltr",
             },
             [0, 1, 2, 3],
-            list(range(8)),
+            list(range(4)),
         ),
     ),
 )
@@ -780,7 +780,7 @@ def test_pdf_direction_priority_off_defers_nearest_background_work(
     window, session, service, backend = _open_many_page_pdf_window(
         tmp_path,
         qapp,
-        settings={
+        settings={"viewer_prefetch_preset": "standard",
             "view_mode": "single",
             "viewer_prefetch_direction_priority_enabled": False,
         },
@@ -906,7 +906,7 @@ def test_single_pdf_prefetch_survives_navigation_and_real_spec_changes_rerender(
     window, session, service, backend = _open_many_page_pdf_window(
         tmp_path,
         qapp,
-        settings={"view_mode": "single", "cache_size": 10},
+        settings={"viewer_prefetch_preset": "standard", "view_mode": "single", "cache_size": 10},
     )
     try:
         assert [request.page_index for request in backend.rendered] == [
@@ -1007,7 +1007,7 @@ def test_spread_pdf_uses_prefetched_current_and_partner_without_rerender(
     window, session, service, backend = _open_many_page_pdf_window(
         tmp_path,
         qapp,
-        settings={
+        settings={"viewer_prefetch_preset": "standard",
             "view_mode": "spread",
             "single_first_page": False,
             "reading_direction": "ltr",

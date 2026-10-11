@@ -40,6 +40,9 @@ class ZipReadAhead:
         self._keep: set[str] = set()
         self._cache: OrderedDict[str, tuple[QByteArray, int]] = OrderedDict()
         self._cache_bytes = 0
+        self._foreground_reads: dict[str, set[Event]] = {}
+        self._consumed: set[str] = set()
+        self._generation = 0
         self._pending_image_id: str | None = None
         self._pending_reserved_bytes = 0
         self._pending_cancel: Event | None = None
@@ -98,6 +101,7 @@ class ZipReadAhead:
                 return
             self._next = dict(next_reads)
             self._keep = set(keep)
+            self._consumed.intersection_update(self._keep)
             self._byte_budget = (
                 None
                 if byte_budget is None
@@ -137,6 +141,8 @@ class ZipReadAhead:
 
     def cancel(self) -> None:
         with self._condition:
+            self._generation += 1
+            self._consumed.clear()
             self._next.clear()
             self._keep.clear()
             self._cache.clear()
@@ -145,7 +151,9 @@ class ZipReadAhead:
                 self._pending_cancel.set()
             self._condition.notify_all()
 
-    def take(self, image_id: str) -> tuple[QByteArray, int] | None:
+    def take(
+        self, image_id: str, *, cancelled: Event | None = None,
+    ) -> tuple[QByteArray, int] | None:
         """Transfer one prepared payload to the foreground decoder.
 
         If this exact entry is currently being read, wait only until *that*
@@ -155,11 +163,15 @@ class ZipReadAhead:
 
         while True:
             with self._condition:
+                if self._closed or (cancelled is not None and cancelled.is_set()):
+                    return None
                 cached = self._cache.pop(image_id, None)
                 if cached is not None:
                     payload, read_calls = cached
                     self._cache_bytes -= payload.size()
                     self.hits += 1
+                    if image_id in self._keep:
+                        self._consumed.add(image_id)
                     self._condition.notify_all()
                     return payload, read_calls
 
@@ -173,6 +185,44 @@ class ZipReadAhead:
                     return None
 
                 self._condition.wait(timeout=0.05)
+
+    def read_foreground(
+        self,
+        image_id: str,
+        cancelled: Event,
+        read: Callable[[str, Event], tuple[QByteArray, int]],
+    ) -> tuple[QByteArray, int]:
+        """Atomically take a payload or reserve the decoder's own read.
+
+        Reservations contain no payload bytes: the page job already owns its
+        normal memory reservation. Keep active claims across ring cancellation
+        until their readers settle, but never revive an old generation's chain.
+        """
+        with self._condition:
+            prepared = self.take(image_id, cancelled=cancelled)
+            if prepared is not None:
+                return prepared
+            if self._closed:
+                cancelled.set()
+            generation = self._generation
+            self._foreground_reads.setdefault(image_id, set()).add(cancelled)
+        completed = False
+        try:
+            result = read(image_id, cancelled)
+            completed = not cancelled.is_set()
+            return result
+        finally:
+            with self._condition:
+                owners = self._foreground_reads[image_id]
+                owners.discard(cancelled)
+                if not owners:
+                    del self._foreground_reads[image_id]
+                if (
+                    completed and not self._closed
+                    and generation == self._generation and image_id in self._keep
+                ):
+                    self._consumed.add(image_id)
+                self._condition.notify_all()
 
     def kick(self, image_id: str) -> None:
         """Fill the ring forward from ``image_id`` on the single ZIP read lane."""
@@ -201,7 +251,10 @@ class ZipReadAhead:
                 next_id, reserved_bytes = candidate
                 if next_id not in self._keep:
                     return
-                if next_id in self._cache:
+                if (
+                    next_id in self._cache or next_id in self._foreground_reads
+                    or next_id in self._consumed
+                ):
                     current_trigger = next_id
                     continue
 
@@ -262,15 +315,17 @@ class ZipReadAhead:
         with self._condition:
             if self._future is future:
                 self._future = None
-            self._pending_image_id = None
-            self._pending_reserved_bytes = 0
-            self._pending_cancel = None
+                self._pending_image_id = None
+                self._pending_reserved_bytes = 0
+                self._pending_cancel = None
             self._condition.notify_all()
         self.signals.completed.emit()
 
     def close(self) -> None:
         with self._condition:
             self._closed = True
+            self._generation += 1
+            self._consumed.clear()
             self._next.clear()
             self._keep.clear()
             self._cache.clear()
