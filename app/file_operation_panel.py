@@ -75,6 +75,7 @@ class FileOperationPanel(QWidget):
         self._cancel_requested_for_operation = False
         self._idle_close_queued = False
         self._result_requires_acknowledgement = False
+        self._pending_result_details: list[str] = []
         self.summary_label = QLabel("", self)
         self.detail_label = QLabel("", self)
         self.queue_label = QLabel("", self)
@@ -179,6 +180,7 @@ class FileOperationPanel(QWidget):
     def _request_cancel(self) -> None:
         if self._result_requires_acknowledgement:
             self._result_requires_acknowledgement = False
+            self._pending_result_details.clear()
             self.close()
             self.result_acknowledged.emit()
             return
@@ -272,7 +274,12 @@ class FileOperationPanel(QWidget):
             and str(result.operation_id) != self._active_operation_id
         ):
             return
-        items = result.effective_items
+        self.show()
+        items = result.effective_items + tuple(
+            item for item in result.items
+            if item.child_results and not item.success
+            and all(child.success for child in item.leaf_results())
+        )
         failures = sum(not item.success for item in items)
         skipped = sum(
             item.state is FileOperationItemState.SKIPPED for item in items
@@ -306,18 +313,17 @@ class FileOperationPanel(QWidget):
             tr('メタデータ同期の確認が必要です: {p0}', p0=warning)
             for warning in result.metadata_sync_warnings
         )
-        self.details_view.setPlainText("\n".join(details))
-        self.details_button.setVisible(
-            bool(failures or result.metadata_sync_warnings)
-        )
+        self._pending_result_details.extend(details)
+        self.details_view.setPlainText("\n".join(self._pending_result_details))
+        self.details_button.setVisible(bool(self._pending_result_details))
         self.cancel_button.setEnabled(False)
         self._result_requires_acknowledgement = bool(
-            result.metadata_sync_warnings
+            self._pending_result_details
         )
         if self._result_requires_acknowledgement:
             self._hide_timer.stop()
-            self.details_view.setVisible(True)
-            self.details_button.setText(tr('詳細を隠す'))
+            self.details_view.setVisible(bool(result.metadata_sync_warnings))
+            self.details_button.setText(tr('詳細を隠す') if result.metadata_sync_warnings else tr('詳細'))
             self.cancel_button.setText(tr('閉じる'))
             self.cancel_button.setEnabled(True)
         else:

@@ -106,8 +106,20 @@ _FOLDER_SORT_TRADITIONAL = {
     '{p0}〈一時変更〉': '{p0}（暫時）',
     '{p0}<指定>': '{p0}<指定>',
 }
-SIMPLIFIED_CHINESE = _complete_catalog(_S1, _S2, _S3, _S4, _ICON_LOCATION_SIMPLIFIED, _PARALLEL_SIMPLIFIED, _SR, _FOLDER_SORT_SIMPLIFIED)
-TRADITIONAL_CHINESE = _complete_catalog(_T1, _T2, _T3, _T4, _ICON_LOCATION_TRADITIONAL, _PARALLEL_TRADITIONAL, _TR, _FOLDER_SORT_TRADITIONAL)
+_FILE_MUTATION_SIMPLIFIED = {
+    'このフォルダは移動中です。完了までお待ちください。': '正在移动此文件夹。请等待操作完成。',
+    'この項目は移動中です。完了までお待ちください。': '正在移动此项目。请等待操作完成。',
+    'このフォルダはファイル操作中です。完了までお待ちください。': '正在对此文件夹执行文件操作。请等待操作完成。',
+    'この項目はファイル操作中です。完了までお待ちください。': '正在对此项目执行文件操作。请等待操作完成。',
+}
+_FILE_MUTATION_TRADITIONAL = {
+    'このフォルダは移動中です。完了までお待ちください。': '正在移動此資料夾。請等待操作完成。',
+    'この項目は移動中です。完了までお待ちください。': '正在移動此項目。請等待操作完成。',
+    'このフォルダはファイル操作中です。完了までお待ちください。': '正在對此資料夾執行檔案操作。請等待操作完成。',
+    'この項目はファイル操作中です。完了までお待ちください。': '正在對此項目執行檔案操作。請等待操作完成。',
+}
+SIMPLIFIED_CHINESE = _complete_catalog(_S1, _S2, _S3, _S4, _ICON_LOCATION_SIMPLIFIED, _PARALLEL_SIMPLIFIED, _SR, _FOLDER_SORT_SIMPLIFIED, _FILE_MUTATION_SIMPLIFIED)
+TRADITIONAL_CHINESE = _complete_catalog(_T1, _T2, _T3, _T4, _ICON_LOCATION_TRADITIONAL, _PARALLEL_TRADITIONAL, _TR, _FOLDER_SORT_TRADITIONAL, _FILE_MUTATION_TRADITIONAL)
 
 SIMPLIFIED_CHINESE_DISAMBIGUATED = {
     ("縮小", "resampling"): "缩小采样",

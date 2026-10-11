@@ -514,6 +514,9 @@ class BrowserWorkflowController(QObject):
 
     def _pump(self) -> None:
         window = self.window
+        if getattr(window, '_file_mutation_requests', None):
+            self._stop_reason = "file-operation"
+            return
         if window._shutdown_prepared:
             self._stop_reason = "shutdown"
             return

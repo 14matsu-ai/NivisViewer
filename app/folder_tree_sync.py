@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtCore import QModelIndex, QObject, QTimer, Signal
@@ -76,6 +77,35 @@ class FolderTreeSyncController(QObject):
     def cancel(self) -> None:
         self.generation += 1
         self._target = None
+
+    def replace_model(self, model: QFileSystemModel, relocate: Callable[[str], str]) -> None:
+        """Rebuild native watches while keeping the tree's presentation."""
+        root = self.model.filePath(self.tree.rootIndex())
+        selected = self.model.filePath(self.tree.currentIndex())
+        expanded = self._auto_expanded | self._user_expanded
+        vertical = self.tree.verticalScrollBar().value()
+        horizontal = self.tree.horizontalScrollBar().value()
+        self.cancel()
+        self.model.directoryLoaded.disconnect(self._on_directory_loaded)
+        self.model = model
+        model.directoryLoaded.connect(self._on_directory_loaded)
+        self._auto_expanded = {self._path_key(relocate(path)) for path in self._auto_expanded}
+        self._user_expanded = {self._path_key(relocate(path)) for path in self._user_expanded}
+        self.applying = True
+        try:
+            self.tree.setModel(model)
+            if root:
+                self.tree.setRootIndex(model.index(relocate(root)))
+            for path in sorted(expanded, key=len):
+                index = model.index(relocate(path))
+                if index.isValid():
+                    self.tree.expand(index)
+            if selected:
+                self.tree.setCurrentIndex(model.index(relocate(selected)))
+            self.tree.verticalScrollBar().setValue(vertical)
+            self.tree.horizontalScrollBar().setValue(horizontal)
+        finally:
+            self.applying = False
 
     def show_full_tree(self, *, keep_current: bool = True) -> None:
         """Restore the model root without navigating or taking keyboard focus."""

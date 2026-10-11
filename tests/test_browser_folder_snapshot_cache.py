@@ -52,6 +52,20 @@ def test_cache_is_bounded_by_total_entries_and_lru() -> None:
     assert cache.get(third, visibility, sorting) is not None
 
 
+def test_discard_tree_removes_descendants_but_keeps_similarly_named_sibling() -> None:
+    cache = BrowserFolderSnapshotCache()
+    visibility, sorting = BrowserVisibilityPolicy(), BrowserSortPolicy()
+    root = Path("C:/folders/book")
+    child, sibling = root / "nested", Path("C:/folders/book-other")
+    for folder in (root, child, sibling):
+        cache.put(folder, visibility, sorting, [make_item(folder / "a.jpg")])
+    cache.discard_tree(root)
+    assert cache.entry_count == 1
+    assert cache.get(root, visibility, sorting) is None
+    assert cache.get(child, visibility, sorting) is None
+    assert cache.get(sibling, visibility, sorting) is not None
+
+
 def test_default_budget_retains_multiple_15k_item_folders() -> None:
     visibility = BrowserVisibilityPolicy()
     sorting = BrowserSortPolicy()

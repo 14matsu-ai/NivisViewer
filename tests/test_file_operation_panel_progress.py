@@ -237,7 +237,7 @@ def test_bound_panel_keeps_coordinator_metadata_warning_until_dismissed(
         ),
     ),
 )
-def test_bound_panel_keeps_existing_non_warning_terminal_lifecycle(
+def test_bound_panel_retains_failures_but_closes_success_and_empty_cancel(
     result: FileOperationResult,
     expected_summary: str,
     qapp: QApplication,
@@ -255,5 +255,41 @@ def test_bound_panel_keeps_existing_non_warning_terminal_lifecycle(
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     qapp.processEvents()
 
+    if result.failures:
+        assert destroyed == []
+        assert panel.isVisible()
+        assert panel.awaiting_result_acknowledgement
+        assert panel.cancel_button.text() == "閉じる"
+        panel.details_button.click()
+        assert panel.details_view.isVisible()
+        assert "injected failure" in panel.details_view.toPlainText()
+        panel.cancel_button.click()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        qapp.processEvents()
     assert destroyed == [True]
     queue.close()
+
+
+def test_failed_parent_cleanup_remains_visible_after_children_succeed(qapp):
+    queue = FileOperationQueue()
+    panel = FileOperationPanel()
+    panel.bind(queue)
+    result = FileOperationResult(
+        FileOperationKind.MOVE,
+        (FileOperationItemResult(
+            "source-folder", "destination-folder", False,
+            error_message="source folder cleanup failed",
+            child_results=(FileOperationItemResult("source-file", "destination-file", True),),
+            source_root_removed=False,
+        ),),
+    )
+    try:
+        queue.operation_completed.emit(result)
+        qapp.processEvents()
+        assert panel.isVisible()
+        assert panel.awaiting_result_acknowledgement
+        assert "失敗 1" in panel.summary_label.text()
+        assert "source folder cleanup failed" in panel.details_view.toPlainText()
+    finally:
+        panel.close()
+        queue.close()

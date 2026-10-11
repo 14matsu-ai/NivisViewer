@@ -201,3 +201,12 @@ class BrowserFolderSnapshotCache:
             _key, snapshot = self._entries.popitem(last=False)
             self._entry_count -= len(snapshot.items)
             self._estimated_bytes -= snapshot.estimated_bytes
+
+    def discard_tree(self, path: str | Path) -> None:
+        root_key = _path_key(path)
+        prefix = root_key.rstrip(os.sep) + os.sep
+        for key, snapshot in tuple(self._entries.items()):
+            if key[0] == root_key or key[0].startswith(prefix):
+                self._entry_count -= len(snapshot.items)
+                self._estimated_bytes -= snapshot.estimated_bytes
+                del self._entries[key]

@@ -1379,6 +1379,10 @@ ENGLISH.update({
 
 ENGLISH.update({
     '並び順変更指定…': 'Folder sort rules…',
+    'このフォルダは移動中です。完了までお待ちください。': 'This folder is being moved. Please wait until it finishes.',
+    'この項目は移動中です。完了までお待ちください。': 'This item is being moved. Please wait until it finishes.',
+    'このフォルダはファイル操作中です。完了までお待ちください。': 'A file operation is in progress on this folder. Please wait until it finishes.',
+    'この項目はファイル操作中です。完了までお待ちください。': 'A file operation is in progress on this item. Please wait until it finishes.',
     '並び順変更指定': 'Folder sort rules',
     '指定が適用されるフォルダでは、一覧上部の並び替えは一時変更です。保存するにはこの画面で編集してください。':
         'In folders with an active rule, sorting from the list toolbar is temporary. Edit here to save a rule.',

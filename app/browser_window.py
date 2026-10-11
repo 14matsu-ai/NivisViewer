@@ -12,7 +12,7 @@ from .menu_icons import install_text_icon_menu_style, selection_action_icon, set
 
 import os
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import monotonic
 from typing import Callable
@@ -637,6 +637,16 @@ class BrowserWindow(QMainWindow):
             file_operation_coordinator
             or FileOperationCoordinator(self.metadata_store)
         )
+        self._file_mutation_requests: dict[str, FileOperationRequest] = {}
+        self._tree_watch_suspended = False
+        self._tree_watch_original_disabled = False
+        self._tree_mutation_relocations: list[tuple[str, str]] = []
+        self.file_operation_coordinator.operation_started.connect(
+            self._on_file_mutation_started
+        )
+        self.file_operation_coordinator.operation_completed.connect(
+            self._on_file_mutation_completed
+        )
         self.file_operation_coordinator.operation_started.connect(
             self._on_file_operation_started
         )
@@ -1153,6 +1163,11 @@ class BrowserWindow(QMainWindow):
         self._build_ui()
         self._browser_workflow = BrowserWorkflowController(self)
         self._download_retry = BrowserDownloadRetry(self)
+        queue = self.file_operation_coordinator.queue
+        executor = self.file_operation_coordinator.executor
+        active_request = queue.active_operation if queue is not None else executor.active_request
+        if active_request is not None:
+            self._on_file_mutation_started(active_request)
         self.shortcut_bindings = normalize_shortcut_bindings(
             self.settings.get("shortcut_bindings")
         ).get("browser", {})
@@ -1271,11 +1286,13 @@ class BrowserWindow(QMainWindow):
         atomic_restore: bool = False,
         retry_failed_thumbnails: bool = False,
     ) -> bool:
+        target = self._absolute_browser_path(path)
+        if self._deny_file_mutation_access(target, folder=True):
+            return False
         if trace_id:
             performance_trace.mark(trace_id, "navigation.navigate_to.called")
         if not self._starting_drop_focus_navigation:
             self._cancel_browser_drop_focus()
-        target = self._absolute_browser_path(path)
         if self._snapshot_reconcile_pending and not self._same_path(
             self.current_path,
             target,
@@ -2295,6 +2312,9 @@ class BrowserWindow(QMainWindow):
         if self._shutdown_prepared:
             return
         target = self._absolute_browser_path(path)
+        if self._file_mutation_for_path(target) is not None:
+            self._clear_active_directory_watch()
+            return
         self._directory_watch_generation += 1
         generation = self._directory_watch_generation
         watched = self.directory_watcher.watch(str(target), generation)
@@ -2565,6 +2585,8 @@ class BrowserWindow(QMainWindow):
         self,
         parent_path: str,
     ) -> None:
+        if self._deny_file_mutation_access(parent_path, folder=True):
+            return
         normalized_path = os.path.abspath(os.path.normpath(parent_path))
         if (
             self._location_directory_menu is not None
@@ -2810,6 +2832,8 @@ class BrowserWindow(QMainWindow):
     ) -> bool:
         # Native Viewer opens already perform physical I/O in BookSession's worker.
         target = str(self._absolute_browser_path(path))
+        if self._deny_file_mutation_access(target, folder=is_directory):
+            return False
         request_id = self.path_availability_service.request_probe(
             target, purpose=f"browser_system_open:{action}", force=True
         )
@@ -2835,6 +2859,8 @@ class BrowserWindow(QMainWindow):
         ):
             return
         self._pending_system_open = None
+        if self._deny_file_mutation_access(pending.path, folder=pending.is_directory):
+            return
         if result.state is not PathAvailability.AVAILABLE:
             message = {
                 PathAvailability.MISSING: tr('対象が見つかりません'),
@@ -2957,6 +2983,8 @@ class BrowserWindow(QMainWindow):
         use_browser_order: bool = True,
         snapshot_item: BrowserItem | None = None,
     ) -> object | None:
+        if self._deny_file_mutation_access(path, folder=False):
+            return None
         handler = self._open_path_handler
         if handler is None:
             return None
@@ -3810,6 +3838,139 @@ class BrowserWindow(QMainWindow):
             tr('{p0}中… 0 / {p1}', p0=self._operation_label(request.operation), p1=max(1, len(request.source_paths)))
         )
 
+    @staticmethod
+    def _path_is_within(path: str | Path, root: str | Path) -> bool:
+        path_key = BrowserWindow._path_key(path)
+        root_key = BrowserWindow._path_key(root)
+        try:
+            return os.path.commonpath((path_key, root_key)) == root_key
+        except ValueError:
+            return False
+
+    def _file_mutation_for_path(self, path: str | Path) -> FileOperationRequest | None:
+        return next((
+            request for request in self._file_mutation_requests.values()
+            if any(self._path_is_within(path, root) for root in request.source_paths)
+        ), None)
+
+    def _deny_file_mutation_access(self, path: str | Path, *, folder: bool) -> bool:
+        request = self._file_mutation_for_path(path)
+        if request is None:
+            return False
+        if request.operation is FileOperationKind.MOVE:
+            message = (tr('このフォルダは移動中です。完了までお待ちください。') if folder
+                       else tr('この項目は移動中です。完了までお待ちください。'))
+        else:
+            message = (tr('このフォルダはファイル操作中です。完了までお待ちください。') if folder
+                       else tr('この項目はファイル操作中です。完了までお待ちください。'))
+        self._show_temporary_status(message)
+        return True
+
+    def _on_file_mutation_started(self, request: FileOperationRequest) -> None:
+        if self._shutdown_prepared or request.operation not in {
+            FileOperationKind.MOVE, FileOperationKind.RENAME,
+            FileOperationKind.RECYCLE, FileOperationKind.UNDO,
+        }:
+            return
+        key = request.operation_id or str(request.request_id)
+        self._file_mutation_requests[key] = request
+        # These direct GUI-thread slots run before either backend starts its
+        # worker. Disabling native tree watches closes existing handles too.
+        if not self._tree_watch_suspended:
+            option = FolderTreeModel.Option.DontWatchForChanges
+            self._tree_watch_original_disabled = self.file_system_model.testOption(option)
+            self.file_system_model.setOption(option, True)
+            self._tree_watch_suspended = True
+        pending = self._pending_scan
+        if pending is not None and self._file_mutation_for_path(pending.path) is not None:
+            self._cancel_pending_scan(rollback_history=True)
+        if (self._directory_watch_path is not None
+                and self._file_mutation_for_path(self._directory_watch_path) is not None):
+            self._clear_active_directory_watch()
+        self._close_location_directory_popup(cancel_pending=True)
+        if request.operation is not FileOperationKind.RENAME:
+            self._generation = self.thumbnail_provider.begin_generation()
+        self._update_selected_detail()
+        self._schedule_thumbnail_requests(0)
+
+    @classmethod
+    def _relocate_browser_value(cls, path: str, relocations: list[tuple[str, str]]) -> str:
+        for source, destination in relocations:
+            if cls._path_is_within(path, source):
+                path = os.path.normpath(os.path.join(destination, os.path.relpath(path, source)))
+        return path
+
+    def _on_file_mutation_completed(self, result: FileOperationResult) -> None:
+        key = result.operation_id or str(result.request_id)
+        request = self._file_mutation_requests.pop(key, None)
+        if self._shutdown_prepared:
+            return
+        if self._tree_watch_suspended:
+            QTimer.singleShot(0, self, self._restore_tree_after_file_mutation)
+        if request is None:
+            return
+        affected_current = self.current_path is not None and any(
+            self._path_is_within(self.current_path, root) for root in request.source_paths
+        )
+        relocations = []
+        # Recycle destinations belong to the trash, not navigation history.
+        for item in (result.items if request.operation is not FileOperationKind.RECYCLE else ()):
+            candidates = (item,) if item.success else item.leaf_results()
+            for candidate in candidates:
+                if candidate.success and candidate.source_path and candidate.destination_path:
+                    relocations.append((candidate.source_path, candidate.destination_path))
+        self._tree_mutation_relocations.extend(relocations)
+        for source, destination in relocations:
+            self.navigation_history.relocate_tree(source, destination)
+        for root in request.source_paths:
+            self.folder_snapshot_cache.discard_tree(root)
+            self.folder_snapshot_cache.discard_path(Path(root).parent)
+        if request.destination_directory:
+            self.folder_snapshot_cache.discard_path(request.destination_directory)
+        for _source, destination in relocations:
+            self.folder_snapshot_cache.discard_tree(destination)
+
+        if affected_current:
+            location = self._current_location()
+            target = self._relocate_browser_value(str(self.current_path), relocations)
+            # A successful recycle has no destination to follow.
+            if request.operation is FileOperationKind.RECYCLE:
+                for item in result.items:
+                    if item.success and item.source_path and self._path_is_within(target, item.source_path):
+                        target = str(Path(item.source_path).parent)
+                        break
+            selected = (self._relocate_browser_value(location.selected_path, relocations)
+                        if location.selected_path else None)
+            self.navigate_to(
+                target, record_history=False, capture_current=False, force_reload=True,
+                restore_location=replace(location, path=target, selected_path=selected),
+            )
+        else:
+            self._restore_current_directory_watch()
+        self._schedule_thumbnail_requests(0)
+        self._browser_workflow.schedule_background()
+
+    def _restore_tree_after_file_mutation(self) -> None:
+        if (self._shutdown_prepared or not self._tree_watch_suspended
+                or self._file_mutation_requests or self.file_operation_coordinator.busy):
+            return
+        # Re-enabling QFileSystemModel's option does not re-register its old
+        # directories. A fresh model restores both watches and updated nodes.
+        old_model = self.file_system_model
+        model = FolderTreeModel(self)
+        model.setOption(FolderTreeModel.Option.DontWatchForChanges, self._tree_watch_original_disabled)
+        model.setRootPath("")
+        relocations = self._tree_mutation_relocations
+        self._tree_mutation_relocations = []
+        self.file_system_model = model
+        self.folder_tree_sync.replace_model(
+            model, lambda path: self._relocate_browser_value(path, relocations),
+        )
+        for column in range(1, model.columnCount()):
+            self.folder_tree.hideColumn(column)
+        self._tree_watch_suspended = False
+        old_model.deleteLater()
+
     def _close_zip_progress_dialog(self) -> None:
         dialog = self._zip_progress_dialog
         self._zip_progress_dialog = None
@@ -3883,20 +4044,6 @@ class BrowserWindow(QMainWindow):
                 tr('ファイル操作は完了しましたが、メタデータ同期の確認が必要です'),
                 10000,
             )
-
-        if result.operation in {FileOperationKind.RENAME, FileOperationKind.MOVE, FileOperationKind.UNDO}:
-            relocation_items = tuple(
-                item
-                for item in result.items
-                if item.success and item.child_results
-            ) or result.effective_items
-            for item in relocation_items:
-                if item.source_path and item.destination_path:
-                    if item.success:
-                        self.navigation_history.relocate_tree(
-                            item.source_path,
-                            item.destination_path,
-                        )
 
         if (
             self._rating_batch is not None
@@ -6440,7 +6587,7 @@ class BrowserWindow(QMainWindow):
             self._set_selected_metadata()
             return
         item = self.item_model.item_at(indexes[0])
-        if item is None:
+        if item is None or self._file_mutation_for_path(item.path) is not None:
             self._detail_request_identity = None
             self._page_count_request_identity = None
             self._cancel_obsolete_page_count_requests(None)
@@ -7955,6 +8102,10 @@ class BrowserWindow(QMainWindow):
     def _restore_initial_folder(self) -> None:
         raw_path = self.settings.get("last_browser_path", "")
         candidate = Path(raw_path) if isinstance(raw_path, str) and raw_path else Path.home()
+        request = self._file_mutation_for_path(candidate)
+        if request is not None:
+            candidate = next(Path(root).parent for root in request.source_paths
+                             if self._path_is_within(candidate, root))
         self.set_current_folder(candidate)
 
     def _restore_window_state(self) -> None:
@@ -8113,6 +8264,8 @@ class BrowserWindow(QMainWindow):
             self._sync_tree_to_path(self.current_path)
 
     def _request_visible_thumbnails(self) -> None:
+        if self.current_path is not None and self._file_mutation_for_path(self.current_path) is not None:
+            return
         retry = getattr(self, "_download_retry", None)
         if retry is not None:
             retry.wake()
@@ -8148,6 +8301,7 @@ class BrowserWindow(QMainWindow):
             str(item.path)
             for row in plan.requested_rows
             if (item := self.item_model.item_at(row)) is not None
+            and self._file_mutation_for_path(item.path) is None
         }
         cancel_outside_plan = getattr(
             self.thumbnail_provider,
@@ -8176,6 +8330,7 @@ class BrowserWindow(QMainWindow):
                 item = self.item_model.item_at(row)
                 if (
                     item is None
+                    or self._file_mutation_for_path(item.path) is not None
                     or not item.can_generate_preview
                     or self.item_model._has_compatible_thumbnail(
                         item,
