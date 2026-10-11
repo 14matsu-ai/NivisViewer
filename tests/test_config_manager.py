@@ -9,7 +9,7 @@ from app.config_manager import ConfigManager
 
 
 @pytest.mark.parametrize("value,expected", [
-    (None, 2), ("invalid", 2), (True, 2), (float("inf"), 2),
+    (None, 5), ("invalid", 5), (True, 5), (float("inf"), 5),
     (-1, 1), (0, 1), (1, 1), (2, 2), (20, 20), (200, 20), ("7", 7),
 ])
 def test_zip_priority_screens_normalizes_load_and_apply(tmp_path, value, expected):
@@ -32,7 +32,7 @@ def test_existing_prefetch_values_migrate_independently_of_zip_priority(tmp_path
     path.write_text(json.dumps(values), encoding="utf-8")
     config = ConfigManager(path)
     config.load()
-    assert config.get("viewer_zip_priority_screens") == 2
+    assert config.get("viewer_zip_priority_screens") == 5
     assert all(config.get(key) == value for key, value in values.items())
 
 

@@ -4058,7 +4058,7 @@ class ViewerWindow(QMainWindow):
                 for candidate in (
                     *self.model.next_display_spreads(
                         direction=direction,
-                        count=int(self.config.get("viewer_prefetch_forward_screens", 2)),
+                        count=int(self.config.get("viewer_prefetch_forward_screens", 5)),
                     ),
                     *self.model.next_display_spreads(
                         direction=-(direction or 1),

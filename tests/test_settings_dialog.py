@@ -34,7 +34,7 @@ def test_zip_priority_settings_apply_cancel_reset_and_preserve_hidden_image_valu
     dialog = SettingsDialog(config)
     try:
         spin = dialog.viewer_zip_priority_screens_spin
-        assert (spin.minimum(), spin.maximum(), spin.value()) == (1, 20, 2)
+        assert (spin.minimum(), spin.maximum(), spin.value()) == (1, 20, 5)
         assert spin.suffix().strip() == "画面分"
         assert dialog.prefetch_image_forward_spin.isHidden()
         assert dialog.prefetch_image_backward_spin.isHidden()
@@ -58,10 +58,10 @@ def test_zip_priority_settings_apply_cancel_reset_and_preserve_hidden_image_valu
     reset = SettingsDialog(config)
     try:
         reset._reset_viewer_scope()
-        assert reset.viewer_zip_priority_screens_spin.value() == 2
+        assert reset.viewer_zip_priority_screens_spin.value() == 5
         assert config.get("viewer_zip_priority_screens") == 20
         reset.apply_settings()
-        assert ConfigManager(config.path).load()["viewer_zip_priority_screens"] == 2
+        assert ConfigManager(config.path).load()["viewer_zip_priority_screens"] == 5
     finally:
         reset.close()
 

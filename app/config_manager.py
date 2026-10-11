@@ -312,8 +312,8 @@ class ConfigManager(QObject):
         "viewer_memory_mode": "auto",
         "viewer_decode_workers": 1,
         "viewer_zip_read_ahead_enabled": True,
-        "viewer_zip_priority_screens": 2,  # Legacy alias for forward priority.
-        "viewer_prefetch_forward_screens": 2,
+        "viewer_zip_priority_screens": 5,  # Legacy alias for forward priority.
+        "viewer_prefetch_forward_screens": 5,
         "viewer_prefetch_backward_screens": 1,
         "viewer_pdf_prefetch_individual": True,
         "viewer_pdf_prefetch_forward_screens": 1,
@@ -1140,7 +1140,7 @@ class ConfigManager(QObject):
         normalized["viewer_zip_priority_screens"] = cls._clamped_int(
             (None if isinstance(normalized.get("viewer_zip_priority_screens"), bool)
              else normalized.get("viewer_zip_priority_screens")),
-            default=2, minimum=1, maximum=20,
+            default=5, minimum=1, maximum=20,
         )
         for key, minimum in (
             ("viewer_prefetch_forward_screens", 1),

@@ -13,11 +13,11 @@ from tests.test_zip_raster_viewer_integration import _wait_until
 
 @pytest.mark.parametrize('legacy, expected', [
     ({'viewer_zip_priority_screens': 17}, (17, 1, 0)),
-    ({'viewer_prefetch_preset': 'standard'}, (2, 3, 3)),
-    ({'viewer_prefetch_preset': 'memory_saver'}, (2, 1, 0)),
-    ({'viewer_prefetch_preset': 'disabled', 'viewer_prefetch_pdf_forward_units': 9}, (2, 0, 0)),
+    ({'viewer_prefetch_preset': 'standard'}, (5, 3, 3)),
+    ({'viewer_prefetch_preset': 'memory_saver'}, (5, 1, 0)),
+    ({'viewer_prefetch_preset': 'disabled', 'viewer_prefetch_pdf_forward_units': 9}, (5, 0, 0)),
     ({'viewer_prefetch_preset': 'custom', 'viewer_prefetch_pdf_forward_units': 13,
-      'viewer_prefetch_pdf_backward_units': 7}, (2, 13, 7)),
+      'viewer_prefetch_pdf_backward_units': 7}, (5, 13, 7)),
     ({'viewer_zip_priority_screens': 19, 'viewer_prefetch_forward_screens': 5,
       'viewer_pdf_prefetch_forward_screens': 4, 'viewer_pdf_prefetch_backward_screens': 2,
       'viewer_pdf_prefetch_individual': False}, (5, 4, 2)),
@@ -42,7 +42,7 @@ def test_new_defaults_and_partial_legacy_updates(tmp_path):
     assert [config.get(key) for key in (
         'viewer_prefetch_forward_screens', 'viewer_prefetch_backward_screens',
         'viewer_pdf_prefetch_individual', 'viewer_pdf_prefetch_forward_screens',
-        'viewer_pdf_prefetch_backward_screens')] == [2, 1, True, 1, 0]
+        'viewer_pdf_prefetch_backward_screens')] == [5, 1, True, 1, 0]
     config.apply({'viewer_prefetch_preset': 'custom', 'viewer_prefetch_pdf_forward_units': 8,
                   'viewer_prefetch_pdf_backward_units': 6})
     config.apply({'viewer_prefetch_pdf_forward_units': 11})
@@ -52,7 +52,7 @@ def test_new_defaults_and_partial_legacy_updates(tmp_path):
 
 
 @pytest.mark.parametrize('value, expected', [(-4, (1, 0)), (99, (20, 20)),
-                                            (True, (2, 1)), (float('inf'), (2, 1))])
+                                            (True, (5, 1)), (float('inf'), (5, 1))])
 def test_common_range_normalization(tmp_path, value, expected):
     config = ConfigManager(tmp_path / 'new.json')
     config.load()
@@ -132,7 +132,7 @@ def test_pdf_individual_bounds_or_common_paced_far(tmp_path, qapp, mode, individ
     })
     try:
         multiplier = 2 if mode == 'spread' else 1
-        assert [r.page_index for r in backend.rendered] == list(range(multiplier * (2 if individual else 3)))
+        assert [r.page_index for r in backend.rendered] == list(range(multiplier * (2 if individual else 6)))
         before = len(backend.rendered)
         generation = window.image_cache.generation
         _advance_far(window, qapp)
@@ -167,7 +167,7 @@ def test_pdf_paced_far_cancel_preserves_current_and_source_lifetime(tmp_path, qa
     window.image_cache.pageLoaded.connect(lambda image: delivered.append(image.page_index))
 
     def blocked(request, *, cancel_token=None):
-        if request.page_index == 3:
+        if request.page_index == 6:
             entered.set()
             assert release.wait(3)
         return original(request, cancel_token=cancel_token)
@@ -178,7 +178,7 @@ def test_pdf_paced_far_cancel_preserves_current_and_source_lifetime(tmp_path, qa
         window._advance_pdf_far_prefetch()
         assert entered.wait(2)
         # Only one distant display unit is admitted while native render blocks.
-        assert [key[1] for key in window.image_cache._tasks] == [3]
+        assert [key[1] for key in window.image_cache._tasks] == [6]
         if action == 'navigate':
             window.model.go_to_index(10)
             window._refresh_view()
@@ -191,12 +191,12 @@ def test_pdf_paced_far_cancel_preserves_current_and_source_lifetime(tmp_path, qa
         release.set()
         assert window.image_cache.wait_for_done(5000)
         qapp.processEvents()
-        assert 3 not in delivered
-        assert not window.image_cache.contains(3)
+        assert 6 not in delivered
+        assert not window.image_cache.contains(6)
         if action == 'navigate':
             assert 10 in delivered
             assert window.image_cache.contains(10)
-            assert [r.page_index for r in backend.rendered].count(3) == 1
+            assert [r.page_index for r in backend.rendered].count(6) == 1
         else:
             assert service.flush(wait_seconds=2)
             qapp.processEvents()
@@ -250,7 +250,7 @@ def test_pdf_common_retention_uses_memory_budget_across_navigation(tmp_path, qap
         for _ in range(12):
             _advance_far(window, qapp)
         retained = set(window.image_cache._cache)
-        assert len(retained) == 15
+        assert len(retained) == 18
         window.model.go_to_index(7)
         window._refresh_view()
         assert window.image_cache.wait_for_done(5000)

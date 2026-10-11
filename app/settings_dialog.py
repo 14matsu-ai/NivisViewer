@@ -3647,7 +3647,7 @@ class SettingsDialog(QDialog):
         )
         self._select_data(self.viewer_decode_workers_combo, self.config.get("viewer_decode_workers", 1))
         self.viewer_zip_read_ahead_checkbox.setChecked(self.config.get("viewer_zip_read_ahead_enabled", True))
-        self.viewer_zip_priority_screens_spin.setValue(self.config.get("viewer_prefetch_forward_screens", 2))
+        self.viewer_zip_priority_screens_spin.setValue(self.config.get("viewer_prefetch_forward_screens", 5))
         self.viewer_prefetch_backward_spin.setValue(self.config.get("viewer_prefetch_backward_screens", 1))
         self.viewer_pdf_prefetch_individual_checkbox.setChecked(self.config.get("viewer_pdf_prefetch_individual", True))
         self.viewer_pdf_prefetch_forward_spin.setValue(self.config.get("viewer_pdf_prefetch_forward_screens", 1))
