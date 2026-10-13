@@ -12,6 +12,61 @@ from app.viewer_render import qimage_to_pillow
 from tests.test_zip_raster_book_runtime import _request, _wait_until
 
 
+@pytest.mark.parametrize('orientation', range(1, 9))
+@pytest.mark.parametrize('lossless', [True, False])
+@pytest.mark.parametrize('size', [(128, 96), (96, 96), (96, 128)])
+def test_folder_webp_header_has_logical_size_without_qt_or_pixel_decode(
+    tmp_path, monkeypatch, orientation, lossless, size,
+):
+    from PIL import WebPImagePlugin
+
+    path = tmp_path / '画像.webp'
+    with Image.new('RGB', size, 'navy') as image:
+        image.getexif()[274] = orientation
+        image.save(path, 'WEBP', lossless=lossless, exif=image.getexif())
+    source = FolderImageSource(tmp_path)
+    original_open = Image.open
+    formats = []
+
+    def open_header(*args, **kwargs):
+        formats.append(kwargs.get('formats'))
+        return original_open(*args, **kwargs)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('Folder WebP metadata must not enter Qt or decode pixels')
+
+    monkeypatch.setattr(Image, 'open', open_header)
+    monkeypatch.setattr(WebPImagePlugin.WebPImageFile, 'load', forbidden)
+    monkeypatch.setattr(source_module, 'QImageReader', forbidden)
+    try:
+        expected = size[::-1] if orientation in {5, 6, 7, 8} else size
+        assert source.probe_image_size(str(path)) == expected
+        assert source.probe_image_size(str(path)) == expected
+        assert formats == [('WEBP',)]  # The second lookup uses metadata cache.
+    finally:
+        source.close()
+
+
+def test_folder_corrupt_webp_header_stays_on_explicit_decoder(tmp_path, monkeypatch):
+    path = tmp_path / 'broken.webp'
+    path.write_bytes(b'not a WebP image')
+    source = FolderImageSource(tmp_path)
+    original_open = Image.open
+    formats = []
+
+    def open_header(*args, **kwargs):
+        formats.append(kwargs.get('formats'))
+        return original_open(*args, **kwargs)
+
+    monkeypatch.setattr(Image, 'open', open_header)
+    try:
+        assert source.probe_image_size(str(path)) is None
+        assert formats == [('WEBP',)]
+        assert str(path) not in source._size_cache
+    finally:
+        source.close()
+
+
 def source_for(tmp_path, folder, image, *, lossless=True):
     path = tmp_path / '画像.webp'
     image.save(path, format='WEBP', lossless=lossless, exact=True, exif=image.getexif())

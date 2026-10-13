@@ -1136,7 +1136,10 @@ class FolderImageSource(ImageSource):
             return logical
 
         try:
-            with Image.open(image_id) as image:
+            with Image.open(
+                image_id,
+                formats=("WEBP",) if suffix == ".webp" else None,
+            ) as image:
                 width, height = image.size
                 orientation = image.getexif().get(274, 1)
                 if orientation in {5, 6, 7, 8}:
@@ -1180,14 +1183,17 @@ class FolderImageSource(ImageSource):
             return None
 
     def probe_image_size(self, image_id: str) -> tuple[int, int] | None:
-        """Read folder image geometry with Qt's header reader, without pixels.
+        """Read folder image geometry without decoding pixels.
 
         Pillow's generic format sniffing can import every registered plugin
         when a malformed file is probed. Besides doing needless work, that can
         contend with optional decoder initialization while an interactive
         request adopts a running prefetch. QImageReader selects from the file
         format and reads only its header. Pillow remains the fallback for the
-        two optional formats not covered by the app's Qt runtime.
+        optional formats not covered by the app's Qt runtime. WebP uses its
+        explicit Pillow header reader: concurrent file-backed Qt WebP header
+        probes and pixel reads have stalled in the folder navigation path.
+        Pixel decoding still uses the parallel Qt fast path.
         """
 
         if Path(image_id).suffix.casefold() in {'.svg', '.ai'}:
@@ -1202,7 +1208,7 @@ class FolderImageSource(ImageSource):
             return self.logical_size(image_id)
         if suffix in CREATIVE_PROJECT_EXTENSIONS:
             return self.logical_size(image_id)
-        if suffix in {".avif", ".jxl"}:
+        if suffix in {".avif", ".jxl", ".webp"}:
             return self.logical_size(image_id)
         require_local(image_id)
         reader = QImageReader(image_id)

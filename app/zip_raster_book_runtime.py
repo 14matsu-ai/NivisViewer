@@ -2835,10 +2835,12 @@ class RasterBookRuntime(QObject):
         self._source_store = _ZipRasterSourceStore()
         self._metrics = ZipRasterRuntimeMetrics()
         if self._current_extra or self._near_prefetch_parallel or self._full_prefetch:
-            RASTER_EXECUTION_BUDGET.signals.capacity_available.connect(self._drive, Qt.ConnectionType.QueuedConnection)
+            RASTER_EXECUTION_BUDGET.signals.capacity_available.connect(
+                self._schedule_warmup_continuation, Qt.ConnectionType.QueuedConnection
+            )
         if self._coordinator is not None and (self._max_active_jobs > 1 or self._current_extra):
             self._coordinator.folder_viewer_capacity_available.connect(
-                self._drive, Qt.ConnectionType.QueuedConnection
+                self._schedule_warmup_continuation, Qt.ConnectionType.QueuedConnection
             )
 
     @property
@@ -4015,6 +4017,14 @@ class RasterBookRuntime(QObject):
                         and RASTER_EXECUTION_BUDGET.current_available(emergency=True))):
                 self._submit(self._current_key, ImageWorkPriority.VIEWER_CURRENT)
             return
+        # Header batches overlap neighboring display units. Wait until the
+        # GUI has consumed their observations before planning more background
+        # work, including when the worker has already finished. Otherwise fast
+        # native completion frees slots while PageModel still has unknown
+        # sizes, repeatedly probing the same corridor and flooding the GUI
+        # queue. Cold current work above remains independently dispatchable.
+        if any(job.layout_metadata_pages for job in self._jobs):
+            return
         if RASTER_EXECUTION_BUDGET.adaptive_pause_prefetch():
             return
         remaining = _WARMUP_SCAN_SLICE_UNITS
@@ -4143,12 +4153,18 @@ class RasterBookRuntime(QObject):
             ):
                 planner.recenter(request.warmup_plan)
                 return
+            if metadata_pages:
+                # Consume this batch's layout before selecting another unit
+                # in the same dispatch pass, too.
+                return
 
+    @Slot()
     def _schedule_warmup_continuation(self) -> None:
         """One owner-bound continuation, never an idle polling scheduler.
 
-        Its callback reads the current request instead of capturing an old
-        generation. Cancel/suspend/layout changes stop the timer explicitly.
+        Coalesce capacity notifications from parents, helpers and coordinator
+        lanes. Its callback reads the current request instead of capturing an
+        old generation. Cancel/suspend/layout changes stop it explicitly.
         """
         if (
             self._accepting_requests
