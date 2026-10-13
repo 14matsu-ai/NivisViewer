@@ -368,6 +368,7 @@ def test_same_favorite_folder_preserves_scroll_and_does_not_rescan(
     qapp,
 ) -> None:
     window, store, scanner, folder, _other = _favorite_window(tmp_path, qapp)
+    window.config.apply({"browser_sidebar_open_focus_first": False})
     try:
         window.current_path = folder.absolute()
         window.item_model.set_items(
@@ -543,13 +544,13 @@ def test_normal_and_favorite_large_folder_navigation_do_the_same_work(
                 metrics["worker_natural_key"] += 1
                 return original_natural_key(value)
 
-            def counted_gui_sort(items):
+            def counted_gui_sort(items, **kwargs):
                 metrics["gui_sort"] += 1
-                return original_gui_sort(items)
+                return original_gui_sort(items, **kwargs)
 
-            def counted_begin(items, *, generation):
+            def counted_begin(items, *, generation, **kwargs):
                 metrics["initial_batch"] += 1
-                return original_begin(items, generation=generation)
+                return original_begin(items, generation=generation, **kwargs)
 
             def counted_append(items, *, generation):
                 metrics["remaining_append"] += 1
@@ -728,10 +729,10 @@ def test_scan_finish_applies_stable_initial_range_then_appends_without_reset(
     sort_calls = 0
     original_sort_items = window.item_model.sort_items
 
-    def counted_sort_items(items):
+    def counted_sort_items(items, **kwargs):
         nonlocal sort_calls
         sort_calls += 1
-        return original_sort_items(items)
+        return original_sort_items(items, **kwargs)
 
     monkeypatch.setattr(
         window.thumbnail_provider,

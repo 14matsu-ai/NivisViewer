@@ -312,6 +312,7 @@ def test_cold_wheel_target_preempts_unrelated_started_startup_warmup(
         started_job = runtime._active_job
         assert started_job is not None and started_job.started.is_set()
         assert started_job.unit.pages[0].page_index == 2
+        adoptions_before = runtime.metrics.running_job_adoptions
 
         # Feed the production wheel event path repeatedly. The first cold
         # target is page one; later notches are consumed by the existing
@@ -321,7 +322,7 @@ def test_cold_wheel_target_preempts_unrelated_started_startup_warmup(
         assert window.presentation_state.requested_page == 1
         assert started_job.cancelled.is_set()
         assert runtime.metrics.cancel_requests == 1
-        assert runtime.metrics.running_job_adoptions == 0
+        assert runtime.metrics.running_job_adoptions == adoptions_before
 
         source.release_blocked_image.set()
         _wait_until(qapp, lambda: window.presentation_state.displayed_page == 1)
@@ -336,11 +337,13 @@ def test_cold_wheel_target_preempts_unrelated_started_startup_warmup(
 
 
 @pytest.mark.parametrize("reading_direction", ["ltr", "rtl"])
+@pytest.mark.parametrize("current_extra", [False, True])
 def test_actual_viewer_wheel_reuses_started_shared_spread_source(
     tmp_path,
     qapp,
     monkeypatch,
     reading_direction,
+    current_extra,
 ):
     """The production wheel path keeps a started page shared by two spreads."""
     archive = tmp_path / f"shared-spread-{reading_direction}.zip"
@@ -349,6 +352,7 @@ def test_actual_viewer_wheel_reuses_started_shared_spread_source(
     session = BookSession(source_factory=lambda *_args, **_kwargs: (source, None))
     config = ConfigManager(tmp_path / f"shared-spread-{reading_direction}.json")
     config.load()
+    config.apply({"viewer_current_extra_trial": current_extra})
     window = ViewerWindow(config_manager=config, book_session=session)
     window.resize(900, 700)
     window.set_view_mode("spread")

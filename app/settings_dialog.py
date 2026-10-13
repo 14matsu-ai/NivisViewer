@@ -393,6 +393,11 @@ TAB_SETTING_KEYS: dict[str, tuple[str, ...]] = {
         "viewer_slider_wheel_single_page_enabled", "magnifier_allow_outside_image",
         "viewer_prefetch_preset", "viewer_prefetch_direction_priority_enabled",
         "viewer_memory_mode", "viewer_decode_workers", "viewer_zip_read_ahead_enabled",
+        "viewer_spread_parallel_trial", "viewer_current_extra_trial",
+        "viewer_raster_execution_limit",
+        "viewer_near_prefetch_parallel",
+        "viewer_prefetch_execution_mode",
+        "viewer_adaptive_maximum",
         "viewer_zip_priority_screens", "viewer_prefetch_forward_screens",
         "viewer_prefetch_backward_screens", "viewer_pdf_prefetch_individual",
         "viewer_pdf_prefetch_forward_screens", "viewer_pdf_prefetch_backward_screens",
@@ -410,7 +415,12 @@ TAB_SETTING_KEYS: dict[str, tuple[str, ...]] = {
         "browser_thumbnail_display_mode", "browser_folder_fallback_background", "browser_file_fallback_background",
         "browser_display_density", "browser_item_spacing_x", "browser_item_spacing_y", "browser_cell_padding",
         "browser_sort_key", "browser_sort_order", "browser_random_seed", "browser_folders_first",
+        "browser_sidebar_open_focus_first", "browser_shift_arrows_switch_focus",
         "browser_location_history_limit", "browser_search_history_limit", "browser_tag_grouped",
+        "browser_search_wheel_enabled",
+        "browser_search_wheel_shift_oldest",
+        "browser_search_wheel_oldest_first",
+        "browser_search_wheel_reverse_oldest",
         "browser_show_rating_overlay", "browser_show_tag_overlay", "browser_show_type_badge",
         "browser_rating_overlay_opacity", "browser_tag_overlay_opacity",
         "browser_tag_auto_text_color", "browser_tag_text_luminance_threshold",
@@ -1295,11 +1305,18 @@ class SettingsDialog(QDialog):
         self._select_data(self.viewer_memory_mode_combo, defaults["viewer_memory_mode"])
         self._select_data(self.viewer_decode_workers_combo, defaults["viewer_decode_workers"])
         self.viewer_zip_read_ahead_checkbox.setChecked(defaults["viewer_zip_read_ahead_enabled"])
+        self.viewer_spread_parallel_checkbox.setChecked(defaults["viewer_spread_parallel_trial"])
+        self.viewer_current_extra_checkbox.setChecked(defaults["viewer_current_extra_trial"])
+        self._select_data(self.viewer_raster_execution_limit_combo, defaults["viewer_raster_execution_limit"])
+        self.viewer_near_prefetch_parallel_checkbox.setChecked(defaults["viewer_near_prefetch_parallel"])
+        self._select_data(self.viewer_prefetch_execution_mode_combo, defaults["viewer_prefetch_execution_mode"])
+        self.viewer_adaptive_maximum_spin.setValue(defaults['viewer_adaptive_maximum'])
         self.viewer_zip_priority_screens_spin.setValue(defaults["viewer_prefetch_forward_screens"])
         self.viewer_prefetch_backward_spin.setValue(defaults["viewer_prefetch_backward_screens"])
         self.viewer_pdf_prefetch_individual_checkbox.setChecked(defaults["viewer_pdf_prefetch_individual"])
         self.viewer_pdf_prefetch_forward_spin.setValue(defaults["viewer_pdf_prefetch_forward_screens"])
         self.viewer_pdf_prefetch_backward_spin.setValue(defaults["viewer_pdf_prefetch_backward_screens"])
+        self._update_parallel_controls()
         self._update_pdf_prefetch_controls(self.viewer_pdf_prefetch_individual_checkbox.isChecked())
         self._select_data(self.viewer_downscale_algorithm_combo, defaults["viewer_downscale_algorithm"])
         self._select_data(self.viewer_upscale_algorithm_combo, defaults["viewer_upscale_algorithm"])
@@ -1384,6 +1401,12 @@ class SettingsDialog(QDialog):
         self.browser_folders_first_checkbox.setChecked(bool(defaults["browser_folders_first"]))
         self.browser_location_history_limit_spin.setValue(int(defaults["browser_location_history_limit"]))
         self.browser_search_history_limit_spin.setValue(int(defaults["browser_search_history_limit"]))
+        self.browser_search_wheel_enabled_checkbox.setChecked(defaults["browser_search_wheel_enabled"])
+        self.browser_search_wheel_shift_oldest_checkbox.setChecked(defaults["browser_search_wheel_shift_oldest"])
+        self.browser_search_wheel_oldest_first_checkbox.setChecked(defaults["browser_search_wheel_oldest_first"])
+        self.browser_search_wheel_reverse_oldest_checkbox.setChecked(defaults["browser_search_wheel_reverse_oldest"])
+        self.browser_sidebar_open_focus_first_checkbox.setChecked(defaults["browser_sidebar_open_focus_first"])
+        self.browser_shift_arrows_switch_focus_checkbox.setChecked(defaults["browser_shift_arrows_switch_focus"])
         self.browser_preserve_search_for_viewer_roundtrip_checkbox.setChecked(
             bool(defaults["browser_preserve_search_for_viewer_roundtrip"])
         )
@@ -2020,22 +2043,47 @@ class SettingsDialog(QDialog):
             tr('ビューワーのメモリ使用量:'),
             self.viewer_memory_mode_combo,
         )
-        self.viewer_decode_workers_combo = QComboBox(memory_group)
-        self.viewer_decode_workers_combo.addItem(tr('1（推奨）'), 1)
+        memory_help = QLabel(tr('保持画像と準備中の予約に使う量です。変更は開いている本にも反映します。並列数や優先画面数を増やしても予算は解除しません。自動ではシステムの空きメモリに応じて調整します。'), memory_group)
+        memory_help.setWordWrap(True)
+        memory_form.addRow(memory_help)
+        trial_group = QGroupBox(tr('並列読み込み'), tab)
+        trial_form = QFormLayout(trial_group)
+        self.viewer_decode_workers_combo = QComboBox(trial_group)
+        self.viewer_decode_workers_combo.addItem(tr('1'), 1)
         self.viewer_decode_workers_combo.addItem(tr('2'), 2)
-        memory_form.addRow(tr('画像の同時読み込み数:'), self.viewer_decode_workers_combo)
+        trial_form.addRow(tr('画像の同時読み込み数:'), self.viewer_decode_workers_combo)
         self.viewer_zip_read_ahead_checkbox = QCheckBox(
-            tr('ZIPの次ページ展開を並列処理する（推奨）'), memory_group,
+            tr('ZIPの次ページ展開を並列処理する（推奨）'), trial_group,
         )
-        memory_form.addRow(self.viewer_zip_read_ahead_checkbox)
-        parallel_help = QLabel(tr(
-            '同時読み込み数は画像フォルダとZIPに適用します。'
-            'ZIPの並列展開は最大1ページ分です。'
-            '読み込み数を増やすと、ページを戻す操作が遅くなる場合があります。'
-            '変更は次にファイルを開いたときから適用します。'
-        ), memory_group)
-        parallel_help.setWordWrap(True)
-        memory_form.addRow(parallel_help)
+        trial_form.addRow(self.viewer_zip_read_ahead_checkbox)
+        self.viewer_spread_parallel_checkbox = QCheckBox(tr('見開きの左右を同時に読み込む'), trial_group)
+        self.viewer_current_extra_checkbox = QCheckBox(tr('先読み中の現在画面を追加枠で読み込む'), trial_group)
+        trial_form.addRow(self.viewer_spread_parallel_checkbox)
+        trial_form.addRow(self.viewer_current_extra_checkbox)
+        self.viewer_near_prefetch_parallel_checkbox = QCheckBox(tr('直近の先読みも左右並列にする'), trial_group)
+        self.viewer_near_prefetch_parallel_checkbox.setToolTip(tr('現在画面の準備後、優先範囲の見開きを左右並列で先読みします。枠の配分は下の設定に従います。左右並列OFFでは使いません。変更は次の本から反映します。'))
+        trial_form.addRow(self.viewer_near_prefetch_parallel_checkbox)
+        self.viewer_prefetch_execution_mode_combo = QComboBox(trial_group)
+        self.viewer_prefetch_execution_mode_combo.addItem(tr('現在画面の余力を残す（A）'), 'reserve')
+        self.viewer_prefetch_execution_mode_combo.addItem(tr('通常4枠＋現在画面2枠（B）'), 'burst')
+        self.viewer_prefetch_execution_mode_combo.addItem(tr('負荷に合わせて自動調整'), 'auto')
+        trial_form.addRow(tr('先読みの処理枠:'), self.viewer_prefetch_execution_mode_combo)
+        self.viewer_raster_execution_limit_combo = QComboBox(trial_group)
+        self.viewer_raster_execution_limit_combo.addItem(tr('3枠'), 3)
+        self.viewer_raster_execution_limit_combo.addItem(tr('4枠'), 4)
+        trial_form.addRow(tr('通常の共有画像処理上限:'), self.viewer_raster_execution_limit_combo)
+        self.viewer_adaptive_maximum_spin = QSpinBox(trial_group)
+        self.viewer_adaptive_maximum_spin.setRange(4, 12)
+        self.viewer_adaptive_maximum_spin.setToolTip(tr('全Viewer共通で、現在画面の追加枠を含む上限です。CPU負荷・空きメモリ・同程度の画像の処理時間を見て増減します。未キャッシュの表示待ち中は新しい先読みを止めます。変更は次の本から反映します。'))
+        trial_form.addRow(tr('自動調整の最大同時処理数:'), self.viewer_adaptive_maximum_spin)
+        self.viewer_parallel_summary_label = QLabel(tr('画像フォルダーとZIP／CBZの処理枠を設定します。'), trial_group)
+        self.viewer_parallel_summary_label.setWordWrap(True)
+        trial_form.addRow(self.viewer_parallel_summary_label)
+        for control in (self.viewer_prefetch_execution_mode_combo, self.viewer_raster_execution_limit_combo):
+            control.currentIndexChanged.connect(self._update_parallel_controls)
+        self.viewer_adaptive_maximum_spin.valueChanged.connect(self._update_parallel_controls)
+        for control in (self.viewer_spread_parallel_checkbox, self.viewer_current_extra_checkbox):
+            control.toggled.connect(self._update_parallel_controls)
 
         zip_priority_group = QGroupBox(tr('先読み設定'), tab)
         zip_priority_form = QFormLayout(zip_priority_group)
@@ -2053,7 +2101,7 @@ class SettingsDialog(QDialog):
         priority_help = QLabel(tr(
             'フォルダー・ZIP／CBZ・RAR／7zに共通です。単ページでは1画面＝1ページ、見開きでは実際の1見開きです。'
             '戻る操作では進行方向と逆方向を入れ替えます。指定範囲を遠方より先に準備し、その先もメモリ上限内で先読みを続けます。'
-            'メモリ使用量は総保持量、同時読み込み数は並列処理数を決めます。メモリ不足時は指定範囲をすべて準備できない場合があります。変更は開いている本にも適用します。'
+            'ここで指定する画面数は準備の優先範囲です。総保持数や同時処理数ではありません。保持量はメモリ、処理数は並列読み込みの設定に従います。メモリ不足時は指定範囲をすべて準備できない場合があります。変更は開いている本にも適用します。'
         ), zip_priority_group)
         priority_help.setWordWrap(True)
         zip_priority_form.addRow(priority_help)
@@ -2228,6 +2276,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(behavior_group)
         layout.addWidget(spread_group)
         layout.addWidget(memory_group)
+        layout.addWidget(trial_group)
         layout.addWidget(zip_priority_group)
         layout.addWidget(resampling_group)
         prefetch_group.hide()
@@ -2664,6 +2713,36 @@ class SettingsDialog(QDialog):
             tr('検索履歴の保持件数:'),
             self.browser_search_history_limit_spin,
         )
+        self.browser_search_wheel_enabled_checkbox = QCheckBox(tr('検索窓上のホイールで検索履歴をたどる'), list_group)
+        self.browser_search_wheel_enabled_checkbox.setToolTip(tr('下ホイールで最新から古い検索履歴へ進みます。上ホイールで新しい履歴へ戻り、最新の先で検索を解除します。未検索時の上ホイールは何もしません。履歴は削除しません。'))
+        list_form.addRow(self.browser_search_wheel_enabled_checkbox)
+        self.browser_search_wheel_shift_oldest_checkbox = QCheckBox(tr('Shift＋上ホイールで最古の検索履歴へ移動する'), list_group)
+        self.browser_search_wheel_shift_oldest_checkbox.setToolTip(tr('検索履歴のホイール操作が有効なとき、Shift＋上ホイールで最古の履歴へ直接移動します。'))
+        list_form.addRow(self.browser_search_wheel_shift_oldest_checkbox)
+        self.browser_search_wheel_oldest_first_checkbox = QCheckBox(tr('検索窓上のホイールで最古の履歴から検索する'), list_group)
+        self.browser_search_wheel_oldest_first_checkbox.setToolTip(tr('検索していない状態からホイールで履歴を選ぶとき、最古の履歴から始めます。'))
+        list_form.addRow(self.browser_search_wheel_oldest_first_checkbox)
+        self.browser_search_wheel_reverse_oldest_checkbox = QCheckBox(tr('最古から始めるとき、履歴をたどる向きも反転する'), list_group)
+        self.browser_search_wheel_reverse_oldest_checkbox.setToolTip(tr('OFFでは最初だけ最古を選び、その後は下で古い履歴、上で新しい履歴へ移動します。ONでは下で新しい履歴、上で古い履歴へ移動し、最新からさらに下で検索を解除します。'))
+        list_form.addRow(self.browser_search_wheel_reverse_oldest_checkbox)
+        self.browser_search_wheel_oldest_first_checkbox.toggled.connect(self.browser_search_wheel_reverse_oldest_checkbox.setEnabled)
+        interaction_group = QGroupBox(tr('一覧とサイドバーの操作'), tab)
+        interaction_form = QFormLayout(interaction_group)
+        self.browser_sidebar_open_focus_first_checkbox = QCheckBox(
+            tr('サイドバーからフォルダーを開いたら、一覧の先頭を選択する'), interaction_group,
+        )
+        self.browser_sidebar_open_focus_first_checkbox.setToolTip(tr(
+            '一覧へキーボード操作を移し、表示中の最初の項目を選択します。OFFではサイドバーでの操作を続けます。読み込み中に操作先や選択を変更した場合は、その操作を優先します。'
+        ))
+        interaction_form.addRow(self.browser_sidebar_open_focus_first_checkbox)
+        self.browser_shift_arrows_switch_focus_checkbox = QCheckBox(
+            tr('Shift＋左右キーでサイドバーと一覧の操作を切り替える'), interaction_group,
+        )
+        self.browser_shift_arrows_switch_focus_checkbox.setToolTip(tr(
+            'Shift＋左でサイドバー、Shift＋右で一覧へ移ります。各領域の現在項目は保持します。文字の編集中は文字選択を優先します。OFFでは既存のキー操作に戻ります。'
+        ))
+        interaction_form.addRow(self.browser_shift_arrows_switch_focus_checkbox)
+        layout.addWidget(interaction_group)
         self.browser_preserve_search_for_viewer_roundtrip_checkbox = QCheckBox(
             tr('検索結果からViewerを開いたとき、戻るまで検索を維持'),
             list_group,
@@ -3511,6 +3590,30 @@ class SettingsDialog(QDialog):
         layout.addStretch(1)
         return tab
 
+    def _update_parallel_controls(self, *_args) -> None:
+        if not hasattr(self, 'viewer_parallel_summary_label'):
+            return
+        mode = self.viewer_prefetch_execution_mode_combo.currentData()
+        limit = int(self.viewer_raster_execution_limit_combo.currentData() or 4)
+        self.viewer_near_prefetch_parallel_checkbox.setEnabled(self.viewer_spread_parallel_checkbox.isChecked())
+        self.viewer_raster_execution_limit_combo.setEnabled(mode != 'auto')
+        self.viewer_adaptive_maximum_spin.setEnabled(mode == 'auto')
+        if mode == 'auto':
+            text = tr('自動：現在画面を優先し、CPU・メモリに余裕があるときに先読みを少しずつ増やします。表示待ちや処理時間の悪化では減らします。最大値は表示用の追加2枠を含みます。固定方式のViewerが混在すると、その固定上限を優先します。')
+        elif mode == 'burst':
+            text = tr('B：通常4枠を先読みに使い、開始できない現在画面だけ全Viewer共通で最大2枠を一時追加します（合計最大6）。背景には追加枠を使いません。')
+            if limit != 4 or not self.viewer_current_extra_checkbox.isChecked():
+                text = tr('B：通常上限3または現在画面の追加OFFでは、一時追加を使いません。選択値は保持します。')
+        else:
+            text = tr('A：左右並列と直近の左右並列が両方ONなら、通常上限4では現在画面用に2枠、3では1枠を残します。現在画面の追加枠は先読みに貸しません。')
+        if mode == 'auto':
+            text += '\n' + tr('自動の最大値・配分方式は次の本から反映します。現在画面の追加OFFでは追加枠を使いません。Viewerメモリの設定も守り、元画像の展開用メモリを見積もって先読みを制限します。実行中の処理は終了まで枠を保持します。PDF・RAR／7z・Browser・ページ一覧は自動拡張しません。')
+        else:
+            text += '\n' + tr('通常1／2は親の処理枠、左右並列は片側の補助、共有上限3／4は全Viewerの通常画像処理数です。ZIP先行展開は別の最大1処理です。Browser・ページ一覧・PDFを含む全thread数ではありません。')
+            text += '\n' + tr('メモリ不足では追加しません。チェック・通常1／2・配分方式・ZIP先行展開は次の本から、通常共有上限は即時です。Aや上限3のViewerが混在する場合はBの一時追加を止めます。処理中の枠はnative終了まで保持します。')
+        self.viewer_parallel_summary_label.setText(text)
+        self.viewer_prefetch_execution_mode_combo.setToolTip(text)
+
     def _update_pdf_prefetch_controls(self, individual: bool) -> None:
         self.viewer_pdf_prefetch_forward_spin.setEnabled(individual)
         self.viewer_pdf_prefetch_backward_spin.setEnabled(individual)
@@ -3647,11 +3750,18 @@ class SettingsDialog(QDialog):
         )
         self._select_data(self.viewer_decode_workers_combo, self.config.get("viewer_decode_workers", 1))
         self.viewer_zip_read_ahead_checkbox.setChecked(self.config.get("viewer_zip_read_ahead_enabled", True))
+        self.viewer_spread_parallel_checkbox.setChecked(self.config.get("viewer_spread_parallel_trial", True))
+        self.viewer_current_extra_checkbox.setChecked(self.config.get("viewer_current_extra_trial", True))
+        self._select_data(self.viewer_raster_execution_limit_combo, self.config.get("viewer_raster_execution_limit", 4))
+        self.viewer_near_prefetch_parallel_checkbox.setChecked(self.config.get("viewer_near_prefetch_parallel", False))
+        self._select_data(self.viewer_prefetch_execution_mode_combo, self.config.get("viewer_prefetch_execution_mode", "reserve"))
+        self.viewer_adaptive_maximum_spin.setValue(self.config.get('viewer_adaptive_maximum', 8))
         self.viewer_zip_priority_screens_spin.setValue(self.config.get("viewer_prefetch_forward_screens", 5))
         self.viewer_prefetch_backward_spin.setValue(self.config.get("viewer_prefetch_backward_screens", 1))
         self.viewer_pdf_prefetch_individual_checkbox.setChecked(self.config.get("viewer_pdf_prefetch_individual", True))
         self.viewer_pdf_prefetch_forward_spin.setValue(self.config.get("viewer_pdf_prefetch_forward_screens", 1))
         self.viewer_pdf_prefetch_backward_spin.setValue(self.config.get("viewer_pdf_prefetch_backward_screens", 0))
+        self._update_parallel_controls()
         self._update_pdf_prefetch_controls(self.viewer_pdf_prefetch_individual_checkbox.isChecked())
         self._select_data(
             self.viewer_downscale_algorithm_combo,
@@ -3871,6 +3981,11 @@ class SettingsDialog(QDialog):
         self.browser_search_history_limit_spin.setValue(
             int(self.config.get("browser_search_history_limit", 50))
         )
+        self.browser_search_wheel_enabled_checkbox.setChecked(self.config.get("browser_search_wheel_enabled", True))
+        self.browser_search_wheel_shift_oldest_checkbox.setChecked(self.config.get("browser_search_wheel_shift_oldest", False))
+        self.browser_search_wheel_oldest_first_checkbox.setChecked(self.config.get("browser_search_wheel_oldest_first", False))
+        self.browser_search_wheel_reverse_oldest_checkbox.setChecked(self.config.get("browser_search_wheel_reverse_oldest", False))
+        self.browser_search_wheel_reverse_oldest_checkbox.setEnabled(self.browser_search_wheel_oldest_first_checkbox.isChecked())
         self.browser_preserve_search_for_viewer_roundtrip_checkbox.setChecked(
             bool(
                 self.config.get(
@@ -3879,6 +3994,8 @@ class SettingsDialog(QDialog):
                 )
             )
         )
+        self.browser_sidebar_open_focus_first_checkbox.setChecked(self.config.get("browser_sidebar_open_focus_first", True))
+        self.browser_shift_arrows_switch_focus_checkbox.setChecked(self.config.get("browser_shift_arrows_switch_focus", True))
         self.browser_item_spacing_x_spin.setValue(
             int(self.config.get("browser_item_spacing_x", 0))
         )
@@ -4468,6 +4585,12 @@ class SettingsDialog(QDialog):
             ),
             "viewer_decode_workers": int(self.viewer_decode_workers_combo.currentData() or 1),
             "viewer_zip_read_ahead_enabled": self.viewer_zip_read_ahead_checkbox.isChecked(),
+            "viewer_spread_parallel_trial": self.viewer_spread_parallel_checkbox.isChecked(),
+            "viewer_current_extra_trial": self.viewer_current_extra_checkbox.isChecked(),
+            "viewer_raster_execution_limit": int(self.viewer_raster_execution_limit_combo.currentData() or 4),
+            "viewer_near_prefetch_parallel": self.viewer_near_prefetch_parallel_checkbox.isChecked(),
+            "viewer_prefetch_execution_mode": str(self.viewer_prefetch_execution_mode_combo.currentData() or 'reserve'),
+            "viewer_adaptive_maximum": self.viewer_adaptive_maximum_spin.value(),
             "viewer_zip_priority_screens": self.viewer_zip_priority_screens_spin.value(),
             "viewer_prefetch_forward_screens": self.viewer_zip_priority_screens_spin.value(),
             "viewer_prefetch_backward_screens": self.viewer_prefetch_backward_spin.value(),
@@ -4574,9 +4697,15 @@ class SettingsDialog(QDialog):
             "browser_search_history_limit": int(
                 self.browser_search_history_limit_spin.value()
             ),
+            "browser_search_wheel_enabled": self.browser_search_wheel_enabled_checkbox.isChecked(),
+            "browser_search_wheel_shift_oldest": self.browser_search_wheel_shift_oldest_checkbox.isChecked(),
+            "browser_search_wheel_oldest_first": self.browser_search_wheel_oldest_first_checkbox.isChecked(),
+            "browser_search_wheel_reverse_oldest": self.browser_search_wheel_reverse_oldest_checkbox.isChecked(),
             "browser_preserve_search_for_viewer_roundtrip": (
                 self.browser_preserve_search_for_viewer_roundtrip_checkbox.isChecked()
             ),
+            "browser_sidebar_open_focus_first": self.browser_sidebar_open_focus_first_checkbox.isChecked(),
+            "browser_shift_arrows_switch_focus": self.browser_shift_arrows_switch_focus_checkbox.isChecked(),
             "browser_tag_grouped": self.browser_tag_grouped_checkbox.isChecked(),
             "browser_show_rating_overlay": self.browser_show_rating_overlay_checkbox.isChecked(),
             "browser_show_type_badge": self.browser_show_type_badge_checkbox.isChecked(),

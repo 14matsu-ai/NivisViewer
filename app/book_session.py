@@ -230,6 +230,11 @@ class BookSession(QObject):
         self._folder_worker_limit = max(1, min(2, int(folder_worker_limit)))
         self._zip_worker_limit = max(1, min(2, int(zip_worker_limit)))
         self._zip_read_ahead_enabled = bool(zip_read_ahead_enabled)
+        self._spread_parallel_trial = False
+        self._current_extra_trial = False
+        self._near_prefetch_parallel = False
+        self._prefetch_execution_mode = "reserve"
+        self._adaptive_maximum = 8
         self._configure_coordinator_workers = False
         self.current_path: Path | None = None
         self.source: ImageSource | None = None
@@ -693,10 +698,19 @@ class BookSession(QObject):
         self._close_source(source)
         return True
 
-    def set_viewer_parallelism(self, *, workers: int, zip_read_ahead: bool) -> None:
+    def set_viewer_parallelism(self, *, workers: int, zip_read_ahead: bool,
+                               spread_parallel: bool = False, current_extra: bool = False,
+                               near_prefetch_parallel: bool = False,
+                               prefetch_execution_mode: str = "reserve",
+                               adaptive_maximum: int = 8) -> None:
         """Configure the next book; leave currently owned jobs untouched."""
         self._folder_worker_limit = self._zip_worker_limit = max(1, min(2, int(workers)))
         self._zip_read_ahead_enabled = bool(zip_read_ahead)
+        self._spread_parallel_trial = bool(spread_parallel)
+        self._current_extra_trial = bool(current_extra)
+        self._near_prefetch_parallel = bool(near_prefetch_parallel)
+        self._prefetch_execution_mode = prefetch_execution_mode if prefetch_execution_mode in ('full','burst','auto') else 'reserve'
+        self._adaptive_maximum = max(4, min(12, int(adaptive_maximum)))
         self._configure_coordinator_workers = True
 
     def _replace_viewer_runtime(
@@ -718,7 +732,13 @@ class BookSession(QObject):
             runtime_type = None
         hard, soft = self._source_runtime_limits(source)
         if self._configure_coordinator_workers and self._image_work_coordinator is not None:
-            self._image_work_coordinator.set_viewer_supplemental_workers(self._zip_worker_limit - 1)
+            if source is None:
+                self._image_work_coordinator.release_viewer_capacity(self)
+            else:
+                self._image_work_coordinator.set_viewer_supplemental_workers(
+                    self._zip_worker_limit - 1 if runtime_type in (ZipRasterBookRuntime, FolderRasterBookRuntime) else 0,
+                    owner=self,
+                )
         new_runtime = (
             runtime_type(
                 source,
@@ -728,6 +748,11 @@ class BookSession(QObject):
                 cache_byte_budget=hard,
                 cache_soft_target_bytes=soft,
                 zip_read_ahead=self._zip_read_ahead_enabled and runtime_type is ZipRasterBookRuntime,
+                spread_parallel=self._spread_parallel_trial,
+                current_extra=self._current_extra_trial,
+                near_prefetch_parallel=self._near_prefetch_parallel,
+                prefetch_execution_mode=self._prefetch_execution_mode,
+                adaptive_maximum=self._adaptive_maximum,
                 max_active_jobs=(
                     self._folder_worker_limit
                     if runtime_type is FolderRasterBookRuntime

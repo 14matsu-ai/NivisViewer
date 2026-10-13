@@ -1981,6 +1981,11 @@ class ViewerWindow(QMainWindow):
                 "viewer_memory_mode",
                 "viewer_decode_workers",
                 "viewer_zip_read_ahead_enabled",
+                "viewer_spread_parallel_trial", "viewer_current_extra_trial",
+                "viewer_raster_execution_limit",
+                "viewer_near_prefetch_parallel",
+                "viewer_prefetch_execution_mode",
+                "viewer_adaptive_maximum",
                 "viewer_zip_priority_screens",
                 "viewer_prefetch_forward_screens", "viewer_prefetch_backward_screens",
                 "viewer_pdf_prefetch_individual", "viewer_pdf_prefetch_forward_screens",
@@ -1996,9 +2001,24 @@ class ViewerWindow(QMainWindow):
             self._reapply_prefetch_settings()
 
     def _load_prefetch_settings(self) -> None:
+        from .raster_execution_budget import RASTER_EXECUTION_BUDGET
+        if not getattr(self, '_shutdown_prepared', False):
+            active = self.book_session.viewer_runtime
+            if (getattr(active, '_adaptive', False)
+                    or (active is None and self.config.get('viewer_prefetch_execution_mode') == 'auto')):
+                RASTER_EXECUTION_BUDGET.release_owner(self)
+            else:
+                RASTER_EXECUTION_BUDGET.configure(
+                    self.config.get("viewer_raster_execution_limit", 4), owner=self,
+                )
         self.book_session.set_viewer_parallelism(
             workers=self.config.get("viewer_decode_workers", 1),
             zip_read_ahead=self.config.get("viewer_zip_read_ahead_enabled", True),
+            spread_parallel=self.config.get("viewer_spread_parallel_trial", True),
+            current_extra=self.config.get("viewer_current_extra_trial", True),
+            near_prefetch_parallel=self.config.get("viewer_near_prefetch_parallel", False),
+            prefetch_execution_mode=self.config.get("viewer_prefetch_execution_mode", "reserve"),
+            adaptive_maximum=self.config.get("viewer_adaptive_maximum", 8),
         )
         values = self.config.viewer_prefetch_settings()
         self.prefetch_preset = str(values["preset"])
@@ -3864,6 +3884,15 @@ class ViewerWindow(QMainWindow):
         self._zip_runtime = (
             runtime if isinstance(runtime, RasterBookRuntime) else None
         )
+        from .raster_execution_budget import RASTER_EXECUTION_BUDGET
+        if not self._shutdown_prepared:
+            if (getattr(self._zip_runtime, '_adaptive', False)
+                    or (self._zip_runtime is None and self.config.get('viewer_prefetch_execution_mode') == 'auto')):
+                RASTER_EXECUTION_BUDGET.release_owner(self)
+            else:
+                RASTER_EXECUTION_BUDGET.configure(
+                    self.config.get('viewer_raster_execution_limit', 4), owner=self,
+                )
         if self._zip_runtime is not None:
             self._apply_raster_memory_policy()
             self._zip_runtime.frameReady.connect(
@@ -7806,6 +7835,8 @@ class ViewerWindow(QMainWindow):
         )
 
     def prepare_shutdown(self, *, wait_msecs: int = 250) -> bool:
+        from .raster_execution_budget import RASTER_EXECUTION_BUDGET
+        RASTER_EXECUTION_BUDGET.release_owner(self)
         export = getattr(self, '_external_open_worker', None)
         if export is not None:
             export.cancelled.set()

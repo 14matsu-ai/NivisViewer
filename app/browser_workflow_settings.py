@@ -12,7 +12,7 @@ from .i18n import tr
 
 class BrowserWorkflowSettings(QGroupBox):
     def __init__(self, parent=None, help_button_class=None) -> None:
-        super().__init__(tr("背景生成・選択表示"), parent)
+        super().__init__(tr("サムネイル生成・選択表示"), parent)
         form = QFormLayout(self)
         self.mode = QComboBox(self)
         for text, value in (("表示範囲のみ", "visible"), ("画面数を指定", "bounded"),

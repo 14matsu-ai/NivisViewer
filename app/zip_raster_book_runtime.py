@@ -15,6 +15,7 @@ complete source/method/license map is in docs/ZIPPLAFORK_COMPARISON.md.
 """
 
 from __future__ import annotations
+from .raster_execution_budget import RASTER_EXECUTION_BUDGET, SourceRequestToken, source_request_scope
 
 from .i18n import tr
 
@@ -34,7 +35,7 @@ from PySide6.QtGui import QImage, QPixmap
 from .archive_backend import ArchiveErrorCode
 from .gimp_xcf_backend import gimp_cancellation
 from .freeze_diagnostics import trace_gui_phase
-from .image_source import ImageSource, ImageSourceError, ZipImageSource
+from .image_source import FolderImageSource, ImageSource, ImageSourceError, ZipImageSource
 from .image_work_coordinator import ImageWorkCoordinator, ImageWorkPriority
 from .raster_layout_metadata import (
     LAYOUT_METADATA_BATCH_PAGES,
@@ -617,6 +618,19 @@ def _requires_exact_prefetch_admission(
 
     del decoder_maximum, has_cached_source
     return page.known_size is None
+
+
+def _adaptive_work_signature(source, pages, spec):
+    """Only cached metadata: group similar format, pixels, aspect and payload cost."""
+    descriptors = []
+    for image_id, size in pages:
+        size = size or (1, 1)
+        byte_count = source.file_size(image_id) or 0
+        descriptors.append((Path(image_id).suffix.casefold(),
+            (size[0] * size[1]) // (1024 * 1024), round(size[0] / max(1, size[1]) * 4),
+            int(byte_count).bit_length()))
+    return (tuple(descriptors), spec.viewport_size, spec.fit_mode, spec.rotation,
+            spec.device_pixel_ratio, spec.adjustments, spec.downscale_algorithm)
 
 
 @dataclass(frozen=True)
@@ -1691,6 +1705,7 @@ class _ZipRasterFrameStore:
 
 class _JobSignals(QObject):
     completed = Signal(object)
+    dispatchReady = Signal()
 
 
 class _ZipRasterUnitJob(QRunnable):
@@ -1706,6 +1721,10 @@ class _ZipRasterUnitJob(QRunnable):
         layout_metadata_pages: tuple[ZipRasterPage, ...] = (),
         prefetch_budget_bytes: int | None = None,
         prefetch_hard_limit_bytes: int | None = None,
+        spread_parallel: bool = False,
+        near_parallel: bool = False,
+        emergency_allowed: bool = False,
+        is_current: bool = True,
     ) -> None:
         super().__init__()
         self.setAutoDelete(False)
@@ -1713,6 +1732,14 @@ class _ZipRasterUnitJob(QRunnable):
         self.key = key
         self.source = source
         self.unit = unit
+        self.spread_parallel = bool(spread_parallel)
+        self.near_parallel = bool(near_parallel)
+        self.emergency_allowed = bool(emergency_allowed)
+        self._helper_future = None
+        self._helper_operation = None
+        self._helper_page = None
+        self._page_started = set()
+        self.current_priority = bool(is_current)
         self.layout_metadata_pages = tuple(layout_metadata_pages)
         self.cached_sources = dict(cached_sources or {})
         self.prefetch_budget_bytes = (
@@ -1727,12 +1754,15 @@ class _ZipRasterUnitJob(QRunnable):
         )
         self.confirmed_required_bytes: int | None = None
         self.signals = _JobSignals()
-        self.cancelled = Event()
+        self.cancelled = SourceRequestToken()
         self.admission_declined = False
         self.oversized_prefetch = False
         self.started = Event()
         self.finished = Event()
         self.source_decode_started = Event()
+        self.helper_decided = Event()
+        self.execution_lease = None
+        self.native_lane_release = None
         self._token_lock = Lock()
         self._request_id = int(request_id)
 
@@ -1744,6 +1774,7 @@ class _ZipRasterUnitJob(QRunnable):
     ) -> None:
         with self._token_lock:
             self._request_id = int(request_id)
+            self.current_priority = bool(as_current)
             if as_current:
                 # A neighbor prefetch can become the interactive target while
                 # its header probe is running.  Current work is never rejected
@@ -1752,6 +1783,21 @@ class _ZipRasterUnitJob(QRunnable):
                 # fresh, unrestricted current request instead of publishing an
                 # error frame for a valid image.
                 self.prefetch_budget_bytes = None
+        if as_current:
+            self._promote_current_helper()
+
+    def _promote_current_helper(self):
+        if not self.emergency_allowed or not self.helper_decided.is_set():
+            return
+        with self._token_lock:
+            if (self.cancelled.is_set() or self._helper_future is not None
+                    or self._helper_operation is None or self._helper_page.image_id in self._page_started):
+                return
+            self._helper_future = RASTER_EXECUTION_BUDGET.helper(
+                self._helper_operation,
+                is_current=lambda: self.current_priority and not self.cancelled.is_set(),
+                emergency=True,
+            )
 
     def expand_prefetch_budget(self, byte_budget: int) -> bool:
         """Expand a running background job's snapshot atomically.
@@ -1785,7 +1831,7 @@ class _ZipRasterUnitJob(QRunnable):
             return False
         self.cancelled.set()
         cancel_image_request = getattr(self.source, "cancel_image_request", None)
-        if callable(cancel_image_request):
+        if callable(cancel_image_request) and not getattr(self.source, 'supports_scoped_cancellation', False):
             for page in (*self.unit.pages, *self.layout_metadata_pages):
                 try:
                     cancel_image_request(page.image_id)
@@ -1795,16 +1841,63 @@ class _ZipRasterUnitJob(QRunnable):
 
     def mark_removed_before_start(self) -> None:
         self.cancelled.set()
+        if getattr(self, 'auto_memory_reserved', False):
+            RASTER_EXECUTION_BUDGET.release_auto_memory(self)
+            self.auto_memory_reserved = False
+        if self.execution_lease is not None:
+            self.execution_lease.release(notify=False)
+        if self.native_lane_release is not None:
+            release, self.native_lane_release = self.native_lane_release, None
+            release()
         self.finished.set()
 
     @Slot()
     def run(self) -> None:
         from .vector_image_decoder import vector_context
         priority = 20 if self.prefetch_budget_bytes is not None else 0
-        with vector_context(getattr(self.source, 'vector_pdfium_service', None), self.cancelled, priority):
-            self._run_owned()
+        execution = self.execution_lease or RASTER_EXECUTION_BUDGET.parent(
+            self.cancelled, lambda: self.current_priority and not self.cancelled.is_set(),
+            emergency=self.emergency_allowed,
+        )
+        try:
+            with execution:
+                adaptive = getattr(self, 'auto_memory_reserved', False)
+                started_at = monotonic() if adaptive else 0.
+                # Compare configured admission levels, not transient occupancy
+                # as a batch ramps up. A constant four-slot batch must not be
+                # mistaken for a concurrency increase from two to four.
+                concurrency = RASTER_EXECUTION_BUDGET.limit if adaptive else 0
+                with source_request_scope(self.cancelled), vector_context(
+                    getattr(self.source, 'vector_pdfium_service', None), self.cancelled, priority,
+                ):
+                    result = self._run_owned()
+                if (adaptive and not self.layout_metadata_pages
+                        and not self.cancelled.is_set() and self.source_decode_started.is_set()
+                        and result.pages and all(page.error is None for page in result.pages)):
+                    try:
+                        missing = dict((page.logical_image_id, page.source_original_size)
+                            for page in result.pages if page.logical_image_id not in self.cached_sources)
+                        RASTER_EXECUTION_BUDGET.observe_auto_job(
+                            ('job', _adaptive_work_signature(self.source, missing.items(), self.key.render_spec)),
+                            monotonic() - started_at, max(1, concurrency),
+                        )
+                    except Exception:
+                        # Optional telemetry must never strand a completed
+                        # frame, native lane, or its callback-drained owner.
+                        pass
+        finally:
+            if getattr(self, 'auto_memory_reserved', False):
+                RASTER_EXECUTION_BUDGET.release_auto_memory(self)
+                self.auto_memory_reserved = False
+        if self.native_lane_release is not None:
+            release, self.native_lane_release = self.native_lane_release, None
+            release()
+        # No source/native access or child remains after the permits leave.
+        # Keep artifact reservations until the queued result is consumed.
+        self.finished.set()
+        self.signals.completed.emit(result)
 
-    def _run_owned(self) -> None:
+    def _run_owned(self) -> _JobResult:
         self.started.set()
         pages: tuple[_RenderedPage, ...] = ()
         metadata = (
@@ -1819,15 +1912,16 @@ class _ZipRasterUnitJob(QRunnable):
         try:
             if not self.cancelled.is_set():
                 if self.layout_metadata_pages:
-                    metadata = RasterLayoutMetadata(
-                        self.key.source_epoch,
-                        self.key.source_identity,
-                        probe_layout_metadata(
-                            self.layout_metadata_pages,
-                            self.source.probe_image_size,
-                            self.cancelled,
-                        ),
-                    )
+                    with RASTER_EXECUTION_BUDGET.native_operation():
+                        metadata = RasterLayoutMetadata(
+                            self.key.source_epoch,
+                            self.key.source_identity,
+                            probe_layout_metadata(
+                                self.layout_metadata_pages,
+                                self.source.probe_image_size,
+                                self.cancelled,
+                            ),
+                        )
                 else:
                     pages = self._render_unit()
         except Exception as exc:  # pragma: no cover - defensive worker wall
@@ -1867,17 +1961,54 @@ class _ZipRasterUnitJob(QRunnable):
         # phases.  Mark native/Pillow/source access finished before queuing the
         # GUI callback; the runtime keeps the job in ``_jobs`` until that
         # callback has consumed the result.
-        self.finished.set()
-        self.signals.completed.emit(result)
+        return result
 
     def _render_unit(self) -> tuple[_RenderedPage, ...]:
         if not self._admit_unknown_prefetch_unit():
             return ()
         decoded_pages: list[_DecodedPage] = []
-        for page in self.unit.pages:
-            decoded_pages.append(self._decode_page(page))
-            if self.cancelled.is_set() or self.admission_declined:
-                return ()
+        missing = [page for page in self.unit.pages if page.image_id not in self.cached_sources]
+        helper = None
+        helper_page = None
+        if (self.spread_parallel and (self.prefetch_budget_bytes is None or self.near_parallel) and len(missing) == 2
+                and missing[0].image_id != missing[1].image_id and not self.cancelled.is_set()):
+            helper_page = missing[1]
+            def decode_helper():
+                from .vector_image_decoder import vector_context
+                with source_request_scope(self.cancelled), vector_context(
+                    getattr(self.source, 'vector_pdfium_service', None), self.cancelled,
+                    0 if self.current_priority else 20,
+                ):
+                    return self._decode_page(helper_page)
+            if (self.prefetch_budget_bytes is None or
+                    (self.confirmed_required_bytes or 0) * 2 <= self.prefetch_budget_bytes):
+                helper = RASTER_EXECUTION_BUDGET.helper(
+                    decode_helper, is_current=lambda: self.current_priority and not self.cancelled.is_set(),
+                    near=self.near_parallel and not self.current_priority,
+                    emergency=self.emergency_allowed,
+                )
+            with self._token_lock:
+                self._helper_operation = decode_helper
+                self._helper_page = helper_page
+                self._helper_future = helper
+        self.helper_decided.set()
+        self.signals.dispatchReady.emit()
+        try:
+            for page in self.unit.pages:
+                with self._token_lock:
+                    page_helper = self._helper_future if page is self._helper_page else None
+                    if page_helper is None:
+                        self._page_started.add(page.image_id)
+                decoded_pages.append(page_helper.result() if page_helper is not None else self._decode_page(page))
+                if self.cancelled.is_set() or self.admission_declined:
+                    return ()
+        finally:
+            with self._token_lock:
+                helper = self._helper_future
+            if helper is not None:
+                # Own the helper until native access has actually ended, even
+                # when the other half fails or cancellation discards the unit.
+                helper.result()
         decoded = tuple(decoded_pages)
         if self.cancelled.is_set() or self.admission_declined:
             return ()
@@ -1980,7 +2111,8 @@ class _ZipRasterUnitJob(QRunnable):
                 upscale_algorithm=self.key.render_spec.upscale_algorithm,
             )
             try:
-                display_qimage, _resized = render_qimage(page.qimage, render_key)
+                with RASTER_EXECUTION_BUDGET.native_operation():
+                    display_qimage, _resized = render_qimage(page.qimage, render_key)
                 error = None if not display_qimage.isNull() else tr('画像を表示できません。')
                 if error is not None:
                     display_qimage = None
@@ -2005,6 +2137,12 @@ class _ZipRasterUnitJob(QRunnable):
         return tuple(rendered)
 
     def _decode_page(self, page: ZipRasterPage) -> _DecodedPage:
+        if page.image_id in self.cached_sources:
+            return self._decode_page_owned(page)
+        with RASTER_EXECUTION_BUDGET.native_operation():
+            return self._decode_page_owned(page)
+
+    def _decode_page_owned(self, page: ZipRasterPage) -> _DecodedPage:
         if self.cancelled.is_set():
             return _DecodedPage(page, None, page.known_size or (360, 520), False)
         spec = self.key.render_spec
@@ -2083,17 +2221,48 @@ class _ZipRasterUnitJob(QRunnable):
                 (qimage is None or qimage.isNull())
                 and spec.adjustments == (1.0, 1.0, 1.0)
                 and suffix == ".webp"
-                and not _can_prepare_pillow_preview(
-                    spec,
-                    self.unit,
-                    page,
-                    decoder_maximum,
-                )
             ):
                 self.source_decode_started.set()
-                qimage = self.source.open_qimage(page.image_id)
+                preview_allowed = _can_prepare_pillow_preview(
+                    spec, self.unit, page, decoder_maximum,
+                )
+                qimage = (
+                    self.source.open_static_webp_qimage(page.image_id)
+                    if preview_allowed
+                    else self.source.open_qimage(page.image_id)
+                )
                 if qimage is not None and not qimage.isNull():
                     original_size = (qimage.width(), qimage.height())
+                    if preview_allowed and not self.cancelled.is_set():
+                        preview_size = _size_within_bounds(original_size, decoder_maximum)
+                        if preview_size != original_size:
+                            # Qt handles the costly static WebP decode. Keep
+                            # the existing Pillow filter/alpha semantics and
+                            # the same bounded retained source, not Qt's
+                            # unconfigurable reader-side resize.
+                            image = qimage_to_pillow(qimage)
+                            qimage = None
+                            preview: Image.Image | None = None
+                            try:
+                                if not self.cancelled.is_set():
+                                    policy = ResamplingPolicy(
+                                        spec.downscale_algorithm, spec.upscale_algorithm,
+                                    )
+                                    preview = image.resize(
+                                        preview_size,
+                                        pillow_resampling_for_policy(
+                                            policy, image.size, preview_size,
+                                        ),
+                                    )
+                                    qimage = pil_to_qimage(preview)
+                            finally:
+                                if preview is not None:
+                                    preview.close()
+                                image.close()
+            if self.cancelled.is_set():
+                return _DecodedPage(
+                    page, None, original_size or page.known_size or (360, 520), False,
+                )
             if (
                 qimage is not None
                 and not qimage.isNull()
@@ -2564,6 +2733,12 @@ class RasterBookRuntime(QObject):
         cache_soft_target_bytes: int | None = None,
         max_active_jobs: int = 1,
         zip_read_ahead: bool = False,
+        spread_parallel: bool = False,
+        current_extra: bool = False,
+        near_prefetch_parallel: bool = False,
+        near_prefetch_reserve: int = 2,
+        prefetch_execution_mode: str = "reserve",
+        adaptive_maximum: int = 8,
     ) -> None:
         if not isinstance(source, self._source_type):
             raise TypeError(
@@ -2576,13 +2751,38 @@ class RasterBookRuntime(QObject):
         self._coordinator = image_work_coordinator
         self._thread_pool = QThreadPool(self)
         self._max_active_jobs = max(1, min(2, int(max_active_jobs)))
+        trial_source = isinstance(source, (FolderImageSource, ZipImageSource))
+        self._spread_parallel = bool(spread_parallel) and trial_source
+        self._current_extra = bool(current_extra) and trial_source
+        self._near_prefetch_parallel = bool(near_prefetch_parallel) and self._spread_parallel
+        self._adaptive = prefetch_execution_mode == 'auto' and trial_source
+        self._adaptive_maximum = max(4, min(12, int(adaptive_maximum)))
+        self._auxiliary_limit = min(8, self._adaptive_maximum - 2) if self._adaptive else 2
+        self._burst_current = prefetch_execution_mode in ("burst", "auto") and trial_source and self._current_extra
+        self._full_prefetch = prefetch_execution_mode in ("full", "burst", "auto") and trial_source
+        RASTER_EXECUTION_BUDGET.configure_mode(self, prefetch_execution_mode if trial_source and
+            (prefetch_execution_mode != 'burst' or self._current_extra) else 'strict')
+        if self._adaptive:
+            RASTER_EXECUTION_BUDGET.configure_auto(
+                self, self._adaptive_maximum, emergency=self._current_extra,
+            )
+        if self._full_prefetch:
+            self._near_prefetch_parallel = bool(near_prefetch_parallel) and self._spread_parallel
+        self._near_prefetch_reserve = max(1, min(2, int(near_prefetch_reserve)))
+        RASTER_EXECUTION_BUDGET.configure_near(
+            self, enabled=self._near_prefetch_parallel or self._full_prefetch,
+            reserve=0 if self._full_prefetch else self._near_prefetch_reserve,
+        )
         self._zip_read_ahead_enabled = bool(zip_read_ahead) and isinstance(source, ZipImageSource)
         self._zip_read_ahead_connected = False
-        self._thread_pool.setMaxThreadCount(self._max_active_jobs)
+        self._thread_pool.setMaxThreadCount(self._max_active_jobs + int(self._current_extra))
         self._accepting_requests = True
         self._shutdown_complete = False
         self._serial = 0
         self._current_request: ZipRasterRequest | None = None
+        self._adaptive_wait_started = None
+        self._adaptive_wait_serial = None
+        self._adaptive_wait_concurrency = 1
         self._current_key: _UnitKey | None = None
         self._warmup_planner: RasterWarmupPlanner[
             ZipRasterDisplayUnit,
@@ -2597,6 +2797,9 @@ class RasterBookRuntime(QObject):
         self._source_hydration_frame: _CachedFrame | None = None
         self._active_job: _ZipRasterUnitJob | None = None
         self._secondary_job: _ZipRasterUnitJob | None = None
+        self._extra_job: _ZipRasterUnitJob | None = None
+        self._auxiliary_jobs: set[_ZipRasterUnitJob] = set()
+        self._emergency_job: _ZipRasterUnitJob | None = None
         self._jobs: set[_ZipRasterUnitJob] = set()
         self._inflight_reservations: dict[_ZipRasterUnitJob, int] = {}
         self._processing_completion = False
@@ -2631,7 +2834,9 @@ class RasterBookRuntime(QObject):
         self._frame_store = _ZipRasterFrameStore()
         self._source_store = _ZipRasterSourceStore()
         self._metrics = ZipRasterRuntimeMetrics()
-        if self._coordinator is not None and self._max_active_jobs > 1:
+        if self._current_extra or self._near_prefetch_parallel or self._full_prefetch:
+            RASTER_EXECUTION_BUDGET.signals.capacity_available.connect(self._drive, Qt.ConnectionType.QueuedConnection)
+        if self._coordinator is not None and (self._max_active_jobs > 1 or self._current_extra):
             self._coordinator.folder_viewer_capacity_available.connect(
                 self._drive, Qt.ConnectionType.QueuedConnection
             )
@@ -2683,7 +2888,7 @@ class RasterBookRuntime(QObject):
 
     def _active_slots(self) -> tuple[_ZipRasterUnitJob, ...]:
         return tuple(
-            job for job in (self._active_job, self._secondary_job)
+            job for job in (self._active_job, self._secondary_job, self._extra_job, self._emergency_job, *self._auxiliary_jobs)
             if job is not None
         )
 
@@ -2692,11 +2897,31 @@ class RasterBookRuntime(QObject):
             self._max_active_jobs > 1 and self._secondary_job is None
         )
 
+    def _full_slot_available(self, *, current=False) -> bool:
+        return (self._full_prefetch and len(self._auxiliary_jobs) < self._auxiliary_limit
+                and (RASTER_EXECUTION_BUDGET.current_available() if current
+                     else RASTER_EXECUTION_BUDGET.full_prefetch_available()))
+
     def _remove_active_slot(self, job: _ZipRasterUnitJob) -> None:
+        if self._emergency_job is job:
+            self._emergency_job = None
+        self._auxiliary_jobs.discard(job)
         if self._active_job is job:
             self._active_job = None
         if self._secondary_job is job:
             self._secondary_job = None
+        if self._extra_job is job:
+            self._extra_job = None
+        if getattr(job, 'private_extra_lane', False):
+            job.private_extra_lane = False
+            RASTER_EXECUTION_BUDGET.release_extra_lane()
+
+    def _current_extra_available(self) -> bool:
+        if not self._current_extra or self._extra_job is not None or self._current_request is None:
+            return False
+        ids = {page.image_id for page in self._current_request.current.pages}
+        return not any(ids.intersection(page.image_id for page in job.unit.pages)
+                       for job in self._active_slots())
 
     @property
     def cached_page_indexes(self) -> tuple[int, ...]:
@@ -2916,6 +3141,7 @@ class RasterBookRuntime(QObject):
                 ):
                     ready_priority_units += 1
         return {
+            **RASTER_EXECUTION_BUDGET.debug_values(),
             "hard_limit_bytes": self._cache_byte_budget,
             "soft_target_bytes": self._cache_soft_target_bytes,
             "cache_used_bytes": self.cache_bytes,
@@ -3345,6 +3571,15 @@ class RasterBookRuntime(QObject):
             self._restore_source_hydration_frame()
         self._current_request = request
         self._current_key = current_key
+        if self._adaptive:
+            if current_key not in self._frame_store and (
+                    self._adaptive_wait_started is None or self._adaptive_wait_serial != request.request_id):
+                self._adaptive_wait_started = monotonic()
+                self._adaptive_wait_serial = request.request_id
+                self._adaptive_wait_concurrency = max(1, RASTER_EXECUTION_BUDGET.limit)
+            RASTER_EXECUTION_BUDGET.set_auto_current_pending(
+                self, current_key not in self._frame_store,
+            )
         planner = self._warmup_planner
         if planner is None:
             planner = RasterWarmupPlanner(request.warmup_plan)
@@ -3450,6 +3685,7 @@ class RasterBookRuntime(QObject):
                         and (
                             not isinstance(self.source, ZipImageSource)
                             or self._max_active_jobs > 1
+                            or self._full_prefetch
                             or any(
                                 page in current_key.unit_identity
                                 for page in active.key.unit_identity
@@ -3598,6 +3834,9 @@ class RasterBookRuntime(QObject):
         return True
 
     def cancel(self, *, clear_artifacts: bool = False) -> None:
+        if self._adaptive:
+            self._adaptive_wait_started = self._adaptive_wait_serial = None
+            RASTER_EXECUTION_BUDGET.set_auto_current_pending(self, False)
         self._warmup_continue_timer.stop()
         if clear_artifacts:
             self._source_hydration_key = None
@@ -3644,6 +3883,9 @@ class RasterBookRuntime(QObject):
         self._cancel_active_job()
 
     def invalidate_layout(self) -> None:
+        if self._adaptive:
+            self._adaptive_wait_started = self._adaptive_wait_serial = None
+            RASTER_EXECUTION_BUDGET.set_auto_current_pending(self, False)
         self._warmup_continue_timer.stop()
         # Layout-dependent QPixmaps are invalid, but decoded archive content
         # remains valid.  Keeping this boundary is what prevents resize, DPI,
@@ -3685,6 +3927,10 @@ class RasterBookRuntime(QObject):
         return True
 
     def shutdown(self, *, wait_msecs: int = 5000) -> bool:
+        if self._adaptive:
+            RASTER_EXECUTION_BUDGET.release_auto(self)
+        RASTER_EXECUTION_BUDGET.configure_mode(self)
+        RASTER_EXECUTION_BUDGET.configure_near(self, enabled=False)
         if self._shutdown_complete:
             return True
         self._accepting_requests = False
@@ -3730,6 +3976,8 @@ class RasterBookRuntime(QObject):
         """
 
         self._accepting_requests = False
+        if self._adaptive:
+            RASTER_EXECUTION_BUDGET.set_auto_current_pending(self, False)
         self.cancel(clear_artifacts=False)
         if self._coordinator is None:
             self._thread_pool.clear()
@@ -3762,11 +4010,29 @@ class RasterBookRuntime(QObject):
                 or any(job.key == self._current_key for job in self._active_slots())
             ):
                 return
-            if self._free_slot_available():
+            if (self._free_slot_available() or self._current_extra_available() or self._full_slot_available(current=True)
+                    or (self._burst_current and self._emergency_job is None
+                        and RASTER_EXECUTION_BUDGET.current_available(emergency=True))):
                 self._submit(self._current_key, ImageWorkPriority.VIEWER_CURRENT)
             return
+        if RASTER_EXECUTION_BUDGET.adaptive_pause_prefetch():
+            return
         remaining = _WARMUP_SCAN_SLICE_UNITS
-        while self._free_slot_available():
+        while self._free_slot_available() or self._full_slot_available():
+            if self._full_prefetch and any(
+                    job.spread_parallel and not job.helper_decided.is_set()
+                    and not job.finished.is_set() for job in self._active_slots()):
+                return
+            if self._near_prefetch_parallel:
+                if not RASTER_EXECUTION_BUDGET.background_available():
+                    return
+                if not self._full_prefetch and self._near_prefetch_reserve == 2 and any(
+                        job.near_parallel and not job.cancelled.is_set()
+                        and job.key != self._current_key and job.key not in self._frame_store
+                        for job in self._jobs):
+                    # Finish the closest complete spread before starting the
+                    # next one; keep its helper from losing a permit to next2.
+                    return
             near_only = False
             near_units = (
                 request.next_display_units
@@ -4446,7 +4712,20 @@ class RasterBookRuntime(QObject):
     ) -> bool:
         request = self._current_request
         unit = self._unit_for_key(key)
-        if request is None or unit is None or not self._free_slot_available():
+        if self._adaptive and key != self._current_key and not RASTER_EXECUTION_BUDGET.background_available():
+            return False
+        extra = not self._free_slot_available()
+        emergency_job = (self._burst_current and key == self._current_key and self._emergency_job is None
+                         and RASTER_EXECUTION_BUDGET.debug_values()['normal_permits'] >= RASTER_EXECUTION_BUDGET.limit
+                         and RASTER_EXECUTION_BUDGET.current_available(emergency=True))
+        full_background = (self._full_prefetch and key != self._current_key
+                           and self._current_key in self._frame_store
+                           and RASTER_EXECUTION_BUDGET.full_prefetch_available())
+        auxiliary = (extra and self._full_prefetch and len(self._auxiliary_jobs) < self._auxiliary_limit
+                     and (not self._current_extra or self._extra_job is not None))
+        if (request is None or unit is None
+                or (extra and not auxiliary and not full_background and not emergency_job
+                    and (key != self._current_key or not self._current_extra_available()))):
             return False
         metadata_pages = (
             self._layout_metadata_pages_for(key)
@@ -4466,6 +4745,14 @@ class RasterBookRuntime(QObject):
                 continue
             cached_sources[page.image_id] = cached
             self._bump("source_cache_hits")
+        if self._current_extra and key == self._current_key:
+            missing_ids = {page.image_id for page in unit.pages if page.image_id not in cached_sources}
+            # Native completion precedes the queued cache publication. Keep
+            # sharing the source until the completion handler drains the job,
+            # including jobs already detached from their execution slots.
+            if any(missing_ids.intersection(page.image_id for page in active.unit.pages)
+                   for active in self._jobs):
+                return False
         source_estimate = (
             0
             if metadata_pages
@@ -4496,6 +4783,20 @@ class RasterBookRuntime(QObject):
         )
         if unknown_cost and self._max_active_jobs > 1 and worker_budget is not None:
             worker_budget = min(worker_budget, reservation)
+        available = min(self._cache_byte_budget, self._cache_soft_target_bytes) - self.cache_bytes - sum(self._inflight_reservations.values())
+        near_parallel = (self._near_prefetch_parallel and key != self._current_key
+                         and self._current_key in self._frame_store
+                         and key.unit_identity in self._urgent_priority_identities(request)
+                         and (self._full_prefetch or not any(not active.finished.is_set() for active in self._active_slots()))
+                         and all(page.known_size is not None for page in unit.pages))
+        parallel = (self._spread_parallel and (key == self._current_key or near_parallel) and not metadata_pages
+                    and len(unit.pages) - len(cached_sources) == 2
+                    and reservation + source_estimate <= available)
+        if parallel:
+            reservation += source_estimate
+        extra_fits = reservation <= available
+        if extra and not extra_fits:
+            return False
         self._serial += 1
         job = _ZipRasterUnitJob(
             serial=self._serial,
@@ -4511,12 +4812,57 @@ class RasterBookRuntime(QObject):
                 if key == self._current_key or metadata_pages
                 else self._cache_byte_budget
             ),
+            spread_parallel=parallel,
+            near_parallel=near_parallel and parallel,
+            emergency_allowed=self._burst_current and extra_fits,
+            is_current=key == self._current_key,
         )
+        if self._adaptive:
+            missing = tuple(page for page in unit.pages if page.image_id not in cached_sources)
+            scratch = 0
+            for page in (() if metadata_pages else missing):
+                size = page.known_size
+                if size is None:
+                    scratch += 256 * 1024 * 1024
+                else:
+                    suffix = Path(page.image_id).suffix.casefold()
+                    bounds = _decoder_maximum_for_page(key.render_spec, unit, page)
+                    retained = self.source.estimate_compatible_jpeg_size(size, bounds or (None, None))
+                    # PNG/WebP and generic codecs can decode a full raster
+                    # before reducing it. Include several scratch/copy buffers.
+                    # Progressive JPEG can keep full-resolution coefficient
+                    # storage even when the output is decoder-reduced.
+                    scratch += (size[0] * size[1] * 4 + retained[0] * retained[1] * 8 if suffix in _JPEG_SUFFIXES
+                                else size[0] * size[1] * 12)
+            if not RASTER_EXECUTION_BUDGET.reserve_auto_memory(
+                    job, scratch, current=key == self._current_key and not extra and not emergency_job):
+                job.mark_removed_before_start()
+                return False
+            job.auto_memory_reserved = True
         job.signals.completed.connect(
             self._on_job_completed,
             Qt.ConnectionType.QueuedConnection,
         )
-        if self._active_job is None:
+        job.signals.dispatchReady.connect(self._drive, Qt.ConnectionType.QueuedConnection)
+        if full_background or auxiliary or emergency_job:
+            job.execution_lease = RASTER_EXECUTION_BUDGET.claim_background(
+                lambda: job.current_priority and not job.cancelled.is_set(),
+                emergency=emergency_job and extra_fits,
+            )
+            if job.execution_lease is None:
+                job.mark_removed_before_start()
+                return False
+        if extra and not auxiliary and not emergency_job and self._coordinator is None and not RASTER_EXECUTION_BUDGET.try_extra_lane():
+            job.mark_removed_before_start()
+            return False
+        if emergency_job:
+            self._emergency_job = job
+        elif auxiliary:
+            self._auxiliary_jobs.add(job)
+        elif extra:
+            self._extra_job = job
+            job.private_extra_lane = self._coordinator is None
+        elif self._active_job is None:
             self._active_job = job
         else:
             self._secondary_job = job
@@ -4527,15 +4873,42 @@ class RasterBookRuntime(QObject):
                 unit, key.render_spec,
                 allow=not metadata_pages and len(cached_sources) < len(unit.pages),
             )
-        if self._coordinator is not None:
+        if emergency_job:
+            started = RASTER_EXECUTION_BUDGET.start_emergency(job, priority)
+        elif auxiliary:
+            started = (RASTER_EXECUTION_BUDGET.start_background(job, priority, adaptive=True)
+                       if self._adaptive else RASTER_EXECUTION_BUDGET.start_background(job, priority))
+        elif self._coordinator is not None:
             started = (
+                self._coordinator.start_current_viewer(job, int(priority)) if extra else
                 self._coordinator.start_folder_viewer(job, int(priority))
-                if self._max_active_jobs > 1
+                if self._max_active_jobs > 1 or (self._current_extra and key == self._current_key)
                 else self._coordinator.start_viewer(job, int(priority))
             )
+            if (started is None and not extra and key == self._current_key
+                    and self._current_extra and self._extra_job is None and extra_fits):
+                started = self._coordinator.start_current_viewer(job, int(priority))
+                if started:
+                    self._remove_active_slot(job)
+                    self._extra_job = job
+            if started is None and full_background:
+                if self._current_extra and self._extra_job is None and extra_fits:
+                    started = self._coordinator.start_current_viewer(job, int(priority))
+                    if started:
+                        self._remove_active_slot(job)
+                        self._extra_job = job
+                if started is None and len(self._auxiliary_jobs) < self._auxiliary_limit:
+                    started = (RASTER_EXECUTION_BUDGET.start_background(job, priority, adaptive=True)
+                               if self._adaptive else RASTER_EXECUTION_BUDGET.start_background(job, priority))
+                    if started:
+                        self._remove_active_slot(job)
+                        self._auxiliary_jobs.add(job)
         else:
-            self._thread_pool.start(job, int(priority))
-            started = True
+            try:
+                self._thread_pool.start(job, int(priority))
+                started = True
+            except RuntimeError:
+                started = False
         if started:
             self._bump("jobs_submitted")
             if metadata_pages:
@@ -4633,6 +5006,10 @@ class RasterBookRuntime(QObject):
         self._emit_idle_if_needed()
 
     def _try_take(self, job: _ZipRasterUnitJob) -> bool:
+        if getattr(job, 'emergency_lane', False):
+            return RASTER_EXECUTION_BUDGET.take_emergency(job)
+        if getattr(job, 'auxiliary_lane', False):
+            return RASTER_EXECUTION_BUDGET.take_background(job)
         if self._coordinator is not None:
             return self._coordinator.try_take_viewer(job)
         try:
@@ -4942,6 +5319,23 @@ class RasterBookRuntime(QObject):
         # Record before emitting: GUI slots can synchronously navigate/release.
         # Cache ownership alone does not imply this request was presented.
         self._published_request = request
+        if self._adaptive:
+            if (self._adaptive_wait_started is not None
+                    and self._adaptive_wait_serial == request.request_id
+                    and all(page.error is None for page in cached.pages)):
+                try:
+                    observed = {page.page_index: page for page in cached.pages}
+                    pairs = tuple((page.image_id, page.known_size or observed[page.page_index].original_size)
+                        for page in request.current.pages if page.page_index in observed)
+                    RASTER_EXECUTION_BUDGET.observe_auto_job(
+                        ('current_wait', _adaptive_work_signature(self.source, pairs, request.render_spec)),
+                        monotonic() - self._adaptive_wait_started, self._adaptive_wait_concurrency,
+                    )
+                except Exception:
+                    pass  # Feedback is optional; presentation ownership is not.
+            self._adaptive_wait_started = None
+            self._adaptive_wait_serial = None
+            RASTER_EXECUTION_BUDGET.set_auto_current_pending(self, False)
         self.frameReady.emit(self._public_frame(request, cached, cache_hit))
 
     def _result_is_artifact_compatible(self, result: _JobResult) -> bool:

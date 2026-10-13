@@ -195,6 +195,10 @@ class ConfigManager(QObject):
         "browser_folders_first": True,
         "browser_location_history_limit": 50,
         "browser_search_history_limit": 50,
+        "browser_search_wheel_enabled": True,
+        "browser_search_wheel_shift_oldest": False,
+        "browser_search_wheel_oldest_first": False,
+        "browser_search_wheel_reverse_oldest": False,
         "browser_search_history": [],
         "browser_tag_registry": [],
         "browser_tag_grouped": False,
@@ -268,6 +272,8 @@ class ConfigManager(QObject):
         "viewer_close_shortcut": "Ctrl+W",
         "shortcut_bindings": default_shortcut_bindings(),
         "browser_cancel_clears_filters": True,
+        "browser_sidebar_open_focus_first": True,
+        "browser_shift_arrows_switch_focus": True,
         "viewer_slideshow_chord_enabled": True,
         "browser_folder_gestures_enabled": True,
         "mouse_back_button_action": "previous_book",
@@ -312,6 +318,12 @@ class ConfigManager(QObject):
         "viewer_memory_mode": "auto",
         "viewer_decode_workers": 1,
         "viewer_zip_read_ahead_enabled": True,
+        "viewer_spread_parallel_trial": True,
+        "viewer_current_extra_trial": True,
+        "viewer_raster_execution_limit": 4,
+        "viewer_near_prefetch_parallel": False,
+        "viewer_prefetch_execution_mode": "reserve",
+        "viewer_adaptive_maximum": 8,
         "viewer_zip_priority_screens": 5,  # Legacy alias for forward priority.
         "viewer_prefetch_forward_screens": 5,
         "viewer_prefetch_backward_screens": 1,
@@ -1071,7 +1083,15 @@ class ConfigManager(QObject):
             "thumbnail_disk_cache_enabled",
             "pdf_render_annotations",
             "viewer_prefetch_direction_priority_enabled",
+            "viewer_spread_parallel_trial", "viewer_current_extra_trial",
+            "viewer_near_prefetch_parallel",
             "browser_cancel_clears_filters",
+            "browser_sidebar_open_focus_first",
+            "browser_shift_arrows_switch_focus",
+            "browser_search_wheel_enabled",
+            "browser_search_wheel_shift_oldest",
+            "browser_search_wheel_oldest_first",
+            "browser_search_wheel_reverse_oldest",
         ):
             if not isinstance(normalized.get(key), bool):
                 normalized[key] = cls.DEFAULTS[key]
@@ -1136,6 +1156,19 @@ class ConfigManager(QObject):
         )
         normalized["viewer_decode_workers"] = cls._clamped_int(
             normalized.get("viewer_decode_workers"), default=1, minimum=1, maximum=2,
+        )
+        raster_limit = normalized.get("viewer_raster_execution_limit")
+        if normalized.get("viewer_prefetch_execution_mode") == "full":
+            normalized["viewer_prefetch_execution_mode"] = "burst"
+        if normalized.get("viewer_prefetch_execution_mode") not in ("reserve", "burst", "auto"):
+            normalized["viewer_prefetch_execution_mode"] = "reserve"
+        normalized["viewer_adaptive_maximum"] = cls._clamped_int(
+            None if isinstance(normalized.get("viewer_adaptive_maximum"), bool)
+            else normalized.get("viewer_adaptive_maximum"), default=8, minimum=4, maximum=12,
+        )
+        normalized["viewer_raster_execution_limit"] = (
+            raster_limit if type(raster_limit) is int and raster_limit in (3, 4)
+            else cls.DEFAULTS["viewer_raster_execution_limit"]
         )
         normalized["viewer_zip_priority_screens"] = cls._clamped_int(
             (None if isinstance(normalized.get("viewer_zip_priority_screens"), bool)

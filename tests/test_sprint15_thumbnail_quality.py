@@ -24,7 +24,6 @@ from app.thumbnail_render import (
     render_pil_thumbnail,
     snap_logical_rect_to_physical_pixels,
 )
-from scripts.thumbnail_quality_audit import run_audit
 
 
 @pytest.mark.parametrize("display_size", [96, 128, 180, 240, 320])
@@ -403,6 +402,10 @@ def test_browser_quality_setting_is_applied_immediately(
 
 
 def test_codec_audit_covers_line_photo_gradient_and_rgba() -> None:
+    run_audit = pytest.importorskip(
+        "out.internal.scripts.thumbnail_quality_audit",
+        reason="Optional local codec investigation tool is not part of the published source.",
+    ).run_audit
     results = run_audit()
     by_key = {(result.sample, result.codec): result for result in results}
     assert {result.sample for result in results} == {

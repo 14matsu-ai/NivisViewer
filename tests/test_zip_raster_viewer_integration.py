@@ -1099,9 +1099,11 @@ def test_rapid_wheel_holds_unready_target_and_finishes_started_work(
         qapp.processEvents()
 
 
+@pytest.mark.parametrize('extra', [False, True])
 def test_actual_wheel_route_preempts_unrelated_cold_archive_work(
     tmp_path: Path,
     qapp: QApplication,
+    extra: bool,
 ) -> None:
     archive = tmp_path / "cold-wheel-priority.zip"
     with zipfile.ZipFile(archive, "w") as output:
@@ -1154,7 +1156,7 @@ def test_actual_wheel_route_preempts_unrelated_cold_archive_work(
     source = GatedZipSource(archive)
     config = ConfigManager(tmp_path / "cold-wheel-config.json")
     config.load()
-    config.apply({"viewer_memory_mode": "4096"})
+    config.apply({"viewer_memory_mode": "4096", "viewer_current_extra_trial": extra})
     session = BookSession(
         source_factory=lambda _path, **_kwargs: (source, None),
     )
@@ -1248,7 +1250,10 @@ def test_actual_wheel_route_preempts_unrelated_cold_archive_work(
         assert old_job.cancelled.is_set()
         assert runtime._active_job is old_job
         assert old_job in runtime._inflight_reservations
-        assert not source.cold_target_started.is_set()
+        if extra:
+            _wait_until(qapp, source.cold_target_started.is_set)
+        else:
+            assert not source.cold_target_started.is_set()
 
         source.release_background.set()
         _wait_until(qapp, source.cold_target_started.is_set, timeout_ms=5000)

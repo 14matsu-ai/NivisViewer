@@ -51,6 +51,7 @@ from PySide6.QtGui import (
     QPixmap,
     QResizeEvent,
     QShortcut,
+    QWheelEvent,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -780,6 +781,18 @@ class BrowserWindow(QMainWindow):
         self._list_view_restore_token = 0
         self._list_scroll_epoch = 0
         self._restoring_list_view_state = False
+        self._list_selection_epoch = 0
+        self._model_selection_depth = 0
+        self._pending_sidebar_focus: tuple[Path, int, int, QWidget | None] | None = None
+        self._last_sidebar_focus: QWidget | None = None
+        self._search_wheel_entries: tuple[str, ...] = ()
+        self._search_wheel_index = -1
+        self._search_wheel_delta = 0
+        self._search_wheel_pixel = False
+        self._search_wheel_shift = False
+        self._search_wheel_query: str | None = None
+        self._search_wheel_view_state: tuple[str, int, _ListViewState] | None = None
+        self._selecting_wheel_history = False
         self._status_message_token = 0
         self._temporary_status_message: str | None = None
         self._screen_tracking_window = None
@@ -809,6 +822,10 @@ class BrowserWindow(QMainWindow):
         self._operation_restore_paths: tuple[str, ...] = ()
         self._operation_restore_row: int | None = None
         self._operation_refresh_generation: int | None = None
+        self._operation_restore_token = 0
+        self._operation_restore_epoch: int | None = None
+        self._operation_restore_folder: Path | None = None
+        self._operation_start_epochs: dict[int, int] = {}
         self._operation_completion_message: str | None = None
         self._file_operation_requests: dict[int, FileOperationRequest] = {}
         self._clipboard_paste_receipts: dict[int, ClipboardPasteReceipt] = {}
@@ -1287,6 +1304,8 @@ class BrowserWindow(QMainWindow):
         retry_failed_thumbnails: bool = False,
     ) -> bool:
         target = self._absolute_browser_path(path)
+        self._pending_sidebar_focus = None
+        self._operation_restore_token += 1
         if self._deny_file_mutation_access(target, folder=True):
             return False
         if trace_id:
@@ -1631,6 +1650,7 @@ class BrowserWindow(QMainWindow):
         if pending.navigation_source == "snapshot_reconcile":
             self._snapshot_reconcile_pending = False
         self._pending_scan = None
+        self._apply_sidebar_open_focus()
         self.directory_scan_committed.emit(str(pending.path))
         self._update_status()
         # Cached navigation and other internal reconciliations are passive;
@@ -1646,7 +1666,8 @@ class BrowserWindow(QMainWindow):
             )
         if self._operation_refresh_generation == pending.generation:
             self._operation_refresh_generation = None
-            QTimer.singleShot(0, self._restore_file_operation_selection)
+            token = self._operation_restore_token
+            QTimer.singleShot(0, lambda: self._restore_file_operation_selection(token))
         if reconcile_again:
             self._schedule_directory_reconciliation()
         if snapshot_reconcile_path is not None:
@@ -1728,8 +1749,12 @@ class BrowserWindow(QMainWindow):
         self.config.set("last_browser_path", str(pending.path))
         self._generation = self.thumbnail_provider.begin_generation()
         self._thumbnail_scroll_direction = 1
-        self.list_view.clearSelection()
-        self.list_view.setCurrentIndex(QModelIndex())
+        self._restoring_list_view_state = True
+        try:
+            self.list_view.clearSelection()
+            self.list_view.setCurrentIndex(QModelIndex())
+        finally:
+            self._restoring_list_view_state = False
         if pending.record_history:
             self.navigation_history.visit(BrowserLocation(str(pending.path)))
         else:
@@ -3523,6 +3548,7 @@ class BrowserWindow(QMainWindow):
             else None
         )
         self._file_operation_requests[request.request_id] = request
+        self._operation_start_epochs[request.request_id] = self._list_selection_epoch
         if clipboard_receipt is not None:
             self._clipboard_paste_receipts[request.request_id] = clipboard_receipt
         self._file_operation_selection_before[request.request_id] = (
@@ -3543,12 +3569,14 @@ class BrowserWindow(QMainWindow):
                 self._file_operation_requests.pop(request.request_id, None)
                 self._clipboard_paste_receipts.pop(request.request_id, None)
                 self._file_operation_selection_before.pop(request.request_id, None)
+                self._operation_start_epochs.pop(request.request_id, None)
                 self._show_temporary_status(tr('クリップボードが変更されたため貼り付けを中止しました'))
                 return False
         if not self.file_operation_coordinator.execute(request):
             self._file_operation_requests.pop(request.request_id, None)
             self._clipboard_paste_receipts.pop(request.request_id, None)
             self._file_operation_selection_before.pop(request.request_id, None)
+            self._operation_start_epochs.pop(request.request_id, None)
             self._show_temporary_status(tr('ファイル操作を開始できません'))
             return False
         return True
@@ -4024,6 +4052,7 @@ class BrowserWindow(QMainWindow):
             result.request_id,
             ((), None),
         )
+        start_epoch = self._operation_start_epochs.pop(result.request_id, None)
         if (
             self._shutdown_prepared
             or request is None
@@ -4229,10 +4258,37 @@ class BrowserWindow(QMainWindow):
         self._operation_completion_message = completion_message
         if self.refresh_current_folder() and self._pending_scan is not None:
             self._operation_refresh_generation = self._pending_scan.generation
+            self._operation_restore_epoch = (
+                self._list_selection_epoch if start_epoch == self._list_selection_epoch else None
+            )
+            self._operation_restore_folder = self.current_path
         else:
             self._show_temporary_status(completion_message)
 
-    def _restore_file_operation_selection(self) -> None:
+    def _restore_file_operation_selection(self, token: int | None = None) -> None:
+        if token is not None and token != self._operation_restore_token:
+            return
+        if (
+            self._operation_restore_epoch != self._list_selection_epoch
+            or self._operation_restore_folder != self.current_path
+            or self._shutdown_prepared
+        ):
+            self._operation_restore_paths = ()
+            self._operation_restore_row = None
+            message = self._operation_completion_message
+            self._operation_completion_message = None
+            if message and not self._shutdown_prepared:
+                self._show_temporary_status(message)
+            return
+        # This final selection supersedes the generic scan layout restore.
+        self._list_view_restore_token += 1
+        self._restoring_list_view_state = True
+        try:
+            self._restore_file_operation_selection_now()
+        finally:
+            self._restoring_list_view_state = False
+
+    def _restore_file_operation_selection_now(self) -> None:
         selection_model = self.list_view.selectionModel()
         selection_model.clearSelection()
         current_index = QModelIndex()
@@ -4342,7 +4398,7 @@ class BrowserWindow(QMainWindow):
         entry = self.folder_bookmark_model.entry_at(index)
         if entry is None or entry.kind != "folder":
             return
-        self.navigate_to(
+        self._navigate_from_sidebar(
             entry.path,
             navigation_source="favorite",
             trace_id=self._favorite_trace_id,
@@ -4461,7 +4517,7 @@ class BrowserWindow(QMainWindow):
             self.statusBar().showMessage(tr('お気に入り先が見つかりません'), 3000)
             return
         if entry.item_type == "folder":
-            self.navigate_to(entry.path)
+            self._navigate_from_sidebar(entry.path)
             return
         if self._open_path_handler is not None:
             self._invoke_open_path_handler(entry.path, open_in_new_window)
@@ -4483,7 +4539,7 @@ class BrowserWindow(QMainWindow):
             self.statusBar().showMessage(tr('履歴の項目が見つかりません'), 3000)
             return
         if entry.item_type in {"folder", "book_folder"} and not open_in_new_window:
-            self.navigate_to(entry.path)
+            self._navigate_from_sidebar(entry.path)
             return
         if self._open_path_handler is not None:
             self._invoke_open_path_handler(entry.path, open_in_new_window)
@@ -4974,8 +5030,16 @@ class BrowserWindow(QMainWindow):
                     self.search_history.replace(value) or search_history_changed
                 )
         if search_history_changed:
+            if not self._selecting_wheel_history:
+                self._search_wheel_entries = ()
+                self._search_wheel_delta = 0
             self._close_owned_popup("_search_history_popup")
             self._sync_search_history_control()
+        if any(key in changed for key in (
+                "browser_search_wheel_enabled", "browser_search_wheel_shift_oldest",
+                "browser_search_wheel_oldest_first", "browser_search_wheel_reverse_oldest")):
+            self._search_wheel_entries = ()
+            self._search_wheel_delta = 0
         if "browser_folder_gestures_enabled" in changed:
             self.browser_folder_gestures_enabled = bool(
                 changed["browser_folder_gestures_enabled"]
@@ -5500,6 +5564,11 @@ class BrowserWindow(QMainWindow):
                 control.blockSignals(False)
 
     def _on_browser_search_text_changed(self, _text: str) -> None:
+        if not self._selecting_wheel_history:
+            self._search_wheel_query = None
+            self._search_wheel_view_state = None
+            self._search_wheel_entries = ()
+            self._search_wheel_delta = 0
         self.search_query_edited.emit(self, str(_text))
         self._browser_search_timer.start()
 
@@ -5533,6 +5602,11 @@ class BrowserWindow(QMainWindow):
         preserve_view_state: bool = True,
         request_thumbnails: bool = True,
     ) -> bool:
+        if not self._selecting_wheel_history:
+            self._search_wheel_query = None
+            self._search_wheel_view_state = None
+            self._search_wheel_entries = ()
+            self._search_wheel_delta = 0
         self._browser_search_timer.stop()
         state = BrowserFilterState.normalized(
             search_text=query,
@@ -5562,6 +5636,8 @@ class BrowserWindow(QMainWindow):
             return False
         self._browser_search_timer.stop()
         self._apply_pending_browser_search()
+        if self._search_wheel_query == self.browser_search_edit.text():
+            return False
         if not self.search_history.record(self.browser_search_edit.text()):
             return False
         self._persist_browser_search_history()
@@ -5632,6 +5708,11 @@ class BrowserWindow(QMainWindow):
         self,
         entry: LocationPopupEntry,
     ) -> None:
+        if not self._selecting_wheel_history:
+            self._search_wheel_query = None
+            self._search_wheel_view_state = None
+            self._search_wheel_entries = ()
+            self._search_wheel_delta = 0
         if entry.value is _CLEAR_SEARCH_HISTORY:
             if self.search_history.clear():
                 self._persist_browser_search_history()
@@ -5640,7 +5721,7 @@ class BrowserWindow(QMainWindow):
         query = str(entry.value).strip()
         if not query:
             return
-        if self.search_history.record(query):
+        if not self._selecting_wheel_history and self.search_history.record(query):
             self._persist_browser_search_history()
         self.browser_search_edit.setText(query)
         self._browser_search_timer.stop()
@@ -5677,6 +5758,12 @@ class BrowserWindow(QMainWindow):
         )
 
     def _set_browser_filter(self, state: BrowserFilterState) -> bool:
+        if (not self._selecting_wheel_history
+                and state.search_text != self.browser_filter_state.search_text):
+            self._search_wheel_query = None
+            self._search_wheel_view_state = None
+            self._search_wheel_entries = ()
+            self._search_wheel_delta = 0
         registry = self.config.get('browser_tag_registry', [])
         normalized = BrowserFilterState.normalized(
             search_text=state.search_text,
@@ -6030,12 +6117,26 @@ class BrowserWindow(QMainWindow):
         current: QModelIndex,
         previous: QModelIndex,
     ) -> None:
+        self._note_list_selection_change()
         self._update_index_rect(previous)
         self._update_index_rect(current)
         self._update_status()
         self._update_selected_detail()
 
+    def _begin_model_selection_change(self, *_args) -> None:
+        self._model_selection_depth += 1
+
+    def _end_model_selection_change(self, *_args) -> None:
+        self._model_selection_depth = max(0, self._model_selection_depth - 1)
+
+    def _note_list_selection_change(self) -> None:
+        if self._restoring_list_view_state or self._model_selection_depth:
+            return
+        self._list_selection_epoch += 1
+        self._pending_sidebar_focus = None
+
     def _on_list_selection_changed(self, selected, deselected) -> None:
+        self._note_list_selection_change()
         for index in tuple(selected.indexes()) + tuple(deselected.indexes()):
             self._update_index_rect(index)
         self._update_status()
@@ -6887,12 +6988,170 @@ class BrowserWindow(QMainWindow):
         return False
 
     def _browser_shortcut_has(self, action_id: str, event: QKeyEvent) -> bool:
-        combined = int(event.key()) | int(event.modifiers().value)
-        sequence = canonical_key(QKeySequence(combined))
-        return sequence in {
+        bindings = {
             canonical_key(value)
             for value in self.shortcut_bindings.get(action_id, [])
         }
+        combined = int(event.key()) | int(event.modifiers().value)
+        if canonical_key(QKeySequence(combined)) in bindings:
+            return True
+        if action_id == "browser_open_selection" and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            # Alias physical Enter/Return only for opening list items. An
+            # explicit Num+Enter binding still matches only the numeric pad.
+            modifiers = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+            return any(canonical_key(QKeySequence(int(key) | int(modifiers.value))) in bindings
+                       for key in (Qt.Key.Key_Return, Qt.Key.Key_Enter))
+        return False
+
+    def _is_search_history_wheel_surface(self, watched: object, event: QWheelEvent) -> bool:
+        current = watched
+        while isinstance(current, QWidget):
+            if current is getattr(self, "browser_search_edit", None) or current is getattr(self, "browser_search_container", None):
+                return True
+            current = current.parentWidget()
+        popup = getattr(self, "_search_history_popup", None)
+        if popup is not None and isinstance(watched, QWidget) and watched.window() is popup:
+            # Qt routes pointer packets to the grabbed popup while it is
+            # open. A wheel over the search bar still belongs to the bar;
+            # scrolling inside the popup remains ordinary popup scrolling.
+            point = self.browser_search_container.mapFromGlobal(event.globalPosition().toPoint())
+            return self.browser_search_container.rect().contains(point)
+        return False
+
+    def _step_search_history_wheel(self, event: QWheelEvent) -> None:
+        phase = event.phase()
+        if phase == Qt.ScrollPhase.ScrollBegin:
+            self._search_wheel_delta = 0
+        if (not self.config.get("browser_search_wheel_enabled", True)
+                or not self.search_history.entries or self._shutdown_prepared):
+            self._search_wheel_delta = 0
+            return
+        pixel = event.pixelDelta().y() != 0
+        delta = event.pixelDelta().y() if pixel else event.angleDelta().y()
+        if not delta:
+            if phase == Qt.ScrollPhase.ScrollEnd:
+                self._search_wheel_delta = 0
+            return
+        if not self._search_wheel_entries:
+            self._search_wheel_entries = self.search_history.entries
+            query = self.browser_search_edit.text().strip().casefold()
+            self._search_wheel_index = next((i for i, text in enumerate(self._search_wheel_entries)
+                                             if text.casefold() == query), -1) if self.active_search_query else -1
+        shift = event.modifiers() == Qt.KeyboardModifier.ShiftModifier
+        if (pixel != self._search_wheel_pixel or shift != self._search_wheel_shift
+                or phase == Qt.ScrollPhase.ScrollBegin):
+            self._search_wheel_delta = 0
+        self._search_wheel_pixel = pixel
+        self._search_wheel_shift = shift
+        self._search_wheel_delta += delta
+        threshold = 40 if pixel else 120
+        steps = int(self._search_wheel_delta / threshold)
+        self._search_wheel_delta -= steps * threshold
+        if phase == Qt.ScrollPhase.ScrollEnd:
+            self._search_wheel_delta = 0
+        if not steps:
+            return
+        last_index = len(self._search_wheel_entries) - 1
+        jump_oldest = shift and steps > 0 and self.config.get("browser_search_wheel_shift_oldest", False)
+        oldest_first = self.config.get("browser_search_wheel_oldest_first", False)
+        if not self.active_search_query and steps > 0 and not jump_oldest:
+            return
+        self._close_owned_popup("_search_history_popup")
+        if jump_oldest or (oldest_first and self._search_wheel_index == -1 and steps < 0):
+            self._search_wheel_index = last_index
+        else:
+            direction = 1 if oldest_first and self.config.get("browser_search_wheel_reverse_oldest", False) else -1
+            self._search_wheel_index = min(last_index,
+                                           max(-1, self._search_wheel_index + direction * steps))
+        self._selecting_wheel_history = True
+        try:
+            if self._search_wheel_index == -1:
+                # A terminal state outside the snapshot, never an MRU entry.
+                if not self.active_search_query:
+                    return
+                self.browser_search_edit.setText("")
+                self.clear_active_browser_search()
+                original_view = self._search_wheel_view_state
+                self._search_wheel_query = None
+                self._search_wheel_view_state = None
+                if (original_view is not None
+                        and original_view[:2] == (str(self.current_path), self._scan_generation)):
+                    self._schedule_list_view_state_restore(
+                        original_view[2], prefer_anchor=True, respect_user_scroll=True,
+                    )
+                return
+            query = self._search_wheel_entries[self._search_wheel_index]
+            if self._search_wheel_view_state is None:
+                self._search_wheel_view_state = (
+                    str(self.current_path), self._scan_generation, self._capture_list_view_state(),
+                )
+            self._search_wheel_query = query
+            self._activate_search_history_entry(LocationPopupEntry(query, query, query))
+            self.browser_search_edit.setFocus(Qt.FocusReason.MouseFocusReason)
+            self.browser_search_edit.selectAll()
+        finally:
+            self._selecting_wheel_history = False
+
+    def _shift_arrow_focus_target(self, watched: object, event: QKeyEvent) -> QWidget | None:
+        if (
+            event.modifiers() != Qt.KeyboardModifier.ShiftModifier
+            or event.key() not in (Qt.Key.Key_Left, Qt.Key.Key_Right)
+            or not self.config.get("browser_shift_arrows_switch_focus", True)
+            or not isinstance(watched, QWidget) or watched.window() is not self
+            or self._is_browser_editing_surface(watched)
+            or self._is_browser_editing_surface(QApplication.focusWidget())
+            or QApplication.activeModalWidget() is not None
+            or QApplication.activePopupWidget() is not None
+        ):
+            return None
+        in_list = watched is self.list_view or self.list_view.isAncestorOf(watched)
+        in_sidebar = watched is self.sidebar or self.sidebar.isAncestorOf(watched)
+        if not (in_list or in_sidebar):
+            return None
+        if event.key() == Qt.Key.Key_Right:
+            return self.list_view if self.list_view.isVisible() and self.list_view.isEnabled() else None
+        if not self.sidebar.isVisible():
+            return None
+        candidates = (self._last_sidebar_focus, self.favorite_view, self.folder_tree,
+                      self.history_view, self.bookmark_view)
+        return next((view for view in candidates if view is not None and view.isVisible() and view.isEnabled()), None)
+
+    def _navigate_from_sidebar(self, path: str | Path, **kwargs) -> bool:
+        epoch = self._list_selection_epoch
+        owner = QApplication.focusWidget()
+        started = self.navigate_to(path, **kwargs)
+        if (started and self.config.get("browser_sidebar_open_focus_first", True)
+                and epoch == self._list_selection_epoch and owner is QApplication.focusWidget()):
+            self._pending_sidebar_focus = (
+                self._absolute_browser_path(path), self._scan_generation, epoch, owner,
+            )
+            if self._pending_scan is None:
+                self._apply_sidebar_open_focus()
+        return started
+
+    def _apply_sidebar_open_focus(self) -> None:
+        request = self._pending_sidebar_focus
+        self._pending_sidebar_focus = None
+        if request is None:
+            return
+        path, generation, epoch, owner = request
+        if (self._shutdown_prepared or generation != self._scan_generation
+                or not self._same_path(self.current_path, path) or epoch != self._list_selection_epoch
+                or QApplication.focusWidget() is not owner
+                or not self.config.get("browser_sidebar_open_focus_first", True)):
+            return
+        first = next((self.item_model.index(row, 0) for row in range(self.item_model.rowCount())
+                      if self.item_model.flags(self.item_model.index(row, 0)) & Qt.ItemFlag.ItemIsSelectable), QModelIndex())
+        self._list_view_restore_token += 1
+        self._location_restore_token += 1
+        self._restoring_list_view_state = True
+        try:
+            self.list_view.selectionModel().setCurrentIndex(first, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+            self.list_view.setFocus(Qt.FocusReason.OtherFocusReason)
+            if first.isValid():
+                self.list_view.scrollTo(first)
+        finally:
+            self._restoring_list_view_state = False
 
     def _apply_browser_shortcuts(self) -> None:
         for shortcut in getattr(self, "_browser_dynamic_shortcuts", []):
@@ -7031,6 +7290,24 @@ class BrowserWindow(QMainWindow):
         return True
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
+        if isinstance(event, QWheelEvent) and self._is_search_history_wheel_surface(watched, event):
+            self._step_search_history_wheel(event)
+            event.accept()
+            return True
+        if event.type() == QEvent.Type.FocusIn and isinstance(watched, QWidget) and watched.window() is self:
+            if watched in (self.folder_tree, self.favorite_view, self.bookmark_view, self.history_view):
+                self._last_sidebar_focus = watched
+            pending_focus = self._pending_sidebar_focus
+            if pending_focus is not None and QApplication.focusWidget() is not pending_focus[3]:
+                self._pending_sidebar_focus = None
+        if event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress) and isinstance(event, QKeyEvent):
+            target = self._shift_arrow_focus_target(watched, event)
+            if target is not None:
+                if event.type() == QEvent.Type.KeyPress:
+                    self._pending_sidebar_focus = None
+                    target.setFocus(Qt.FocusReason.ShortcutFocusReason)
+                event.accept()
+                return True
         workflow = getattr(self, "_browser_workflow", None)
         if workflow is not None:
             if (watched in (self, self.list_view.viewport())
@@ -7383,6 +7660,9 @@ class BrowserWindow(QMainWindow):
         )
 
         self.list_view = ExplorerListView(self)
+        for signal in (self.item_model.modelAboutToBeReset, self.item_model.layoutAboutToBeChanged,
+                       self.item_model.rowsAboutToBeRemoved):
+            signal.connect(self._begin_model_selection_change)
         self.list_view.setModel(self.item_model)
         self.list_view.set_folder_gesture_options(
             enabled=self.browser_folder_gestures_enabled,
@@ -7438,6 +7718,8 @@ class BrowserWindow(QMainWindow):
         self.list_view.selectionModel().selectionChanged.connect(
             self._on_list_selection_changed
         )
+        for signal in (self.item_model.modelReset, self.item_model.layoutChanged, self.item_model.rowsRemoved):
+            signal.connect(self._end_model_selection_change)
         self.list_view.entered.connect(self._on_list_hovered)
         self.item_model.modelReset.connect(self._update_list_viewport)
         self.item_model.layoutChanged.connect(self._update_list_viewport)
@@ -8147,7 +8429,7 @@ class BrowserWindow(QMainWindow):
             return
         path = self.file_system_model.filePath(index)
         if path:
-            self.navigate_to(path)
+            self._navigate_from_sidebar(path)
 
     def _apply_pending_tree_path(self) -> None:
         # Kept for binary/test compatibility with Sprint 15. No currentChanged
@@ -8161,7 +8443,7 @@ class BrowserWindow(QMainWindow):
             )
             path = Path(current_path) if current_path else None
         if path is not None:
-            self.navigate_to(path)
+            self._navigate_from_sidebar(path)
 
     def _apply_favorite_row_metrics(self) -> None:
         if not hasattr(self, "favorite_view"):
@@ -8722,9 +9004,12 @@ class BrowserWindow(QMainWindow):
             state,
             prefer_anchor=prefer_anchor,
         )
+        selection_epoch = self._list_selection_epoch
 
         def restore_after_layout() -> None:
             if token != self._list_view_restore_token:
+                return
+            if selection_epoch != self._list_selection_epoch:
                 return
             if (
                 respect_user_scroll
@@ -8874,9 +9159,12 @@ class BrowserWindow(QMainWindow):
         self._location_restore_token += 1
         token = self._location_restore_token
         self._restore_location(location)
+        selection_epoch = self._list_selection_epoch
 
         def restore_after_layout() -> None:
             if token != self._location_restore_token:
+                return
+            if selection_epoch != self._list_selection_epoch:
                 return
             self._restore_location(location, update_status=False)
 
@@ -8888,6 +9176,14 @@ class BrowserWindow(QMainWindow):
         *,
         update_status: bool = True,
     ) -> None:
+        restoring = self._restoring_list_view_state
+        self._restoring_list_view_state = True
+        try:
+            self._restore_location_now(location, update_status=update_status)
+        finally:
+            self._restoring_list_view_state = restoring
+
+    def _restore_location_now(self, location: BrowserLocation, *, update_status: bool = True) -> None:
         if not self._same_path(self.current_path, Path(location.path)):
             return
         index = QModelIndex()

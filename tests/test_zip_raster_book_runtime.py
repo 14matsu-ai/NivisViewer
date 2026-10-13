@@ -1689,7 +1689,7 @@ def test_memory_budget_prioritizes_a_display_ready_runway_over_sources(
 
 
 @pytest.mark.parametrize("suffix", [".png", ".webp"])
-def test_static_png_and_webp_retain_pillow_navigation_preview(
+def test_static_png_and_webp_retain_bounded_navigation_preview(
     tmp_path: Path,
     qapp: QApplication,
     suffix: str,
@@ -1743,7 +1743,7 @@ def test_static_png_and_webp_retain_pillow_navigation_preview(
         assert page.source_is_preview
         assert page.source_qimage is not None
         assert page.source_qimage.size().toTuple() == (400, 600)
-        assert source.open_image_calls == 1
+        assert source.open_image_calls == (1 if suffix == ".png" else 0)
         assert source.open_qimage_calls == 0
     finally:
         assert runtime.shutdown(wait_msecs=3000)

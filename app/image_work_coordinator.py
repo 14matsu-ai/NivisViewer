@@ -1,10 +1,11 @@
 from __future__ import annotations
+from .raster_execution_budget import RASTER_EXECUTION_BUDGET
 
 from enum import IntEnum
 import logging
 from math import ceil
 from time import monotonic
-from weakref import WeakSet
+from weakref import WeakSet, WeakKeyDictionary
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal
 
@@ -49,10 +50,14 @@ class ImageWorkCoordinator(QObject):
         # This Folder-only lane is additional to legacy max_workers. The
         # general Viewer and Browser lanes retain their original capacities.
         self.folder_supplemental_workers = max(0, min(1, int(folder_supplemental_workers)))
+        self._supplemental_default = self.folder_supplemental_workers
+        self._supplemental_requests = WeakKeyDictionary()
         self._viewer_pool = QThreadPool(self)
         self._viewer_pool.setMaxThreadCount(self.viewer_workers)
         self._folder_viewer_pool = QThreadPool(self)
         self._folder_viewer_pool.setMaxThreadCount(max(1, self.folder_supplemental_workers))
+        self._current_viewer_pool = QThreadPool(self)
+        self._current_viewer_pool.setMaxThreadCount(1)
         self._browser_pool = QThreadPool(self)
         self._browser_pool.setMaxThreadCount(max(1, self.browser_workers))
         self._browser_paused = False
@@ -70,13 +75,22 @@ class ImageWorkCoordinator(QObject):
     def browser_paused(self) -> bool:
         return self._browser_paused
 
-    def set_viewer_supplemental_workers(self, workers: int) -> None:
+    def set_viewer_supplemental_workers(self, workers: int, *, owner=None) -> None:
         """Set capacity for the next book without discarding owned jobs.
 
         A disabled supplemental lane finishes its existing job, then accepts
         no more work. Browser capacity and its dedicated pool are unchanged.
         """
-        self.folder_supplemental_workers = max(0, min(1, int(workers)))
+        workers = max(0, min(1, int(workers)))
+        if owner is None:
+            self._supplemental_default = workers
+        else:
+            self._supplemental_requests[owner] = workers
+        self.folder_supplemental_workers = max(self._supplemental_requests.values(), default=self._supplemental_default)
+
+    def release_viewer_capacity(self, owner):
+        self._supplemental_requests.pop(owner, None)
+        self.folder_supplemental_workers = max(self._supplemental_requests.values(), default=self._supplemental_default)
 
     def begin_viewer_interactive(self) -> None:
         self._interactive_depth += 1
@@ -139,8 +153,29 @@ class ImageWorkCoordinator(QObject):
                 Qt.ConnectionType.QueuedConnection,
             )
 
+    def start_current_viewer(self, runnable: QRunnable, priority: int) -> bool | None:
+        """One additional current lane shared by every window, never queued."""
+        if not self._accepting_requests:
+            return False
+        if 'current' in self._viewer_lane.values():
+            return None
+        if not RASTER_EXECUTION_BUDGET.try_extra_lane():
+            return None
+        self._viewer_runnables.add(runnable)
+        self._track_viewer_lane(runnable, 'current')
+        try:
+            self._current_viewer_pool.start(runnable, int(priority))
+        except RuntimeError:
+            self._release_viewer_lane(runnable)
+            self._viewer_runnables.discard(runnable)
+            return False
+        return True
+
     def _release_viewer_lane(self, runnable: QRunnable) -> None:
-        if self._viewer_lane.pop(runnable, None) is not None:
+        lane = self._viewer_lane.pop(runnable, None)
+        if lane == 'current':
+            RASTER_EXECUTION_BUDGET.release_extra_lane()
+        if lane is not None:
             self.folder_viewer_capacity_available.emit()
 
     def start_browser(
@@ -162,7 +197,8 @@ class ImageWorkCoordinator(QObject):
     def try_take_viewer(self, runnable: QRunnable) -> bool:
         try:
             lane = self._viewer_lane.get(runnable, "general")
-            pool = self._folder_viewer_pool if lane == "folder" else self._viewer_pool
+            pool = (self._current_viewer_pool if lane == "current" else
+                    self._folder_viewer_pool if lane == "folder" else self._viewer_pool)
             taken = pool.tryTake(runnable)
             if taken:
                 self._release_viewer_lane(runnable)
@@ -185,7 +221,8 @@ class ImageWorkCoordinator(QObject):
         deadline = monotonic() + max(0, int(msecs)) / 1000
         general_done = self._viewer_pool.waitForDone(self._remaining_msecs(deadline))
         folder_done = self._folder_viewer_pool.waitForDone(self._remaining_msecs(deadline))
-        return general_done and folder_done
+        current_done = self._current_viewer_pool.waitForDone(self._remaining_msecs(deadline))
+        return general_done and folder_done and current_done
 
     def wait_for_browser(self, msecs: int) -> bool:
         if self.browser_workers <= 0:
@@ -200,6 +237,7 @@ class ImageWorkCoordinator(QObject):
         self._request_worker_cancellation(self._browser_runnables)
         self._viewer_pool.clear()
         self._folder_viewer_pool.clear()
+        self._current_viewer_pool.clear()
         self._browser_pool.clear()
         deadline = monotonic() + max(0, int(wait_msecs)) / 1000
         viewer_done = self._viewer_pool.waitForDone(
@@ -208,16 +246,18 @@ class ImageWorkCoordinator(QObject):
         folder_done = self._folder_viewer_pool.waitForDone(
             self._remaining_msecs(deadline)
         )
+        current_done = self._current_viewer_pool.waitForDone(self._remaining_msecs(deadline))
         browser_done = self._browser_pool.waitForDone(
             self._remaining_msecs(deadline)
         )
-        if viewer_done and folder_done and browser_done:
+        if viewer_done and folder_done and current_done and browser_done:
             self._shutdown_complete = True
             self.last_shutdown_error = None
             self._viewer_runnables.clear()
             self._browser_runnables.clear()
             self._cancel_requested.clear()
-            self._viewer_lane.clear()
+            for runnable in tuple(self._viewer_lane):
+                self._release_viewer_lane(runnable)
             return True
 
         pending_lanes = ", ".join(
@@ -225,6 +265,7 @@ class ImageWorkCoordinator(QObject):
             for lane, done in (
                 ("viewer", viewer_done),
                 ("folder viewer", folder_done),
+                ("current viewer", current_done),
                 ("browser", browser_done),
             )
             if not done

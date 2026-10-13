@@ -1059,7 +1059,10 @@ def test_full_near_ram_band_allows_remaining_range_to_finish_on_disk(
         qapp.processEvents()
         provider.wait_for_done(20)
         qapp.processEvents()
-        if workflow.stop_reason == "range-complete" and provider.pending_count == 0:
+        # Decode completion may enqueue its disk write in the final event
+        # pump. Pending decode count alone does not mean the save has settled.
+        if (workflow.stop_reason == "range-complete" and provider.pending_count == 0
+                and provider.cache_statistics()["disk_saved_background"] == 1):
             break
         time.sleep(0.002)
 

@@ -1126,7 +1126,7 @@ ENGLISH.update({
 })
 
 ENGLISH.update({
-    "背景生成・選択表示": "Background Generation and Selection Display",
+    "サムネイル生成・選択表示": "Thumbnail Generation and Selection Display",
     "表示範囲のみ": "Visible items only",
     "画面数を指定": "Specify screen count",
     "無制限（現在の一覧全体）": "Unlimited (current listing)",
@@ -1189,6 +1189,7 @@ ENGLISH_DISAMBIGUATED = {
 
 ENGLISH.update({
     '1（推奨）': '1 (recommended)',
+    '1': '1',
     '2': '2',
     '画像の同時読み込み数:': 'Concurrent image loads:',
     'ZIPの次ページ展開を並列処理する（推奨）': 'Parallel ZIP page extraction (recommended)',
@@ -1543,3 +1544,201 @@ ENGLISH.update({'先読み設定': 'Prefetch settings',
                                                                                                                            'to '
                                                                                                                            'new '
                                                                                                                            'input.'})
+
+ENGLISH.update({
+    '一覧とサイドバーの操作': (
+        'List and sidebar controls'
+    ),
+    'サイドバーからフォルダーを開いたら、一覧の先頭を選択する': (
+        'Sidebar folders: select first list item'
+    ),
+    '一覧へキーボード操作を移し、表示中の最初の項目を選択します。OFFではサイドバーでの操作を続けます。読み込み中に操作先や選択を変更した場合は、その操作を優先します。': (
+        'Move keyboard control to the list and select its first displayed item. When '
+        'disabled, continue using the sidebar. Changes to focus or selection while loading '
+        'take priority.'
+    ),
+    'Shift＋左右キーでサイドバーと一覧の操作を切り替える': (
+        'Shift+Left/Right: switch sidebar/list'
+    ),
+    'Shift＋左でサイドバー、Shift＋右で一覧へ移ります。各領域の現在項目は保持します。文字の編集中は文字選択を優先します。OFFでは既存のキー操作に戻ります。': (
+        'Shift+Left moves to the sidebar; Shift+Right moves to the list. Keep the current '
+        'item in each area. Text selection takes priority while editing. When disabled, '
+        'keep the existing key behavior.'
+    ),
+})
+
+ENGLISH.update({
+    '読み込みの並列化を試す': 'Try parallel loading',
+    '見開きの左右を同時に読み込む（試行）': 'Load both spread pages together (trial)',
+    '先読み中は現在画面の読み込みを1つ追加する（試行）': 'Extra read for current view (trial)',
+    '画像フォルダーとZIP／CBZで試します。CPU・メモリの使用量が増える場合があります。同時読み込み数が1でも追加の読み込みを使い、フォルダー・ZIPの画面処理を全Viewerで最大3つに制限します。空き容量が不足すると追加しません。変更は次に本を開いたときに反映します。初期設定は両方OFFです。': 'Try these options with image folders and ZIP/CBZ. They may use more CPU and memory. Additional reads are allowed even with one concurrent read selected; folder and ZIP view processing is limited to three across all Viewer windows. No extra work is added when memory is insufficient. Changes take effect when opening the next book. Both options are off by default.',
+})
+
+ENGLISH.update({
+    '検索窓上のホイールで検索履歴をたどる': 'Use wheel over search box for history',
+    '最古から始めるとき、履歴をたどる向きも反転する': 'Reverse direction when starting oldest',
+    'OFFでは最初だけ最古を選び、その後は下で古い履歴、上で新しい履歴へ移動します。ONでは下で新しい履歴、上で古い履歴へ移動し、最新からさらに下で検索を解除します。': 'Off: select the oldest first, then down for older and up for newer entries. On: down for newer and up for older entries; down past the newest clears the search.',
+    'Shift＋上ホイールで最古の検索履歴へ移動する': 'Shift + wheel up: oldest search',
+    '検索窓上のホイールで最古の履歴から検索する': 'Start search wheel at oldest entry',
+    '下ホイールで最新から古い検索履歴へ進みます。上ホイールで新しい履歴へ戻り、最新の先で検索を解除します。未検索時の上ホイールは何もしません。履歴は削除しません。': 'Wheel down moves from newest to older searches. Wheel up returns to newer searches and clears the search above the newest entry. Wheel up does nothing when no search is active. History is kept.',
+    '検索履歴のホイール操作が有効なとき、Shift＋上ホイールで最古の履歴へ直接移動します。': 'When search history wheel navigation is enabled, Shift + wheel up jumps directly to the oldest entry.',
+    '検索していない状態からホイールで履歴を選ぶとき、最古の履歴から始めます。': 'When starting wheel history navigation without an active search, begin at the oldest entry.',
+})
+
+ENGLISH.update({
+    '並列読み込み': 'Parallel loading',
+    '見開きの左右を同時に読み込む': 'Load both spread pages together',
+    '先読みで通常枠が埋まったら、現在画面用に1枠追加する': 'Extra current slot when prefetch is busy',
+    '全Viewer共通の画像処理上限:': 'Shared Viewer image-processing limit:',
+    '3枠': '3 slots',
+    '4枠': '4 slots',
+    '対象は画像フォルダーとZIP／CBZです。左右並列と現在画面用の追加枠は既定ONです。通常の同時読み込み数1／2に対し、共通上限3／4は左右の補助処理と追加枠を含む全Viewerの画像処理数です。Browser・ページ一覧・PDF・ZIPの先行展開を含む全処理数ではありません。追加枠は先読みで通常枠が埋まった場合だけ使い、メモリ不足や空き枠がない場合は通常処理へ戻します。両チェックの変更は次の本から、共通上限は適用後すぐに反映します。上限を下げても処理中の仕事は終了まで保持します。複数Viewerの設定が異なる場合は小さい上限を使います。': 'For image folders and ZIP/CBZ. Both spread parallel loading and the extra current-view slot are on by default. The normal concurrent reads setting selects 1 or 2 lanes; the shared 3 or 4 slot limit includes spread helpers and the extra lane across Viewer windows. It is not a limit on all app work: Browser, page lists, PDF and ZIP read-ahead are separate. The extra slot is used only when prefetch fills the normal lanes. Without spare memory or slots, regular processing is used. Checkbox changes apply to the next book; the shared limit applies immediately. Reducing it lets running work finish. Different Viewer preferences use the smaller limit.',
+})
+
+ENGLISH.update({
+    '直近の先読みも左右並列にする': 'Parallel nearby spread prefetch',
+    '現在画面の準備後、優先範囲の見開きを並列で先読みします。左右並列がONのときに使い、現在画面用に全Viewer共通で4枠なら2枠、3枠なら1枠を残します。現在画面用の追加枠は先読みに貸しません。変更は次に本を開いたときから反映します。': 'After the current view is ready, prefetch priority spreads in parallel when spread parallel loading is enabled. Across Viewer windows, reserve two slots for current work with a four-slot limit, or one with three slots. Never lend the extra current-view lane to prefetch. Changes apply to the next book.',
+})
+
+ENGLISH.update({
+    '現在画面の余力を残す（A）': 'Keep room for current view (A)',
+    '先読みの処理枠:': 'Prefetch allocation:',
+})
+
+ENGLISH.update({
+    '先読み中の現在画面を追加枠で読み込む': 'Extra current slots during prefetch',
+    '通常4枠＋現在画面2枠（B）': '4 + 2 current (B)',
+    '通常の共有画像処理上限:': 'Normal shared image limit:',
+    '画像フォルダーとZIP／CBZの処理枠を設定します。': 'Processing slots for image folders and ZIP/CBZ.',
+    '保持画像と準備中の予約に使う量です。変更は開いている本にも反映します。並列数や優先画面数を増やしても予算は解除しません。自動ではシステムの空きメモリに応じて調整します。': 'Budget for retained images and in-flight reservations. Changes apply to open books. More parallel work or priority screens does not remove the budget. Auto adjusts to available system memory.',
+    'B：通常4枠を先読みに使い、開始できない現在画面だけ全Viewer共通で最大2枠を一時追加します（合計最大6）。背景には追加枠を使いません。': 'B: use four normal slots for prefetch, plus at most two temporary current-only slots shared by all Viewers when current work cannot start (six total). Background cannot use the temporary slots.',
+    'B：通常上限3または現在画面の追加OFFでは、一時追加を使いません。選択値は保持します。': 'B: with normal limit 3 or extra current slots off, temporary slots are disabled. Saved selections are retained.',
+    'A：左右並列と直近の左右並列が両方ONなら、通常上限4では現在画面用に2枠、3では1枠を残します。現在画面の追加枠は先読みに貸しません。': 'A: with spread and nearby spread parallel loading both on, reserve two current slots at normal limit 4, or one at limit 3. The extra current lane is not lent to prefetch.',
+    '通常1／2は親の処理枠、左右並列は片側の補助、共有上限3／4は全Viewerの通常画像処理数です。ZIP先行展開は別の最大1処理です。Browser・ページ一覧・PDFを含む全thread数ではありません。': 'Normal 1/2 selects parent lanes; spread parallel loading adds a helper for one side. Shared 3/4 caps normal Viewer image work. ZIP read-ahead is a separate single operation. This is not a cap on all threads, Browser, page lists or PDF.',
+    'メモリ不足では追加しません。チェック・通常1／2・配分方式・ZIP先行展開は次の本から、通常共有上限は即時です。Aや上限3のViewerが混在する場合はBの一時追加を止めます。処理中の枠はnative終了まで保持します。': 'No extra work is added without sufficient memory. Checkboxes, normal lanes, allocation mode and ZIP read-ahead apply to the next book; the normal shared limit applies immediately. A or limit-3 Viewers disable temporary B slots. Running slots remain owned until native work ends.',
+    'フォルダー・ZIP／CBZ・RAR／7zに共通です。単ページでは1画面＝1ページ、見開きでは実際の1見開きです。戻る操作では進行方向と逆方向を入れ替えます。指定範囲を遠方より先に準備し、その先もメモリ上限内で先読みを続けます。ここで指定する画面数は準備の優先範囲です。総保持数や同時処理数ではありません。保持量はメモリ、処理数は並列読み込みの設定に従います。メモリ不足時は指定範囲をすべて準備できない場合があります。変更は開いている本にも適用します。': 'For folders, ZIP/CBZ and RAR/7z. One screen is one page in single mode, or one actual spread. Reversal swaps forward/backward priority. The priority range is prepared before distant work, then prefetch continues within the memory budget. These screen counts are priority ranges, not total retention or concurrent work. Memory sets retention; parallel loading sets concurrency. Insufficient memory may prevent preparing the whole range. Applies to open books.',
+})
+
+
+ENGLISH.update({'負荷に合わせて自動調整': 'Adjust to load automatically',
+ '自動調整の最大同時処理数:': 'Maximum concurrent image jobs in Auto:',
+ '全Viewer共通で、現在画面の追加枠を含む上限です。CPU負荷・空きメモリ・同程度の画像の処理時間を見て増減します。未キャッシュの表示待ち中は新しい先読みを止めます。変更は次の本から反映します。': 'Shared '
+                                                                                                       'across '
+                                                                                                       'Viewers, '
+                                                                                                       'including '
+                                                                                                       'extra '
+                                                                                                       'current-display '
+                                                                                                       'slots. '
+                                                                                                       'Adjusts '
+                                                                                                       'using '
+                                                                                                       'CPU '
+                                                                                                       'load, '
+                                                                                                       'available '
+                                                                                                       'memory '
+                                                                                                       'and '
+                                                                                                       'processing '
+                                                                                                       'time '
+                                                                                                       'for '
+                                                                                                       'similar '
+                                                                                                       'images. '
+                                                                                                       'New '
+                                                                                                       'prefetch '
+                                                                                                       'pauses '
+                                                                                                       'while '
+                                                                                                       'an '
+                                                                                                       'uncached '
+                                                                                                       'display '
+                                                                                                       'is '
+                                                                                                       'pending. '
+                                                                                                       'Applies '
+                                                                                                       'to '
+                                                                                                       'the '
+                                                                                                       'next '
+                                                                                                       'book.',
+ '自動：現在画面を優先し、CPU・メモリに余裕があるときに先読みを少しずつ増やします。表示待ちや処理時間の悪化では減らします。最大値は表示用の追加2枠を含みます。固定方式のViewerが混在すると、その固定上限を優先します。': 'Auto: '
+                                                                                                                    'prioritize '
+                                                                                                                    'the '
+                                                                                                                    'current '
+                                                                                                                    'display '
+                                                                                                                    'and '
+                                                                                                                    'gradually '
+                                                                                                                    'increase '
+                                                                                                                    'prefetch '
+                                                                                                                    'with '
+                                                                                                                    'CPU '
+                                                                                                                    'and '
+                                                                                                                    'memory '
+                                                                                                                    'headroom. '
+                                                                                                                    'Reduce '
+                                                                                                                    'during '
+                                                                                                                    'display '
+                                                                                                                    'waits '
+                                                                                                                    'or '
+                                                                                                                    'slower '
+                                                                                                                    'processing. '
+                                                                                                                    'The '
+                                                                                                                    'maximum '
+                                                                                                                    'includes '
+                                                                                                                    'two '
+                                                                                                                    'extra '
+                                                                                                                    'current-display '
+                                                                                                                    'slots. '
+                                                                                                                    'Mixed '
+                                                                                                                    'fixed-mode '
+                                                                                                                    'Viewers '
+                                                                                                                    'impose '
+                                                                                                                    'their '
+                                                                                                                    'stricter '
+                                                                                                                    'cap.',
+ '自動の最大値・配分方式は次の本から反映します。現在画面の追加OFFでは追加枠を使いません。Viewerメモリの設定も守り、元画像の展開用メモリを見積もって先読みを制限します。実行中の処理は終了まで枠を保持します。PDF・RAR／7z・Browser・ページ一覧は自動拡張しません。': 'Auto '
+                                                                                                                                                 'maximum '
+                                                                                                                                                 'and '
+                                                                                                                                                 'allocation '
+                                                                                                                                                 'mode '
+                                                                                                                                                 'apply '
+                                                                                                                                                 'to '
+                                                                                                                                                 'the '
+                                                                                                                                                 'next '
+                                                                                                                                                 'book. '
+                                                                                                                                                 'Extra '
+                                                                                                                                                 'slots '
+                                                                                                                                                 'require '
+                                                                                                                                                 'the '
+                                                                                                                                                 'extra-current '
+                                                                                                                                                 'option. '
+                                                                                                                                                 'Viewer '
+                                                                                                                                                 'memory '
+                                                                                                                                                 'limits '
+                                                                                                                                                 'still '
+                                                                                                                                                 'apply; '
+                                                                                                                                                 'estimated '
+                                                                                                                                                 'full-image '
+                                                                                                                                                 'decoder '
+                                                                                                                                                 'scratch '
+                                                                                                                                                 'also '
+                                                                                                                                                 'limits '
+                                                                                                                                                 'prefetch. '
+                                                                                                                                                 'Running '
+                                                                                                                                                 'jobs '
+                                                                                                                                                 'retain '
+                                                                                                                                                 'slots '
+                                                                                                                                                 'until '
+                                                                                                                                                 'completion. '
+                                                                                                                                                 'Auto '
+                                                                                                                                                 'does '
+                                                                                                                                                 'not '
+                                                                                                                                                 'expand '
+                                                                                                                                                 'PDF, '
+                                                                                                                                                 'RAR/7z, '
+                                                                                                                                                 'Browser '
+                                                                                                                                                 'or '
+                                                                                                                                                 'page-list '
+                                                                                                                                                 'work.',
+ '現在画面の準備後、優先範囲の見開きを左右並列で先読みします。枠の配分は下の設定に従います。左右並列OFFでは使いません。変更は次の本から反映します。': 'After the current display is '
+                                                                               'ready, prefetch nearby '
+                                                                               'spreads with both sides in '
+                                                                               'parallel. Slot allocation '
+                                                                               'follows the setting below. '
+                                                                               'Requires spread parallel '
+                                                                               'loading. Applies to the next '
+                                                                               'book.'})

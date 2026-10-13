@@ -279,7 +279,7 @@ def test_create_directory_cancel_and_close_never_detaches_panel(
     "outcome",
     ["success", "failure", "cancelled", "exception"],
 )
-def test_intentional_fallback_closes_after_every_terminal_outcome(
+def test_intentional_fallback_closes_after_terminal_outcome_is_acknowledged(
     tmp_path: Path,
     qapp: QApplication,
     monkeypatch,
@@ -329,6 +329,13 @@ def test_intentional_fallback_closes_after_every_terminal_outcome(
             assert "cancelling" in panel.summary_label.text()
 
         service.release.set()
+        if outcome in {"failure", "exception"}:
+            assert wait_until(qapp, lambda: not controller.file_operation_queue.busy)
+            assert controller._operation_fallback_panel is panel
+            assert panel.isVisible() and panel.awaiting_result_acknowledgement
+            assert panel.details_view.toPlainText()
+            assert panel.cancel_button.text() == "閉じる"
+            panel.cancel_button.click()
         assert wait_until(
             qapp,
             lambda: (

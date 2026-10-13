@@ -116,9 +116,11 @@ def _wait_until(
     assert predicate()
 
 
+@pytest.mark.parametrize('extra', [False, True])
 def test_ready_wheel_keeps_folder_prefetch_running_and_latest_cold_wins(
     tmp_path: Path,
     qapp: QApplication,
+    extra: bool,
 ) -> None:
     class ControlledFolderSource(FolderImageSource):
         def __init__(self, path: Path) -> None:
@@ -144,6 +146,7 @@ def test_ready_wheel_keeps_folder_prefetch_running_and_latest_cold_wins(
     source = ControlledFolderSource(folder)
     config = ConfigManager(tmp_path / "config.json")
     config.load()
+    config.apply({'viewer_current_extra_trial': extra})
     session = BookSession(
         source_factory=lambda *_args, **_kwargs: (source, None),
         folder_worker_limit=1,
@@ -197,7 +200,7 @@ def test_ready_wheel_keeps_folder_prefetch_running_and_latest_cold_wins(
         # race one more page ahead of its missing image.
         assert window.presentation_state.requested_page == 8
         assert window._pending_zip_runtime_request is None
-        assert len(runtime._jobs) <= 1
+        assert len(runtime._jobs) <= 1 + int(extra)
         source.release_seven.set()
         _wait_until(qapp, lambda: window.presentation_state.displayed_page == 8)
         window.next_page(input_kind=NavigationInputKind.WHEEL)

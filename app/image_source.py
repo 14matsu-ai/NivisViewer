@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .raster_execution_budget import SourceRequestToken, source_request_token
 from .cloud_files import require_local, local_image_candidate, walk_local_files, OnlineOnlyError
 
 from .i18n import tr
@@ -299,6 +300,34 @@ def _read_webp_qimage(data: bytes) -> QImage | None:
     image = reader.read()
     buffer.close()
     return None if image.isNull() else image.copy()
+
+
+def _read_static_webp_qimage(data: bytes) -> QImage | None:
+    """Use Qt for ordinary static WebP, retaining Pillow's EXIF fallback.
+
+    The WebP Qt plugin does not promise Pillow-compatible EXIF transforms.
+    Inspect metadata without decoding pixels and leave rotated/mirrored,
+    animated, and unrecognized payloads on the existing Pillow path.
+    """
+    if _probe_animation_from_header(data, ".webp") is not False:
+        return None
+    offset = 12
+    while offset + 8 <= len(data):
+        chunk = data[offset:offset + 4]
+        length = int.from_bytes(data[offset + 4:offset + 8], "little")
+        end = offset + 8 + length
+        if end > len(data):
+            return None
+        if chunk == b"EXIF":
+            try:
+                with Image.open(io.BytesIO(data), formats=("WEBP",)) as header:
+                    if int(header.getexif().get(274, 1)) != 1:
+                        return None
+            except Exception:
+                return None
+            break
+        offset = end + (length & 1)
+    return _read_webp_qimage(data)
 
 
 def _read_jpeg_qimage_at_most(
@@ -711,6 +740,10 @@ class ImageSource(ABC):
     def open_qimage(self, image_id: str) -> QImage | None:
         return None
 
+    def open_static_webp_qimage(self, image_id: str) -> QImage | None:
+        """Optional worker decoder for a static, untransformed WebP raster."""
+        return None
+
     def open_qimage_at_most(
         self,
         image_id: str,
@@ -996,6 +1029,28 @@ class FolderImageSource(ImageSource):
         self._remember_folder_metadata(image_id, size=(image.width(), image.height()))
         return image
 
+    def open_static_webp_qimage(self, image_id: str) -> QImage | None:
+        if (
+            Path(image_id).suffix.casefold() != ".webp"
+            or self.probe_image_is_animated(image_id) is not False
+        ):
+            return None
+        cancelled = source_request_token()
+        if cancelled.is_set():
+            return None
+        try:
+            data = _read_image_file_bytes(image_id)
+        except OSError:
+            return None
+        self._remember_folder_metadata(image_id, byte_count=len(data))
+        if cancelled.is_set():
+            return None
+        image = _read_static_webp_qimage(data)
+        if cancelled.is_set() or image is None:
+            return None
+        self._remember_folder_metadata(image_id, size=(image.width(), image.height()))
+        return image
+
     def open_qimage_at_most(
         self,
         image_id: str,
@@ -1184,6 +1239,7 @@ class FolderImageSource(ImageSource):
 
 
 class ZipImageSource(ImageSource):
+    supports_scoped_cancellation = True
     load_sizes_lazily = True
     _READ_CHUNK_BYTES = 1024 * 1024
 
@@ -1285,6 +1341,26 @@ class ZipImageSource(ImageSource):
             stream = self._read_entry_stream(image_id, cancelled)
             self._raise_if_cancelled(cancelled)
             image = _read_webp_qimage(stream.getvalue())
+            self._raise_if_cancelled(cancelled)
+            return image
+        except ImageSourceError:
+            raise
+        except Exception:
+            return None
+        finally:
+            self._finish_request(image_id, cancelled)
+
+    def open_static_webp_qimage(self, image_id: str) -> QImage | None:
+        if (
+            Path(image_id).suffix.casefold() != ".webp"
+            or self.probe_image_is_animated(image_id) is not False
+        ):
+            return None
+        cancelled = self._begin_request(image_id)
+        try:
+            stream = self._read_entry_stream(image_id, cancelled)
+            self._raise_if_cancelled(cancelled)
+            image = _read_static_webp_qimage(stream.getvalue())
             self._raise_if_cancelled(cancelled)
             return image
         except ImageSourceError:
@@ -1685,7 +1761,7 @@ class ZipImageSource(ImageSource):
         return self.probe_image_size(image_id)
 
     def _begin_request(self, image_id: str) -> threading.Event:
-        cancelled = threading.Event()
+        cancelled = source_request_token()
         with self._active_lock:
             if self._closed.is_set():
                 cancelled.set()
@@ -1896,7 +1972,8 @@ class ZipImageSource(ImageSource):
             for cancelled in tuple(
                 self._active_requests.get(image_id, ())
             ):
-                cancelled.set()
+                if not isinstance(cancelled, SourceRequestToken):
+                    cancelled.set()
 
     def display_path(self, image_id: str) -> str:
         display_name = getattr(self, "_display_names", {}).get(image_id, image_id)
@@ -1945,6 +2022,7 @@ class ZipImageSource(ImageSource):
 
 
 class SevenZipImageSource(ImageSource):
+    supports_scoped_cancellation = True
     load_sizes_lazily = True
     compatible_jpeg_unknown_area_multiplier = 4
 
@@ -2065,7 +2143,7 @@ class SevenZipImageSource(ImageSource):
                 tr('書庫内の画像が大きすぎます。'),
                 code=ArchiveErrorCode.ENTRY_TOO_LARGE.value,
             )
-        cancelled = threading.Event()
+        cancelled = source_request_token()
         self.validate_archive()
         with self._active_lock:
             if self._closed.is_set():
@@ -2240,7 +2318,8 @@ class SevenZipImageSource(ImageSource):
     def cancel_image_request(self, image_id: str) -> None:
         with self._active_lock:
             for cancelled in tuple(self._active_requests.get(image_id, ())):
-                cancelled.set()
+                if not isinstance(cancelled, SourceRequestToken):
+                    cancelled.set()
 
     def display_path(self, image_id: str) -> str:
         return f"{self.source_path}!/{image_id}"

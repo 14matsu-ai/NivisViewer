@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PySide6.QtCore import QObject, QModelIndex, Signal
@@ -71,6 +72,7 @@ class FakeFileOperationCoordinator(QObject):
         super().__init__()
         self.busy = False
         self.queue = None
+        self.executor = SimpleNamespace(active_request=None)
 
     def execute(self, _request) -> bool:
         return False
@@ -980,6 +982,7 @@ def test_own_rename_relocates_once_and_absorbs_deferred_watcher_burst(
     window._file_operation_selection_before[71] = ((), None)
     window._active_file_operation_id = 71
     coordinator.busy = True
+    coordinator.operation_started.emit(request)
 
     try:
         with patch.object(
@@ -1052,6 +1055,7 @@ def test_own_recycle_absorbs_watcher_event_into_one_authoritative_refresh(
     )
     window._active_file_operation_id = 72
     coordinator.busy = True
+    coordinator.operation_started.emit(request)
 
     try:
         with patch.object(
