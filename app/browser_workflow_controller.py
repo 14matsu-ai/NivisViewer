@@ -67,6 +67,7 @@ class BrowserWorkflowController(QObject):
             try:
                 self._memory_broker = BrowserThumbnailMemoryBroker.for_application()
                 self._memory_broker.register(self)
+                window.thumbnail_provider._display_budget_callback = self._memory_broker.rebalance
             except RuntimeError:
                 # Isolated controller tests may intentionally omit QApplication.
                 self._memory_broker = None
@@ -111,6 +112,7 @@ class BrowserWorkflowController(QObject):
 
     def shutdown(self) -> None:
         """Release the app-wide grant before the owning Browser closes its provider."""
+        self.window.thumbnail_provider._display_budget_callback = None
         if self._memory_broker is not None:
             self._memory_near_bytes = 0
             self._memory_broker.unregister(id(self))
@@ -523,7 +525,7 @@ class BrowserWorkflowController(QObject):
         if window._fast_scrolling:
             self._stop_reason = "fast-scroll-idle-boundary"
             return
-        if not window.isVisible():
+        if not window.isVisible() or bool(getattr(window, 'isMinimized', lambda: False)()):
             self._stop_reason = "browser-hidden"
             return
         if not self._synchronize_cursor():
@@ -603,6 +605,7 @@ class BrowserWorkflowController(QObject):
                 return
         if (self._memory_broker is not None
                 and self.options["browser_thumbnail_background_screens"] < 0
+                and not getattr(provider, '_retained_display_enabled', False)
                 and not bool(getattr(provider, "background_persistence_available", False))):
             self._stop_reason = "persistence-unavailable"
             return

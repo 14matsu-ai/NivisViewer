@@ -1748,6 +1748,8 @@ class BrowserWindow(QMainWindow):
         self._sync_browser_controls()
         self.config.set("last_browser_path", str(pending.path))
         self._generation = self.thumbnail_provider.begin_generation()
+        if location_changed and getattr(self.thumbnail_provider, '_retained_display_enabled', False):
+            self.thumbnail_provider.clear_memory_cache()
         self._thumbnail_scroll_direction = 1
         self._restoring_list_view_state = True
         try:
@@ -7693,6 +7695,10 @@ class BrowserWindow(QMainWindow):
             **self._browser_overlay_delegate_options(),
         )
         self.list_view.setItemDelegate(self.item_delegate)
+        if hasattr(self.thumbnail_provider, 'enable_retained_display'):
+            self.thumbnail_provider.enable_retained_display()
+            self.item_model.bind_thumbnail_memory(self.thumbnail_provider)
+            self.item_delegate._display_surface_cache.bind_memory(self.thumbnail_provider)
         self.list_view.setViewMode(QListView.ViewMode.IconMode)
         self.list_view.setResizeMode(QListView.ResizeMode.Adjust)
         self.list_view.setMovement(QListView.Movement.Static)
@@ -7732,6 +7738,7 @@ class BrowserWindow(QMainWindow):
         self.list_view.verticalScrollBar().valueChanged.connect(
             self._on_list_scrolled
         )
+        self.list_view.paintStarting.connect(self._restore_visible_memory_thumbnails)
         self.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_view.customContextMenuRequested.connect(self._show_context_menu)
         self.list_view.paths_dropped.connect(self._on_browser_paths_dropped)
@@ -8545,6 +8552,40 @@ class BrowserWindow(QMainWindow):
         if self.current_path is not None:
             self._sync_tree_to_path(self.current_path)
 
+    def _restore_visible_memory_thumbnails(self) -> None:
+        """Populate only the viewport from RAM before QListView paints it."""
+        if (self._shutdown_prepared or self.current_path is None
+                or self._file_mutation_for_path(self.current_path) is not None):
+            return
+        restore = getattr(self.thumbnail_provider, "restore_memory_thumbnail", None)
+        visible = self._visible_row_range()
+        if not callable(restore) or visible is None:
+            return
+        workflow = getattr(self, "_browser_workflow", None)
+        if workflow is not None:
+            viewport = workflow._viewport
+            if viewport is None or viewport[:2] != visible:
+                # Update eviction priorities during rapid scrolling; completed
+                # display references remain owned until the budget evicts them.
+                workflow.recenter_cache_retention()
+        spec = self.thumbnail_render_spec
+        generation = self._generation
+        for row in range(visible[0], visible[1] + 1):
+            item = self.item_model.item_at(row)
+            if (item is None or not item.can_generate_preview
+                    or self._file_mutation_for_path(item.path) is not None
+                    or self.item_model._has_compatible_thumbnail(item, spec.cache_token)):
+                continue
+            cached = restore(item, spec, generation=generation)
+            if cached is None:
+                continue
+            image, page_count = cached
+            if generation != self._generation or spec != self.thumbnail_render_spec:
+                return
+            self.item_model.set_thumbnail_image(item.path, image, request_token=spec.cache_token)
+            if page_count is not None:
+                self._on_page_count_ready(str(item.path), generation, page_count)
+
     def _request_visible_thumbnails(self) -> None:
         if self.current_path is not None and self._file_mutation_for_path(self.current_path) is not None:
             return
@@ -8749,6 +8790,7 @@ class BrowserWindow(QMainWindow):
         self._fast_scrolling = delta >= threshold or fast_velocity
         self._last_scroll_value = int(value)
         self._last_scroll_time = now
+        self._restore_visible_memory_thumbnails()
         self._schedule_thumbnail_requests(0)
         self._scroll_idle_timer.start()
 

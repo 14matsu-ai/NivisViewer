@@ -54,6 +54,7 @@ class ExplorerListView(QListView):
     itemPressCaptured = Signal(str)
     itemReleaseConfirmed = Signal(str)
     paintCompleted = Signal()
+    paintStarting = Signal()
     folderGestureRecognized = Signal(str)
 
     def __init__(self, parent=None) -> None:
@@ -652,6 +653,7 @@ class ExplorerListView(QListView):
         return self._drop_in_progress
 
     def paintEvent(self, event: QPaintEvent) -> None:  # type: ignore[override]
+        self.paintStarting.emit()
         super().paintEvent(event)
         if (
             self.mouse_gesture_show_trail

@@ -101,9 +101,11 @@ def test_changed_source_fences_running_and_queued_cached_results(tmp_path,qapp):
         provider.reconcile_items([changed],[])
         qapp.processEvents()
         assert not ready
+        assert provider.memory_cache_bytes == 0
         provider.reconcile_items([],[changed])  # same-name reappearance
-        provider.request(changed,80,generation=generation)
-        qapp.processEvents()
+        # Removal releases retained pixels; reappearance needs a fresh read.
+        assert provider.request(changed,80,generation=generation)
+        assert provider.wait_for_done(3000);qapp.processEvents()
         assert len(ready)==1
     finally:
         release.set();provider.close()

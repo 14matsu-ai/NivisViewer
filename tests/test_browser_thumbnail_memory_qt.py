@@ -83,8 +83,9 @@ def test_real_qimage_store_exceeds_old_128_entries_but_obeys_bytes(app):
         image=QImage(32,32,QImage.Format.Format_RGB32)
         image.fill(0)
         for index in range(300):
+            unique_image = image.copy()
             provider._consume_thumbnail_finished(
-                str(index)+'.jpg',provider.generation,1,(1,),ThumbnailLoadResult(image))
+                str(index)+'.jpg',provider.generation,1,(1,),ThumbnailLoadResult(unique_image))
         assert provider.browser_memory_diagnostics()['entries']==300
         provider.configure_browser_memory(mode='512',limit_bytes=100*image.sizeInBytes(),
             desired_bytes=512*MIB,group_capacity_bytes=GIB,reason='headroom_limited')

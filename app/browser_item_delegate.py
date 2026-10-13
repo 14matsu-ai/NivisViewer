@@ -158,6 +158,32 @@ class BrowserDisplaySurfaceCache:
         self._items: OrderedDict[tuple[object, ...], QImage] = OrderedDict()
         self._byte_cost = 0
         self._device_pixel_ratio: float | None = None
+        self._memory_owner = None
+        self._by_source = {}
+        self.hits = 0
+        self.preparations = 0
+
+    def bind_memory(self, owner):
+        self.clear()
+        self._memory_owner = owner
+        owner.memory_image_released.connect(self._release_source)
+
+    def _remove(self, key):
+        image = self._items.pop(key, None)
+        if image is None:
+            return
+        self._byte_cost -= max(1, int(image.sizeInBytes()))
+        keys = self._by_source.get(key[0])
+        if keys is not None:
+            keys.discard(key)
+            if not keys:
+                self._by_source.pop(key[0], None)
+        if self._memory_owner is not None:
+            self._memory_owner.release_surface_reference(('surface', id(self), key))
+
+    def _release_source(self, _path, pixel):
+        for key in tuple(self._by_source.get(pixel, ())):
+            self._remove(key)
 
     @property
     def item_count(self) -> int:
@@ -168,8 +194,8 @@ class BrowserDisplaySurfaceCache:
         return self._byte_cost
 
     def clear(self) -> None:
-        self._items.clear()
-        self._byte_cost = 0
+        for key in tuple(self._items):
+            self._remove(key)
 
     def prepare(
         self,
@@ -197,9 +223,13 @@ class BrowserDisplaySurfaceCache:
         )
         cached = self._items.get(key)
         if cached is not None:
+            self.hits += 1
             self._items.move_to_end(key)
             return DisplayThumbnailSurface(cached, True, False)
 
+        self.preparations += 1
+        if self._memory_owner is not None:
+            self._memory_owner.mark_displayed_image(image)
         surface = prepare_display_thumbnail_surface(
             image,
             source_rect,
@@ -207,16 +237,19 @@ class BrowserDisplaySurfaceCache:
             dpr,
         )
         cost = max(1, int(surface.image.sizeInBytes()))
-        if cost <= self.max_bytes:
+        if self._memory_owner is not None or cost <= self.max_bytes:
             self._items[key] = surface.image
+            self._by_source.setdefault(key[0], set()).add(key)
             self._items.move_to_end(key)
             self._byte_cost += cost
-            while (
+            if self._memory_owner is not None:
+                self._memory_owner.retain_surface_reference(('surface', id(self), key), surface.image)
+                self._memory_owner.enforce_display_budget()
+            while self._memory_owner is None and (
                 len(self._items) > self.max_items
                 or self._byte_cost > self.max_bytes
             ):
-                _old_key, old_image = self._items.popitem(last=False)
-                self._byte_cost -= max(1, int(old_image.sizeInBytes()))
+                self._remove(next(iter(self._items)))
         return surface
 
 

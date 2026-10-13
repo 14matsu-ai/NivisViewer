@@ -176,3 +176,33 @@ See `THIRD_PARTY_NOTICES.md` for the retained notices and port boundaries.
 | `source/ZipPla/ViewerForm.cs:6438-6487,6768-6879,6990-7280`, `showCurrentPage` / paint path | Paint is separate from worker continuation; upstream loading/display semantics were also evaluated. | Only the non-gating separation is adopted. `ViewerPresentationState` and `PresentationSurface` replace the upstream logical/display and half-gray behavior. |
 | `source/ZipPla/PackedImageLoader.cs:283-330,1197-1243,1781-1867`, loader/index/entry stream | Book-scoped archive/index lifetime and entry-local read. | Existing `ZipImageSource` and `ZipRasterBookRuntime`; unchanged by this planner/surface replacement. |
 
+
+## Original ZipPla 1.7.2.9 Browser thumbnail residency
+
+The Browser completion/residency and direct-redisplay structure also derives
+from <https://github.com/himamon/ZipPlaFork>, at the separate fixed import
+revision `5e942ef0006decf01c21d9dbe037dba50e763420` (commit message
+`ZipPla 1.7.2.9`). This identifies the repository import; it does not certify
+binary identity with an official distribution. License: AGPL-3.0-or-later.
+Copyright: Rio's Toolbox, 2016; source assembly copyright 2016-2017.
+The full license and upstream notice remain in `licenses/ZipPlaFork/AGPL.txt`
+and `licenses/ZipPlaFork/About.txt`.
+
+| Fixed source / processing structure | NivisViewer correspondence |
+| --- | --- |
+| `source/ZipPla/CatalogForm.cs:8730`, `SetBackgroundMode` (`:10988-11168` and following work ordering): prioritize visible items, then include remaining current-list items | Existing `BrowserWorkflowController` and `ThumbnailWarmupCursor` preserve visible priority and asynchronous one-job continuation. A finite prefetch setting bounds generation; unlimited iterates the current list. Initial paint never waits for the list to finish. |
+| `CatalogForm.cs:9190-9207`, `bmwMakePreview_EachRunWorkerCompleted`; `:30301-30381`, `ThumbViewerItem.Image` / ownership: retain completed images, including unseen items | `BrowserThumbnailProvider` owns completed artifacts; `BrowserItemModel` retains shared completed-image references beyond the viewport. Original item-owned residency is translated to a central Qt identity/byte store with implicit QImage sharing. No per-completion whole-list model publication is needed for unseen artifacts. |
+| `CatalogForm.cs:31007` and following, `ThumbViewer.DrawItem`; `:32506-32518`, `PaintPart`: draw completed images directly and do not dispose offscreen images | `BrowserItemDelegate`, managed `BrowserDisplaySurfaceCache`, and model thumbnail roles draw retained artifacts directly. Scrolling does not clear completed model references or prepared surfaces. The RAM-only pre-paint pull remains a fallback for a newly exposed completed artifact. |
+| `CatalogForm.cs:32385` and following, `ThumbViewer.Clear`; `ThumbViewerItem.Dispose`: release images when the listing is replaced | Browser directory switch, source update, cancellation/generation fences, and source eviction release matching model/surface ownership. Rendering geometry/DPI invalidation retains NivisViewer's identity contracts. |
+
+The later fixed Fork revision `07955f5267e2fb92d6fc6e40fde2507d8fb07b3b`
+has a different offscreen-clear/`LoadAsync` policy and is not the origin of
+this Browser residency adaptation. The original source has no observed
+aggregate Catalog thumbnail byte cap. NivisViewer adds a shared budget for
+unique cache/model/surface pixels, auto growth with completed-image usage,
+OS-pressure shrink, manual limits, and a 65,536 cached-entry guard. Unseen
+completed images remain normal residents; distance alone does not evict them.
+Read/visible priority only selects victims when the actual budget is exceeded.
+The original WinForms renderer, synchronous image APIs, and worker scheduling
+are not reproduced: decoding stays off the GUI thread, completion is bounded,
+and rank/ref accounting is incremental on scroll and completion.

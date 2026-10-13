@@ -1742,3 +1742,5 @@ ENGLISH.update({'負荷に合わせて自動調整': 'Adjust to load automatical
                                                                                'Requires spread parallel '
                                                                                'loading. Applies to the next '
                                                                                'book.'})
+
+ENGLISH.update({'完成サムネイルと描画用画像の共有メモリ上限です。表示範囲を外れても保持し、自動は生成済み画像の量と空きメモリに追従します。Viewerや生成中の作業領域は含みません。': 'Shared memory limit for completed thumbnails and display images. Images remain resident outside the viewport. Auto follows completed-image usage and available memory. Viewer and generation working buffers are excluded.'})

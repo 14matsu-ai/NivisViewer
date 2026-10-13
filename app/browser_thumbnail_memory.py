@@ -105,8 +105,19 @@ class BrowserThumbnailMemoryBroker(QObject):
         clients = self._live_clients()
         if not clients:
             return
-        retained = sum(client.window.thumbnail_provider.memory_cache_bytes
-                       for client in clients.values())
+        retained = 0
+        pixels = {}
+        for client in clients.values():
+            provider = client.window.thumbnail_provider
+            ledger = getattr(provider, 'artifact_memory', None)
+            if ledger is None:
+                retained += provider.memory_cache_bytes
+            else:
+                # Shared QImages between Browser clients are also added back
+                # once. This OS sampling walk is not a completion/paint path.
+                for pixel, record in ledger.pixels.items():
+                    pixels[pixel] = record[0]
+        retained += sum(pixels.values())
         try:
             snapshot = self._reader()
         except Exception:
@@ -125,10 +136,12 @@ class BrowserThumbnailMemoryBroker(QObject):
             for identity, client in clients.items():
                 window = client.window
                 visible = bool(window.isVisible() and not window.isMinimized())
+                retain_completed = bool(getattr(window.thumbnail_provider, '_retained_display_enabled', False))
                 demands[identity] = MemoryDemand(
                     str(client.options.get("browser_thumbnail_memory_mode", "auto")),
-                    client._memory_near_bytes,
-                    visible,
+                    max(client._memory_near_bytes, int(getattr(
+                        window.thumbnail_provider, "displayed_memory_demand", 0))),
+                    visible or retain_completed,
                 )
             grants = self._governor.resolve(demands, self._clock())
             # Reclaim first: two clients must not momentarily both spend an

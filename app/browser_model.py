@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .i18n import tr
+from .browser_artifact_memory import ThumbnailImageReferences
 
 
 import os
@@ -747,18 +748,60 @@ class BrowserItemModel(QAbstractListModel):
     @property
     def thumbnail_image_bytes(self) -> int:
         """Bytes held by model-owned thumbnail QImages (implicit sharing included)."""
+        owner = getattr(self, "_thumbnail_memory_owner", None)
+        if owner is not None:
+            return owner.artifact_memory.role_bytes.get('model', 0)
         return sum(int(image.sizeInBytes()) for image in self._thumbnail_images.values())
 
-    def retain_thumbnail_images(self, paths) -> int:
-        """Release model QImage references outside the current viewport.
+    @property
+    def _thumbnail_images(self):
+        return self._thumbnail_image_refs
 
-        Provider RAM remains the reusable cache; keeping every old model image
-        would pin evicted QImages as the user scrolls through a large folder.
-        """
+    @_thumbnail_images.setter
+    def _thumbnail_images(self, images):
+        if not hasattr(self, "_thumbnail_image_refs"):
+            self._thumbnail_image_refs = ThumbnailImageReferences(self._image_reference_changed)
+        self._thumbnail_image_refs.replace(images)
+
+    def _image_reference_changed(self, path, image):
+        owner = getattr(self, "_thumbnail_memory_owner", None)
+        if owner is not None:
+            owner.model_image_reference(path, image)
+
+    def bind_thumbnail_memory(self, owner):
+        self._thumbnail_memory_owner = owner
+        owner.memory_image_released.connect(self._release_memory_image)
+        for path, image in self._thumbnail_images.items():
+            owner.model_image_reference(path, image)
+
+    def _release_memory_image(self, path, pixel):
+        owner = self._thumbnail_memory_owner
+        record = owner.artifact_memory.pixels.get(pixel)
+        # One decoded image can be shared by multiple item references. The
+        # final cache eviction releases every matching model alias, by index.
+        keys = tuple(ref[1] for ref in record[1] if ref[0] == 'model') if record else ()
+        for key in keys:
+            image = self._thumbnail_images.get(key)
+            if image is None or int(image.cacheKey()) != pixel:
+                continue
+            self._thumbnail_images.pop(key)
+            self._thumbnail_signatures.pop(key, None)
+            self._low_resolution_thumbnails.discard(key)
+            row = self.row_for_path(key)
+            if row >= 0:
+                index = self.index(row, 0)
+                self.dataChanged.emit(index, index, [self.ThumbnailImageRole])
+
+    def retain_thumbnail_images(self, paths) -> int:
+        """Keep completed owned images until real eviction; bound orphan previews."""
         retained = {self._key(Path(path)) for path in paths}
         removed = 0
-        for key in tuple(self._thumbnail_images):
-            if key in retained:
+        owner = getattr(self, "_thumbnail_memory_owner", None)
+        keys = tuple(owner._orphan_model_images) if owner is not None else tuple(self._thumbnail_images)
+        for key in keys:
+            if key not in self._thumbnail_images:
+                continue
+            if key in retained or (owner is not None and owner.owns_memory_image(self._thumbnail_images[key])):
                 continue
             image = self._thumbnail_images.pop(key)
             removed += int(image.sizeInBytes())

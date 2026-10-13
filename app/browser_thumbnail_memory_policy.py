@@ -59,8 +59,9 @@ def physical_group_capacity(snapshot: object | None, retained_bytes: int) -> int
 
     Positive spare memory contributes only half to growth. Negative spare
     memory subtracts the complete shortfall. Add back only managed Browser
-    provider caches, once per application sample. Model/native/Viewer images
-    are *not* assumed reclaimable. The broker freezes this allowance until
+    cache/model/surface pixels, counted once per application sample. Decoder
+    workspaces and Viewer images are not assumed reclaimable. The broker freezes
+    this allowance until
     the next OS sample (never reuse stale availability with new usage).
     """
     values = _snapshot_values(snapshot)
@@ -176,7 +177,8 @@ def hot_row_order(*, count: int, first: int, last: int, direction: int,
     """Bounded near-window identities, independent of far generation progress.
 
     Within each distance band, prefer the scroll direction, then the reverse.
-    Unlimited generation still has a finite three-screen RAM working set.
+    Unlimited generation uses a three-screen priority/refill band. Completed
+    artifacts outside that band remain resident until the actual budget evicts.
     """
     count = max(0, int(count))
     if count == 0:

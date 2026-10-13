@@ -253,6 +253,7 @@ class _ThumbnailWorker(QRunnable):
 
 
 class BrowserThumbnailProvider(QObject):
+    memory_image_released = Signal(str, object)
     thumbnail_ready = Signal(str, int, object)
     thumbnail_provisional = Signal(str, int, object)
     thumbnail_failed = Signal(str, int, str)
@@ -323,6 +324,16 @@ class BrowserThumbnailProvider(QObject):
         self._browser_memory_group_capacity_bytes = self._cache_capacity_bytes
         self._browser_memory_reason = "unmanaged"
         self._cache_bytes = 0
+        from .browser_artifact_memory import BrowserArtifactMemory
+        self.artifact_memory = BrowserArtifactMemory()
+        self._cache_pixels = {}
+        self._pixel_cache_keys = {}
+        self._read_cache_keys = set()
+        self._retained_display_enabled = False
+        self._display_budget_callback = None
+        self._display_pending_bytes = 0
+        self._display_growth_asked = 0
+        self._orphan_model_images = OrderedDict()
         self._cache: OrderedDict[tuple[str, int, tuple[object, ...]], QImage] = OrderedDict()
         self._cache_page_counts: dict[
             tuple[str, int, tuple[object, ...]], int
@@ -456,6 +467,14 @@ class BrowserThumbnailProvider(QObject):
         for path, item in current.items():
             if path not in previous and path in self._changed_revisions:
                 self._changed_revisions[path] = item.thumbnail_revision
+        for path in changed:
+            for key in tuple(self._cache_keys_by_path.get(path, ())):
+                image = self._cache.pop(key, None)
+                if image is not None:
+                    self._cache_bytes -= int(image.sizeInBytes())
+                    self._cache_index_remove(key)
+                    self._cache_page_counts.pop(key, None)
+                    self._cache_entry_priority.pop(key, None)
         with self._failure_lock:
             self._failed = {key for key in self._failed if key[0] not in changed}
             self._permanent_failures.intersection_update(self._failed)
@@ -1007,12 +1026,80 @@ class BrowserThumbnailProvider(QObject):
     @property
     def memory_cache_usage_bytes(self) -> int:
         """Bytes retained by Browser thumbnails, excluding Viewer caches."""
-        return self._cache_bytes
+        return self.memory_cache_bytes
 
     @property
     def memory_cache_bytes(self) -> int:
         """Application broker interface: Browser provider-owned QImage bytes."""
-        return self._cache_bytes
+        return self.artifact_memory.bytes
+
+    @property
+    def displayed_memory_demand(self):
+        # Residency includes completed unseen images, independently of range.
+        return self.artifact_memory.bytes + self._display_pending_bytes
+
+    def enable_retained_display(self):
+        self._retained_display_enabled = True
+        if self._browser_memory_managed:
+            self._rebuild_cache_rank_index()
+
+    def owns_memory_image(self, image):
+        return int(image.cacheKey()) in self._pixel_cache_keys
+
+    def _ensure_display_headroom(self, additional=0):
+        from .browser_thumbnail_memory_policy import desired_limit
+        self._display_pending_bytes = max(0, int(additional))
+        need = desired_limit('auto', self.displayed_memory_demand)
+        if (self._display_budget_callback is not None and self._browser_memory_mode == 'auto'
+                and need > max(self._display_growth_asked, self._browser_memory_desired_bytes)):
+            self._display_growth_asked = need
+            self._display_budget_callback()
+        self._display_pending_bytes = 0
+
+    def mark_displayed_image(self, image, path=None):
+        pixel = int(image.cacheKey())
+        if path is None:
+            keys = self._pixel_cache_keys.get(pixel, ())
+            keys = (next(iter(keys)),) if keys else ()
+        else:
+            keys = tuple(key for key in self._cache_keys_by_path.get(path, ())
+                         if self._cache_pixels.get(key) == pixel)
+        for key in keys:
+            self._mark_displayed_cache_key(key)
+
+    def _mark_displayed_cache_key(self, key):
+        if key not in self._read_cache_keys:
+            self._read_cache_keys.add(key)
+            if self._browser_memory_managed:
+                self._cache_rank_remove(key)
+                self._cache_index_rank_add(key)
+        self._cache.move_to_end(key)
+        self._cache_index_touch(key)
+
+    def model_image_reference(self, path, image):
+        owner = ('model', path)
+        self._orphan_model_images.pop(path, None)
+        if image is None:
+            self.artifact_memory.release(owner)
+        else:
+            pixel = int(image.cacheKey())
+            existing = self.artifact_memory.pixels.get(pixel)
+            self._ensure_display_headroom(0 if existing is not None else int(image.sizeInBytes()))
+            self.artifact_memory.retain(owner, image)
+            self.mark_displayed_image(image, path)
+            if not self.owns_memory_image(image):
+                self._orphan_model_images[path] = int(image.cacheKey())
+
+    def enforce_display_budget(self):
+        self._trim_browser_memory()
+
+    def retain_surface_reference(self, owner, image):
+        if int(image.cacheKey()) not in self.artifact_memory.pixels:
+            self._ensure_display_headroom(int(image.sizeInBytes()))
+        self.artifact_memory.retain(owner, image)
+
+    def release_surface_reference(self, owner):
+        self.artifact_memory.release(owner)
 
     @property
     def memory_cache_limit_bytes(self) -> int:
@@ -1028,8 +1115,10 @@ class BrowserThumbnailProvider(QObject):
         group_capacity_bytes: int, reason: str,
     ) -> None:
         """Apply one broker grant and promptly evict to its byte allowance."""
+        was_managed = self._browser_memory_managed
         self._browser_memory_managed = True
         self._browser_memory_mode = str(mode)
+        self._display_growth_asked = 0
         self._browser_memory_desired_bytes = max(0, int(desired_bytes))
         self._browser_memory_group_capacity_bytes = max(0, int(group_capacity_bytes))
         self._browser_memory_reason = str(reason)
@@ -1038,7 +1127,8 @@ class BrowserThumbnailProvider(QObject):
             else min(self._cache_capacity, 65536)
         )
         self._cache_capacity_bytes = max(0, int(limit_bytes))
-        self._rebuild_cache_rank_index()
+        if not was_managed:
+            self._rebuild_cache_rank_index()
         self._trim_browser_memory()
 
     def memory_has_thumbnail(self, item: BrowserItem, size) -> bool:
@@ -1048,7 +1138,11 @@ class BrowserThumbnailProvider(QObject):
     def browser_memory_diagnostics(self) -> dict[str, object]:
         """Return provider-only RAM accounting; performs no cache or disk I/O."""
         return {
-            "bytes": int(self._cache_bytes),
+            "bytes": int(self.memory_cache_bytes),
+            "source_bytes": int(self._cache_bytes),
+            "model_reference_bytes": self.artifact_memory.role_bytes.get('model', 0),
+            "surface_reference_bytes": self.artifact_memory.role_bytes.get('surface', 0),
+            "unique_pixels": len(self.artifact_memory.pixels),
             "entries": len(self._cache),
             "limit_bytes": int(self._cache_capacity_bytes),
             "desired_bytes": int(self._browser_memory_desired_bytes),
@@ -1057,6 +1151,45 @@ class BrowserThumbnailProvider(QObject):
             "reason": self._browser_memory_reason,
             "managed": bool(self._browser_memory_managed),
         }
+
+    def restore_memory_thumbnail(
+        self,
+        item: BrowserItem,
+        size: int | ThumbnailRenderSpec,
+        *,
+        generation: int,
+    ) -> tuple[QImage, int | None] | None:
+        """Borrow a compatible RAM image for immediate display, without signals/I/O.
+
+        Keep request() asynchronous: callers of this display-only path own model
+        updates, so restoring a frame cannot reenter the request notification lane.
+        """
+        path_key = self._path_key(item.path)
+        if (self._closed or generation != self._generation
+                or path_key in self._changing_paths
+                or not self._revision_current(str(item.path), item.thumbnail_revision)):
+            return None
+        token = size.cache_token if isinstance(size, ThumbnailRenderSpec) else int(size)
+        key = (path_key, token, item.thumbnail_revision)
+        image = self._cache.get(key)
+        page_count = self._cache_page_counts.get(key)
+        if image is None:
+            if not isinstance(size, ThumbnailRenderSpec):
+                return None
+            candidate = self._memory_candidate(path_key, item.thumbnail_revision, size)
+            if candidate is None or candidate[1].long_edge < size.long_edge * 0.95:
+                return None
+            image, spec, page_count = candidate
+            key = (path_key, spec.cache_token, item.thumbnail_revision)
+        self._increment_stat("memory_hit")
+        self._cache_entry_priority[key] = max(
+            int(ThumbnailPriority.VISIBLE), self._cache_entry_priority.get(key, 0),
+        )
+        self._cache.move_to_end(key)
+        self._cache_index_touch(key)
+        if not self._cache_retention_rank:
+            self._reorder_memory_cache()
+        return QImage(image), page_count
 
     def has_memory_thumbnail(
         self,
@@ -1085,7 +1218,7 @@ class BrowserThumbnailProvider(QObject):
         """Cheap RAM-only capacity check; safe for GUI scheduling decisions."""
         return (
             len(self._cache) >= self._cache_capacity
-            or self._cache_bytes >= self._cache_capacity_bytes
+            or self.memory_cache_bytes >= self._cache_capacity_bytes
         )
 
     @property
@@ -1095,6 +1228,11 @@ class BrowserThumbnailProvider(QObject):
     @property
     def memory_cache_has_evictable_entries(self) -> bool:
         """Whether old/distant RAM entries can make room for more work."""
+        if self._browser_memory_managed:
+            return bool(self._cache_rank_buckets.get(None)) or any(
+                rank >= 3 and bool(bucket)
+                for rank, bucket in self._cache_rank_buckets.items() if rank is not None
+            )
         return any(
             self._retention_rank_for_cache_key(key) is None
             or (self._browser_memory_managed
@@ -1170,9 +1308,16 @@ class BrowserThumbnailProvider(QObject):
         for path, revision, rank in entries:
             key = (self._path_key(Path(path)), tuple(revision))
             priorities[key] = min(int(rank), priorities.get(key, int(rank)))
+        previous = self._cache_retention_rank
+        changed = {identity for identity in previous.keys() | priorities.keys()
+                   if previous.get(identity) != priorities.get(identity)}
         self._cache_retention_rank = priorities
         if self._browser_memory_managed:
-            self._rebuild_cache_rank_index()
+            for identity in changed:
+                for key in tuple(self._cache_keys_by_path.get(identity[0], ())):
+                    if key[2] == identity[1]:
+                        self._cache_rank_remove(key)
+                        self._cache_index_rank_add(key)
             self._trim_browser_memory()
         else:
             self._reorder_memory_cache()
@@ -1188,13 +1333,15 @@ class BrowserThumbnailProvider(QObject):
         if not self._browser_memory_managed:
             return
         if (len(self._cache) <= self._cache_capacity
-                and self._cache_bytes <= self._cache_capacity_bytes):
+                and self.memory_cache_bytes <= self._cache_capacity_bytes):
             return
         # Unranked entries leave first; then evict oldest entries in the
         # least-valuable rank. Completion-time pressure trims need no full-cache
         # walk, cost dictionary, or sort.
         while (len(self._cache) > self._cache_capacity
-               or self._cache_bytes > self._cache_capacity_bytes):
+               or self.memory_cache_bytes > self._cache_capacity_bytes):
+            if not self._cache:
+                break
             bucket = self._cache_rank_buckets.get(None)
             if bucket:
                 key = next(iter(bucket))
@@ -1230,6 +1377,9 @@ class BrowserThumbnailProvider(QObject):
             self._cache_page_counts.pop(key, None)
             self._cache_entry_priority.pop(key, None)
             self._increment_stat("memory_cache_evictions")
+        while self.memory_cache_bytes > self._cache_capacity_bytes and self._orphan_model_images:
+            path, pixel = self._orphan_model_images.popitem(last=False)
+            self.memory_image_released.emit(path, pixel)
 
     def _cache_index_rank_add(
         self, key: tuple[str, int, tuple[object, ...]]
@@ -1251,6 +1401,11 @@ class BrowserThumbnailProvider(QObject):
     def _cache_index_add(
         self, key: tuple[str, int, tuple[object, ...]]
     ) -> None:
+        image = self._cache[key]
+        pixel = int(image.cacheKey())
+        self._cache_pixels[key] = pixel
+        self._pixel_cache_keys.setdefault(pixel, set()).add(key)
+        self.artifact_memory.retain(('cache', key), image)
         self._cache_keys_by_path.setdefault(key[0], OrderedDict())[key] = None
         if self._browser_memory_managed:
             self._cache_index_rank_add(key)
@@ -1258,11 +1413,23 @@ class BrowserThumbnailProvider(QObject):
     def _cache_index_remove(
         self, key: tuple[str, int, tuple[object, ...]]
     ) -> None:
+        pixel = self._cache_pixels.pop(key, None)
+        if pixel is not None:
+            self.artifact_memory.release(('cache', key))
+            owners = self._pixel_cache_keys[pixel]
+            owners.discard(key)
+            if not owners:
+                del self._pixel_cache_keys[pixel]
+                self.memory_image_released.emit(key[0], pixel)
+        self._read_cache_keys.discard(key)
         path_bucket = self._cache_keys_by_path.get(key[0])
         if path_bucket is not None:
             path_bucket.pop(key, None)
             if not path_bucket:
                 self._cache_keys_by_path.pop(key[0], None)
+        self._cache_rank_remove(key)
+
+    def _cache_rank_remove(self, key):
         rank = self._cache_key_indexed_rank.pop(key, None)
         rank_bucket = self._cache_rank_buckets.get(rank)
         if rank_bucket is not None:
@@ -1297,7 +1464,13 @@ class BrowserThumbnailProvider(QObject):
         self,
         key: tuple[str, int, tuple[object, ...]],
     ) -> int | None:
-        return self._cache_retention_rank.get((key[0], key[2]))
+        rank = self._cache_retention_rank.get((key[0], key[2]))
+        if self._retained_display_enabled:
+            if key in self._read_cache_keys:
+                return 0 if rank == 0 else 1
+            if rank is not None:
+                return 0 if rank == 0 else rank + 1
+        return rank
 
     def _reorder_memory_cache(self) -> None:
         if len(self._cache) < 2:
@@ -1334,7 +1507,10 @@ class BrowserThumbnailProvider(QObject):
             stats: dict[str, object] = dict(self._stats)
             stats["generated_buckets"] = dict(self._generated_buckets)
             stats["generated_variants"] = dict(self._generated_variants)
-        stats["memory_cache_usage_bytes"] = self._cache_bytes
+        stats["memory_cache_usage_bytes"] = self.memory_cache_bytes
+        stats["source_reference_bytes"] = self._cache_bytes
+        stats["model_reference_bytes"] = self.artifact_memory.role_bytes.get('model', 0)
+        stats["surface_reference_bytes"] = self.artifact_memory.role_bytes.get('surface', 0)
         stats["memory_cache_capacity_bytes"] = self._cache_capacity_bytes
         stats["memory_cache_entries"] = len(self._cache)
         stats["memory_cache_capacity_entries"] = self._cache_capacity
@@ -1471,6 +1647,11 @@ class BrowserThumbnailProvider(QObject):
             QTimer.singleShot(500, self, self._continue_cache_maintenance)
 
     def clear_memory_cache(self) -> None:
+        for key in tuple(self._cache):
+            self._cache_index_remove(key)
+        for path, pixel in tuple(self._orphan_model_images.items()):
+            self.memory_image_released.emit(path, pixel)
+        self._orphan_model_images.clear()
         self._cache.clear()
         self._cache_bytes = 0
         self._cache_page_counts.clear()
@@ -1551,6 +1732,9 @@ class BrowserThumbnailProvider(QObject):
         if self._closed:
             return
         self._closed = True
+        self._display_budget_callback = None
+        if self._retained_display_enabled:
+            self.clear_memory_cache()
         self._generation += 1
         with self._save_lock:
             self._deferred_save_queue.clear()
@@ -2277,10 +2461,14 @@ class BrowserThumbnailProvider(QObject):
         self._cache_entry_priority.pop(cache_key, None)
         self._cache_page_counts.pop(cache_key, None)
         image_bytes = int(cached_image.sizeInBytes())
+        if self._retained_display_enabled and loaded.cache_in_memory:
+            self._ensure_display_headroom(image_bytes)
         if loaded.cache_in_memory and image_bytes <= self._cache_capacity_bytes:
             self._cache[cache_key] = cached_image
             self._cache_bytes += image_bytes
             self._cache_index_add(cache_key)
+            if self._retained_display_enabled and (pending is None or pending.priority >= ThumbnailPriority.SELECTED):
+                self._mark_displayed_cache_key(cache_key)
             self._cache_entry_priority[cache_key] = int(
                 pending.priority if pending is not None else ThumbnailPriority.VISIBLE
             )

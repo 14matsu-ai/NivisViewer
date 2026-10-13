@@ -251,3 +251,15 @@ RAR／7z／CBR／CB7閲覧では、利用者環境のWindows関連付け、標�
 frozen配布では、実際に含まれるPySide6／Qt DLLとplugin、shiboken6、Pillowのnative component、pypdfium2／PDFium native binary、PyInstaller bootloaderを監査対象にします。`scripts/collect_licenses.py`はインストール済みdistributionの正式なLICENSE／COPYING／NOTICE等だけを収集し、バージョンmanifestを生成します。自動収集結果は正式公開前に必ず人手で監査します。PyInstallerはビルドツールである一方、生成物にはbootloaderが含まれるためruntime componentとは区別して記録します。
 
 将来WinRAR、UnRAR、RAR、7-Zipのいずれかを同梱する配布形態へ変更する場合は、その時点の公式ライセンス、構成要素ごとの条件、著作権表示および再配布条件を改めて監査し、必要な文書を`licenses/`へ追加します。
+
+## Original ZipPla 1.7.2.9 Browser thumbnail residency
+
+The Browser completed-image residency and direct-redisplay structure derives
+from `source/ZipPla/CatalogForm.cs` in <https://github.com/himamon/ZipPlaFork>,
+fixed import revision `5e942ef0006decf01c21d9dbe037dba50e763420` (`ZipPla 1.7.2.9`).
+License: **AGPL-3.0-or-later**. Copyright: Rio's Toolbox, 2016;
+source assembly copyright 2016-2017. The full license and upstream notice are
+preserved in `licenses/ZipPlaFork/AGPL.txt` and `licenses/ZipPlaFork/About.txt`.
+This is a separate Browser provenance entry; existing Viewer fixed revisions
+remain as documented above. The translated methods, Qt ownership/budget
+extensions, and boundaries are recorded in `docs/ZIPPLAFORK_COMPARISON.md`.

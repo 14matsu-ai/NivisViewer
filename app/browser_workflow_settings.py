@@ -71,8 +71,7 @@ class BrowserWorkflowSettings(QGroupBox):
         self.memory_status.setWordWrap(True)
         self.memory_status.setObjectName("browser_thumbnail_memory_status")
         memory_note = QLabel(tr(
-            "BrowserのサムネイルRAMキャッシュ上限です。実際の使用量は表示範囲や空きメモリに応じて調整されます。"
-            "この値はBrowserのプロバイダーキャッシュだけを対象とし、表示中の画像やViewerなどの使用量は含みません。"
+            "完成サムネイルと描画用画像の共有メモリ上限です。表示範囲を外れても保持し、自動は生成済み画像の量と空きメモリに追従します。Viewerや生成中の作業領域は含みません。"
         ), self)
         memory_note.setWordWrap(True)
         form.addRow(tr("サムネイルのメモリ上限:"), self.memory_mode)
