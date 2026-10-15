@@ -150,9 +150,15 @@ class BrowserWorkflowController(QObject):
         token = self.window.thumbnail_render_spec.cache_token
         first, last = (self._viewport[0], self._viewport[1]) if self._viewport else (-1, -1)
         has_memory = getattr(self.window.thumbnail_provider, "has_memory_thumbnail", None)
+        # Recenter preserves these requests. Re-enqueuing them wastes the next
+        # refill slots on jobs already submitted, starving newly exposed rows.
+        # Cancelled/rejected jobs are explicitly reopened by their normal paths.
+        inflight = {(key[0], key[1].casefold(), key[3], key[4])
+                    for key in self._inflight_jobs if key[-1] == self._context}
         rows = []
         for row, identity in self._memory_scope:
-            if first <= row <= last or identity in self._memory_attempted:
+            if (first <= row <= last or identity in self._memory_attempted
+                    or (row, *identity) in inflight):
                 continue
             item = model.item_at(row)
             if (not self._background_eligible(item)
@@ -174,6 +180,13 @@ class BrowserWorkflowController(QObject):
         # the configured memory scope without waiting for input to stop.
         self._memory_refill = deque(sorted(self._memory_refill,
             key=lambda row: not band[0] <= row <= band[1]))
+
+    def _retry_memory_job(self, key) -> None:
+        identity = (key[1].casefold(), key[3], key[4])
+        if (key[-1] == self._context and (key[0], identity) in self._memory_scope
+                and key[0] not in self._memory_refill):
+            self._memory_refill.appendleft(key[0])
+            self._input_refill_band = None
 
     def _set_memory_scope(self, rows, first: int, last: int, *, selected_rows=()) -> None:
         if self._memory_broker is None:
@@ -448,6 +461,9 @@ class BrowserWorkflowController(QObject):
         self._near_rows = set(near_rows)
 
         provider = window.thumbnail_provider
+        configure_reads = getattr(provider, 'set_saved_read_window', None)
+        if callable(configure_reads):
+            configure_reads(len(next_rows))
         base_rows = set(range(first, last + 1)) | set(next_rows) | set(safety_rows)
         frame_bytes = frame_byte_estimate(window.thumbnail_render_spec)
         entry_capacity = max(
@@ -619,9 +635,8 @@ class BrowserWorkflowController(QObject):
                 if not pending(key[1], key[3], key[2]):
                     lane = self._inflight_jobs.pop(key)
                     self._cursor.retry(key[0])
-                    if lane == 'memory' and key[0] not in self._memory_refill:
-                        self._memory_refill.appendleft(key[0])
-                        self._input_refill_band = None
+                    if lane == 'memory':
+                        self._retry_memory_job(key)
         if self._near_cache_blocked:
             can_roll = bool(
                 self._memory_broker is not None
@@ -689,7 +704,8 @@ class BrowserWorkflowController(QObject):
                 self._inflight = None
                 self._inflight_lane = "cursor"
                 if state == "blocked":
-                    self._memory_refill.appendleft(row)
+                    if row not in self._memory_refill:
+                        self._memory_refill.appendleft(row)
                     self._input_refill_band = None
                     self._stop_reason = "provider-busy"
                     return
@@ -792,10 +808,8 @@ class BrowserWorkflowController(QObject):
                 )
                 if state == "cancelled" or item_changed:
                     self._cursor.retry(row)
-                    if (lane == "memory" and state == "cancelled" and not item_changed
-                            and row not in self._memory_refill):
-                        self._memory_refill.appendleft(row)
-                        self._input_refill_band = None
+                    if lane == "memory" and state == "cancelled" and not item_changed:
+                        self._retry_memory_job(current)
                 else:
                     self._cursor.complete(row)
                     if state == "disk-miss" and item is not None and item.preview_kind != "video":
@@ -826,22 +840,72 @@ class BrowserWorkflowController(QObject):
                 item = model.item_at(row)
                 if not callable(compatible) or item is None or not compatible(item, token):
                     self.window._schedule_thumbnail_requests(0)
+        if generation == self.window._generation and token == self.window.thumbnail_render_spec.cache_token:
+            self._refill_saved_slot()
         self.schedule_background()
+
+    def _refill_saved_slot(self) -> None:
+        """Replace one finished read before the next paint, without a plan scan."""
+        window = self.window
+        provider = window.thumbnail_provider
+        if (self._pumping or not window._fast_scrolling or not self._memory_refill
+                or self._viewport is None or self._context is None or self._cursor is None
+                or window._shutdown_prepared or not window.isVisible()
+                or getattr(window, '_file_mutation_requests', None)
+                or getattr(window, '_first_paint_pending_generation', None) is not None
+                or self.options['browser_thumbnail_background_screens'] == 0
+                or getattr(provider, '_paused', False)
+                or provider.pending_read_count >= provider.background_read_request_limit):
+            return
+        # The ordinary timer still handles recentering, cache misses, generation
+        # and scans. Completion only replenishes one already planned saved read;
+        # it must never run another 32-item/2ms dispatch slice per notification.
+        row = self._memory_refill.popleft()
+        item = window.item_model.item_at(row)
+        if not self._background_eligible(item):
+            return
+        token = window.thumbnail_render_spec.cache_token
+        identity = self._memory_identity(item, token)
+        if (identity in self._memory_attempted
+                or provider.has_memory_thumbnail(item, window.thumbnail_render_spec)):
+            return
+        key = (row, str(item.path), window._generation, token, item.thumbnail_revision, self._context)
+        self._inflight, self._inflight_lane = key, 'memory'
+        self._pumping = True
+        try:
+            state = provider.request_background_read(item, window.thumbnail_render_spec,
+                                                     generation=window._generation)
+        finally:
+            self._pumping = False
+        if state == 'queued':
+            self._inflight_jobs[key] = 'memory'
+        else:
+            self._inflight, self._inflight_lane = None, 'cursor'
+            if state == 'blocked':
+                if row not in self._memory_refill:
+                    self._memory_refill.appendleft(row)
+                self._input_refill_band = None
+            else:
+                self._memory_attempted.add(identity)
+                if state == 'disk-miss' and item.preview_kind != 'video':
+                    self._disk_misses.add(row)
+                self._cursor.complete(row)
 
     def _submission_rejected(self, path, generation, token, revision) -> None:
         for key in tuple(getattr(self, '_inflight_jobs', {})):
             if key[1:5] == (path, generation, token, revision):
-                self._inflight_jobs.pop(key, None)
+                lane = self._inflight_jobs.pop(key)
+                if key[-1] == self._context:
+                    self._inflight, self._inflight_lane = key, lane
+                break
         current = self._inflight
         if current is not None and current[1:5] == (
             path, generation, token, revision
         ):
             if self._cursor is not None:
                 self._cursor.retry(current[0])
-            if (getattr(self, "_inflight_lane", "cursor") == "memory"
-                    and current[0] not in getattr(self, "_memory_refill", ())):
-                self._memory_refill.appendleft(current[0])
-                self._input_refill_band = None
+            if getattr(self, "_inflight_lane", "cursor") == "memory":
+                self._retry_memory_job(current)
             self._inflight = None
             self._inflight_lane = "cursor"
             self._stop_reason = "submission-rejected"

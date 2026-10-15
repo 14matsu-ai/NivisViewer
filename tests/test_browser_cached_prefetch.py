@@ -316,6 +316,60 @@ def test_completion_burst_yields_before_one_background_dispatch(tmp_path, qapp):
         window.close();qapp.processEvents()
 
 
+def test_fast_scroll_defers_submission_and_settlement_replaces_only_one_slot(tmp_path, qapp, monkeypatch):
+    from tests.test_browser_thumbnail_first_exposure import fixture_listing
+    from tests.test_browser_retained_scroll_qt import make_browser
+    from tests.test_browser_thumbnail_ram_restore import wait_visible
+    fixture_listing(tmp_path/'images', 160)
+    window = make_browser(tmp_path, tmp_path/'images', qapp, 0, True)
+    try:
+        wait_visible(window, qapp)
+        provider, workflow = window.thumbnail_provider, window._browser_workflow
+        spin(qapp, lambda: provider.pending_count == 0)
+        window.config.apply({'browser_thumbnail_background_screens': 1}, save=False)
+        workflow.recenter_cache_retention()
+        window._fast_scrolling = True
+        calls = []
+        def read(item, spec, *, generation):
+            calls.append(window.item_model.row_for_path(item.path))
+            return 'queued'
+        monkeypatch.setattr(provider, 'request_background_read', read)
+        monkeypatch.setattr(workflow, '_pump_batch', lambda: pytest.fail('No dispatch slice inside a completion'))
+        planned = {row for row, _identity in workflow._memory_scope}
+        # Input restores already prepared RAM pixels, but must not create/start
+        # read workers before Qt gets to paint the movement. The scheduled
+        # visible/background pass and existing completions keep acquisition going.
+        window._on_list_scrolled(window._last_scroll_value + window.list_view.viewport().height())
+        assert not calls
+        token = window.thumbnail_render_spec.cache_token
+        workflow._settled('', window._generation, token, (), 'ready')
+        assert len(calls) == 1
+        before = len(calls)
+        workflow._settled('', window._generation-1, token, (), 'ready')
+        assert len(calls) == before
+        workflow._rebuild_memory_refill()  # Recenter must not replay inflight rows.
+        workflow._settled('', window._generation, token, (), 'ready')
+        assert len(calls) == before+1
+        assert set(calls) <= planned
+        assert len(calls) == len(set(calls))
+        key = next(iter(workflow._inflight_jobs))
+        assert workflow._inflight != key
+        workflow._submission_rejected(*key[1:5])
+        assert workflow._memory_refill[0] == key[0]
+        workflow._refill_saved_slot()
+        assert calls[-1] == key[0]  # An older rejected job must remain retryable.
+        workflow._memory_scope = tuple(pair for pair in workflow._memory_scope if pair[0] != key[0])
+        workflow._submission_rejected(*key[1:5])
+        assert key[0] not in workflow._memory_refill  # Do not retry beyond the moved horizon.
+        before = len(calls)
+        window._fast_scrolling = False
+        workflow._settled('', window._generation, token, (), 'ready')
+        assert len(calls) == before
+        workflow._timer.stop()
+    finally:
+        window.close(); qapp.processEvents()
+
+
 def test_visible_pass_reuses_retention_but_selection_refreshes_it(tmp_path, qapp):
     from PySide6.QtCore import QItemSelectionModel
     from tests.test_browser_thumbnail_first_exposure import fixture_listing

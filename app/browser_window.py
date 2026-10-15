@@ -11,6 +11,7 @@ from .menu_icons import install_text_icon_menu_style, selection_action_icon, set
 
 
 import os
+from collections import deque
 import logging
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -1155,6 +1156,12 @@ class BrowserWindow(QMainWindow):
         self._thumbnail_request_timer.timeout.connect(
             self._request_visible_thumbnails
         )
+        self._visible_submission_timer = QTimer(self)
+        self._visible_submission_timer.setSingleShot(True)
+        self._visible_submission_timer.setInterval(0)
+        self._visible_submission_timer.timeout.connect(self._submit_visible_thumbnail_batch)
+        self._visible_submission_queue = deque()
+        self._visible_submission_context = None
         self._scroll_idle_timer = QTimer(self)
         self._scroll_idle_timer.setSingleShot(True)
         self._scroll_idle_timer.setInterval(180)
@@ -4696,6 +4703,8 @@ class BrowserWindow(QMainWindow):
             self._close_owned_popup("_location_history_popup")
             self._close_owned_popup("_search_history_popup")
             self._thumbnail_request_timer.stop()
+            self._visible_submission_timer.stop()
+            self._visible_submission_queue.clear()
             self._browser_search_timer.stop()
             self._scroll_idle_timer.stop()
             self._scan_status_timer.stop()
@@ -8596,6 +8605,9 @@ class BrowserWindow(QMainWindow):
                 self._on_page_count_ready(str(item.path), generation, page_count)
 
     def _request_visible_thumbnails(self) -> None:
+        self._thumbnail_request_timer.stop()
+        self._visible_submission_timer.stop()
+        self._visible_submission_queue.clear()
         if self.current_path is not None and self._file_mutation_for_path(self.current_path) is not None:
             return
         presentation = getattr(self, '_thumbnail_presentation', None)
@@ -8655,30 +8667,46 @@ class BrowserWindow(QMainWindow):
                 size=self.thumbnail_render_spec,
                 generation=self._generation,
             )
+        self._visible_submission_context = (self._generation, request_token)
         for rows, priority in (
             (plan.visible_rows, ThumbnailPriority.VISIBLE),
             (plan.selected_rows, ThumbnailPriority.SELECTED),
-            (plan.directional_rows, ThumbnailPriority.READ_AHEAD),
-            (plan.safety_rows, ThumbnailPriority.PREFETCH),
         ):
             for row in rows:
                 item = self.item_model.item_at(row)
-                if (
-                    item is None
-                    or self._file_mutation_for_path(item.path) is not None
-                    or not item.can_generate_preview
-                    or self.item_model._has_compatible_thumbnail(
-                        item,
-                        request_token,
-                    )
-                ):
-                    continue
+                if item is not None:
+                    self._visible_submission_queue.append((row, item.path, item.thumbnail_revision, priority))
+        self._submit_visible_thumbnail_batch()
+
+    def _submit_visible_thumbnail_batch(self) -> None:
+        # Creating every visible worker in one timer callback can monopolize
+        # input for tens of milliseconds at high DPI. Yield between small
+        # submission slices; completed pixels are still published immediately.
+        if (self._shutdown_prepared
+                or self._visible_submission_context != (self._generation, self.thumbnail_render_spec.cache_token)):
+            self._visible_submission_queue.clear()
+            return
+        if self._thumbnail_request_timer.isActive():
+            return  # Its new viewport plan supersedes this continuation.
+        deadline = monotonic() + 0.002
+        request_token = self.thumbnail_render_spec.cache_token
+        while self._visible_submission_queue:
+            row, path, revision, priority = self._visible_submission_queue.popleft()
+            item = self.item_model.item_at(row)
+            if (item is not None and item.path == path and item.thumbnail_revision == revision
+                    and self._file_mutation_for_path(item.path) is None
+                    and item.can_generate_preview
+                    and not self.item_model._has_compatible_thumbnail(item, request_token)):
                 self.thumbnail_provider.request(
-                    item,
-                    self.thumbnail_render_spec,
-                    generation=self._generation,
-                    priority=priority,
+                    item, self.thumbnail_render_spec,
+                    generation=self._generation, priority=priority,
                 )
+            if monotonic() >= deadline:
+                break
+        if self._visible_submission_queue:
+            self._visible_submission_timer.start()
+        else:
+            self._browser_workflow.schedule_background()
 
     def _current_device_pixel_ratio(self) -> float:
         window = self.windowHandle()
@@ -8810,6 +8838,9 @@ class BrowserWindow(QMainWindow):
         presentation = getattr(self, '_thumbnail_presentation', None)
         if presentation is not None:
             presentation.recenter()
+        # Keep the input path RAM-only. Starting a read wave here contends with
+        # the moved viewport's first paint; the queued request pass and existing
+        # read completions already keep prefetch progressing during scrolling.
         self._schedule_thumbnail_requests(0)
         self._scroll_idle_timer.start()
 

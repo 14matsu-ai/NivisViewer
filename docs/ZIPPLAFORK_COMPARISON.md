@@ -437,8 +437,10 @@ every completed image. Unlimited mode uses its bounded near window while
 input is active; it does not submit the entire listing.
 
 Saved reads and display derivatives share half the logical CPU count, bounded
-to two through eight workers, with at most twice that many outstanding
-speculative read requests. Original-image
+to two through eight workers, with a base queue of twice that many outstanding
+speculative read requests. For a larger next viewport, the queue
+can cover up to four worker waves (at most 32 requests), without increasing the
+worker count or acquisition horizon. Original-image
 generation retains its separate scratch admission and four-request background
 limit. A disabled or failed writer does not justify treating an existing saved
 thumbnail as a generation job.
@@ -467,3 +469,50 @@ acquisition. This change prepares final item images before exposure, not an
 entire viewport strip bitmap. Literal strip painting still differs from
 `CatalogForm.preRenderScroll` / `PaintPart` in ZipPla 1.7.2.9 at the previously
 recorded fixed revision. No additional source code is transplanted here.
+
+### Saved-read throughput and refill before paint
+
+Continuous scrolling also exposed serialization inside saved-cache reads.
+Readers now borrow bounded, reusable read-only SQLite connections. Metadata
+queries and immutable-file opening run outside the shared writer lock; file
+leases, source signatures, write epochs and final index validation remain in
+place. A shared commit revision detects an in-process writer racing the final
+query and repeats that validation under the writer lock. Idle connections close
+with the cache, and outstanding readers close on return after invalidation.
+
+PNG/WebP cache pixels decode directly into QImage storage, retaining a Pillow
+fallback when a Qt codec is unavailable. This removes the Python pixel-buffer
+round trip and extra image copy. Use a worker-owned `QImageReader` over a
+`QBuffer` containing bytes from the leased file handle. The `QImage.fromData`
+Python-bytes overload serialized decoding with Python input handlers in the
+tested PySide runtime; `QImageReader.read()` allows input to progress during
+native decoding. This keeps file leases and codec fallback intact without
+reducing read concurrency or delaying publication. Native RGB32 storage can use
+four bytes per pixel instead of three; the existing RAM ledger charges the actual image size.
+Saved file formats, quality selection and disk layout are unchanged.
+
+Native runnable ownership is collected by the existing timer or at its hard
+bound, rather than checking/joining all pools for every submitted image.
+Scroll input restores prepared RAM pixels and schedules acquisition; it does
+not create/start a saved-read wave on the input call stack. Submitting even a
+bounded wave there delayed the first paint through worker contention. The
+scheduled request pass continues acquisition during scrolling. Its visible
+worker submissions use a two-millisecond time budget, then resume through a
+zero-delay event-loop continuation. This prevents a high-DPI viewport of cold
+RAM entries from registering every worker in one long input-blocking callback.
+A newly scheduled viewport request supersedes the remaining old rows; generation,
+path and revision checks fence each continuation. Ready pixels are still published
+immediately, and no fixed input debounce or new worker thread is introduced.
+Each completed read may replenish one saved-only slot immediately. This does not
+run a full dispatch slice, rebuild the plan, or generate an original image in a
+completion callback. The ordinary coalesced timer still owns scans and generation.
+The next-viewport queue remains bounded even with unlimited warmup, and results
+still pass through the GUI owner's generation and revision checks.
+Recentring excludes matching in-flight requests from the refill queue. Previously
+these duplicated submissions consumed refill slots before genuinely new rows;
+cancellation and rejection now explicitly reopen the affected row for retry.
+
+This remains the Hybrid described above: retain Qt virtualization and modern
+resource ownership, with final display pixels prepared ahead of exposure. No
+additional ZipPla code is copied, and a separate viewport bitmap renderer is
+unnecessary for these read-lane and scheduling delays.

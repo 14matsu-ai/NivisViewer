@@ -1077,6 +1077,13 @@ class BrowserThumbnailProvider(QObject):
         with self._pending_lock:
             return sum(pending.worker.cache_probe for pending in self._pending.values())
 
+    def set_saved_read_window(self, item_count: int) -> None:
+        # Queue enough of the next viewport to cover a GUI paint interval.
+        # Parallelism is unchanged; both queued and completed/unconsumed jobs
+        # count here, and even unlimited warmup cannot exceed four worker waves.
+        workers = browser_read_workers()
+        self.background_read_request_limit = min(4 * workers, max(2 * workers, int(item_count)))
+
     def has_pending_request(self, path, token, generation):
         with self._pending_lock:
             return (self._path_key(Path(path)), token, generation) in self._pending
@@ -3850,14 +3857,20 @@ class BrowserThumbnailProvider(QObject):
         worker: _ThumbnailWorker,
         priority: ThumbnailPriority,
     ) -> bool:
-        self._collect_owned_workers()
+        # Collect on the existing idle timer, not for every submitted image.
+        # waitForDone(0) probes/joining several native pools here stalled each
+        # refill batch while the GUI and read workers contended for the GIL.
+        # The hard ownership bound still forces a fence before refusing work.
+        if len(self._owned_workers) >= 256:
+            self._collect_owned_workers()
         if self._closed or self._paused or worker.cancelled.is_set():
             return False
         if worker not in self._owned_workers:
             if len(self._owned_workers) >= 256:
                 return False  # Quiesce before growing unconsumed native ownership.
             self._owned_workers.add(worker)
-            self._owned_collection_timer.start()
+            if not self._owned_collection_timer.isActive():
+                self._owned_collection_timer.start()
         normalized = ThumbnailPriority(priority)
         worker.display_plan = self._display_plan if isinstance(worker.size, ThumbnailRenderSpec) else None
         if worker.display_plan is not None and not worker.display_only:

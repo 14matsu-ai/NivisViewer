@@ -16,12 +16,14 @@ import time
 import uuid
 import weakref
 import ctypes
+from contextlib import contextmanager
 from ctypes import wintypes
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PIL import Image, features
-from PySide6.QtGui import QImage
+from PySide6.QtCore import QBuffer, QIODevice
+from PySide6.QtGui import QImage, QImageReader
 
 from .browser_model import BrowserItem, BrowserItemKind
 from .ffmpeg_thumbnail_backend import VIDEO_PREVIEW_EXTENSIONS
@@ -48,6 +50,7 @@ class _CacheReadState:
         self.lock = threading.RLock()
         self.leases = {}
         self.retired = set()
+        self.revision = 0
 
 
 def _cache_read_state(directory):
@@ -333,6 +336,7 @@ class ThumbnailDiskCache:
         self._read_leases = self._read_state.leases
         self._retired_read_files = self._read_state.retired
         self._connection: sqlite3.Connection | None = None
+        self._read_connections: list[sqlite3.Connection] = []
         self._pending_accesses: dict[str, float] = {}
         self._pending_delete_files = set()
         self._saves_since_cleanup = 0
@@ -542,8 +546,44 @@ class ThumbnailDiskCache:
                                  required_cover_path, forbid_zippla_cover)
 
     def _lookup_read(self, item, spec, token, entry_path, required_cover_path, forbid_zippla_cover):
-        # Only metadata selection / opening the immutable saved file is locked.
-        # Source validation and decoding use a stable handle outside the lock.
+        try:
+            with self._borrow_read_connection() as (connection, epoch):
+                if connection is None:
+                    return None
+                return self._lookup_read_connection(connection, epoch, item, spec, token,
+                    entry_path, required_cover_path, forbid_zippla_cover)
+        except sqlite3.DatabaseError as exc:
+            self.last_error = str(exc)
+            return None
+
+    @contextmanager
+    def _borrow_read_connection(self):
+        # Independent autocommit SELECTs must not serialize all read workers
+        # behind the writer lock (including while SQLite releases the GIL).
+        with self._lock:
+            enabled = self.enabled and self._connection is not None
+            epoch = self._write_epoch
+            connection = self._read_connections.pop() if enabled and self._read_connections else None
+        if not enabled:
+            yield None, epoch
+            return
+        if connection is None:
+            connection = sqlite3.connect(self.index_path.absolute().as_uri() + '?mode=ro',
+                uri=True, check_same_thread=False, isolation_level=None)
+        try:
+            yield connection, epoch
+        finally:
+            with self._lock:
+                retain = (self.enabled and self._connection is not None
+                          and epoch == self._write_epoch and len(self._read_connections) < 8)
+                if retain:
+                    self._read_connections.append(connection)
+            if not retain:
+                connection.close()
+
+    def _lookup_read_connection(self, connection, epoch, item, spec, token,
+                                entry_path, required_cover_path, forbid_zippla_cover):
+        # Immutable files remain leased through source and index validation.
         source = self._source_for_item(item)
         if source is None:
             return None
@@ -580,33 +620,26 @@ class ThumbnailDiskCache:
                 # uncertain placeholder. Within usable results prefer current.
                 return (not (adequate and not refresh), row[14] != families[0],
                         row[10] != token, edge if adequate else -edge)
-        with self._lock:
-            if not self.enabled or self._connection is None:
-                return None
-            epoch = self._write_epoch
-            try:
-                rows = self._connection.execute(query, tuple(parameters)).fetchall()
-            except sqlite3.DatabaseError as exc:
-                self.last_error = str(exc)
-                return None
-            rows = [row for row in rows
-                    if (required is None or row[6] == required)
-                    and not (forbid_zippla_cover and row[6]
-                             and is_zippla_cover_name(Path(row[6]).name))]
-            if spec is not None and len(rows) > 1:
-                rows.sort(key=rank)
-            # Select and lease the first immutable file in the same transaction
-            # boundary. Codecs and source inspection remain outside the lock.
-            first_handle = self._open_read_file_locked(rows[0][1]) if rows else None
-        for index, row in enumerate(rows):
+        rows = connection.execute(query, tuple(parameters)).fetchall()
+        rows = [row for row in rows
+                if (required is None or row[6] == required)
+                and not (forbid_zippla_cover and row[6]
+                         and is_zippla_cover_name(Path(row[6]).name))]
+        if spec is not None and len(rows) > 1:
+            rows.sort(key=rank)
+        for row in rows:
             key, filename = row[:2]
             cover_path = row[6]
-            handle = first_handle
-            if index:
+            with self._lock:
+                if not self.enabled or self._connection is None or epoch != self._write_epoch:
+                    return None
+                self._read_leases[filename] = self._read_leases.get(filename, 0) + 1
+            try:
+                handle = (self.files_dir / filename).open('rb')
+            except OSError:
                 with self._lock:
-                    if not self.enabled or self._connection is None or epoch != self._write_epoch:
-                        return None
-                    handle = self._open_read_file_locked(filename)
+                    self._release_read_file_locked(filename)
+                handle = None
             if handle is None:
                 self._discard_read_snapshot(row, epoch)
                 continue
@@ -626,15 +659,24 @@ class ThumbnailDiskCache:
                     image = None
                 handle.close()
                 with self._lock:
+                    revision = self._read_state.revision
+                current = connection.execute(
+                    'SELECT file_name,source_signature,cover_signature FROM entries WHERE cache_key=?',
+                    (key,)).fetchone()
+                with self._lock:
                     # Release the lease in the validation interval, even when
                     # another cache object deleted/replaced the row meanwhile.
                     self._release_read_file_locked(filename)
                     released = True
                     if not self.enabled or self._connection is None or epoch != self._write_epoch:
                         return None
-                    current = self._connection.execute(
-                        'SELECT file_name,source_signature,cover_signature FROM entries WHERE cache_key=?',
-                        (key,)).fetchone()
+                    if revision != self._read_state.revision:
+                        # A local writer committed between SELECT and the final
+                        # lifetime fence. Recheck only this uncommon race under
+                        # its lock, including writes by another cache instance.
+                        current = self._connection.execute(
+                            'SELECT file_name,source_signature,cover_signature FROM entries WHERE cache_key=?',
+                            (key,)).fetchone()
                     if current != (filename, row[5], row[9]):
                         continue
                     if image is not None:
@@ -1623,6 +1665,7 @@ class ThumbnailDiskCache:
         assert self._connection is not None
         try:
             self._connection.commit()
+            self._read_state.revision += 1
         except sqlite3.DatabaseError:
             try:
                 self._connection.rollback()
@@ -1732,6 +1775,9 @@ class ThumbnailDiskCache:
         return value if value == 0 or value >= 7 else 7
 
     def _close_connection(self) -> None:
+        readers, self._read_connections = self._read_connections, []
+        for reader in readers:
+            reader.close()
         connection = self._connection
         self._connection = None
         if connection is not None:
@@ -1788,7 +1834,25 @@ class ThumbnailDiskCache:
     @staticmethod
     def _read_qimage(path: Path) -> QImage | None:
         try:
-            with Image.open(path) as image:
+            # The cache contains PNG/WebP display pixels. Decode directly into
+            # Qt storage instead of Pillow -> Python bytes -> another QImage copy.
+            # Keep the leased handle: reopening its path would lose the lifetime
+            # guarantee if cleanup/replacement ran concurrently.
+            data = path.read() if hasattr(path, 'read') else Path(path).read_bytes()
+            # QImage.fromData's Python-bytes overload holds the GIL while
+            # decoding in PySide. Several read workers then stall Python input
+            # handlers even though no decoding runs on the GUI thread. The
+            # QIODevice reader releases it for the native decode. Keep both
+            # reader and buffer alive on this worker until read() completes.
+            buffer = QBuffer()
+            buffer.setData(data)
+            buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+            image = QImageReader(buffer).read()
+            if not image.isNull():
+                return image
+            # Retain compatibility if the installed Qt build lacks a codec.
+            import io
+            with Image.open(io.BytesIO(data)) as image:
                 return pil_to_qimage(image)
         except Exception:
             return None
