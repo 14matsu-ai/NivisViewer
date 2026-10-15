@@ -1744,3 +1744,7 @@ ENGLISH.update({'負荷に合わせて自動調整': 'Adjust to load automatical
                                                                                'book.'})
 
 ENGLISH.update({'完成サムネイルと描画用画像の共有メモリ上限です。表示範囲を外れても保持し、自動は生成済み画像の量と空きメモリに追従します。Viewerや生成中の作業領域は含みません。': 'Shared memory limit for completed thumbnails and display images. Images remain resident outside the viewport. Auto follows completed-image usage and available memory. Viewer and generation working buffers are excluded.'})
+ENGLISH.update({
+    '保存容量に上限を設定する': 'Limit saved cache capacity',
+    'オフの場合、保存容量の上限はありません。RAMの上限とは別の設定です。': 'When off, saved cache capacity is unlimited. This setting is separate from the RAM limit.',
+})

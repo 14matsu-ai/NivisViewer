@@ -357,7 +357,7 @@ def test_generation_change_clears_queued_cache_maintenance_and_allows_retry(
     qapp: QApplication,
 ) -> None:
     disk_cache = ThumbnailDiskCache(tmp_path / "queued-maintenance-cache")
-    provider = BrowserThumbnailProvider(disk_cache=disk_cache)
+    provider = BrowserThumbnailProvider(disk_cache=disk_cache, max_workers=1)
     lane_started = Event()
     release_lane = Event()
     maintenance_calls: list[bool] = []
@@ -727,7 +727,7 @@ def test_cancelling_queued_thumbnail_releases_background_capacity(
         return image
 
     provider = BrowserThumbnailProvider(
-        loader=loader, disk_cache_enabled=False
+        loader=loader, disk_cache_enabled=False, max_workers=1
     )
     released: list[bool] = []
     provider.capacity_released.connect(lambda: released.append(True))
@@ -1584,6 +1584,49 @@ def test_slow_disk_persistence_cannot_withhold_ready_thumbnail(
     qapp.processEvents()
     assert provider.cache_statistics()["disk_saved"] == 1
     provider.close()
+
+
+@pytest.mark.parametrize('wait_before_completion', [True, False])
+def test_background_save_wait_wakes_without_queue_backpressure(
+    tmp_path, qapp, monkeypatch, wait_before_completion,
+):
+    source = tmp_path / 'ordinary-save.png'
+    write_image(source)
+    item = make_item(source, BrowserItemKind.IMAGE)
+    disk_cache = ThumbnailDiskCache(tmp_path / 'cache')
+    original_put = disk_cache.put
+    started, release = Event(), Event()
+
+    def put(*args, **kwargs):
+        started.set()
+        assert release.wait(5)
+        return original_put(*args, **kwargs)
+
+    monkeypatch.setattr(disk_cache, 'put', put)
+    provider = BrowserThumbnailProvider(disk_cache=disk_cache)
+    ready = QSignalSpy(provider.thumbnail_ready)
+    wake = QSignalSpy(provider.capacity_released)
+    spec = ThumbnailRenderSpec.from_settings(96, 'square_1_1', 'letterbox')
+    try:
+        generation = provider.begin_generation()
+        assert provider.request(item, spec, generation=generation)
+        assert _wait_for_spy(ready, qapp, 2000) and started.wait(1)
+        qapp.processEvents()
+        assert not provider._save_enqueue_backpressured
+        assert not provider._deferred_save_queue and not provider._retry_save_queue
+        previous = wake.count()
+        if wait_before_completion:
+            assert provider.request_background(item, spec, generation=generation) == 'blocked'
+        release.set()
+        assert provider.wait_for_done(5000)
+        qapp.processEvents()
+        if wait_before_completion:
+            assert wake.count() > previous
+        assert provider.request_background(item, spec, generation=generation) == 'settled'
+        assert provider.cache_statistics()['disk_saved'] == 1
+    finally:
+        release.set()
+        provider.close()
 
 
 def test_deferred_save_does_not_cache_pixels_for_a_newer_source(

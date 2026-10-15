@@ -5,8 +5,10 @@ from .i18n import tr
 
 
 from collections import OrderedDict, deque
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from enum import Enum
+from functools import lru_cache
 import heapq
 import inspect
 import logging
@@ -19,13 +21,17 @@ import zipfile
 
 from natsort import natsorted
 from PIL import Image
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal, Slot, QCoreApplication, QThread, QEvent
 from PySide6.QtGui import QImage
 
 from .browser_model import (
     BROWSER_IMAGE_EXTENSIONS,
     BrowserItem,
     BrowserItemKind,
+)
+from .browser_generation_budget import (
+    BROWSER_GENERATION_BUDGET, GenerationAdmissionDeferred,
+    browser_generation_workers, browser_read_workers, refresh_generation_memory,
 )
 from .browser_thumbnail_scheduler import ThumbnailPriority
 from .archive_backend import MAX_IMAGE_ENTRY_BYTES
@@ -61,6 +67,7 @@ from .thumbnail_render import (
 _RETIRED_THUMBNAIL_PROVIDERS: set[BrowserThumbnailProvider] = set()
 _THUMBNAIL_LOG = logging.getLogger("nivisviewer.thumbnail")
 _PAGE_COUNT_REQUEST_TOKEN = -1
+_DISPLAY_REQUEST_TOKEN = -2
 _DEFAULT_BROWSER_MEMORY_CACHE_BYTES = 128 * 1024 * 1024
 
 
@@ -99,6 +106,10 @@ class ThumbnailLoadResult:
     source_identity: ThumbnailSourceIdentity | None = None
     cache_in_memory: bool = True
     failure_kind: ThumbnailFailureKind = ThumbnailFailureKind.TRANSIENT
+    display_plan: object = None
+    display_surfaces: tuple = ()
+    display_nonce: object = None
+    generation_deferred: bool = False
 
     @property
     def resolved_kind(self) -> PreviewResultKind:
@@ -157,6 +168,8 @@ class _ThumbnailSaveDrain(QRunnable):
 
 
 class _ThumbnailWorkerSignals(QObject):
+    admission_deferred = Signal(object)
+    generation_deferred = Signal(object)
     xcf_deferred = Signal(object)
     finished = Signal(str, int, object, object, object)
     provisional = Signal(str, int, object, object, object)
@@ -173,6 +186,11 @@ class _ThumbnailWorker(QRunnable):
         priority: ThumbnailPriority = ThumbnailPriority.VISIBLE,
     ) -> None:
         super().__init__()
+        # Provider retains native ownership until pool quiescence, including
+        # the post-run epilogue and queued handoff/completion delivery.
+        self.setAutoDelete(False)
+        self.queue_lock = Lock()
+        self.request_nonce = object()
         self.item = item
         self.size = size
         self.generation = generation
@@ -183,11 +201,25 @@ class _ThumbnailWorker(QRunnable):
         self.page_count_reported = False
         self.xcf_lane = item.path.suffix.lower() in XCF_EXTENSIONS
         self.xcf_handoff_connected = False
+        self.cache_probe = False
+        self.generation_work = False
+        self.generation_cost = None
+        self.generation_reserved = False
+        self.admission_handoff_connected = False
+        self.probe_loader = None
         self.signals = _ThumbnailWorkerSignals()
+        self.display_plan = None
+        self.display_only = False
+        self.disk_only = False
+
+    def handoff_receipt(self):
+        token = self.size.cache_token if isinstance(self.size, ThumbnailRenderSpec) else self.size
+        return (str(self.item.path), token, self.generation, self.request_nonce)
 
     @Slot()
     def run(self) -> None:
-        self.run_started.set()
+        with self.queue_lock:
+            self.run_started.set()
 
         def report_provisional(image: QImage) -> None:
             self.signals.provisional.emit(
@@ -213,9 +245,13 @@ class _ThumbnailWorker(QRunnable):
             )
 
         try:
-            with xcf_worker_scope(defer=not self.xcf_lane):
+            admission = (BROWSER_GENERATION_BUDGET.hold(
+                self.item, self.cancelled, cost=self.generation_cost, wait=False,
+                reserved=self.generation_reserved)
+                         if self.generation_work and not self.cache_probe else nullcontext())
+            with admission, xcf_worker_scope(defer=not self.xcf_lane):
                 result = _invoke_thumbnail_loader(
-                    self.loader,
+                    self.probe_loader if self.cache_probe and not self.display_only else self.loader,
                     self.item,
                     self.size,
                     self.cancelled,
@@ -223,10 +259,23 @@ class _ThumbnailWorker(QRunnable):
                     report_provisional,
                     report_page_count,
                 )
+                if self.display_plan is not None and not self.cancelled.is_set():
+                    loaded = result if isinstance(result, ThumbnailLoadResult) else ThumbnailLoadResult(result)
+                    if loaded.image is not None and not loaded.image.isNull():
+                        result = replace(loaded, display_plan=self.display_plan,
+                            display_surfaces=self.display_plan.render(loaded.image, self.cancelled),
+                            display_nonce=self.request_nonce if self.display_only else None)
+        except GenerationAdmissionDeferred as deferred:
+            self.generation_cost = deferred.cost
+            self.signals.admission_deferred.emit(self.handoff_receipt())
+            return
+        except _NeedsGeneration:
+            self.signals.generation_deferred.emit(self.handoff_receipt())
+            return
         except DeferXcf:
             # An archive/folder cover was discovered to be XCF. Release the
             # ordinary lane before retrying under the same request identity.
-            self.signals.xcf_deferred.emit(self)
+            self.signals.xcf_deferred.emit(self.handoff_receipt())
             return
         except Exception:
             _THUMBNAIL_LOG.exception(
@@ -239,6 +288,14 @@ class _ThumbnailWorker(QRunnable):
                 result_kind=PreviewResultKind.FAILED,
                 persist_to_disk=False,
             )
+        finally:
+            self.generation_reserved = False
+        if self.display_only:
+            loaded = result if isinstance(result, ThumbnailLoadResult) else ThumbnailLoadResult(result)
+            result = replace(loaded, display_nonce=self.request_nonce)
+            # Keep the native runnable through pool quiescence, but release
+            # its RAM-only input closure as soon as processing has finished.
+            self.loader = None
         self.signals.finished.emit(
             str(self.item.path),
             self.generation,
@@ -252,7 +309,14 @@ class _ThumbnailWorker(QRunnable):
         )
 
 
+class _NeedsGeneration(Exception):
+    pass
+
+
 class BrowserThumbnailProvider(QObject):
+    display_surfaces_ready = Signal(str, int, object, object, object, object, object)
+    display_artifact_released = Signal(object)
+    resident_thumbnail_ready = Signal(str, int, object, object)
     memory_image_released = Signal(str, object)
     thumbnail_ready = Signal(str, int, object)
     thumbnail_provisional = Signal(str, int, object)
@@ -269,7 +333,7 @@ class BrowserThumbnailProvider(QObject):
         self,
         parent: QObject | None = None,
         *,
-        max_workers: int = 2,
+        max_workers: int | None = None,
         cache_capacity: int | None = None,
         cache_capacity_bytes: int = _DEFAULT_BROWSER_MEMORY_CACHE_BYTES,
         loader: Callable[[BrowserItem, int], QImage | None] | None = None,
@@ -282,9 +346,33 @@ class BrowserThumbnailProvider(QObject):
         preview_settings: dict[str, object] | None = None,
     ) -> None:
         super().__init__(parent)
+        refresh_generation_memory()
+        # QObject.thread() reparents its returned binding to this provider in
+        # PySide. Capture affinity without lending the GUI wrapper to a shorter
+        # lived QObject; the application-owned sampler remains its lifetime root.
+        self._owner_thread = QThread.currentThread()
+        self._display_plan = None
+        self._display_artifacts = {}
+        self._display_rank_buckets = {rank: OrderedDict() for rank in range(5)}
+        self._display_pixel_rank = {}
+        self._display_retention_rank = None
+        self._surface_reference_counts = {}
         self._coordinator = image_work_coordinator
         self._pool = QThreadPool(self)
-        self._pool.setMaxThreadCount(1)
+        self._pool.setMaxThreadCount(browser_generation_workers() if max_workers is None
+                                     else max(1, int(max_workers)))
+        self._read_pool = QThreadPool(self)
+        self._read_pool.setMaxThreadCount(browser_read_workers())
+        self._owned_workers = set()
+        self._waiting_generation = {}
+        self._admission_timer = QTimer(self)
+        self._admission_timer.setInterval(100)
+        self._admission_timer.timeout.connect(self._retry_generation_admission)
+        self._owned_collection_timer = QTimer(self)
+        self._owned_collection_timer.setInterval(250)
+        self._owned_collection_timer.timeout.connect(self._collect_owned_workers)
+        self.background_request_limit = 4
+        self.background_read_request_limit = 2 * browser_read_workers()
         self._xcf_pool = QThreadPool(self)
         self._xcf_pool.setMaxThreadCount(1)
         self._xcf_pool.setExpiryTimeout(1000)
@@ -294,6 +382,7 @@ class BrowserThumbnailProvider(QObject):
         # retire promptly when Browser windows are opened and closed repeatedly.
         self._save_pool.setExpiryTimeout(1000)
         self._save_lock = Lock()
+        self._save_completion_waiting = False
         self._save_queue: deque[_ThumbnailSaveRequest] = deque()
         self._save_queue_bytes = 0
         self._deferred_save_queue: OrderedDict[
@@ -568,6 +657,7 @@ class BrowserThumbnailProvider(QObject):
         *,
         generation: int | None = None,
         priority: ThumbnailPriority = ThumbnailPriority.VISIBLE,
+        disk_only: bool = False,
     ) -> bool:
         from .supported_formats import VECTOR_IMAGE_EXTENSIONS, ENABLED_IMAGE_EXTENSIONS
         if item.path.suffix.casefold() in VECTOR_IMAGE_EXTENSIONS - ENABLED_IMAGE_EXTENSIONS:
@@ -576,6 +666,8 @@ class BrowserThumbnailProvider(QObject):
             return False
         if (self._closed or self._path_key(item.path) in self._changing_paths
                 or not self._revision_current(str(item.path), item.thumbnail_revision)):
+            return False
+        if disk_only and (not self._disk_cache_enabled or self._disk_cache is None):
             return False
         requested_generation = self._generation if generation is None else generation
         if requested_generation != self._generation:
@@ -677,19 +769,12 @@ class BrowserThumbnailProvider(QObject):
         pending_key = (path_key, cache_token, requested_generation)
         with self._pending_lock:
             existing = self._pending.get(pending_key)
-            if existing is not None:
-                if (
-                    normalized_priority > existing.priority
-                    and self._try_take(existing.worker)
-                ):
-                    self._pending[pending_key] = _PendingThumbnail(
-                        existing.worker,
-                        normalized_priority,
-                    )
-                    existing.worker.priority = normalized_priority
-                    self._start_worker(existing.worker, normalized_priority)
-                return False
-
+        if existing is not None:
+            if not disk_only:
+                existing.worker.disk_only = False
+            self._promote_pending_worker(pending_key, normalized_priority)
+            return False
+        with self._pending_lock:
             worker = _ThumbnailWorker(
                 item,
                 normalized_size,
@@ -697,6 +782,11 @@ class BrowserThumbnailProvider(QObject):
                 self._loader,
                 normalized_priority,
             )
+            worker.cache_probe = bool(self._disk_cache_enabled and self._disk_cache is not None)
+            worker.disk_only = disk_only
+            worker.generation_work = True
+            worker.probe_loader = self._probe_pipeline
+            worker.signals.generation_deferred.connect(self._on_generation_deferred)
             worker.signals.finished.connect(self._on_finished)
             worker.signals.provisional.connect(self._on_provisional)
             worker.signals.page_count_discovered.connect(
@@ -799,48 +889,27 @@ class BrowserThumbnailProvider(QObject):
             _PAGE_COUNT_REQUEST_TOKEN,
             requested_generation,
         )
+        # Adopt/promote an existing thumbnail instead of listing twice. Queue
+        # removal updates the record under the lock; collection and submission
+        # must happen after releasing it, including metadata-only promotions.
         with self._pending_lock:
-            # A current-generation thumbnail worker for the same item already
-            # performs the required folder/header listing.  Adopt it when it
-            # is visible/selected, or promote it if it is still queued at a
-            # speculative priority, instead of adding duplicate count work.
-            for key, pending in tuple(self._pending.items()):
-                if (
-                    key[0] != path_key
-                    or key[1] == _PAGE_COUNT_REQUEST_TOKEN
-                    or key[2] != requested_generation
-                    or pending.worker.cancelled.is_set()
-                ):
-                    continue
-                if pending.priority >= normalized_priority:
-                    return False
-                if self._try_take(pending.worker):
-                    pending.worker.priority = normalized_priority
-                    self._pending[key] = _PendingThumbnail(
-                        pending.worker,
-                        normalized_priority,
-                    )
-                    self._start_worker(
-                        pending.worker,
-                        normalized_priority,
-                    )
-                    return False
-            existing = self._pending.get(pending_key)
-            if existing is not None:
-                if (
-                    normalized_priority > existing.priority
-                    and self._try_take(existing.worker)
-                ):
-                    existing.worker.priority = normalized_priority
-                    self._pending[pending_key] = _PendingThumbnail(
-                        existing.worker,
-                        normalized_priority,
-                    )
-                    self._start_worker(
-                        existing.worker,
-                        normalized_priority,
-                    )
+            candidates = tuple(
+                (key, pending) for key, pending in self._pending.items()
+                if key[0] == path_key and key[1] != _PAGE_COUNT_REQUEST_TOKEN
+                and key[2] == requested_generation
+                and not pending.worker.cancelled.is_set()
+            )
+        for key, pending in candidates:
+            if pending.priority >= normalized_priority:
                 return False
+            if self._promote_pending_worker(key, normalized_priority):
+                return False
+        with self._pending_lock:
+            existing = self._pending.get(pending_key)
+        if existing is not None:
+            self._promote_pending_worker(pending_key, normalized_priority)
+            return False
+        with self._pending_lock:
             worker = _ThumbnailWorker(
                 item,
                 _PAGE_COUNT_REQUEST_TOKEN,
@@ -964,6 +1033,9 @@ class BrowserThumbnailProvider(QObject):
                     pending_generation != generation
                     or pending_size != size_token
                     or path_key in keep
+                    or (pending.priority is ThumbnailPriority.BACKGROUND
+                        and self._browser_memory_managed
+                        and (path_key, pending.worker.item.thumbnail_revision) in self._cache_retention_rank)
                 ):
                     continue
                 if self._try_take(pending.worker):
@@ -999,20 +1071,47 @@ class BrowserThumbnailProvider(QObject):
             return len(self._pending)
 
     @property
+    def pending_read_count(self) -> int:
+        # Generation and metadata must not consume saved-read admission.
+        # Queued read completions still count toward this bounded lane.
+        with self._pending_lock:
+            return sum(pending.worker.cache_probe for pending in self._pending.values())
+
+    def has_pending_request(self, path, token, generation):
+        with self._pending_lock:
+            return (self._path_key(Path(path)), token, generation) in self._pending
+
+    @property
     def shell_preview_pending_count(self) -> int:
         return self._preview_registry.shell_service.pending_count
 
     def wait_for_done(self, msecs: int = 5000) -> bool:
         deadline = monotonic() + max(0, int(msecs)) / 1000.0
-        if self._coordinator is not None:
-            decode_done = self._coordinator.wait_for_browser(msecs)
-        else:
-            decode_done = self._pool.waitForDone(msecs)
-        remaining = max(0, int((deadline - monotonic()) * 1000))
-        xcf_done = self._xcf_pool.waitForDone(remaining)
-        remaining = max(0, int((deadline - monotonic()) * 1000))
-        save_done = self._save_pool.waitForDone(remaining)
-        return decode_done and xcf_done and save_done
+        while True:
+            refresh_generation_memory()
+            if QCoreApplication.instance() is not None and QThread.currentThread() == self._owner_thread:
+                self._retry_generation_admission()
+            remaining = min(50, max(0, int((deadline-monotonic())*1000)))
+            decode_done = (self._coordinator.wait_for_browser(remaining) if self._coordinator is not None
+                           else self._pool.waitForDone(remaining))
+            read_done = self._read_pool.waitForDone(min(50, max(0, int((deadline-monotonic())*1000))))
+            if (msecs > 0 and QCoreApplication.instance() is not None
+                    and QThread.currentThread() == self._owner_thread):
+                # Deliver this provider's cache-read/generation handoff and
+                # completion callbacks, without re-entering unrelated GUI
+                # paint, input or background timers inside a completion wait.
+                QCoreApplication.sendPostedEvents(self, QEvent.Type.MetaCall)
+            with self._pending_lock:
+                handoff = any(p.worker.cache_probe for p in self._pending.values())
+            current_done = (self._coordinator.wait_for_browser(0) if self._coordinator is not None
+                            else self._pool.waitForDone(0))
+            xcf_done = self._xcf_pool.waitForDone(min(50, max(0, int((deadline-monotonic())*1000))))
+            save_done = self._save_pool.waitForDone(min(50, max(0, int((deadline-monotonic())*1000))))
+            if (decode_done and read_done and current_done and xcf_done and save_done
+                    and not handoff and not self._waiting_generation):
+                return True
+            if monotonic() >= deadline:
+                return False
 
     @property
     def disk_cache(self) -> ThumbnailDiskCache | None:
@@ -1086,19 +1185,200 @@ class BrowserThumbnailProvider(QObject):
             existing = self.artifact_memory.pixels.get(pixel)
             self._ensure_display_headroom(0 if existing is not None else int(image.sizeInBytes()))
             self.artifact_memory.retain(owner, image)
-            self.mark_displayed_image(image, path)
             if not self.owns_memory_image(image):
                 self._orphan_model_images[path] = int(image.cacheKey())
 
     def enforce_display_budget(self):
         self._trim_browser_memory()
 
+    def ensure_surface_headroom(self, *images):
+        extra = {int(image.cacheKey()): int(image.sizeInBytes()) for image in images
+                 if int(image.cacheKey()) not in self.artifact_memory.pixels}
+        if extra:
+            self._ensure_display_headroom(sum(extra.values()))
+
+    def set_display_plan(self, plan):
+        if plan != self._display_plan:
+            for pixel in tuple(self._display_pixel_rank):
+                self._drop_display_artifact(pixel)
+        self._display_plan = plan
+
+    def _display_rank(self, pixel):
+        # Displayed-in-the-past is not a reason to protect every derivative.
+        # Actual viewport/next-band ranks are independent of raw-source LRU.
+        priorities = (self._cache_retention_rank if self._display_retention_rank is None
+                      else self._display_retention_rank)
+        return min((priorities.get((key[0], key[2]), 4)
+                    for key in self._pixel_cache_keys.get(pixel, ())), default=4)
+
+    def set_display_retention_priorities(self, entries):
+        """Protect both adjacent display viewports during direction reversals."""
+        priorities = {(self._path_key(path if isinstance(path, Path) else Path(path)), tuple(revision)): rank
+                      for path, revision, rank in entries}
+        previous = self._display_retention_rank or {}
+        changed = {identity for identity in previous.keys() | priorities.keys()
+                   if previous.get(identity) != priorities.get(identity)}
+        self._display_retention_rank = priorities
+        for path, revision in changed:
+            for key in self._cache_keys_by_path.get(path, ()):
+                pixel = self._cache_pixels.get(key)
+                if key[2] == revision and pixel in self._display_pixel_rank:
+                    self._index_display_pixel(pixel)
+
+    def _index_display_pixel(self, pixel):
+        present = pixel in self._display_artifacts or self._surface_reference_counts.get(pixel, 0)
+        rank = min(4, max(0, self._display_rank(pixel))) if present else None
+        previous = self._display_pixel_rank.get(pixel)
+        if previous == rank:
+            return
+        self._display_pixel_rank.pop(pixel, None)
+        if previous is not None:
+            self._display_rank_buckets[previous].pop(pixel, None)
+        if rank is not None:
+            self._display_pixel_rank[pixel] = rank
+            self._display_rank_buckets[rank][pixel] = None
+
+    def _reclaim_display_headroom(self, additional=0, *, minimum_rank=3, exclude=None):
+        """Release lower-priority derivatives, never their reusable sources."""
+        for rank in range(4, minimum_rank - 1, -1):
+            bucket = self._display_rank_buckets[rank]
+            while bucket and self.memory_cache_bytes + additional > self._cache_capacity_bytes:
+                pixel = next(iter(bucket))
+                if pixel == exclude:
+                    # At most one excluded item. Move it behind other victims.
+                    if len(bucket) == 1:
+                        break
+                    bucket.move_to_end(pixel)
+                    pixel = next(iter(bucket))
+                self._drop_display_artifact(pixel)
+
+    def can_prepare_display(self, image):
+        """Do not repeatedly rebuild distant derivatives refused by the budget."""
+        if not self.owns_memory_image(image) or self._display_plan is None:
+            return False
+        cost = sum(key[4] * key[5] * 4
+                   for key, _ in self._display_plan.geometries(image))
+        self._ensure_display_headroom(cost)
+        if self._display_rank(int(image.cacheKey())) <= 2:
+            # Near work may reclaim distant display pixels on completion.
+            return self.owns_memory_image(image) and cost + int(image.sizeInBytes()) <= self._cache_capacity_bytes
+        return (self.owns_memory_image(image)
+                and self.memory_cache_bytes + cost <= self._cache_capacity_bytes)
+
+    def reserve_display_surfaces(self, image, *surfaces, require_source=True):
+        had_source = self.owns_memory_image(image)
+        self.ensure_surface_headroom(*surfaces)
+        if (require_source or had_source) and not self.owns_memory_image(image):
+            return False
+        additional = sum({int(surface.cacheKey()): int(surface.sizeInBytes())
+                         for surface in surfaces
+                         if int(surface.cacheKey()) not in self.artifact_memory.pixels}.values())
+        pixel = int(image.cacheKey())
+        rank = self._display_rank(pixel)
+        if rank <= 2:
+            self._reclaim_display_headroom(additional, minimum_rank=rank+1, exclude=pixel)
+        return ((self.owns_memory_image(image) or not (require_source or had_source))
+                and self.memory_cache_bytes + additional <= self._cache_capacity_bytes)
+
+    def display_artifact(self, image, plan):
+        record = self._display_artifacts.get(int(image.cacheKey()))
+        return record[1] if record is not None and record[0] == plan else None
+
+    def _drop_display_artifact(self, pixel):
+        record = self._display_artifacts.pop(pixel, None)
+        if record is not None:
+            for key, _image in record[1]:
+                self.artifact_memory.release(('display', pixel, key))
+        # GUI indexes share these pixels; dropping only the provider reference
+        # would not free memory. Do not emit memory_image_released: raw/model
+        # ownership must survive derivative-only pressure.
+        if self._surface_reference_counts.get(pixel, 0):
+            self.display_artifact_released.emit(pixel)
+        self._index_display_pixel(pixel)
+
+    def _store_display_artifact(self, image, plan, surfaces):
+        if not surfaces or plan != self._display_plan or not self.owns_memory_image(image):
+            return False
+        pixel = int(image.cacheKey())
+        current = self._display_artifacts.get(pixel)
+        if current is not None and current[0] == plan:
+            return True
+        generation = self._generation
+        admitted = self.reserve_display_surfaces(image, *(surface for _, surface in surfaces))
+        if (generation != self._generation or plan != self._display_plan
+                or not admitted or not self.owns_memory_image(image)):
+            return False
+        self._drop_display_artifact(pixel)
+        self._display_artifacts[pixel] = (plan, surfaces)
+        for key, surface in surfaces:
+            self.artifact_memory.retain(('display', pixel, key), surface)
+        self._index_display_pixel(pixel)
+        self._trim_browser_memory()
+        return self.owns_memory_image(image) and pixel in self._display_artifacts
+
+    @property
+    def display_pending_count(self):
+        with self._pending_lock:
+            return sum(p.worker.display_only for p in self._pending.values())
+
+    def request_display_surfaces(self, item, spec, image, *, generation, priority):
+        if (self._display_plan is None or self._closed or self._paused
+                or generation != self._generation or not self.owns_memory_image(image)
+                or not self._revision_current(str(item.path), item.thumbnail_revision)):
+            return False
+        key = (self._path_key(item.path), _DISPLAY_REQUEST_TOKEN, generation)
+        with self._pending_lock:
+            if key in self._pending:
+                return True
+            if sum(p.worker.display_only for p in self._pending.values()) >= 2:
+                return False
+            snapshot = QImage(image)
+            worker = _ThumbnailWorker(item, spec, generation,
+                lambda *_: ThumbnailLoadResult(snapshot, persist_to_disk=False), priority)
+            worker.display_only = True
+            worker.cache_probe = True  # Existing bounded read pool/lifetime fence.
+            worker.signals.finished.connect(self._on_display_finished)
+            self._pending[key] = _PendingThumbnail(worker, priority)
+        if self._start_worker(worker, priority):
+            return True
+        with self._pending_lock:
+            self._pending.pop(key, None)
+        return False
+
+    @Slot(str, int, object, object, object)
+    def _on_display_finished(self, path, generation, token, revision, result):
+        key = (self._path_key(Path(path)), _DISPLAY_REQUEST_TOKEN, generation)
+        with self._pending_lock:
+            pending = self._pending.get(key)
+            if pending is None or result.display_nonce is not pending.worker.request_nonce:
+                return
+            self._pending.pop(key)
+        if (not self._closed and not pending.worker.cancelled.is_set()
+                and generation == self._generation and self._revision_current(path, revision)
+                and result.display_plan == self._display_plan and self.owns_memory_image(result.image)):
+            if self._store_display_artifact(result.image, result.display_plan, result.display_surfaces):
+                self.display_surfaces_ready.emit(path, generation, token, revision,
+                    result.image, result.display_plan, self.display_artifact(result.image, result.display_plan))
+        if not self._closed:
+            self.capacity_released.emit()
+
     def retain_surface_reference(self, owner, image):
-        if int(image.cacheKey()) not in self.artifact_memory.pixels:
-            self._ensure_display_headroom(int(image.sizeInBytes()))
+        # Headroom and entry validation must precede this callback-free update.
+        if owner not in self.artifact_memory.owners:
+            pixel = owner[2][0]
+            self._surface_reference_counts[pixel] = self._surface_reference_counts.get(pixel, 0) + 1
+            self._index_display_pixel(pixel)
         self.artifact_memory.retain(owner, image)
 
     def release_surface_reference(self, owner):
+        if owner in self.artifact_memory.owners:
+            pixel = owner[2][0]
+            count = self._surface_reference_counts.get(pixel, 1) - 1
+            if count:
+                self._surface_reference_counts[pixel] = count
+            else:
+                self._surface_reference_counts.pop(pixel, None)
+            self._index_display_pixel(pixel)
         self.artifact_memory.release(owner)
 
     @property
@@ -1142,6 +1422,7 @@ class BrowserThumbnailProvider(QObject):
             "source_bytes": int(self._cache_bytes),
             "model_reference_bytes": self.artifact_memory.role_bytes.get('model', 0),
             "surface_reference_bytes": self.artifact_memory.role_bytes.get('surface', 0),
+            "display_artifact_bytes": self.artifact_memory.role_bytes.get('display', 0),
             "unique_pixels": len(self.artifact_memory.pixels),
             "entries": len(self._cache),
             "limit_bytes": int(self._cache_capacity_bytes),
@@ -1158,6 +1439,7 @@ class BrowserThumbnailProvider(QObject):
         size: int | ThumbnailRenderSpec,
         *,
         generation: int,
+        displayed: bool = True,
     ) -> tuple[QImage, int | None] | None:
         """Borrow a compatible RAM image for immediate display, without signals/I/O.
 
@@ -1181,14 +1463,15 @@ class BrowserThumbnailProvider(QObject):
                 return None
             image, spec, page_count = candidate
             key = (path_key, spec.cache_token, item.thumbnail_revision)
-        self._increment_stat("memory_hit")
-        self._cache_entry_priority[key] = max(
-            int(ThumbnailPriority.VISIBLE), self._cache_entry_priority.get(key, 0),
-        )
-        self._cache.move_to_end(key)
-        self._cache_index_touch(key)
-        if not self._cache_retention_rank:
-            self._reorder_memory_cache()
+        if displayed:
+            self._increment_stat("memory_hit")
+            self._cache_entry_priority[key] = max(
+                int(ThumbnailPriority.VISIBLE), self._cache_entry_priority.get(key, 0),
+            )
+            self._cache.move_to_end(key)
+            self._cache_index_touch(key)
+            if not self._cache_retention_rank:
+                self._reorder_memory_cache()
         return QImage(image), page_count
 
     def has_memory_thumbnail(
@@ -1239,6 +1522,11 @@ class BrowserThumbnailProvider(QObject):
                 and self._retention_rank_for_cache_key(key) >= 3)
             for key in self._cache
         )
+
+    @property
+    def background_reads_available(self) -> bool:
+        # Reading existing files remains useful even after a failed disk write.
+        return self._disk_cache_enabled and self._disk_cache is not None
 
     @property
     def background_disk_cache_enabled(self) -> bool:
@@ -1306,12 +1594,18 @@ class BrowserThumbnailProvider(QObject):
         """
         priorities: dict[tuple[str, tuple[object, ...]], int] = {}
         for path, revision, rank in entries:
-            key = (self._path_key(Path(path)), tuple(revision))
+            key = (self._path_key(path if isinstance(path, Path) else Path(path)), tuple(revision))
             priorities[key] = min(int(rank), priorities.get(key, int(rank)))
         previous = self._cache_retention_rank
         changed = {identity for identity in previous.keys() | priorities.keys()
                    if previous.get(identity) != priorities.get(identity)}
         self._cache_retention_rank = priorities
+        if self._display_retention_rank is None:
+            for identity in changed:
+                for key in self._cache_keys_by_path.get(identity[0], ()):
+                    pixel = self._cache_pixels.get(key)
+                    if pixel in self._display_pixel_rank:
+                        self._index_display_pixel(pixel)
         if self._browser_memory_managed:
             for identity in changed:
                 for key in tuple(self._cache_keys_by_path.get(identity[0], ())):
@@ -1335,6 +1629,9 @@ class BrowserThumbnailProvider(QObject):
         if (len(self._cache) <= self._cache_capacity
                 and self.memory_cache_bytes <= self._cache_capacity_bytes):
             return
+        # Finished display variants are a reconstructible tier. Reclaim the
+        # distant tier before evicting any raw thumbnail/model reference.
+        self._reclaim_display_headroom()
         # Unranked entries leave first; then evict oldest entries in the
         # least-valuable rank. Completion-time pressure trims need no full-cache
         # walk, cost dictionary, or sort.
@@ -1405,6 +1702,8 @@ class BrowserThumbnailProvider(QObject):
         pixel = int(image.cacheKey())
         self._cache_pixels[key] = pixel
         self._pixel_cache_keys.setdefault(pixel, set()).add(key)
+        if pixel in self._display_pixel_rank:
+            self._index_display_pixel(pixel)
         self.artifact_memory.retain(('cache', key), image)
         self._cache_keys_by_path.setdefault(key[0], OrderedDict())[key] = None
         if self._browser_memory_managed:
@@ -1420,7 +1719,10 @@ class BrowserThumbnailProvider(QObject):
             owners.discard(key)
             if not owners:
                 del self._pixel_cache_keys[pixel]
+                self._drop_display_artifact(pixel)
                 self.memory_image_released.emit(key[0], pixel)
+            elif pixel in self._display_pixel_rank:
+                self._index_display_pixel(pixel)
         self._read_cache_keys.discard(key)
         path_bucket = self._cache_keys_by_path.get(key[0])
         if path_bucket is not None:
@@ -1748,6 +2050,7 @@ class BrowserThumbnailProvider(QObject):
         self._cancel_queued_maintenance()
         if self._coordinator is None:
             self._pool.clear()
+        self._read_pool.clear()
         if self.wait_for_done(wait_msecs):
             self._finalize_close()
             return
@@ -1903,6 +2206,16 @@ class BrowserThumbnailProvider(QObject):
             persist_to_disk=False,
         )
 
+    def _probe_pipeline(self, item, size, cancel_token=None, thumbnail_priority=ThumbnailPriority.VISIBLE,
+                        provisional_callback=None, page_count_callback=None):
+        return self._load_pipeline(item, size, cancel_token, thumbnail_priority,
+            provisional_callback, page_count_callback, cache_only=True)
+
+    def _generate_pipeline(self, item, size, cancel_token=None, thumbnail_priority=ThumbnailPriority.VISIBLE,
+                           provisional_callback=None, page_count_callback=None):
+        return self._load_pipeline(item, size, cancel_token, thumbnail_priority,
+            provisional_callback, page_count_callback, skip_disk=True)
+
     def _load_pipeline(
         self,
         item: BrowserItem,
@@ -1911,6 +2224,7 @@ class BrowserThumbnailProvider(QObject):
         thumbnail_priority: ThumbnailPriority = ThumbnailPriority.VISIBLE,
         provisional_callback: Callable[[QImage], None] | None = None,
         page_count_callback: Callable[[int], None] | None = None,
+        *, cache_only=False, skip_disk=False,
     ) -> ThumbnailLoadResult:
         cache_token = size.cache_token if isinstance(size, ThumbnailRenderSpec) else int(size)
         failure_key = (self._path_key(item.path), cache_token, item.thumbnail_revision)
@@ -1962,7 +2276,7 @@ class BrowserThumbnailProvider(QObject):
                 disk_cache_available = False
             if not disk_cache_available:
                 self._record_disk_cache_write_availability(False)
-        if disk_cache_available:
+        if disk_cache_available and not skip_disk:
             with self._stats_lock:
                 if not self._session_disk_baseline_initialized:
                     self._session_start_disk_bytes = disk_cache.usage_bytes()
@@ -2018,6 +2332,8 @@ class BrowserThumbnailProvider(QObject):
                         self._increment_stat("background_disk_hit")
                     return ThumbnailLoadResult(cached, disk_cache_hit=True)
 
+        if cache_only:
+            raise _NeedsGeneration
         try:
             require_local(item.path)
         except OSError:
@@ -2421,6 +2737,8 @@ class BrowserThumbnailProvider(QObject):
             if isinstance(result, ThumbnailLoadResult)
             else ThumbnailLoadResult(result)
         )
+        if loaded.generation_deferred:
+            return  # A saved-cache miss is not a preview failure or a quiet result.
         provisional = loaded.provisional_image
         if (provisional is not None and not provisional.isNull()
                 and (pending is None or pending.priority is not ThumbnailPriority.BACKGROUND)):
@@ -2486,7 +2804,11 @@ class BrowserThumbnailProvider(QObject):
             # current viewport rank and preserves LRU order within each rank.
             self._cache.move_to_end(cache_key, last=True)
             self._cache_index_touch(cache_key)
-            if not self._browser_memory_managed:
+            if (not self._browser_memory_managed
+                    and (len(self._cache) > self._cache_capacity
+                         or self._cache_bytes > self._cache_capacity_bytes)):
+                # Rank victims only when eviction is needed, rather than
+                # sorting every resident entry after every completed read.
                 self._reorder_memory_cache()
         if self._browser_memory_managed:
             self._trim_browser_memory()
@@ -2517,8 +2839,17 @@ class BrowserThumbnailProvider(QObject):
             and cache_key not in self._cache
         ):
             self._increment_stat("generated_background_nonresident")
+        if (loaded.display_plan is not None and loaded.display_plan == self._display_plan
+                and cache_key in self._cache):
+            if self._store_display_artifact(cached_image, loaded.display_plan, loaded.display_surfaces):
+                self.display_surfaces_ready.emit(path, generation, size_token, modified_at,
+                    cached_image, loaded.display_plan, self.display_artifact(cached_image, loaded.display_plan))
         if pending is None or pending.priority is not ThumbnailPriority.BACKGROUND:
             self.thumbnail_ready.emit(path, generation, image)
+        if self._retained_display_enabled and cache_key in self._cache:
+            # Publish residency separately from view invalidation. Background
+            # pixels are immediately borrowable without marking them displayed.
+            self.resident_thumbnail_ready.emit(path, generation, size_token, modified_at)
 
     @Slot(str, int, object, object, object)
     def _on_page_count_finished(
@@ -2788,7 +3119,7 @@ class BrowserThumbnailProvider(QObject):
                 outcome = str(getattr(disk_cache, "last_put_status", "io_error"))
                 if persisted or outcome == "already_present":
                     self._record_disk_cache_write_availability(True)
-                elif outcome in {"io_error", "disabled"}:
+                elif outcome in {"io_error", "disabled", "disk_full"}:
                     # Source revision/cancellation is an expected refusal,
                     # not evidence that the persistence route is unhealthy.
                     self._record_disk_cache_write_availability(False)
@@ -2813,6 +3144,12 @@ class BrowserThumbnailProvider(QObject):
                     self._active_save_key = None
                 self._promote_deferred_saves_locked()
                 self._promote_retry_saves_locked()
+                wake_waiter = self._save_completion_waiting
+                self._save_completion_waiting = False
+            if wake_waiter:
+                # Registration and completion share the save lock: a waiter
+                # either sees a finished save or receives this queued wakeup.
+                self.capacity_released.emit()
             if disk_cache is not None and getattr(
                 disk_cache, "maintenance_pending", False
             ):
@@ -3398,7 +3735,18 @@ class BrowserThumbnailProvider(QObject):
         return rendered, crop
 
     @staticmethod
-    def _path_key(path: Path) -> str:
+    @lru_cache(maxsize=8192)
+    def _absolute_path_key(path: Path) -> str:
+        # This is lexical normalization, not a cached stat or file identity.
+        # Absolute Path objects have no dependency on the current directory.
+        return os.path.normcase(
+            os.path.abspath(os.path.normpath(os.fspath(path)))
+        ).casefold()
+
+    @staticmethod
+    def _path_key(path: str | Path) -> str:
+        if isinstance(path, Path) and path.is_absolute():
+            return BrowserThumbnailProvider._absolute_path_key(path)
         return os.path.normcase(
             os.path.abspath(os.path.normpath(os.fspath(path)))
         ).casefold()
@@ -3411,6 +3759,78 @@ class BrowserThumbnailProvider(QObject):
         )
 
     def _try_take(self, worker: _ThumbnailWorker) -> bool:
+        with worker.queue_lock:
+            if worker in self._waiting_generation:
+                self._waiting_generation.pop(worker)
+                if not self._waiting_generation:
+                    self._admission_timer.stop()
+                return True
+            # Once run starts Qt may complete/delete the native runnable before
+            # its queued signal is consumed. Never dereference that pointer.
+            if worker.run_started.is_set():
+                return False
+            taken = self._try_take_queued(worker)
+            if taken and worker.display_only:
+                worker.loader = None
+            if taken and worker.generation_reserved:
+                BROWSER_GENERATION_BUDGET.release(worker.generation_cost)
+                worker.generation_reserved = False
+            return taken
+
+    def _promote_pending_worker(self, key, priority: ThumbnailPriority) -> bool:
+        with self._pending_lock:
+            pending = self._pending.get(key)
+            if (pending is None or pending.worker.cancelled.is_set()
+                    or priority <= pending.priority or not self._try_take(pending.worker)):
+                return False
+            worker = pending.worker
+            worker.priority = priority
+            self._pending[key] = _PendingThumbnail(worker, priority)
+        if not self._start_worker(worker, priority):
+            with self._pending_lock:
+                current = self._pending.get(key)
+                removed = (self._pending.pop(key) if current is not None
+                           and current.worker is worker else None)
+            if removed is not None:
+                self.submission_rejected.emit(str(worker.item.path), key[2], key[1],
+                                              worker.item.thumbnail_revision)
+        return True
+
+    @Slot()
+    def _collect_owned_workers(self):
+        if not self._owned_workers:
+            self._owned_collection_timer.stop()
+            return
+        done = (self._coordinator.wait_for_browser(0) if self._coordinator is not None
+                else self._pool.waitForDone(0))
+        if not done or not self._read_pool.waitForDone(0) or not self._xcf_pool.waitForDone(0):
+            return
+        with self._pending_lock:
+            protected = {pending.worker for pending in self._pending.values()}
+        if self._maintenance_worker is not None:
+            protected.add(self._maintenance_worker)
+        previous_count = len(self._owned_workers)
+        self._owned_workers.intersection_update(protected)
+        if not self._owned_workers:
+            self._owned_collection_timer.stop()
+        if len(self._owned_workers) < previous_count:
+            # Submission may be in progress. Deliver capacity notification on
+            # the next GUI turn so callbacks cannot cancel/re-enter its record.
+            QTimer.singleShot(0, self, self._notify_capacity_released)
+
+    @Slot()
+    def _notify_capacity_released(self):
+        if not self._closed:
+            self.capacity_released.emit()
+
+    def _try_take_queued(self, worker: _ThumbnailWorker) -> bool:
+        if worker.cache_probe:
+            try:
+                if self._coordinator is not None:
+                    return self._coordinator.try_take_browser_read(worker)
+                return self._read_pool.tryTake(worker)
+            except RuntimeError:
+                return False
         if worker.xcf_lane:
             try:
                 return self._xcf_pool.tryTake(worker)
@@ -3421,8 +3841,8 @@ class BrowserThumbnailProvider(QObject):
         try:
             return self._pool.tryTake(worker)
         except RuntimeError:
-            # The worker completed and Qt auto-deleted its QRunnable before
-            # the queued finished signal removed the Python pending record.
+            # Teardown can invalidate the Qt pool while a cancellation owner
+            # still holds the request's Python record.
             return False
 
     def _start_worker(
@@ -3430,7 +3850,39 @@ class BrowserThumbnailProvider(QObject):
         worker: _ThumbnailWorker,
         priority: ThumbnailPriority,
     ) -> bool:
+        self._collect_owned_workers()
+        if self._closed or self._paused or worker.cancelled.is_set():
+            return False
+        if worker not in self._owned_workers:
+            if len(self._owned_workers) >= 256:
+                return False  # Quiesce before growing unconsumed native ownership.
+            self._owned_workers.add(worker)
+            self._owned_collection_timer.start()
         normalized = ThumbnailPriority(priority)
+        worker.display_plan = self._display_plan if isinstance(worker.size, ThumbnailRenderSpec) else None
+        if worker.display_plan is not None and not worker.display_only:
+            priorities = (self._cache_retention_rank if self._display_retention_rank is None
+                          else self._display_retention_rank)
+            identity = (self._path_key(worker.item.path), worker.item.thumbnail_revision)
+            rank = priorities.get(identity, 4)
+            frame = worker.display_plan.frame
+            # At a saturated budget, far jobs still obtain/persist the raw
+            # thumbnail, but do not spend CPU on display pixels we cannot keep.
+            # Exact admission runs again at completion with actual image sizes.
+            minimum_bytes = (worker.size.frame_width * worker.size.frame_height * 4
+                             + int(frame[2] * frame[3] * worker.display_plan.dpr**2 * 4))
+            if rank > 2 and self.memory_cache_bytes + minimum_bytes > self._cache_capacity_bytes:
+                worker.display_plan = None
+        if worker.cache_probe:
+            if self._closed or self._paused:
+                return False
+            if self._coordinator is not None:
+                return self._coordinator.start_browser_read(worker, int(normalized))
+            self._read_pool.start(worker, int(normalized))
+            return True
+        if worker.generation_work and not worker.admission_handoff_connected:
+            worker.signals.admission_deferred.connect(self._on_admission_deferred)
+            worker.admission_handoff_connected = True
         if not worker.xcf_handoff_connected:
             worker.signals.xcf_deferred.connect(self._on_xcf_deferred)
             worker.xcf_handoff_connected = True
@@ -3449,11 +3901,111 @@ class BrowserThumbnailProvider(QObject):
                 ThumbnailPriority.PREFETCH: ImageWorkPriority.BROWSER_PREFETCH,
                 ThumbnailPriority.BACKGROUND: ImageWorkPriority.BROWSER_PREFETCH,
             }[normalized]
+            if worker.generation_work:
+                return self._coordinator.start_browser_generation(worker, mapped)
             return self._coordinator.start_browser(worker, mapped)
         self._pool.start(worker, int(normalized))
         return True
 
-    def _on_xcf_deferred(self, old: _ThumbnailWorker) -> None:
+    def _handoff_worker(self, receipt):
+        path, token, generation, nonce = receipt
+        key = (self._path_key(Path(path)), token, generation)
+        with self._pending_lock:
+            pending = self._pending.get(key)
+            if pending is None or pending.worker.request_nonce is not nonce:
+                return None
+            return pending.worker
+
+    @Slot(object)
+    def _on_admission_deferred(self, receipt):
+        old = self._handoff_worker(receipt)
+        if old is None:
+            return
+        token = old.size.cache_token if isinstance(old.size, ThumbnailRenderSpec) else old.size
+        if self._closed or old.cancelled.is_set() or old.generation != self._generation:
+            old.signals.finished.emit(str(old.item.path), old.generation, token,
+                old.item.thumbnail_revision, ThumbnailLoadResult(None,
+                    result_kind=PreviewResultKind.CANCELLED, persist_to_disk=False))
+            return
+        key = (self._path_key(old.item.path), token, old.generation)
+        with self._pending_lock:
+            pending = self._pending.get(key)
+            if pending is None or pending.worker is not old:
+                return
+            worker = _ThumbnailWorker(old.item, old.size, old.generation, old.loader, pending.priority)
+            worker.generation_work = True
+            worker.generation_cost = old.generation_cost
+            worker.admission_handoff_connected = old.admission_handoff_connected
+            worker.cancelled = old.cancelled
+            worker.signals = old.signals
+            worker.xcf_lane = old.xcf_lane
+            worker.xcf_handoff_connected = old.xcf_handoff_connected
+            self._pending[key] = _PendingThumbnail(worker, pending.priority)
+        self._waiting_generation[worker] = key
+        self._admission_timer.start()
+
+    @Slot()
+    def _retry_generation_admission(self):
+        if not self._waiting_generation:
+            self._admission_timer.stop()
+            return
+        if self._closed or self._paused:
+            return
+        # Waiting requests own only Python state, never a native pool slot.
+        # Large requests do not prevent a smaller visible request from fitting.
+        for worker, key in sorted(tuple(self._waiting_generation.items()),
+                                  key=lambda pair: int(pair[0].priority), reverse=True):
+            if not BROWSER_GENERATION_BUDGET.try_reserve(worker.generation_cost):
+                continue
+            worker.generation_reserved = True
+            self._waiting_generation.pop(worker, None)
+            if not self._start_worker(worker, worker.priority):
+                BROWSER_GENERATION_BUDGET.release(worker.generation_cost)
+                worker.generation_reserved = False
+                with self._pending_lock:
+                    pending = self._pending.get(key)
+                    if pending is not None and pending.worker is worker:
+                        self._pending.pop(key)
+                self.submission_rejected.emit(str(worker.item.path), key[2], key[1],
+                                              worker.item.thumbnail_revision)
+        if not self._waiting_generation:
+            self._admission_timer.stop()
+
+    @Slot(object)
+    def _on_generation_deferred(self, receipt):
+        old = self._handoff_worker(receipt)
+        if old is None:
+            return
+        token = old.size.cache_token if isinstance(old.size, ThumbnailRenderSpec) else old.size
+        key = (self._path_key(old.item.path), token, old.generation)
+        if old.disk_only:
+            self._on_finished(str(old.item.path), old.generation, token,
+                old.item.thumbnail_revision, ThumbnailLoadResult(None,
+                    generation_deferred=True, persist_to_disk=False))
+            return
+        with self._pending_lock:
+            pending = self._pending.get(key)
+            if pending is None or pending.worker is not old:
+                return
+            loader = self._generate_pipeline if old.loader == self._load_pipeline else old.loader
+            worker = _ThumbnailWorker(old.item, old.size, old.generation, loader, pending.priority)
+            worker.generation_work = True
+            worker.cancelled = old.cancelled
+            worker.signals = old.signals
+            worker.xcf_handoff_connected = old.xcf_handoff_connected
+            self._pending[key] = _PendingThumbnail(worker, pending.priority)
+        if (not worker.cancelled.is_set() and old.generation == self._generation
+                and self._start_worker(worker, worker.priority)):
+            return
+        worker.signals.finished.emit(str(worker.item.path), worker.generation, token,
+            worker.item.thumbnail_revision, ThumbnailLoadResult(None, result_kind=PreviewResultKind.CANCELLED,
+                                                               persist_to_disk=False))
+
+    @Slot(object)
+    def _on_xcf_deferred(self, receipt) -> None:
+        old = self._handoff_worker(receipt)
+        if old is None:
+            return
         token = old.size.cache_token if isinstance(old.size, ThumbnailRenderSpec) else old.size
         key = (self._path_key(old.item.path), token, old.generation)
         with self._pending_lock:
@@ -3461,6 +4013,9 @@ class BrowserThumbnailProvider(QObject):
             if pending is None or pending.worker is not old:
                 return
             worker = _ThumbnailWorker(old.item, old.size, old.generation, old.loader, old.priority)
+            worker.generation_work = old.generation_work
+            worker.generation_cost = old.generation_cost
+            worker.admission_handoff_connected = old.admission_handoff_connected
             worker.cancelled = old.cancelled
             worker.signals = old.signals
             worker.xcf_lane = True
@@ -3483,6 +4038,10 @@ class BrowserThumbnailProvider(QObject):
         self._finalize_close()
 
     def _finalize_close(self) -> None:
+        self._admission_timer.stop()
+        self._waiting_generation.clear()
+        self._owned_collection_timer.stop()
+        self._owned_workers.clear()  # Called only after native pools finished.
         with self._pending_lock:
             self._pending.clear()
         if self._owns_preview_registry:
@@ -3492,7 +4051,18 @@ class BrowserThumbnailProvider(QObject):
         _RETIRED_THUMBNAIL_PROVIDERS.discard(self)
 
     def request_background(self, item, size, *, generation):
-        """Generate through the existing lane; never enqueue the entire listing."""
+        return self._request_background(item, size, generation=generation)
+
+    def request_background_read(self, item, size, *, generation):
+        """Continue saved-cache acquisition during input without decoding originals."""
+        if self._closed or self._paused or generation != self._generation:
+            return "blocked"
+        if not self._disk_cache_enabled or self._disk_cache is None:
+            return "disk-miss"
+        return self._request_background(item, size, generation=generation, disk_only=True)
+
+    def _request_background(self, item, size, *, generation, disk_only=False):
+        """Bounded acquisition; saved-only requests never hand off to generation."""
         if self._closed or self._paused or generation != self._generation:
             return "blocked"
         if self._path_key(item.path) in self._changing_paths:
@@ -3500,11 +4070,11 @@ class BrowserThumbnailProvider(QObject):
             # a growing download must not block unrelated background rows.
             return "settled"
         with self._save_lock:
-            if self._save_enqueue_backpressured:
+            if self._save_enqueue_backpressured and not disk_only:
                 return "blocked"
         token = size.cache_token
         cache_key = (self._path_key(item.path), token, item.thumbnail_revision)
-        if self._has_pending_save_for(item, size):
+        if self._has_pending_save_for(item, size, register_waiter=True):
             return "blocked"
         if cache_key in self._cache:
             return "settled"
@@ -3515,9 +4085,13 @@ class BrowserThumbnailProvider(QObject):
         with self._failure_lock:
             if cache_key in self._failed or cache_key in self._quiet_results:
                 return "settled"
-        if self.pending_count:
+        limit = self.background_read_request_limit if disk_only else self.background_request_limit
+        pending_count = self.pending_read_count if disk_only else self.pending_count
+        if pending_count >= limit:
             return "blocked"
-        if self.request(item, size, generation=generation, priority=ThumbnailPriority.BACKGROUND):
+        read_options = {"disk_only": True} if disk_only else {}
+        if self.request(item, size, generation=generation, priority=ThumbnailPriority.BACKGROUND,
+                        **read_options):
             return "queued"
         with self._pending_lock:
             if (cache_key[0], token, generation) in self._pending:
@@ -3532,6 +4106,7 @@ class BrowserThumbnailProvider(QObject):
         self,
         item: BrowserItem,
         size: int | ThumbnailRenderSpec,
+        *, register_waiter: bool = False,
     ) -> bool:
         path_key = self._path_key(item.path)
         token = size.cache_token if isinstance(size, ThumbnailRenderSpec) else int(size)
@@ -3558,7 +4133,7 @@ class BrowserThumbnailProvider(QObject):
             )
 
         with self._save_lock:
-            return bool(
+            pending = bool(
                 key_matches(self._active_save_key)
                 or any(matches(request) for request in self._save_queue)
                 or any(
@@ -3570,11 +4145,14 @@ class BrowserThumbnailProvider(QObject):
                     for request in self._retry_save_queue.values()
                 )
             )
+            if pending and register_waiter:
+                self._save_completion_waiting = True
+            return pending
 
     @Slot(str, int, object, object, object)
     def _on_finished(self, path, generation, size_token, modified_at, result):
         loaded = result if isinstance(result, ThumbnailLoadResult) else ThumbnailLoadResult(result)
-        state = loaded.resolved_kind.value
+        state = "disk-miss" if loaded.generation_deferred else loaded.resolved_kind.value
         with self._save_lock:
             self._save_enqueue_backpressured = False
         key = (self._path_key(Path(path)), int(size_token), generation)
@@ -3603,6 +4181,8 @@ class BrowserThumbnailProvider(QObject):
                 self._increment_stat("memory_only")
             if not self._closed and not self._save_enqueue_backpressured:
                 self.work_settled.emit(path, generation, size_token, modified_at, state)
+            if self._waiting_generation and not self._closed:
+                QTimer.singleShot(0, self._retry_generation_admission)
 
 
 def _invoke_thumbnail_loader(

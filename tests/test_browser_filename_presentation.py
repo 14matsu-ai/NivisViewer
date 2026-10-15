@@ -482,3 +482,64 @@ def test_live_presentation_apply_keeps_selection_cache_and_scan_generation(
         dialog.reject()
         close_window(window, store, qapp)
         install_ui_language("ja")
+
+
+def test_reused_title_layout_tracks_font_geometry_and_label_changes(qapp):
+    delegate = BrowserItemDelegate(thumbnail_size=149,
+        density=BrowserDisplayDensity.MEDIUM, filename_display='two_lines')
+    title = '日本語の長いファイル名とLatin-characters-0123456789.png'
+    option = QStyleOptionViewItem()
+
+    def paint():
+        option.rect = delegate.grid_metrics.cell_rect()
+        painter = TextCapturePainter()
+        delegate._paint_title(painter, option, QRect(), title)
+        return painter.drawn_text
+
+    def verify():
+        # Cached layout and a fresh layout must produce exactly the same text.
+        cached = paint()
+        delegate._title_lines_cache.clear()
+        assert paint() == cached
+        return cached
+
+    original = verify()
+    option.font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3)
+    spaced = verify()
+    assert spaced != original
+    delegate.configure(thumbnail_size=100, density=BrowserDisplayDensity.LARGE,
+        filename_display='one_line', filename_elide_mode='middle',
+        show_filename_extension=False, filename_font_size=14)
+    assert verify() != spaced
+    title = '名前変更後の別の長いファイル名-9876543210.jpg'
+    verify()
+    for number in range(520):
+        title = f'{number}-別の名前.png'
+        paint()
+    assert len(delegate._title_lines_cache) <= 512
+
+
+def test_reused_grid_geometry_tracks_application_font_and_settings(qapp):
+    delegate = BrowserItemDelegate(thumbnail_size=149,
+        density=BrowserDisplayDensity.MEDIUM, filename_display='two_lines')
+    original_font = QFont(qapp.font())
+    first = delegate.grid_metrics
+    assert delegate.grid_metrics == first
+    try:
+        changed_font = QFont(original_font)
+        changed_font.setStretch(150)
+        changed_font.setFamily('Times New Roman')
+        qapp.setFont(changed_font)
+        expected_font = QFont()
+        expected_font.setPointSize(delegate.effective_filename_font_size)
+        assert delegate.grid_metrics.font_height == QFontMetrics(expected_font).height()
+        delegate.configure(thumbnail_size=200, density=BrowserDisplayDensity.LARGE,
+            filename_font_size=20, filename_gap=12, filename_padding_y=8,
+            item_spacing_x=5, item_spacing_y=9)
+        result = delegate.grid_metrics
+        assert result != first
+        assert result.frame_size.width() == delegate.frame_size.width()
+        assert result.filename_gap == 12 and result.filename_padding_y == 8
+        assert result.grid_size == result.cell_size + QSize(5, 9)
+    finally:
+        qapp.setFont(original_font)

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import cached_property
 import hashlib
 import math
 from pathlib import Path
@@ -149,7 +150,7 @@ class ThumbnailRenderSpec:
     preserve_alpha: bool = False
     matte_color: str = "#ffffff"
 
-    @property
+    @cached_property
     def encoding_policy(self) -> ThumbnailEncodingPolicy:
         return ThumbnailEncodingPolicy(self.encoder_quality, self.preserve_alpha, self.matte_color)
 
@@ -210,7 +211,7 @@ class ThumbnailRenderSpec:
     def long_edge(self) -> int:
         return max(self.frame_width, self.frame_height)
 
-    @property
+    @cached_property
     def cache_token(self) -> int:
         display_variant = (
             ""
@@ -233,7 +234,7 @@ class ThumbnailRenderSpec:
             (1 << 63) - 1
         )
 
-    @property
+    @cached_property
     def family_token(self) -> int:
         """Cache identity shared by compatible physical resolutions."""
         display_variant = (
@@ -250,6 +251,36 @@ class ThumbnailRenderSpec:
         return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & (
             (1 << 63) - 1
         )
+
+    @cached_property
+    def _read_variants(self) -> tuple[ThumbnailRenderSpec, ...]:
+        # Owned by this immutable spec; no source identities or global memo.
+        return tuple(replace(self, implementation_version=v) for v in (4, 3))
+
+    @cached_property
+    def exact_read_tokens(self) -> tuple[int, ...]:
+        return (self.cache_token, *(variant.cache_token for variant in self._read_variants))
+
+    @cached_property
+    def readable_families(self) -> tuple[int, ...]:
+        """Explicit 3/4→5 policy; all other rendering/encoding fields stay exact.
+
+        21286f7 added JPEG draft in v4; 15272ae bumped v5 for cover/vector
+        changes without changing raster rendering. Uncertain old pixels can
+        still be provisional, as classified by legacy_requires_refresh().
+        """
+        if self.implementation_version != 5:
+            return (self.family_token,)
+        return (self.family_token, *(variant.family_token for variant in self._read_variants))
+
+    def legacy_requires_refresh(self, family: int, suffix: str) -> bool:
+        if family == self.family_token:
+            return False
+        if suffix.lower() not in {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tif', '.tiff',
+                                  '.webp', '.avif', '.jxl', '.pdf'}:
+            return True
+        return (family == self._read_variants[-1].family_token
+                and suffix.lower() in {'.jpg', '.jpeg'} and self.crop_mode == 'smart_crop')
 
 
 @dataclass(frozen=True)
@@ -540,7 +571,8 @@ def render_pil_thumbnail(
     _draft_jpeg_before_copy(image, spec, normalized_crop)
     frame = image.copy()
     frame.seek(0)
-    prepared = ImageOps.exif_transpose(frame)
+    ImageOps.exif_transpose(frame, in_place=True)
+    prepared = frame
     source_size = prepared.size
     crop = normalized_crop
     if spec.crop_mode != "letterbox":

@@ -426,6 +426,12 @@ def test_shell_icon_cache_uses_physical_dpr_buckets(monkeypatch) -> None:
     assert second.width() == first.width()
     assert larger.width() >= 48
     assert calls == [32, 48]
+    assert first.cacheKey() == second.cacheKey()
+    first.fill(Qt.GlobalColor.blue)
+    second.setDevicePixelRatio(3.0)
+    cached = provider.image_for_extension('.txt', logical_size=16, device_pixel_ratio=2.0)
+    assert cached.pixelColor(0, 0).rgba() == 0xffff0000
+    assert cached.devicePixelRatio() == 1.0
 
 
 def test_config_defaults_and_normalizes_sprint18_settings(tmp_path: Path) -> None:

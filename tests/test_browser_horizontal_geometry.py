@@ -115,8 +115,10 @@ def test_measured_horizontal_gap_reduction_preserves_pixels_and_rows(qapp, tmp_p
         assert result['frame_gap'] == 4
         assert before['frame_gap'] == OLD_MARGINS[density]
         assert result['cell_width'] == 109
-        assert abs(result['pixel_gap'] - 12) <= 1 / view.devicePixelRatioF()
-        assert abs(result['pixel_width'] - before['pixel_width']) <= 1 / view.devicePixelRatioF()
+        # E.g. 12.4 - 12 evaluates to 0.40000000000000036; retain the
+        # one-physical-pixel bound without rejecting binary float roundoff.
+        assert abs(result['pixel_gap'] - 12) <= 1 / view.devicePixelRatioF() + 1e-6
+        assert abs(result['pixel_width'] - before['pixel_width']) <= 1 / view.devicePixelRatioF() + 1e-6
         assert result['vertical_frame_gap'] == before['vertical_frame_gap']
         assert result['row_pitch'] == before['row_pitch']
         # Fractional-DPI x-origin changes can round the available Fit width by

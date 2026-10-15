@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass
 from math import isfinite
 import sys
+from threading import RLock
 from time import monotonic
 from typing import Final
 
@@ -75,6 +78,8 @@ class PhysicalMemorySnapshot:
     total_physical_bytes: int
     available_physical_bytes: int
     process_working_set_bytes: int
+    available_commit_bytes: int | None = None
+    total_commit_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,55 +226,66 @@ def viewer_memory_mode_from_legacy_mib(value: object) -> str:
     return "minimal" if nearest == 128 else str(nearest)
 
 
+_WINDOWS_MEMORY_API = None
+_WINDOWS_MEMORY_API_LOCK = RLock()
+
+
+def _windows_memory_api():
+    """Private immutable ctypes bindings shared by GUI and worker sampling."""
+    global _WINDOWS_MEMORY_API
+    with _WINDOWS_MEMORY_API_LOCK:
+        if _WINDOWS_MEMORY_API is not None:
+            return _WINDOWS_MEMORY_API
+        return _initialize_windows_memory_api()
+
+
+def _initialize_windows_memory_api():
+    global _WINDOWS_MEMORY_API
+
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = (
+            ("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        )
+
+    class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+        _fields_ = (
+            ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+        )
+
+    # Do not mutate ctypes.windll's globally cached function prototypes.
+    # Per-call local Structure classes/prototype replacement race when the
+    # native call releases the GIL, including with other process metrics users.
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    psapi = ctypes.WinDLL('psapi', use_last_error=True)
+    kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(MEMORYSTATUSEX)]
+    kernel32.GlobalMemoryStatusEx.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), wintypes.DWORD]
+    psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+    _WINDOWS_MEMORY_API = (kernel32, psapi, MEMORYSTATUSEX, PROCESS_MEMORY_COUNTERS)
+    return _WINDOWS_MEMORY_API
+
+
 def read_physical_memory_snapshot() -> PhysicalMemorySnapshot | None:
+    with _WINDOWS_MEMORY_API_LOCK:
+        return _read_physical_memory_snapshot()
+
+
+def _read_physical_memory_snapshot() -> PhysicalMemorySnapshot | None:
     """Return a single Windows memory snapshot without adding a dependency."""
     if sys.platform != "win32":
         return None
     try:
-        import ctypes
-        from ctypes import wintypes
-
-        class MEMORYSTATUSEX(ctypes.Structure):
-            _fields_ = (
-                ("dwLength", wintypes.DWORD),
-                ("dwMemoryLoad", wintypes.DWORD),
-                ("ullTotalPhys", ctypes.c_ulonglong),
-                ("ullAvailPhys", ctypes.c_ulonglong),
-                ("ullTotalPageFile", ctypes.c_ulonglong),
-                ("ullAvailPageFile", ctypes.c_ulonglong),
-                ("ullTotalVirtual", ctypes.c_ulonglong),
-                ("ullAvailVirtual", ctypes.c_ulonglong),
-                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-            )
-
-        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
-            _fields_ = (
-                ("cb", wintypes.DWORD),
-                ("PageFaultCount", wintypes.DWORD),
-                ("PeakWorkingSetSize", ctypes.c_size_t),
-                ("WorkingSetSize", ctypes.c_size_t),
-                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                ("PagefileUsage", ctypes.c_size_t),
-                ("PeakPagefileUsage", ctypes.c_size_t),
-            )
-
-        kernel32 = ctypes.windll.kernel32
-        psapi = ctypes.windll.psapi
-        kernel32.GlobalMemoryStatusEx.argtypes = [
-            ctypes.POINTER(MEMORYSTATUSEX)
-        ]
-        kernel32.GlobalMemoryStatusEx.restype = wintypes.BOOL
-        kernel32.GetCurrentProcess.argtypes = []
-        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-        psapi.GetProcessMemoryInfo.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
-            wintypes.DWORD,
-        ]
-        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        kernel32, psapi, MEMORYSTATUSEX, PROCESS_MEMORY_COUNTERS = _windows_memory_api()
 
         status = MEMORYSTATUSEX()
         status.dwLength = ctypes.sizeof(status)
@@ -288,6 +304,8 @@ def read_physical_memory_snapshot() -> PhysicalMemorySnapshot | None:
             total_physical_bytes=max(0, int(status.ullTotalPhys)),
             available_physical_bytes=max(0, int(status.ullAvailPhys)),
             process_working_set_bytes=max(0, int(counters.WorkingSetSize)),
+            available_commit_bytes=max(0, int(status.ullAvailPageFile)),
+            total_commit_bytes=max(0, int(status.ullTotalPageFile)),
         )
     except Exception:
         return None

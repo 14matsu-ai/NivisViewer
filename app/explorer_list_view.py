@@ -26,7 +26,7 @@ from PySide6.QtGui import (
     QPen,
     QWheelEvent,
 )
-from PySide6.QtWidgets import QApplication, QListView, QRubberBand, QTreeView
+from PySide6.QtWidgets import QApplication, QListView, QRubberBand, QScrollBar, QTreeView
 
 from .item_tooltip_controller import ItemTooltipController
 
@@ -45,6 +45,28 @@ from .mouse_gesture import MouseGestureRecognizer
 from .gesture_trail import draw_gesture_trail
 
 
+class _PreparingScrollBar(QScrollBar):
+    preparing = Signal(int, int)
+
+    def __init__(self, parent):
+        super().__init__(Qt.Orientation.Vertical, parent)
+        # Qt emits this after calculating sliderPosition, before committing
+        # value/viewport changes. Native wheel/drag/key behavior stays in Qt.
+        self.actionTriggered.connect(self._prepare_action)
+
+    def _prepare_action(self, _action):
+        self._prepare(self.sliderPosition())
+
+    def _prepare(self, value):
+        target = max(self.minimum(), min(self.maximum(), int(value)))
+        if target != self.value():
+            self.preparing.emit(self.value(), target)
+
+    def setValue(self, value):
+        self._prepare(value)
+        super().setValue(value)
+
+
 class ExplorerListView(QListView):
     """Path-based Explorer input with no standard drag/rubber-band overlap."""
 
@@ -55,10 +77,19 @@ class ExplorerListView(QListView):
     itemReleaseConfirmed = Signal(str)
     paintCompleted = Signal()
     paintStarting = Signal()
+    scrollPreparing = Signal(int, int)
     folderGestureRecognized = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._scroll_trace = None
+        self._prepared_move = None
+        self._announcing_scroll = False
+        scrollbar = _PreparingScrollBar(self)
+        self.setVerticalScrollBar(scrollbar)
+        self._committed_scroll_value = scrollbar.value()
+        scrollbar.valueChanged.connect(self._remember_scroll_value)
+        scrollbar.preparing.connect(self._announce_scroll)
         self.pointer_controller = BrowserPointerController()
         # Compatibility name used by BrowserWindow and older integrations.
         self.selection_controller = self.pointer_controller
@@ -106,6 +137,34 @@ class ExplorerListView(QListView):
             viewport_percent,
         )
 
+    def _announce_scroll(self, old_value, new_value):
+        pair = (old_value, new_value)
+        if self._announcing_scroll or pair == self._prepared_move:
+            return
+        self._announcing_scroll = True
+        trace = self._scroll_trace
+        if trace is not None:
+            trace.mark('exposure.begin')
+        try:
+            self.scrollPreparing.emit(old_value, new_value)
+            self._prepared_move = pair
+        finally:
+            if trace is not None:
+                trace.mark('exposure.end')
+            self._announcing_scroll = False
+
+    def _remember_scroll_value(self, value):
+        self._committed_scroll_value = int(value)
+
+    def scrollContentsBy(self, dx, dy):
+        # Covers direct C++ value changes (e.g. scrollTo/layout adjustment)
+        # that bypass Python setValue and slider actions, before viewport copy.
+        if dy:
+            current = self.verticalScrollBar().value()
+            self._announce_scroll(self._committed_scroll_value, current)
+        super().scrollContentsBy(dx, dy)
+        self._prepared_move = None
+
     def reset_wheel_scroll_remainder(self) -> None:
         self._wheel_scroll.reset()
 
@@ -126,6 +185,17 @@ class ExplorerListView(QListView):
         return self._wheel_scroll.viewport_percent
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
+        trace = self._scroll_trace
+        if trace is None:
+            self._handle_wheel_event(event)
+            return
+        trace.begin_wheel(event)
+        try:
+            self._handle_wheel_event(event)
+        finally:
+            trace.end_wheel()
+
+    def _handle_wheel_event(self, event: QWheelEvent) -> None:
         # Pixel deltas are already device/gesture-native. Keep Qt's smooth
         # touchpad path intact and customize only vertical angle-wheel input.
         if (
@@ -653,8 +723,26 @@ class ExplorerListView(QListView):
         return self._drop_in_progress
 
     def paintEvent(self, event: QPaintEvent) -> None:  # type: ignore[override]
+        trace = self._scroll_trace
+        if trace is not None:
+            trace.mark('paint.begin')
+        try:
+            self._paint_viewport(event)
+        finally:
+            if trace is not None:
+                trace.mark('paint.end')
+
+    def _paint_viewport(self, event: QPaintEvent) -> None:
+        trace = self._scroll_trace
+        if trace is not None:
+            trace.mark('paint.restore.begin')
         self.paintStarting.emit()
+        if trace is not None:
+            trace.mark('paint.restore.end')
+            trace.mark('paint.qt.begin')
         super().paintEvent(event)
+        if trace is not None:
+            trace.mark('paint.qt.end')
         if (
             self.mouse_gesture_show_trail
             and self.browser_folder_gestures_enabled

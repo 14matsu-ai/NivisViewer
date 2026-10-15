@@ -700,6 +700,11 @@ class _ShortcutPage(QWidget):
 
 
 class SettingsDialog(QDialog):
+    def _set_disk_cache_limit_controls(self, limit):
+        self.cache_limit_enabled_checkbox.setChecked(limit > 0)
+        self.cache_limit_spin.setValue(limit if limit > 0 else 512)
+        self.cache_limit_spin.setEnabled(limit > 0)
+
     settings_applied = Signal(object)
     cache_clear_requested = Signal()
 
@@ -1415,7 +1420,7 @@ class SettingsDialog(QDialog):
         self.browser_cell_padding_spin.setValue(int(defaults["browser_cell_padding"]))
         self._reset_sidebar_scope()
         self.disk_cache_checkbox.setChecked(bool(defaults["thumbnail_disk_cache_enabled"]))
-        self.cache_limit_spin.setValue(int(defaults["thumbnail_cache_limit_mb"]))
+        self._set_disk_cache_limit_controls(int(defaults["thumbnail_cache_limit_mb"]))
         unused_days = int(defaults["thumbnail_cache_max_unused_days"])
         index = self.cache_unused_days_combo.findData(unused_days)
         self.cache_unused_days_combo.setCurrentIndex(max(0, index))
@@ -3220,10 +3225,15 @@ class SettingsDialog(QDialog):
         )
         form.addRow(self.disk_cache_checkbox)
 
+        self.cache_limit_enabled_checkbox = QCheckBox(tr('保存容量に上限を設定する'), cache_group)
+        self.cache_limit_enabled_checkbox.setToolTip(tr('オフの場合、保存容量の上限はありません。RAMの上限とは別の設定です。'))
+        form.addRow(self.cache_limit_enabled_checkbox)
+
         self.cache_limit_spin = QSpinBox(cache_group)
         self.cache_limit_spin.setRange(128, 4096)
         self.cache_limit_spin.setSuffix(" MB")
         form.addRow(tr('キャッシュ最大容量:'), self.cache_limit_spin)
+        self.cache_limit_enabled_checkbox.toggled.connect(self.cache_limit_spin.setEnabled)
 
         self.cache_unused_days_combo = QComboBox(cache_group)
         for label, days in (
@@ -4043,9 +4053,7 @@ class SettingsDialog(QDialog):
         self.disk_cache_checkbox.setChecked(
             bool(self.config.get("thumbnail_disk_cache_enabled", True))
         )
-        self.cache_limit_spin.setValue(
-            int(self.config.get("thumbnail_cache_limit_mb", 512))
-        )
+        self._set_disk_cache_limit_controls(int(self.config.get("thumbnail_cache_limit_mb", 0)))
         unused_days = int(self.config.get("thumbnail_cache_max_unused_days", 0))
         preset_index = self.cache_unused_days_combo.findData(unused_days)
         if preset_index < 0:
@@ -4779,7 +4787,7 @@ class SettingsDialog(QDialog):
             "favorite_row_spacing": self.favorite_row_spacing_spin.value(),
             "favorite_icon_size": self.favorite_icon_size_spin.value(),
             "thumbnail_disk_cache_enabled": self.disk_cache_checkbox.isChecked(),
-            "thumbnail_cache_limit_mb": self.cache_limit_spin.value(),
+            "thumbnail_cache_limit_mb": self.cache_limit_spin.value() if self.cache_limit_enabled_checkbox.isChecked() else 0,
             "thumbnail_cache_max_unused_days": (
                 self.cache_unused_days_spin.value()
                 if int(self.cache_unused_days_combo.currentData()) == -1

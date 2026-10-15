@@ -289,7 +289,11 @@ def test_disk_placeholder_is_delivered_before_source_upgrade_finishes(
     generation = provider.begin_generation()
     try:
         assert provider.request(item, high, generation=generation)
-        assert started.wait(1)
+        deadline = time.monotonic() + 2
+        while not started.is_set() and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.001)
+        assert started.is_set()
         deadline = time.monotonic() + 1
         while not provisional and time.monotonic() < deadline:
             qapp.processEvents()

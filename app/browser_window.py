@@ -235,6 +235,7 @@ from .settings_dialog import SettingsDialog
 from .sidebar_layout import SidebarLayoutController
 from .thumbnail_provider import BrowserThumbnailProvider
 from .thumbnail_disk_cache import ThumbnailDiskCache
+from .browser_thumbnail_presentation import BrowserThumbnailPresentation
 from .thumbnail_render import ThumbnailRenderPolicy, ThumbnailRenderSpec, normalize_thumbnail_webp_quality
 from .system_file_opener import SystemFileOpener
 from .windows_filename import (
@@ -710,7 +711,7 @@ class BrowserWindow(QMainWindow):
                 # the first thumbnail is requested, so it must not delay the
                 # first Browser window paint.
                 enabled=False,
-                limit_mb=int(self.settings.get("thumbnail_cache_limit_mb", 512)),
+                limit_mb=int(self.settings.get("thumbnail_cache_limit_mb", 0)),
                 max_unused_days=int(
                     self.settings.get("thumbnail_cache_max_unused_days", 0)
                 ),
@@ -1179,6 +1180,7 @@ class BrowserWindow(QMainWindow):
         )
         self._build_ui()
         self._browser_workflow = BrowserWorkflowController(self)
+        self._thumbnail_presentation = BrowserThumbnailPresentation(self)
         self._download_retry = BrowserDownloadRetry(self)
         queue = self.file_operation_coordinator.queue
         executor = self.file_operation_coordinator.executor
@@ -4703,6 +4705,9 @@ class BrowserWindow(QMainWindow):
             workflow = getattr(self, "_browser_workflow", None)
             if workflow is not None:
                 workflow.shutdown()
+            presentation = getattr(self, '_thumbnail_presentation', None)
+            if presentation is not None:
+                presentation.shutdown()
             self._shutdown_cleanup_phase = 1
 
         if self._shutdown_cleanup_phase == 1:
@@ -7694,6 +7699,8 @@ class BrowserWindow(QMainWindow):
             **self._browser_icon_delegate_options(),
             **self._browser_overlay_delegate_options(),
         )
+        self.item_delegate.shell_icon_provider.enable_async(self.item_delegate)
+        self.item_delegate.shell_icon_provider.image_ready.connect(self.list_view.viewport().update)
         self.list_view.setItemDelegate(self.item_delegate)
         if hasattr(self.thumbnail_provider, 'enable_retained_display'):
             self.thumbnail_provider.enable_retained_display()
@@ -7739,6 +7746,8 @@ class BrowserWindow(QMainWindow):
             self._on_list_scrolled
         )
         self.list_view.paintStarting.connect(self._restore_visible_memory_thumbnails)
+        from .browser_scroll_trace import install_browser_scroll_trace
+        install_browser_scroll_trace(self)
         self.list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list_view.customContextMenuRequested.connect(self._show_context_menu)
         self.list_view.paths_dropped.connect(self._on_browser_paths_dropped)
@@ -8589,6 +8598,9 @@ class BrowserWindow(QMainWindow):
     def _request_visible_thumbnails(self) -> None:
         if self.current_path is not None and self._file_mutation_for_path(self.current_path) is not None:
             return
+        presentation = getattr(self, '_thumbnail_presentation', None)
+        if presentation is not None:
+            presentation.recenter()
         retry = getattr(self, "_download_retry", None)
         if retry is not None:
             retry.wake()
@@ -8597,7 +8609,7 @@ class BrowserWindow(QMainWindow):
             # Recenter cache retention before the visible requests below can
             # touch the LRU. This also runs while rapid scrolling suppresses
             # speculative generation, without doing any image or disk I/O.
-            workflow.recenter_cache_retention()
+            workflow.recenter_cache_retention(refresh=False)
             workflow.schedule_background()
         row_count = self.item_model.rowCount()
         if self._shutdown_prepared or row_count <= 0:
@@ -8763,7 +8775,11 @@ class BrowserWindow(QMainWindow):
     def _schedule_thumbnail_requests(self, delay_ms: int = 30) -> None:
         if self._shutdown_prepared:
             return
-        self._thumbnail_request_timer.start(max(0, int(delay_ms)))
+        delay = max(0, int(delay_ms))
+        # Completion bursts must not postpone an already queued visible pass.
+        if (not self._thumbnail_request_timer.isActive()
+                or self._thumbnail_request_timer.remainingTime() > delay):
+            self._thumbnail_request_timer.start(delay)
 
     def _on_list_scrolled(self, value: int) -> None:
         now = monotonic()
@@ -8791,6 +8807,9 @@ class BrowserWindow(QMainWindow):
         self._last_scroll_value = int(value)
         self._last_scroll_time = now
         self._restore_visible_memory_thumbnails()
+        presentation = getattr(self, '_thumbnail_presentation', None)
+        if presentation is not None:
+            presentation.recenter()
         self._schedule_thumbnail_requests(0)
         self._scroll_idle_timer.start()
 

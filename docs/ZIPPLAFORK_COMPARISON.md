@@ -190,7 +190,7 @@ and `licenses/ZipPlaFork/About.txt`.
 
 | Fixed source / processing structure | NivisViewer correspondence |
 | --- | --- |
-| `source/ZipPla/CatalogForm.cs:8730`, `SetBackgroundMode` (`:10988-11168` and following work ordering): prioritize visible items, then include remaining current-list items | Existing `BrowserWorkflowController` and `ThumbnailWarmupCursor` preserve visible priority and asynchronous one-job continuation. A finite prefetch setting bounds generation; unlimited iterates the current list. Initial paint never waits for the list to finish. |
+| `source/ZipPla/CatalogForm.cs:8730`, `SetBackgroundMode` (`:10988-11168` and following work ordering): prioritize visible items, then include remaining current-list items | `BrowserWorkflowController` and `ThumbnailWarmupCursor` preserve visible priority with at most four background requests outstanding. A finite prefetch setting bounds generation; unlimited iterates the current list. Initial paint never waits for the list to finish. |
 | `CatalogForm.cs:9190-9207`, `bmwMakePreview_EachRunWorkerCompleted`; `:30301-30381`, `ThumbViewerItem.Image` / ownership: retain completed images, including unseen items | `BrowserThumbnailProvider` owns completed artifacts; `BrowserItemModel` retains shared completed-image references beyond the viewport. Original item-owned residency is translated to a central Qt identity/byte store with implicit QImage sharing. No per-completion whole-list model publication is needed for unseen artifacts. |
 | `CatalogForm.cs:31007` and following, `ThumbViewer.DrawItem`; `:32506-32518`, `PaintPart`: draw completed images directly and do not dispose offscreen images | `BrowserItemDelegate`, managed `BrowserDisplaySurfaceCache`, and model thumbnail roles draw retained artifacts directly. Scrolling does not clear completed model references or prepared surfaces. The RAM-only pre-paint pull remains a fallback for a newly exposed completed artifact. |
 | `CatalogForm.cs:32385` and following, `ThumbViewer.Clear`; `ThumbViewerItem.Dispose`: release images when the listing is replaced | Browser directory switch, source update, cancellation/generation fences, and source eviction release matching model/surface ownership. Rendering geometry/DPI invalidation retains NivisViewer's identity contracts. |
@@ -206,3 +206,264 @@ Read/visible priority only selects victims when the actual budget is exceeded.
 The original WinForms renderer, synchronous image APIs, and worker scheduling
 are not reproduced: decoding stays off the GUI thread, completion is bounded,
 and rank/ref accounting is incremental on scroll and completion.
+
+## Browser first admission and generation
+
+The same fixed import revision `5e942ef0006decf01c21d9dbe037dba50e763420`
+of `himamon/ZipPlaFork` remains the comparison source, with the license,
+copyright, full license text and notice identified above.
+
+| Fixed source / processing structure | Evaluation and NivisViewer correspondence |
+| --- | --- |
+| `source/ZipPla/CatalogForm.cs:1874,11238-11264`, `bmwMakePreview_DoWork`: multiple preview workers with CPU-dependent capacity | **Hybrid adopted:** `browser_generation_budget.browser_generation_workers` translates the ordinary CPU/2 allowance into the shared generation pool and process-wide admission ceiling. GUI-published physical and commit headroom constrain the aggregate scratch estimate. Viewer keeps its separate execution lane; PDF and XCF retain their native serialization contracts. Full-power CPU-1 scaling and process-priority changes are not translated. |
+| `source/ZipPla/GPSizeThumbnail.cs:390-471`: per-item saved-preview validation and decoding without a central database decode lock | **Hybrid adopted:** retain NivisViewer SQLite metadata and strict source/cover/policy validation; two dedicated saved-read workers decode immutable saved files outside the shared lock. Read leases, post-decode source revalidation and row/epoch revalidation protect deletion, replacement and cancellation. The JPEG XR/file-stream representation is not copied. |
+| No ZipPlaFork counterpart | **NivisViewer/New design maintained:** implementation-family 3/4 reuse requires matching crop, quality, alpha, matte and encoding policy. Uncertain legacy rendering is provisional and refreshed; valid reuse does not require a duplicate write. Current saved variants retire only proven superseded legacy variants of the same source/cover and no larger resolution. Qt request generations, source revisions and explicit runnable lifetime remain authoritative. |
+
+The alternatives were evaluated separately: unchanged NivisViewer serial
+admission blocked saved reads behind expensive generation; copying ZipPla's
+CPU-scaled worker count would omit aggregate scratch-memory admission and Qt
+lifetime protection; a wholly new cache format would add migration cost without
+solving generation latency. The selected Hybrid keeps the existing quality,
+memory-residency and UI contracts and changes execution/lifetime boundaries.
+Scratch reservations estimate transient native memory rather than imposing a
+hard process RSS limit; large unknown container/vector decoders can exceed the
+estimate. Already executing native work finishes before its reservation is
+released. Interactive Viewer use pauses new Browser submissions. Persistent
+capacity is independent from these RAM/execution limits: new/missing disk
+settings use unlimited capacity and no unused-age deletion. Existing numeric
+capacity and age settings remain effective. The capacity option stores zero
+for unlimited; normal total-size LRU pruning runs only for positive limits.
+Actual low disk space or write failure stops new writes and preserves reads.
+Source/policy invalidation, compatible variant handling and explicit clearing
+remain separate. Index/file layout and save location are unchanged.
+
+Completion waits deliver only the provider's queued handoff/completion calls;
+they do not re-enter unrelated GUI timers or painting. Thumbnail runnables
+retain native ownership until the pool has fully returned, including its
+post-run epilogue. A completion signal alone does not release that ownership.
+Retained runnable bookkeeping is bounded. Handoffs carry plain request receipts,
+not auto-deleted Qt object pointers. OS samples use immutable private native
+bindings and a GUI-owned publisher; generation workers consume the published
+sample and pause admission if it becomes stale. The publisher retains its GUI
+thread binding wrapper for its application lifetime; completion delivery is
+skipped when no Qt application exists. The
+existing Qt WebP decoder in `image_source._read_webp_qimage` now releases its
+codec handler before closing its input buffer, preserving pixels, alpha and
+EXIF fallback while protecting concurrent Browser/Viewer execution.
+
+### Saved-read overhead and generation admission revision
+
+Reference remains the original ZipPla 1.7.2.9 import at
+`5e942ef0006decf01c21d9dbe037dba50e763420`, AGPL-3.0-or-later,
+Copyright Rio's Toolbox, 2016; source assembly copyright 2016-2017.
+The full license and notice paths at the start of this document are preserved.
+The later Fork's single-thumbnail semaphore is a separate implementation.
+
+| Fixed original source / processing | Translation and correspondence |
+| --- | --- |
+| `CatalogForm.cs:1874,8996-9080,11240-11264`; `GenerarClasses.cs:247-338`: CPU-dependent work slots, ordered dispatch, GUI completion/next dispatch | `ImageWorkCoordinator._browser_generation_pool`, `BrowserGenerationBudget.max_active`: ordinary CPU/2 slots shared across Browser windows, with the existing read/metadata/Viewer separation. `_ThumbnailWorker.run` defers memory-blocked jobs to `BrowserThumbnailProvider._waiting_generation`; priority-ordered GUI admission does not occupy native decode slots while waiting. |
+| `PackedImageLoader.cs:283-330`: default `onMemory=None`, file-backed archive input; `GPSizeThumbnail.cs:796-1169`: scoped images/streams and progressive resize resource release | NivisViewer retains worker-scoped loader/codec lifetimes and existing reduced JPEG decode. The archive is not copied wholesale to RAM by the admission mechanism. Conservative header estimates remain 20 bytes/pixel, unknown paths 256 MiB; these are reservations, not measured RSS or hard decoder limits. |
+| No original aggregate scratch/OS-pressure gate in the reviewed Catalog generation path | New admission keeps half the lesser physical/commit surplus after an OS reserve (10% of physical RAM, between 512 MiB and 2 GiB). This replaces the former always-active 512 MiB ceiling. Active estimated bytes remain charged as well, conservatively allowing for lag and allocation uncertainty. Stale samples defer; unavailable monitoring permits one generation at a time. Temporary pressure does not permanently fail the item; cancellation, source changes and Viewer pause can remove waiting requests. |
+
+**ZipPla:** ordinary CPU scaling is useful, but its lack of an aggregate scratch
+gate is not adopted as a safety guarantee for modern large native decoders.
+**Earlier NivisViewer:** lane isolation and lifetime fences remain useful; fixed
+two-generation slots and the 512 MiB ceiling unnecessarily serialized ordinary
+large images even with ample RAM. **Hybrid adopted:** CPU slots plus published
+physical/commit admission, preserving independent saved reads and Viewer work.
+**New design:** a metadata/decode split or process-based decode was considered;
+additional serialization, ownership and cancellation machinery was not justified
+by the measured local read overhead.
+
+`ThumbnailRenderSpec` now owns cached encoding/tokens/legacy variants for its
+immutable lifetime; mutable source or cover identities are never memoized.
+`ThumbnailDiskCache._lookup_read` selects and leases its first immutable file
+in one short shared interval, then combines lease release with the post-decode
+row/epoch check. Source/cover signatures and the second SQL row verification
+remain. Codecs and source inspection stay outside the shared lock. Redundant
+enable calls take an optimistic no-op path; actual reads still fence state under
+both shared intervals. Standalone completion ranks all residents only when
+eviction is required. Read workers remain two; no all-list completion barrier
+or GUI decode was introduced. Native runnable ownership through pool quiescence
+and the retained GUI QThread binding wrapper remain unchanged.
+
+### Earlier resident first exposure and nearby display preparation
+
+The reference is the original ZipPla 1.7.2.9 import in
+`himamon/ZipPlaFork`, revision `5e942ef0006decf01c21d9dbe037dba50e763420`,
+AGPL-3.0-or-later, Copyright Rio's Toolbox 2016 / assembly 2016-2017.
+The existing full license and About notice are retained at the paths above.
+
+| Original source / processing | NivisViewer translation |
+| --- | --- |
+| `source/ZipPla/CatalogForm.cs:9190-9207`, `bmwMakePreview_EachRunWorkerCompleted`: assign completed Bitmap directly to `item.Image`, including unseen items | `BrowserThumbnailProvider.resident_thumbnail_ready` publishes an identity receipt after a retained completion. `BrowserThumbnailPresentation` borrows existing RAM pixels and calls `BrowserItemModel.set_thumbnail_image` immediately; unseen publication uses shared QImage references and the existing pixel ledger, without per-row view invalidation. |
+| `CatalogForm.cs:32555-32634`, `preRenderScroll`; `:32636` onward `tryRenderWithPrerender`; `:32705` onward `OnMouseWheel`: prepare a bounded newly exposed strip before scrolling | `BrowserThumbnailPresentation` prepares image-only surfaces for a bounded band around the viewport, in GUI slices of at most four units / a soft two-millisecond budget, yielding between slices. `BrowserItemDelegate.prepare_thumbnail_image` uses the real cell/DPR/crop geometry; rational pixel-snap phases cover partial-row scrolling. Selection, hover, title and badges remain live delegate rendering rather than a saved full-screen canvas. |
+
+**ZipPla:** item-ready pixels and bounded exposure preparation are useful; its
+WinForms strip bitmaps and scrolling API are not reproduced. **Earlier NivisViewer:**
+visible RAM restoration and paint-driven preparation remain safe fallbacks, but
+unseen background completion did not immediately populate model references.
+**Hybrid adopted:** separate resident publication from `dataChanged`, and prepare
+nearby image surfaces before exposure, using the existing Qt virtualized view.
+**New design:** an entirely new presentation/model authority was not justified;
+the current generation/source/token identity and memory ownership remain in place.
+
+Warmup borrows RAM only: no source decode or disk read is requested. Preparing a
+surface and publishing an unseen model reference do not mark the source displayed;
+an actual paint marks it even on a surface hit. All source/model/surface references
+share the existing budget. Real source eviction drops corresponding model and
+surface references. Quiet publication rechecks ownership after its model-reference
+callback so a synchronous eviction cannot recreate an orphan image. Queue contexts fence generation, model revision, render token,
+geometry, layout direction and DPR; a model replacement is reconciled from RAM
+incrementally, rather than rescanned per completion or per scroll. Viewer pause
+suspends surface work. Completed artifacts remain resident outside the band until
+actual budget/identity invalidation. Finite acquisition horizons, unlimited-list
+acquisition, disk defaults and RAM limits are unchanged. A large jump outside the
+prepared band can still prepare surfaces during its first paint; resident pixels
+are already model-visible. No whole-list preparation barrier delays initial paint.
+
+Offscreen first-exposure checks distinguish image/model residency from surface
+preparation and presentation timing. They do not prove that Windows compositor
+presentation or the reported transient icon has been eliminated on a real display.
+
+### Worker-completed display artifacts and preparation before scrolling
+
+This revision supersedes the GUI raster warmup described immediately above.
+The fixed reference remains the original ZipPla 1.7.2.9 import in
+`https://github.com/himamon/ZipPlaFork`, revision
+`5e942ef0006decf01c21d9dbe037dba50e763420`,
+`source/ZipPla/CatalogForm.cs`, Git blob
+`85a9346c52d49bce18008249060833f3af4c42d6`.
+The translated structure is AGPL-3.0-or-later derived, Copyright Rio's Toolbox
+2016 / assembly 2016-2017. Existing license texts and notices remain unchanged.
+
+| Original processing | Current translation |
+| --- | --- |
+| `CatalogForm.cs:8996-9080`, `:5343-5390`, `:5538-5609`: worker obtains and clips/resizes the display-sized image | `_ThumbnailWorker.run` completes `BrowserThumbnailDisplayPlan` images before publishing a result. `browser_thumbnail_surface.py` contains widget-independent QImage raster work and the existing crop/fit/pixel snapping geometry. Geometry is memoized by shape and source dimensions; identical physical variants are rendered once. Ties-to-even may require up to three dimensions on each axis, rather than an unbounded image per scroll position. |
+| `:9190-9207`: assign a finished bitmap to an unseen item | `BrowserThumbnailProvider._display_artifacts` keeps the completed images with their resident source. GUI surface entries are shared references to that artifact. Publication precedes model-ready notification and does not require a per-item widget or an all-list completion barrier. |
+| `:32555-32634`, especially `:32615/:32624` before `:32632`; `:32705-32718`: prepare the new exposure before moving | `ExplorerListView.scrollPreparing`, `_PreparingScrollBar`, and `BrowserThumbnailPresentation.prepare_scroll` resolve the future exposure and exact cell/DPR geometry before Python value changes and native slider actions commit. Direct C++ scroll changes have a fallback before `scrollContentsBy` performs the viewport move. Only cells intersecting the new exposure strip are prepared; large jumps are bounded by one future viewport. Finished source artifacts also serve any remaining paint after successive input. |
+| `:32481-32503`, `:32636-32666`: reuse completed work, render any missing part normally | `BrowserItemDelegate` consumes the prepared image/target metadata and draws the completed QImage one-to-one. Selection, hover, frames, text and badges remain live Qt drawing. Missing or provisional images retain their normal paint fallback; work is never awaited by the input handler. |
+
+**ZipPla** supplies the useful completion and prepare-before-move order; its
+WinForms strip canvases, fixed 480 bound and pending-one-strip restriction are
+not carried over. **Earlier NivisViewer** preserved virtualization and resource
+identity, but repeated GUI phase jobs could fall behind continuous input.
+**Hybrid adopted:** finish display pixels on existing worker lanes, retain them
+as budgeted source artifacts, and prepare a small image-only exposure plan before
+the move. **New design considered:** a single phase-independent bitmap or a full
+viewport tile authority would reduce some indexing, but would change fractional
+edge snapping/crop or introduce a second canvas and live-state invalidation.
+The existing exact pixel geometry and the Qt virtualized view are retained.
+
+The source raster remains the reusable disk/render variant; completed display
+images are not new disk variants. Source, model, completed display and GUI aliases
+are counted by the same unique-pixel ledger. GUI index clearing does not discard
+the authoritative completed artifact. Final source eviction releases it and its
+aliases. Reservation precedes publication and rechecks generation, plan and source
+ownership; GUI entry registration also preserves the reentrant cancellation guard.
+The memory tradeoff is explicit: keeping more finished images costs RAM. Existing
+auto/manual limits, the default auto maximum of 2 GiB and OS pressure trimming
+remain the authority; additional images do not bypass them.
+
+Resident geometry changes use at most two RAM-only display jobs on the existing
+read lane and its native ownership fence. Pending overlap is preserved on scroll;
+direction changes update priority even within the same row interval. GUI slices
+perform bounded reference publication and dispatch, without image decode, archive
+extraction or raster preparation. A new geometry or an unfinished source can still
+use the normal paint fallback while workers progress. There is no input-time wait
+for disk, a worker, an entire viewport or an entire listing.
+
+Qt's native action boundary is documented in
+[QAbstractSlider.actionTriggered](https://doc.qt.io/qtforpython-6/PySide6/QtWidgets/QAbstractSlider.html#PySide6.QtWidgets.QAbstractSlider.actionTriggered).
+Native system wheel, pixel input, dragging and slider actions retain Qt movement
+semantics; custom angle-wheel accumulation, clipping and reversal remain unchanged.
+Offscreen measurements distinguish missing model pixels from unfinished display
+pixels and record delivered input intervals alongside handler/paint time. They
+do not establish real Windows compositor latency or elimination of an observed
+transient icon on a physical display.
+
+### Display retention under a finite RAM grant
+
+This revision supersedes the multiple pixel-snap variants described above.
+The worker-completed display and prepare-before-move order are retained.
+The two image tiers now have separate eviction lifetimes within the same unique
+pixel budget. Under pressure, distant display images and their GUI aliases
+yield before reusable source thumbnails. Preparing a derivative cannot evict a
+source merely to admit that derivative. Scrolling alone does not clear either
+tier. Current images, two upcoming resident viewports and a reverse-direction row are protected
+ahead of the remaining reverse viewport. A hard source-cache limit still applies
+when the source images themselves no longer fit.
+
+**ZipPla:** retaining one completed item bitmap minimizes duplicate RAM, but
+replacing the reusable source with it would change NivisViewer's size/quality
+reuse and fractional-DPI geometry. **Previous NivisViewer:** source and display
+artifacts shared a budget but were evicted together; eager display completion
+could therefore evict a source-only listing that otherwise fit. **Hybrid chosen:**
+keep the existing disk/render source with independent derivative admission and
+reclamation. **New design adopted for display geometry:** round physical image
+dimensions independently of placement, yielding one worker-produced final image
+per item and display plan. Fractional-DPI scrolling moves that image without
+changing its dimensions or crop. Compared with separately rounding both absolute
+edges, an edge can differ by one physical pixel; one-to-one painting, fit/crop,
+aspect ratio and the existing source quality are preserved. Viewport tiles were
+rejected because they add live-state invalidation and another canvas owner.
+
+`BrowserThumbnailProvider` maintains incremental display-priority buckets and
+releases GUI aliases explicitly without invalidating model/source pixels.
+`BrowserThumbnailPresentation` protects the adjacent display ranges, skips distant
+work that cannot be retained, and resumes worker dispatch on capacity notifications
+instead of polling blocked workers every millisecond. A normal pending disk save
+also registers its resume notification under the save lock, preventing an idle
+background acquisition queue after that save completes. Acquisition horizons,
+disk layout, manual limits and the automatic 2 GiB ceiling are preserved.
+
+### Saved-cache acquisition during continuous Browser scrolling
+
+The preceding resident-image checks do not cover thumbnails that exist only on
+disk. Browser warmup previously stopped during fast input, while the visible-only
+request plan could cancel queued background reads inside the configured horizon.
+Completed display images therefore stopped arriving before exposure even though
+the disk cache already contained them.
+
+The chosen **Hybrid** keeps the Qt model, virtual list, revision fences and joint
+RAM budget, but lets saved-cache reads continue during input. A miss defers
+original-image generation until idle; a visible request can promote that same
+probe without waiting for idle. Deferred misses are reopened rather than marked
+as permanent failures. The active retention window protects queued background
+requests, and a bounded dispatch batch refills free slots after foreground
+submission or read completion. Notifications share one subsequent UI turn
+(a non-restarting one-shot timer); they do not run a dispatch batch inline for
+every completed image. Unlimited mode uses its bounded near window while
+input is active; it does not submit the entire listing.
+
+Saved reads and display derivatives share half the logical CPU count, bounded
+to two through eight workers, with at most twice that many outstanding
+speculative read requests. Original-image
+generation retains its separate scratch admission and four-request background
+limit. A disabled or failed writer does not justify treating an existing saved
+thumbnail as a generation job.
+
+Idle usage-date updates resolve source paths before acquiring the shared
+database/read-file lock. Windows path resolution can inspect multiple ancestors;
+holding that lock for a whole usage batch prevented read workers from progressing
+even when all requested thumbnails already existed on disk. SQL updates remain
+serialized and retain the same source-token identities.
+
+Scrolling and the later visible-request pass reuse the same retention calculation
+when the viewport and memory grant are unchanged. Selection changes still force
+a refresh. The already bounded selected-row set also serves the memory scope;
+per-item Qt selection queries are needed only while orphan previews require
+model-only retention, not for ordinary provider-owned thumbnails.
+Absolute-path normalization uses a bounded 8,192-entry lexical-key cache; relative
+paths continue to use the current directory. This caches neither file state nor
+image data and does not change source-revision validation or image retention.
+
+**ZipPla:** the already documented item-owned final bitmap and before-scroll
+preparation remain the reference. **Previous NivisViewer:** retain its modern
+resource lifetime and virtualization, but replace conflicting stop/cancel
+decisions. **New design:** a separate viewport tile renderer would add another
+pixel owner and live-state invalidation; it is not needed to fix late disk
+acquisition. This change prepares final item images before exposure, not an
+entire viewport strip bitmap. Literal strip painting still differs from
+`CatalogForm.preRenderScroll` / `PaintPart` in ZipPla 1.7.2.9 at the previously
+recorded fixed revision. No additional source code is transplanted here.

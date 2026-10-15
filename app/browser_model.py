@@ -7,6 +7,7 @@ from .browser_artifact_memory import ThumbnailImageReferences
 import os
 from dataclasses import dataclass, replace
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 
 from PySide6.QtCore import QAbstractListModel, QModelIndex, Qt
@@ -698,12 +699,17 @@ class BrowserItemModel(QAbstractListModel):
         *,
         low_resolution: bool = False,
         request_token: int | None = None,
+        notify: bool = True,
+        displayed: bool = True,
     ) -> bool:
         row = self.row_for_path(path)
         if row < 0 or image is None or image.isNull():
             return False
         item = self._items[row]
         key = self._key(item.path)
+        owner = getattr(self, '_thumbnail_memory_owner', None)
+        if not displayed and owner is not None and not owner.owns_memory_image(image):
+            return False
         signature = (
             (int(request_token), item.thumbnail_revision)
             if request_token is not None
@@ -737,12 +743,24 @@ class BrowserItemModel(QAbstractListModel):
             else:
                 self._thumbnail_signatures[key] = signature
         self._thumbnail_errors.pop(key, None)
-        index = self.index(row, 0)
-        self.dataChanged.emit(
-            index,
-            index,
-            [self.ThumbnailImageRole, self.ThumbnailLowResolutionRole],
-        )
+        if not displayed and owner is not None and not owner.owns_memory_image(image):
+            # A broker rebalance can evict the source during the reference
+            # callback. Unseen publication must not recreate an orphan/pin it.
+            current = self._thumbnail_images.get(key)
+            if current is not None and int(current.cacheKey()) == int(image.cacheKey()):
+                self._thumbnail_images.pop(key)
+                self._thumbnail_signatures.pop(key, None)
+                self._low_resolution_thumbnails.discard(key)
+            return False
+        if displayed and owner is not None:
+            owner.mark_displayed_image(image, key)
+        if notify:
+            index = self.index(row, 0)
+            self.dataChanged.emit(
+                index,
+                index,
+                [self.ThumbnailImageRole, self.ThumbnailLowResolutionRole],
+            )
         return True
 
     @property
@@ -794,10 +812,14 @@ class BrowserItemModel(QAbstractListModel):
 
     def retain_thumbnail_images(self, paths) -> int:
         """Keep completed owned images until real eviction; bound orphan previews."""
-        retained = {self._key(Path(path)) for path in paths}
-        removed = 0
         owner = getattr(self, "_thumbnail_memory_owner", None)
         keys = tuple(owner._orphan_model_images) if owner is not None else tuple(self._thumbnail_images)
+        # Completed provider-owned pixels already have an eviction lifetime.
+        # Most scrolls have no orphan previews to filter at all.
+        if not keys:
+            return 0
+        retained = {self._key(path if isinstance(path, Path) else Path(path)) for path in paths}
+        removed = 0
         for key in keys:
             if key not in self._thumbnail_images:
                 continue
@@ -1366,7 +1388,17 @@ class BrowserItemModel(QAbstractListModel):
         self._low_resolution_thumbnails.clear()
 
     @staticmethod
-    def _key(path: Path) -> str:
+    @lru_cache(maxsize=8192)
+    def _absolute_path_key(path: Path) -> str:
+        # Cache lexical keys only; relative paths must still follow cwd changes.
+        return os.path.normcase(
+            os.path.abspath(os.path.normpath(os.fspath(path)))
+        ).casefold()
+
+    @staticmethod
+    def _key(path: str | Path) -> str:
+        if isinstance(path, Path) and path.is_absolute():
+            return BrowserItemModel._absolute_path_key(path)
         return os.path.normcase(
             os.path.abspath(os.path.normpath(os.fspath(path)))
         ).casefold()

@@ -76,7 +76,8 @@ def drain_background(window, qapp, timeout=60):
         window.thumbnail_provider.wait_for_done(10)
         qapp.processEvents()
         if (workflow.stop_reason == 'range-complete'
-                and window.thumbnail_provider.pending_count == 0 and not workflow._timer.isActive()):
+                and window.thumbnail_provider.pending_count == 0 and not workflow._timer.isActive()
+                and not window.thumbnail_provider._changing_paths):
             return
         sleep(0.001)
     pytest.fail(f'Background did not settle: {workflow.stop_reason}; {window.thumbnail_provider.cache_statistics()}')
@@ -184,7 +185,11 @@ def test_unlimited_mixed_image_folder_zip_pdf_retains_unseen_images(tmp_path, qa
         wait_visible(window, qapp)
         drain_background(window, qapp)
         provider = window.thumbnail_provider
-        assert len(provider._cache) == 160
+        assert len(provider._cache) == 160, {
+            'statistics': provider.cache_statistics(),
+            'missing': [(item.path.name, item.kind.value) for item in window.item_model.items
+                        if not provider.has_memory_thumbnail(item, window.thumbnail_render_spec)],
+        }
         assert len({item.kind for item in window.item_model.items}) == 4
         bar = window.list_view.verticalScrollBar()
         positions = [0, bar.maximum()//3, bar.maximum()*2//3, bar.maximum()]

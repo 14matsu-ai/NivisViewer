@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
 import ctypes
 from ctypes import wintypes
 from math import ceil
 from pathlib import Path
 import sys
 import uuid
+from queue import SimpleQueue, Empty
+from threading import Thread
 
-from PySide6.QtCore import QFileInfo, QSize
+from PySide6.QtCore import QFileInfo, QSize, QObject, QTimer, Signal
 from PySide6.QtGui import QIcon, QImage, QPixmap
 from PySide6.QtWidgets import QFileIconProvider
 
@@ -23,14 +25,67 @@ def physical_icon_bucket(logical_size: int, device_pixel_ratio: float) -> int:
     return next((size for size in _ICON_BUCKETS if size >= requested), _ICON_BUCKETS[-1])
 
 
-class ShellAssociatedIconProvider:
+class ShellAssociatedIconProvider(QObject):
     """High-DPI Explorer association icons cached as physical QImages."""
 
+    image_ready = Signal()
+
     def __init__(self, *, cache_capacity: int = 192) -> None:
+        super().__init__()
+        self._async = False
+        self._pending_icons = set()
+        self._icon_requests = deque()
+        self._icon_results = SimpleQueue()
+        self._icon_running = False
+        self._icon_timer = QTimer(self)
+        self._icon_timer.setInterval(16)
+        self._icon_timer.timeout.connect(self._collect_icons)
         self._image_cache: OrderedDict[tuple[str, int], QImage] = OrderedDict()
         self._icon_cache: dict[tuple[str, int], QIcon] = {}
         self._cache_capacity = max(16, int(cache_capacity))
         self._fallback = QFileIconProvider()
+
+    def enable_async(self, parent):
+        """Browser paints only consume cached pixels; Shell runs outside Qt UI."""
+        self.setParent(parent)
+        self._async = True
+
+    def _queue_icon(self, key, extension, folder):
+        if key in self._pending_icons or len(self._pending_icons) >= 16:
+            return
+        self._pending_icons.add(key)
+        self._icon_requests.append((key, extension, folder))
+        self._start_next_icon()
+        self._icon_timer.start()
+
+    def _start_next_icon(self):
+        if self._icon_running or not self._icon_requests:
+            return
+        self._icon_running = True
+        key, extension, folder = self._icon_requests.popleft()
+        # The worker owns no QWidget, QPixmap, cache, or QObject. Its queue may
+        # outlive the window safely; no wait for native Shell at window close.
+        Thread(target=_load_association_image,
+               args=(self._windows_image, key, extension, folder, self._icon_results),
+               daemon=True).start()
+
+    def _collect_icons(self):
+        try:
+            key, image = self._icon_results.get_nowait()
+        except Empty:
+            return
+        self._icon_running = False
+        self._pending_icons.discard(key)
+        # Negative caching prevents repeated queries for unavailable handlers.
+        self._image_cache[key] = image
+        self._image_cache.move_to_end(key)
+        while len(self._image_cache) > self._cache_capacity:
+            old_key, _ = self._image_cache.popitem(last=False)
+            self._icon_cache.pop(old_key, None)
+        self._start_next_icon()
+        if not self._icon_running:
+            self._icon_timer.stop()
+        self.image_ready.emit()
 
     @property
     def cache_size(self) -> int:
@@ -78,7 +133,12 @@ class ShellAssociatedIconProvider:
         cached = self._image_cache.get(key)
         if cached is not None:
             self._image_cache.move_to_end(key)
-            return cached.copy()
+            # QImage is implicitly shared: preserve caller mutation isolation
+            # without copying every pixel again on each thumbnail repaint.
+            return QImage(cached)
+        if self._async:
+            self._queue_icon(key, extension, folder)
+            return QImage()
         image = self._windows_image(
             extension,
             folder=folder,
@@ -93,7 +153,7 @@ class ShellAssociatedIconProvider:
             pixmap = fallback_icon.pixmap(QSize(physical_size, physical_size))
             image = pixmap.toImage() if not pixmap.isNull() else QImage()
         if not image.isNull():
-            self._image_cache[key] = image.copy()
+            self._image_cache[key] = QImage(image)
             self._image_cache.move_to_end(key)
             while len(self._image_cache) > self._cache_capacity:
                 old_key, _old_image = self._image_cache.popitem(last=False)
@@ -129,6 +189,10 @@ class ShellAssociatedIconProvider:
         cached = self._icon_cache.get(key)
         if cached is not None:
             return cached
+        if self._async:
+            image = self.image_for_extension(extension, folder=folder,
+                logical_size=logical_size, device_pixel_ratio=device_pixel_ratio)
+            return QIcon(QPixmap.fromImage(image)) if not image.isNull() else QIcon()
         icon = self._windows_icon(extension, folder=folder)
         if icon.isNull():
             image = self.image_for_extension(
@@ -171,6 +235,22 @@ class ShellAssociatedIconProvider:
             )
         except (AttributeError, OSError, ValueError):
             return QImage()
+
+
+def _load_association_image(query, key, extension, folder, results):
+    initialized = False
+    image = QImage()
+    try:
+        if sys.platform == 'win32':
+            initialized = ctypes.windll.ole32.CoInitializeEx(None, 2) in (0, 1)
+        image = query(extension, folder=folder, physical_size=key[1])
+    except Exception:
+        # Optional decoration failure must not strand the bounded request lane.
+        image = QImage()
+    finally:
+        if initialized:
+            ctypes.windll.ole32.CoUninitialize()
+        results.put((key, image))
 
 
 class _GUID(ctypes.Structure):

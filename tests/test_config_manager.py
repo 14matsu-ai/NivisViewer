@@ -70,7 +70,7 @@ def test_missing_config_uses_defaults(tmp_path: Path) -> None:
     assert manager.data["browser_preserve_search_for_viewer_roundtrip"] is True
     assert manager.data["join_spread_pages"] is False
     assert manager.data["thumbnail_disk_cache_enabled"] is True
-    assert manager.data["thumbnail_cache_limit_mb"] == 512
+    assert manager.data["thumbnail_cache_limit_mb"] == 0
     assert manager.data["gap"] == 12
     assert manager.data["viewer_downscale_algorithm"] == "auto"
     assert manager.data["viewer_upscale_algorithm"] == "auto"

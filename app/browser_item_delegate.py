@@ -4,6 +4,7 @@ from .browser_workflow_policy import SelectionAppearance
 
 from collections import OrderedDict
 from dataclasses import dataclass
+from time import perf_counter
 
 from PySide6.QtCore import QModelIndex, QRect, QRectF, QSize, Qt
 from PySide6.QtGui import (
@@ -13,6 +14,10 @@ from PySide6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
 
 from .browser_model import BrowserItem, BrowserItemKind, BrowserItemModel
 from .browser_grid_metrics import build_browser_grid_metrics
+from .browser_thumbnail_surface import (
+    DisplayThumbnailSurface, prepare_display_thumbnail_surface,
+    thumbnail_image_rects, thumbnail_content_rect, surface_geometry_key,
+)
 from .browser_icon_size import (
     BROWSER_ICON_SIZE_DEFAULT_CUSTOM_PERCENT,
     BROWSER_ICON_SIZE_DEFAULT_PRESET,
@@ -75,75 +80,6 @@ BROWSER_TAG_OVERLAY_DEFAULT_OPACITY = 100
 BROWSER_TAG_TEXT_LUMINANCE_THRESHOLD_DEFAULT = 150
 
 
-@dataclass(frozen=True)
-class DisplayThumbnailSurface:
-    image: QImage
-    cache_hit: bool
-    prepared_with_resampling: bool
-
-
-def prepare_display_thumbnail_surface(
-    image: QImage,
-    source_rect: QRectF,
-    target_rect: QRectF,
-    device_pixel_ratio: float,
-) -> DisplayThumbnailSurface:
-    """Prepare physical display pixels once for a later unscaled paint."""
-
-    dpr = max(0.5, float(device_pixel_ratio))
-    physical_width = max(1, round(target_rect.width() * dpr))
-    physical_height = max(1, round(target_rect.height() * dpr))
-    source_is_integral = all(
-        abs(value - round(value)) < 0.000001
-        for value in (
-            source_rect.x(),
-            source_rect.y(),
-            source_rect.width(),
-            source_rect.height(),
-        )
-    )
-    source_matches_surface = (
-        source_is_integral
-        and round(source_rect.width()) == physical_width
-        and round(source_rect.height()) == physical_height
-    )
-    if source_matches_surface:
-        source = QRect(
-            round(source_rect.x()),
-            round(source_rect.y()),
-            physical_width,
-            physical_height,
-        )
-        if source == image.rect():
-            prepared = QImage(image)
-        else:
-            prepared = image.copy(source)
-        prepared.setDevicePixelRatio(dpr)
-        return DisplayThumbnailSurface(prepared, False, False)
-
-    prepared = QImage(
-        physical_width,
-        physical_height,
-        QImage.Format.Format_ARGB32_Premultiplied,
-    )
-    prepared.fill(Qt.GlobalColor.transparent)
-    surface_painter = QPainter(prepared)
-    try:
-        surface_painter.setRenderHint(
-            QPainter.RenderHint.SmoothPixmapTransform,
-            True,
-        )
-        surface_painter.drawImage(
-            QRectF(0, 0, physical_width, physical_height),
-            image,
-            source_rect,
-        )
-    finally:
-        surface_painter.end()
-    prepared.setDevicePixelRatio(dpr)
-    return DisplayThumbnailSurface(prepared, False, True)
-
-
 class BrowserDisplaySurfaceCache:
     """Bounded, paint-driven cache of final physical Browser thumbnail pixels."""
 
@@ -162,11 +98,49 @@ class BrowserDisplaySurfaceCache:
         self._by_source = {}
         self.hits = 0
         self.preparations = 0
+        self.adopted_surfaces = 0
+        self._revision = 0
+
+    def has_plan(self, image, plan):
+        pixel = int(image.cacheKey())
+        return all((pixel, *geometry) in self._items for geometry, _ in plan.geometries(image))
+
+    def adopt(self, image, plan, surfaces):
+        """Publish a worker-completed batch after one reentrant reservation."""
+        owner = self._memory_owner
+        if owner is None or not owner.owns_memory_image(image):
+            return 0
+        pixel = int(image.cacheKey())
+        additions = [((pixel, *key), surface) for key, surface in surfaces
+                     if (pixel, *key) not in self._items]
+        revision = self._revision
+        admitted = owner.reserve_display_surfaces(image, *(surface for _, surface in additions))
+        if (self._revision != revision or self._memory_owner is not owner
+                or not admitted or not owner.owns_memory_image(image)):
+            return 0
+        count = 0
+        # No callback occurs between entry/index and ledger registration.
+        for key, surface in additions:
+            if key in self._items:
+                continue
+            self._items[key] = surface
+            self._by_source.setdefault(pixel, set()).add(key)
+            self._byte_cost += max(1, int(surface.sizeInBytes()))
+            owner.retain_surface_reference(('surface', id(self), key), surface)
+            count += 1
+        self.adopted_surfaces += count
+        self._device_pixel_ratio = plan.dpr
+        owner.enforce_display_budget()
+        return count
 
     def bind_memory(self, owner):
         self.clear()
         self._memory_owner = owner
         owner.memory_image_released.connect(self._release_source)
+        owner.display_artifact_released.connect(self._release_display)
+
+    def _release_display(self, pixel):
+        self._release_source(None, pixel)
 
     def _remove(self, key):
         image = self._items.pop(key, None)
@@ -194,6 +168,7 @@ class BrowserDisplaySurfaceCache:
         return self._byte_cost
 
     def clear(self) -> None:
+        self._revision += 1
         for key in tuple(self._items):
             self._remove(key)
 
@@ -203,6 +178,8 @@ class BrowserDisplaySurfaceCache:
         source_rect: QRectF,
         target_rect: QRectF,
         device_pixel_ratio: float,
+        *,
+        displayed: bool = True,
     ) -> DisplayThumbnailSurface:
         dpr = max(0.5, float(device_pixel_ratio))
         if (
@@ -211,25 +188,24 @@ class BrowserDisplaySurfaceCache:
         ):
             self.clear()
         self._device_pixel_ratio = dpr
-        key = (
-            int(image.cacheKey()),
-            round(source_rect.x(), 6),
-            round(source_rect.y(), 6),
-            round(source_rect.width(), 6),
-            round(source_rect.height(), 6),
-            max(1, round(target_rect.width() * dpr)),
-            max(1, round(target_rect.height() * dpr)),
-            round(dpr, 6),
-        )
+        if displayed and self._memory_owner is not None:
+            self._memory_owner.mark_displayed_image(image)
+        key = (int(image.cacheKey()), *surface_geometry_key(source_rect, target_rect, dpr))
         cached = self._items.get(key)
+        if cached is None and displayed and self._memory_owner is not None:
+            owner = self._memory_owner
+            plan = getattr(owner, '_display_plan', None)
+            if plan is not None and abs(plan.dpr-dpr) < .001:
+                surfaces = owner.display_artifact(image, plan)
+                if surfaces is not None and any((key[0], *geometry) == key for geometry, _ in surfaces):
+                    self.adopt(image, plan, surfaces)
+                    cached = self._items.get(key)
         if cached is not None:
             self.hits += 1
             self._items.move_to_end(key)
             return DisplayThumbnailSurface(cached, True, False)
 
         self.preparations += 1
-        if self._memory_owner is not None:
-            self._memory_owner.mark_displayed_image(image)
         surface = prepare_display_thumbnail_surface(
             image,
             source_rect,
@@ -237,14 +213,31 @@ class BrowserDisplaySurfaceCache:
             dpr,
         )
         cost = max(1, int(surface.image.sizeInBytes()))
+        if self._memory_owner is not None:
+            owner, revision = self._memory_owner, self._revision
+            admitted = owner.reserve_display_surfaces(image, surface.image, require_source=False)
+            if not admitted or self._memory_owner is not owner or self._revision != revision:
+                return surface  # Transient paint result, never evict raw sources for it.
+            plan = getattr(owner, '_display_plan', None)
+            if plan is not None and owner.owns_memory_image(image):
+                geometries = plan.geometries(image)
+                if len(geometries) == 1 and (key[0], *geometries[0][0]) == key:
+                    # A first-paint fallback is also a complete final image.
+                    # Give it the same lifetime as worker output; otherwise a
+                    # GUI index clear would discard the only finished pixels.
+                    ready = ((geometries[0][0], surface.image),)
+                    if owner._store_display_artifact(image, plan, ready):
+                        self.adopt(image, plan, owner.display_artifact(image, plan))
+                    return surface
         if self._memory_owner is not None or cost <= self.max_bytes:
             self._items[key] = surface.image
             self._by_source.setdefault(key[0], set()).add(key)
             self._items.move_to_end(key)
             self._byte_cost += cost
             if self._memory_owner is not None:
-                self._memory_owner.retain_surface_reference(('surface', id(self), key), surface.image)
-                self._memory_owner.enforce_display_budget()
+                owner = self._memory_owner
+                owner.retain_surface_reference(('surface', id(self), key), surface.image)
+                owner.enforce_display_budget()
             while self._memory_owner is None and (
                 len(self._items) > self.max_items
                 or self._byte_cost > self.max_bytes
@@ -298,87 +291,6 @@ def thumbnail_rect_for_cell(
         cell_rect.top() + max(0, int(cell_padding)),
         size.width(),
         size.height(),
-    )
-
-
-def thumbnail_image_rects(
-    thumbnail_rect: QRect,
-    image_size: QSize,
-    display_mode: str,
-    *,
-    device_pixel_ratio: float = 1.0,
-) -> tuple[QRectF, QRectF]:
-    """Return target/source rectangles for the Browser thumbnail paint."""
-    image_width = max(1, image_size.width())
-    image_height = max(1, image_size.height())
-    dpr = max(0.5, float(device_pixel_ratio))
-    content_rect = thumbnail_content_rect(
-        thumbnail_rect,
-        display_mode=display_mode,
-        device_pixel_ratio=dpr,
-    )
-    if display_mode == "center_crop":
-        target = content_rect
-        target_ratio = target.width() / max(1.0, target.height())
-        source_ratio = image_width / image_height
-        if source_ratio > target_ratio:
-            source_width = image_height * target_ratio
-            source = QRectF(
-                (image_width - source_width) / 2,
-                0.0,
-                source_width,
-                float(image_height),
-            )
-        else:
-            source_height = image_width / max(0.0001, target_ratio)
-            source = QRectF(
-                0.0,
-                (image_height - source_height) / 2,
-                float(image_width),
-                source_height,
-            )
-        return target, source
-
-    available = content_rect
-    source_ratio = image_width / image_height
-    target_ratio = available.width() / max(1.0, available.height())
-    if source_ratio > target_ratio:
-        width = available.width()
-        height = width / source_ratio
-    else:
-        height = available.height()
-        width = height * source_ratio
-    no_upscale = min(
-        1.0,
-        image_width / max(1.0, width * dpr),
-        image_height / max(1.0, height * dpr),
-    )
-    width *= no_upscale
-    height *= no_upscale
-    target = QRectF(
-        available.center().x() - width / 2,
-        available.center().y() - height / 2,
-        width,
-        height,
-    )
-    return (
-        snap_logical_rect_to_physical_pixels(target, dpr),
-        QRectF(0.0, 0.0, float(image_width), float(image_height)),
-    )
-
-
-def thumbnail_content_rect(
-    thumbnail_rect: QRect,
-    *,
-    display_mode: str = "fit",
-    device_pixel_ratio: float = 1.0,
-) -> QRectF:
-    """Return the shared maximum target for real or placeholder content."""
-
-    inset = 1 if display_mode == "center_crop" else 4
-    return snap_logical_rect_to_physical_pixels(
-        QRectF(thumbnail_rect.adjusted(inset, inset, -inset, -inset)),
-        max(0.5, float(device_pixel_ratio)),
     )
 
 
@@ -619,6 +531,13 @@ class BrowserItemDelegate(QStyledItemDelegate):
             shell_icon_provider or ShellAssociatedIconProvider()
         )
         self._display_surface_cache = BrowserDisplaySurfaceCache()
+        self._exposure_plans = {}
+        self._grid_metrics_key = None
+        self._grid_metrics_value = None
+        from .filename_fallback import FilenameFallback
+        self._filename_fallback = FilenameFallback()
+        self._title_fallback_layouts = OrderedDict()
+        self._title_lines_cache: OrderedDict[tuple, tuple[str, ...]] = OrderedDict()
         self.badge_icon_left_margin = normalize_browser_icon_margin(badge_icon_left_margin)
         self.badge_icon_bottom_margin = normalize_browser_icon_margin(badge_icon_bottom_margin)
         self.show_rating_overlay = bool(show_rating_overlay)
@@ -675,10 +594,21 @@ class BrowserItemDelegate(QStyledItemDelegate):
     def grid_metrics(self):
         font = QFont()
         font.setPointSize(self.effective_filename_font_size)
-        return build_browser_grid_metrics(
+        # Read the current font height even on a hit: application font and
+        # logical DPI can change without configure() being called.
+        font_height = QFontMetrics(font).height()
+        key = (
+            self.thumbnail_size, self.frame_ratio_id, font_height,
+            self.filename_display, self.filename_gap, self.filename_padding_y,
+            self.effective_filename_font_size, self.profile.horizontal_margin,
+            self.cell_padding, self.item_spacing_x, self.item_spacing_y,
+        )
+        if key == self._grid_metrics_key:
+            return self._grid_metrics_value
+        value = build_browser_grid_metrics(
             thumbnail_size=self.thumbnail_size,
             frame_ratio_id=self.frame_ratio_id,
-            font_height=QFontMetrics(font).height(),
+            font_height=font_height,
             filename_display=self.filename_display,
             filename_gap=self.filename_gap,
             filename_padding_y=self.filename_padding_y,
@@ -688,6 +618,9 @@ class BrowserItemDelegate(QStyledItemDelegate):
             item_spacing_x=self.item_spacing_x,
             item_spacing_y=self.item_spacing_y,
         )
+        self._grid_metrics_key = key
+        self._grid_metrics_value = value
+        return value
 
     def configure(
         self,
@@ -844,7 +777,20 @@ class BrowserItemDelegate(QStyledItemDelegate):
             return 0.62
         return 1.0
 
-    def paint(
+    def paint(self, painter, option, index) -> None:
+        trace = getattr(self.parent(), '_scroll_trace', None)
+        if trace is None or not trace._active or trace._started is None:
+            self._paint_item(painter, option, index)
+            return
+        started = perf_counter()
+        try:
+            self._paint_item(painter, option, index)
+        finally:
+            elapsed = (perf_counter() - started) * 1000
+            if elapsed >= 8:
+                trace.mark('item.paint.slow', row=index.row(), duration_ms=round(elapsed, 3))
+
+    def _paint_item(
         self,
         painter: QPainter,
         option: QStyleOptionViewItem,
@@ -1098,18 +1044,20 @@ class BrowserItemDelegate(QStyledItemDelegate):
         display_mode: str | None = None,
     ) -> None:
         dpr = max(0.5, painter.device().devicePixelRatioF())
-        target, source = thumbnail_image_rects(
-            thumbnail_rect,
-            image.size(),
-            display_mode or self.thumbnail_display_mode,
-            device_pixel_ratio=dpr,
-        )
-        surface = self._display_surface_cache.prepare(
-            image,
-            source,
-            target,
-            dpr,
-        )
+        mode = display_mode or self.thumbnail_display_mode
+        cache = self._display_surface_cache
+        planned = self._exposure_plans.get((int(image.cacheKey()), *thumbnail_rect.getRect(), round(dpr, 6), mode))
+        cached = cache._items.get(planned[0]) if planned is not None else None
+        if cached is not None:
+            target = planned[1]
+            cache.hits += 1
+            cache._items.move_to_end(planned[0])
+            if cache._memory_owner is not None:
+                cache._memory_owner.mark_displayed_image(image)
+            surface = DisplayThumbnailSurface(cached, True, False)
+        else:
+            target, source = thumbnail_image_rects(thumbnail_rect, image.size(), mode, device_pixel_ratio=dpr)
+            surface = cache.prepare(image, source, target, dpr)
         if not enabled:
             painter.setOpacity(0.55)
         painter.drawImage(
@@ -1118,6 +1066,52 @@ class BrowserItemDelegate(QStyledItemDelegate):
         )
         if not enabled:
             painter.setOpacity(1.0)
+
+    def begin_exposure_preparation(self):
+        # Metadata only: no hidden QImage owner outside the shared ledger.
+        self._exposure_plans.clear()
+
+    def prepare_exposure_image(self, image, dpr, cell_rect):
+        frame = self.grid_metrics.thumbnail_frame_rect(cell_rect)
+        target, source = thumbnail_image_rects(frame, image.size(), self.thumbnail_display_mode,
+                                               device_pixel_ratio=dpr)
+        key = (int(image.cacheKey()), *surface_geometry_key(source, target, dpr))
+        if key not in self._display_surface_cache._items:
+            return False
+        self._exposure_plans[(int(image.cacheKey()), *frame.getRect(), round(dpr, 6),
+                              self.thumbnail_display_mode)] = (key, target)
+        return True
+
+    def prepare_item_decoration(self, item, dpr):
+        """Request both placeholder and badge sizes before their first paint."""
+        metrics = self.grid_metrics
+        frame = metrics.thumbnail_frame_rect(metrics.cell_rect())
+        center_size = max(8, round(min(96 * self._icon_scale(item, badge=False),
+                                      min(frame.width(), frame.height()) - 8)))
+        self._association_image(item, center_size, dpr)
+        if not self.show_type_badge:
+            return
+        size = self._type_badge_size(frame, item)
+        image = self._association_image(item, size, dpr)
+        base_size = self._type_badge_size(frame, item, scale=1.0)
+        if (not image.isNull() and (size != base_size
+                or self.badge_icon_left_margin >= 0 or self.badge_icon_bottom_margin >= 0)):
+            self._badge_reference_insets(item, base_size, dpr)
+            self._badge_visible_insets(item, image)
+
+    def prepare_thumbnail_image(
+        self, image: QImage, device_pixel_ratio: float, cell_rect: QRect | None = None,
+    ) -> DisplayThumbnailSurface:
+        """Warm only image pixels; selection/hover/title stay live in paint()."""
+        cell = cell_rect if cell_rect is not None else QRect(0, 0, self.cell_size.width(), self.cell_size.height())
+        thumbnail_rect = self.grid_metrics.thumbnail_frame_rect(cell)
+        target, source = thumbnail_image_rects(
+            thumbnail_rect, image.size(), self.thumbnail_display_mode,
+            device_pixel_ratio=device_pixel_ratio,
+        )
+        return self._display_surface_cache.prepare(
+            image, source, target, device_pixel_ratio, displayed=False,
+        )
 
     @staticmethod
     def _paint_background(
@@ -1164,26 +1158,39 @@ class BrowserItemDelegate(QStyledItemDelegate):
                 grid.selected_title_rect(option.rect),
                 selected_background,
             )
-        lines = (
-            (
-                elide_filename_line(
-                    metrics,
-                    display_title.replace("\n", " "),
-                    title_rect.width(),
-                    self.filename_elide_mode,
-                    preserve_extension=preserve_extension,
-                ),
-            )
-            if grid.title_lines == 1
-            else elided_title_lines(
-                metrics,
-                display_title,
-                title_rect.width(),
-                2,
-                self.filename_elide_mode,
+        # The same labels are painted on every scroll and thumbnail arrival.
+        # Cache text only, not item pixels; include all layout inputs so font,
+        # DPI, rename and settings changes take effect on the next paint.
+        title_key = (
+            font, metrics.fontDpi(), display_title, preserve_extension,
+            title_rect.width(), grid.title_lines, self.filename_elide_mode,
+        )
+        if grid.title_lines == 1 and self.filename_elide_mode == 'right':
+            if title_key not in self._title_fallback_layouts:
+                suffix = split_filename_extension(display_title)[1] if preserve_extension else ''
+                self._title_fallback_layouts[title_key] = self._filename_fallback.prepare(
+                    font, display_title, title_rect.width(), suffix=suffix)
+                while len(self._title_fallback_layouts) > 512:
+                    self._title_fallback_layouts.popitem(last=False)
+            else:
+                self._title_fallback_layouts.move_to_end(title_key)
+            layout = self._title_fallback_layouts[title_key]
+            if layout is not None:
+                line_rect = QRect(title_rect.left(), grid.title_text_rect(option.rect).top(),
+                                  title_rect.width(), metrics.height())
+                self._filename_fallback.draw(painter, line_rect, layout)
+                return
+        lines = self._title_lines_cache.get(title_key)
+        if lines is None:
+            lines = self._elided_title_lines(
+                metrics, display_title, title_rect.width(), grid.title_lines,
                 preserve_extension=preserve_extension,
             )
-        )
+            self._title_lines_cache[title_key] = lines
+            while len(self._title_lines_cache) > 512:
+                self._title_lines_cache.popitem(last=False)
+        else:
+            self._title_lines_cache.move_to_end(title_key)
         y = grid.title_text_rect(option.rect).top()
         for line in lines:
             line_rect = QRect(title_rect.left(), y, title_rect.width(), metrics.height())
@@ -1193,6 +1200,31 @@ class BrowserItemDelegate(QStyledItemDelegate):
                 line,
             )
             y += metrics.lineSpacing()
+
+    def _elided_title_lines(
+        self, metrics, display_title: str, width: int, line_count: int,
+        *, preserve_extension: bool,
+    ) -> tuple[str, ...]:
+        return tuple(
+            (
+                elide_filename_line(
+                    metrics,
+                    display_title.replace("\n", " "),
+                    width,
+                    self.filename_elide_mode,
+                    preserve_extension=preserve_extension,
+                ),
+            )
+            if line_count == 1
+            else elided_title_lines(
+                metrics,
+                display_title,
+                width,
+                2,
+                self.filename_elide_mode,
+                preserve_extension=preserve_extension,
+            )
+        )
 
     def _icon_scale(self, item: BrowserItem, *, badge: bool) -> float:
         if item.kind is BrowserItemKind.FOLDER:

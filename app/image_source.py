@@ -296,9 +296,15 @@ def _read_webp_qimage(data: bytes) -> QImage | None:
     if not buffer.open(QIODevice.OpenModeFlag.ReadOnly):
         return None
     reader = QImageReader(buffer, b"webp")
-    reader.setAutoTransform(True)
-    image = reader.read()
-    buffer.close()
+    try:
+        reader.setAutoTransform(True)
+        image = reader.read()
+    finally:
+        # The codec handler can retain the device. Tear it down while the
+        # QBuffer and its QByteArray are still alive, before closing the IO.
+        reader.setDevice(None)
+        del reader
+        buffer.close()
     return None if image.isNull() else image.copy()
 
 

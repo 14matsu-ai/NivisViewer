@@ -281,7 +281,7 @@ class ConfigManager(QObject):
         "mouse_side_buttons_folder_navigation": False,
         "join_spread_pages": False,
         "thumbnail_disk_cache_enabled": True,
-        "thumbnail_cache_limit_mb": 512,
+        "thumbnail_cache_limit_mb": 0,
         "thumbnail_cache_max_unused_days": 0,
         "pdf_render_base_dpi": 96,
         "pdf_render_annotations": True,
@@ -1194,9 +1194,11 @@ class ConfigManager(QObject):
         normalized["thumbnail_cache_limit_mb"] = cls._clamped_int(
             normalized.get("thumbnail_cache_limit_mb"),
             default=int(cls.DEFAULTS["thumbnail_cache_limit_mb"]),
-            minimum=128,
+            minimum=0,
             maximum=4096,
         )
+        if normalized["thumbnail_cache_limit_mb"]:
+            normalized["thumbnail_cache_limit_mb"] = max(128, normalized["thumbnail_cache_limit_mb"])
         unused_days = cls._clamped_int(
             normalized.get("thumbnail_cache_max_unused_days"),
             default=0,

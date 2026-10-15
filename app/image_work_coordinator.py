@@ -1,5 +1,6 @@
 from __future__ import annotations
 from .raster_execution_budget import RASTER_EXECUTION_BUDGET
+from .browser_generation_budget import browser_generation_workers, browser_read_workers
 
 from enum import IntEnum
 import logging
@@ -60,6 +61,10 @@ class ImageWorkCoordinator(QObject):
         self._current_viewer_pool.setMaxThreadCount(1)
         self._browser_pool = QThreadPool(self)
         self._browser_pool.setMaxThreadCount(max(1, self.browser_workers))
+        self._browser_read_pool = QThreadPool(self)
+        self._browser_read_pool.setMaxThreadCount(browser_read_workers())
+        self._browser_generation_pool = QThreadPool(self)
+        self._browser_generation_pool.setMaxThreadCount(browser_generation_workers())
         self._browser_paused = False
         self._interactive_depth = 0
         self._accepting_requests = True
@@ -194,6 +199,32 @@ class ImageWorkCoordinator(QObject):
         self._browser_pool.start(runnable, int(priority))
         return True
 
+    def start_browser_read(self, runnable, priority):
+        if not self._accepting_requests or self._browser_paused:
+            return False
+        if self.browser_workers <= 0:
+            return self.start_browser(runnable, priority)
+        self._browser_runnables.add(runnable)
+        self._browser_read_pool.start(runnable, int(priority))
+        return True
+
+    def try_take_browser_read(self, runnable):
+        if self.browser_workers <= 0:
+            return self.try_take_viewer(runnable)
+        try:
+            return self._browser_read_pool.tryTake(runnable)
+        except RuntimeError:
+            return False
+
+    def start_browser_generation(self, runnable, priority):
+        if not self._accepting_requests or self._browser_paused:
+            return False
+        if self.browser_workers <= 0:
+            return self.start_browser(runnable, priority)
+        self._browser_runnables.add(runnable)
+        self._browser_generation_pool.start(runnable, int(priority))
+        return True
+
     def try_take_viewer(self, runnable: QRunnable) -> bool:
         try:
             lane = self._viewer_lane.get(runnable, "general")
@@ -210,12 +241,14 @@ class ImageWorkCoordinator(QObject):
         if self.browser_workers <= 0:
             return self.try_take_viewer(runnable)
         try:
-            return self._browser_pool.tryTake(runnable)
+            return self._browser_generation_pool.tryTake(runnable) or self._browser_pool.tryTake(runnable)
         except RuntimeError:
             return False
 
     def clear_browser_queue(self) -> None:
         self._browser_pool.clear()
+        self._browser_read_pool.clear()
+        self._browser_generation_pool.clear()
 
     def wait_for_viewer(self, msecs: int) -> bool:
         deadline = monotonic() + max(0, int(msecs)) / 1000
@@ -227,7 +260,11 @@ class ImageWorkCoordinator(QObject):
     def wait_for_browser(self, msecs: int) -> bool:
         if self.browser_workers <= 0:
             return self.wait_for_viewer(msecs)
-        return self._browser_pool.waitForDone(max(0, int(msecs)))
+        deadline = monotonic() + max(0, int(msecs))/1000
+        ordinary = self._browser_pool.waitForDone(self._remaining_msecs(deadline))
+        read = self._browser_read_pool.waitForDone(self._remaining_msecs(deadline))
+        generate = self._browser_generation_pool.waitForDone(self._remaining_msecs(deadline))
+        return ordinary and read and generate
 
     def shutdown(self, *, wait_msecs: int = 250) -> bool:
         if self._shutdown_complete:
@@ -239,6 +276,8 @@ class ImageWorkCoordinator(QObject):
         self._folder_viewer_pool.clear()
         self._current_viewer_pool.clear()
         self._browser_pool.clear()
+        self._browser_read_pool.clear()
+        self._browser_generation_pool.clear()
         deadline = monotonic() + max(0, int(wait_msecs)) / 1000
         viewer_done = self._viewer_pool.waitForDone(
             self._remaining_msecs(deadline)
@@ -247,9 +286,7 @@ class ImageWorkCoordinator(QObject):
             self._remaining_msecs(deadline)
         )
         current_done = self._current_viewer_pool.waitForDone(self._remaining_msecs(deadline))
-        browser_done = self._browser_pool.waitForDone(
-            self._remaining_msecs(deadline)
-        )
+        browser_done = self.wait_for_browser(self._remaining_msecs(deadline))
         if viewer_done and folder_done and current_done and browser_done:
             self._shutdown_complete = True
             self.last_shutdown_error = None
