@@ -516,3 +516,22 @@ This remains the Hybrid described above: retain Qt virtualization and modern
 resource ownership, with final display pixels prepared ahead of exposure. No
 additional ZipPla code is copied, and a separate viewport bitmap renderer is
 unnecessary for these read-lane and scheduling delays.
+
+### ZIP WebP geometry probing
+
+ZIP/CBZ WebP geometry no longer enters `QImageReader.size()` alongside parallel
+WebP pixel decodes. Folder WebP metadata already avoids that Qt path. The ZIP
+adapter now uses `webp_metadata.probe_webp_size` to inspect RIFF, VP8/VP8L/VP8X
+geometry and available EXIF orientation within its existing bounded header read.
+Ordinary dimensions need only the first header block. EXIF beyond the one-MiB
+probe budget leaves geometry unknown until the normal decode publishes it;
+the probe neither guesses an unrotated size nor decompresses an entire entry.
+The format reference is the [WebP container specification](https://developers.google.com/speed/webp/docs/riff_container).
+
+The NivisViewer source/runtime separation is retained. Replacing the scheduler
+with ZipPla's structure would not remove this Qt metadata call, and a further
+Hybrid scheduling bridge would add unrelated lifetime machinery. The selected
+new header parser preserves bounded ZIP work; reusing the folder Pillow WebP
+reader would materialize the entire encoded entry. Pixel decoding, cancellation,
+generation checks and display policy remain in their existing owners. No ZipPla
+code or additional dependency is introduced by this change.

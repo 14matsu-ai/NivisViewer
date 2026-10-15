@@ -49,6 +49,7 @@ from .creative_image_decoder import (
     probe_xcf_size_from_header,
 )
 from .folder_cover import is_cover_artifact_name
+from .webp_metadata import probe_webp_size
 from .psd_decoder import (
     PSD_HEADER_SIZE,
     decode_psd_image,
@@ -1680,6 +1681,21 @@ class ZipImageSource(ImageSource):
                         chunk = entry.read(max(0, min(limit, info.file_size) - header.size()))
                     header.append(chunk)
                     self._raise_if_cancelled(cancelled)
+                    if suffix == ".webp" or (
+                        header.startsWith(b"RIFF") and header.mid(8, 4) == b"WEBP"
+                    ):
+                        # WebP metadata must not enter QImageReader.size while
+                        # parallel jobs decode WebP pixels. The folder adapter
+                        # already avoids that path; ZIP must do so as well.
+                        # Keep the bounded ZIP read: EXIF beyond this budget is
+                        # resolved by the eventual decode, not a full-entry probe.
+                        logical = probe_webp_size(bytes(header), file_size=info.file_size)
+                        if logical is not None:
+                            self._size_cache[image_id] = logical
+                            return logical
+                        if header.size() >= info.file_size or not chunk:
+                            return None
+                        continue
                     # Both device methods and plugin reads stay in C++. Do
                     # not hold the ZIP lock during reader/plugin operations.
                     device = QBuffer(header)
