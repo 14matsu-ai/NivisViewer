@@ -462,15 +462,24 @@ class PageModel:
             int(self._spread_count_zero[1]) if total else 0
         )
 
-    def spread_at(self, start_index: int | None = None) -> DisplaySpread:
+    def spread_at(
+        self, start_index: int | None = None, *, sliding: bool | None = None,
+    ) -> DisplaySpread:
         if self.total_pages == 0:
             return DisplaySpread(0, tuple(), True)
 
         start = self.current_index if start_index is None else start_index
         start = max(0, min(start, self.total_pages - 1))
+        if sliding is None:
+            sliding = self._sliding_spread if start_index is None else False
+        # One-page navigation deliberately changes the pairing, including
+        # pairing the cover with page 1. Indexed/canonical units stay intact.
+        single = self.is_single_at(start)
+        if sliding and self.view_mode == "spread" and start == 0:
+            single = self.is_wide_image(start)
 
         if (
-            self.is_single_at(start)
+            single
             or start + 1 >= self.total_pages
             or self.is_wide_image(start + 1)
         ):
@@ -484,10 +493,15 @@ class PageModel:
             slots = (second, first)
         return DisplaySpread(start, slots, False)
 
-    def next_index_from(self, start_index: int) -> int:
+    def next_index_from(
+        self, start_index: int, *, preserve_alignment: bool = False,
+    ) -> int:
         if self.total_pages == 0:
             return 0
-        spread = self.spread_at(start_index)
+        spread = (
+            self.spread_at(start_index, sliding=True)
+            if preserve_alignment else self.spread_at(start_index)
+        )
         if not spread.slots:
             return 0
         max_index = max(slot.page_index for slot in spread.slots)
@@ -513,7 +527,7 @@ class PageModel:
             # through the fixed-boundary lookup below.
             candidate = start_index - 1
             while candidate >= 0:
-                candidate_next = self.next_index_from(candidate)
+                candidate_next = self.next_index_from(candidate, preserve_alignment=True)
                 if candidate_next == start_index:
                     return candidate
                 if candidate_next < start_index:
@@ -539,7 +553,7 @@ class PageModel:
         result: list[DisplaySpread] = []
         for _ in range(max(0, min(20, int(count)))):
             target = (
-                self.next_index_from(index) if step > 0
+                self.next_index_from(index, preserve_alignment=sliding) if step > 0
                 else self.previous_index_from(index, preserve_alignment=sliding)
             )
             if target == index:
@@ -547,7 +561,7 @@ class PageModel:
             index = target
             if sliding:
                 sliding = self._uses_shifted_spread_anchor(index)
-            result.append(self.spread_at(index))
+            result.append(self.spread_at(index, sliding=sliding))
         return tuple(result)
 
     def prefetch_spreads(
@@ -575,19 +589,19 @@ class PageModel:
         seen = {tuple((slot.page_index, slot.image_id) for slot in current.slots)}
         result: list[DisplaySpread] = []
 
-        def append_at(index: int) -> None:
-            spread = self.spread_at(index)
+        def append_at(index: int, sliding: bool) -> None:
+            spread = self.spread_at(index, sliding=sliding)
             identity = tuple((slot.page_index, slot.image_id) for slot in spread.slots)
             if spread.slots and identity not in seen:
                 seen.add(identity)
                 result.append(spread)
 
-        def normal_edges(sign: int, count: int) -> list[int]:
+        def normal_edges(sign: int, count: int) -> list[tuple[int, bool]]:
             index, sliding = self.current_index, self._sliding_spread
-            edges: list[int] = []
+            edges: list[tuple[int, bool]] = []
             for _ in range(count):
                 target = (
-                    self.next_index_from(index) if sign > 0
+                    self.next_index_from(index, preserve_alignment=sliding) if sign > 0
                     else self.previous_index_from(index, preserve_alignment=sliding)
                 )
                 if target == index:
@@ -595,16 +609,16 @@ class PageModel:
                 index = target
                 if sliding:
                     sliding = self._uses_shifted_spread_anchor(index)
-                edges.append(index)
+                edges.append((index, sliding))
             return edges
 
         preferred = normal_edges(step, forward_count)
         opposite = normal_edges(-step, reverse_count)
         # The immediate normal forward/reverse units retain ranks 1 and 2.
         if preferred:
-            append_at(preferred[0])
+            append_at(*preferred[0])
         if opposite:
-            append_at(opposite[0])
+            append_at(*opposite[0])
         # Resolve a focus on either current slot in O(1); focused_index's
         # generic source lookup can scan the whole book for the second slot.
         focused = next(
@@ -617,19 +631,22 @@ class PageModel:
         for sign in (step, -step):
             target = focused + sign
             if 0 <= target < self.total_pages:
-                append_at(target)
+                append_at(target, self.view_mode == "spread")
         for distance in range(1, max(len(preferred), len(opposite))):
             if distance < len(preferred):
-                append_at(preferred[distance])
+                append_at(*preferred[distance])
             if distance < len(opposite):
-                append_at(opposite[distance])
+                append_at(*opposite[distance])
         return tuple(result)
 
     def _uses_shifted_spread_anchor(self, index: int) -> bool:
         return bool(
             self.view_mode == "spread"
             and self.total_pages > 0
-            and index != self.spread_start_for_index(index)
+            and (
+                index != self.spread_start_for_index(index)
+                or (index == 0 and self.single_first_page)
+            )
         )
 
     def go_to_index(self, index: int) -> None:
@@ -663,7 +680,9 @@ class PageModel:
     def next(self) -> None:
         if self.total_pages:
             preserve_alignment = self._sliding_spread
-            self.current_index = self.next_index_from(self.current_index)
+            self.current_index = self.next_index_from(
+                self.current_index, preserve_alignment=preserve_alignment,
+            )
             self._focused_page_identity = self.page_identity(self.current_index)
             if preserve_alignment:
                 self._sliding_spread = self._uses_shifted_spread_anchor(

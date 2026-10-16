@@ -225,6 +225,60 @@ def test_single_navigation_obeys_cover_wide_and_last_page_rules() -> None:
     assert _indexes(model) == [5]
 
 
+@pytest.mark.parametrize("direction", ["ltr", "rtl"])
+def test_one_page_return_pairs_cover_without_changing_canonical_units(direction) -> None:
+    model = _model([(80, 120)] * 7, direction=direction)
+    revision = model.topology_revision
+    model.next()
+    assert _indexes(model) == [1, 2]
+    # The actual one-page destination must already be a warmup candidate.
+    assert any(sorted(s.page_index for s in unit.slots) == [0, 1]
+               for unit in model.prefetch_spreads(direction=-1))
+    model.previous_single()
+    assert _indexes(model) == [0, 1]
+    expected = [1, 0] if direction == "rtl" else [0, 1]
+    assert [s.page_index for s in model.spread_at().slots] == expected
+    assert model.single_first_page
+    assert model.spread_at(0).is_single
+    assert model.topology_revision == revision
+    model.set_image_sizes(((0, (80, 120)), (1, (80, 120))))
+    assert _indexes(model) == [0, 1]
+    for _ in range(2):
+        preview = model.next_display_spreads(count=2)
+        model.next()
+        assert model.spread_at() == preview[0]
+        assert _indexes(model) == [2, 3]
+        reverse = model.next_display_spreads(direction=-1, count=2)
+        model.previous()
+        assert model.spread_at() == reverse[0]
+        assert _indexes(model) == [0, 1]
+    model.first()
+    assert _indexes(model) == [0]
+    model.next()
+    model.previous()
+    assert _indexes(model) == [0]
+    model.next()
+    model.previous_single()
+    model.update_options(view_mode="single")
+    assert _indexes(model) == [0]
+    model.update_options(view_mode="spread")
+    assert _indexes(model) == [0]
+    model.next()
+    model.previous_single()
+    model.set_source(_MemorySource([(80, 120)] * 4))
+    assert _indexes(model) == [0]
+
+
+@pytest.mark.parametrize("sizes", [
+    [(80, 120)], [(160, 80), (80, 120)], [(80, 120), (160, 80)],
+])
+def test_one_page_cover_return_keeps_wide_and_last_page_single(sizes) -> None:
+    model = _model(sizes)
+    model.next_single()
+    model.previous_single()
+    assert _indexes(model) == [0]
+
+
 def test_delayed_dimensions_do_not_snap_sliding_anchor() -> None:
     model = _model([(80, 120)] * 6)
     model.go_to_index(1)
@@ -1775,6 +1829,31 @@ def test_bottom_trigger_clamps_and_legacy_edge_migrates(tmp_path: Path) -> None:
     )
     assert changed["fullscreen_top_edge_trigger_px"] == 32
     assert changed["fullscreen_bottom_edge_trigger_px"] == 12
+
+
+@pytest.mark.parametrize("direction", ["ltr", "rtl"])
+def test_canvas_one_page_return_publishes_cover_spread(tmp_path, qapp, direction) -> None:
+    window, _pages = _viewer_with_pages(tmp_path, qapp)
+    try:
+        window.set_reading_direction(direction)
+        window.config.apply({"viewer_canvas_click_direction": "auto"})
+        window.next_page()
+        _wait_for_applied_display(window, qapp)
+        x = 5 if direction == "ltr" else window.viewer.width() - 5
+        QTest.mouseClick(window.viewer, Qt.MouseButton.LeftButton,
+                         pos=QPoint(x, window.viewer.height() // 2))
+        _wait_for_applied_display(window, qapp)
+        assert _indexes(window.model) == [0, 1]
+        assert sorted(image.page_index for image in window.viewer._images) == [0, 1]
+        assert not window.viewer._spread.is_single
+        assert window.config.get("single_first_page") is True
+        window.page_navigation.first_page()
+        _wait_for_applied_display(window, qapp)
+        assert _indexes(window.model) == [0]
+        assert [image.page_index for image in window.viewer._images] == [0]
+    finally:
+        window.close()
+        qapp.processEvents()
 
 
 def test_canvas_click_moves_immediately_on_release_without_pending_timer(

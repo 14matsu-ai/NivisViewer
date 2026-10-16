@@ -87,10 +87,12 @@ class ViewerPageNavigationController(QObject):
             return False
         previous_focus = self.model.focused_index
         previous_anchor = self.model.current_index
+        previous_sliding = self.model.sliding_spread
         operation()
         if (
             self.model.focused_index == previous_focus
             and self.model.current_index == previous_anchor
+            and self.model.sliding_spread == previous_sliding
         ):
             return False
         self._on_page_changed(previous_focus, NavigationInputKind(input_kind))

@@ -88,7 +88,8 @@ def test_live_topology_index_tracks_incremental_page_model_layout(
 
 @pytest.mark.parametrize('reading_direction', ['ltr', 'rtl'])
 @pytest.mark.parametrize('cover', [False, True])
-def test_shifted_and_overlap_units_are_both_eligible(reading_direction, cover):
+@pytest.mark.parametrize('anchor', [0, 1, 2, 3])
+def test_shifted_and_overlap_units_are_both_eligible(reading_direction, cover, anchor):
     model = PageModel()
     model.update_options(reading_direction=reading_direction, single_first_page=cover)
     model.set_source(LazySource())
@@ -104,7 +105,7 @@ def test_shifted_and_overlap_units_are_both_eligible(reading_direction, cover):
         start = target
     topology = RasterBookTopology(units, identity_of=identity,
         page_indexes_of=page_indexes, page_count=129)
-    model.go_to_raw_index(2 if cover else 3)
+    model.go_to_raw_index(anchor)
     before = (model.current_index, model.focused_index, model.topology_revision)
     nearby = model.prefetch_spreads(direction=1)
     plan = RasterWarmupPlan(topology, current=model.spread_at(),
@@ -115,6 +116,8 @@ def test_shifted_and_overlap_units_are_both_eligible(reading_direction, cover):
         candidate = copy(model)
         getattr(candidate, command)()
         key = identity(candidate.spread_at())
+        if key == identity(model.spread_at()):
+            continue  # At the book edge this command does not move.
         assert key in ready
         assert plan.contains_identity(key)
         assert plan.unit_for_identity(key) is not None
