@@ -1748,3 +1748,9 @@ ENGLISH.update({
     '保存容量に上限を設定する': 'Limit saved cache capacity',
     'オフの場合、保存容量の上限はありません。RAMの上限とは別の設定です。': 'When off, saved cache capacity is unlimited. This setting is separate from the RAM limit.',
 })
+
+ENGLISH.update({
+    '正方形に近い画像を単独表示': 'Show nearly square images as single pages',
+    '正方形の許容差:': 'Square tolerance:',
+    '長辺に対する縦横の差です。10%なら短辺が長辺の90%以上の画像を単独表示します。0%は正方形だけが対象です。': 'Difference between width and height relative to the longer side. At 10%, images whose shorter side is at least 90% of the longer side are shown alone. At 0%, only exact squares qualify.',
+})

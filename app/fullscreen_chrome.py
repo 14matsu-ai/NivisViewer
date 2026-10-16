@@ -195,6 +195,40 @@ class FullscreenChromeController(QObject):
         self.hide_overlays()
         self.bottom_reveal_strip.hide()
 
+    def prepare_true_fullscreen(self) -> None:
+        """Establish fullscreen geometry and restoration without showing it.
+
+        A hidden Viewer can prepare final-sized pixels for its first display.
+        The actual surface remains hidden until enter_true_fullscreen().
+        """
+        if (self._shutdown or self.window.isFullScreen()
+                or self._fullscreen_restore_state is not None):
+            return
+        screen = self.window.screen()
+        normal_geometry = QRect(self.window.normalGeometry())
+        if not normal_geometry.isValid() or normal_geometry.isEmpty():
+            normal_geometry = QRect(self.window.geometry())
+        self._fullscreen_restore_state = _FullscreenRestoreState(
+            window_flags=self.window.windowFlags(),
+            normal_geometry=normal_geometry,
+            saved_geometry=QByteArray(self.window.saveGeometry()),
+            screen=screen,
+            was_maximized=self.window.isMaximized(),
+        )
+        target_geometry = (QRect(screen.geometry()) if screen is not None
+                           else QRect(self.window.geometry()))
+        self._fullscreen_transitioning = True
+        if self.window.isVisible() and self.window.isMaximized():
+            self.window.hide()
+        self.window.setWindowState(Qt.WindowState.WindowNoState)
+        self.window.setWindowFlags(
+            self._fullscreen_restore_state.window_flags
+            | Qt.WindowType.FramelessWindowHint
+        )
+        self._set_target_screen(screen)
+        self.window.setGeometry(target_geometry)
+        self._fullscreen_transitioning = False
+
     def enter_true_fullscreen(self) -> None:
         """Enter a full-monitor borderless state through a neutral state.
 
@@ -208,40 +242,11 @@ class FullscreenChromeController(QObject):
         if (
             self._shutdown
             or self.window.isFullScreen()
-            or self._fullscreen_restore_state is not None
         ):
             return
-        screen = self.window.screen()
-        normal_geometry = QRect(self.window.normalGeometry())
-        if not normal_geometry.isValid() or normal_geometry.isEmpty():
-            normal_geometry = QRect(self.window.geometry())
-        self._fullscreen_restore_state = _FullscreenRestoreState(
-            window_flags=self.window.windowFlags(),
-            normal_geometry=normal_geometry,
-            saved_geometry=QByteArray(self.window.saveGeometry()),
-            screen=screen,
-            was_maximized=self.window.isMaximized(),
-        )
-        target_geometry = (
-            QRect(screen.geometry())
-            if screen is not None
-            else QRect(self.window.geometry())
-        )
         native_monitor = self._capture_native_fullscreen_monitor()
+        self.prepare_true_fullscreen()
         self._fullscreen_transitioning = True
-
-        # setWindowFlags recreates the native surface and hides it.  Hide an
-        # already visible maximized window first so neither the neutral state
-        # nor the working-area bounds are presented to the user.
-        if self.window.isVisible() and self.window.isMaximized():
-            self.window.hide()
-        self.window.setWindowState(Qt.WindowState.WindowNoState)
-        self.window.setWindowFlags(
-            self._fullscreen_restore_state.window_flags
-            | Qt.WindowType.FramelessWindowHint
-        )
-        self._set_target_screen(screen)
-        self.window.setGeometry(target_geometry)
         # Qt 6.11.2 deliberately restricts frameless maximization to rcWork.
         # Enter its distinct fullscreen state from neutral instead. Do not
         # call QWidget.setGeometry after this: a changed rect clears that state.

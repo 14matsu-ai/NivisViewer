@@ -570,6 +570,7 @@ class BrowserWindow(QMainWindow):
     directory_scan_committed = Signal(str)
     location_changed = Signal(object, str)
     search_query_edited = Signal(object, str)
+    book_preparation_requested = Signal(object)
 
     def __init__(
         self,
@@ -6138,6 +6139,16 @@ class BrowserWindow(QMainWindow):
         self._update_index_rect(current)
         self._update_status()
         self._update_selected_detail()
+        self._request_selected_book_preparation()
+
+    def _request_selected_book_preparation(self) -> None:
+        index = self.list_view.currentIndex()
+        item = self.item_model.item_at(index)
+        if (item is None or item.kind is not BrowserItemKind.ARCHIVE
+                or not item.openable_by_nivisviewer or item.online_only
+                or not self.list_view.selectionModel().isSelected(index)):
+            item = None
+        self.book_preparation_requested.emit(item)
 
     def _begin_model_selection_change(self, *_args) -> None:
         self._model_selection_depth += 1
@@ -6157,6 +6168,7 @@ class BrowserWindow(QMainWindow):
             self._update_index_rect(index)
         self._update_status()
         self._update_selected_detail()
+        self._request_selected_book_preparation()
         self._update_file_action_states()
         workflow = getattr(self, "_browser_workflow", None)
         if workflow is not None:

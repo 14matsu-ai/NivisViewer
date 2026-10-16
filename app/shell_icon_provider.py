@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict, deque
+from dataclasses import dataclass
 import ctypes
 from ctypes import wintypes
 from math import ceil
@@ -18,6 +19,25 @@ from .browser_model import BrowserItem, BrowserItemKind
 
 
 _ICON_BUCKETS = (16, 20, 24, 32, 40, 48, 64, 96, 128, 256)
+
+
+@dataclass(frozen=True, slots=True)
+class _ShellIconPixels:
+    """Copied BGRA pixels, independent of Shell handles and Qt ownership."""
+
+    size: int
+    bgra: bytes
+
+
+def _image_from_shell_pixels(pixels: _ShellIconPixels | None) -> QImage:
+    if pixels is None or pixels.size <= 0 or len(pixels.bgra) != pixels.size ** 2 * 4:
+        return QImage()
+    # Allocate Qt-owned storage. No external Python buffer/cleanup callback
+    # crosses the Shell worker -> GUI boundary, and no image codec runs here.
+    image = QImage(pixels.size, pixels.size, QImage.Format.Format_ARGB32)
+    if not image.isNull():
+        image.bits()[:] = pixels.bgra
+    return image
 
 
 def physical_icon_bucket(logical_size: int, device_pixel_ratio: float) -> int:
@@ -63,19 +83,20 @@ class ShellAssociatedIconProvider(QObject):
             return
         self._icon_running = True
         key, extension, folder = self._icon_requests.popleft()
-        # The worker owns no QWidget, QPixmap, cache, or QObject. Its queue may
-        # outlive the window safely; no wait for native Shell at window close.
-        Thread(target=_load_association_image,
-               args=(self._windows_image, key, extension, folder, self._icon_results),
+        # The worker enters no Qt image/UI APIs and owns only plain pixels.
+        # Its queue may outlive the window; close never waits for native Shell.
+        Thread(target=_load_association_pixels,
+               args=(self._windows_pixels, key, extension, folder, self._icon_results),
                daemon=True).start()
 
     def _collect_icons(self):
         try:
-            key, image = self._icon_results.get_nowait()
+            key, pixels = self._icon_results.get_nowait()
         except Empty:
             return
         self._icon_running = False
         self._pending_icons.discard(key)
+        image = _image_from_shell_pixels(pixels)
         # Negative caching prevents repeated queries for unavailable handlers.
         self._image_cache[key] = image
         self._image_cache.move_to_end(key)
@@ -236,21 +257,31 @@ class ShellAssociatedIconProvider(QObject):
         except (AttributeError, OSError, ValueError):
             return QImage()
 
+    @staticmethod
+    def _windows_pixels(extension: str, *, folder: bool, physical_size: int) -> _ShellIconPixels | None:
+        if sys.platform != 'win32':
+            return None
+        try:
+            return _query_windows_shell_icon_pixels(extension, folder=folder,
+                                                    physical_size=physical_size)
+        except (AttributeError, OSError, ValueError):
+            return None
 
-def _load_association_image(query, key, extension, folder, results):
+
+def _load_association_pixels(query, key, extension, folder, results):
     initialized = False
-    image = QImage()
+    pixels = None
     try:
         if sys.platform == 'win32':
             initialized = ctypes.windll.ole32.CoInitializeEx(None, 2) in (0, 1)
-        image = query(extension, folder=folder, physical_size=key[1])
+        pixels = query(extension, folder=folder, physical_size=key[1])
     except Exception:
         # Optional decoration failure must not strand the bounded request lane.
-        image = QImage()
+        pixels = None
     finally:
         if initialized:
             ctypes.windll.ole32.CoUninitialize()
-        results.put((key, image))
+        results.put((key, pixels))
 
 
 class _GUID(ctypes.Structure):
@@ -322,6 +353,17 @@ def _query_windows_shell_icon_image(
     folder: bool,
     physical_size: int,
 ) -> QImage:
+    return _image_from_shell_pixels(_query_windows_shell_icon_pixels(
+        extension, folder=folder, physical_size=physical_size,
+    ))
+
+
+def _query_windows_shell_icon_pixels(
+    extension: str,
+    *,
+    folder: bool,
+    physical_size: int,
+) -> _ShellIconPixels | None:
     shell32 = ctypes.windll.shell32
     ctypes.windll.user32.DestroyIcon.argtypes = [ctypes.c_void_p]
     shell32.SHGetFileInfoW.restype = ctypes.c_size_t
@@ -344,7 +386,7 @@ def _query_windows_shell_icon_image(
         0x000004000 | 0x000000010,
     )
     if not result:
-        return QImage()
+        return None
     image_list_kind = (
         0
         if physical_size <= 16
@@ -369,7 +411,7 @@ def _query_windows_shell_icon_image(
         )
     )
     if hresult < 0 or not interface.value:
-        return QImage()
+        return None
     function_type = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
     try:
         vtable = ctypes.cast(
@@ -394,9 +436,9 @@ def _query_windows_shell_icon_image(
             )
         )
         if hresult < 0 or not icon_handle.value:
-            return QImage()
+            return None
         try:
-            return _copy_hicon(icon_handle, max(1, int(physical_size)))
+            return _copy_hicon_pixels(icon_handle, max(1, int(physical_size)))
         finally:
             ctypes.windll.user32.DestroyIcon(icon_handle)
     finally:
@@ -406,7 +448,7 @@ def _query_windows_shell_icon_image(
             pass
 
 
-def _copy_hicon(icon_handle: ctypes.c_void_p, size: int) -> QImage:
+def _copy_hicon_pixels(icon_handle: ctypes.c_void_p, size: int) -> _ShellIconPixels | None:
     user32 = ctypes.windll.user32
     gdi32 = ctypes.windll.gdi32
     user32.GetDC.restype = ctypes.c_void_p
@@ -461,7 +503,7 @@ def _copy_hicon(icon_handle: ctypes.c_void_p, size: int) -> QImage:
             gdi32.DeleteDC(memory_dc)
         if screen_dc:
             user32.ReleaseDC(None, screen_dc)
-        return QImage()
+        return None
     old_bitmap = gdi32.SelectObject(memory_dc, bitmap)
     try:
         user32.DrawIconEx(
@@ -479,13 +521,7 @@ def _copy_hicon(icon_handle: ctypes.c_void_p, size: int) -> QImage:
         if raw and not any(raw[index] for index in range(3, len(raw), 4)):
             for index in range(3, len(raw), 4):
                 raw[index] = 255
-        return QImage(
-            bytes(raw),
-            size,
-            size,
-            size * 4,
-            QImage.Format.Format_ARGB32,
-        ).copy()
+        return _ShellIconPixels(size, bytes(raw))
     finally:
         gdi32.SelectObject(memory_dc, old_bitmap)
         gdi32.DeleteObject(bitmap)

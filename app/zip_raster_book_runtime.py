@@ -110,6 +110,15 @@ def _bounded_physical_render_size(
     return max(1, round(width * scale)), max(1, round(height * scale))
 
 
+def _physical_render_size(
+    render_spec: "ZipRasterRenderSpec", width: float, height: float,
+) -> tuple[int, int]:
+    return _bounded_physical_render_size(render_spec, (
+        max(1, round(width * render_spec.device_pixel_ratio)),
+        max(1, round(height * render_spec.device_pixel_ratio)),
+    ))
+
+
 @dataclass(frozen=True)
 class ZipRasterPage:
     page_index: int
@@ -344,20 +353,60 @@ def _retained_source_size_for_page(
         page,
         decoder_maximum,
     ) and page.is_animated is False:
-        return _size_within_bounds(logical_size, decoder_maximum)
+        return _pillow_preview_size(render_spec, unit, page, logical_size, decoder_maximum)
     return logical_size
+
+
+def _pillow_preview_size(
+    render_spec: "ZipRasterRenderSpec",
+    unit: "ZipRasterDisplayUnit",
+    page: "ZipRasterPage",
+    logical_size: tuple[int, int],
+    decoder_maximum: DecoderMaximumSize,
+) -> tuple[int, int]:
+    """Size static PNG/WebP sources exactly like their final physical slot.
+
+    JPEG's native decoder bounds retain their ceil/tier semantics. Explicit
+    headroom, provisional layouts and transforms keep the existing bounds.
+    """
+    bounded = _size_within_bounds(logical_size, decoder_maximum)
+    if (not render_spec.decoder_layout_sized
+            or render_spec.decoder_headroom != 1.0
+            or render_spec.rotation % 360 != 0
+            or render_spec.split_wide_image
+            or render_spec.fit_mode not in _FIT_PREVIEW_MODES):
+        return bounded
+    sizes = tuple(logical_size if candidate.image_id == page.image_id else candidate.known_size
+                  for candidate in unit.pages)
+    if any(size is None for size in sizes):
+        return bounded
+    layout = calculate_spread_layout(
+        sizes, render_spec.viewport_size,
+        fit_mode=render_spec.fit_mode, manual_zoom=render_spec.manual_zoom,
+        gap=render_spec.gap, join_spread_pages=render_spec.join_spread_pages,
+        spread_is_single=unit.is_single,
+        horizontal_alignment=render_spec.horizontal_alignment,
+    )
+    for candidate, rect in zip(unit.pages, layout.rects):
+        if candidate.image_id == page.image_id:
+            target = _physical_render_size(render_spec, rect.width(), rect.height())
+            # Retain original pixels when the final frame needs enlargement.
+            if target[0] <= logical_size[0] and target[1] <= logical_size[1]:
+                return target
+    return bounded
 
 
 def _qimage_satisfies_source_requirement(
     qimage: QImage,
     original_size: tuple[int, int],
     maximum_size: DecoderMaximumSize | None,
+    *, required_pixels: tuple[int, int] | None = None,
 ) -> bool:
     if maximum_size is None:
         return (qimage.width(), qimage.height()) == original_size
-    required_width, required_height = _size_within_bounds(
-        original_size,
-        maximum_size,
+    required_width, required_height = (
+        required_pixels if required_pixels is not None
+        else _size_within_bounds(original_size, maximum_size)
     )
     return (
         qimage.width() >= required_width
@@ -987,7 +1036,14 @@ class _ZipRasterSourceStore:
             for key in group or ()
             if self._satisfies(self._sources[key],
                 _vector_size_for_page(render_spec, display_unit, page, self._sources[key].original_size)
-                if Path(page.image_id).suffix.casefold() in VECTOR_SUFFIXES else required_size)
+                if Path(page.image_id).suffix.casefold() in VECTOR_SUFFIXES else required_size,
+                required_pixels=(
+                    _pillow_preview_size(render_spec, display_unit, page,
+                                         self._sources[key].original_size, required_size)
+                    if self._sources[key].source_is_preview
+                    and _can_prepare_pillow_preview(render_spec, display_unit, page, required_size)
+                    else None
+                ))
         )
         if not candidates:
             return None
@@ -1419,6 +1475,7 @@ class _ZipRasterSourceStore:
     def _satisfies(
         source: _CachedSource,
         maximum_size: DecoderMaximumSize | None,
+        *, required_pixels: tuple[int, int] | None = None,
     ) -> bool:
         if Path(source.key.image_id).suffix.casefold() in VECTOR_SUFFIXES:
             required = vector_target_size(source.original_size, maximum_size)
@@ -1431,6 +1488,7 @@ class _ZipRasterSourceStore:
             source.qimage,
             source.original_size,
             maximum_size,
+            required_pixels=required_pixels,
         )
 
     @staticmethod
@@ -2081,17 +2139,8 @@ class _ZipRasterUnitJob(QRunnable):
                     )
                 )
                 continue
-            target_width = max(
-                1,
-                round(target_rect.width() * self.key.render_spec.device_pixel_ratio),
-            )
-            target_height = max(
-                1,
-                round(target_rect.height() * self.key.render_spec.device_pixel_ratio),
-            )
-            target_width, target_height = _bounded_physical_render_size(
-                self.key.render_spec,
-                (target_width, target_height),
+            target_width, target_height = _physical_render_size(
+                self.key.render_spec, target_rect.width(), target_rect.height(),
             )
             render_key = ViewerRenderKey(
                 image_id=image_id,
@@ -2234,7 +2283,9 @@ class _ZipRasterUnitJob(QRunnable):
                 if qimage is not None and not qimage.isNull():
                     original_size = (qimage.width(), qimage.height())
                     if preview_allowed and not self.cancelled.is_set():
-                        preview_size = _size_within_bounds(original_size, decoder_maximum)
+                        preview_size = _pillow_preview_size(
+                            spec, self.unit, page, original_size, decoder_maximum,
+                        )
                         if preview_size != original_size:
                             # Qt handles the costly static WebP decode. Keep
                             # the existing Pillow filter/alpha semantics and
@@ -2331,9 +2382,8 @@ class _ZipRasterUnitJob(QRunnable):
                         )
                         and int(getattr(adjusted, "n_frames", 1)) == 1
                     ):
-                        preview_size = _size_within_bounds(
-                            original_size,
-                            decoder_maximum,
+                        preview_size = _pillow_preview_size(
+                            spec, self.unit, page, original_size, decoder_maximum,
                         )
                         if preview_size != adjusted.size:
                             policy = ResamplingPolicy(
@@ -2504,6 +2554,12 @@ class _ZipRasterUnitJob(QRunnable):
                 cached.qimage,
                 logical_size,
                 decoder_maximum,
+                required_pixels=(
+                    _pillow_preview_size(self.key.render_spec, resolved_unit, page,
+                                         logical_size, decoder_maximum)
+                    if _can_prepare_pillow_preview(self.key.render_spec, resolved_unit, page, decoder_maximum)
+                    else None
+                ),
             ):
                 source_sizes.append(
                     (cached.qimage.width(), cached.qimage.height())
@@ -2737,6 +2793,7 @@ class RasterBookRuntime(QObject):
         current_extra: bool = False,
         near_prefetch_parallel: bool = False,
         near_prefetch_reserve: int = 2,
+        speculative: bool = False,
         prefetch_execution_mode: str = "reserve",
         adaptive_maximum: int = 8,
     ) -> None:
@@ -2747,6 +2804,8 @@ class RasterBookRuntime(QObject):
         super().__init__(parent)
         self.source = source
         self.source_epoch = int(source_epoch)
+        self.speculative = bool(speculative)
+        self._preparation_sizes: dict[int, tuple[int, int]] = {}
         self._source_identity = id(source)
         self._coordinator = image_work_coordinator
         self._thread_pool = QThreadPool(self)
@@ -2846,6 +2905,19 @@ class RasterBookRuntime(QObject):
     @property
     def metrics(self) -> ZipRasterRuntimeMetrics:
         return replace(self._metrics)
+
+    def preparation_image_sizes(self) -> tuple[tuple[int, tuple[int, int]], ...]:
+        """Carry a bounded metadata completion across the queued owner handoff."""
+        return tuple(self._preparation_sizes.items())
+
+    def activate_prepared_book(self) -> None:
+        self.speculative = False
+        self._preparation_sizes.clear()
+
+    def begin_prepared_handoff(self) -> None:
+        """Keep native jobs alive; let the receiving Viewer submit the next work."""
+        self._warmup_continue_timer.stop()
+        self._dispatch_suspended = True
 
     @property
     def auto_cache_growth_requested(self) -> bool:
@@ -3580,7 +3652,7 @@ class RasterBookRuntime(QObject):
                 self._adaptive_wait_serial = request.request_id
                 self._adaptive_wait_concurrency = max(1, RASTER_EXECUTION_BUDGET.limit)
             RASTER_EXECUTION_BUDGET.set_auto_current_pending(
-                self, current_key not in self._frame_store,
+                self, not self.speculative and current_key not in self._frame_store,
             )
         planner = self._warmup_planner
         if planner is None:
@@ -3675,7 +3747,7 @@ class RasterBookRuntime(QObject):
                 or self._has_pending_completion(current_key)
             )
             if active.key == current_key and not active_cancelled:
-                active.adopt_request(request.request_id, as_current=True)
+                active.adopt_request(request.request_id, as_current=not self.speculative)
             elif (
                 not active_cancelled
                 and self._active_job_is_artifact_compatible(active, request)
@@ -4726,12 +4798,15 @@ class RasterBookRuntime(QObject):
         layout_metadata_pages: tuple[ZipRasterPage, ...] | None = None,
         allow_encoded_prefetch: bool = True,
     ) -> bool:
+        if self.speculative:
+            priority = ImageWorkPriority.BROWSER_PREFETCH
+            allow_encoded_prefetch = False
         request = self._current_request
         unit = self._unit_for_key(key)
         if self._adaptive and key != self._current_key and not RASTER_EXECUTION_BUDGET.background_available():
             return False
         extra = not self._free_slot_available()
-        emergency_job = (self._burst_current and key == self._current_key and self._emergency_job is None
+        emergency_job = (not self.speculative and self._burst_current and key == self._current_key and self._emergency_job is None
                          and RASTER_EXECUTION_BUDGET.debug_values()['normal_permits'] >= RASTER_EXECUTION_BUDGET.limit
                          and RASTER_EXECUTION_BUDGET.current_available(emergency=True))
         full_background = (self._full_prefetch and key != self._current_key
@@ -4794,7 +4869,7 @@ class RasterBookRuntime(QObject):
             # granting either unknown page the other's whole free budget.
             reservation = max(reservation, available // 3)
         worker_budget = (
-            None if key == self._current_key or metadata_pages
+            None if (key == self._current_key and not self.speculative) or metadata_pages
             else self._prefetch_worker_budget(key)
         )
         if unknown_cost and self._max_active_jobs > 1 and worker_budget is not None:
@@ -4805,7 +4880,7 @@ class RasterBookRuntime(QObject):
                          and key.unit_identity in self._urgent_priority_identities(request)
                          and (self._full_prefetch or not any(not active.finished.is_set() for active in self._active_slots()))
                          and all(page.known_size is not None for page in unit.pages))
-        parallel = (self._spread_parallel and (key == self._current_key or near_parallel) and not metadata_pages
+        parallel = (not self.speculative and self._spread_parallel and (key == self._current_key or near_parallel) and not metadata_pages
                     and len(unit.pages) - len(cached_sources) == 2
                     and reservation + source_estimate <= available)
         if parallel:
@@ -4825,13 +4900,13 @@ class RasterBookRuntime(QObject):
             prefetch_budget_bytes=worker_budget,
             prefetch_hard_limit_bytes=(
                 None
-                if key == self._current_key or metadata_pages
+                if (key == self._current_key and not self.speculative) or metadata_pages
                 else self._cache_byte_budget
             ),
             spread_parallel=parallel,
             near_parallel=near_parallel and parallel,
             emergency_allowed=self._burst_current and extra_fits,
-            is_current=key == self._current_key,
+            is_current=key == self._current_key and not self.speculative,
         )
         if self._adaptive:
             missing = tuple(page for page in unit.pages if page.image_id not in cached_sources)
@@ -4851,7 +4926,7 @@ class RasterBookRuntime(QObject):
                     scratch += (size[0] * size[1] * 4 + retained[0] * retained[1] * 8 if suffix in _JPEG_SUFFIXES
                                 else size[0] * size[1] * 12)
             if not RASTER_EXECUTION_BUDGET.reserve_auto_memory(
-                    job, scratch, current=key == self._current_key and not extra and not emergency_job):
+                    job, scratch, current=key == self._current_key and not self.speculative and not extra and not emergency_job):
                 job.mark_removed_before_start()
                 return False
             job.auto_memory_reserved = True
@@ -5072,6 +5147,11 @@ class RasterBookRuntime(QObject):
                     image_id
                     for _index, image_id, _size in metadata.observations
                 )
+                if self.speculative:
+                    self._preparation_sizes.update(
+                        (index, size) for index, _image_id, size in metadata.observations
+                        if size is not None
+                    )
                 self._bump(
                     "layout_metadata_pages",
                     len(metadata.observations),
@@ -5089,6 +5169,12 @@ class RasterBookRuntime(QObject):
             self._emit_idle_if_needed()
             return
         if result.admission_declined:
+            if self.speculative:
+                # A selected book is optional work. Keep completed artifacts,
+                # but never spin/retry an over-budget current preparation.
+                self._dispatch_suspended = True
+                self._emit_idle_if_needed()
+                return
             request = self._current_request
             if result.oversized_prefetch:
                 self._bump("oversized_prefetch_skips")

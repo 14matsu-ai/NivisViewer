@@ -23,7 +23,7 @@ from tests.test_browser_thumbnail_ram_restore import wait_visible
 def test_first_two_system_wheels_use_prepared_association_badges(tmp_path, qapp, monkeypatch):
     from PySide6.QtCore import QPoint, QPointF
     from PySide6.QtGui import QWheelEvent
-    from app.shell_icon_provider import ShellAssociatedIconProvider
+    from app.shell_icon_provider import ShellAssociatedIconProvider, _ShellIconPixels
     root = tmp_path/'images'
     fixture_listing(root, 180)
     # Keep a second association out of the initial viewport. PNG signatures
@@ -34,10 +34,8 @@ def test_first_two_system_wheels_use_prepared_association_badges(tmp_path, qapp,
     queries = []
     def query(extension, *, folder, physical_size):
         queries.append((extension, physical_size))
-        image = QImage(physical_size, physical_size, QImage.Format.Format_RGB32)
-        image.fill(Qt.GlobalColor.red)
-        return image
-    monkeypatch.setattr(ShellAssociatedIconProvider, '_windows_image', staticmethod(query))
+        return _ShellIconPixels(physical_size, bytes((0, 0, 255, 255)) * physical_size ** 2)
+    monkeypatch.setattr(ShellAssociatedIconProvider, '_windows_pixels', staticmethod(query))
     old_lines = qapp.wheelScrollLines()
     qapp.setWheelScrollLines(12)
     window = make_browser(tmp_path, root, qapp, 5, False)
@@ -52,7 +50,7 @@ def test_first_two_system_wheels_use_prepared_association_badges(tmp_path, qapp,
         def unexpected(*args, **kwargs):
             unexpected_queries.append(args)
             return query(*args, **kwargs)
-        monkeypatch.setattr(ShellAssociatedIconProvider, '_windows_image', staticmethod(unexpected))
+        monkeypatch.setattr(ShellAssociatedIconProvider, '_windows_pixels', staticmethod(unexpected))
         cache = window.item_delegate._display_surface_cache
         before = cache.preparations
         for _ in range(2):

@@ -153,6 +153,7 @@ class FileOperationQueue(QObject):
         service: FileOperationService | None = None,
         planner: FileOperationPlanner | None = None,
         history_limit: int = 50,
+        execution_ready=None,
     ) -> None:
         super().__init__(parent)
         self.service = service or FileOperationService()
@@ -171,6 +172,11 @@ class FileOperationQueue(QObject):
         self._shutdown_timer = QTimer(self)
         self._shutdown_timer.setSingleShot(True)
         self._shutdown_timer.timeout.connect(self._on_shutdown_timeout)
+        self._execution_ready = execution_ready
+        self._gated_entry = None
+        self._execution_gate_timer = QTimer(self)
+        self._execution_gate_timer.setSingleShot(True)
+        self._execution_gate_timer.timeout.connect(self._retry_gated_execution)
 
     @property
     def lifecycle(self) -> FileOperationQueueState:
@@ -500,7 +506,24 @@ class FileOperationQueue(QObject):
             return
         self._start_execution(entry)
 
+    def _retry_gated_execution(self) -> None:
+        entry, self._gated_entry = self._gated_entry, None
+        if entry is not None:
+            self._start_execution(entry)
+
     def _start_execution(self, entry: _QueueEntry) -> None:
+        with self._lock:
+            if self._active is not entry:
+                return
+            needs_handles = (not self._closed and self._active is entry
+                             and not entry.cancelled.is_set())
+        if needs_handles and self._execution_ready is not None and not self._execution_ready():
+            # Optional selected-book reads must release Windows archive handles
+            # before a rename/move/delete starts. Drain asynchronously, keeping
+            # the GUI and operation cancellation responsive.
+            self._gated_entry = entry
+            self._execution_gate_timer.start(10)
+            return
         with self._lock:
             if self._closed or self._active is not entry:
                 if self._active is entry:

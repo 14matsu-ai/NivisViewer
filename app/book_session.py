@@ -3,7 +3,7 @@ from __future__ import annotations
 from .i18n import tr
 
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import inspect
 import logging
 from pathlib import Path
@@ -68,6 +68,8 @@ class _PreparedBook:
     error: ImageSourceError | None = None
     cancelled: bool = False
     trace_id: int = 0
+    viewer_runtime: RasterBookRuntime | None = None
+    image_sizes: tuple[tuple[int, tuple[int, int]], ...] = ()
 
 
 class _BookOpenSignals(QObject):
@@ -255,6 +257,7 @@ class BookSession(QObject):
         # remains on screen.
         self.generation = 0
         self._open_generation = 0
+        self._prepared_opens: dict[int, _PreparedBook] = {}
         self._source_factory = source_factory
         self._retired_sources: dict[int, ImageSource] = {}
         self._retired_viewer_runtimes: dict[int, RasterBookRuntime] = {}
@@ -412,12 +415,30 @@ class BookSession(QObject):
         sort_descending: bool = False,
         trace_id: int = 0,
         folder_snapshot: FolderListingSnapshot | None = None,
+        prepared_book: _PreparedBook | None = None,
     ) -> int:
         self.cancel_pending_open()
         self._open_generation += 1
         self._shutdown = False
         generation = self._open_generation
         cancelled = Event()
+        if prepared_book is not None and (
+            prepared_book.viewer_runtime is None
+            or prepared_book.viewer_runtime.source is not prepared_book.source
+            or prepared_book.viewer_runtime.source_epoch != self.generation + 1
+        ):
+            self._discard_prepared_book(prepared_book)
+            prepared_book = None
+        if prepared_book is not None:
+            runtime = prepared_book.viewer_runtime
+            if runtime is not None:
+                runtime.setParent(self)
+            self._open_cancel = cancelled
+            result = replace(prepared_book, generation=generation, trace_id=trace_id)
+            self._prepared_opens[generation] = result
+            QTimer.singleShot(0, lambda: self._on_async_prepared(
+                replace(result, cancelled=cancelled.is_set())))
+            return generation
         worker = _BookOpenWorker(
             self._source_factory,
             Path(path),
@@ -433,6 +454,54 @@ class BookSession(QObject):
         self._open_workers[generation] = worker
         self._open_pool.start(worker)
         return generation
+
+    def create_preparation_session(self, parent: QObject, byte_budget: int) -> BookSession:
+        """An isolated owner using the same factory, workers and next book epoch."""
+        session = BookSession(
+            parent=parent, source_factory=self._source_factory,
+            image_work_coordinator=self._image_work_coordinator,
+        )
+        session.generation = self.generation
+        session.set_viewer_parallelism(
+            workers=self._zip_worker_limit, zip_read_ahead=self._zip_read_ahead_enabled,
+            spread_parallel=self._spread_parallel_trial, current_extra=self._current_extra_trial,
+            near_prefetch_parallel=self._near_prefetch_parallel,
+            prefetch_execution_mode=self._prefetch_execution_mode,
+            adaptive_maximum=self._adaptive_maximum,
+        )
+        session._preparing_raster = True
+        session.set_viewer_runtime_memory_limits(
+            hard_limit_bytes=byte_budget, soft_target_bytes=byte_budget,
+        )
+        return session
+
+    def take_prepared_book(self) -> _PreparedBook | None:
+        """Move ownership without cancelling a running decode or copying pixels."""
+        runtime, source = self.viewer_runtime, self.source
+        if runtime is None or source is None or self.current_path is None:
+            return None
+        result = _PreparedBook(
+            self.current_path, source, getattr(self, "_prepared_selected_image", None), tuple(self.model.image_ids),
+            self.generation, viewer_runtime=runtime,
+            image_sizes=self.model.known_image_sizes(),
+        )
+        runtime.idle.disconnect(self._release_retired_viewer_runtime)
+        runtime.begin_prepared_handoff()
+        runtime.setParent(None)
+        self.viewer_runtime = None
+        self.source = None
+        self.current_path = None
+        self._pending_page_list_source = None
+        self._pending_page_list_image_ids = ()
+        self.model.clear_source()
+        return result
+
+    def _discard_prepared_book(self, result: _PreparedBook) -> None:
+        if result.viewer_runtime is not None:
+            result.viewer_runtime.idle.connect(self._release_retired_viewer_runtime)
+            self._retire_viewer_runtime(result.viewer_runtime)
+        if result.source is not None:
+            self._retire_source(result.source)
 
     def cancel_pending_open(self) -> None:
         cancelled = self._open_cancel
@@ -535,16 +604,17 @@ class BookSession(QObject):
     @Slot(object)
     @trace_gui_phase
     def _on_async_prepared(self, result: _PreparedBook) -> None:
+        self._prepared_opens.pop(result.generation, None)
         self._open_workers.pop(result.generation, None)
         if not self._open_workers:
             _RETIRED_BOOK_OPEN_POOLS.discard(self._open_pool)
         if self._shutdown or result.generation != self._open_generation:
-            if result.source is not None:
-                self._close_source(result.source)
+            self._discard_prepared_book(result)
             self._maybe_finalize_shutdown()
             return
         self._open_cancel = None
         if result.cancelled:
+            self._discard_prepared_book(result)
             self.async_open_failed.emit(
                 AsyncBookOpenFailed(
                     result.requested_path,
@@ -591,13 +661,17 @@ class BookSession(QObject):
                 list(result.image_ids),
                 result.selected_image,
             )
+            if result.image_sizes:
+                self.model.set_image_sizes(result.image_sizes)
+            if result.viewer_runtime is not None:
+                self.model.set_image_sizes(result.viewer_runtime.preparation_image_sizes())
             performance_trace.mark(
                 result.trace_id,
                 "page_model.constructed",
                 f"pages={self.model.total_pages}",
             )
         except Exception as exc:
-            self._close_source(result.source)
+            self._discard_prepared_book(result)
             error = ImageSourceError(tr('本を開けません: {p0}', p0=result.requested_path))
             error.__cause__ = exc
             self.error_occurred.emit(str(error))
@@ -613,6 +687,7 @@ class BookSession(QObject):
         old_source = self.source
         self.generation += 1
         self.source = result.source
+        self._prepared_selected_image = result.selected_image
         self.current_path = result.requested_path
         raster_fast_path = isinstance(
             result.source,
@@ -624,10 +699,29 @@ class BookSession(QObject):
             # deferred owners before installing C; running callbacks retain
             # their sources through the normal idle-drain maps.
             self.release_retired_book_resources()
-        self._replace_viewer_runtime(
-            result.source,
-            defer_retired_cleanup=raster_fast_path,
-        )
+        if result.viewer_runtime is not None:
+            runtime = result.viewer_runtime
+            if runtime.source is not result.source or runtime.source_epoch != self.generation:
+                raise ValueError("prepared runtime epoch/source mismatch")
+            old_runtime = self.viewer_runtime
+            self.viewer_runtime = runtime
+            runtime.setParent(self)
+            runtime.activate_prepared_book()
+            runtime.idle.connect(self._release_retired_viewer_runtime)
+            if self._configure_coordinator_workers and self._image_work_coordinator is not None:
+                self._image_work_coordinator.set_viewer_supplemental_workers(
+                    self._zip_worker_limit - 1, owner=self,
+                )
+            hard, soft = self._source_runtime_limits(result.source)
+            runtime.set_memory_limits(hard_limit_bytes=hard, soft_target_bytes=soft)
+            if old_runtime is not None:
+                self._retire_viewer_runtime(old_runtime, defer_cleanup=raster_fast_path)
+            self.viewer_runtime_changed.emit(runtime)
+        else:
+            self._replace_viewer_runtime(
+                result.source,
+                defer_retired_cleanup=raster_fast_path,
+            )
         self._replace_page_list_runtime(
             result.source,
             tuple(self.model.image_ids),
@@ -753,6 +847,7 @@ class BookSession(QObject):
                 near_prefetch_parallel=self._near_prefetch_parallel,
                 prefetch_execution_mode=self._prefetch_execution_mode,
                 adaptive_maximum=self._adaptive_maximum,
+                speculative=getattr(self, "_preparing_raster", False),
                 max_active_jobs=(
                     self._folder_worker_limit
                     if runtime_type is FolderRasterBookRuntime
@@ -978,6 +1073,7 @@ class BookSession(QObject):
     def _has_owned_async_work(self) -> bool:
         return bool(
             self._open_workers
+            or self._prepared_opens
             or self._retired_sources
             or any(
                 runtime.has_unfinished_tasks()

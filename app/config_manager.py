@@ -303,6 +303,8 @@ class ConfigManager(QObject):
         "gap": 12,
         "single_first_page": True,
         "treat_wide_image_as_single": True,
+        "treat_square_image_as_single": False,
+        "square_image_tolerance_percent": 10,
         "split_wide_image": False,
         "horizontal_alignment": "center",
         "brightness": 1.0,
@@ -1062,6 +1064,10 @@ class ConfigManager(QObject):
             minimum=SLIDESHOW_INTERVAL_MIN_MS,
             maximum=SLIDESHOW_INTERVAL_MAX_MS,
         )
+        normalized["square_image_tolerance_percent"] = cls._clamped_int(
+            normalized.get("square_image_tolerance_percent"),
+            default=10, minimum=0, maximum=30,
+        )
         for key in (
             "favorite_tabs_wrap_wheel",
             "history_double_click_to_open",
@@ -1080,6 +1086,7 @@ class ConfigManager(QObject):
             "join_spread_pages",
             "single_first_page",
             "treat_wide_image_as_single",
+            "treat_square_image_as_single",
             "thumbnail_disk_cache_enabled",
             "pdf_render_annotations",
             "viewer_prefetch_direction_priority_enabled",

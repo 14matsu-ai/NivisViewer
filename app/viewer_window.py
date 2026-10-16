@@ -400,6 +400,8 @@ class ViewerWindow(QMainWindow):
         self.join_spread_pages = bool(self.settings.get("join_spread_pages", False))
         self.single_first_page = bool(self.settings["single_first_page"])
         self.treat_wide_image_as_single = bool(self.settings["treat_wide_image_as_single"])
+        self.treat_square_image_as_single = bool(self.settings["treat_square_image_as_single"])
+        self.square_image_tolerance_percent = int(self.settings["square_image_tolerance_percent"])
         self.split_wide_image = bool(self.settings.get("split_wide_image", False))
         self.horizontal_alignment = str(self.settings.get("horizontal_alignment", "center"))
         self.brightness = max(0.1, min(3.0, float(self.settings.get("brightness", 1.0))))
@@ -953,6 +955,18 @@ class ViewerWindow(QMainWindow):
             self.show()
         self._apply_chrome_visibility()
 
+    def prepare_initial_render_layout(self) -> None:
+        """Resolve the opening viewport while a standby Viewer stays hidden."""
+        if not self.isVisible() and self._start_fullscreen:
+            self.fullscreen_chrome.prepare_true_fullscreen()
+            self._apply_chrome_visibility()
+        self.ensurePolished()
+        if self.layout() is not None:
+            self.layout().activate()
+        central = self.centralWidget()
+        if central is not None and central.layout() is not None:
+            central.layout().activate()
+
     def _request_open_path(self, path: str | Path) -> None:
         if self._open_path_handler is not None:
             self._open_path_handler(str(path), False, self)
@@ -1279,10 +1293,13 @@ class ViewerWindow(QMainWindow):
         self.single_first_action.triggered.connect(self.set_single_first_page)
         self.wide_single_action = QAction(tr('横長画像を単独表示'), self, checkable=True)
         self.wide_single_action.triggered.connect(self.set_treat_wide_image_as_single)
+        self.square_single_action = QAction(tr('正方形に近い画像を単独表示'), self, checkable=True)
+        self.square_single_action.triggered.connect(self.set_treat_square_image_as_single)
         self.split_wide_action = QAction(tr('横長画像を左右分割'), self, checkable=True)
         self.split_wide_action.triggered.connect(self.set_split_wide_image)
         view_menu.addAction(self.single_first_action)
         view_menu.addAction(self.wide_single_action)
+        view_menu.addAction(self.square_single_action)
         view_menu.addAction(self.split_wide_action)
         view_menu.addSeparator()
 
@@ -1733,6 +1750,8 @@ class ViewerWindow(QMainWindow):
             reading_direction=self.reading_direction,
             single_first_page=self.single_first_page,
             treat_wide_image_as_single=self.treat_wide_image_as_single,
+            treat_square_image_as_single=self.treat_square_image_as_single,
+            square_image_tolerance_percent=self.square_image_tolerance_percent,
         )
         self._sync_actions()
         self._update_status()
@@ -1854,6 +1873,12 @@ class ViewerWindow(QMainWindow):
             model_updates["treat_wide_image_as_single"] = (
                 self.treat_wide_image_as_single
             )
+        if "treat_square_image_as_single" in changed:
+            self.treat_square_image_as_single = bool(changed["treat_square_image_as_single"])
+            model_updates["treat_square_image_as_single"] = self.treat_square_image_as_single
+        if "square_image_tolerance_percent" in changed:
+            self.square_image_tolerance_percent = int(changed["square_image_tolerance_percent"])
+            model_updates["square_image_tolerance_percent"] = self.square_image_tolerance_percent
         if model_updates:
             self.model.update_options(**model_updates)
             refresh = True
@@ -2230,6 +2255,7 @@ class ViewerWindow(QMainWindow):
         self.rtl_action.setChecked(self.reading_direction == "rtl")
         self.single_first_action.setChecked(self.single_first_page)
         self.wide_single_action.setChecked(self.treat_wide_image_as_single)
+        self.square_single_action.setChecked(self.treat_square_image_as_single)
         self.split_wide_action.setChecked(self.split_wide_image)
         self.fit_window_action.setChecked(self.fit_mode == "fit_window")
         self.fit_no_upscale_action.setChecked(self.fit_mode == "fit_no_upscale")
@@ -2305,6 +2331,7 @@ class ViewerWindow(QMainWindow):
         browser_snapshot: AdjacentBookBrowserSnapshot | None = None,
         preserve_current_page: bool = False,
         slideshow_transition: bool = False,
+        prepared_book=None,
     ) -> bool:
         if slideshow_transition and self._slideshow_waiting_for_next:
             self._slideshow_opening_next = True
@@ -2355,6 +2382,7 @@ class ViewerWindow(QMainWindow):
             sort_descending=self.sort_descending,
             trace_id=self._active_open_trace_id,
             folder_snapshot=folder_snapshot,
+            prepared_book=prepared_book,
         )
         if suffix in ARCHIVE_EXTENSIONS | PDF_EXTENSIONS:
             self._set_status_override(
@@ -4073,9 +4101,6 @@ class ViewerWindow(QMainWindow):
             is_single=spread.is_single,
         )
         direction = self.presentation_state.direction
-        decoder_bound = self._current_book_runtime_decode_bounds()
-        if self.viewer.magnifier_selecting or self.viewer.magnifier_active:
-            decoder_bound = None
         background_enabled = self._raster_background_allowed()
         next_units = (
             tuple(
@@ -4118,7 +4143,36 @@ class ViewerWindow(QMainWindow):
             ),
         )
 
-        render_spec = RasterRenderSpec(
+        render_spec = self._raster_render_spec()
+        return RasterRequest(
+            self.book_session.generation,
+            self._active_request_id,
+            current,
+            warmup_plan,
+            render_spec,
+            navigation_direction=direction,
+            next_display_units=next_units,
+            reverse_priority_screens=int(self.config.get("viewer_prefetch_backward_screens", 1)),
+            resolve_layout_metadata=(
+                # ZIP header reconnaissance is cheap relative to full decode
+                # and is also useful in single-page mode for cost-aware early
+                # start of an approaching heavy page.
+                isinstance(source, ZipImageSource)
+                or (
+                    isinstance(source, FolderImageSource)
+                    # Folder header I/O remains limited to the layout-sensitive
+                    # spread case that originally required metadata preflight.
+                    and self.view_mode == "spread"
+                    and (self.treat_wide_image_as_single or self.treat_square_image_as_single)
+                )
+            ),
+        )
+
+    def _raster_render_spec(self) -> RasterRenderSpec:
+        decoder_bound = self._current_book_runtime_decode_bounds()
+        if self.viewer.magnifier_selecting or self.viewer.magnifier_active:
+            decoder_bound = None
+        return RasterRenderSpec(
             viewport_size=(
                 max(1, self.viewer.width()),
                 max(1, self.viewer.height()),
@@ -4145,29 +4199,6 @@ class ViewerWindow(QMainWindow):
             decoder_layout_sized=True,
             vector_minimum_size=(getattr(self, '_vector_magnifier_size', None)
                                  if self.viewer.magnifier_selecting or self.viewer.magnifier_active else None),
-        )
-        return RasterRequest(
-            self.book_session.generation,
-            self._active_request_id,
-            current,
-            warmup_plan,
-            render_spec,
-            navigation_direction=direction,
-            next_display_units=next_units,
-            reverse_priority_screens=int(self.config.get("viewer_prefetch_backward_screens", 1)),
-            resolve_layout_metadata=(
-                # ZIP header reconnaissance is cheap relative to full decode
-                # and is also useful in single-page mode for cost-aware early
-                # start of an approaching heavy page.
-                isinstance(source, ZipImageSource)
-                or (
-                    isinstance(source, FolderImageSource)
-                    # Folder header I/O remains limited to the layout-sensitive
-                    # spread case that originally required metadata preflight.
-                    and self.view_mode == "spread"
-                    and self.treat_wide_image_as_single
-                )
-            ),
         )
 
     def _activate_zip_runtime(self) -> None:
@@ -4582,6 +4613,8 @@ class ViewerWindow(QMainWindow):
             self.view_mode,
             self.single_first_page,
             self.treat_wide_image_as_single,
+            self.treat_square_image_as_single,
+            self.square_image_tolerance_percent,
             round(float(self.brightness), 6),
             round(float(self.contrast), 6),
             round(float(self.gamma), 6),
@@ -7461,6 +7494,10 @@ class ViewerWindow(QMainWindow):
         if self.model.total_pages:
             self._refresh_view()
         self.fullscreen_chrome.reevaluate_visibility()
+
+    def set_treat_square_image_as_single(self, checked: bool) -> None:
+        # The shared settings callback updates layout once for every Viewer.
+        self._update_shared_setting("treat_square_image_as_single", checked)
 
     def set_split_wide_image(self, checked: bool) -> None:
         self.viewer.cancel_magnifier()

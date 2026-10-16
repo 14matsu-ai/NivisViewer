@@ -32,6 +32,7 @@ from .adjacent_book_search import (
 )
 from .archive_backend_registry import ArchiveBackendRegistry
 from .browser_window import BrowserWindow
+from .browser_book_preparation import BrowserBookPreparation
 from .config_manager import ConfigManager
 from .gimp_xcf_backend import configure_gimp_executable
 from .supported_formats import configure_xcf_loading, configure_vector_loading
@@ -136,7 +137,7 @@ class ApplicationController(QObject):
         self.image_work_coordinator = ImageWorkCoordinator(self, max_workers=2)
         self.file_registration_service = file_registration_service
         self.config.settings_changed.connect(self._on_controller_settings_changed)
-        self.file_operation_queue = FileOperationQueue(self)
+        self.file_operation_queue = FileOperationQueue(self, execution_ready=self._release_prepared_file_handles)
         self.file_operation_coordinator = FileOperationCoordinator(
             self.metadata_store,
             self,
@@ -147,6 +148,13 @@ class ApplicationController(QObject):
         self._browser_window_factory = browser_window_factory
         self._viewer_windows: list[ViewerWindow] = []
         self._active_viewer: ViewerWindow | None = None
+        self._standby_viewer: ViewerWindow | None = None
+        self.book_preparation = BrowserBookPreparation(self._preparation_target, self)
+        self._book_preparation_refresh = QTimer(self)
+        self._book_preparation_refresh.setSingleShot(True)
+        self._book_preparation_refresh.timeout.connect(self._refresh_selected_book_preparation)
+        self.book_preparation.drained.connect(self._on_prepared_book_drained)
+        self.file_operation_queue.operation_preparing.connect(lambda _request: self.book_preparation.cancel('file_operation'))
         self._browser_window: BrowserWindow | None = None
         self._viewer_search_return_context: (
             _ViewerSearchReturnContext | None
@@ -278,6 +286,8 @@ class ApplicationController(QObject):
         window.search_query_edited.connect(
             self._on_browser_search_query_edited
         )
+        if hasattr(window, "book_preparation_requested"):
+            window.book_preparation_requested.connect(self._prepare_selected_book)
         window.directory_scan_committed.connect(
             self.adjacent_book_search.invalidate
         )
@@ -313,7 +323,14 @@ class ApplicationController(QObject):
     def create_viewer_window(self) -> ViewerWindow:
         if self._shutdown:
             raise RuntimeError("application is shutting down")
-        window = self._window_factory(
+        window = self._standby_viewer
+        self._standby_viewer = None
+        if window is None:
+            window = self._construct_viewer_window()
+        return self._register_viewer_window(window)
+
+    def _construct_viewer_window(self) -> ViewerWindow:
+        return self._window_factory(
             config_manager=self.config,
             metadata_store=self.metadata_store,
             open_path_handler=self._handle_viewer_open_request,
@@ -324,6 +341,46 @@ class ApplicationController(QObject):
             path_availability_service=self.path_availability_service,
             file_operation_coordinator=self.file_operation_coordinator,
         )
+
+    def _preparation_target(self) -> ViewerWindow | None:
+        if self._shutdown or self.file_operation_queue.busy:
+            return None
+        active = self.get_active_viewer()
+        if active is not None and self.settings.get("open_viewer_behavior") != "always_new":
+            return active if isinstance(active, ViewerWindow) else None
+        if self._standby_viewer is None:
+            self._standby_viewer = self._construct_viewer_window()
+        target = self._standby_viewer
+        return target if isinstance(target, ViewerWindow) else None
+
+    def _prepare_selected_book(self, item) -> None:
+        if self._shutdown:
+            return
+        self.book_preparation.select(None if self.file_operation_queue.busy else item)
+
+    def _refresh_selected_book_preparation(self) -> None:
+        browser = self.get_browser_window()
+        if (self._shutdown or not isinstance(browser, BrowserWindow) or browser._shutdown_prepared
+                or self.file_operation_queue.busy):
+            return
+        # A consumed preparation belongs to the Viewer and ends with it.
+        # Closing does not change the Browser selection: explicitly re-arm
+        # the existing bounded two-unit pipeline for the *current* selection.
+        browser._request_selected_book_preparation()
+        self.book_preparation.retry_selection()
+
+    def _release_prepared_file_handles(self) -> bool:
+        preparation = getattr(self, "book_preparation", None)
+        if preparation is None:
+            return True
+        preparation.cancel('file_operation')
+        return preparation._drain_retiring()
+
+    def _on_prepared_book_drained(self) -> None:
+        if self._shutdown and not self._shutdown_complete:
+            QTimer.singleShot(0, self.shutdown)
+
+    def _register_viewer_window(self, window) -> ViewerWindow:
         self._viewer_windows.append(window)
         window.set_close_request_handler(self.close_viewer_window)
         window._application_close_guard = self._allow_window_close
@@ -651,6 +708,7 @@ class ApplicationController(QObject):
             return True
         if not self._shutdown:
             self._shutdown = True
+            self._book_preparation_refresh.stop()
             self.startup_restore.cancel()
             active = self.get_active_viewer()
             if active is not None:
@@ -725,7 +783,14 @@ class ApplicationController(QObject):
         return True
 
     def _prepare_viewers_for_shutdown(self) -> bool:
-        complete = True
+        complete = self.book_preparation.shutdown()
+        standby = self._standby_viewer
+        if standby is not None:
+            if standby.prepare_shutdown() is False:
+                complete = False
+            else:
+                self._standby_viewer = None
+                standby.deleteLater()
         for window in tuple(self._viewer_windows):
             if window.prepare_shutdown() is False:
                 complete = False
@@ -814,6 +879,9 @@ class ApplicationController(QObject):
         )
         window.set_next_open_trace(trace_id)
         open_kwargs = dict(folder_snapshot=folder_snapshot, browser_snapshot=browser_snapshot)
+        prepared = self.book_preparation.take(path, window)
+        if prepared is not None:
+            open_kwargs["prepared_book"] = prepared
         if slideshow_transition:
             open_kwargs["slideshow_transition"] = True
         opened = window.open_path(path, **open_kwargs)
@@ -908,6 +976,7 @@ class ApplicationController(QObject):
         browser: object,
         _path: str,
     ) -> None:
+        self.book_preparation.cancel('browser_location_changed')
         context = self._viewer_search_return_context
         if context is not None and context.browser_ref() is browser:
             self._invalidate_viewer_search_return_context()
@@ -1007,6 +1076,7 @@ class ApplicationController(QObject):
         self._sync_displayed_item_in_current_browser(window)
 
     def _on_viewer_interactive_open_started(self, _window: object) -> None:
+        self.book_preparation.cancel('interactive_open')
         self.image_work_coordinator.begin_viewer_interactive()
 
     def _on_viewer_first_frame_ready(self, _window: object) -> None:
@@ -1016,6 +1086,8 @@ class ApplicationController(QObject):
         self.image_work_coordinator.cancel_viewer_interactive()
 
     def _on_viewer_closing(self, window: object) -> None:
+        if self.book_preparation._target() is window:
+            self.book_preparation.cancel('viewer_closed')
         if isinstance(window, ViewerWindow):
             self._side_folder_contexts.pop(id(window), None)
             self._side_folder_pending.pop(id(window), None)
@@ -1033,6 +1105,7 @@ class ApplicationController(QObject):
 
     def _on_browser_closing(self, window: object) -> None:
         if isinstance(window, BrowserWindow) and window is self._browser_window:
+            self.book_preparation.cancel('browser_closed')
             self._invalidate_viewer_search_return_context()
             self._cancel_adjacent_search(window)
             self._unregister_browser(window)
@@ -1068,6 +1141,9 @@ class ApplicationController(QObject):
         self.viewer_closed.emit(window)
         self.config.save()
         self._evaluate_application_exit()
+
+        if not self._shutdown:
+            self._book_preparation_refresh.start(0)
 
     def _unregister_browser(self, window: BrowserWindow) -> None:
         if window is not self._browser_window:
@@ -1584,6 +1660,9 @@ class ApplicationController(QObject):
             return False
 
     def _on_controller_settings_changed(self, changed: dict[str, object]) -> None:
+        preparation = getattr(self, "book_preparation", None)
+        if preparation is not None:
+            preparation.settings_changed(changed)
         if "gimp_executable" in changed:
             configure_gimp_executable(str(changed["gimp_executable"] or ""))
         if (

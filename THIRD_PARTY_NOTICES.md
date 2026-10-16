@@ -150,6 +150,18 @@ updated independently. This processing organization is treated as a direct
 structural port and as AGPL-3.0-or-later-derived. It is not a verbatim or
 line-for-line translation of the upstream C# source.
 
+`app/browser_book_preparation.py` and its `BookSession` / application-controller
+integration also structurally translate the selected-book prepare-before-open
+mechanism from the original ZipPla 1.7.2.9 import, fixed revision
+`5e942ef0006decf01c21d9dbe037dba50e763420` of the same repository.
+The reference methods are `CatalogForm.tvCatalog_SelectedIndexChanged`,
+`SetLookAheadArchive`, `PrepareLookAheadProcess`, `OpenWaitingProcess`, and
+`ViewerForm.tmWatchIpc_Tick` / `OpenFile(..., forLookAhead: true)`.
+This is AGPL-3.0-or-later-derived structure, Copyright (C) 2016-2017 Rio's
+Toolbox. NivisViewer transfers its existing Qt source/runtime owner and prepared
+frames instead of starting a hidden external process. The fixed-source mapping
+and ownership adaptations are recorded in `docs/ZIPPLAFORK_COMPARISON.md`.
+
 NivisViewer's `app/viewer_page_list_runtime.py` and its integration in
 `app/book_session.py` and `app/viewer_window.py` adopt the visible-only
 thumbnail ownership structure from `source/ZipPla/CatalogForm.cs`:

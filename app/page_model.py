@@ -63,6 +63,8 @@ class PageModel:
         self.reading_direction = "rtl"
         self.single_first_page = True
         self.treat_wide_image_as_single = True
+        self.treat_square_image_as_single = False
+        self.square_image_tolerance_percent = 10
         self._size_cache: dict[int, tuple[int, int] | None] = {}
         self._spread_start_by_index = _SpreadStartIndexView(self)
         self._spread_tree_base = 1
@@ -151,6 +153,10 @@ class PageModel:
         self._sliding_spread = False
         self._rebuild_spread_boundaries()
 
+    def known_image_sizes(self) -> tuple[tuple[int, tuple[int, int]], ...]:
+        """Export observed metadata without probing unvisited pages."""
+        return tuple((index, size) for index, size in self._size_cache.items() if size is not None)
+
     def update_options(
         self,
         *,
@@ -158,6 +164,8 @@ class PageModel:
         reading_direction: str | None = None,
         single_first_page: bool | None = None,
         treat_wide_image_as_single: bool | None = None,
+        treat_square_image_as_single: bool | None = None,
+        square_image_tolerance_percent: int | None = None,
     ) -> None:
         if view_mode is not None:
             self.view_mode = view_mode
@@ -167,6 +175,10 @@ class PageModel:
             self.single_first_page = single_first_page
         if treat_wide_image_as_single is not None:
             self.treat_wide_image_as_single = treat_wide_image_as_single
+        if treat_square_image_as_single is not None:
+            self.treat_square_image_as_single = treat_square_image_as_single
+        if square_image_tolerance_percent is not None:
+            self.square_image_tolerance_percent = max(0, min(30, int(square_image_tolerance_percent)))
         self._sliding_spread = False
         self._rebuild_spread_boundaries()
         self.current_index = self.spread_start_for_index(self.focused_index)
@@ -267,8 +279,8 @@ class PageModel:
         changed_boundaries = tuple(
             index
             for index, size in changes.items()
-            if self._cached_size_is_wide(index)
-            != (self.treat_wide_image_as_single and self._size_is_wide(size))
+            if self._size_needs_single_page(self._size_cache.get(index))
+            != self._size_needs_single_page(size)
         )
         self._size_cache.update(changes)
         if changed_boundaries and self.view_mode == "spread":
@@ -299,17 +311,30 @@ class PageModel:
         width, height = size
         return height > 0 and width / height >= 1.25
 
-    def _cached_size_is_wide(self, index: int) -> bool:
-        if not self.treat_wide_image_as_single:
+    def _size_needs_single_page(self, size: tuple[int, int] | None) -> bool:
+        if self.treat_wide_image_as_single and self._size_is_wide(size):
+            return True
+        if not self.treat_square_image_as_single or size is None:
             return False
-        return self._size_is_wide(self._size_cache.get(index))
+        width, height = size
+        return (
+            width > 0 and height > 0
+            and min(width, height) * 100
+            >= max(width, height) * (100 - self.square_image_tolerance_percent)
+        )
+
+    def is_independent_image(self, index: int) -> bool:
+        """Apply all shape-based single-page options using existing metadata."""
+        if not (self.treat_wide_image_as_single or self.treat_square_image_as_single):
+            return False
+        return self._size_needs_single_page(self.get_image_size(index))
 
     def is_single_at(self, index: int) -> bool:
         if self.view_mode == "single":
             return True
         if self.single_first_page and index == 0:
             return True
-        return self.is_wide_image(index)
+        return self.is_independent_image(index)
 
     def spread_start_for_index(self, target_index: int) -> int:
         if self.total_pages == 0:
@@ -476,12 +501,12 @@ class PageModel:
         # pairing the cover with page 1. Indexed/canonical units stay intact.
         single = self.is_single_at(start)
         if sliding and self.view_mode == "spread" and start == 0:
-            single = self.is_wide_image(start)
+            single = self.is_independent_image(start)
 
         if (
             single
             or start + 1 >= self.total_pages
-            or self.is_wide_image(start + 1)
+            or self.is_independent_image(start + 1)
         ):
             image_id = self.image_ids[start]
             return DisplaySpread(start, (PageSlot(image_id, start),), True)

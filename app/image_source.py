@@ -75,6 +75,18 @@ _PILLOW_FORMAT_BY_SUFFIX = {
 _ANIMATION_PROBE_BYTES = 1024 * 1024
 
 
+def _orient_first_frame(image: Image.Image, *, animated: bool) -> Image.Image:
+    """Transfer a loaded static PNG's pixels without a full-raster copy.
+
+    Callers own the input stream and close it before returning the image.
+    Animated formats retain the detached first-frame behavior.
+    """
+    if image.format == "PNG" and not animated:
+        ImageOps.exif_transpose(image, in_place=True)
+        return image
+    return ImageOps.exif_transpose(image)
+
+
 def _pillow_formats_for_image(image_id: str, data: bytes) -> tuple[str, ...] | None:
     """Limit Pillow's malformed-file scan while keeping common mislabels readable."""
     prefix = data[:16]
@@ -1001,16 +1013,16 @@ class FolderImageSource(ImageSource):
             _require_image_decoder(image_id)
             data = _read_image_file_bytes(image_id)
             self._remember_folder_metadata(image_id, byte_count=len(data))
-            with Image.open(
-                io.BytesIO(data),
-                formats=_pillow_formats_for_image(image_id, data),
-            ) as image:
+            with (
+                io.BytesIO(data) as stream,
+                Image.open(stream, formats=_pillow_formats_for_image(image_id, data)) as image,
+            ):
                 image.seek(0)
                 source_is_animated = bool(
                     getattr(image, "is_animated", False)
                     or int(getattr(image, "n_frames", 1)) != 1
                 )
-                result = ImageOps.exif_transpose(image)
+                result = _orient_first_frame(image, animated=source_is_animated)
                 result.load()
                 setattr(result, "_nivis_source_is_animated", source_is_animated)
                 self._remember_folder_metadata(image_id, size=result.size)
@@ -1303,6 +1315,7 @@ class ZipImageSource(ImageSource):
             return self._open_vector_image(image_id)
         _require_image_decoder(image_id)
         cancelled = self._begin_request(image_id)
+        stream = None
         try:
             stream = self._read_entry_stream(image_id, cancelled)
             self._raise_if_cancelled(cancelled)
@@ -1325,7 +1338,7 @@ class ZipImageSource(ImageSource):
                         getattr(image, "is_animated", False)
                         or int(getattr(image, "n_frames", 1)) != 1
                     )
-                    result = ImageOps.exif_transpose(image)
+                    result = _orient_first_frame(image, animated=source_is_animated)
                     result.load()
                     setattr(
                         result,
@@ -1344,6 +1357,8 @@ class ZipImageSource(ImageSource):
         except Exception as exc:
             raise ImageSourceError(tr('書庫内の画像を読み込めません: {p0}', p0=image_id)) from exc
         finally:
+            if stream is not None:
+                stream.close()
             self._finish_request(image_id, cancelled)
 
     def open_qimage(self, image_id: str) -> QImage | None:
@@ -2244,9 +2259,13 @@ class SevenZipImageSource(ImageSource):
                 result = decode_creative_image(data, suffix=suffix)
                 setattr(result, "_nivis_source_is_animated", False)
                 return result
-            with Image.open(io.BytesIO(data)) as image:
+            with io.BytesIO(data) as stream, Image.open(stream) as image:
                 image.seek(0)
-                return ImageOps.exif_transpose(image).copy()
+                animated = bool(getattr(image, "is_animated", False)
+                                or int(getattr(image, "n_frames", 1)) != 1)
+                result = _orient_first_frame(image, animated=animated)
+                setattr(result, "_nivis_source_is_animated", animated)
+                return result
         except Exception as exc:
             self._discard_payload(image_id)
             raise ImageSourceError(tr('書庫内の画像を読み込めません: {p0}', p0=image_id), code="decode_failed") from exc

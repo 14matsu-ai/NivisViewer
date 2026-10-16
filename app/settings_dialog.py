@@ -389,6 +389,7 @@ TAB_SETTING_KEYS: dict[str, tuple[str, ...]] = {
     "viewer": (
         "open_viewer_behavior", "bring_viewer_to_front_on_open", "loop_book_navigation",
         "join_spread_pages", "gap", "single_first_page", "treat_wide_image_as_single",
+        "treat_square_image_as_single", "square_image_tolerance_percent",
         "book_open_position", "viewer_canvas_click_direction", "viewer_canvas_left_click_action",
         "viewer_slider_wheel_single_page_enabled", "magnifier_allow_outside_image",
         "viewer_prefetch_preset", "viewer_prefetch_direction_priority_enabled",
@@ -1291,6 +1292,8 @@ class SettingsDialog(QDialog):
         self.gap_spin.setValue(int(defaults["gap"]))
         self.single_first_checkbox.setChecked(bool(defaults["single_first_page"]))
         self.wide_single_checkbox.setChecked(bool(defaults["treat_wide_image_as_single"]))
+        self.square_single_checkbox.setChecked(bool(defaults["treat_square_image_as_single"]))
+        self.square_tolerance_spin.setValue(int(defaults["square_image_tolerance_percent"]))
         self._select_data(self.book_open_position_combo, defaults["book_open_position"])
         self._select_data(self.viewer_canvas_click_direction_combo, defaults["viewer_canvas_click_direction"])
         self._select_data(self.viewer_canvas_left_click_combo, defaults["viewer_canvas_left_click_action"])
@@ -1986,6 +1989,15 @@ class SettingsDialog(QDialog):
         spread_form.addRow(self.single_first_checkbox)
         self.wide_single_checkbox = QCheckBox(tr('横長画像を単独表示'), spread_group)
         spread_form.addRow(self.wide_single_checkbox)
+        self.square_single_checkbox = QCheckBox(tr('正方形に近い画像を単独表示'), spread_group)
+        spread_form.addRow(self.square_single_checkbox)
+        self.square_tolerance_spin = QSpinBox(spread_group)
+        self.square_tolerance_spin.setRange(0, 30)
+        self.square_tolerance_spin.setSuffix(" %")
+        self.square_tolerance_spin.setToolTip(tr('長辺に対する縦横の差です。10%なら短辺が長辺の90%以上の画像を単独表示します。0%は正方形だけが対象です。'))
+        self.square_tolerance_spin.setEnabled(False)
+        self.square_single_checkbox.toggled.connect(self.square_tolerance_spin.setEnabled)
+        spread_form.addRow(tr('正方形の許容差:'), self.square_tolerance_spin)
         self.book_open_position_combo = QComboBox(spread_group)
         self.book_open_position_combo.addItem(
             tr('常に先頭ページから開く'),
@@ -3712,6 +3724,12 @@ class SettingsDialog(QDialog):
         self.wide_single_checkbox.setChecked(
             bool(self.config.get("treat_wide_image_as_single", True))
         )
+        self.square_single_checkbox.setChecked(
+            bool(self.config.get("treat_square_image_as_single", False))
+        )
+        self.square_tolerance_spin.setValue(
+            int(self.config.get("square_image_tolerance_percent", 10))
+        )
         self._select_data(
             self.book_open_position_combo,
             self.config.get("book_open_position", "first_page"),
@@ -4571,6 +4589,8 @@ class SettingsDialog(QDialog):
             "gap": self.gap_spin.value(),
             "single_first_page": self.single_first_checkbox.isChecked(),
             "treat_wide_image_as_single": self.wide_single_checkbox.isChecked(),
+            "treat_square_image_as_single": self.square_single_checkbox.isChecked(),
+            "square_image_tolerance_percent": self.square_tolerance_spin.value(),
             "book_open_position": str(
                 self.book_open_position_combo.currentData() or "first_page"
             ),

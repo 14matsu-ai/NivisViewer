@@ -535,3 +535,89 @@ new header parser preserves bounded ZIP work; reusing the folder Pillow WebP
 reader would materialize the entire encoded entry. Pixel decoding, cancellation,
 generation checks and display policy remain in their existing owners. No ZipPla
 code or additional dependency is introduced by this change.
+
+### Static PNG ownership and final-size preparation
+
+Static PNG sources now apply EXIF orientation in place and transfer the loaded
+image to their caller. Folder, ZIP and external-archive adapters close their
+owned encoded streams before returning; the pixel owner remains valid until
+the caller closes it. Animated formats keep a detached first frame.
+
+For static PNG/WebP fit views, source preparation, retained-source estimates,
+cache reuse and final rendering share the same rounded physical slot size.
+This removes an intermediate ceil-sized resize followed by another resize for
+a one- or two-pixel difference. JPEG native reduction tiers, explicit decoder
+headroom, transformed views and full-pixel demands retain their existing rules.
+Larger layouts and magnifier requests still require a sufficient source.
+
+The selected design retains the NivisViewer source/runtime/cache split and
+improves its pixel ownership and size contract. ZipPla-style final-size
+retention supports the same goal, but replacing the scheduler would not remove
+these copies or rounding differences. A further Hybrid bridge adds no value;
+a new PNG decoder remains an unmeasured alternative. No ZipPla code is copied,
+and no thread, cache, decoder dependency or publication route is added.
+
+### Selected archive preparation before opening
+
+Reference: `himamon/ZipPlaFork`, original ZipPla 1.7.2.9 import revision
+`5e942ef0006decf01c21d9dbe037dba50e763420`, AGPL-3.0-or-later,
+Copyright (C) 2016-2017 Rio's Toolbox. The existing license and notices remain
+in `licenses/ZipPlaFork/` and `THIRD_PARTY_NOTICES.md`.
+
+| Fixed source structure | NivisViewer adaptation |
+| --- | --- |
+| `CatalogForm.cs`, `tvCatalog_SelectedIndexChanged`, `SetLookAheadArchive`, `PrepareLookAheadProcess` | `BrowserWindow.book_preparation_requested` and `BrowserBookPreparation`: coalesce selection changes, prepare only the selected archive with one cancellable owner |
+| `ViewerForm.cs`, `tmWatchIpc_Tick` / `OpenFile(..., forLookAhead: true)` and `bmwLoadEachPage_DoWork` | Reuse `BookSession` and `RasterBookRuntime` to prepare the first display unit and its successor, including decode and final physical-size resize |
+| `CatalogForm.OpenWaitingProcess` and the matching-target `Show` path in `ViewerForm.tmWatchIpc_Tick` | `BookSession.take_prepared_book` / `open_book_async`: move the source, runtime, completed frames and running jobs into the actual Viewer without reopening or copying pixels |
+
+This is a structural translation of the prepare-before-open mechanism. It uses
+Qt object ownership and the existing generation/request fences instead of a
+hidden external Viewer process. An unregistered empty Viewer may be constructed
+to establish the first window's real viewport and DPI; it becomes the normal
+registered Viewer on open. Preparation itself uses no Viewer presentation or
+history/progress side effects. A changed target, book revision, layout or render
+setting falls back to the ordinary opening path.
+
+For an initial fullscreen open, the hidden Viewer establishes fullscreen
+geometry, chrome placement and dock visibility before rendering; showing it
+then uses that same layout while preserving the normal-window restore state.
+Selection changes coalesce within one event turn, without a fixed delay before
+starting preparation. Unrelated shared settings retain the owner; render
+changes rebuild it. Viewer-to-Browser selection synchronization skips a book
+already open in the target Viewer. Preparation/adoption diagnostics record
+timings and rejection reasons without book names or paths.
+
+When a Viewer closes, its book owner is released normally. The controller then
+rechecks the current Browser selection and reuses this same bounded preparation
+pipeline for the cover and next display unit, including an unchanged selection
+previously skipped because that book was already open. This avoids a second
+cache or a reverse ownership transfer from a closing Viewer. A newer selection,
+Browser close, file operation or application shutdown supersedes that retry.
+Opening before the retry finishes can still require the remaining decode work.
+
+Browser association-icon acquisition publishes copied BGRA bytes after releasing
+its Windows Shell/GDI/COM resources. The GUI collector creates a small Qt-owned
+image from those bytes without invoking a codec. The native acquisition thread
+does not enter Qt image constructors or retain a Python-backed QImage buffer.
+This removes the Shell-to-Qt overlap observed during simultaneous hidden-Viewer
+menu construction. The exact native lock was not identified; this boundary
+change is a NivisViewer adaptation and imports no additional ZipPla code.
+
+The preparation owner retains only two display units, uses low-priority work,
+and caps its cache at the smaller of the configured Viewer limit, 256 MiB and
+one eighth of available RAM. Pixel admission still checks the actual retained
+cost. Header observations also reject speculative full-raster scratch work that
+would exceed one quarter of available RAM. Selection replacement drains the
+old native job before starting the latest candidate; unlimited Viewer prefetch
+does not expand this selected-book preparation into an all-book warmup.
+Prepared owners also yield under observed RAM pressure. File operations cancel
+optional preparation and asynchronously drain its Windows archive handles before
+execution. Shutdown resumes when an uninterruptible native decode finishes;
+the source stays owned until its queued completion has drained.
+
+The selected Hybrid design combines ZipPla's earlier start with NivisViewer's
+existing decode, resize, budget, cancellation and atomic spread publication.
+Keeping NivisViewer's open-after-click timing cannot hide the first image work.
+Copying ZipPla's hidden-process lifetime wholesale would duplicate Qt/UI
+ownership. A new codec or independent decoder pipeline is not justified by
+the same-image PNG measurements and would add another resource lifetime.
