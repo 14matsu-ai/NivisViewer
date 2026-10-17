@@ -1134,6 +1134,105 @@ def test_same_location_sort_rating_and_thumbnail_changes_keep_search(
         qapp.processEvents()
 
 
+@pytest.mark.parametrize('route', ['tree', 'favorite', 'history'])
+def test_sidebar_reopening_current_folder_clears_search(tmp_path, qapp, route):
+    from tests.test_application_controller import make_controller, close_controller
+    folder = tmp_path / 'books'
+    write_image(folder / 'a {zpi$r=4}.jpg')
+    write_image(folder / 'keep {zpi$r=4}.jpg')
+    write_image(folder / 'low {zpi$r=1}.jpg')
+    controller = make_controller(tmp_path, qapp)
+    controller._restore_on_start = False
+    window = controller.create_browser_window()
+    window.show()
+    try:
+        assert window.navigate_to(folder)
+        finish_scan(window, qapp)
+        controller.metadata_store.add_group_favorite(window.folder_bookmark_model.group_id, str(folder))
+        controller.metadata_store.record_book_opened(str(folder), item_type='folder', start_page_index=0, total_pages=0)
+        window.search_history.record('keep')
+        window._set_browser_filter(BrowserFilterState.normalized(
+            search_text='keep', rating_mode=RatingFilterMode.AT_LEAST, rating_reference=3))
+        qapp.processEvents()
+        assert window.item_model.rowCount() == 1
+        generation = window._scan_generation
+        window.folder_tree.setFocus()
+        if route == 'tree':
+            index = window.file_system_model.index(str(folder))
+            assert index.isValid()
+            window.folder_tree.navigationConfirmed.emit(index)
+        else:
+            model, open_entry = {
+                'favorite': (window.folder_bookmark_model, window.open_folder_bookmark),
+                'history': (window.history_model, window.open_history),
+            }[route]
+            row = next(row for row in range(model.rowCount()) if model.entry_at(row).path == str(folder))
+            open_entry(model.index(row, 0))
+        qapp.processEvents()
+        assert window.active_search_query == ''
+        assert window.browser_search_edit.text() == ''
+        assert window.search_history.entries == ('keep',)
+        assert window.browser_filter_state.rating_reference == 3
+        assert window.browser_filter_state.rating_mode is RatingFilterMode.AT_LEAST
+        assert window.item_model.rowCount() == 2
+        assert window.current_path == folder
+        assert window._scan_generation == generation
+        assert window.list_view.hasFocus()
+        assert window.list_view.currentIndex().row() == 0
+    finally:
+        close_controller(controller, qapp)
+
+
+def test_same_folder_sidebar_open_cancels_pending_search(tmp_path, qapp):
+    folder = tmp_path / 'books'
+    write_image(folder / 'a.jpg')
+    write_image(folder / 'keep.jpg')
+    window = make_window(tmp_path, folder, qapp)
+    try:
+        window.browser_search_edit.setText('keep')
+        assert window._browser_search_timer.isActive()
+        window.folder_tree.navigationConfirmed.emit(window.file_system_model.index(str(folder)))
+        assert window.browser_search_edit.text() == ''
+        assert not window._browser_search_timer.isActive()
+        QTest.qWait(window._browser_search_timer.interval() + 20)
+        assert window.active_search_query == ''
+        assert window.item_model.rowCount() == 2
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+@pytest.mark.parametrize('already_cleared', [False, True])
+def test_sidebar_open_discards_viewer_return_query(tmp_path, qapp, already_cleared):
+    from tests.test_application_controller import (
+        make_controller, close_controller, activate_browser_search, finish_viewer_open,
+    )
+    folder = tmp_path / 'books'
+    image = folder / 'keep.jpg'
+    write_image(image)
+    write_image(folder / 'a.jpg')
+    controller = make_controller(tmp_path, qapp)
+    controller._restore_on_start = False
+    window = controller.create_browser_window()
+    window.show()
+    try:
+        window.navigate_to(folder)
+        finish_scan(window, qapp)
+        activate_browser_search(window, 'keep')
+        window.open_item(window.item_model.index(window.item_model.row_for_path(image), 0))
+        finish_viewer_open(qapp, controller.get_active_viewer())
+        assert controller._viewer_search_return_context is not None
+        if already_cleared:
+            window.clear_active_browser_search()
+        window.folder_tree.navigationConfirmed.emit(window.file_system_model.index(str(folder)))
+        assert controller._viewer_search_return_context is None
+        controller._on_browser_activated(window)
+        assert window.active_search_query == ''
+        assert window.browser_search_edit.text() == ''
+    finally:
+        close_controller(controller, qapp)
+
+
 def test_refresh_preserves_history_selection_scroll_and_updates_items(
     tmp_path: Path,
     qapp: QApplication,

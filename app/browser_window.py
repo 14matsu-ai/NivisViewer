@@ -7148,6 +7148,14 @@ class BrowserWindow(QMainWindow):
         epoch = self._list_selection_epoch
         owner = QApplication.focusWidget()
         started = self.navigate_to(path, **kwargs)
+        if started:
+            # Folder changes clear the query when their scan commits. An
+            # explicit same-folder open has no scan, but must clear it too.
+            if self._same_path(self.current_path, self._absolute_browser_path(path)):
+                self.clear_active_browser_search()
+            # Also discard a saved Viewer-return query, even if the search
+            # control is already empty, so activation cannot resurrect it.
+            self.search_query_edited.emit(self, "")
         if (started and self.config.get("browser_sidebar_open_focus_first", True)
                 and epoch == self._list_selection_epoch and owner is QApplication.focusWidget()):
             self._pending_sidebar_focus = (
