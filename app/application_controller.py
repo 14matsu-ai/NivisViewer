@@ -33,6 +33,11 @@ from .adjacent_book_search import (
 from .archive_backend_registry import ArchiveBackendRegistry
 from .browser_window import BrowserWindow
 from .browser_book_preparation import BrowserBookPreparation
+from .browser_sort import (
+    BrowserSortPolicy, normalize_browser_sort_key, normalize_browser_sort_order,
+    normalize_browser_random_seed,
+)
+from .folder_sort_rules import SORT_RULES_KEY, folder_sort_policy
 from .config_manager import ConfigManager
 from .gimp_xcf_backend import configure_gimp_executable
 from .supported_formats import configure_xcf_loading, configure_vector_loading
@@ -169,7 +174,8 @@ class ApplicationController(QObject):
         self._side_folder_pending: dict[int, tuple] = {}
         self._adjacent_context: dict[
             int,
-            tuple[weakref.ReferenceType[object], int, int, str, str],
+            tuple[weakref.ReferenceType[object], int, int, str, str]
+            | tuple[weakref.ReferenceType[object], int, int, str, str, tuple[int, int, int]],
         ] = {}
         self._operation_fallback_panel: FileOperationPanel | None = None
         self._operation_conflict_dialog: ConflictResolutionDialog | None = None
@@ -580,8 +586,9 @@ class ApplicationController(QObject):
             if refreshed is not None and refreshed.contains_viewer_path(anchor):
                 snapshot = refreshed
         if snapshot is None:
-            window._set_status_override(tr('移動元のBrowser一覧がありません'), 2500)
-            return "unavailable"
+            return self._search_side_folder(
+                window, anchor if retained_folder_anchor else source.source_path, direction,
+            )
         if not retained_folder_anchor:
             # This property validates the committed display's epoch/source.
             # Membership keeps a folder opened from its parent anchored to
@@ -593,17 +600,73 @@ class ApplicationController(QObject):
             anchor, direction, loop=bool(self.settings.get("loop_book_navigation", False)),
         )
         if candidate is None:
+            # An image-only Browser snapshot describes pages inside the book,
+            # not the book's sibling folders. A captured parent/mixed list
+            # remains authoritative, including its filtered boundaries.
+            if (adjacent_path_key(snapshot.parent_folder) == adjacent_path_key(source.source_path)
+                    and not any(entry.item_kind == "folder" for entry in snapshot.entries)):
+                return self._search_side_folder(window, source.source_path, direction)
             window._set_status_override(tr('移動できるフォルダーがありません'), 2500)
             return status.value
+        return self._open_side_folder_candidate(window, candidate, snapshot)
+
+    def _open_side_folder_candidate(
+        self, window: ViewerWindow, candidate: str,
+        snapshot: AdjacentBookBrowserSnapshot | None,
+    ) -> str:
         self._side_folder_pending.pop(id(window), None)
         self._cancel_adjacent_search(window, clear_status=True)
-        self._open_path_in_viewer(window, candidate, bring_to_front=False, browser_snapshot=snapshot)
+        if not self._open_path_in_viewer(window, candidate, bring_to_front=False, browser_snapshot=snapshot):
+            return "error"
         # BookSession publishes only the matching generation. Preserve an
         # additional request fence for the no-images Browser fallback.
         self._side_folder_pending[id(window)] = (
             window.book_session._open_generation, candidate, snapshot,
         )
         return "opening"
+
+    def _search_side_folder(self, window: ViewerWindow, current: str | Path, direction: int) -> str:
+        current = lexical_absolute(current)
+        parent = lexical_absolute(os.path.dirname(current))
+        if adjacent_path_key(parent) == adjacent_path_key(current):
+            return "boundary"
+        browser = self.get_browser_window()
+        if browser is not None:
+            policy = browser._browser_sort_policy_for_path(parent)
+        else:
+            default = BrowserSortPolicy(
+                normalize_browser_sort_key(self.settings.get("browser_sort_key")),
+                normalize_browser_sort_order(self.settings.get("browser_sort_order")),
+                bool(self.settings.get("browser_folders_first", True)),
+                normalize_browser_random_seed(self.settings.get("browser_random_seed")),
+            )
+            policy = folder_sort_policy(parent, self.settings.get(SORT_RULES_KEY, []), default)
+        self._cancel_adjacent_search(window, clear_status=True)
+        self._adjacent_request_sequence += 1
+        self._adjacent_generation += 1
+        request = AdjacentBookSearchRequest(
+            request_id=self._adjacent_request_sequence, current_book_path=current,
+            direction=-1 if direction < 0 else 1,
+            loop=bool(self.settings.get("loop_book_navigation", False)),
+            browser_snapshot=None, generation=self._adjacent_generation,
+            candidate_mode=SIBLING_FOLDERS, sort_key=policy.sort_key.value,
+            sort_order=policy.sort_order.value, folders_first=policy.folders_first,
+            random_seed=policy.random_seed,
+        )
+        source = window.book_session.source
+        fence = (window.book_session.generation, id(source), window.book_session._open_generation)
+        self._adjacent_request_by_window[id(window)] = request.request_id
+        self._adjacent_context[request.request_id] = (
+            weakref.ref(window), request.generation, request.direction,
+            adjacent_path_key(source.source_path), "viewer_folder", fence,
+        )
+        window.show_adjacent_book_searching(request.direction)
+        if not self.adjacent_book_search.search(request):
+            self._adjacent_request_by_window.pop(id(window), None)
+            self._adjacent_context.pop(request.request_id, None)
+            window.complete_adjacent_book_search(request.direction, "unavailable")
+            return "unavailable"
+        return "searching"
 
     def _finish_side_folder(self, window: ViewerWindow, result, *, success: bool) -> None:
         pending = self._side_folder_pending.get(id(window))
@@ -1587,7 +1650,7 @@ class ApplicationController(QObject):
             clear_status
             and isinstance(window, ViewerWindow)
             and context is not None
-            and context[4] == "book"
+            and context[4] in {"book", "viewer_folder"}
         ):
             window.complete_adjacent_book_search(1, "opened")
 
@@ -1599,7 +1662,7 @@ class ApplicationController(QObject):
         if context is None or self._shutdown:
             return
         window_ref, generation, direction, expected_current_key, operation = (
-            context
+            context[:5]
         )
         window = window_ref()
         if window is None or result.generation != generation:
@@ -1608,13 +1671,22 @@ class ApplicationController(QObject):
             return
         self._adjacent_request_by_window.pop(id(window), None)
 
-        if operation == "book":
+        if operation in {"book", "viewer_folder"}:
             if (
                 not isinstance(window, ViewerWindow)
                 or window not in self._viewer_windows
             ):
                 return
             current = self._book_navigation_path_lexical(window)
+            if operation == "viewer_folder":
+                source = window.book_session.source
+                if (window._shutdown_prepared
+                        or not bool(self.settings.get("mouse_side_buttons_folder_navigation", False))
+                        or not isinstance(source, FolderImageSource)
+                        or context[5] != (window.book_session.generation, id(source),
+                                          window.book_session._open_generation)):
+                    return
+                current = lexical_absolute(source.source_path)
         else:
             if (
                 not isinstance(window, BrowserWindow)
@@ -1632,6 +1704,10 @@ class ApplicationController(QObject):
             if operation == "browser_folder":
                 window.navigate_to(result.candidate_path)
                 return
+            if operation == "viewer_folder":
+                opened = self._open_side_folder_candidate(window, result.candidate_path, None)
+                window.complete_adjacent_book_search(direction, "opened" if opened == "opening" else "error")
+                return
             transition = {"slideshow_transition": True} if window._slideshow_waiting_for_next else {}
             opened = self._open_path_in_viewer(
                 window, result.candidate_path, bring_to_front=False, **transition,
@@ -1641,7 +1717,7 @@ class ApplicationController(QObject):
                 "opened" if opened else "error",
             )
             return
-        if operation == "book":
+        if operation in {"book", "viewer_folder"}:
             window.complete_adjacent_book_search(direction, result.status.value)
 
     @staticmethod
@@ -1660,6 +1736,12 @@ class ApplicationController(QObject):
             return False
 
     def _on_controller_settings_changed(self, changed: dict[str, object]) -> None:
+        if changed.get("mouse_side_buttons_folder_navigation") is False:
+            for window in tuple(self._viewer_windows):
+                request_id = self._adjacent_request_by_window.get(id(window))
+                context = self._adjacent_context.get(request_id)
+                if context is not None and context[4] == "viewer_folder":
+                    self._cancel_adjacent_search(window, clear_status=True)
         preparation = getattr(self, "book_preparation", None)
         if preparation is not None:
             preparation.settings_changed(changed)

@@ -3,13 +3,18 @@ from unittest.mock import Mock
 from threading import get_ident
 
 import pytest
+from PySide6.QtCore import Qt
 
-from app.adjacent_book_search import AdjacentBookBrowserSnapshot, AdjacentBookSnapshotEntry
+from app.adjacent_book_search import (
+    AdjacentBookBrowserSnapshot, AdjacentBookSnapshotEntry,
+    AdjacentBookSearchResult, AdjacentBookSearchStatus, SIBLING_FOLDERS,
+)
 from app.config_manager import ConfigManager
 from app.settings_dialog import SettingsDialog
 from tests.test_application_controller import (
-    make_controller, write_image, write_archive, finish_viewer_open, close_controller,
+    make_controller, write_image, write_archive, finish_viewer_open, close_controller, wait_until,
 )
+from tests.test_viewer_xbutton_navigation import _send_mouse_button
 
 
 @pytest.fixture
@@ -192,15 +197,143 @@ def test_inactive_viewer_empty_result_does_not_move_browser(shelf, qapp):
     assert viewer.book_session.current_path == root / 'd'
 
 
-def test_no_browser_or_snapshot_is_explicitly_unavailable(tmp_path, qapp):
-    write_image(tmp_path / 'a.png')
+@pytest.mark.parametrize('route', ['browser_image', 'direct_image', 'direct_folder'])
+@pytest.mark.parametrize('button, expected', [
+    (Qt.MouseButton.BackButton, '01'), (Qt.MouseButton.ForwardButton, '03'),
+])
+def test_image_folder_side_buttons_move_to_sibling_folder(tmp_path, qapp, route, button, expected):
+    root = tmp_path / 'books'
+    for folder in ('01', '02', '03'):
+        for page in ('1.png', '2.png'):
+            write_image(root / folder / page)
+    controller = make_controller(tmp_path, qapp)
+    controller.config.apply({'mouse_side_buttons_folder_navigation': True, 'view_mode': 'single'})
+    browser = None
+    try:
+        if route == 'browser_image':
+            browser = controller.create_browser_window()
+            browser.set_current_folder(root / '02')
+            assert browser.wait_for_scan()
+            browser.open_item(browser.item_model.index(0, 0))
+            viewer = controller.get_active_viewer()
+        else:
+            path = root / '02' if route == 'direct_folder' else root / '02' / '1.png'
+            viewer = controller.open_path(path)
+        finish_viewer_open(qapp, viewer)
+        viewer.next_page()
+        from tests.test_viewer_browser_page_sync import settle_page
+        settle_page(qapp, viewer, root / '02' / '2.png')
+        _send_mouse_button(viewer.viewer, button)
+        assert wait_until(qapp, lambda: viewer.book_session.current_path == root / expected, timeout=5)
+        finish_viewer_open(qapp, viewer)
+        assert viewer.book_session.source.source_path == root / expected
+        assert controller.viewer_windows == (viewer,)
+        if browser is None:
+            assert controller.get_browser_window() is None
+        else:
+            assert browser.current_path == root / '02'
+    finally:
+        close_controller(controller, qapp)
+
+
+def test_sibling_folder_search_uses_parent_sort_and_worker_thread(tmp_path, qapp, monkeypatch):
+    root = tmp_path / 'books'
+    for name in ('01', '02', '03'):
+        write_image(root / name / '1.png')
+    write_archive(root / '02-extra.cbz')
+    write_image(root / '02-extra.png')
+    controller = make_controller(tmp_path, qapp)
+    controller.config.apply({
+        'mouse_side_buttons_folder_navigation': True,
+        'browser_folder_sort_rules': [{'path': str(root), 'scope': 'folder',
+            'mode': 'specified', 'sort_key': 'name', 'sort_order': 'descending'}],
+    })
+    threads = []
+    filesystem = controller.adjacent_book_search.filesystem
+    scan = filesystem.scandir
+    def record_scan(*args, **kwargs):
+        threads.append(get_ident())
+        return scan(*args, **kwargs)
+    monkeypatch.setattr(filesystem, 'scandir', record_scan)
+    monkeypatch.setattr(filesystem, 'directory_contains_supported_image',
+        lambda *_args: pytest.fail('folder navigation must not inspect candidate image contents'))
+    try:
+        viewer = controller.open_path(root / '02')
+        finish_viewer_open(qapp, viewer)
+        _send_mouse_button(viewer.viewer, Qt.MouseButton.ForwardButton)
+        assert wait_until(qapp, lambda: viewer.book_session.current_path == root / '01', timeout=5)
+        finish_viewer_open(qapp, viewer)
+        assert threads and all(thread != get_ident() for thread in threads)
+        generation = viewer.book_session.generation
+        _send_mouse_button(viewer.viewer, Qt.MouseButton.ForwardButton)
+        assert wait_until(qapp, lambda: not controller._adjacent_request_by_window)
+        assert viewer.book_session.current_path == root / '01'
+        assert viewer.book_session.generation == generation
+        controller.config.apply({'loop_book_navigation': True})
+        _send_mouse_button(viewer.viewer, Qt.MouseButton.ForwardButton)
+        assert wait_until(qapp, lambda: viewer.book_session.current_path == root / '03', timeout=5)
+        finish_viewer_open(qapp, viewer)
+    finally:
+        close_controller(controller, qapp)
+
+
+@pytest.mark.parametrize('change', ['newer_request', 'reopen', 'disable', 'pending_open'])
+def test_sibling_folder_search_rejects_stale_result(tmp_path, qapp, monkeypatch, change):
+    root = tmp_path / 'books'
+    for name in ('01', '02', '03'):
+        write_image(root / name / '1.png')
+    controller = make_controller(tmp_path, qapp)
+    controller.config.apply({'mouse_side_buttons_folder_navigation': True})
+    searches = []
+    monkeypatch.setattr(controller.adjacent_book_search, 'search', lambda request: searches.append(request) or True)
+    try:
+        viewer = controller.open_path(root / '02')
+        finish_viewer_open(qapp, viewer)
+        _send_mouse_button(viewer.viewer, Qt.MouseButton.ForwardButton)
+        request = searches[-1]
+        assert request.candidate_mode == SIBLING_FOLDERS
+        if change == 'newer_request':
+            _send_mouse_button(viewer.viewer, Qt.MouseButton.BackButton)
+        elif change == 'reopen':
+            viewer.open_path(root / '02')
+            finish_viewer_open(qapp, viewer)
+        elif change == 'pending_open':
+            viewer.open_path(root / '03')
+        else:
+            controller.config.apply({'mouse_side_buttons_folder_navigation': False})
+        opened = Mock()
+        monkeypatch.setattr(controller, '_open_side_folder_candidate', opened)
+        controller._on_adjacent_book_search_result(AdjacentBookSearchResult(
+            request.request_id, AdjacentBookSearchStatus.FOUND, str(root / '03'), request.generation))
+        opened.assert_not_called()
+        if change == 'newer_request':
+            latest = searches[-1]
+            controller._on_adjacent_book_search_result(AdjacentBookSearchResult(
+                latest.request_id, AdjacentBookSearchStatus.FOUND, str(root / '01'), latest.generation))
+            opened.assert_called_once_with(viewer, str(root / '01'), None)
+        elif change == 'disable':
+            assert id(viewer) not in controller._adjacent_request_by_window
+    finally:
+        close_controller(controller, qapp)
+
+
+def test_sibling_folder_empty_fallback_keeps_navigation_anchor(tmp_path, qapp):
+    root = tmp_path / 'books'
+    write_image(root / '01' / '1.png')
+    (root / '02').mkdir()
+    write_image(root / '03' / '1.png')
     controller = make_controller(tmp_path, qapp)
     controller.config.apply({'mouse_side_buttons_folder_navigation': True})
     try:
-        viewer = controller.open_path(tmp_path / 'a.png')
+        viewer = controller.open_path(root / '01')
         finish_viewer_open(qapp, viewer)
-        assert controller.open_side_folder(viewer, 1) == 'unavailable'
-        assert controller.get_browser_window() is None
+        _send_mouse_button(viewer.viewer, Qt.MouseButton.ForwardButton)
+        assert wait_until(qapp, lambda: controller.get_browser_window() is not None and
+                          controller.get_browser_window().current_path == root / '02', timeout=5)
+        assert viewer.book_session.current_path == root / '01'
+        _send_mouse_button(viewer.viewer, Qt.MouseButton.ForwardButton)
+        assert wait_until(qapp, lambda: viewer.book_session.current_path == root / '03', timeout=5)
+        finish_viewer_open(qapp, viewer)
     finally:
         close_controller(controller, qapp)
 
