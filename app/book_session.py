@@ -503,7 +503,9 @@ class BookSession(QObject):
         if result.source is not None:
             self._retire_source(result.source)
 
-    def cancel_pending_open(self) -> None:
+    def cancel_pending_open(self, *, invalidate: bool = False) -> None:
+        if invalidate:
+            self._open_generation += 1
         cancelled = self._open_cancel
         self._open_cancel = None
         if cancelled is None:
@@ -551,6 +553,11 @@ class BookSession(QObject):
     def notify_page_changed(self) -> None:
         if self.is_open:
             self.page_changed.emit()
+
+    @property
+    def shutdown_complete(self) -> bool:
+        # The retained set is released only after jobs and source handles drain.
+        return self._shutdown and self not in _RETIRED_BOOK_SESSIONS
 
     def shutdown(self, wait_msecs: int = 250) -> None:
         if self._shutdown:

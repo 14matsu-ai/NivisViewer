@@ -8,12 +8,13 @@ Source structure: Copyright (C) 2016-2017 Rio's Toolbox, AGPL-3.0-or-later.
 from __future__ import annotations
 
 from pathlib import Path
+import os
 from dataclasses import fields
 import logging
-from time import monotonic
+from time import monotonic, sleep
 import weakref
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, QTimer, Signal
 from shiboken6 import isValid
 
 from .book_session import BookSession
@@ -48,6 +49,7 @@ class BrowserBookPreparation(QObject):
         self._profile_check.timeout.connect(self._revalidate_profile)
         self.session: BookSession | None = None
         self._retiring: BookSession | None = None
+        self._retiring_path: Path | None = None
         self._item = None
         self._target = lambda: None
         self._signature = None
@@ -82,24 +84,56 @@ class BrowserBookPreparation(QObject):
             # not consume the head start between a click and a double click.
             self._timer.start(0)
 
-    def cancel(self, reason='cancelled') -> None:
+    def cancel(self, reason='cancelled', *, wait_msecs=0) -> None:
         if self._item is not None:
             self._log('cancelled', reason)
         self._timer.stop()
         self._advance.stop()
         self._pressure.stop()
         self._profile_check.stop()
-        self._item = None
+        item, self._item = self._item, None
         self.ready = False
         session, self.session = self.session, None
         if session is not None:
             self._disconnect(session)
-            session.shutdown(wait_msecs=0)
+            session.shutdown(wait_msecs=wait_msecs)
             if session._has_owned_async_work():
                 self._retiring = session
+                self._retiring_path = item.path if item is not None else None
                 session.destroyed.connect(self._retired_session_destroyed)
             else:
                 session.deleteLater()
+
+    def release_file_handles(self, paths: tuple[str, ...]) -> bool:
+        """Stop selected-book speculation before changing its filename."""
+        roots = tuple(os.path.normcase(os.path.abspath(path)) for path in paths)
+
+        def affected(path):
+            if path is None:
+                return False
+            key = os.path.normcase(os.path.abspath(path))
+            return any(key == root or key.startswith(root + os.sep) for root in roots)
+
+        if self._item is not None and affected(self._item.path):
+            self.cancel('metadata_rename', wait_msecs=500)
+        if affected(self._retiring_path):
+            deadline = monotonic() + .5
+            while not self._drain_retiring():
+                session = self._retiring
+                # Deliver only this retired owner's worker completions. No
+                # paint, input or selection timers can reopen the old name.
+                receivers = [session, session.image_cache,
+                    *session._retired_viewer_runtimes.values(),
+                    *session._retired_page_list_runtimes.values()]
+                for receiver in receivers:
+                    if isValid(receiver):
+                        QCoreApplication.sendPostedEvents(receiver, QEvent.Type.MetaCall)
+                if isValid(session):
+                    session.release_retired_book_resources()
+                if monotonic() >= deadline:
+                    return self._drain_retiring()
+                sleep(.001)
+        return True
 
     def retry_selection(self) -> None:
         """Retry an unchanged selection after its occupied target closes."""
@@ -128,6 +162,7 @@ class BrowserBookPreparation(QObject):
     def _retired_session_destroyed(self, _object=None) -> None:
         if self._retiring is not None and not isValid(self._retiring):
             self._retiring = None
+            self._retiring_path = None
         if self._closed and self._retiring is None:
             self.drained.emit()
 
@@ -137,10 +172,12 @@ class BrowserBookPreparation(QObject):
             return True
         if not isValid(session):
             self._retiring = None
+            self._retiring_path = None
             return True
         if session._has_owned_async_work():
             return False
         self._retiring = None
+        self._retiring_path = None
         session.deleteLater()
         return True
 

@@ -642,6 +642,8 @@ def test_closing_stale_window_does_not_roll_back_shared_setting(
     controller.close_viewer_window(stale)
 
     assert controller.config.get("view_mode") == "single"
+    from tests.test_application_controller import wait_until
+    assert wait_until(qapp, lambda: stale not in controller._viewer_windows)
     assert ConfigManager(config.path).load()["view_mode"] == "single"
     close_remaining = controller.viewer_windows
     for window in close_remaining:
@@ -794,6 +796,8 @@ def test_default_down_gesture_closes_only_target_viewer(
 
     target.viewer.gestureRecognized.emit("D")
 
+    from tests.test_application_controller import wait_until
+    assert wait_until(qapp, lambda: closed == [target])
     assert closed == [target]
     assert not other._shutdown_prepared
     other.close()

@@ -54,7 +54,8 @@ def close_controller(
     if browser is not None:
         browser.close()
     qapp.processEvents()
-    controller.shutdown()
+    from tests.test_application_controller import wait_until
+    assert wait_until(qapp, controller.shutdown, timeout=10)
 
 
 def finish_viewer_open(qapp: QApplication, window) -> None:
@@ -179,10 +180,39 @@ def test_viewer_close_flushes_latest_progress(
     finish_presentation(qapp, window, 1)
 
     window.close()
-    qapp.processEvents()
+    from tests.test_application_controller import wait_until
+    assert wait_until(qapp, lambda: window not in controller._viewer_windows)
 
     assert persisted_page(controller.config.metadata_database_path, book) == 1
     close_controller(controller, qapp)
+
+
+def test_hidden_viewer_cleanup_does_not_rollback_later_progress(tmp_path, qapp, monkeypatch):
+    from tests.test_application_controller import wait_until
+    book = tmp_path / 'close-order'
+    write_book(book)
+    controller = make_controller(tmp_path, qapp)
+    controller.create_browser_window()
+    window = controller.open_path(book)
+    finish_viewer_open(qapp, window)
+    window.next_one_page()
+    finish_presentation(qapp, window, 1)
+    released = [False]
+    original = window.viewer.shutdown_rendering
+    monkeypatch.setattr(window.viewer, 'shutdown_rendering',
+                        lambda msecs: original(msecs) if released[0] else False)
+    try:
+        window.close()
+        assert not window.isVisible()
+        # A newer presentation for the same book arrives while cleanup waits.
+        controller.metadata_store.update_reading_progress(str(book), page_index=2, total_pages=4)
+        controller.metadata_store.flush()
+        released[0] = True
+        assert wait_until(qapp, lambda: window not in controller._viewer_windows)
+        assert persisted_page(controller.config.metadata_database_path, book) == 2
+    finally:
+        released[0] = True
+        close_controller(controller, qapp)
 
 
 def test_normal_reopen_restores_progress_and_clamps_to_page_count(
@@ -395,6 +425,10 @@ def test_multiple_viewers_update_shared_database_without_corruption(
     second.close()
     qapp.processEvents()
 
+    # close() starts deferred cleanup; its metadata flush may need another turn.
+    from tests.test_application_controller import wait_until
+    assert wait_until(qapp, lambda: first._shutdown_cleanup_complete and second._shutdown_cleanup_complete)
+
     reopened = MetadataStore(controller.config.metadata_database_path)
     history = reopened.list_history()
     assert len(history) == 1
@@ -474,7 +508,8 @@ def test_lifecycle_metadata_flush_does_not_probe_source(
         finish_viewer_open(qapp, window)
     elif operation == "viewer_close":
         window.close()
-        qapp.processEvents()
+        from tests.test_application_controller import wait_until
+        assert wait_until(qapp, lambda: window not in controller._viewer_windows)
     elif operation == "browser_close":
         assert browser is not None
         browser._application_close_guard = lambda _window: True

@@ -25,6 +25,8 @@ from PIL import Image, features
 from PySide6.QtCore import QBuffer, QIODevice
 from PySide6.QtGui import QImage, QImageReader
 
+from .qt_image_reader import read_qimage
+
 from .browser_model import BrowserItem, BrowserItemKind
 from .ffmpeg_thumbnail_backend import VIDEO_PREVIEW_EXTENSIONS
 from .thumbnail_render import (
@@ -51,6 +53,7 @@ class _CacheReadState:
         self.leases = {}
         self.retired = set()
         self.revision = 0
+        self.removal_revision = 0
 
 
 def _cache_read_state(directory):
@@ -339,6 +342,7 @@ class ThumbnailDiskCache:
         self._read_connections: list[sqlite3.Connection] = []
         self._pending_accesses: dict[str, float] = {}
         self._pending_delete_files = set()
+        self._pending_index_removals = False
         self._saves_since_cleanup = 0
         self._write_epoch = 0
         self._entry_scan_cursor = ""
@@ -411,6 +415,16 @@ class ThumbnailDiskCache:
     def write_epoch(self) -> int:
         with self._lock:
             return self._write_epoch
+
+    @property
+    def admission_revision(self) -> tuple[int, int] | None:
+        """Best-effort RAM fence; GUI callers must never wait for an I/O writer."""
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            return self._write_epoch, self._read_state.removal_revision
+        finally:
+            self._lock.release()
 
     def invalidate_pending_writes(self) -> int:
         with self._lock:
@@ -982,6 +996,7 @@ class ThumbnailDiskCache:
                 if self._connection is not None:
                     self._connection.rollback()
                 self._pending_delete_files.clear()
+                self._pending_index_removals = False
             self.last_error = str(exc)
             self.last_put_status = "io_error"
             return False
@@ -1212,6 +1227,7 @@ class ThumbnailDiskCache:
                             connection.execute(
                                 "DELETE FROM entries WHERE cache_key = ?", (key,)
                             )
+                            self._pending_index_removals = True
                             removed += 1
                     if scan_more and scan_batch:
                         self._entry_scan_cursor = str(scan_batch[-1][0])
@@ -1377,6 +1393,7 @@ class ThumbnailDiskCache:
                         except OSError:
                             success = False
                 self._connection.execute("DELETE FROM entries")
+                self._pending_index_removals = True
                 self._commit()
                 self._pending_accesses.clear()
                 self._saves_since_cleanup = 0
@@ -1654,6 +1671,7 @@ class ThumbnailDiskCache:
     ) -> None:
         assert self._connection is not None
         for key, file_name in entries:
+            self._pending_index_removals = True
             self._pending_delete_files.add(file_name)
             self._connection.execute(
                 "DELETE FROM entries WHERE cache_key = ?",
@@ -1666,11 +1684,15 @@ class ThumbnailDiskCache:
         try:
             self._connection.commit()
             self._read_state.revision += 1
+            if self._pending_index_removals or self._pending_delete_files:
+                self._read_state.removal_revision += 1
+            self._pending_index_removals = False
         except sqlite3.DatabaseError:
             try:
                 self._connection.rollback()
             finally:
                 self._pending_delete_files.clear()
+                self._pending_index_removals = False
             raise
         files = self._pending_delete_files
         self._pending_delete_files = set()
@@ -1834,25 +1856,19 @@ class ThumbnailDiskCache:
     @staticmethod
     def _read_qimage(path: Path) -> QImage | None:
         try:
-            # The cache contains PNG/WebP display pixels. Decode directly into
-            # Qt storage instead of Pillow -> Python bytes -> another QImage copy.
             # Keep the leased handle: reopening its path would lose the lifetime
             # guarantee if cleanup/replacement ran concurrently.
             data = path.read() if hasattr(path, 'read') else Path(path).read_bytes()
-            # QImage.fromData's Python-bytes overload holds the GIL while
-            # decoding in PySide. Several read workers then stall Python input
-            # handlers even though no decoding runs on the GUI thread. The
-            # QIODevice reader releases it for the native decode. Keep both
-            # reader and buffer alive on this worker until read() completes.
             buffer = QBuffer()
             buffer.setData(data)
             buffer.open(QIODevice.OpenModeFlag.ReadOnly)
-            image = QImageReader(buffer).read()
+            # Initialize the handler before read releases the GIL, preserving
+            # native parallel pixel reads without GUI/plugin lock inversion.
+            image = read_qimage(QImageReader(buffer))
             if not image.isNull():
                 return image
-            # Retain compatibility if the installed Qt build lacks a codec.
             import io
-            with Image.open(io.BytesIO(data)) as image:
+            with Image.open(io.BytesIO(data), formats=('PNG', 'WEBP')) as image:
                 return pil_to_qimage(image)
         except Exception:
             return None

@@ -623,13 +623,12 @@ def test_folder_header_probe_avoids_pillow_sniffing_for_common_formats(
         image.save(image_path, "PNG")
     source = FolderImageSource(tmp_path)
 
-    monkeypatch.setattr(
-        Image,
-        "open",
-        lambda *_args, **_kwargs: pytest.fail(
-            "Qt header probing must not enter Pillow's generic plugin scan"
-        ),
-    )
+    original_open = Image.open
+    def explicit_header(*args, **kwargs):
+        assert kwargs.get('formats') == ('PNG',)
+        return original_open(*args, **kwargs)
+    monkeypatch.setattr(Image, 'open', explicit_header)
+    monkeypatch.setattr(Image.Image, 'load', lambda *_: pytest.fail('Header probe decoded pixels'))
 
     assert source.probe_image_size(str(image_path)) == (321, 654)
 

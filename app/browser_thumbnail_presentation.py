@@ -93,7 +93,8 @@ class BrowserThumbnailPresentation(QObject):
             round(max(.5, window.list_view.viewport().devicePixelRatioF()), 6))
         context = (window._generation, window.thumbnail_render_spec.cache_token, self._revision, plan)
         if context != self._context:
-            if self._plan is not None and self._plan != plan:
+            plan_changed = self._plan is not None and self._plan != plan
+            if plan_changed:
                 delegate._display_surface_cache.clear()
             self._context = context
             self._shape = self._plan = plan
@@ -107,6 +108,13 @@ class BrowserThumbnailPresentation(QObject):
             configure = getattr(window.thumbnail_provider, 'set_display_plan', None)
             if configure is not None:
                 configure(plan)
+            if plan_changed and getattr(window.thumbnail_provider, 'memory_images_need_plan_check', False):
+                # A DPR/geometry change can retain the same disk bucket. Reopen
+                # consumed source attempts whose compact pixels no longer fit.
+                workflow = getattr(window, '_browser_workflow', None)
+                if workflow is not None:
+                    workflow._model_changed()
+                window._schedule_thumbnail_requests(0)
         return True
 
     def recenter(self, *_):
@@ -244,8 +252,9 @@ class BrowserThumbnailPresentation(QObject):
         rect = window.list_view.visualRect(window.item_model.index(row, 0))
         if rect.intersects(window.list_view.viewport().rect()):
             window.list_view.viewport().update(rect)
-        if self._queue and getattr(window.thumbnail_provider, 'display_pending_count', 0) < 2:
-            self._pump(prepare_decorations=False)
+        # Publish this receipt immediately; the existing coalesced timer owns
+        # subsequent preparation. A burst of source completions must not also
+        # run a fresh display scan in every notification.
         self._schedule()
 
     @Slot(int, int)

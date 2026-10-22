@@ -156,6 +156,11 @@ class ThumbnailWarmupCursor:
         if 0 <= row < self.count:
             self._done[row] = 1
 
+    def defer(self, row: int) -> None:
+        """Leave a row unfinished without spinning the active read cursor."""
+        if 0 <= row < self.count:
+            self._done[row] = 0
+
     def reopen(self, rows) -> None:
         """Requeue eligible rows whose current thumbnail is no longer ready.
 

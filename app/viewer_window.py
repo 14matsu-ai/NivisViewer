@@ -57,6 +57,7 @@ from .adjacent_book_search import (
 )
 from .app_icon import install_window_icon
 from .book_session import AsyncBookOpenFailed, BookOpened, BookSession
+from .gui_garbage_collector import ensure_gui_garbage_collector
 from .config_manager import (
     SLIDESHOW_INTERVAL_MAX_MS,
     SLIDESHOW_INTERVAL_MIN_MS,
@@ -158,6 +159,8 @@ from .viewer_render import (
     resampling_policy_for_legacy_mode,
 )
 _DISPLAY_LOG = logging.getLogger("nivisviewer.viewer.display_unit")
+# Standalone Viewers must also outlive their hidden, asynchronous close.
+_CLOSING_VIEWERS: set[object] = set()
 _PDF_PREFETCH_IDLE_GRACE_MS = 120
 _PREPARED_DISPLAY_IDLE_GRACE_MS = 16
 _DISPLAY_DEMAND_IDLE_GRACE_MS = 16
@@ -234,6 +237,7 @@ class _PageModelRasterTopology:
 
 class ViewerWindow(QMainWindow):
     activated = Signal(object)
+    close_started = Signal(object)
     closing = Signal(object)
     slideshow_stopped = Signal(object)
     book_changed = Signal(object, str)
@@ -261,6 +265,7 @@ class ViewerWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        ensure_gui_garbage_collector()
         self.setWindowTitle("NivisViewer")
         install_window_icon(self)
         self.resize(1200, 820)
@@ -347,6 +352,15 @@ class ViewerWindow(QMainWindow):
         QApplication.clipboard().dataChanged.connect(self._clipboard_changed)
         self._shutdown_cleanup_phase = 0
         self._shutdown_cleanup_complete = False
+        self._close_pending = False
+        self._closing_source = None
+        self._closing_current_path = None
+        self._close_cleanup_error_reported = False
+        self._close_runtime_retired = False
+        self._close_retired_runtime = None
+        self._deferred_close_timer = QTimer(self)
+        self._deferred_close_timer.setSingleShot(True)
+        self._deferred_close_timer.timeout.connect(self._finish_deferred_close)
         self._reload_page_index: int | None = None
         self._pending_display_demand: (
             tuple[
@@ -2333,6 +2347,8 @@ class ViewerWindow(QMainWindow):
         slideshow_transition: bool = False,
         prepared_book=None,
     ) -> bool:
+        if self._shutdown_prepared:
+            return False
         if slideshow_transition and self._slideshow_waiting_for_next:
             self._slideshow_opening_next = True
         else:
@@ -6648,7 +6664,8 @@ class ViewerWindow(QMainWindow):
         if callable(handler):
             result = handler(self)
             return True if result is None else bool(result)
-        return bool(self.close())
+        closed = self.close()
+        return bool(closed or self._close_pending)
 
     def _viewer_close_key_is_eligible(self, watched: object) -> bool:
         if not isinstance(watched, QWidget) or watched.window() is not self:
@@ -7888,7 +7905,12 @@ class ViewerWindow(QMainWindow):
         self._shutdown_prepared = True
         phase = self._shutdown_cleanup_phase
         if phase == 0:
-            self._save_current_reading_position()
+            if not self._close_pending:
+                self._save_current_reading_position()
+            elif self.metadata_store is not None:
+                # The close request already staged its committed position.
+                # A later commit from a new Viewer must not be rolled back.
+                self.metadata_store.flush()
             self._pending_book_open_projection = None
             self.presentation_state.close()
             self._project_presentation_surface()
@@ -7920,12 +7942,14 @@ class ViewerWindow(QMainWindow):
             self._shutdown_cleanup_phase = 1
 
         if self._shutdown_cleanup_phase == 1:
-            if not self._pdf_loupe_cache.shutdown(max(5000, wait_msecs)):
+            render_wait = max(5000, wait_msecs) if wait_msecs > 0 else 0
+            if not self._pdf_loupe_cache.shutdown(render_wait):
                 return False
             self._shutdown_cleanup_phase = 2
 
         if self._shutdown_cleanup_phase == 2:
-            if not self.viewer.shutdown_rendering(max(5000, wait_msecs)):
+            render_wait = max(5000, wait_msecs) if wait_msecs > 0 else 0
+            if not self.viewer.shutdown_rendering(render_wait):
                 return False
             self._shutdown_cleanup_phase = 3
 
@@ -7942,6 +7966,8 @@ class ViewerWindow(QMainWindow):
             self._cancel_pending_decode_demand()
             self._cancel_deferred_pdf_prefetch()
             self.book_session.shutdown(wait_msecs=wait_msecs)
+            if self._close_pending and not self.book_session.shutdown_complete:
+                return False
             self._shutdown_cleanup_phase = 4
 
         if self._shutdown_cleanup_phase == 4:
@@ -7965,23 +7991,63 @@ class ViewerWindow(QMainWindow):
         self._shutdown_cleanup_complete = self._shutdown_cleanup_phase == 7
         return self._shutdown_cleanup_complete
 
+    def _finish_deferred_close(self) -> None:
+        if not self._close_pending:
+            return
+        try:
+            runtime = self._zip_runtime
+            if self._shutdown_cleanup_phase == 0 and runtime is not None:
+                if runtime is not self._close_retired_runtime:
+                    runtime.retire()
+                    self._close_runtime_retired = True
+                    self._close_retired_runtime = runtime
+                # QPixmaps stay on the GUI thread, in bounded retirement slices.
+                # Native workers finish asynchronously; no GUI wait is needed.
+                if not runtime.drain_retired_artifacts():
+                    self._deferred_close_timer.start(10 if runtime.has_unfinished_tasks() else 1)
+                    return
+            complete = self.prepare_shutdown(wait_msecs=0)
+        except Exception:
+            if not self._close_cleanup_error_reported:
+                _LOG.exception("Hidden Viewer shutdown preparation did not complete")
+                self._close_cleanup_error_reported = True
+            self._deferred_close_timer.start(100)
+            return
+        if complete:
+            self.close()
+        else:
+            self._deferred_close_timer.start(10)
+
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
         guard = getattr(self, "_application_close_guard", None)
-        if callable(guard) and not guard(self):
+        if not self._close_pending and callable(guard) and not guard(self):
             event.ignore()
+            return
+        if not self._shutdown_cleanup_complete:
+            event.ignore()
+            if not self._close_pending:
+                self._close_pending = True
+                self._closing_source = self.book_session.source
+                self._closing_current_path = self.book_session.current_path
+                self._shutdown_prepared = True
+                _CLOSING_VIEWERS.add(self)
+                # Preserve active worker owners until the accepted close.
+                self.hide()
+                application = QApplication.instance()
+                if application is not None:
+                    application.removeEventFilter(self)
+                    application.removeEventFilter(self.fullscreen_chrome)
+                self._deferred_close_timer.start(0)
+                self.book_session.cancel_pending_open(invalidate=True)
+                self._save_current_reading_position(flush_metadata=False)
+                self.close_started.emit(self)
             return
         application = QApplication.instance()
         if application is not None:
             application.removeEventFilter(self)
-        try:
-            if not self.prepare_shutdown():
-                event.ignore()
-                return
-        except Exception:
-            _LOG.exception("Viewer shutdown preparation did not complete")
-            event.ignore()
-            return
+        self._deferred_close_timer.stop()
         self.closing.emit(self)
         if self._owns_file_operation_coordinator:
             self.file_operation_coordinator.close()
         super().closeEvent(event)
+        _CLOSING_VIEWERS.discard(self)

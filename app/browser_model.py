@@ -730,6 +730,7 @@ class BrowserItemModel(QAbstractListModel):
             and key in self._thumbnail_images
             and key not in self._low_resolution_thumbnails
             and self._thumbnail_signatures.get(key) == signature
+            and self._has_compatible_thumbnail(item, int(request_token))
         ):
             return False
         self._thumbnail_images[key] = QImage(image)
@@ -1328,11 +1329,14 @@ class BrowserItemModel(QAbstractListModel):
         request_token: int,
     ) -> bool:
         key = self._key(item.path)
+        owner = getattr(self, '_thumbnail_memory_owner', None)
+        compatible = getattr(owner, 'memory_image_compatible', None)
         return (
             key in self._thumbnail_images
             and key not in self._low_resolution_thumbnails
             and self._thumbnail_signatures.get(key)
             == (int(request_token), item.thumbnail_revision)
+            and (not callable(compatible) or compatible(self._thumbnail_images[key]))
         )
 
     def set_cut_paths(self, paths: tuple[str | Path, ...] | list[str | Path]) -> bool:

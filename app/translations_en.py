@@ -5,6 +5,10 @@ search queries, persisted identifiers or other runtime user data here.
 """
 
 ENGLISH: dict[str, str] = {
+    '同名の項目が既に存在するため変更できません: {p0}': 'Cannot change the name because an item already exists: {p0}',
+    'ファイルが使用中のため変更できません。Viewerや他のアプリで閉じてから再試行してください。': 'The file is in use. Close it in the Viewer or other apps and try again.',
+    '画像や書庫の読み込み終了を待機中です。少し待ってから再試行してください。': 'Waiting for image or archive reads to finish. Please wait a moment and try again.',
+    'Viewerや書庫の解放を待機中です。少し待ってから再試行してください。': 'Waiting for Viewer or archive resources to be released. Please wait a moment and try again.',
     "オンラインのみの項目です。Dropboxなどの同期アプリでダウンロードしてから、一覧を更新してください。": "This item is online-only. Download it using Dropbox or your sync app, then refresh the list.",
     "GIMP（XCF画像）": "GIMP (XCF images)",
     "XCFには、CLIPやPSDのように取り出して表示できるプレビュー画像がないため、読み込み・表示に時間がかかります。": "Unlike CLIP or PSD, XCF has no saved preview image that can be extracted for display, so loading and displaying it takes longer.",

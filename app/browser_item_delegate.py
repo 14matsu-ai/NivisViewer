@@ -106,15 +106,19 @@ class BrowserDisplaySurfaceCache:
         return all((pixel, *geometry) in self._items for geometry, _ in plan.geometries(image))
 
     def adopt(self, image, plan, surfaces):
-        """Publish a worker-completed batch after one reentrant reservation."""
+        """Alias owned pixels, or reserve a new worker-completed batch."""
         owner = self._memory_owner
         if owner is None or not owner.owns_memory_image(image):
             return 0
         pixel = int(image.cacheKey())
         additions = [((pixel, *key), surface) for key, surface in surfaces
                      if (pixel, *key) not in self._items]
+        if not additions:
+            self._device_pixel_ratio = plan.dpr
+            return 0
         revision = self._revision
-        admitted = owner.reserve_display_surfaces(image, *(surface for _, surface in additions))
+        aliases = all(int(surface.cacheKey()) in owner.artifact_memory.pixels for _, surface in additions)
+        admitted = aliases or owner.reserve_display_surfaces(image, *(surface for _, surface in additions))
         if (self._revision != revision or self._memory_owner is not owner
                 or not admitted or not owner.owns_memory_image(image)):
             return 0
@@ -130,7 +134,8 @@ class BrowserDisplaySurfaceCache:
             count += 1
         self.adopted_surfaces += count
         self._device_pixel_ratio = plan.dpr
-        owner.enforce_display_budget()
+        if not aliases:
+            owner.enforce_display_budget()
         return count
 
     def bind_memory(self, owner):
@@ -217,7 +222,7 @@ class BrowserDisplaySurfaceCache:
             owner, revision = self._memory_owner, self._revision
             admitted = owner.reserve_display_surfaces(image, surface.image, require_source=False)
             if not admitted or self._memory_owner is not owner or self._revision != revision:
-                return surface  # Transient paint result, never evict raw sources for it.
+                return surface  # An unadmitted paint result stays transient.
             plan = getattr(owner, '_display_plan', None)
             if plan is not None and owner.owns_memory_image(image):
                 geometries = plan.geometries(image)

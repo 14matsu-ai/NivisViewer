@@ -51,6 +51,39 @@ def start(preparation, item):
     preparation._start()
 
 
+@pytest.mark.parametrize('decoding', [False, True])
+def test_filename_change_releases_selected_and_retiring_archive(tmp_path, qapp, target, monkeypatch, decoding):
+    item = make_book(tmp_path)
+    preparation = BrowserBookPreparation(lambda: target)
+    entered, release = Event(), Event()
+    original = ZipImageSource.open_image
+    def blocked(source, name):
+        entered.set()
+        assert release.wait(5)
+        return original(source, name)
+    if decoding:
+        monkeypatch.setattr(ZipImageSource, 'open_image', blocked)
+    try:
+        start(preparation, item)
+        assert wait_until(qapp, entered.is_set if decoding else lambda: preparation.ready, timeout=5)
+        source = preparation.session.source
+        # Unrelated filenames must not invalidate useful preparation.
+        assert preparation.release_file_handles((str(tmp_path / 'other.cbz'),))
+        assert preparation.session is not None
+        paths = (str(item.path),)
+        if decoding:
+            assert not preparation.release_file_handles(paths)
+            assert preparation._retiring is not None and not source._closed.is_set()
+            release.set()
+        assert preparation.release_file_handles(paths)
+        assert source._closed.is_set()
+        assert preparation.session is None and not preparation.ready
+        item.path.rename(tmp_path / 'renamed.cbz')
+    finally:
+        release.set()
+        preparation.shutdown()
+
+
 @pytest.mark.parametrize('single_first', [True, False])
 @pytest.mark.parametrize('direction', ['ltr', 'rtl'])
 def test_prepared_frames_and_source_move_without_decode_again(tmp_path, qapp, target, monkeypatch, single_first, direction):
@@ -272,7 +305,7 @@ def test_mouse_selection_and_double_click_adopt_prepared_frames(tmp_path,qapp,fu
 @pytest.mark.parametrize('prepared_first',[False,True])
 @pytest.mark.parametrize('fullscreen',[False,True])
 def test_closing_viewer_prepares_still_selected_book_for_reopen(tmp_path,qapp,fullscreen,prepared_first):
-    from tests.test_application_controller import make_controller,close_controller
+    from tests.test_application_controller import make_controller,close_controller,finish_viewer_open
     controller=make_controller(tmp_path,qapp)
     controller.config.apply({'fullscreen':fullscreen,'show_page_list':False,
         'single_first_page':True,'book_open_position':'first_page'})
@@ -291,6 +324,10 @@ def test_closing_viewer_prepares_still_selected_book_for_reopen(tmp_path,qapp,fu
             controller.open_path(item.path)
         viewer=controller.get_active_viewer()
         assert wait_until(qapp,lambda:viewer.viewer.displayed_page_indexes==(0,),timeout=5)
+        # First paint precedes the queued Browser selection projection. Finish
+        # that open transaction before testing a still-selected book's close.
+        finish_viewer_open(qapp,viewer)
+        assert browser.list_view.selectionModel().isSelected(browser.list_view.currentIndex())
         viewer.next_page(input_kind=NavigationInputKind.WHEEL)
         assert wait_until(qapp,lambda:set(viewer.viewer.displayed_page_indexes)=={1,2},timeout=5)
         viewer.close()

@@ -122,6 +122,53 @@ class _Window(QWidget):
         app.processEvents()
 
 
+@pytest.mark.parametrize('direction', [-1, 1])
+@pytest.mark.parametrize('fast,screens,frames,expected', [
+    (False, 6, 100, 10), (True, 1, 100, 10), (True, 0, 100, 0),
+    (True, 6, 100, 20), (True, 6, 25, 12), (True, 6, 10, 10),
+    (True, 6, 1000, 10),
+])
+def test_fast_scroll_lead_respects_grant_and_screen_setting(
+    tmp_path, app, controlled_broker, monkeypatch, direction, fast, screens, frames, expected,
+):
+    from app.browser_thumbnail_memory_policy import frame_byte_estimate
+    broker, _snapshots = controlled_broker
+    window = _Window(tmp_path, _mixed_items(tmp_path, 500), loader=lambda *_: None,
+        screens=screens, mode='128')
+    try:
+        window.workflow._timer.stop()
+        window.thumbnail_provider.set_paused(True)
+        # Freeze the broker grant so scope updates do not replace this small
+        # synthetic allowance with the configured 128 MiB request.
+        monkeypatch.setattr(broker, 'rebalance', lambda: None)
+        limit = frame_byte_estimate(window.thumbnail_render_spec) * frames
+        window.thumbnail_provider.configure_browser_memory(mode='128', limit_bytes=limit,
+            desired_bytes=limit, group_capacity_bytes=limit, reason='test-lead')
+        window._fast_scrolling = fast
+        window.workflow._update_cache_retention(30, 39, direction, screens)
+        rows = window.workflow._next_rows
+        assert len(rows) == expected
+        assert rows == (set(range(40, 40+expected)) if direction > 0
+                        else set(range(30-expected, 30)))
+        if expected > 10:
+            assert expected + 10 + 3 <= frames
+    finally:
+        window.close_resources(app)
+
+
+def test_fast_refill_orders_lead_before_distant_reverse_and_reorders_same_band():
+    from collections import deque
+    workflow = SimpleNamespace(_viewport=(30, 39, 1, 6), _input_refill_band=None,
+        _memory_refill=deque([0, 29, 10, 60, 40, 50, 49, 20, 28, 51, 70, 35]))
+    BrowserWorkflowController._prioritize_input_refill(workflow)
+    assert list(workflow._memory_refill)[:7] == [35, 40, 49, 29, 28, 50, 51]
+    assert list(workflow._memory_refill)[7:] == [0, 10, 60, 20, 70]
+    # The viewport need not cross a row boundary to reverse direction.
+    workflow._viewport = (30, 39, -1, 6)
+    BrowserWorkflowController._prioritize_input_refill(workflow)
+    assert list(workflow._memory_refill)[:6] == [35, 29, 28, 20, 40, 10]
+
+
 def _mixed_items(root, count, *, materialize=False):
     kinds = (
         (BrowserItemKind.IMAGE, ".jpg"),
@@ -167,6 +214,79 @@ def _drain_workflow(app, window, timeout=5.0):
         f"Browser warmup did not settle: {window.workflow.stop_reason}; "
         f"{window.thumbnail_provider.cache_statistics()}"
     )
+
+
+@pytest.mark.parametrize('sparse', (False, True))
+def test_missing_far_attempt_reopens_on_near_promotion_inside_same_scope(tmp_path, app, controlled_broker, sparse):
+    from dataclasses import replace
+    items = [replace(item, kind=BrowserItemKind.IMAGE) for item in _mixed_items(tmp_path, 60)]
+    if sparse:
+        items = [replace(item, can_generate_preview=row in (30, 31, 50)) for row, item in enumerate(items)]
+    window = _Window(tmp_path, items, loader=lambda *_: None, screens=6)
+    workflow = window.workflow
+    try:
+        assert workflow._synchronize_cursor()
+        before = {row for row, _identity in workflow._memory_scope}
+        ordered_scope = workflow._memory_scope
+        token = window.thumbnail_render_spec.cache_token
+        missing, resident, distant = [window.item_model.item_at(row) for row in (30, 31, 50)]
+        assert all(item.can_generate_preview for item in (missing, resident, distant))
+        pixels = QImage(24, 24, QImage.Format.Format_RGB32)
+        pixels.fill(0xff123456)
+        window.thumbnail_provider._consume_thumbnail_finished(
+            str(resident.path), window._generation, token, resident.thumbnail_revision, ThumbnailLoadResult(pixels))
+        identities = [workflow._memory_identity(item, token) for item in (missing, resident, distant)]
+        workflow._memory_attempted.update(identities)
+        workflow._rebuild_memory_refill()
+        assert 30 not in workflow._memory_refill
+        window._range = (20, 29)
+        assert workflow._synchronize_cursor()
+        assert {row for row, _identity in workflow._memory_scope} == before
+        if sparse:
+            assert workflow._memory_scope == ordered_scope
+        assert identities[0] not in workflow._memory_attempted
+        assert identities[1] in workflow._memory_attempted
+        assert identities[2] in workflow._memory_attempted
+        assert 30 in workflow._memory_refill
+        assert 31 not in workflow._memory_refill and 50 not in workflow._memory_refill
+        # A refusal within an unchanged near band still gets one attempt,
+        # rather than a new job on every completion or pixel scroll.
+        workflow._memory_attempted.add(identities[0])
+        workflow.recenter_cache_retention()
+        assert identities[0] in workflow._memory_attempted
+    finally:
+        window.close_resources(app)
+
+
+@pytest.mark.parametrize('deferred', ('disk-miss', 'memory-deferred'))
+def test_saved_only_deferrals_resume_original_policy_when_input_stops(tmp_path, app, controlled_broker, deferred):
+    from dataclasses import replace
+    items = [replace(item, kind=BrowserItemKind.IMAGE) for item in _mixed_items(tmp_path, 60)]
+    window = _Window(tmp_path, items, loader=lambda *_: None, screens=6)
+    calls = []
+    def request(item):
+        row = window.item_model.row_for_path(item.path)
+        calls.append((window._fast_scrolling, row))
+        return deferred if window._fast_scrolling else 'settled'
+    window.workflow._background_request = request
+    try:
+        window._fast_scrolling = True
+        for _ in range(10):
+            window.workflow._pump()
+        assert (True, 30) in calls
+        if deferred == 'disk-miss':
+            assert 30 in window.workflow._disk_misses
+        else:
+            assert window.workflow._far_reads_deferred
+            assert not window.workflow._disk_misses
+        window._fast_scrolling = False
+        for _ in range(10):
+            window.workflow._pump()
+        assert (False, 30) in calls
+        assert not window.workflow._disk_misses
+        assert not window.workflow._far_reads_deferred
+    finally:
+        window.close_resources(app)
 
 
 def test_visible_video_model_thumbnail_survives_memory_retention_pass(

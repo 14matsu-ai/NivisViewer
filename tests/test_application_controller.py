@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import pytest
 from types import SimpleNamespace
 from io import BytesIO
 from pathlib import Path
 from time import monotonic
+from threading import Event
 from zipfile import ZipFile
 from PIL import Image
 from PySide6.QtCore import Qt
@@ -287,10 +289,104 @@ def test_last_viewer_requests_application_exit_once(
     controller.close_viewer_window(window)
     controller.close_viewer_window(window)
 
-    assert exit_requests == [True]
+    assert wait_until(qapp, lambda: exit_requests == [True])
     assert controller.viewer_windows == ()
     qapp.processEvents()
     controller.shutdown()
+
+
+def test_close_hides_before_cleanup_and_does_not_reuse_retiring_viewer(tmp_path, qapp, monkeypatch):
+    controller = make_controller(tmp_path / 'profile', qapp)
+    controller.create_browser_window()
+    window = controller.create_viewer_window()
+    window.show()
+    released = [False]
+    waits = []
+    original = window.viewer.shutdown_rendering
+    def pending_render(msecs):
+        waits.append(msecs)
+        return original(msecs) if released[0] else False
+    monkeypatch.setattr(window.viewer, 'shutdown_rendering', pending_render)
+    try:
+        window.close()
+        assert not window.isVisible()
+        assert window not in controller.viewer_windows
+        assert window in controller._viewer_windows
+        assert wait_until(qapp, lambda: bool(waits))
+        assert waits and all(value == 0 for value in waits)
+        image = tmp_path / 'next.jpg'
+        write_image(image)
+        assert window.open_path(image) is False
+        assert controller._open_path_in_viewer(window, image) is False
+        other = controller.open_path(image, open_in_new_window=False)
+        assert other is not window
+        assert controller.get_active_viewer() is other
+        released[0] = True
+        assert wait_until(qapp, lambda: window not in controller._viewer_windows)
+    finally:
+        released[0] = True
+        close_controller(controller, qapp)
+
+
+def test_rejected_close_keeps_viewer_visible(tmp_path, qapp):
+    controller = make_controller(tmp_path, qapp)
+    window = controller.create_viewer_window()
+    window.show()
+    window._application_close_guard = lambda *_: False
+    try:
+        window.close()
+        assert window.isVisible()
+        assert not window._close_pending
+    finally:
+        window._application_close_guard = None
+        close_controller(controller, qapp)
+
+
+@pytest.mark.parametrize('hide_first', [False, True])
+def test_hidden_zip_viewer_retains_handles_until_its_worker_drains(tmp_path, qapp, monkeypatch, hide_first):
+    archive = tmp_path / 'book.zip'
+    payload = BytesIO()
+    with Image.new('RGB', (32, 48), 'navy') as image:
+        image.save(payload, 'PNG')
+    with ZipFile(archive, 'w') as output:
+        for page in range(3):
+            output.writestr(f'{page}.png', payload.getvalue())
+    controller = make_controller(tmp_path / 'profile', qapp)
+    controller.config.apply({'view_mode': 'single', 'show_page_list': False})
+    controller.create_browser_window()
+    window = controller.create_viewer_window()
+    monkeypatch.setattr(window, '_raster_background_allowed', lambda: False)
+    entered, release = Event(), Event()
+    try:
+        controller.open_path(archive, open_in_new_window=False)
+        finish_viewer_open(qapp, window)
+        session = window.book_session
+        source = session.source
+        original = source.open_image
+        def blocked_pixels(name):
+            entered.set()
+            assert release.wait(5)
+            return original(name)
+        monkeypatch.setattr(source, 'open_image', blocked_pixels)
+        window.next_page()
+        assert wait_until(qapp, entered.is_set)
+        if hide_first:
+            window.close()
+            assert not window.isVisible()
+            assert wait_until(qapp, lambda: window._close_runtime_retired)
+            assert not session.shutdown_complete
+            assert window in controller.viewers_using_paths((str(archive),))
+        assert controller.close_viewers((window,)) is False
+        assert not window.isVisible()
+        assert window in controller.viewers_using_paths((str(archive),))
+        assert not source._closed.is_set()
+        release.set()
+        assert wait_until(qapp, lambda: window not in controller._viewer_windows)
+        assert source._closed.is_set()
+        archive.rename(tmp_path / 'released.zip')
+    finally:
+        release.set()
+        close_controller(controller, qapp)
 
 
 def test_browser_is_singleton_and_coexists_with_viewers(

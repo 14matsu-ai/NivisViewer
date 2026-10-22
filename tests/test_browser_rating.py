@@ -121,6 +121,35 @@ def test_rating_rename_does_not_overwrite_collision(tmp_path: Path) -> None:
     assert collision.read_bytes() == b"collision"
 
 
+def test_clear_rating_collision_reports_destination_and_retry_succeeds(tmp_path):
+    source = tmp_path / "日本語 {zpi$r=3}.zip"
+    collision = tmp_path / "日本語.zip"
+    source.write_bytes(b"rated")
+    collision.write_bytes(b"unrated")
+    service = RatingRenameService()
+    result = service.set_rating(source, None)
+    assert not result.success
+    assert "同名" in result.error_message and collision.name in result.error_message
+    assert source.read_bytes() == b"rated" and collision.read_bytes() == b"unrated"
+    collision.rename(tmp_path / "退避.zip")
+    assert service.set_rating(source, None).success
+    assert collision.read_bytes() == b"rated"
+
+
+def test_rating_sharing_violation_has_actionable_reason(tmp_path, monkeypatch):
+    source = tmp_path / "日本語 {zpi$r=3}.zip"
+    source.write_bytes(b"archive")
+    error = PermissionError("sharing violation")
+    error.winerror = 32
+    def locked(*_args):
+        raise error
+    monkeypatch.setattr("app.rating_rename_service.os.rename", locked)
+    result = RatingRenameService().set_rating(source, None)
+    assert not result.success and "使用中" in result.error_message
+    assert "同名" not in result.error_message
+    assert source.read_bytes() == b"archive"
+
+
 def _item(path: Path, rating: int | None) -> BrowserItem:
     return BrowserItem(
         display_name=path.name,

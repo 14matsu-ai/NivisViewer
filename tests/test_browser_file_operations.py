@@ -371,7 +371,9 @@ def test_folder_rating_uses_safe_rename_and_preserves_tree_state_and_content(
 def test_folder_rating_collision_keeps_both_directories_unchanged(
     tmp_path: Path,
     qapp: QApplication,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setattr(QMessageBox, 'warning', lambda *_args: QMessageBox.StandardButton.Ok)
     folder = tmp_path / "books"
     source = folder / "Folder.Name"
     collision = folder / "Folder.Name {zpi$r=3}"
@@ -382,7 +384,7 @@ def test_folder_rating_collision_keeps_both_directories_unchanged(
     window, coordinator = make_window(tmp_path, qapp, folder)
     select_paths(window, [source])
 
-    assert window.set_rating_for_paths((str(source),), 3)
+    assert not window.set_rating_for_paths((str(source),), 3)
     finish_operation(window, coordinator, qapp)
 
     assert (source / "source.txt").read_text(encoding="utf-8") == "source"

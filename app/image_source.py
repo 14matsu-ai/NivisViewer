@@ -21,6 +21,7 @@ from natsort import natsorted
 from PIL import Image, ImageOps
 from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QSize
 from PySide6.QtGui import QImage, QImageIOHandler, QImageReader
+from .qt_image_reader import read_qimage
 
 from .archive_backend import (
     ArchiveEntry,
@@ -112,6 +113,27 @@ def _pillow_formats_for_image(image_id: str, data: bytes) -> tuple[str, ...] | N
     declared = _PILLOW_FORMAT_BY_SUFFIX.get(Path(image_id).suffix.casefold())
     format_hint = detected or declared
     return (format_hint,) if format_hint is not None else None
+
+
+def _probe_raster_header_size(stream, image_id: str) -> tuple[int, int] | None:
+    """Read geometry without Qt image handlers or a pixel allocation.
+
+    Explicit codec selection also avoids generic Pillow plugin discovery on
+    malformed input. Unknown formats leave geometry to the real decoder.
+    """
+    prefix = stream.read(16)
+    stream.seek(0)
+    formats = _pillow_formats_for_image(image_id, prefix)
+    if formats is None:
+        return None
+    with Image.open(stream, formats=formats) as image:
+        width, height = image.size
+        # Preserve Qt PNG's raw geometry hint. PNG.getexif() may load the
+        # entire raster to find late EXIF; the actual decoder owns that work.
+        orientation = 1 if image.format == 'PNG' else image.getexif().get(274, 1)
+        if orientation in {5, 6, 7, 8}:
+            width, height = height, width
+        return (width, height) if width > 0 and height > 0 else None
 
 
 def jpeg_decode_target_size(
@@ -311,7 +333,7 @@ def _read_webp_qimage(data: bytes) -> QImage | None:
     reader = QImageReader(buffer, b"webp")
     try:
         reader.setAutoTransform(True)
-        image = reader.read()
+        image = read_qimage(reader)
     finally:
         # The codec handler can retain the device. Tear it down while the
         # QBuffer and its QByteArray are still alive, before closing the IO.
@@ -383,7 +405,7 @@ def _read_jpeg_qimage_at_most(
     reader = QImageReader(buffer, b"jpeg")
     reader.setAutoTransform(True)
     reader.setScaledSize(QSize(*raw_target))
-    image = reader.read()
+    image = read_qimage(reader)
     buffer.close()
     if image.isNull():
         return None
@@ -510,28 +532,37 @@ def _read_jpeg_qbytearray_at_most(
     data: QByteArray,
     maximum_size: JpegMaximumSize,
 ) -> tuple[QImage, tuple[int, int]] | None:
-    """Decode one seekable Qt byte buffer without Python QIODevice callbacks."""
+    """Decode seekable Qt bytes with codec setup before parallel pixel work."""
     # Reject a plainly invalid entry before entering Qt's JPEG plugin.  Besides
     # avoiding native work, this prevents a first-ever worker-side malformed
     # JPEG probe from hanging plugin error initialization on Windows/offscreen.
     if data.size() < 3 or not data.startsWith(QByteArray(b"\xff\xd8\xff")):
         return None
+    # The pixel reader must not re-enter Qt's metadata path either: it can
+    # overlap saved-thumbnail reads just like a standalone geometry probe.
+    # Copy only the bounded header, retaining the single native pixel payload.
+    geometry = None
+    for limit in (64 * 1024, 256 * 1024, 1024 * 1024):
+        try:
+            with Image.open(io.BytesIO(bytes(data.first(min(limit, data.size())))),
+                            formats=('JPEG',)) as header:
+                raw_width, raw_height = header.size
+                swaps_axes = header.getexif().get(274, 1) in {5, 6, 7, 8}
+                if raw_width > 0 and raw_height > 0:
+                    geometry = raw_width, raw_height, swaps_axes
+                    break
+        except Exception:
+            pass
+        if limit >= data.size():
+            break
+    if geometry is None:
+        return None
+    raw_width, raw_height, swaps_axes = geometry
     buffer = QBuffer(data)
     if not buffer.open(QIODevice.OpenModeFlag.ReadOnly):
         return None
     try:
         reader = QImageReader(buffer, b"jpeg")
-        raw_size = reader.size()
-        transformation = reader.transformation()
-        raw_width = raw_size.width()
-        raw_height = raw_size.height()
-        if raw_width <= 0 or raw_height <= 0:
-            return None
-
-        swaps_axes = bool(
-            transformation
-            & QImageIOHandler.Transformation.TransformationRotate90
-        )
         logical_size = (
             (raw_height, raw_width)
             if swaps_axes
@@ -552,7 +583,7 @@ def _read_jpeg_qbytearray_at_most(
         )
         reader.setAutoTransform(True)
         reader.setScaledSize(QSize(*raw_target))
-        image = reader.read()
+        image = read_qimage(reader)
         if image.isNull():
             return None
         return image, logical_size
@@ -1204,15 +1235,9 @@ class FolderImageSource(ImageSource):
     def probe_image_size(self, image_id: str) -> tuple[int, int] | None:
         """Read folder image geometry without decoding pixels.
 
-        Pillow's generic format sniffing can import every registered plugin
-        when a malformed file is probed. Besides doing needless work, that can
-        contend with optional decoder initialization while an interactive
-        request adopts a running prefetch. QImageReader selects from the file
-        format and reads only its header. Pillow remains the fallback for the
-        optional formats not covered by the app's Qt runtime. WebP uses its
-        explicit Pillow header reader: concurrent file-backed Qt WebP header
-        probes and pixel reads have stalled in the folder navigation path.
-        Pixel decoding still uses the parallel Qt fast path.
+        Header probes stay outside Qt image handlers so saved-thumbnail and
+        Viewer pixel decoders can run concurrently. Explicit Pillow formats
+        avoid generic plugin discovery for malformed input.
         """
 
         if Path(image_id).suffix.casefold() in {'.svg', '.ai'}:
@@ -1230,17 +1255,13 @@ class FolderImageSource(ImageSource):
         if suffix in {".avif", ".jxl", ".webp"}:
             return self.logical_size(image_id)
         require_local(image_id)
-        reader = QImageReader(image_id)
-        size = reader.size()
-        if not size.isValid() or size.width() <= 0 or size.height() <= 0:
+        try:
+            with open(image_id, 'rb') as stream:
+                logical_size = _probe_raster_header_size(stream, image_id)
+        except Exception:
             return None
-        width, height = int(size.width()), int(size.height())
-        if reader.transformation().value & (
-            QImageIOHandler.Transformation.TransformationRotate90.value
-        ):
-            width, height = height, width
-        logical_size = (width, height)
-        self._remember_folder_metadata(image_id, size=logical_size)
+        if logical_size is not None:
+            self._remember_folder_metadata(image_id, size=logical_size)
         return logical_size
 
     def display_path(self, image_id: str) -> str:
@@ -1501,7 +1522,7 @@ class ZipImageSource(ImageSource):
 
                         reader.setAutoTransform(True)
                         reader.setScaledSize(QSize(*raw_target))
-                        image = reader.read()
+                        image = read_qimage(reader)
                         self._raise_if_cancelled(cancelled)
                         if device.too_large:
                             raise ImageSourceError(
@@ -1689,15 +1710,15 @@ class ZipImageSource(ImageSource):
                     )
                 entry = self._zip.open(info, "r")
             with entry:
-                header = QByteArray()
+                header = bytearray()
                 for limit in (64 * 1024, 256 * 1024, 1024 * 1024):
                     self._raise_if_cancelled(cancelled)
                     with self._lock:
-                        chunk = entry.read(max(0, min(limit, info.file_size) - header.size()))
-                    header.append(chunk)
+                        chunk = entry.read(max(0, min(limit, info.file_size) - len(header)))
+                    header.extend(chunk)
                     self._raise_if_cancelled(cancelled)
                     if suffix == ".webp" or (
-                        header.startsWith(b"RIFF") and header.mid(8, 4) == b"WEBP"
+                        header.startswith(b"RIFF") and header[8:12] == b"WEBP"
                     ):
                         # WebP metadata must not enter QImageReader.size while
                         # parallel jobs decode WebP pixels. The folder adapter
@@ -1708,38 +1729,22 @@ class ZipImageSource(ImageSource):
                         if logical is not None:
                             self._size_cache[image_id] = logical
                             return logical
-                        if header.size() >= info.file_size or not chunk:
+                        if len(header) >= info.file_size or not chunk:
                             return None
                         continue
-                    # Both device methods and plugin reads stay in C++. Do
-                    # not hold the ZIP lock during reader/plugin operations.
-                    device = QBuffer(header)
-                    if not device.open(QIODevice.OpenModeFlag.ReadOnly):
-                        return None
+                    # Never overlap Qt metadata probing with Qt pixel reads.
+                    # Keep bounded header parsing outside the ZIP source lock.
                     try:
-                        reader = QImageReader(device)
-                        raw_size = reader.size()
-                        transformation = reader.transformation()
-                        self._raise_if_cancelled(cancelled)
-                        raw_width = raw_size.width()
-                        raw_height = raw_size.height()
-                        if raw_width <= 0 or raw_height <= 0:
-                            if header.size() >= info.file_size or not chunk:
-                                return None
-                            continue
-                        swaps_axes = bool(
-                            transformation
-                            & QImageIOHandler.Transformation.TransformationRotate90
-                        )
-                        logical_size = (
-                            (raw_height, raw_width)
-                            if swaps_axes
-                            else (raw_width, raw_height)
-                        )
+                        with io.BytesIO(header) as stream:
+                            logical_size = _probe_raster_header_size(stream, image_id)
+                    except Exception:
+                        logical_size = None
+                    self._raise_if_cancelled(cancelled)
+                    if logical_size is not None:
                         self._size_cache[image_id] = logical_size
                         return logical_size
-                    finally:
-                        device.close()
+                    if len(header) >= info.file_size or not chunk:
+                        return None
                 return None
         except ImageSourceError:
             raise

@@ -145,7 +145,10 @@ def test_strict_filter_and_or_exclude_composes_with_search_and_rating():
 
 
 @pytest.fixture
-def library(tmp_path, qapp):
+def library(tmp_path, qapp, monkeypatch):
+    # Failure notifications are modal in the application; assertions below
+    # still inspect filesystem/model results without waiting for human input.
+    monkeypatch.setattr(QMessageBox, 'warning', Mock(return_value=QMessageBox.StandardButton.Ok))
     root = tmp_path / 'shelf'
     root.mkdir()
     controller = make_controller(tmp_path, qapp)
@@ -386,6 +389,7 @@ def test_folder_tag_collision_preserves_both_trees(library, qapp):
     browser.set_rating_for_paths((str(path),), None, tag_changes={'新': True})
     assert wait_until(qapp, lambda: browser._rating_batch is None and not browser.file_operation_coordinator.busy, timeout=5)
     assert (path / '1.png').exists() and (collision / '2.png').exists()
+    assert '同名' in QMessageBox.warning.call_args.args[2]
 
 
 def test_registered_labels_render_and_disappear_without_touching_filename(library, qapp):

@@ -145,6 +145,48 @@ def test_direct_rating_target_preserves_multiselection_and_thumbnail_cache(
         qapp.processEvents()
 
 
+def test_clear_rating_collision_explains_reason_and_allows_retry(tmp_path, qapp, monkeypatch):
+    warnings = []
+    monkeypatch.setattr(QMessageBox, 'warning', lambda _parent, title, message: warnings.append((title, message)))
+    folder = tmp_path / "ratings"
+    rated = folder / "日本語 {zpi$r=3}.jpg"
+    collision = folder / "日本語.jpg"
+    write_image(rated)
+    write_image(collision)
+    window = BrowserWindow(config_manager=make_config(tmp_path, folder))
+    finish_scan(window, qapp)
+    assert window.thumbnail_provider.wait_for_done()
+
+    def clear_rating(path):
+        index = window.item_model.index(window.item_model.row_for_path(path), 0)
+        selection = window.list_view.selectionModel()
+        selection.select(index, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        selection.setCurrentIndex(index, QItemSelectionModel.SelectionFlag.NoUpdate)
+        return window.set_rating_for_paths((str(path),), None)
+
+    try:
+        with patch.object(window, '_confirm_and_close_affected_viewers', return_value=True) as close_viewers:
+            assert not clear_rating(rated)
+            close_viewers.assert_not_called()
+            assert window.set_rating_for_paths((str(rated),), 3) is False
+            close_viewers.assert_not_called()
+        assert warnings and "同名" in warnings[-1][1] and collision.name in warnings[-1][1]
+        assert rated.exists() and collision.exists()
+        assert window._rating_batch is None and not window.file_operation_coordinator.busy
+        # A different star can succeed while clearing still collides.
+        assert window.set_rating_for_paths((str(rated),), 4)
+        changed = folder / "日本語 {zpi$r=4}.jpg"
+        assert changed.exists()
+        collision.rename(folder / "退避.jpg")
+        qapp.processEvents()
+        assert clear_rating(changed)
+        assert collision.exists() and not changed.exists()
+        assert window.item_model.item_at(window.item_model.row_for_path(collision)).rating is None
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
 def test_top_rating_sort_controls_live_resort_without_thumbnail_decode(
     tmp_path: Path,
     qapp: QApplication,
@@ -529,8 +571,12 @@ def test_search_and_rating_quick_filter_compose_without_changing_sort(
 
         window.rating_filter_widget.clear_filter()
         window.browser_search_edit.setText("ALPHA")
-        QTest.qWait(120)
-        qapp.processEvents()
+        # Wait for the debounced result, rather than its nominal timer period:
+        # concurrent native cache reads can delay delivery on a loaded host.
+        for _ in range(100):
+            if [item.display_name for item in window.items] == ["alpha.jpg"]:
+                break
+            QTest.qWait(10)
         assert [item.display_name for item in window.items] == ["alpha.jpg"]
     finally:
         window.close()
@@ -706,14 +752,14 @@ def test_rating_change_live_filters_without_rescan_or_thumbnail_decode(
     )
 
     try:
-        with patch.object(
-            window.thumbnail_provider,
-            "request",
-            wraps=window.thumbnail_provider.request,
-        ) as thumbnail_request:
-            assert window.set_rating_for_paths((str(middle),), 2)
-            qapp.processEvents()
-            assert thumbnail_request.call_count == 0
+        generated_before = window.thumbnail_provider.cache_statistics()['generated']
+        assert window.set_rating_for_paths((str(middle),), 2)
+        qapp.processEvents()
+        assert window.thumbnail_provider.wait_for_done()
+        qapp.processEvents()
+        # A pending viewport timer may request a resident image again. The
+        # user-visible contract is no new pixel generation or directory scan.
+        assert window.thumbnail_provider.cache_statistics()['generated'] == generated_before
 
         renamed = folder / "middle {zpi$r=2}.jpg"
         assert renamed.exists()

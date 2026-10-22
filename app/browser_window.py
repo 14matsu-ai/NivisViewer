@@ -230,6 +230,7 @@ from .internal_clipboard import (
 from .metadata_store import MetadataStore
 from .path_availability import PathAvailability, PathAvailabilityResult, PathAvailabilityService, path_key
 from .rating_rename_service import RatingRenameService
+from .gui_garbage_collector import ensure_gui_garbage_collector
 from .zippla_filename_metadata import ZipPlaFilenameMetadata
 from .performance_trace import performance_trace
 from .settings_dialog import SettingsDialog
@@ -585,6 +586,7 @@ class BrowserWindow(QMainWindow):
         file_operation_coordinator: FileOperationCoordinator | None = None,
         affected_viewers_handler: AffectedViewersHandler | None = None,
         close_affected_viewers_handler: CloseAffectedViewersHandler | None = None,
+        release_prepared_book_handler: Callable[[tuple[str, ...]], bool] | None = None,
         archive_backend_registry=None,
         pdfium_service=None,
         file_registration_service=None,
@@ -596,6 +598,7 @@ class BrowserWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        ensure_gui_garbage_collector()
         self.setAcceptDrops(True)
         self.setWindowTitle(tr('NivisViewer - ブラウザ'))
         install_window_icon(self)
@@ -609,6 +612,7 @@ class BrowserWindow(QMainWindow):
         self._open_path_handler = open_path_handler
         self._affected_viewers_handler = affected_viewers_handler
         self._close_affected_viewers_handler = close_affected_viewers_handler
+        self._release_prepared_book_handler = release_prepared_book_handler
         self._folder_navigation_handler = folder_navigation_handler
         self._owns_archive_backend_registry = archive_backend_registry is None
         self.archive_backend_registry = (
@@ -3694,7 +3698,7 @@ class BrowserWindow(QMainWindow):
         closed = self._close_affected_viewers_handler(viewers)
         if closed is False:
             self._show_temporary_status(
-                tr('PDFの解放を待機中のためファイル操作を開始できません')
+                tr('Viewerや書庫の解放を待機中です。少し待ってから再試行してください。')
             )
             return False
         return True
@@ -6320,7 +6324,34 @@ class BrowserWindow(QMainWindow):
             existing_items = changed_items
             if not existing_items:
                 return False
+        batch = _RatingRenameBatch(
+            normalized_rating, self._capture_list_view_state(),
+            tag_edit=tag_changes is not None,
+        )
+        planned = []
+        for path, kind in existing_items:
+            original = ZipPlaFilenameMetadata.parse(path)
+            metadata = (
+                original.with_tag_changes(expand_logical_tag_changes(
+                    original.tags or (), tag_changes, tag_registry,
+                )) if tag_changes is not None else original.with_rating(normalized_rating)
+            )
+            directory = kind is BrowserItemKind.FOLDER
+            if os.fspath(metadata.serialized_path(is_directory=directory)) == path:
+                continue
+            conflict = self.rating_rename_service.destination_conflict(metadata, is_directory=directory)
+            if conflict:
+                batch.failures.append(f"{Path(path).name}: {conflict}")
+            else:
+                planned.append((path, kind, metadata))
+        if not planned:
+            return self._finalize_rating_batch(batch)
+        existing_items = [(path, kind) for path, kind, _metadata in planned]
         existing = tuple(path for path, _kind in existing_items)
+        if (self._release_prepared_book_handler is not None
+                and not self._release_prepared_book_handler(existing)):
+            batch.failures.append(tr('画像や書庫の読み込み終了を待機中です。少し待ってから再試行してください。'))
+            return self._finalize_rating_batch(batch)
         # A selection-triggered Pillow header probe briefly owns a Windows
         # file handle. Retire its stale pending work and drain only the active
         # header read before the same-file rename, otherwise WinError 32 can
@@ -6333,23 +6364,11 @@ class BrowserWindow(QMainWindow):
         # Folder books retain immutable page identities for their lifetime.
         # Reuse the established safety contract instead of leaving an open
         # Viewer with a stale page path after the metadata rename.
-        direct_file_paths = tuple(
-            path
-            for path, kind in existing_items
-            if kind is not BrowserItemKind.FOLDER
-        )
-        if (
-            direct_file_paths
-            and not self._confirm_and_close_affected_viewers(direct_file_paths)
-        ):
+        if not self._confirm_and_close_affected_viewers(existing):
             return False
-
-        state = self._capture_list_view_state()
-        batch = _RatingRenameBatch(
-            normalized_rating,
-            state,
-            tag_edit=tag_changes is not None,
-        )
+        if not self.thumbnail_provider.release_file_handles(existing):
+            batch.failures.append(tr('画像や書庫の読み込み終了を待機中です。少し待ってから再試行してください。'))
+            return self._finalize_rating_batch(batch)
         # A single archive tag edit has no Pillow detail handle to drain.
         # Publish its successful filename change before a possibly slow
         # profile-database relocation on rotational storage.
@@ -6359,21 +6378,7 @@ class BrowserWindow(QMainWindow):
             and existing_items[0][1] is BrowserItemKind.ARCHIVE
         )
         pending_metadata_relocation: tuple[str, str] | None = None
-        for path, kind in existing_items:
-            original_metadata = ZipPlaFilenameMetadata.parse(path)
-            if tag_changes is not None:
-                physical_changes = expand_logical_tag_changes(
-                    original_metadata.tags or (),
-                    tag_changes,
-                    tag_registry,
-                )
-                metadata = original_metadata.with_tag_changes(
-                    physical_changes
-                )
-            else:
-                metadata = original_metadata.with_rating(normalized_rating)
-            if tag_changes is not None and metadata == original_metadata:
-                continue
+        for path, kind, metadata in planned:
             if kind is BrowserItemKind.FOLDER:
                 destination = metadata.serialized_path(is_directory=True)
                 if str(Path(path)) == str(destination):
@@ -6469,11 +6474,11 @@ class BrowserWindow(QMainWindow):
             return
 
     def _finalize_rating_batch(self, batch: _RatingRenameBatch) -> bool:
-        self.file_operation_coordinator.invalidate_undo()
         if self._rating_batch is batch:
             self._rating_batch = None
         replacements = batch.replacements
         if replacements:
+            self.file_operation_coordinator.invalidate_undo()
             self._clear_rating_hover()
             self.item_model.apply_rating_renames(tuple(replacements))
             remap = {
@@ -6514,6 +6519,7 @@ class BrowserWindow(QMainWindow):
             logging.getLogger("nivisviewer.rating").warning(
                 "%s: %s", summary, "; ".join(batch.failures)
             )
+            QMessageBox.warning(self, summary, "\n\n".join(batch.failures[:3]))
         elif changed_count:
             self._show_temporary_status(tr('{p0}件のタグを変更しました', p0=changed_count) if getattr(batch, 'tag_edit', False) else
                                         tr('{p0}件のレートを変更しました', p0=changed_count))
@@ -8799,12 +8805,16 @@ class BrowserWindow(QMainWindow):
             return
         self._thumbnail_dpr = current
         new_spec = self._build_thumbnail_render_spec()
-        if new_spec.cache_token == self.thumbnail_render_spec.cache_token:
-            return
-        self.thumbnail_render_spec = new_spec
-        self.thumbnail_bucket_size = new_spec.long_edge
-        self._generation = self.thumbnail_provider.begin_generation()
-        self._schedule_thumbnail_requests(0)
+        changed = new_spec.cache_token != self.thumbnail_render_spec.cache_token
+        if changed:
+            self.thumbnail_render_spec = new_spec
+            self.thumbnail_bucket_size = new_spec.long_edge
+            self._generation = self.thumbnail_provider.begin_generation()
+        presentation = getattr(self, '_thumbnail_presentation', None)
+        if presentation is not None:
+            presentation.recenter()
+        if changed:
+            self._schedule_thumbnail_requests(0)
 
     def _visible_row_range(self) -> tuple[int, int] | None:
         viewport = self.list_view.viewport()

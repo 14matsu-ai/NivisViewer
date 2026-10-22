@@ -53,6 +53,7 @@ class BrowserWorkflowController(QObject):
         self._inflight_lane = "cursor"
         self._inflight_jobs = {}
         self._disk_misses = set()
+        self._far_reads_deferred = False
         self._pumping = False
         self._ime_composing = False
         self._timer = QTimer(self)
@@ -172,14 +173,24 @@ class BrowserWorkflowController(QObject):
     def _prioritize_input_refill(self) -> None:
         first, last = self._viewport[:2]
         span = max(1, last - first + 1)
-        band = (max(0, first - 2 * span), last + 2 * span)
+        direction = -1 if self._viewport[2] < 0 else 1
+        band = (max(0, first - 2 * span), last + 2 * span, direction)
         if band == self._input_refill_band:
             return
         self._input_refill_band = band
-        # Prioritize the two-screen guard, then continue saved reads through
-        # the configured memory scope without waiting for input to stop.
-        self._memory_refill = deque(sorted(self._memory_refill,
-            key=lambda row: not band[0] <= row <= band[1]))
+        def priority(row):
+            if first <= row <= last:
+                return (0, row - first)
+            ahead = row - last if direction > 0 else first - row
+            behind = first - row if direction > 0 else row - last
+            if 0 < ahead <= span:
+                return (1, ahead)
+            if 0 < behind <= ceil(span * .25):
+                return (2, behind)
+            if span < ahead <= 2 * span:
+                return (3, ahead)
+            return (4, 0)  # Keep the configured scope's existing far order.
+        self._memory_refill = deque(sorted(self._memory_refill, key=priority))
 
     def _retry_memory_job(self, key) -> None:
         identity = (key[1].casefold(), key[3], key[4])
@@ -188,13 +199,15 @@ class BrowserWorkflowController(QObject):
             self._memory_refill.appendleft(key[0])
             self._input_refill_band = None
 
-    def _set_memory_scope(self, rows, first: int, last: int, *, selected_rows=()) -> None:
+    def _set_memory_scope(self, rows, first: int, last: int, *, selected_rows=(), reopened_rows=()) -> None:
         if self._memory_broker is None:
             return
         model = self.window.item_model
         rows = tuple(int(row) for row in rows)
         token = self.window.thumbnail_render_spec.cache_token
         scope = []
+        reopened_rows = set(reopened_rows)
+        promoted = []
         retained_paths = []
         selected = set(selected_rows)
         # Only orphan previews need model-only retention. Owned thumbnail
@@ -224,11 +237,21 @@ class BrowserWorkflowController(QObject):
             if not self._background_eligible(item):
                 continue
             scope.append((row, self._memory_identity(item, token)))
+            if row in reopened_rows:
+                promoted.append(row)
         new_scope = tuple(scope)
         if new_scope != self._memory_scope:
             self._memory_attempted.intersection_update(identity for _row, identity in new_scope)
             self._memory_scope = new_scope
             self._rebuild_memory_refill()
+        elif promoted:
+            queued = set(self._memory_refill)
+            inflight = {key[0] for key in self._inflight_jobs if key[-1] == self._context}
+            for row in reversed(promoted):
+                if row not in queued and row not in inflight:
+                    self._memory_refill.appendleft(row)
+                    queued.add(row)
+            self._input_refill_band = None
         retain_images = getattr(model, "retain_thumbnail_images", None)
         if callable(retain_images):
             retain_images(retained_paths)
@@ -302,6 +325,7 @@ class BrowserWorkflowController(QObject):
         self._inflight = None
         self._inflight_jobs.clear()
         self._disk_misses.clear()
+        self._far_reads_deferred = False
         self._inflight_lane = "cursor"
         self._near_rows.clear()
         self._next_rows.clear()
@@ -397,6 +421,7 @@ class BrowserWorkflowController(QObject):
                     self.options["browser_thumbnail_background_screens"])
         if context != self._context:
             self._disk_misses.clear()
+            self._far_reads_deferred = False
             self._context = context
             self._cursor = ThumbnailWarmupCursor(count)
             self._viewport = None
@@ -434,6 +459,9 @@ class BrowserWorkflowController(QObject):
         self._retention_quota_epoch = self._memory_quota_epoch
         window = self.window
         count = window.item_model.rowCount()
+        configure_display_count = getattr(window.thumbnail_provider, 'set_display_working_set_count', None)
+        if callable(configure_display_count):
+            configure_display_count(count)
         span = max(1, last - first + 1)
         direction = -1 if int(direction) < 0 else 1
 
@@ -450,6 +478,15 @@ class BrowserWorkflowController(QObject):
         if screens != 0:
             next_count = span
             safety_count = ceil(span * 0.25)
+            if getattr(window, '_fast_scrolling', False) and screens != 1:
+                # A faster input loop must have enough lead to keep images
+                # ready. Protect a second forward viewport when the grant
+                # holds it, rather than deferring it as far speculative work.
+                frame_bytes = max(1, frame_byte_estimate(window.thumbnail_render_spec))
+                capacity = int(getattr(window.thumbnail_provider,
+                    'memory_cache_limit_bytes', 0)) // frame_bytes
+                if count > capacity:
+                    next_count = min(2 * span, max(span, capacity - span - safety_count))
             if direction > 0:
                 next_rows = list(range(last + 1, min(count, last + 1 + next_count)))
                 safety_rows = list(range(first - 1, max(-1, first - 1 - safety_count), -1))
@@ -457,10 +494,25 @@ class BrowserWorkflowController(QObject):
                 next_rows = list(range(first - 1, max(-1, first - 1 - next_count), -1))
                 safety_rows = list(range(last + 1, min(count, last + 1 + safety_count)))
             near_rows = next_rows + safety_rows
+        entering_near = set(near_rows) - self._near_rows
         self._next_rows = set(next_rows)
         self._near_rows = set(near_rows)
 
         provider = window.thumbnail_provider
+        reopened_rows = []
+        has_memory = getattr(provider, 'has_memory_thumbnail', None)
+        if self._memory_broker is not None and callable(has_memory):
+            spec = window.thumbnail_render_spec
+            for row in entering_near:
+                item = window.item_model.item_at(row)
+                if item is not None and not has_memory(item, spec):
+                    # A terminal far attempt may have lost RAM admission.
+                    # Promote it once when it enters the next/reverse band,
+                    # even if it never left the larger configured scope.
+                    identity = self._memory_identity(item, spec.cache_token)
+                    if identity in self._memory_attempted:
+                        self._memory_attempted.discard(identity)
+                        reopened_rows.append(row)
         configure_reads = getattr(provider, 'set_saved_read_window', None)
         if callable(configure_reads):
             configure_reads(len(next_rows))
@@ -511,7 +563,8 @@ class BrowserWorkflowController(QObject):
                             2 if row in safety_set else 3
                         )
                         entries.append((item.path, item.thumbnail_revision, retention_rank))
-                self._set_memory_scope(hot_rows, first, last, selected_rows=selected_rows)
+                self._set_memory_scope(hot_rows, first, last, selected_rows=selected_rows,
+                                       reopened_rows=reopened_rows)
             else:
                 for row, rank in retained.items():
                     item = window.item_model.item_at(row)
@@ -581,6 +634,12 @@ class BrowserWorkflowController(QObject):
             self._pumping = False
 
     def _reopen_disk_misses(self):
+        if getattr(self, '_far_reads_deferred', False) and self._cursor is not None:
+            self._far_reads_deferred = False
+            if self._viewport is not None:
+                # Deferred reads only changed done bits. Rewind the iterator
+                # once at idle, without accumulating an all-list retry queue.
+                self._cursor.recenter(*self._viewport)
         if not self._disk_misses or self._cursor is None:
             return
         token = self.window.thumbnail_render_spec.cache_token
@@ -591,6 +650,17 @@ class BrowserWorkflowController(QObject):
                 self._memory_attempted.discard(self._memory_identity(item, token))
         self._disk_misses.clear()
         self._rebuild_memory_refill()
+
+    def _complete_background_attempt(self, row, item, state):
+        if state == 'memory-deferred' and item is not None and item.preview_kind != 'video':
+            self._far_reads_deferred = True
+            if self._cursor is not None:
+                self._cursor.defer(row)
+            return
+        if state == 'disk-miss' and item is not None and item.preview_kind != 'video':
+            self._disk_misses.add(row)
+        if self._cursor is not None:
+            self._cursor.complete(row)
 
     def _background_request(self, item):
         provider = self.window.thumbnail_provider
@@ -710,10 +780,7 @@ class BrowserWorkflowController(QObject):
                     self._stop_reason = "provider-busy"
                     return
                 self._memory_attempted.add(identity)
-                if state == "disk-miss" and item is not None and item.preview_kind != "video":
-                    self._disk_misses.add(row)
-                if self._cursor is not None:
-                    self._cursor.complete(row)
+                self._complete_background_attempt(row, item, state)
             if self._memory_refill:
                 self._stop_reason = "memory-refill-yield"
                 self.schedule_background()
@@ -781,9 +848,7 @@ class BrowserWorkflowController(QObject):
                     else "provider-busy"
                 )
                 return
-            if state == "disk-miss" and item is not None and item.preview_kind != "video":
-                self._disk_misses.add(row)
-            self._cursor.complete(row)
+            self._complete_background_attempt(row, item, state)
         self._stop_reason = "scan-yield"
         self.schedule_background()  # Bounded cached/unsupported scan per tick.
 
@@ -811,9 +876,7 @@ class BrowserWorkflowController(QObject):
                     if lane == "memory" and state == "cancelled" and not item_changed:
                         self._retry_memory_job(current)
                 else:
-                    self._cursor.complete(row)
-                    if state == "disk-miss" and item is not None and item.preview_kind != "video":
-                        self._disk_misses.add(row)
+                    self._complete_background_attempt(row, item, state)
                     if lane == "memory" and item is not None:
                         identity = self._memory_identity(item, token)
                         if any(identity == current_identity for _scoped_row, current_identity in self._memory_scope):
@@ -860,6 +923,7 @@ class BrowserWorkflowController(QObject):
         # The ordinary timer still handles recentering, cache misses, generation
         # and scans. Completion only replenishes one already planned saved read;
         # it must never run another 32-item/2ms dispatch slice per notification.
+        self._prioritize_input_refill()
         row = self._memory_refill.popleft()
         item = window.item_model.item_at(row)
         if not self._background_eligible(item):
@@ -887,9 +951,7 @@ class BrowserWorkflowController(QObject):
                 self._input_refill_band = None
             else:
                 self._memory_attempted.add(identity)
-                if state == 'disk-miss' and item.preview_kind != 'video':
-                    self._disk_misses.add(row)
-                self._cursor.complete(row)
+                self._complete_background_attempt(row, item, state)
 
     def _submission_rejected(self, path, generation, token, revision) -> None:
         for key in tuple(getattr(self, '_inflight_jobs', {})):

@@ -33,6 +33,7 @@ from .adjacent_book_search import (
 from .archive_backend_registry import ArchiveBackendRegistry
 from .browser_window import BrowserWindow
 from .browser_book_preparation import BrowserBookPreparation
+from .gui_garbage_collector import ensure_gui_garbage_collector
 from .browser_sort import (
     BrowserSortPolicy, normalize_browser_sort_key, normalize_browser_sort_order,
     normalize_browser_random_seed,
@@ -108,6 +109,7 @@ class ApplicationController(QObject):
         file_registration_service=None,
     ) -> None:
         super().__init__(parent if parent is not None else application)
+        ensure_gui_garbage_collector()
         self.application = application
         self.config = config_manager or ConfigManager()
         self.settings = self.config.load()
@@ -207,7 +209,8 @@ class ApplicationController(QObject):
 
     @property
     def viewer_windows(self) -> tuple[ViewerWindow, ...]:
-        return tuple(self._viewer_windows)
+        return tuple(window for window in self._viewer_windows
+                     if not getattr(window, '_close_pending', False))
 
     def start(
         self,
@@ -274,6 +277,7 @@ class ApplicationController(QObject):
             file_operation_coordinator=self.file_operation_coordinator,
             affected_viewers_handler=self.viewers_using_paths,
             close_affected_viewers_handler=self.close_viewers,
+            release_prepared_book_handler=self.book_preparation.release_file_handles,
             archive_backend_registry=self.archive_backend_registry,
             pdfium_service=self.pdfium_service,
             file_registration_service=self.file_registration_service,
@@ -393,6 +397,8 @@ class ApplicationController(QObject):
         self._active_viewer = window
         self._quit_requested = False
         window.activated.connect(self._on_viewer_activated)
+        if isinstance(window, ViewerWindow):
+            window.close_started.connect(self._on_viewer_close_started)
         window.closing.connect(self._on_viewer_closing)
         window.slideshow_stopped.connect(
             lambda target: self._cancel_adjacent_search(target, clear_status=True),
@@ -421,7 +427,7 @@ class ApplicationController(QObject):
         return window
 
     def get_active_viewer(self) -> ViewerWindow | None:
-        if self._active_viewer in self._viewer_windows:
+        if self._active_viewer in self.viewer_windows:
             return self._active_viewer
         self._active_viewer = None
         return None
@@ -461,8 +467,8 @@ class ApplicationController(QObject):
         affected: list[ViewerWindow] = []
         targets = tuple(self._path_key(path) for path in paths)
         for window in self._viewer_windows:
-            source = window.book_session.source
-            current = window.book_session.current_path
+            source = window.book_session.source or getattr(window, '_closing_source', None)
+            current = window.book_session.current_path or getattr(window, '_closing_current_path', None)
             if source is None or current is None:
                 continue
             source_key = self._path_key(source.source_path)
@@ -487,7 +493,14 @@ class ApplicationController(QObject):
         try:
             for window in tuple(viewers):
                 if window in self._viewer_windows:
-                    window.prepare_shutdown(wait_msecs=2000)
+                    # Capture the source identity and retain this hidden owner
+                    # before shutdown clears session.source. A retired worker
+                    # may still hold its archive even after the wait expires.
+                    window.close()
+                    if not window._close_pending and not window._shutdown_cleanup_complete:
+                        return False
+                    if window.prepare_shutdown(wait_msecs=2000) is False:
+                        return False
                     window.close()
             return self.pdfium_service.flush(wait_seconds=2.0)
         finally:
@@ -902,9 +915,10 @@ class ApplicationController(QObject):
             return self.create_viewer_window()
 
         active = self.get_active_viewer()
+        reusable = self.viewer_windows
         if open_in_new_window is False:
             return active or (
-                self._viewer_windows[-1] if self._viewer_windows else self.create_viewer_window()
+                reusable[-1] if reusable else self.create_viewer_window()
             )
 
         behavior = str(self.settings.get("open_viewer_behavior", "reuse_or_create"))
@@ -915,7 +929,7 @@ class ApplicationController(QObject):
         if behavior == "reuse_active":
             return active or self.create_viewer_window()
         return active or (
-            self._viewer_windows[-1] if self._viewer_windows else self.create_viewer_window()
+            reusable[-1] if reusable else self.create_viewer_window()
         )
 
     def _open_path_in_viewer(
@@ -928,6 +942,8 @@ class ApplicationController(QObject):
         browser_snapshot: AdjacentBookBrowserSnapshot | None = None,
         slideshow_transition: bool = False,
     ) -> bool:
+        if getattr(window, '_shutdown_prepared', False):
+            return False
         self._cancel_adjacent_search(window, clear_status=True)
         self._active_viewer = window
         browser = self.get_browser_window()
@@ -1094,7 +1110,7 @@ class ApplicationController(QObject):
         )
 
     def _on_viewer_activated(self, window: object) -> None:
-        if isinstance(window, ViewerWindow) and window in self._viewer_windows:
+        if isinstance(window, ViewerWindow) and window in self.viewer_windows:
             self._active_viewer = window
             if self._sync_displayed_item_in_current_browser(window):
                 return
@@ -1148,6 +1164,13 @@ class ApplicationController(QObject):
     def _on_viewer_interactive_open_cancelled(self, _window: object) -> None:
         self.image_work_coordinator.cancel_viewer_interactive()
 
+    def _on_viewer_close_started(self, window: object) -> None:
+        self._cancel_adjacent_search(window)
+        if window is self._active_viewer:
+            self._save_standard_window_state(window)
+            available = self.viewer_windows
+            self._active_viewer = available[-1] if available else None
+
     def _on_viewer_closing(self, window: object) -> None:
         if self.book_preparation._target() is window:
             self.book_preparation.cancel('viewer_closed')
@@ -1195,7 +1218,8 @@ class ApplicationController(QObject):
             self._save_standard_window_state(window)
         self._viewer_windows.remove(window)
         if self._active_viewer is window:
-            self._active_viewer = self._viewer_windows[-1] if self._viewer_windows else None
+            available = self.viewer_windows
+            self._active_viewer = available[-1] if available else None
             if (
                 self._active_viewer is not None
                 and self._active_viewer.book_session.current_path is not None

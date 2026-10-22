@@ -139,7 +139,8 @@ def test_cancelled_old_decode_cannot_poison_failure_or_disk_cache(tmp_path, qapp
     provider = BrowserThumbnailProvider(loader=decode, disk_cache=disk)
     try:
         provider.request(old, 80, generation=provider.begin_generation())
-        assert started.wait(2)
+        # A saved-cache miss hands generation back through the GUI event loop.
+        wait_until(qapp, started.is_set, timeout=2000)
         write_png(path, "blue", 80)
         provider.begin_generation(retry_failed=True)
         release.set()

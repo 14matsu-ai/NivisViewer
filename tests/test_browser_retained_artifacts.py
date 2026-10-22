@@ -1,5 +1,6 @@
 """Original ZipPla item-owned redisplay adapted to a joint Qt pixel budget."""
 from types import SimpleNamespace
+import pytest
 
 from PySide6.QtCore import QRectF
 from PySide6.QtGui import QImage
@@ -13,6 +14,192 @@ from app.thumbnail_provider import BrowserThumbnailProvider, ThumbnailLoadResult
 from app.thumbnail_render import ThumbnailRenderSpec
 from tests.test_browser_thumbnail_memory_integration_qt import app, controlled_broker
 from tests.test_browser_navigation_window import make_window
+
+
+@pytest.mark.parametrize('resume', ('near', 'grant', 'foreground', 'clear', 'generation', 'revision',
+                                  'disk_epoch', 'prune', 'other_instance_prune', 'writer_busy', 'access_update',
+                                  'prune_before_gui', 'far_admission'))
+def test_nonresident_saved_read_waits_for_useful_admission(tmp_path, qapp, resume):
+    from dataclasses import replace
+    from PIL import Image
+    from app.thumbnail_disk_cache import ThumbnailDiskCache
+
+    disk = ThumbnailDiskCache(tmp_path/'cache')
+    path = tmp_path/'未表示.png'
+    Image.new('RGB', (512, 512), 'navy').save(path)
+    info = path.stat()
+    item = BrowserItem(path.name, path, BrowserItemKind.IMAGE, info.st_mtime,
+                       file_size=info.st_size, modified_time_ns=info.st_mtime_ns)
+    spec = ThumbnailRenderSpec.from_settings(64, 'square_1_1', 'letterbox')
+    image = QImage(512, 512, QImage.Format.Format_RGB32)
+    image.fill(0xff123456)
+    assert disk.put(item, spec, image)
+    if resume == 'prune_before_gui':
+        read = disk.get_suitable
+        def read_then_prune(*args, **kwargs):
+            result = read(*args, **kwargs)
+            if result is not None:
+                disk.limit_bytes = 1
+                assert disk.prune() >= 1
+            return result
+        disk.get_suitable = read_then_prune
+    provider = BrowserThumbnailProvider(disk_cache=disk)
+    provider.enable_retained_display()
+    limit = 2*image.sizeInBytes()
+    provider.configure_browser_memory(mode='128', limit_bytes=limit, desired_bytes=limit,
+                                      group_capacity_bytes=GIB, reason='ready')
+    try:
+        # Two distant, previously painted images fill RAM. A far saved read
+        # loses admission, while a next-screen read must outrank those images.
+        for row in range(2):
+            old = BrowserItem(str(row), tmp_path/f'{row}.png', BrowserItemKind.IMAGE, 1.0)
+            provider._consume_thumbnail_finished(str(old.path), provider.generation, spec.cache_token,
+                old.thumbnail_revision, ThumbnailLoadResult(image.copy()))
+        provider.set_cache_retention_priorities([(item.path, item.thumbnail_revision, 3)])
+        if resume == 'far_admission':
+            assert provider.request_background_read(item, spec, generation=provider.generation) == 'memory-deferred'
+            assert provider.pending_count == 0
+            assert provider.cache_statistics()['disk_hit'] == 0
+            assert provider.cache_statistics()['background_memory_deferrals'] == 1
+            return
+        assert provider.request_background(item, spec, generation=provider.generation) == 'queued'
+        assert provider.wait_for_done(5000)
+        qapp.processEvents()
+        assert not provider.has_memory_thumbnail(item, spec)
+        before = provider.cache_statistics()
+        assert before['disk_hit'] == before['background_self_evictions'] == 1
+        if resume == 'prune_before_gui':
+            assert provider.request_background(item, spec, generation=provider.generation) == 'queued'
+            assert provider.wait_for_done(5000)
+            qapp.processEvents()
+            assert provider.cache_statistics()['generated'] == 1
+            return
+        for _ in range(10):
+            assert provider.request_background_read(item, spec, generation=provider.generation) == 'settled'
+        assert provider.cache_statistics()['disk_hit'] == 1
+        assert provider.cache_statistics()['background_capacity_skips'] == 10
+        if resume == 'access_update':
+            revision = disk.admission_revision
+            disk.flush_accesses()
+            assert disk.admission_revision == revision
+            assert provider.request_background_read(item, spec, generation=provider.generation) == 'settled'
+            assert provider.cache_statistics()['disk_hit'] == 1
+            return
+        if resume == 'writer_busy':
+            from threading import Event, Thread
+            from time import perf_counter
+            entered, release = Event(), Event()
+            def hold_writer():
+                with disk._lock:
+                    entered.set()
+                    assert release.wait(5)
+            writer = Thread(target=hold_writer)
+            writer.start()
+            try:
+                assert entered.wait(2)
+                assert disk.admission_revision is None
+                started = perf_counter()
+                assert provider.request_background(item, spec, generation=provider.generation) == 'queued'
+                assert perf_counter()-started < .1
+            finally:
+                release.set()
+                writer.join(5)
+            assert provider.wait_for_done(5000)
+            qapp.processEvents()
+            assert provider.cache_statistics()['disk_hit'] == 2
+            return
+        if resume in ('prune', 'other_instance_prune'):
+            epoch = disk.write_epoch
+            revision = disk.admission_revision
+            evictor = (ThumbnailDiskCache(disk.cache_dir, limit_bytes=1)
+                       if resume == 'other_instance_prune' else disk)
+            try:
+                evictor.limit_bytes = 1
+                assert evictor.prune() >= 1
+                assert disk.write_epoch == epoch
+                assert disk.admission_revision != revision
+                assert provider.request_background(item, spec, generation=provider.generation) == 'queued'
+                assert provider.wait_for_done(5000)
+                qapp.processEvents()
+                assert provider.cache_statistics()['generated'] == 1
+            finally:
+                if evictor is not disk:
+                    evictor.close()
+            return
+        if resume == 'near':
+            provider.set_cache_retention_priorities([(item.path, item.thumbnail_revision, 1)])
+        elif resume == 'grant':
+            provider.configure_browser_memory(mode='128', limit_bytes=2*limit, desired_bytes=2*limit,
+                                              group_capacity_bytes=GIB, reason='ready')
+        elif resume == 'clear':
+            provider.clear_memory_cache()
+        elif resume == 'generation':
+            provider.begin_generation()
+        elif resume == 'revision':
+            item = replace(item, created_time_ns=1)
+        elif resume == 'disk_epoch':
+            disk.invalidate_pending_writes()
+        if resume == 'foreground':
+            assert provider.request(item, spec, generation=provider.generation)
+        elif resume == 'near':
+            assert provider.request_background_read(item, spec, generation=provider.generation) == 'queued'
+        else:
+            assert provider.request_background(item, spec, generation=provider.generation) == 'queued'
+        assert provider.wait_for_done(5000)
+        qapp.processEvents()
+        assert provider.cache_statistics()['disk_hit'] == 2
+        assert provider.memory_cache_bytes <= provider.memory_cache_limit_bytes
+        if resume in ('near', 'grant', 'clear', 'foreground'):
+            assert provider.has_memory_thumbnail(item, spec)
+    finally:
+        provider.close()
+
+
+@pytest.mark.parametrize('rank', (0, 1, 2))
+def test_only_visible_display_can_reclaim_distant_sources(tmp_path, qapp, rank):
+    from threading import Event
+    from app.browser_thumbnail_surface import BrowserThumbnailDisplayPlan
+
+    provider = BrowserThumbnailProvider(disk_cache_enabled=False)
+    provider.enable_retained_display()
+    model = BrowserItemModel()
+    model.bind_thumbnail_memory(provider)
+    surfaces = BrowserDisplaySurfaceCache()
+    surfaces.bind_memory(provider)
+    items = [BrowserItem(str(i), tmp_path/f'{i}.png', BrowserItemKind.IMAGE, 1.0) for i in range(3)]
+    model.set_items(items)
+    image = QImage(512, 512, QImage.Format.Format_RGB32)
+    image.fill(0xff123456)
+    limit = 3*image.sizeInBytes()
+    provider.configure_browser_memory(mode='128', limit_bytes=limit, desired_bytes=limit,
+                                      group_capacity_bytes=GIB, reason='ready')
+    plan = BrowserThumbnailDisplayPlan((0, 0, 128, 128), 'fit', 1.)
+    provider.set_display_plan(plan)
+    try:
+        for item in items:
+            provider._consume_thumbnail_finished(str(item.path), provider.generation, 64,
+                item.thumbnail_revision, ThumbnailLoadResult(image.copy()))
+        provider.set_cache_retention_priorities([(items[0].path, items[0].thumbnail_revision, rank),
+                                                (items[1].path, items[1].thumbnail_revision, 2)])
+        provider.set_display_retention_priorities([(items[0].path, items[0].thumbnail_revision, rank)])
+        source_image = provider.restore_memory_thumbnail(items[0], 64, generation=provider.generation)[0]
+        assert provider.can_prepare_display(source_image) == (rank == 0)
+        ready = plan.render(source_image, Event())
+        assert provider._store_display_artifact(source_image, plan, ready) == (rank == 0)
+        if rank == 0:
+            assert surfaces.adopt(source_image, plan, ready)
+        for item in items[:2]:
+            assert provider.has_memory_thumbnail(item, 64)
+        assert provider.has_memory_thumbnail(items[2], 64) == (rank != 0)
+        assert provider.memory_cache_bytes <= limit
+        assert surfaces.has_plan(source_image, plan) == (rank == 0)
+        if rank != 0:
+            provider.configure_browser_memory(mode='128', limit_bytes=2*limit, desired_bytes=2*limit,
+                                              group_capacity_bytes=GIB, reason='ready')
+            assert provider.can_prepare_display(source_image)
+            assert provider._store_display_artifact(source_image, plan, ready)
+    finally:
+        provider.close()
 
 
 def test_shared_pixels_are_charged_once_and_detached_surfaces_are_charged(qapp):

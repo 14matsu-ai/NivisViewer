@@ -602,6 +602,7 @@ def test_shutdown_retains_running_open_until_owner_independent_cleanup(
 
     assert session.parent() is None
     assert session in _RETIRED_BOOK_SESSIONS
+    assert not session.shutdown_complete
     assert session._open_pool in _RETIRED_BOOK_OPEN_POOLS
     assert session._open_workers
 
@@ -613,3 +614,17 @@ def test_shutdown_retains_running_open_until_owner_independent_cleanup(
     assert session not in _RETIRED_BOOK_SESSIONS
     assert session._open_pool not in _RETIRED_BOOK_OPEN_POOLS
     assert source.closed
+    assert session.shutdown_complete
+
+
+def test_cancel_pending_open_invalidates_already_queued_success(qapp):
+    source = BlockingImageSource(Path('queued'), threading.Event(), threading.Event())
+    session = BookSession(source_factory=lambda *args, **kwargs: (source, None))
+    session.open_book_async('queued')
+    assert session.wait_for_async(2000)
+    assert session.source is None
+    session.cancel_pending_open(invalidate=True)
+    qapp.processEvents()
+    assert session.source is None
+    assert source.closed
+    session.shutdown()

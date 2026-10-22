@@ -27,6 +27,17 @@ class RatingRenameResult:
 class RatingRenameService:
     """Rename only the ZipPla rating token; never rewrite file content."""
 
+    @staticmethod
+    def destination_conflict(
+        metadata: ZipPlaFilenameMetadata, *, is_directory: bool = False,
+    ) -> str | None:
+        source = metadata.original_path
+        destination = metadata.serialized_path(is_directory=is_directory)
+        if (os.path.normcase(os.fspath(source)) != os.path.normcase(os.fspath(destination))
+                and os.path.lexists(destination)):
+            return tr('同名の項目が既に存在するため変更できません: {p0}', p0=destination.name)
+        return None
+
     def set_rating(
         self,
         path: str | Path,
@@ -67,13 +78,14 @@ class RatingRenameService:
                 original_mtime_ns=source_stat.st_mtime_ns,
                 final_mtime_ns=source_stat.st_mtime_ns,
             )
-        if destination.exists() and not same_key:
+        conflict = self.destination_conflict(metadata, is_directory=directory)
+        if conflict:
             return RatingRenameResult(
                 source,
                 destination,
                 normalized_rating,
                 False,
-                error_message=tr('同名の項目が既に存在します。'),
+                error_message=conflict,
                 original_mtime_ns=source_stat.st_mtime_ns,
             )
         try:
@@ -105,12 +117,18 @@ class RatingRenameService:
                 final_mtime_ns=destination_stat.st_mtime_ns,
             )
         except OSError as exc:
+            if getattr(exc, 'winerror', None) in {32, 33}:
+                message = tr('ファイルが使用中のため変更できません。Viewerや他のアプリで閉じてから再試行してください。')
+            elif isinstance(exc, FileExistsError):
+                message = tr('同名の項目が既に存在するため変更できません: {p0}', p0=destination.name)
+            else:
+                message = str(exc)
             return RatingRenameResult(
                 source,
                 destination,
                 normalized_rating,
                 False,
-                error_message=str(exc),
+                error_message=message,
                 original_mtime_ns=source_stat.st_mtime_ns,
             )
 

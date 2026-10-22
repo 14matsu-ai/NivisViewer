@@ -11,6 +11,43 @@ from app.thumbnail_render import ThumbnailRenderSpec
 from tests.test_thumbnail_admission import source, pixels
 
 
+@pytest.mark.parametrize('retire_generation', [False, True])
+def test_metadata_rename_waits_for_only_target_source_handles(tmp_path, qapp, retire_generation):
+    from app.thumbnail_provider import BrowserThumbnailProvider
+    from threading import Timer
+    items = [source(tmp_path / name) for name in ('target.png', 'other.png')]
+    entered = [Event(), Event()]
+    release = [Event(), Event()]
+    def loader(item, _size, **_kwargs):
+        index = 0 if item.path == items[0].path else 1
+        with item.path.open('rb'):
+            entered[index].set()
+            assert release[index].wait(5)
+            return pixels()
+    provider = BrowserThumbnailProvider(loader=loader, max_workers=2, disk_cache_enabled=False)
+    timer = None
+    try:
+        for item in items:
+            assert provider.request(item, 96)
+        assert all(event.wait(2) for event in entered)
+        if retire_generation:
+            provider.begin_generation()
+        target = (str(items[0].path),)
+        assert provider.release_file_handles(target, wait_msecs=0) is False
+        timer = Timer(.05, release[0].set)
+        timer.start()
+        assert provider.release_file_handles(target, wait_msecs=1000)
+        items[0].path.rename(tmp_path / 'renamed.png')
+        assert not release[1].is_set()
+    finally:
+        for event in release:
+            event.set()
+        if timer is not None:
+            timer.join()
+        provider.close(wait_msecs=3000)
+        qapp.processEvents()
+
+
 @pytest.mark.parametrize('close', [False, True])
 def test_index_read_does_not_hold_writer_lock_and_close_fences_result(tmp_path, close):
     item = source(tmp_path/'image.png')
@@ -111,21 +148,21 @@ def test_saved_pixels_decode_directly_and_preserve_color_alpha_and_storage(tmp_p
     with Image.new('RGBA' if alpha else 'RGB', (64, 48), color) as image:
         image.save(path, format=format, lossless=True)
     def no_python_image(*_args, **_kwargs):
-        pytest.fail('Native saved-image decoding must not round-trip through Pillow')
+        pytest.fail('Saved-image decoding must not round-trip through Pillow')
     monkeypatch.setattr(Image, 'open', no_python_image)
-    # The bytes convenience decoder serializes workers with Python input;
-    # native decoding must go through the QIODevice reader instead.
     monkeypatch.setattr(QImage, 'fromData', no_python_image)
     with path.open('rb') as handle:
         result = ThumbnailDiskCache._read_qimage(handle)
         assert not handle.closed
     assert result is not None and result.size().toTuple() == (64, 48)
     assert result.pixelColor(17, 23).getRgb() == (color if alpha else (*color, 255))
-    # Keep the native codec's storage; RGB32 must not incur another RGB888 copy.
+    # The result remains usable after its decoder and leased input are closed.
+    path.unlink()
     assert result.sizeInBytes() <= 64*48*4
+    assert result.pixelColor(17, 23).getRgb() == (color if alpha else (*color, 255))
 
 
-def test_missing_qt_codec_retains_pillow_fallback_and_corrupt_read_is_miss(tmp_path, monkeypatch):
+def test_saved_read_without_qt_codec_and_corrupt_read_is_miss(tmp_path, monkeypatch):
     path = tmp_path/'saved.png'
     with Image.new('RGB', (32, 32), 'navy') as image:
         image.save(path)
