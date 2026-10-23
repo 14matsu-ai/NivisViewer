@@ -158,6 +158,7 @@ from .viewer_render import (
     normalize_upscale_algorithm,
     resampling_policy_for_legacy_mode,
 )
+_LOG = logging.getLogger(__name__)
 _DISPLAY_LOG = logging.getLogger("nivisviewer.viewer.display_unit")
 # Standalone Viewers must also outlive their hidden, asynchronous close.
 _CLOSING_VIEWERS: set[object] = set()
@@ -6415,12 +6416,12 @@ class ViewerWindow(QMainWindow):
         self._first_frame_image_id = None
         self.interactive_open_started.emit(self)
 
-    def _cancel_interactive_open(self) -> None:
+    def _cancel_interactive_open(self, *, resume_page_list: bool = True) -> None:
         if not self._awaiting_first_frame:
             return
         self._awaiting_first_frame = False
         self._first_frame_image_id = None
-        self._release_raster_interactive_lane()
+        self._release_raster_interactive_lane(resume_page_list=resume_page_list)
         self.interactive_open_cancelled.emit(self)
 
     def _on_viewer_content_painted(self, image_ids: object) -> None:
@@ -8003,8 +8004,9 @@ class ViewerWindow(QMainWindow):
                     self._close_retired_runtime = runtime
                 # QPixmaps stay on the GUI thread, in bounded retirement slices.
                 # Native workers finish asynchronously; no GUI wait is needed.
-                if not runtime.drain_retired_artifacts():
-                    self._deferred_close_timer.start(10 if runtime.has_unfinished_tasks() else 1)
+                if not runtime.drain_retired_artifacts(max_items=1):
+                    # Give current-frame callbacks time between disposal slices.
+                    self._deferred_close_timer.start(10 if runtime.has_unfinished_tasks() else 8)
                     return
             complete = self.prepare_shutdown(wait_msecs=0)
         except Exception:
@@ -8033,11 +8035,30 @@ class ViewerWindow(QMainWindow):
                 _CLOSING_VIEWERS.add(self)
                 # Preserve active worker owners until the accepted close.
                 self.hide()
+                self._deferred_close_timer.start(0)
+                runtime = self._zip_runtime
+                if runtime is not None:
+                    # Cancel old decoding before constructing another Viewer.
+                    # Retain its artifacts/leases until asynchronous retirement;
+                    # neither worker completion nor cache disposal is awaited.
+                    try:
+                        runtime.retire()
+                    except Exception:
+                        if not self._close_cleanup_error_reported:
+                            _LOG.exception("Hidden Viewer shutdown preparation did not complete")
+                            self._close_cleanup_error_reported = True
+                    else:
+                        self._close_runtime_retired = True
+                        self._close_retired_runtime = runtime
+                # Closing this Viewer must not keep Browser admission paused
+                # while its cache/handles drain. Release only its own holds,
+                # keeping its hidden page list stopped throughout retirement.
+                self._cancel_interactive_open(resume_page_list=False)
+                self._release_raster_interactive_lane(resume_page_list=False)
                 application = QApplication.instance()
                 if application is not None:
                     application.removeEventFilter(self)
                     application.removeEventFilter(self.fullscreen_chrome)
-                self._deferred_close_timer.start(0)
                 self.book_session.cancel_pending_open(invalidate=True)
                 self._save_current_reading_position(flush_metadata=False)
                 self.close_started.emit(self)

@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import platform
 import subprocess
+import sys
+from time import monotonic, sleep
 import webbrowser
 from collections.abc import Iterator
 from unittest.mock import Mock
@@ -116,3 +118,13 @@ def qapp() -> Iterator[QApplication]:
     application = QApplication.instance() or QApplication([])
     yield application
     application.processEvents()
+    # Accepted closes retain their Qt owners until worker completions and
+    # bounded artifact disposal finish. Keep the event loop alive as the real
+    # application does before destroying QApplication and its thread pools.
+    viewer_module = sys.modules.get('app.viewer_window')
+    closing = getattr(viewer_module, '_CLOSING_VIEWERS', ())
+    deadline = monotonic() + 10
+    while closing and monotonic() < deadline:
+        application.processEvents()
+        sleep(.001)
+    assert not closing, 'Deferred Viewer close did not finish before QApplication teardown'

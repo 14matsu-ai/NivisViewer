@@ -1,5 +1,10 @@
 from threading import Event, Lock, get_ident
 import zipfile
+from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor
+import gc
+import hashlib
+import weakref
 
 from PIL import Image
 import pytest
@@ -10,6 +15,161 @@ from app.folder_raster_book_runtime import FolderRasterBookRuntime
 from app.zip_raster_book_runtime import ZipRasterBookRuntime, ZipRasterDisplayUnit, ZipRasterPage, ZipRasterRenderSpec
 from app.viewer_render import qimage_to_pillow
 from tests.test_zip_raster_book_runtime import _request, _wait_until
+
+
+def _webp_payload(color, *, alpha=False, lossless=True):
+    with Image.new('RGBA' if alpha else 'RGB', (96, 128), color) as image:
+        output = BytesIO()
+        image.save(output, 'WEBP', lossless=lossless, exact=True)
+        return output.getvalue()
+
+
+def _pixel_digest(image):
+    from PySide6.QtGui import QImage
+    converted = image.convertToFormat(QImage.Format.Format_RGBA8888)
+    return hashlib.sha256(converted.constBits()).hexdigest()
+
+
+@pytest.mark.parametrize('alpha', [False, True])
+@pytest.mark.parametrize('lossless', [False, True])
+def test_webp_pixels_outlive_reader_device_and_input(monkeypatch, alpha, lossless):
+    buffers, readers = [], []
+    original_buffer, original_reader = source_module.QBuffer, source_module.QImageReader
+    def buffer(*args, **kwargs):
+        value = original_buffer(*args, **kwargs)
+        buffers.append(weakref.ref(value))
+        return value
+    def reader(*args, **kwargs):
+        value = original_reader(*args, **kwargs)
+        readers.append(weakref.ref(value))
+        return value
+    monkeypatch.setattr(source_module, 'QBuffer', buffer)
+    monkeypatch.setattr(source_module, 'QImageReader', reader)
+    payload = bytearray(_webp_payload((50, 90, 150, 111) if alpha else (50, 90, 150),
+        alpha=alpha, lossless=lossless))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        image = pool.submit(source_module._read_webp_qimage, payload).result(timeout=5)
+        assert image is not None
+        expected = _pixel_digest(image)
+        assert all(ref() is None for ref in readers + buffers)
+        payload[:] = b'\0' * len(payload)
+        del payload
+        for value in range(20):
+            following = pool.submit(source_module._read_webp_qimage,
+                _webp_payload((value, 200, 30))).result(timeout=5)
+            assert following is not None
+    gc.collect()
+    assert _pixel_digest(image) == expected
+    assert image.pixelColor(20, 30).alpha() == (111 if alpha else 255)
+
+
+def test_webp_retained_value_crosses_finished_threads_without_borrowing():
+    from PySide6.QtGui import QImage, QColor
+    def produce():
+        return source_module._read_webp_qimage(_webp_payload((40, 80, 120, 123), alpha=True))
+    with ThreadPoolExecutor(max_workers=1) as producer:
+        image = producer.submit(produce).result(timeout=5)
+    expected = _pixel_digest(image)
+    retained = QImage(image)
+    del image
+    def consume(value):
+        original = _pixel_digest(value)
+        changed = QImage(value)
+        changed.setPixelColor(0, 0, QColor('white'))
+        assert _pixel_digest(changed) != original
+        return original
+    with ThreadPoolExecutor(max_workers=1) as consumer:
+        assert consumer.submit(consume, retained).result(timeout=5) == expected
+    gc.collect()
+    assert _pixel_digest(retained) == expected
+
+
+def test_cancelled_webp_decode_does_not_invalidate_an_owned_result(tmp_path, monkeypatch):
+    from PySide6.QtGui import QImage
+    from app.raster_execution_budget import source_request_scope, SourceRequestToken
+    from app.image_source import ImageSourceError
+    archive = tmp_path / 'cancel.zip'
+    with zipfile.ZipFile(archive, 'w') as output:
+        output.writestr('page.webp', _webp_payload((90, 60, 30)))
+    source = ZipImageSource(archive)
+    decoded, finish = Event(), Event()
+    retained = []
+    read = source_module.read_qimage
+    def paused_read(reader):
+        image = read(reader)
+        retained.append(QImage(image))
+        decoded.set()
+        assert finish.wait(5)
+        return image
+    monkeypatch.setattr(source_module, 'read_qimage', paused_read)
+    token = SourceRequestToken()
+    def decode():
+        with source_request_scope(token):
+            return source.open_static_webp_qimage('page.webp')
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(decode)
+            try:
+                assert decoded.wait(5)
+                expected = _pixel_digest(retained[0])
+                token.set()
+            finally:
+                finish.set()
+            with pytest.raises(ImageSourceError):
+                future.result(timeout=5)
+        source.close()
+        assert not source._active_requests
+        assert _pixel_digest(retained[0]) == expected
+    finally:
+        finish.set()
+        source.close()
+
+
+def test_webp_animated_first_frame_is_owned_and_static_path_declines():
+    frames = [Image.new('RGBA', (64, 96), color) for color in ('red', 'green')]
+    output = BytesIO()
+    try:
+        frames[0].save(output, 'WEBP', save_all=True, append_images=frames[1:], duration=40, lossless=True)
+    finally:
+        for frame in frames:
+            frame.close()
+    payload = bytearray(output.getvalue())
+    assert source_module._read_static_webp_qimage(payload) is None
+    image = source_module._read_webp_qimage(payload)
+    assert image is not None and image.pixelColor(20, 30).red() == 255
+    expected = _pixel_digest(image)
+    payload[:] = b'\0' * len(payload)
+    assert source_module._read_webp_qimage(b'not a WebP') is None
+    for _ in range(5):
+        assert source_module._read_webp_qimage(_webp_payload((20, 50, 90))) is not None
+    assert _pixel_digest(image) == expected
+
+
+@pytest.mark.parametrize('alpha', [False, True])
+def test_owned_webp_preserves_icc_profile_and_pixels_after_teardown(alpha):
+    from PIL import ImageCms
+    from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+    from PySide6.QtGui import QImageReader
+    profile = ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB')).tobytes()
+    output = BytesIO()
+    with Image.new('RGBA' if alpha else 'RGB', (96, 128),
+                   (40, 80, 120, 123) if alpha else (40, 80, 120)) as original:
+        original.save(output, 'WEBP', lossless=True, exact=True, icc_profile=profile)
+    payload = output.getvalue()
+    buffer = QBuffer()
+    buffer.setData(QByteArray(payload))
+    assert buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+    reader = QImageReader(buffer, b'webp')
+    try:
+        expected = source_module.read_qimage(reader)
+    finally:
+        reader.setDevice(None)
+        del reader
+        buffer.close()
+    actual = source_module._read_webp_qimage(payload)
+    assert actual is not None and expected.colorSpace().isValid()
+    assert actual.colorSpace() == expected.colorSpace()
+    assert _pixel_digest(actual) == _pixel_digest(expected)
 
 
 @pytest.mark.parametrize('orientation', range(1, 9))

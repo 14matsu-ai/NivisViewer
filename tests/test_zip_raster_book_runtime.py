@@ -2125,3 +2125,27 @@ def test_current_worker_start_rejection_publishes_terminal_frame(
     finally:
         assert runtime.shutdown(wait_msecs=3000)
         source.close()
+
+
+def test_retired_cache_can_drain_one_gui_artifact_at_a_time(tmp_path, qapp):
+    source = ZipImageSource(_write_zip(tmp_path, pages=3))
+    runtime = ZipRasterBookRuntime(source, 1)
+    try:
+        for index in range(3):
+            assert runtime.request(_request(index + 1, _unit(index)))
+            _wait_until(qapp, lambda: not runtime.has_unfinished_tasks())
+        runtime.retire()
+        def count():
+            return runtime._frame_store.unit_count + runtime._source_store.page_count
+        assert count() > 1
+        for _ in range(12):
+            before = count()
+            completed = runtime.drain_retired_artifacts(max_items=1)
+            assert count() == before - 1
+            assert completed == (count() == 0)
+            if completed:
+                break
+        assert completed and runtime.cache_bytes == 0
+    finally:
+        assert runtime.shutdown(wait_msecs=3000)
+        source.close()

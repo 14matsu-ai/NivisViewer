@@ -333,12 +333,90 @@ def test_rejected_close_keeps_viewer_visible(tmp_path, qapp):
     window = controller.create_viewer_window()
     window.show()
     window._application_close_guard = lambda *_: False
+    window._begin_interactive_open()
+    window._hold_raster_interactive_lane()
     try:
         window.close()
         assert window.isVisible()
         assert not window._close_pending
+        assert window._awaiting_first_frame
+        assert window._raster_interactive_lane_held
+        assert controller.image_work_coordinator._interactive_depth == 2
     finally:
         window._application_close_guard = None
+        close_controller(controller, qapp)
+
+
+def test_close_retirement_failure_retries_after_hiding(tmp_path, qapp, monkeypatch):
+    archive = tmp_path / 'book.zip'
+    write_archive(archive)
+    controller = make_controller(tmp_path / 'profile', qapp)
+    controller.create_browser_window()
+    window = controller.open_path(archive)
+    finish_viewer_open(qapp, window)
+    runtime = window.book_session.viewer_runtime
+    original = runtime.retire
+    attempts = []
+    def fail_once():
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise RuntimeError('retry retirement')
+        return original()
+    monkeypatch.setattr(runtime, 'retire', fail_once)
+    try:
+        window.close()
+        assert not window.isVisible()
+        assert window not in controller.viewer_windows
+        assert wait_until(qapp, lambda: window not in controller._viewer_windows)
+        assert len(attempts) >= 2
+    finally:
+        close_controller(controller, qapp)
+
+
+@pytest.mark.parametrize('another_viewer', [False, True])
+@pytest.mark.parametrize('during_open', [False, True])
+def test_close_releases_only_its_browser_pause_before_cleanup(
+    tmp_path, qapp, monkeypatch, another_viewer, during_open,
+):
+    controller = make_controller(tmp_path, qapp)
+    controller.create_browser_window()
+    window = controller.create_viewer_window()
+    other = controller.create_viewer_window() if another_viewer else None
+    released = [False]
+    shutdown = window.viewer.shutdown_rendering
+    monkeypatch.setattr(window.viewer, 'shutdown_rendering',
+        lambda msecs: shutdown(msecs) if released[0] else False)
+    page_list_resumes = []
+    set_paused = window._set_page_list_paused
+    def track_page_list(paused):
+        page_list_resumes.append(paused)
+        set_paused(paused)
+    monkeypatch.setattr(window, '_set_page_list_paused', track_page_list)
+    if during_open:
+        window._begin_interactive_open()
+    window._hold_raster_interactive_lane()
+    if other is not None:
+        other._begin_interactive_open()
+        other._hold_raster_interactive_lane()
+    coordinator = controller.image_work_coordinator
+    try:
+        before = coordinator._interactive_depth
+        page_list_resumes.clear()
+        window.close()
+        assert not window.isVisible()
+        assert coordinator._interactive_depth == before - 1 - int(during_open)
+        assert coordinator.browser_paused == another_viewer
+        assert not window._awaiting_first_frame
+        assert not window._raster_interactive_lane_held
+        assert page_list_resumes and all(page_list_resumes)
+        assert window in controller._viewer_windows  # Native owners still drain.
+        window._cancel_interactive_open(resume_page_list=False)
+        window._release_raster_interactive_lane(resume_page_list=False)
+        assert coordinator._interactive_depth == (2 if another_viewer else 0)
+        if other is not None:
+            assert other._awaiting_first_frame and other._raster_interactive_lane_held
+    finally:
+        released[0] = True
         close_controller(controller, qapp)
 
 
@@ -371,9 +449,11 @@ def test_hidden_zip_viewer_retains_handles_until_its_worker_drains(tmp_path, qap
         window.next_page()
         assert wait_until(qapp, entered.is_set)
         if hide_first:
+            jobs = tuple(session.viewer_runtime._jobs)
             window.close()
             assert not window.isVisible()
-            assert wait_until(qapp, lambda: window._close_runtime_retired)
+            assert window._close_runtime_retired
+            assert jobs and all(job.cancelled.is_set() for job in jobs)
             assert not session.shutdown_complete
             assert window in controller.viewers_using_paths((str(archive),))
         assert controller.close_viewers((window,)) is False

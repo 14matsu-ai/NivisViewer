@@ -4018,7 +4018,7 @@ class RasterBookRuntime(QObject):
         return completed
 
     @trace_gui_phase
-    def drain_retired_artifacts(self) -> bool:
+    def drain_retired_artifacts(self, *, max_items: int = 8) -> bool:
         """Release a bounded GUI slice before finalizing an idle retired owner.
 
         QPixmaps must stay on the GUI thread. A zero-wait shutdown still
@@ -4028,7 +4028,7 @@ class RasterBookRuntime(QObject):
         if self._accepting_requests or self.has_unfinished_tasks():
             return False
         deadline = monotonic() + 0.004
-        for _ in range(8):
+        for _ in range(max(1, min(8, max_items))):
             if self._frame_store.unit_count:
                 key = next(iter(self._frame_store._frames))
                 self._frame_store._remove(key)

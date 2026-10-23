@@ -340,7 +340,9 @@ def _read_webp_qimage(data: bytes) -> QImage | None:
         reader.setDevice(None)
         del reader
         buffer.close()
-    return None if image.isNull() else image.copy()
+    # QImageReader returns an owning QImage value. Its shared pixel allocation
+    # survives handler/device destruction; another full raster copy is redundant.
+    return None if image.isNull() else image
 
 
 def _read_static_webp_qimage(data: bytes) -> QImage | None:
@@ -528,6 +530,62 @@ def _read_folder_compatible_jpeg_at_most(
     return qimage, logical_size
 
 
+def _jpeg_buffer_geometry(data: QByteArray | bytes | bytearray) -> tuple[int, int, bool] | None:
+    """Skip JPEG segments in the existing payload, without decoding pixels.
+
+    APP/ICC data can exceed a prefix limit. Only an EXIF APP1 segment needs
+    copying for Pillow's TIFF parser; every other segment is skipped by size.
+    Keep Qt's metadata handlers out of concurrent Viewer/thumbnail reads.
+    """
+    with memoryview(data) as payload:
+        size = len(payload)
+        if size < 4 or payload[:2] != b'\xff\xd8':
+            return None
+        position = 2
+        geometry = None
+        orientation = 1
+        exif_seen = False
+        while position < size:
+            if payload[position] != 0xff:
+                return None
+            while position < size and payload[position] == 0xff:
+                position += 1
+            if position >= size:
+                return None
+            marker = payload[position]
+            position += 1
+            if marker in (0, 0xd8, 0xd9):
+                return None
+            if marker == 1 or 0xd0 <= marker <= 0xd7:
+                continue
+            if position + 2 > size:
+                return None
+            length = (payload[position] << 8) | payload[position + 1]
+            end = position + length
+            if length < 2 or end > size:
+                return None
+            if marker == 0xda:
+                return (*geometry, orientation in {5, 6, 7, 8}) if geometry else None
+            if 0xc0 <= marker <= 0xcf and marker not in (0xc4, 0xc8, 0xcc):
+                if length < 8:
+                    return None
+                height = (payload[position + 3] << 8) | payload[position + 4]
+                width = (payload[position + 5] << 8) | payload[position + 6]
+                if width <= 0 or height <= 0:
+                    return None
+                geometry = (width, height)
+            elif marker == 0xe1 and not exif_seen and length >= 8 and payload[position + 2:position + 8] == b'Exif\0\0':
+                exif_seen = True
+                try:
+                    exif = Image.Exif()
+                    exif.load(bytes(payload[position + 2:end]))
+                    orientation = exif.get(274, 1)
+                except Exception:
+                    orientation = 1
+            position = end
+        return None
+
+
 def _read_jpeg_qbytearray_at_most(
     data: QByteArray,
     maximum_size: JpegMaximumSize,
@@ -540,21 +598,7 @@ def _read_jpeg_qbytearray_at_most(
         return None
     # The pixel reader must not re-enter Qt's metadata path either: it can
     # overlap saved-thumbnail reads just like a standalone geometry probe.
-    # Copy only the bounded header, retaining the single native pixel payload.
-    geometry = None
-    for limit in (64 * 1024, 256 * 1024, 1024 * 1024):
-        try:
-            with Image.open(io.BytesIO(bytes(data.first(min(limit, data.size())))),
-                            formats=('JPEG',)) as header:
-                raw_width, raw_height = header.size
-                swaps_axes = header.getexif().get(274, 1) in {5, 6, 7, 8}
-                if raw_width > 0 and raw_height > 0:
-                    geometry = raw_width, raw_height, swaps_axes
-                    break
-        except Exception:
-            pass
-        if limit >= data.size():
-            break
+    geometry = _jpeg_buffer_geometry(data)
     if geometry is None:
         return None
     raw_width, raw_height, swaps_axes = geometry
@@ -1735,8 +1779,16 @@ class ZipImageSource(ImageSource):
                     # Never overlap Qt metadata probing with Qt pixel reads.
                     # Keep bounded header parsing outside the ZIP source lock.
                     try:
-                        with io.BytesIO(header) as stream:
-                            logical_size = _probe_raster_header_size(stream, image_id)
+                        if header.startswith(b'\xff\xd8\xff'):
+                            geometry = _jpeg_buffer_geometry(header)
+                            if geometry is None:
+                                logical_size = None
+                            else:
+                                width, height, swaps_axes = geometry
+                                logical_size = (height, width) if swaps_axes else (width, height)
+                        else:
+                            with io.BytesIO(header) as stream:
+                                logical_size = _probe_raster_header_size(stream, image_id)
                     except Exception:
                         logical_size = None
                     self._raise_if_cancelled(cancelled)
