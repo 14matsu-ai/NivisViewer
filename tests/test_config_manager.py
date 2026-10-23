@@ -651,6 +651,40 @@ def test_truncated_json_config_is_preserved(tmp_path: Path) -> None:
     assert "JSON" in (manager.last_error or "")
 
 
+@pytest.mark.parametrize("original", [b'[]', b'null', b'"saved profile"'])
+def test_non_object_config_is_preserved(tmp_path: Path, original: bytes) -> None:
+    path = tmp_path / "config.json"
+    path.write_bytes(original)
+    manager = ConfigManager(path)
+
+    assert manager.load() == ConfigManager.DEFAULTS
+    manager.save({"window_width": 777})
+
+    assert path.read_bytes() == original
+    assert manager.last_error
+
+
+@pytest.mark.parametrize("invalid_scope", [None, [], "invalid", 5])
+def test_legacy_close_shortcut_migrates_with_invalid_viewer_scope(
+    tmp_path: Path, invalid_scope,
+) -> None:
+    import json
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({
+        "viewer_close_shortcut": "Escape",
+        "shortcut_bindings": {
+            "viewer": invalid_scope,
+            "browser": {"browser_focus_search": ["Ctrl+J"]},
+        },
+    }), encoding="utf-8")
+
+    loaded = ConfigManager(path).load()
+
+    assert loaded["shortcut_bindings"]["viewer"]["viewer_close"] == ["Esc"]
+    assert loaded["shortcut_bindings"]["browser"]["browser_focus_search"] == ["Ctrl+J"]
+
+
 def test_config_loads_utf8_bom_and_unicode_and_readonly_save_preserves_bytes(
     tmp_path: Path,
 ) -> None:

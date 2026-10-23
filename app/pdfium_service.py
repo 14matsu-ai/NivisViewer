@@ -477,6 +477,9 @@ class PdfiumService:
                     job = self._pending.get(item.key)
                     if (
                         job is None
+                        # A cancelled job's old queue item may share the key
+                        # and version of its replacement, but not its order.
+                        or job.sequence != item.sequence
                         or job.version != item.version
                         or job.future.done()
                     ):

@@ -6,10 +6,14 @@ from .i18n import tr
 
 
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import Path
 
 from .zippla_filename_metadata import ZipPlaFilenameMetadata
+
+
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -99,23 +103,6 @@ class RatingRenameService:
                     raise OSError(item.error_message if item is not None else tr('変更できません'))
             else:
                 os.rename(source, destination)
-            destination_stat = destination.stat()
-            if destination_stat.st_mtime_ns != source_stat.st_mtime_ns:
-                os.utime(
-                    destination,
-                    ns=(destination_stat.st_atime_ns, source_stat.st_mtime_ns),
-                    follow_symlinks=False,
-                )
-                destination_stat = destination.stat()
-            return RatingRenameResult(
-                source,
-                destination,
-                normalized_rating,
-                True,
-                changed=True,
-                original_mtime_ns=source_stat.st_mtime_ns,
-                final_mtime_ns=destination_stat.st_mtime_ns,
-            )
         except OSError as exc:
             if getattr(exc, 'winerror', None) in {32, 33}:
                 message = tr('ファイルが使用中のため変更できません。Viewerや他のアプリで閉じてから再試行してください。')
@@ -131,6 +118,35 @@ class RatingRenameService:
                 error_message=message,
                 original_mtime_ns=source_stat.st_mtime_ns,
             )
+
+        final_mtime_ns = None
+        try:
+            destination_stat = destination.stat()
+            final_mtime_ns = destination_stat.st_mtime_ns
+            if final_mtime_ns != source_stat.st_mtime_ns:
+                os.utime(
+                    destination,
+                    ns=(destination_stat.st_atime_ns, source_stat.st_mtime_ns),
+                    follow_symlinks=False,
+                )
+                final_mtime_ns = destination.stat().st_mtime_ns
+        except (OSError, NotImplementedError, ValueError) as exc:
+            # Publication already succeeded. Keep the new path authoritative
+            # so the Browser, Viewer and history can follow the completed rename.
+            final_mtime_ns = None
+            _LOG.warning(
+                "rating rename mtime restore failed source=%s destination=%s: %s",
+                source, destination, exc,
+            )
+        return RatingRenameResult(
+            source,
+            destination,
+            normalized_rating,
+            True,
+            changed=True,
+            original_mtime_ns=source_stat.st_mtime_ns,
+            final_mtime_ns=final_mtime_ns,
+        )
 
 
 __all__ = ["RatingRenameResult", "RatingRenameService"]

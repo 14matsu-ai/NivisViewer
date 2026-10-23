@@ -171,7 +171,7 @@ class PathAvailabilityService(QObject):
                 cached.state,
                 cached.checked_at,
             )
-            QTimer.singleShot(0, self, lambda value=result: self.result_ready.emit(value))
+            QTimer.singleShot(0, self, lambda value=result: self._publish_cached_result(value))
             return request_id
         assert cancelled is not None
         worker = _ProbeWorker(
@@ -184,6 +184,13 @@ class PathAvailabilityService(QObject):
         worker.signals.finished.connect(self._on_finished)
         self._pool.start(worker)
         return request_id
+
+    def _publish_cached_result(self, result: PathAvailabilityResult) -> None:
+        # Cached deliveries are queued too: close may have run since probe().
+        with self._lock:
+            if self._state is not PathAvailabilityServiceState.RUNNING:
+                return
+        self.result_ready.emit(result)
 
     def request_probe(
         self,

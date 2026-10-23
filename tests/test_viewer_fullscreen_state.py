@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from time import monotonic
 import ctypes
 import pytest
 
@@ -92,6 +93,14 @@ def _dispose_window(
     controller: FullscreenChromeController,
 ) -> None:
     controller.shutdown()
+    prepare = getattr(window, "prepare_shutdown", None)
+    if callable(prepare):
+        # Viewer close is asynchronous: finish its worker lifetime before
+        # forcing DeferredDelete, just as the application shutdown does.
+        deadline = monotonic() + 5
+        while not prepare(wait_msecs=0):
+            assert monotonic() < deadline
+            qapp.processEvents()
     window.close()
     window.deleteLater()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

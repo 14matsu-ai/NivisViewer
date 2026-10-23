@@ -773,6 +773,62 @@ def test_disabled_pdf_prefetch_still_loads_spread_partner(
         )
 
 
+@pytest.mark.parametrize("direction", ["ltr", "rtl"])
+@pytest.mark.parametrize("failed_current", [False, True])
+def test_pdf_first_paint_gate_with_cached_focus_still_loads_spread_partner(
+    tmp_path, qapp, monkeypatch, direction, failed_current,
+):
+    from tests.test_sprint18_navigation_followup import _wait_for_applied_display
+
+    window, session, service, backend = _open_many_page_pdf_window(
+        tmp_path, qapp,
+        settings={"view_mode": "spread", "single_first_page": False,
+                  "reading_direction": direction, "viewer_prefetch_preset": "disabled"},
+        complete_prefetch=False,
+    )
+    try:
+        # Hold the first content-paint notification, as when input arrives
+        # before the initial committed frame has actually reached the screen.
+        window.viewer.contentPainted.disconnect(window._on_viewer_content_painted)
+        window._begin_interactive_open()
+        window._first_frame_image_id = session.model.image_id_at(0)
+        cache = window.image_cache
+        cache.set_render_spec(window._current_pdf_render_spec(extra_indexes=(2, 3)))
+        if failed_current:
+            original_render = backend.render_page
+
+            def fail_current(request, **kwargs):
+                if request.page_index == 2:
+                    raise PdfBackendError(PdfErrorCode.RENDER_FAILED)
+                return original_render(request, **kwargs)
+
+            monkeypatch.setattr(backend, "render_page", fail_current)
+        cache.preload_around(2, radius=0, visible_indexes=(2,), prefetch_indexes=())
+        assert cache.wait_for_done(3000)
+        qapp.processEvents()
+        assert cache.contains(2) and not cache.contains(3)
+        assert not cache.has_unfinished_tasks()
+        assert window._awaiting_first_frame
+
+        window.next_page()
+        # No page-2 completion callback will arrive on a cache hit. Page 3
+        # must be admitted now; otherwise the complete spread can never paint.
+        assert {2, 3}.issubset(cache._wanted_indexes), {
+            "cached": tuple(cache._cache), "pending": tuple(cache._tasks),
+            "slots": window._display_unit.slots,
+        }
+        _wait_for_applied_display(window, qapp)
+        assert sorted(window.viewer.displayed_page_indexes) == [2, 3]
+        assert window._awaiting_first_frame is (not failed_current)
+        assert sum(request.page_index == 3 for request in backend.rendered) == 1
+        if not failed_current:
+            window._on_viewer_content_painted(tuple(image.image_id for image in window.viewer._images))
+            assert not window._awaiting_first_frame
+    finally:
+        window.prepare_shutdown(wait_msecs=3000)
+        _close_measured_pdf_window(window, session, service, qapp)
+
+
 def test_pdf_direction_priority_off_defers_nearest_background_work(
     tmp_path,
     qapp,
@@ -1583,6 +1639,59 @@ def test_pdf_service_promotes_an_identical_pending_request():
     finally:
         backend.release.set()
         service.shutdown()
+
+
+def test_pdf_service_replacement_does_not_inherit_cancelled_queue_priority(monkeypatch):
+    backend = BlockingRenderBackend()
+    service = PdfiumService(backend, auto_probe=False)
+    cancelled = Event()
+    current_priority = int(PdfRenderPriority.VIEWER_CURRENT)
+    next_priority = int(PdfRenderPriority.VIEWER_NEXT)
+    submitted = {
+        (4, current_priority): Event(),
+        (4, next_priority): Event(),
+        (5, current_priority): Event(),
+    }
+    original_submit = service._submit
+
+    def tracked_submit(key, priority, *args, **kwargs):
+        future = original_submit(key, priority, *args, **kwargs)
+        event = submitted.get((key[2], priority)) if key[0] == "render" else None
+        if event is not None:
+            event.set()
+        return future
+
+    monkeypatch.setattr(service, "_submit", tracked_submit)
+    try:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            try:
+                blocker = executor.submit(service.render_page, PdfRenderRequest("doc", 99, 8, 8))
+                assert backend.started.wait(1)
+                obsolete = executor.submit(
+                    service.render_page, PdfRenderRequest("doc", 4, 8, 8),
+                    cancel_token=cancelled,
+                )
+                assert submitted[(4, current_priority)].wait(1)
+                cancelled.set()
+                replacement = executor.submit(
+                    service.render_page,
+                    PdfRenderRequest("doc", 4, 8, 8, priority=next_priority),
+                )
+                assert submitted[(4, next_priority)].wait(1)
+                current = executor.submit(service.render_page, PdfRenderRequest("doc", 5, 8, 8))
+                assert submitted[(5, current_priority)].wait(1)
+            finally:
+                backend.release.set()
+            blocker.result(timeout=2)
+            with pytest.raises(PdfBackendError) as captured:
+                obsolete.result(timeout=2)
+            assert captured.value.code is PdfErrorCode.CANCELLED
+            assert current.result(timeout=2).page_index == 5
+            assert replacement.result(timeout=2).page_index == 4
+        assert [request.page_index for request in backend.rendered] == [99, 5, 4]
+    finally:
+        backend.release.set()
+        service.shutdown(wait_seconds=2)
 
 
 def test_pdf_service_does_not_start_cancelled_pending_request():

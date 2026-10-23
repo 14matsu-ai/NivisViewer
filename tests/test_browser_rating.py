@@ -150,6 +150,47 @@ def test_rating_sharing_violation_has_actionable_reason(tmp_path, monkeypatch):
     assert source.read_bytes() == b"archive"
 
 
+@pytest.mark.parametrize("failed_step", ["stat", "utime"])
+def test_rating_rename_reports_completed_rename_after_timestamp_error(
+    tmp_path, monkeypatch, failed_step,
+):
+    source = tmp_path / "日本語.zip"
+    destination = tmp_path / "日本語 {zpi$r=3}.zip"
+    source.write_bytes(b"archive")
+    original_mtime = source.stat().st_mtime_ns
+    original_rename = os.rename
+    original_utime = os.utime
+    original_stat = Path.stat
+    renamed = False
+
+    def rename_then_change_timestamp(old, new):
+        nonlocal renamed
+        original_rename(old, new)
+        if failed_step == "utime":
+            original_utime(new, ns=(original_mtime + 1_000_000_000,) * 2)
+        renamed = True
+
+    def stat_with_error(path, *args, **kwargs):
+        if failed_step == "stat" and renamed and path == destination:
+            raise PermissionError("timestamp read failed after rename")
+        return original_stat(path, *args, **kwargs)
+
+    def denied_utime(*args, **kwargs):
+        raise PermissionError("timestamp restore failed after rename")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "rename", rename_then_change_timestamp)
+        patch.setattr(Path, "stat", stat_with_error)
+        patch.setattr(os, "utime", denied_utime)
+        result = RatingRenameService().set_rating(source, 3)
+
+    assert result.success and result.changed
+    assert result.destination_path == destination
+    assert result.original_mtime_ns == original_mtime
+    assert not source.exists()
+    assert destination.read_bytes() == b"archive"
+
+
 def _item(path: Path, rating: int | None) -> BrowserItem:
     return BrowserItem(
         display_name=path.name,

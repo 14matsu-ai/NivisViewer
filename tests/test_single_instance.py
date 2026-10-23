@@ -55,6 +55,29 @@ def test_primary_listens_and_closes(qapp, tmp_path):
         broker.close()
 
 
+def test_server_releases_disconnected_client_sockets(qapp, tmp_path, monkeypatch):
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from PySide6.QtNetwork import QLocalSocket
+
+    broker = SingleInstanceBroker(make_server_name(tmp_path, user_identity='test-user'))
+    # QLocalServer parents accepted sockets; simulate delivery without opening
+    # an OS pipe so this ownership regression also runs in restricted sessions.
+    client = QLocalSocket(broker.server)
+    pending = [client]
+    monkeypatch.setattr(broker.server, 'hasPendingConnections', lambda: bool(pending))
+    monkeypatch.setattr(broker.server, 'nextPendingConnection', lambda: pending.pop())
+
+    try:
+        broker._accept_connections()
+        assert client in broker._buffers
+        client.disconnected.emit()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        assert not broker._buffers
+        assert not broker.server.findChildren(QLocalSocket)
+    finally:
+        broker.close()
+
+
 def test_secondary_exits_before_mutable_services_are_opened(
     qapp, monkeypatch, tmp_path
 ):

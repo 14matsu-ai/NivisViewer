@@ -431,6 +431,8 @@ class ConfigManager(QObject):
                     legacy_close = normalize_viewer_close_shortcut(
                         loaded.get("viewer_close_shortcut")
                     )
+                    if not isinstance(migrated_shortcuts.get("viewer"), dict):
+                        migrated_shortcuts["viewer"] = {}
                     migrated_shortcuts.setdefault("viewer", {})[
                         "viewer_close"
                     ] = [] if legacy_close == "" else [legacy_close]
@@ -465,6 +467,11 @@ class ConfigManager(QObject):
                 merged["fullscreen_bottom_edge_trigger_px"] = legacy_edge
             self._replace_data(self._normalize(merged))
         else:
+            self._preserve_unreadable_config = True
+            self.last_error = tr(
+                '設定ファイルのJSONがオブジェクトではありません。元ファイルを保護し、既定値で起動します。'
+            )
+            _LOG.warning("Config root is not an object; preserving original file path=%s", self.path)
             self._replace_data(defaults)
         return self.data
 

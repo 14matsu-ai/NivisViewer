@@ -2246,7 +2246,10 @@ class SevenZipImageSource(ImageSource):
         cancelled = source_request_token()
         self.validate_archive()
         with self._active_lock:
-            if self._closed.is_set():
+            # A cancelled job must not decode even a retained payload. It no
+            # longer owns useful work, while another job may still use this
+            # source and its cache.
+            if cancelled.is_set() or self._closed.is_set():
                 raise ImageSourceError(tr('読み込みを中止しました。'), code=ArchiveErrorCode.PROCESS_CANCELLED.value)
             cached = self._payloads.get(image_id)
             if cached is not None:

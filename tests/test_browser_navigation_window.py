@@ -298,6 +298,43 @@ def test_history_restore_publishes_cached_listing_before_reconcile(
     qapp.processEvents()
 
 
+@pytest.mark.parametrize("replaced_by_file", [False, True])
+def test_history_snapshot_missing_folder_is_evicted_and_recovers_to_parent(
+    tmp_path: Path,
+    qapp: QApplication,
+    replaced_by_file: bool,
+) -> None:
+    first = tmp_path / "消えたフォルダ"
+    second = tmp_path / "別のフォルダ"
+    second.mkdir()
+    page = first / "page.jpg"
+    write_image(page)
+    window = make_window(tmp_path, first, qapp)
+    try:
+        assert window.navigate_to(second)
+        finish_scan(window, qapp)
+        visibility = window._current_browser_visibility_policy()
+        sorting = window._browser_sort_policy_for_path(first)
+        assert window.folder_snapshot_cache.get(first, visibility, sorting) is not None
+        page.unlink()
+        first.rmdir()
+        if replaced_by_file:
+            first.write_text("replaced", encoding="utf-8")
+
+        assert window.go_back()
+        # Cached navigation may paint immediately, but its asynchronous
+        # reconciliation must remove a directory that no longer exists.
+        for _ in range(3):
+            finish_scan(window, qapp)
+        assert window.current_path == tmp_path.absolute()
+        assert window.item_model.row_for_path(page) == -1
+        assert window.folder_snapshot_cache.get(first, visibility, sorting) is None
+        assert window._directory_watch_path == tmp_path.absolute()
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
 def test_history_snapshot_reconcile_rearms_visible_thumbnail_requests(
     tmp_path: Path,
     qapp: QApplication,

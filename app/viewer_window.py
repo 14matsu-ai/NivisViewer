@@ -8,6 +8,7 @@ from .menu_icons import install_text_icon_menu_style, settings_icon
 import inspect
 import logging
 import math
+import weakref
 from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter_ns
@@ -266,6 +267,11 @@ class ViewerWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        # Qt disposal can bypass the final close event after an owner has
+        # completed shutdown. Never retain an already-destroyed Qt wrapper.
+        self.destroyed.connect(
+            lambda *_args, owner=weakref.ref(self): _CLOSING_VIEWERS.discard(owner())
+        )
         ensure_gui_garbage_collector()
         self.setWindowTitle("NivisViewer")
         install_window_icon(self)
@@ -5017,6 +5023,18 @@ class ViewerWindow(QMainWindow):
             else self._visible_page_indexes
         )
         if isinstance(self.image_cache.source, PdfImageSource):
+            if first_frame_gate:
+                cached_focus = self.image_cache.get(self.model.focused_index)
+                if cached_focus is not None:
+                    # A cache hit produces no completion callback to admit the
+                    # spread partner. Keep the paint gate, but request both.
+                    gated_visible_indexes = self._visible_page_indexes
+                    if (
+                        cached_focus.error
+                        or cached_focus.qimage is None
+                        or cached_focus.original_size is None
+                    ):
+                        self._cancel_interactive_open()
             self._cancel_pending_decode_demand()
             self._raster_paint_fallback_timer.stop()
             self._raster_prefetch_after_paint = None

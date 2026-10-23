@@ -14,6 +14,7 @@ from PySide6.QtGui import (
     QWindow,
 )
 from PySide6.QtTest import QTest
+from shiboken6 import isValid
 from PySide6.QtWidgets import (
     QApplication,
     QLabel,
@@ -39,7 +40,17 @@ def _release_test_windows(qapp):
     existing = {id(widget) for widget in qapp.topLevelWidgets()}
     yield
     for widget in tuple(qapp.topLevelWidgets()):
-        if id(widget) not in existing:
+        if isValid(widget) and id(widget) not in existing:
+            prepare = getattr(widget, "prepare_shutdown", None)
+            if callable(prepare):
+                deadline = monotonic() + 5
+                options = {"wait_msecs": 0} if isinstance(widget, ViewerWindow) else {}
+                while isValid(widget) and prepare(**options) is False:
+                    assert monotonic() < deadline
+                    qapp.processEvents()
+                    QTest.qWait(1)
+            if not isValid(widget):
+                continue
             widget.close()
             widget.deleteLater()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

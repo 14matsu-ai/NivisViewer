@@ -207,6 +207,9 @@ class SingleInstanceBroker(QObject):
             socket.disconnected.connect(
                 lambda socket=socket: self._buffers.pop(socket, None)
             )
+            # Accepted sockets are parented to the server. Removing their
+            # buffer alone leaves every past Explorer request alive until exit.
+            socket.disconnected.connect(socket.deleteLater)
 
     def _read_from_socket(self, socket: QLocalSocket) -> None:
         buffer = self._buffers.get(socket)

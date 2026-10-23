@@ -23,6 +23,7 @@ from app.image_source import (
     create_image_source,
 )
 from app.page_model import PageModel
+from app.raster_execution_budget import SourceRequestToken, source_request_scope
 
 
 def image_bytes(color: str = "red") -> bytes:
@@ -243,6 +244,47 @@ def test_source_close_cancels_running_backend_request(tmp_path: Path) -> None:
 
     assert cancelled_seen.is_set()
     assert failures and isinstance(failures[0], ImageSourceError)
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_cancelled_request_does_not_extract_or_decode_retained_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cached: bool,
+) -> None:
+    archive = tmp_path / "日本語.7z"
+    archive.write_bytes(b"source")
+    backend = FakeBackend((archive_entry("1.png"),))
+    source = SevenZipImageSource(archive, backend=backend)
+    source.set_payload_cache_budget(len(backend.data))
+    if cached:
+        with source.open_image("1.png"):
+            pass
+    reads_before = len(backend.read_calls)
+    hits_before = source.payload_cache_hits
+    decode_calls = []
+    real_open = Image.open
+
+    def counted_open(*args, **kwargs):
+        decode_calls.append(True)
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(Image, "open", counted_open)
+    cancelled = SourceRequestToken()
+    cancelled.set()
+    try:
+        with source_request_scope(cancelled):
+            with pytest.raises(ImageSourceError) as captured:
+                with source.open_image("1.png"):
+                    pass
+        assert captured.value.code == ArchiveErrorCode.PROCESS_CANCELLED.value
+        assert len(backend.read_calls) == reads_before
+        assert source.payload_cache_hits == hits_before
+        assert decode_calls == []
+        assert source._active_requests == {}
+        # Cancellation belongs to one job, not to the shared source/cache.
+        with source.open_image("1.png") as image:
+            assert image.size == (20, 30)
+    finally:
+        source.close()
 
 
 def _capture_failure(source: SevenZipImageSource, failures: list[Exception]) -> None:

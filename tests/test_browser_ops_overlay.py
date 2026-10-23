@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from time import monotonic
 
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QRect
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QLabel, QStyleOptionViewItem
+from PySide6.QtTest import QTest
+from shiboken6 import isValid
 
 from app.browser_item_delegate import BrowserItemDelegate
 from app.browser_model import BrowserItem, BrowserItemKind
@@ -22,7 +25,16 @@ def _release_test_windows(qapp):
     existing = {id(widget) for widget in qapp.topLevelWidgets()}
     yield
     for widget in tuple(qapp.topLevelWidgets()):
-        if id(widget) not in existing:
+        if isValid(widget) and id(widget) not in existing:
+            prepare = getattr(widget, "prepare_shutdown", None)
+            if callable(prepare):
+                deadline = monotonic() + 5
+                while isValid(widget) and prepare() is False:
+                    assert monotonic() < deadline
+                    qapp.processEvents()
+                    QTest.qWait(1)
+            if not isValid(widget):
+                continue
             widget.close()
             widget.deleteLater()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

@@ -453,6 +453,13 @@ class FileOperationQueue(QObject):
             entry = self._active
             if entry is None or entry.operation_id != request.operation_id:
                 return
+            # Cancellation may arrive after the worker's final check but
+            # before its queued result reaches the GUI. Shutdown likewise
+            # cannot wait for a new conflict dialog after owners have closed.
+            if self._closed or (entry.cancelled is not None and entry.cancelled.is_set()):
+                plan = replace(
+                    plan, state=FileOperationState.CANCELLED, conflicts=(), errors=(),
+                )
             entry.plan = plan
             if plan.state is FileOperationState.CANCELLED:
                 entry.state = FileOperationState.CANCELLED

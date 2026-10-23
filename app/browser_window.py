@@ -1694,14 +1694,18 @@ class BrowserWindow(QMainWindow):
         pending = self._matching_pending_scan(error.generation, error.path)
         if pending is None or self._shutdown_prepared:
             return
-        recover_missing_watched_directory = bool(
+        missing_directory = error.status in {
+            BrowserScanStatus.NOT_FOUND,
+            BrowserScanStatus.NOT_DIRECTORY,
+        }
+        if missing_directory:
+            # A cached listing is provisional until reconciliation succeeds.
+            # Do not replay deleted folders (or their descendants) on Back.
+            self.folder_snapshot_cache.discard_tree(pending.path)
+        recover_missing_current_directory = bool(
             pending.refresh
-            and pending.navigation_source == "filesystem_watch"
-            and error.status
-            in {
-                BrowserScanStatus.NOT_FOUND,
-                BrowserScanStatus.NOT_DIRECTORY,
-            }
+            and pending.navigation_source in {"filesystem_watch", "snapshot_reconcile"}
+            and missing_directory
             and self._same_path(self.current_path, pending.path)
         )
         if pending.navigation_source == "recent_location":
@@ -1718,7 +1722,7 @@ class BrowserWindow(QMainWindow):
         self._pending_scan = None
         self._pending_browser_focus = None
         self._scan_batch_timer.stop()
-        if recover_missing_watched_directory:
+        if recover_missing_current_directory:
             self._clear_active_directory_watch()
         else:
             self._restore_current_directory_watch()
@@ -1731,7 +1735,7 @@ class BrowserWindow(QMainWindow):
         else:
             message = tr('フォルダへアクセスできません')
         self._show_temporary_status(message)
-        if recover_missing_watched_directory:
+        if recover_missing_current_directory:
             parent = pending.path.parent
             if not self._same_path(parent, pending.path):
                 self.navigate_to(

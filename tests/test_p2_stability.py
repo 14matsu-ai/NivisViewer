@@ -337,6 +337,23 @@ def test_path_availability_shutdown_rejects_new_and_finishes(
     )
 
 
+def test_cached_path_result_is_not_published_after_shutdown(qapp):
+    service = PathAvailabilityService(
+        filesystem=ControlledFileSystem(PathAvailability.AVAILABLE),
+    )
+    results = []
+    service.result_ready.connect(results.append)
+    try:
+        service.probe(r'C:\cached.cbz')
+        assert wait_until(qapp, lambda: len(results) == 1)
+        service.probe(r'C:\cached.cbz')
+        service.close()
+        qapp.processEvents()
+        assert len(results) == 1
+    finally:
+        service.close()
+
+
 def test_shared_probe_consumer_cancel_does_not_cancel_physical_work(
     qapp: QApplication,
 ) -> None:

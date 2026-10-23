@@ -1292,6 +1292,7 @@ ENGLISH_RECENT_ADDITIONS = {
     '現在のBrowserキャッシュ使用量を取得できません。': 'Could not read current Browser cache usage.',
     '設定ファイルをUTF-8として読めません。元ファイルを保護し、既定値で起動します: {p0}': 'Could not read the settings file as UTF-8. The original file is preserved and defaults will be used: {p0}',
     '設定ファイルのJSONを読み取れません。元ファイルを保護し、既定値で起動します: {p0}': 'Could not parse the settings JSON. The original file is preserved and defaults will be used: {p0}',
+    '設定ファイルのJSONがオブジェクトではありません。元ファイルを保護し、既定値で起動します。': 'The settings JSON is not an object. The original file is preserved and defaults will be used.',
     '設定ファイルを読み取れません。元ファイルを保護し、既定値で起動します: {p0}': 'Could not read the settings file. The original file is preserved and defaults will be used: {p0}',
     '設定ファイルの元データを保護中のため保存していません。ファイルを確認してください。': 'Settings were not saved to protect the original data. Check the file.',
     'お気に入りタブを追加': 'Add favorites tab',
