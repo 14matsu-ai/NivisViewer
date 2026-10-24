@@ -12,6 +12,7 @@ import re
 import threading
 import zipfile
 from collections import OrderedDict
+from contextlib import ExitStack
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from math import ceil
@@ -1952,7 +1953,8 @@ class ZipImageSource(ImageSource):
         self._raise_if_cancelled(cancelled)
         payload = QByteArray()
         read_calls = 0
-        with self._lock:
+        with ExitStack() as source_lock:
+            source_lock.enter_context(self._lock)
             try:
                 info = self._zip.getinfo(image_id)
             except KeyError as exc:
@@ -1969,6 +1971,13 @@ class ZipImageSource(ImageSource):
             self._raise_if_cancelled(cancelled)
             total = 0
             with self._zip.open(info, "r") as file:
+                if info.compress_type == zipfile.ZIP_DEFLATED:
+                    # Each ZipExtFile owns its decompressor and CRC state;
+                    # zipfile's shared-file lock still serializes raw reads.
+                    # The registered request keeps the archive alive until
+                    # this entry closes. Leave other compression serialized,
+                    # including entry open/close, to preserve seek order.
+                    source_lock.close()
                 while True:
                     self._raise_if_cancelled(cancelled)
                     chunk = file.read(self._entry_read_chunk_bytes(info))
