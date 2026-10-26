@@ -4,6 +4,7 @@ import ctypes
 import logging
 import sys
 from dataclasses import dataclass
+from shiboken6 import isValid
 
 from PySide6.QtCore import QByteArray, QEvent, QObject, QPoint, QRect, QTimer, Qt
 from PySide6.QtGui import (
@@ -204,7 +205,7 @@ class FullscreenChromeController(QObject):
         if (self._shutdown or self.window.isFullScreen()
                 or self._fullscreen_restore_state is not None):
             return
-        screen = self.window.screen()
+        screen = self._resolve_target_screen(self.window.screen())
         normal_geometry = QRect(self.window.normalGeometry())
         if not normal_geometry.isValid() or normal_geometry.isEmpty():
             normal_geometry = QRect(self.window.geometry())
@@ -218,16 +219,18 @@ class FullscreenChromeController(QObject):
         target_geometry = (QRect(screen.geometry()) if screen is not None
                            else QRect(self.window.geometry()))
         self._fullscreen_transitioning = True
-        if self.window.isVisible() and self.window.isMaximized():
-            self.window.hide()
-        self.window.setWindowState(Qt.WindowState.WindowNoState)
-        self.window.setWindowFlags(
-            self._fullscreen_restore_state.window_flags
-            | Qt.WindowType.FramelessWindowHint
-        )
-        self._set_target_screen(screen)
-        self.window.setGeometry(target_geometry)
-        self._fullscreen_transitioning = False
+        try:
+            if self.window.isVisible() and self.window.isMaximized():
+                self.window.hide()
+            self.window.setWindowState(Qt.WindowState.WindowNoState)
+            self.window.setWindowFlags(
+                self._fullscreen_restore_state.window_flags
+                | Qt.WindowType.FramelessWindowHint
+            )
+            self._set_target_screen(screen)
+            self.window.setGeometry(target_geometry)
+        finally:
+            self._fullscreen_transitioning = False
 
     def enter_true_fullscreen(self) -> None:
         """Enter a full-monitor borderless state through a neutral state.
@@ -247,14 +250,16 @@ class FullscreenChromeController(QObject):
         native_monitor = self._capture_native_fullscreen_monitor()
         self.prepare_true_fullscreen()
         self._fullscreen_transitioning = True
-        # Qt 6.11.2 deliberately restricts frameless maximization to rcWork.
-        # Enter its distinct fullscreen state from neutral instead. Do not
-        # call QWidget.setGeometry after this: a changed rect clears that state.
-        self.window.showFullScreen()
-        self._watch_native_surface()
-        self._apply_native_fullscreen_bounds(native_monitor)
-        self._mark_native_fullscreen()
-        self._fullscreen_transitioning = False
+        try:
+            # Qt 6.11.2 deliberately restricts frameless maximization to rcWork.
+            # Enter its distinct fullscreen state from neutral instead. Do not
+            # call QWidget.setGeometry after this: a changed rect clears that state.
+            self.window.showFullScreen()
+            self._watch_native_surface()
+            self._apply_native_fullscreen_bounds(native_monitor)
+            self._mark_native_fullscreen()
+        finally:
+            self._fullscreen_transitioning = False
 
     @property
     def owns_true_fullscreen_transition(self) -> bool:
@@ -263,6 +268,8 @@ class FullscreenChromeController(QObject):
     def leave_true_fullscreen(self) -> None:
         """Restore the exact pre-fullscreen flags, monitor and normal state."""
 
+        if self._shutdown:
+            return
         restore = self._fullscreen_restore_state
         if restore is None:
             if self.window.isFullScreen():
@@ -270,20 +277,33 @@ class FullscreenChromeController(QObject):
             return
 
         self._fullscreen_transitioning = True
-        self._native_reconcile_timer.stop()
-        self._clear_native_fullscreen_mark()
-        self.window.hide()
-        self.window.setWindowState(Qt.WindowState.WindowNoState)
-        self.window.setWindowFlags(restore.window_flags)
-        self._set_target_screen(restore.screen)
-        self.window.setGeometry(restore.normal_geometry)
-        if restore.was_maximized:
-            self.window.showMaximized()
-        else:
-            self.window.showNormal()
-            self.window.setGeometry(restore.normal_geometry)
-        self._fullscreen_restore_state = None
-        self._fullscreen_transitioning = False
+        try:
+            self._native_reconcile_timer.stop()
+            self._clear_native_fullscreen_mark()
+            self.window.hide()
+            self.window.setWindowState(Qt.WindowState.WindowNoState)
+            self.window.setWindowFlags(restore.window_flags)
+            screen = self._resolve_target_screen(restore.screen)
+            geometry = QRect(restore.normal_geometry)
+            if screen is not restore.screen and screen is not None:
+                # A removed monitor's coordinates may now be off desktop.
+                bounds = screen.availableGeometry()
+                if bounds.isValid() and not bounds.isEmpty():
+                    geometry.setSize(geometry.size().boundedTo(bounds.size()))
+                    geometry.moveLeft(min(max(geometry.left(), bounds.left()),
+                                          bounds.right() - geometry.width() + 1))
+                    geometry.moveTop(min(max(geometry.top(), bounds.top()),
+                                         bounds.bottom() - geometry.height() + 1))
+            self._set_target_screen(screen)
+            self.window.setGeometry(geometry)
+            if restore.was_maximized:
+                self.window.showMaximized()
+            else:
+                self.window.showNormal()
+                self.window.setGeometry(geometry)
+            self._fullscreen_restore_state = None
+        finally:
+            self._fullscreen_transitioning = False
 
     def standard_window_geometry(self) -> QByteArray:
         """Return geometry for persistence without saving fullscreen bounds."""
@@ -293,11 +313,25 @@ class FullscreenChromeController(QObject):
             return QByteArray(restore.saved_geometry)
         return QByteArray(self.window.saveGeometry())
 
+    def _resolve_target_screen(self, screen: QScreen | None) -> QScreen | None:
+        # A saved QScreen wrapper can outlive its native screen after display
+        # topology changes. Resolve it again instead of passing a dead pointer
+        # across QWindow.setScreen's C++ boundary.
+        if screen is not None and isValid(screen):
+            return screen
+        screen = self.window.screen()
+        if screen is not None and isValid(screen):
+            return screen
+        screen = QGuiApplication.primaryScreen()
+        return screen if screen is not None and isValid(screen) else None
+
     def _set_target_screen(self, screen: QScreen | None) -> None:
+        screen = self._resolve_target_screen(screen)
         if screen is None:
             return
         window_handle = self.window.windowHandle()
-        if window_handle is not None and window_handle.screen() is not screen:
+        if (window_handle is not None and isValid(window_handle)
+                and window_handle.screen() is not screen and isValid(screen)):
             window_handle.setScreen(screen)
 
     def _capture_native_fullscreen_monitor(self) -> int | None:
@@ -600,6 +634,8 @@ class FullscreenChromeController(QObject):
         self._hide_timer.start(self.hide_delay_ms)
 
     def reevaluate_visibility(self) -> None:
+        if self._shutdown:
+            return
         self._invalidate_hide_timer()
         self._apply_native_fullscreen_frame(self.fullscreen)
         cursor_position = QCursor.pos()
@@ -1011,7 +1047,7 @@ class FullscreenChromeController(QObject):
         frame = self.window.frameGeometry()
         bottom_bounds = QRect(frame)
         if self.fullscreen or self.window.isFullScreen():
-            screen = self.window.screen()
+            screen = self._resolve_target_screen(self.window.screen())
             if screen is not None:
                 # QRect uses inclusive right/bottom coordinates, while
                 # Windows can round a high-DPI cursor at the physical edge
@@ -1038,7 +1074,7 @@ class FullscreenChromeController(QObject):
         left = overlay_region.left()
         right = overlay_region.right()
         if self.fullscreen or self.window.isFullScreen():
-            screen = self.window.screen()
+            screen = self._resolve_target_screen(self.window.screen())
             if screen is not None:
                 # Preserve the existing high-DPI boundary allowance only
                 # while the visible overlay owns Wheel input.

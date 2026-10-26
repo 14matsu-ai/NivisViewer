@@ -1021,10 +1021,12 @@ class ViewerWindow(QMainWindow):
             self._finish_pending_navigation_sequence()
         if (
             hasattr(self, "fullscreen_chrome")
+            and not getattr(self, '_shutdown_prepared', False)
             and event.type()
             in {QEvent.Type.Resize, QEvent.Type.ScreenChangeInternal}
         ):
-            QTimer.singleShot(0, self.fullscreen_chrome.reevaluate_visibility)
+            QTimer.singleShot(0, self.fullscreen_chrome,
+                              self.fullscreen_chrome.reevaluate_visibility)
         if (
             hasattr(self, "_page_list_viewport_timer")
             and hasattr(self, "page_list_model")
@@ -6618,6 +6620,8 @@ class ViewerWindow(QMainWindow):
         }
 
     def dispatch_command(self, command: str) -> bool:
+        if self._shutdown_prepared:
+            return False
         normalized = commands.normalize_viewer_command(command)
         handlers: dict[str, Callable[[], None]] = {
             commands.PREVIOUS_PAGE: self.previous_page,
@@ -7876,6 +7880,8 @@ class ViewerWindow(QMainWindow):
         self.page_navigation.last_page(input_kind=input_kind)
 
     def toggle_fullscreen(self) -> None:
+        if self._shutdown_prepared:
+            return
         if self._is_fullscreen_mode():
             self.fullscreen_chrome.leave_true_fullscreen()
         else:

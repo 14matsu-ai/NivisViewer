@@ -3688,15 +3688,19 @@ class BrowserWindow(QMainWindow):
         viewers = self._affected_viewers_handler(paths)
         if not viewers:
             return True
-        answer = QMessageBox.question(
-            self,
-            tr('ViewerWindowで使用中'),
-            tr('この項目はViewerWindowで開かれています。\n対象Viewerを閉じて操作を続けますか？'),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return False
+        # A hidden, closing Viewer still owns its source while native jobs
+        # drain. Keep it in the handle-safety check, but do not ask the user
+        # to close a window whose close request has already been accepted.
+        if any(not getattr(viewer, '_close_pending', False) for viewer in viewers):
+            answer = QMessageBox.question(
+                self,
+                tr('ViewerWindowで使用中'),
+                tr('この項目はViewerWindowで開かれています。\n対象Viewerを閉じて操作を続けますか？'),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
         if self._close_affected_viewers_handler is None:
             return False
         closed = self._close_affected_viewers_handler(viewers)

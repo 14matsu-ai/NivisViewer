@@ -493,13 +493,16 @@ class ApplicationController(QObject):
         try:
             for window in tuple(viewers):
                 if window in self._viewer_windows:
+                    already_closing = window._close_pending
                     # Capture the source identity and retain this hidden owner
                     # before shutdown clears session.source. A retired worker
                     # may still hold its archive even after the wait expires.
                     window.close()
                     if not window._close_pending and not window._shutdown_cleanup_complete:
                         return False
-                    if window.prepare_shutdown(wait_msecs=2000) is False:
+                    # An earlier accepted close already drains asynchronously.
+                    # Do not block a Browser rating click on that native work.
+                    if window.prepare_shutdown(wait_msecs=0 if already_closing else 2000) is False:
                         return False
                     window.close()
             return self.pdfium_service.flush(wait_seconds=2.0)

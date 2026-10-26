@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from dataclasses import replace
 from time import monotonic
 import ctypes
 import pytest
 
 from PySide6.QtCore import QByteArray, QCoreApplication, QEvent, QPoint, QPointF, QRect, Qt
-from PySide6.QtGui import QMouseEvent, QWindow
+from PySide6.QtGui import QMouseEvent, QScreen, QWindow
+from shiboken6 import isValid
 from PySide6.QtWidgets import QDialog, QMainWindow, QSlider, QStatusBar, QVBoxLayout, QWidget
 
 from app import fullscreen_chrome as fullscreen_module
@@ -105,6 +107,129 @@ def _dispose_window(
     window.deleteLater()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     qapp.processEvents()
+
+
+@pytest.mark.parametrize("was_maximized", [False, True])
+def test_stale_screen_restore_falls_back_to_current_monitor(qapp, was_maximized):
+    window, controller = _make_controller()
+    window.setGeometry(QRect(100, 80, 480, 360))
+    if was_maximized:
+        window.showMaximized()
+    else:
+        window.show()
+    qapp.processEvents()
+    original_flags = window.windowFlags()
+    try:
+        controller.enter_true_fullscreen()
+        # Use an invalid Qt wrapper without deleting the application's real
+        # platform screen. It must never cross QWindow.setScreen's boundary.
+        stale = QScreen.__new__(QScreen)
+        assert not isValid(stale)
+        controller._fullscreen_restore_state = replace(
+            controller._fullscreen_restore_state,
+            screen=stale,
+            normal_geometry=QRect(50000, 50000, 480, 360),
+        )
+        controller.leave_true_fullscreen()
+        qapp.processEvents()
+        assert window.isVisible() and not window.isFullScreen()
+        assert window.isMaximized() is was_maximized
+        assert window.windowFlags() == original_flags
+        assert window.geometry().intersects(qapp.primaryScreen().availableGeometry())
+        assert controller._fullscreen_restore_state is None
+        assert not controller._fullscreen_transitioning
+        controller.enter_true_fullscreen()
+        controller.leave_true_fullscreen()
+        assert not controller._fullscreen_transitioning
+    finally:
+        _dispose_window(qapp, window, controller)
+
+
+def test_stale_screen_is_rejected_at_native_window_boundary(qapp):
+    window, controller = _make_controller()
+    window.show()
+    try:
+        stale = QScreen.__new__(QScreen)
+        assert not isValid(stale)
+        controller._set_target_screen(stale)
+        assert window.windowHandle().screen() is qapp.primaryScreen()
+    finally:
+        _dispose_window(qapp, window, controller)
+
+
+@pytest.mark.parametrize("primary_available", [False, True])
+def test_stale_screen_and_current_monitor_use_live_primary_or_none(qapp, monkeypatch, primary_available):
+    window, controller = _make_controller()
+    window.show()
+    primary = qapp.primaryScreen()
+    stale = QScreen.__new__(QScreen)
+    try:
+        monkeypatch.setattr(window, "screen", lambda: stale)
+        monkeypatch.setattr(fullscreen_module.QGuiApplication, "primaryScreen",
+                            lambda: primary if primary_available else None)
+        assert controller._resolve_target_screen(stale) is (primary if primary_available else None)
+        controller._set_target_screen(stale)
+    finally:
+        _dispose_window(qapp, window, controller)
+
+
+def test_queued_fullscreen_callback_after_shutdown_does_not_touch_deleted_timers(qapp):
+    window, controller = _make_controller()
+    window.show()
+    controller.enter_true_fullscreen()
+    _dispose_window(qapp, window, controller)
+    assert not isValid(controller)
+    controller.reevaluate_visibility()
+    controller.leave_true_fullscreen()
+
+
+@pytest.mark.parametrize("phase", ["prepare", "enter", "leave"])
+def test_interrupted_fullscreen_transition_clears_in_progress_flag(qapp, monkeypatch, phase):
+    window, controller = _make_controller()
+    window.show()
+    try:
+        if phase == "leave":
+            controller.enter_true_fullscreen()
+        method = "showFullScreen" if phase == "enter" else "setWindowFlags"
+        original = getattr(window, method)
+        def fail(*_args):
+            raise RuntimeError("injected window transition failure")
+        monkeypatch.setattr(window, method, fail)
+        with pytest.raises(RuntimeError, match="injected"):
+            {"prepare": controller.prepare_true_fullscreen,
+             "enter": controller.enter_true_fullscreen,
+             "leave": controller.leave_true_fullscreen}[phase]()
+        assert not controller._fullscreen_transitioning
+        assert controller._fullscreen_restore_state is not None
+        monkeypatch.setattr(window, method, original)
+        controller.leave_true_fullscreen()
+        assert window.isVisible() and controller._fullscreen_restore_state is None
+    finally:
+        _dispose_window(qapp, window, controller)
+
+
+@pytest.mark.parametrize("via_command", [False, True])
+def test_closing_viewer_rejects_late_fullscreen_input(tmp_path, qapp, via_command):
+    from app.config_manager import ConfigManager
+    from app.viewer_window import ViewerWindow
+    config = ConfigManager(tmp_path / "config.json")
+    config.load()
+    config.set("fullscreen", False)
+    window = ViewerWindow(config_manager=config)
+    window.show_initial()
+    qapp.processEvents()
+    try:
+        window.close()
+        assert window._close_pending and window._shutdown_prepared
+        assert not window.isVisible()
+        if via_command:
+            assert not window.dispatch_command("toggle_fullscreen")
+        else:
+            window.toggle_fullscreen()
+        assert not window.isVisible()
+        assert not window.fullscreen_chrome.owns_true_fullscreen_transition
+    finally:
+        _dispose_window(qapp, window, window.fullscreen_chrome)
 
 
 class _ScreenGeometry:
