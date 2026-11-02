@@ -6,6 +6,7 @@ from threading import Event
 from PySide6.QtCore import QObject, QRunnable, Signal
 
 from .image_source import create_image_source, ZipImageSource, SevenZipImageSource
+from .raster_execution_budget import source_request_scope
 
 
 class _Signals(QObject):
@@ -36,7 +37,8 @@ class ArchiveImageExport(QRunnable):
                 with source._read_entry_stream(self.image_id, self.cancelled) as stream:
                     payload = stream.getvalue()
             elif isinstance(source, SevenZipImageSource):
-                payload = source._read_payload(self.image_id)
+                with source_request_scope(self.cancelled):
+                    payload = source._read_payload(self.image_id)
             else:
                 raise ValueError("Not an archive image")
             if self.cancelled.is_set():
@@ -55,5 +57,8 @@ class ArchiveImageExport(QRunnable):
             error = str(exc)
         finally:
             if source is not None:
-                source.close()
+                try:
+                    source.close()
+                except Exception as exc:
+                    error = error or str(exc)
             self.signals.finished.emit(self.identity, str(target) if target else None, error)

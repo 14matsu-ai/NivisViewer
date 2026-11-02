@@ -65,6 +65,18 @@ from .thumbnail_render import (
 
 
 _RETIRED_THUMBNAIL_PROVIDERS: set[BrowserThumbnailProvider] = set()
+
+
+def drain_retired_thumbnail_providers(coordinator: ImageWorkCoordinator) -> bool:
+    """Drain this application's providers, without taking over other owners."""
+    retired = tuple(provider for provider in _RETIRED_THUMBNAIL_PROVIDERS
+                    if provider._coordinator is coordinator)
+    for provider in retired:
+        if provider.wait_for_done(0):
+            provider._finalize_close()
+    return all(provider not in _RETIRED_THUMBNAIL_PROVIDERS for provider in retired)
+
+
 _THUMBNAIL_LOG = logging.getLogger("nivisviewer.thumbnail")
 _PAGE_COUNT_REQUEST_TOKEN = -1
 _DISPLAY_REQUEST_TOKEN = -2
@@ -2219,9 +2231,12 @@ class BrowserThumbnailProvider(QObject):
             self._retry_save_queue.clear()
             self._retry_save_bytes = 0
         with self._pending_lock:
-            for pending in self._pending.values():
+            for key, pending in tuple(self._pending.items()):
                 pending.worker.cancelled.set()
-                self._try_take(pending.worker)
+                if self._try_take(pending.worker):
+                    # Removed queued jobs never emit a completion. Keeping a
+                    # cache-read record here would prevent shutdown forever.
+                    self._pending.pop(key, None)
         self._cancel_queued_maintenance()
         if self._coordinator is None:
             self._pool.clear()
@@ -4266,7 +4281,7 @@ class BrowserThumbnailProvider(QObject):
                                          persist_to_disk=False))
 
     def _release_retired_if_idle(self) -> None:
-        if not self._closed:
+        if self not in _RETIRED_THUMBNAIL_PROVIDERS:
             return
         if not self.wait_for_done(0):
             QTimer.singleShot(100, self, self._release_retired_if_idle)

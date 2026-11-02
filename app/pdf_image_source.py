@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .i18n import tr
 from .cloud_files import require_local
+from .raster_execution_budget import source_request_token
 
 
 from pathlib import Path
@@ -98,7 +99,7 @@ class PdfImageSource(ImageSource):
             if render_spec is not None
             else bucket_render_size(*logical_size)
         )
-        cancelled = cancel_token if cancel_token is not None else Event()
+        cancelled = cancel_token if cancel_token is not None else source_request_token()
         request_group = (image_id, purpose)
         with self._request_lock:
             if self._closed.is_set():

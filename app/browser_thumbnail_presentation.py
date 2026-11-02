@@ -196,7 +196,8 @@ class BrowserThumbnailPresentation(QObject):
     def _schedule(self):
         if (not self._closed and not self._waiting_capacity and not self._timer.isActive() and
                 (self._queue or self._decoration_rows
-                 or self._scan_row < self.window.item_model.rowCount())):
+                 or (not self.window._fast_scrolling
+                     and self._scan_row < self.window.item_model.rowCount()))):
             self._timer.start()
 
     def _publish(self, row):
@@ -341,7 +342,10 @@ class BrowserThumbnailPresentation(QObject):
                 item = window.item_model.item_at(self._decoration_rows.popleft())
                 if item is not None:
                     window.item_delegate.prepare_item_decoration(item, self._plan.dpr)
-            elif self._scan_row < window.item_model.rowCount():
+            elif not window._fast_scrolling and self._scan_row < window.item_model.rowCount():
+                # Whole-list resident reconciliation can span thousands of
+                # rows. Keep it idle-only; the viewport band and completion
+                # queue above still prepare the next visible rows during input.
                 self._enqueue(self._scan_row)
                 self._scan_row += 1
             else:

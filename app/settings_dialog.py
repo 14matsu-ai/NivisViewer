@@ -3601,7 +3601,7 @@ class SettingsDialog(QDialog):
         button_form.addRow(tr('戻る / XButton1:'), self.mouse_back_action_combo)
         button_form.addRow(tr('進む / XButton2:'), self.mouse_forward_action_combo)
         self.mouse_side_buttons_folder_navigation_checkbox = QCheckBox(
-            tr('画像表示中はサイドボタンでフォルダー間を移動'), button_group,
+            tr('サイドボタンでフォルダー・書庫間を移動（画像のないフォルダーは飛ばす）'), button_group,
         )
         button_form.addRow(self.mouse_side_buttons_folder_navigation_checkbox)
 

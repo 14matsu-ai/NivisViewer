@@ -336,6 +336,7 @@ class _PendingDirectoryScan:
     first_batch_applied: bool = False
     snapshot_hit: bool = False
     retry_failed_thumbnails: bool = False
+    priority_item_applied: bool = False
 
 
 @dataclass(frozen=True)
@@ -1237,6 +1238,7 @@ class BrowserWindow(QMainWindow):
         ):
             return None
         return AdjacentBookBrowserSnapshot(
+            listing_revision=self._navigation_listing_revision(),
             parent_folder=str(self.current_path),
             scan_generation=self._scan_generation,
             entries=tuple(
@@ -1273,6 +1275,15 @@ class BrowserWindow(QMainWindow):
                 f":tags={(self.browser_filter_state.include_tags, self.browser_filter_state.exclude_tags, self.browser_filter_state.tag_match)!r}"
             ),
         )
+
+    def _navigation_listing_revision(self) -> tuple[int, int, int]:
+        return (id(self), self._navigation_model_revision, self._scan_generation)
+
+    def _invalidate_navigation_listing(self, *_args) -> None:
+        self._navigation_model_revision += 1
+
+    def navigation_snapshot_is_current(self, snapshot: AdjacentBookBrowserSnapshot) -> bool:
+        return snapshot.listing_revision == self._navigation_listing_revision()
 
     def show_initial(self) -> None:
         self.show()
@@ -1316,6 +1327,7 @@ class BrowserWindow(QMainWindow):
         trace_id: int = 0,
         atomic_restore: bool = False,
         retry_failed_thumbnails: bool = False,
+        priority_path: str | None = None,
     ) -> bool:
         target = self._absolute_browser_path(path)
         self._pending_sidebar_focus = None
@@ -1404,6 +1416,7 @@ class BrowserWindow(QMainWindow):
             trace_id=trace_id,
             sort_policy=self._browser_sort_policy_for_path(target),
             include_progress_entries=False,
+            priority_path=priority_path if not same_path else None,
         )
         self._pending_scan = _PendingDirectoryScan(
             path=target,
@@ -1440,6 +1453,24 @@ class BrowserWindow(QMainWindow):
 
     def _on_scan_batch(self, batch: BrowserScanBatch) -> None:
         pending = self._matching_pending_scan(batch.generation, batch.path)
+        if batch.priority_item:
+            try:
+                if (pending is None or self._shutdown_prepared
+                        or pending.refresh or pending.committed):
+                    return
+                self._commit_pending_scan(pending)
+                self.item_model.begin_final_directory_scan(
+                    self._items_from_scan_entries(batch.entries), generation=pending.generation,
+                    sort_policy=self._current_browser_sort_policy(),
+                )
+                pending.priority_item_applied = True
+                pending.first_batch_applied = True
+                self._restore_pending_scan_location(pending, final=False)
+                self._update_status()
+            finally:
+                if batch.priority_ready is not None:
+                    batch.priority_ready.set()
+            return
         if pending is None or self._shutdown_prepared:
             return
         pending.scanned_count += batch.item_count
@@ -2130,7 +2161,7 @@ class BrowserWindow(QMainWindow):
         if not self._scan_status_timer.isActive():
             self._scan_status_timer.start()
 
-    def select_path(self, path: str | Path) -> None:
+    def select_path(self, path: str | Path, *, prioritize_selection: bool = False) -> None:
         target = self._absolute_browser_path(path)
         if target.suffix.lower() in (
             BROWSER_IMAGE_EXTENSIONS | BROWSER_ARCHIVE_EXTENSIONS
@@ -2143,7 +2174,10 @@ class BrowserWindow(QMainWindow):
             selected = target
 
         location = BrowserLocation(str(folder), selected_path=str(selected))
-        if not self.navigate_to(folder, restore_location=location):
+        options = {"restore_location": location}
+        if prioritize_selection:
+            options["priority_path"] = str(target)
+        if not self.navigate_to(folder, **options):
             return
         self._restore_location(location)
 
@@ -2162,6 +2196,10 @@ class BrowserWindow(QMainWindow):
         ):
             return False
         target = self._absolute_browser_path(path)
+        pending = self._pending_scan
+        if (pending is not None and pending.priority_item_applied
+                and self._same_path(pending.path, target.parent)):
+            pending.restore_location = replace(pending.restore_location, selected_path=str(target))
         row = self.item_model.row_for_path(target)
         selection_model = self.list_view.selectionModel()
         if selection_model is None:
@@ -4692,6 +4730,7 @@ class BrowserWindow(QMainWindow):
         self._shutdown_prepared = True
         self._pending_system_open = None
         if self._shutdown_cleanup_phase == 0:
+            self.folder_tree_sync.cancel()
             self._download_retry.close()
             self._close_zip_progress_dialog()
             self.clear_file_clipboard()
@@ -7686,6 +7725,10 @@ class BrowserWindow(QMainWindow):
         self._apply_sidebar_layout()
 
         self.item_model = BrowserItemModel(self)
+        self._navigation_model_revision = 0
+        for signal in (self.item_model.modelReset, self.item_model.layoutChanged,
+                       self.item_model.rowsInserted, self.item_model.rowsRemoved):
+            signal.connect(self._invalidate_navigation_listing)
         self.item_model.configure_filter_restore_cache(
             enabled=self.folder_snapshot_cache.enabled,
             max_entries=self.folder_snapshot_cache.max_entries,

@@ -949,6 +949,10 @@ class FolderImageSource(ImageSource):
             listing_snapshot if self._image_snapshot is not None else None
         )
         self._listed_images: tuple[str, ...] | None = self._image_snapshot
+        self._identity_indexes: dict[str, int] | None = (
+            self._build_identity_indexes(self._image_snapshot)
+            if self._image_snapshot is not None else None
+        )
         self._metadata_lock = threading.Lock()
         self._size_cache: dict[str, tuple[int, int]] = {}
         self._animation_cache: dict[str, bool | None] = {}
@@ -1023,6 +1027,9 @@ class FolderImageSource(ImageSource):
                 reverse=self.sort_descending,
             )
         )
+        # Publish both immutable listing and its index together. Book opening
+        # builds this on the worker; page navigation never walks all paths.
+        self._identity_indexes = self._build_identity_indexes(listed)
         self._listed_images = listed
         return list(listed)
 
@@ -1036,11 +1043,16 @@ class FolderImageSource(ImageSource):
         return self._path_identity(image_id)
 
     def index_for_identity(self, identity: str) -> int:
-        target = self._path_identity(identity)
-        for index, image_id in enumerate(self.list_images()):
-            if self._path_identity(image_id) == target:
-                return index
-        return -1
+        if self._identity_indexes is None:
+            self.list_images()
+        return self._identity_indexes.get(self._path_identity(identity), -1)
+
+    @classmethod
+    def _build_identity_indexes(cls, images: tuple[str, ...]) -> dict[str, int]:
+        indexes: dict[str, int] = {}
+        for index, image_id in enumerate(images):
+            indexes.setdefault(cls._path_identity(image_id), index)
+        return indexes
 
     def index_for_path(self, path: str | Path) -> int:
         return self.index_for_identity(os.fspath(path))

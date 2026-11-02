@@ -26,10 +26,13 @@ from .browser_sort import (
 )
 from .image_source import BOOK_FILE_EXTENSIONS, SUPPORTED_EXTENSIONS
 from .zippla_filename_metadata import ZipPlaFilenameMetadata
+from .cloud_files import local_image_candidate, require_local
+from .folder_cover import is_cover_artifact_name
 
 
 ADJACENT_BOOKS = "books"
 SIBLING_FOLDERS = "sibling_folders"
+SIDE_BOOKS = "side_books"
 
 
 class AdjacentBookSearchStatus(StrEnum):
@@ -60,6 +63,7 @@ class AdjacentBookBrowserSnapshot:
     entries: tuple[AdjacentBookSnapshotEntry, ...]
     sort_identity: str = "name:ascending"
     filter_identity: str = "browser-visible-items"
+    listing_revision: tuple[int, int, int] | None = field(default=None, compare=False, repr=False)
 
     # Derived once from captured order, never from the current filesystem.
     # Excluded from the public dataclass constructor/value/repr contracts.
@@ -172,6 +176,9 @@ class AdjacentBookSearchRequest:
     sort_order: str = BrowserSortOrder.ASCENDING.value
     folders_first: bool = True
     random_seed: int = 0
+    use_zippla_cover: bool = False
+    recursive_folder: bool = False
+    excluded_paths: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -273,14 +280,47 @@ class AdjacentBookFileSystem:
                 )
         return tuple(result)
 
-    def directory_contains_supported_image(self, path: str) -> bool:
+    def directory_contains_supported_image(
+        self, path: str, *, use_zippla_cover: bool = False, local_only: bool = False,
+        cancelled: Event | None = None,
+        recursive: bool = False,
+    ) -> bool:
+        if recursive:
+            pending = [path]
+            while pending:
+                if cancelled is not None and cancelled.is_set():
+                    return False
+                folder = pending.pop()
+                try:
+                    require_local(folder)
+                    with os.scandir(folder) as entries:
+                        for entry in entries:
+                            if cancelled is not None and cancelled.is_set():
+                                return False
+                            if entry.is_symlink() or not local_image_candidate(entry.path):
+                                continue
+                            if entry.is_dir(follow_symlinks=False):
+                                pending.append(entry.path)
+                            elif (entry.is_file(follow_symlinks=False)
+                                  and os.path.splitext(entry.name)[1].lower() in SUPPORTED_EXTENSIONS
+                                  and not is_cover_artifact_name(entry.name, use_zippla_cover=use_zippla_cover)):
+                                return True
+                except OSError:
+                    continue
+            return False
+        if local_only:
+            require_local(path)
         with os.scandir(path) as entries:
             for entry in entries:
+                if cancelled is not None and cancelled.is_set():
+                    return False
                 try:
                     is_supported_image = (
-                        entry.is_file(follow_symlinks=False)
+                        entry.is_file(follow_symlinks=local_only)
                         and os.path.splitext(entry.name)[1].lower()
                         in SUPPORTED_EXTENSIONS
+                        and not is_cover_artifact_name(entry.name, use_zippla_cover=use_zippla_cover)
+                        and (not local_only or local_image_candidate(entry.path))
                     )
                 except OSError:
                     continue
@@ -325,21 +365,25 @@ class _SearchWorker(QRunnable):
                     candidates,
                 )
                 return
-            fingerprint = self.filesystem.directory_fingerprint(parent)
-            if (
-                self.cached is not None
-                and self.cached.fingerprint == fingerprint
-            ):
-                candidates = self.cached.candidates
+            # Captured Browser order/filter is authoritative. Do not reuse a
+            # filesystem cache (or an older filtered snapshot) in its place.
+            if (request.candidate_mode == SIDE_BOOKS and request.browser_snapshot is not None
+                    and path_key(request.browser_snapshot.parent_folder) == parent_key):
+                candidates = tuple(
+                    entry.absolute_path for entry in request.browser_snapshot.entries
+                    if entry.openable_by_nivisviewer and entry.item_kind != "other"
+                )
             else:
-                snapshot = request.browser_snapshot
-                if (
-                    snapshot is not None
-                    and path_key(snapshot.parent_folder) == parent_key
-                ):
-                    candidates = self._from_snapshot(snapshot)
+                fingerprint = self.filesystem.directory_fingerprint(parent)
+            if candidates is None:
+                if self.cached is not None and self.cached.fingerprint == fingerprint:
+                    candidates = self.cached.candidates
                 else:
-                    candidates = self._from_filesystem(parent)
+                    snapshot = request.browser_snapshot
+                    if snapshot is not None and path_key(snapshot.parent_folder) == parent_key:
+                        candidates = self._from_snapshot(snapshot)
+                    else:
+                        candidates = self._from_filesystem(parent)
             if self.cancelled.is_set():
                 self._emit(
                     AdjacentBookSearchStatus.CANCELLED,
@@ -358,6 +402,9 @@ class _SearchWorker(QRunnable):
                     fingerprint,
                     candidates,
                 )
+                return
+            if request.candidate_mode == SIDE_BOOKS:
+                self._select_side_book(candidates, current_index, parent_key, fingerprint)
                 return
             next_index = current_index + (-1 if request.direction < 0 else 1)
             if not 0 <= next_index < len(candidates):
@@ -405,9 +452,13 @@ class _SearchWorker(QRunnable):
 
     def _from_filesystem(self, parent: str) -> tuple[str, ...]:
         include_metadata = (
-            self.request.candidate_mode == SIBLING_FOLDERS
-            and normalize_browser_sort_key(self.request.sort_key)
-            in {BrowserSortKey.MODIFIED_TIME, BrowserSortKey.CREATED_TIME, BrowserSortKey.ACCESSED_TIME}
+            self.request.candidate_mode in {SIBLING_FOLDERS, SIDE_BOOKS}
+            and (
+                normalize_browser_sort_key(self.request.sort_key)
+                in {BrowserSortKey.MODIFIED_TIME, BrowserSortKey.CREATED_TIME, BrowserSortKey.ACCESSED_TIME}
+                or (self.request.candidate_mode == SIDE_BOOKS
+                    and normalize_browser_sort_key(self.request.sort_key) is BrowserSortKey.FILE_SIZE)
+            )
         )
         return self._collect_candidates(
             self.filesystem.scandir(
@@ -442,7 +493,7 @@ class _SearchWorker(QRunnable):
         self,
         entries: tuple[_FileSystemEntry, ...],
     ) -> tuple[str, ...]:
-        if self.request.candidate_mode == SIBLING_FOLDERS:
+        if self.request.candidate_mode in {SIBLING_FOLDERS, SIDE_BOOKS}:
             policy = BrowserSortPolicy(
                 sort_key=normalize_browser_sort_key(self.request.sort_key),
                 sort_order=normalize_browser_sort_order(
@@ -454,7 +505,13 @@ class _SearchWorker(QRunnable):
             return tuple(
                 entry.path
                 for entry in policy.sorted_items(
-                    entry for entry in entries if entry.is_directory
+                    entry for entry in entries if entry.is_directory or (
+                        self.request.candidate_mode == SIDE_BOOKS and entry.is_file
+                        and entry.extension in BOOK_FILE_EXTENSIONS
+                        and entry.extension not in SUPPORTED_EXTENSIONS
+                        and (entry.extension not in EXTERNAL_ARCHIVE_EXTENSIONS
+                             or is_supported_archive_candidate(entry.name))
+                    )
                 )
             )
 
@@ -485,6 +542,36 @@ class _SearchWorker(QRunnable):
         )
         return tuple(ordered)
 
+    def _select_side_book(self, candidates, current_index, parent_key, fingerprint) -> None:
+        step = -1 if self.request.direction < 0 else 1
+        for offset in range(1, len(candidates)):
+            if self.cancelled.is_set():
+                self._emit(AdjacentBookSearchStatus.CANCELLED, parent_key, fingerprint, candidates)
+                return
+            index = current_index + offset * step
+            if not 0 <= index < len(candidates):
+                if not self.request.loop:
+                    break
+                index %= len(candidates)
+            candidate = candidates[index]
+            if path_key(candidate) in self.request.excluded_paths:
+                continue
+            if os.path.isdir(candidate):
+                try:
+                    if not self.filesystem.directory_contains_supported_image(
+                        candidate, use_zippla_cover=self.request.use_zippla_cover, local_only=True,
+                        cancelled=self.cancelled,
+                        recursive=self.request.recursive_folder,
+                    ):
+                        continue
+                except OSError:
+                    continue
+            elif os.path.splitext(candidate)[1].lower() not in BOOK_FILE_EXTENSIONS - SUPPORTED_EXTENSIONS:
+                continue
+            self._emit(AdjacentBookSearchStatus.FOUND, parent_key, fingerprint, candidates, candidate)
+            return
+        self._emit(AdjacentBookSearchStatus.BOUNDARY, parent_key, fingerprint, candidates)
+
     def _emit(
         self,
         status: AdjacentBookSearchStatus,
@@ -513,7 +600,7 @@ class _SearchWorker(QRunnable):
                     self.request.random_seed,
                 ),
                 fingerprint,
-                candidates,
+                None if self.request.candidate_mode == SIDE_BOOKS and self.request.browser_snapshot is not None else candidates,
             )
         )
 
@@ -555,7 +642,7 @@ class AdjacentBookSearchService(QObject):
                 return False
             cancelled = Event()
             self._cancel_events[request.request_id] = cancelled
-            cached = self._cache.get(cache_key)
+            cached = self._cache.get(cache_key) if request.browser_snapshot is None else None
         worker = _SearchWorker(request, self.filesystem, cached, cancelled)
         worker.signals.finished.connect(self._on_finished)
         self._pool.start(worker)
@@ -597,7 +684,7 @@ class AdjacentBookSearchService(QObject):
             if self._closed:
                 return
             if (
-                outcome.candidates is not None
+                    outcome.candidates is not None
                 and outcome.result.status
                 not in {
                     AdjacentBookSearchStatus.CANCELLED,

@@ -356,6 +356,7 @@ class ViewerWindow(QMainWindow):
         ) = None
         self._shutdown_prepared = False
         self._clipboard_change_serial = 0
+        self._auxiliary_image_pool: QThreadPool | None = None
         QApplication.clipboard().dataChanged.connect(self._clipboard_changed)
         self._shutdown_cleanup_phase = 0
         self._shutdown_cleanup_complete = False
@@ -2913,7 +2914,7 @@ class ViewerWindow(QMainWindow):
             self._external_open_worker = worker
             worker.signals.finished.connect(self._external_image_prepared)
             self._set_status_override(tr('読み込み中…'))
-            QThreadPool.globalInstance().start(worker)
+            self._start_auxiliary_image_worker(worker)
         else:
             target = page.image_id if isinstance(source, FolderImageSource) else str(source.source_path)
             self._external_open_path = lexical_absolute(target)
@@ -2997,7 +2998,26 @@ class ViewerWindow(QMainWindow):
         )
         self._clipboard_image_worker = worker
         worker.signals.finished.connect(self._clipboard_image_decoded)
-        QThreadPool.globalInstance().start(worker)
+        self._start_auxiliary_image_worker(worker)
+
+    def _start_auxiliary_image_worker(self, worker) -> None:
+        if self._shutdown_prepared:
+            worker.cancelled.set()
+            return
+        if self._auxiliary_image_pool is None:
+            self._auxiliary_image_pool = QThreadPool(self)
+            self._auxiliary_image_pool.setMaxThreadCount(2)
+            self._auxiliary_image_pool.setExpiryTimeout(1000)
+        self._auxiliary_image_pool.start(worker)
+
+    def _cancel_auxiliary_image_workers(self) -> None:
+        # Superseded requests are cancelled when replaced. These are the two
+        # latest owners; the dedicated pool retains every native runnable.
+        for name in ('_external_open_worker', '_clipboard_image_worker'):
+            worker = getattr(self, name, None)
+            if worker is not None:
+                worker.cancelled.set()
+        self._clipboard_image_identity = None
 
     def _clipboard_changed(self) -> None:
         self._clipboard_change_serial += 1
@@ -6659,7 +6679,7 @@ class ViewerWindow(QMainWindow):
         )
         if (
             bool(self.settings.get("mouse_side_buttons_folder_navigation", False))
-            and isinstance(self.book_session.source, FolderImageSource)
+            and self.book_session.source is not None
             and command in {commands.PREVIOUS_BOOK, commands.NEXT_BOOK}
         ):
             self.side_folder_requested.emit(self, -1 if command == commands.PREVIOUS_BOOK else 1)
@@ -7916,13 +7936,7 @@ class ViewerWindow(QMainWindow):
     def prepare_shutdown(self, *, wait_msecs: int = 250) -> bool:
         from .raster_execution_budget import RASTER_EXECUTION_BUDGET
         RASTER_EXECUTION_BUDGET.release_owner(self)
-        export = getattr(self, '_external_open_worker', None)
-        if export is not None:
-            export.cancelled.set()
-        clipboard_decode = getattr(self, '_clipboard_image_worker', None)
-        if clipboard_decode is not None:
-            clipboard_decode.cancelled.set()
-            self._clipboard_image_identity = None
+        self._cancel_auxiliary_image_workers()
         if self._shutdown_cleanup_complete:
             return True
         # This flag fences all new input/work on the first attempt and stays
@@ -7996,6 +8010,8 @@ class ViewerWindow(QMainWindow):
             self._shutdown_cleanup_phase = 4
 
         if self._shutdown_cleanup_phase == 4:
+            if self._auxiliary_image_pool is not None and not self._auxiliary_image_pool.waitForDone(0):
+                return False
             if self._owns_archive_backend_registry:
                 self.archive_backend_registry.close()
             self._shutdown_cleanup_phase = 5
@@ -8057,6 +8073,7 @@ class ViewerWindow(QMainWindow):
                 self._closing_current_path = self.book_session.current_path
                 self._shutdown_prepared = True
                 _CLOSING_VIEWERS.add(self)
+                self._cancel_auxiliary_image_workers()
                 # Preserve active worker owners until the accepted close.
                 self.hide()
                 self._deferred_close_timer.start(0)

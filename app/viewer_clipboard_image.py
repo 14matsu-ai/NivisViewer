@@ -5,6 +5,8 @@ from threading import Event
 from PySide6.QtCore import QObject, QRunnable, Signal
 
 from .image_source import create_image_source
+from .raster_execution_budget import source_request_scope
+from .gimp_xcf_backend import gimp_cancellation
 from .thumbnail_render import pil_to_qimage
 
 
@@ -35,14 +37,17 @@ class ClipboardImageDecode(QRunnable):
                     **self.source_options,
                 )
                 if not self.cancelled.is_set():
-                    image = source.open_image(self.image_id)
+                    with source_request_scope(self.cancelled), gimp_cancellation(self.cancelled):
+                        image = source.open_image(self.image_id)
                     if not self.cancelled.is_set():
                         result = pil_to_qimage(image)
         except Exception as exc:
             error = str(exc)
         finally:
-            if image is not None:
-                image.close()
-            if source is not None:
-                source.close()
+            for resource in (image, source):
+                if resource is not None:
+                    try:
+                        resource.close()
+                    except Exception as exc:
+                        error = error or str(exc)
             self.signals.finished.emit(self.identity, result, error)

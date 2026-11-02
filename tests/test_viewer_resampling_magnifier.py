@@ -667,35 +667,44 @@ def test_actual_size_avoids_unnecessary_resize(qapp: QApplication) -> None:
     widget.close()
 
 
+@pytest.mark.parametrize("completed_before_paint", [False, True])
 def test_high_dpi_physical_target_is_part_of_render_key(
     qapp: QApplication,
     monkeypatch: pytest.MonkeyPatch,
+    completed_before_paint: bool,
 ) -> None:
     widget = ViewerWidget()
-    widget.resize(480, 320)
-    monkeypatch.setattr(widget, "devicePixelRatioF", lambda: 2.0)
-    widget.set_resampling_modes(normal="pixel")
-    _set_single_page(widget)
-    widget.show()
-    qapp.processEvents()
-    QTest.qWait(widget._resize_render_timer.interval() + 20)
-    qapp.processEvents()
-    widget.render(QPixmap(widget.size()))
+    completed = []
+    from tests.test_application_controller import wait_until
+    try:
+        widget.renderWorkFinished.connect(lambda key, success: completed.append((key, success)))
+        widget.resize(480, 320)
+        monkeypatch.setattr(widget, "devicePixelRatioF", lambda: 2.0)
+        widget.set_resampling_modes(normal="pixel")
+        _set_single_page(widget)
+        widget.show()
+        assert wait_until(qapp, lambda: not widget._resize_render_timer.isActive())
+        if completed_before_paint:
+            assert widget.wait_for_rendering()
+            qapp.processEvents()
+            assert not widget._render_pending
+        widget.render(QPixmap(widget.size()))
 
-    assert widget._render_pending
-    key = next(iter(widget._render_pending))
-    assert widget._pending_display is not None
-    layout = widget._layout_for_images(
-        widget._pending_display.spread,
-        widget._pending_display.images,
-    )
-    assert key.target_width == layout.rects[0].width() * 2
-    assert key.target_height == layout.rects[0].height() * 2
-    assert key.device_pixel_ratio_milli == 2000
-    assert widget.wait_for_rendering()
-    qapp.processEvents()
-    assert widget._render_cache[key].devicePixelRatioF() == 2.0
-    widget.close()
+        # Completion can be delivered before or after the explicit paint. A fast
+        # worker must not fail this test merely because its pending entry is gone.
+        assert widget.wait_for_rendering()
+        qapp.processEvents()
+        assert completed
+        key, success = completed[-1]
+        assert success
+        assert widget._pending_display is None
+        layout = widget._layout_for_images(widget._spread, widget._images)
+        assert key.target_width == layout.rects[0].width() * 2
+        assert key.target_height == layout.rects[0].height() * 2
+        assert key.device_pixel_ratio_milli == 2000
+        assert widget._render_cache[key].devicePixelRatioF() == 2.0
+    finally:
+        widget.close()
 
 
 def test_spread_independent_layout_is_shared_by_all_modes_and_high_dpi_cache(

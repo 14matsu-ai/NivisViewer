@@ -36,6 +36,37 @@ def fixture_listing(root, count):
     assert not errors, errors
 
 
+def test_fast_scroll_pauses_whole_listing_sweep_but_keeps_nearby_work(tmp_path, qapp, monkeypatch):
+    root = tmp_path / 'images'
+    fixture_listing(root, 90)
+    window = make_browser(tmp_path, root, qapp, 0, False)
+    try:
+        wait_visible(window, qapp)
+        settle_presentation(window, qapp)
+        controller = window._thumbnail_presentation
+        controller._timer.stop()
+        controller._queue.clear()
+        controller._queued.clear()
+        controller._decoration_rows.clear()
+        controller._scan_row = 0
+        window._fast_scrolling = True
+        processed = []
+        monkeypatch.setattr(controller, '_publish', lambda row: processed.append(row))
+        controller._queue.append((20, 0))
+        controller._queued.add((20, 0))
+        controller._pump()
+        assert processed == [20]
+        assert controller._scan_row == 0
+        assert not controller._timer.isActive()
+        window._fast_scrolling = False
+        controller._pump()
+        assert controller._scan_row > 0
+        assert controller._timer.isActive()
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
 @pytest.mark.parametrize('screens', [2, -1])
 @pytest.mark.parametrize('disk', [False, True])
 @pytest.mark.parametrize('display', ['fit', 'center_crop'])

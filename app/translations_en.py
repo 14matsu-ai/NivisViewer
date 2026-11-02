@@ -173,6 +173,7 @@ ENGLISH: dict[str, str] = {
     "移動できるフォルダーがありません": "No adjacent folder is available",
     "画像がないためBrowserでフォルダーを表示しました": "No images; the folder is shown in Browser",
     "画像表示中はサイドボタンでフォルダー間を移動": "Side buttons navigate folders for images",
+    "サイドボタンでフォルダー・書庫間を移動（画像のないフォルダーは飛ばす）": "Side buttons: folders and archives\n(skip folders without images)",
     "最後のページで先頭に戻って繰り返す": "Repeat from the first page at the end",
     "{seconds}秒": "{seconds} seconds",
     "S: スライドショー開始/停止（キーを離したとき）": "S: Start / stop slideshow on key release",

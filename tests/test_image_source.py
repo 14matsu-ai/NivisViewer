@@ -28,6 +28,27 @@ def write_image(path: Path, *, size: tuple[int, int] = (8, 12)) -> None:
         image.save(path)
 
 
+@pytest.mark.parametrize('snapshot', [False, True])
+def test_folder_identity_index_reuses_listing_and_normalizes_paths(tmp_path, monkeypatch, snapshot):
+    first, second = tmp_path / '日本語1.png', tmp_path / '日本語2.png'
+    write_image(first)
+    write_image(second)
+    source = FolderImageSource(tmp_path, image_snapshot=(str(first), str(second), str(first)) if snapshot else None)
+    source.list_images()
+    normalize = source._path_identity
+    calls = []
+    monkeypatch.setattr(source, '_path_identity', lambda path: calls.append(path) or normalize(path))
+    monkeypatch.setattr(source, 'list_images', lambda: pytest.fail('navigation must reuse the indexed listing'))
+    try:
+        for _ in range(20):
+            assert source.index_for_path(second) == 1
+            assert source.index_for_identity(str(first).upper()) == 0
+            assert source.index_for_path(tmp_path / 'missing.png') == -1
+        assert len(calls) == 60
+    finally:
+        source.close()
+
+
 def write_psd(
     path: Path,
     *,

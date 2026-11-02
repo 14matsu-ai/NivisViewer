@@ -125,7 +125,7 @@ class FolderTreeSyncController(QObject):
         if not index.isValid():
             self._retry_count += 1
             if self._retry_count <= self.maximum_retries:
-                QTimer.singleShot(50, lambda: self._attempt(generation))
+                QTimer.singleShot(50, self, lambda: self._attempt(generation))
             else:
                 target = str(self._target)
                 self._target = None

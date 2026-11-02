@@ -90,6 +90,7 @@ class BrowserScanRequest:
     trace_id: int = 0
     sort_policy: BrowserSortPolicy = BrowserSortPolicy()
     include_progress_entries: bool = True
+    priority_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +120,8 @@ class BrowserScanBatch:
     entries: tuple[BrowserScanEntry, ...]
     final_items_pending: bool = False
     batch_count: int | None = None
+    priority_item: bool = False
+    priority_ready: Event | None = field(default=None, compare=False, repr=False)
 
     @property
     def item_count(self) -> int:
@@ -317,6 +320,33 @@ def scan_directory(
                 request.path,
             )
         require_local(target)
+        if (request.priority_path is not None
+                and os.path.normcase(os.path.dirname(request.priority_path))
+                == os.path.normcase(os.fspath(target))):
+            # Find only the selected name first. Metadata for the whole folder
+            # can be slow; this one real, visibility-checked entry lets the UI
+            # follow the committed Viewer image while the full sort continues.
+            wanted = os.path.normcase(request.priority_path)
+            with os.scandir(target) as entries:
+                for entry in entries:
+                    if cancelled.is_set():
+                        break
+                    if os.path.normcase(entry.path) == wanted:
+                        selected = scan_entry_from_dir_entry(entry, request.visibility_policy)
+                        if selected is not None:
+                            ready = Event()
+                            emit_batch(BrowserScanBatch(
+                                request.path, request.generation, (selected,),
+                                final_items_pending=True, priority_item=True,
+                                priority_ready=ready,
+                            ))
+                            # Let the GUI publish this row before the Python
+                            # metadata/sort work competes for its execution.
+                            # Only this worker waits, with bounded cancellation.
+                            for _ in range(20):
+                                if cancelled.is_set() or ready.wait(.005):
+                                    break
+                        break
         with os.scandir(target) as entries:
             if request.trace_id:
                 performance_trace.mark(

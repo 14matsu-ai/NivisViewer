@@ -605,7 +605,7 @@ class ConfigManager(QObject):
         from .browser_tags import normalize_tag_registry
         normalized['browser_tag_registry'] = normalize_tag_registry(normalized.get('browser_tag_registry'))
         normalized["ui_language"] = normalize_ui_language(normalized.get("ui_language"))
-        if normalized.get("archive_backend_preference") not in {
+        if not isinstance(normalized.get("archive_backend_preference"), str) or normalized.get("archive_backend_preference") not in {
             "auto",
             "winrar",
             "seven_zip",
@@ -711,7 +711,7 @@ class ConfigManager(QObject):
         )
         if not isinstance(normalized.get("browser_window_geometry"), str):
             normalized["browser_window_geometry"] = cls.DEFAULTS["browser_window_geometry"]
-        if normalized.get("video_thumbnail_backend") not in {
+        if not isinstance(normalized.get("video_thumbnail_backend"), str) or normalized.get("video_thumbnail_backend") not in {
             "auto",
             "windows_shell",
             "ffmpeg",
@@ -720,7 +720,7 @@ class ConfigManager(QObject):
             normalized["video_thumbnail_backend"] = cls.DEFAULTS[
                 "video_thumbnail_backend"
             ]
-        if normalized.get("video_thumbnail_frame_mode") not in {
+        if not isinstance(normalized.get("video_thumbnail_frame_mode"), str) or normalized.get("video_thumbnail_frame_mode") not in {
             "smart",
             "one_third",
             "windows_shell",
@@ -730,14 +730,14 @@ class ConfigManager(QObject):
             ]
         if not isinstance(normalized.get("ffmpeg_executable"), str):
             normalized["ffmpeg_executable"] = ""
-        if normalized.get("browser_external_drop_behavior") not in {
+        if not isinstance(normalized.get("browser_external_drop_behavior"), str) or normalized.get("browser_external_drop_behavior") not in {
             "focus_only",
             "focus_and_open",
         }:
             normalized["browser_external_drop_behavior"] = cls.DEFAULTS[
                 "browser_external_drop_behavior"
             ]
-        if normalized.get("favorite_drop_default_operation") not in {
+        if not isinstance(normalized.get("favorite_drop_default_operation"), str) or normalized.get("favorite_drop_default_operation") not in {
             "copy",
             "move",
         }:
@@ -776,7 +776,7 @@ class ConfigManager(QObject):
             default=BROWSER_WHEEL_SCROLL_DEFAULT_VIEWPORT_PERCENT,
             maximum=BROWSER_WHEEL_SCROLL_MAX_VIEWPORT_PERCENT,
         )
-        if normalized.get("browser_filename_display") not in {
+        if not isinstance(normalized.get("browser_filename_display"), str) or normalized.get("browser_filename_display") not in {
             "hidden",
             "one_line",
             "two_lines",
@@ -784,7 +784,7 @@ class ConfigManager(QObject):
             normalized["browser_filename_display"] = cls.DEFAULTS[
                 "browser_filename_display"
             ]
-        if normalized.get("viewer_delete_mode") not in {
+        if not isinstance(normalized.get("viewer_delete_mode"), str) or normalized.get("viewer_delete_mode") not in {
             "disabled", "single", "spread_front", "spread_back", "spread_cursor",
         }:
             normalized["viewer_delete_mode"] = "disabled"
@@ -814,7 +814,7 @@ class ConfigManager(QObject):
         )
         if 0 < normalized["browser_filename_font_size"] < 6:
             normalized["browser_filename_font_size"] = 0
-        if normalized.get("thumbnail_frame_ratio") not in {
+        if not isinstance(normalized.get("thumbnail_frame_ratio"), str) or normalized.get("thumbnail_frame_ratio") not in {
             "square_1_1",
             "landscape_3_2",
             "portrait_2_3",
@@ -828,7 +828,7 @@ class ConfigManager(QObject):
             normalized["thumbnail_frame_ratio"] = cls.DEFAULTS[
                 "thumbnail_frame_ratio"
             ]
-        if normalized.get("thumbnail_crop_mode") not in {
+        if not isinstance(normalized.get("thumbnail_crop_mode"), str) or normalized.get("thumbnail_crop_mode") not in {
             "letterbox",
             "center_crop",
             "smart_crop",
@@ -836,14 +836,14 @@ class ConfigManager(QObject):
             normalized["thumbnail_crop_mode"] = cls.DEFAULTS[
                 "thumbnail_crop_mode"
             ]
-        if normalized.get("browser_thumbnail_display_mode") not in {
+        if not isinstance(normalized.get("browser_thumbnail_display_mode"), str) or normalized.get("browser_thumbnail_display_mode") not in {
             "fit",
             "center_crop",
         }:
             normalized["browser_thumbnail_display_mode"] = cls.DEFAULTS[
                 "browser_thumbnail_display_mode"
             ]
-        if normalized.get("thumbnail_quality_mode") not in {
+        if not isinstance(normalized.get("thumbnail_quality_mode"), str) or normalized.get("thumbnail_quality_mode") not in {
             "economy",
             "auto",
             "high",
@@ -864,7 +864,7 @@ class ConfigManager(QObject):
         normalized["browser_sort_key"] = normalize_browser_sort_key(normalized.get("browser_sort_key")).value
         normalized[SORT_RULES_KEY] = normalize_folder_sort_rules(normalized.get(SORT_RULES_KEY))
         normalized["browser_random_seed"] = normalize_browser_random_seed(normalized.get("browser_random_seed"))
-        if normalized.get("browser_sort_order") not in {"ascending", "descending"}:
+        if not isinstance(normalized.get("browser_sort_order"), str) or normalized.get("browser_sort_order") not in {"ascending", "descending"}:
             normalized["browser_sort_order"] = cls.DEFAULTS["browser_sort_order"]
         if not isinstance(normalized.get("browser_folders_first"), bool):
             normalized["browser_folders_first"] = cls.DEFAULTS["browser_folders_first"]
@@ -903,7 +903,7 @@ class ConfigManager(QObject):
                 if len(search_history) >= search_history_limit:
                     break
         normalized["browser_search_history"] = search_history
-        if normalized.get("browser_display_density") not in {
+        if not isinstance(normalized.get("browser_display_density"), str) or normalized.get("browser_display_density") not in {
             "extra_compact",
             "compact",
             "medium",
@@ -924,7 +924,7 @@ class ConfigManager(QObject):
             minimum=0,
             maximum=12,
         )
-        if normalized.get("browser_sidebar_layout") not in {
+        if not isinstance(normalized.get("browser_sidebar_layout"), str) or normalized.get("browser_sidebar_layout") not in {
             "favorites_top_tree_bottom",
             "tree_top_favorites_bottom",
             "tabs",
@@ -949,7 +949,7 @@ class ConfigManager(QObject):
             )
             for index, value in enumerate(raw_splitter_sizes)
         ]
-        if normalized.get("folder_tree_sync_mode") not in {
+        if not isinstance(normalized.get("folder_tree_sync_mode"), str) or normalized.get("folder_tree_sync_mode") not in {
             "off",
             "select_current",
             "focus_current",
@@ -1005,7 +1005,7 @@ class ConfigManager(QObject):
             minimum=12,
             maximum=64,
         )
-        if normalized.get("viewer_canvas_left_click_action") not in {
+        if not isinstance(normalized.get("viewer_canvas_left_click_action"), str) or normalized.get("viewer_canvas_left_click_action") not in {
             "next_single_page",
             "next_display_unit",
             "none",
@@ -1013,7 +1013,7 @@ class ConfigManager(QObject):
             normalized["viewer_canvas_left_click_action"] = cls.DEFAULTS[
                 "viewer_canvas_left_click_action"
             ]
-        if normalized.get("viewer_canvas_click_direction") not in {
+        if not isinstance(normalized.get("viewer_canvas_click_direction"), str) or normalized.get("viewer_canvas_click_direction") not in {
             "right_next",
             "left_next",
             "auto",
@@ -1028,16 +1028,16 @@ class ConfigManager(QObject):
             maximum=3000,
         )
         behavior = normalized.get("open_viewer_behavior")
-        if behavior not in {"reuse_active", "always_new", "reuse_or_create"}:
+        if not isinstance(behavior, str) or behavior not in {"reuse_active", "always_new", "reuse_or_create"}:
             normalized["open_viewer_behavior"] = "reuse_or_create"
-        if normalized.get("viewer_prefetch_preset") not in {
+        if not isinstance(normalized.get("viewer_prefetch_preset"), str) or normalized.get("viewer_prefetch_preset") not in {
             *cls.VIEWER_PREFETCH_PRESETS,
             "custom",
         }:
             normalized["viewer_prefetch_preset"] = cls.DEFAULTS[
                 "viewer_prefetch_preset"
             ]
-        if normalized.get("book_open_position") not in {
+        if not isinstance(normalized.get("book_open_position"), str) or normalized.get("book_open_position") not in {
             "first_page",
             "resume_last",
         }:
@@ -1048,13 +1048,13 @@ class ConfigManager(QObject):
             "viewer_downscale_algorithm",
             "magnifier_downscale_algorithm",
         ):
-            if normalized.get(key) not in cls.VIEWER_DOWNSCALE_ALGORITHMS:
+            if not isinstance(normalized.get(key), str) or normalized.get(key) not in cls.VIEWER_DOWNSCALE_ALGORITHMS:
                 normalized[key] = cls.DEFAULTS[key]
         for key in (
             "viewer_upscale_algorithm",
             "magnifier_upscale_algorithm",
         ):
-            if normalized.get(key) not in cls.VIEWER_UPSCALE_ALGORITHMS:
+            if not isinstance(normalized.get(key), str) or normalized.get(key) not in cls.VIEWER_UPSCALE_ALGORITHMS:
                 normalized[key] = cls.DEFAULTS[key]
         try:
             magnifier_zoom = float(normalized.get("magnifier_zoom", 2.0))
@@ -1174,7 +1174,7 @@ class ConfigManager(QObject):
         raster_limit = normalized.get("viewer_raster_execution_limit")
         if normalized.get("viewer_prefetch_execution_mode") == "full":
             normalized["viewer_prefetch_execution_mode"] = "burst"
-        if normalized.get("viewer_prefetch_execution_mode") not in ("reserve", "burst", "auto"):
+        if not isinstance(normalized.get("viewer_prefetch_execution_mode"), str) or normalized.get("viewer_prefetch_execution_mode") not in ("reserve", "burst", "auto"):
             normalized["viewer_prefetch_execution_mode"] = "reserve"
         normalized["viewer_adaptive_maximum"] = cls._clamped_int(
             None if isinstance(normalized.get("viewer_adaptive_maximum"), bool)
