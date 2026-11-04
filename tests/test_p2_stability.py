@@ -897,7 +897,7 @@ def test_controller_shutdown_retries_image_step_and_defers_application_quit(
         controller.create_viewer_window()
 
     image_worker_released = True
-    assert controller.shutdown()
+    assert wait_until(qapp, lambda: controller._quit_committed)
 
     assert controller._shutdown_complete
     assert controller._quit_committed
@@ -982,6 +982,7 @@ def test_controller_retries_settings_step_before_shutting_down_backends(
     )
     order: list[str] = []
     settings_ready = False
+    quit_calls: list[bool] = []
 
     def tracked(name: str, callback):
         def run():
@@ -1050,13 +1051,16 @@ def test_controller_retries_settings_step_before_shutting_down_backends(
         tracked("metadata_close", controller.metadata_store.close),
     )
 
-    assert not controller.shutdown()
+    controller.application = SimpleNamespace(quit=lambda: quit_calls.append(True))
+    controller._request_application_exit()
     assert controller.shutdown_coordinator.failed_step_name == "settings_probes"
     assert not controller._shutdown_complete
     assert order == ["viewers", "browser", "settings"]
+    assert quit_calls == []
 
     settings_ready = True
-    assert controller.shutdown()
+    assert wait_until(qapp, lambda: controller._quit_committed)
+    assert quit_calls == [True]
     assert controller._shutdown_complete
     assert order == [
         "viewers",

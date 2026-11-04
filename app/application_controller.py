@@ -175,9 +175,9 @@ class ApplicationController(QObject):
         self._shutdown = False
         self._shutdown_complete = False
         self.shutdown_coordinator = ApplicationShutdownCoordinator(self)
-        self._thumbnail_shutdown_timer = QTimer(self)
-        self._thumbnail_shutdown_timer.setSingleShot(True)
-        self._thumbnail_shutdown_timer.timeout.connect(self.shutdown)
+        self._shutdown_retry_timer = QTimer(self)
+        self._shutdown_retry_timer.setSingleShot(True)
+        self._shutdown_retry_timer.timeout.connect(self.shutdown)
         self._navigation = NavigationState()
         self._adjacent_request_by_window = self._navigation.requests_by_window
         self._adjacent_context = self._navigation.searches
@@ -862,7 +862,18 @@ class ApplicationController(QObject):
 
     def _continue_application_shutdown(self) -> bool:
         if not self.shutdown_coordinator.begin_shutdown():
+            # A closed window cannot ask to exit again. Resume the unfinished
+            # step on a later event turn, even if its worker has no completion
+            # signal connected to this controller.
+            if (
+                self.shutdown_coordinator.state is ApplicationShutdownState.TIMED_OUT
+                and (self._quit_requested
+                     or self.shutdown_coordinator.failed_step_name == "thumbnail_workers")
+                and not self._shutdown_retry_timer.isActive()
+            ):
+                self._shutdown_retry_timer.start(50)
             return False
+        self._shutdown_retry_timer.stop()
         self._shutdown_complete = True
         self._commit_application_exit()
         return True
@@ -888,14 +899,7 @@ class ApplicationController(QObject):
         return True
 
     def _shutdown_thumbnail_providers(self) -> bool:
-        complete = drain_retired_thumbnail_providers(self.image_work_coordinator)
-        if complete:
-            self._thumbnail_shutdown_timer.stop()
-        else:
-            # The windows can stay closed while native saves finish. Keep the
-            # event loop alive, without a blocking wait or polling during use.
-            self._thumbnail_shutdown_timer.start(50)
-        return complete
+        return drain_retired_thumbnail_providers(self.image_work_coordinator)
 
     def _shutdown_settings_probes(self) -> bool:
         dialogs_by_id = {
