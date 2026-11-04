@@ -1156,14 +1156,17 @@ def test_ready_thumbnails_are_not_requested_again(
     image.fill(QColor("green"))
     for path in initial_paths:
         window._on_thumbnail_ready(path, window._generation, image)
-    assert len(changes) == expected_requests
+    assert changes == []
 
     provider.requests.clear()
     for _ in range(5):
         window._request_visible_thumbnails()
 
     assert provider.requests == []
-    assert len(changes) == expected_requests
+    # Availability is immediate, even before the coalesced view receipt.
+    assert changes == []
+    qapp.processEvents()
+    assert len(changes) == 1
     window.close()
     qapp.processEvents()
 

@@ -417,6 +417,16 @@ class ThumbnailDiskCache:
             return self._write_epoch
 
     @property
+    def write_epoch_snapshot(self) -> int:
+        """Read only the scalar fence without waiting for a disk writer.
+
+        GUI enqueueing needs a snapshot, not an I/O transaction. Writers still
+        validate expected_write_epoch under the cache lock before committing;
+        a concurrent invalidation therefore rejects an obsolete snapshot.
+        """
+        return self._write_epoch
+
+    @property
     def admission_revision(self) -> tuple[int, int] | None:
         """Best-effort RAM fence; GUI callers must never wait for an I/O writer."""
         if not self._lock.acquire(blocking=False):

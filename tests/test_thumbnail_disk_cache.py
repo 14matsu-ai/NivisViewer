@@ -36,6 +36,34 @@ def thumbnail(color: str = "red", size: int = 80) -> QImage:
     return image
 
 
+def test_enqueue_epoch_snapshot_does_not_wait_for_disk_lock(tmp_path):
+    from threading import Event, Thread
+
+    cache = ThumbnailDiskCache(tmp_path / "cache")
+    read = Event()
+    values = []
+
+    def snapshot():
+        values.append(cache.write_epoch_snapshot)
+        read.set()
+
+    worker = Thread(target=snapshot)
+    try:
+        with cache._lock:
+            expected = cache.write_epoch
+            worker.start()
+            assert read.wait(1), "enqueueing must not wait for the disk cache lock"
+        assert values == [expected]
+        source = tmp_path / "画像.jpg"
+        write_image(source)
+        cache.invalidate_pending_writes()
+        assert cache.write_epoch_snapshot != expected
+        assert not cache.put(make_item(source), 80, thumbnail(), expected_write_epoch=expected)
+    finally:
+        worker.join(2)
+        cache.close()
+
+
 def test_save_reload_no_duplicate_and_unicode_path(tmp_path: Path) -> None:
     source = tmp_path / "日本語画像.jpg"
     write_image(source)

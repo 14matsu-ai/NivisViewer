@@ -18,9 +18,12 @@ def browser_read_workers():
 
 
 def browser_generation_workers():
-    # ZipPla 1.7.2.9's ordinary CPU/2 work allowance, translated to a shared
-    # process admission ceiling; the independent Viewer lane stays reserved.
-    return max(1, (os.cpu_count() or 2) // 2)
+    # Original-image generation mixes native codecs with Python/Qt callbacks.
+    # CPU/2 simultaneous generators contend with GUI publication and Viewer
+    # work even though they use a separate pool. Serialize this background
+    # lane process-wide; saved-thumbnail reads and Viewer decoding keep their
+    # independent parallel lanes. Memory admission still bounds scratch use.
+    return 1
 
 
 class GenerationAdmissionDeferred(Exception):

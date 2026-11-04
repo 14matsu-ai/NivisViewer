@@ -977,11 +977,15 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
 
         applied.clear()
         reads_before_rapid = list(source.read_calls)
+        # Hold the final decode explicitly. A fixed timer wait can otherwise
+        # observe a legitimately completed frame instead of the pending one.
+        final_started, final_release = source.block("page-5.jpg")
         window.next_page()
         for _index in range(3):
             window.next_page()
         assert source.read_calls == reads_before_rapid
         QTest.qWait(window._decode_demand_timer.interval() + 50)
+        assert final_started.wait(2)
         qapp.processEvents()
 
         assert window.model.focused_index == 5
@@ -991,21 +995,13 @@ def test_zip_miss_keeps_previous_frame_and_rapid_navigation_applies_latest(
         assert "6 / 7" in window.status.currentMessage()
         assert window.presentation_state.status_values.page_index == 1
         assert window.presentation_state.progress_page == 1
-        assert applied in ([], [("page-5.jpg",)])
+        assert applied == []
         intermediate_ids = tuple(
             image.image_id for image in window.viewer._images
         )
-        # set_pages records acceptance of the new source image before its
-        # asynchronous render necessarily commits. Either the old complete
-        # frame or the final target is valid at this intermediate boundary;
-        # crossed pages are never valid.
-        assert intermediate_ids in {
-            ("page-1.jpg",),
-            ("page-5.jpg",),
-        }
-        if not applied:
-            assert intermediate_ids == ("page-1.jpg",)
+        assert intermediate_ids == ("page-1.jpg",)
 
+        final_release.set()
         assert session.image_cache.wait_for_done(3000)
         qapp.processEvents()
         QTest.qWait(window._display_demand_timer.interval() + 5)

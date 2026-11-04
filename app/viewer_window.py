@@ -59,6 +59,7 @@ from .adjacent_book_search import (
 from .app_icon import install_window_icon
 from .book_session import AsyncBookOpenFailed, BookOpened, BookSession
 from .gui_garbage_collector import ensure_gui_garbage_collector
+from .viewer_shutdown import ViewerShutdown, CLOSING_VIEWERS as _CLOSING_VIEWERS
 from .config_manager import (
     SLIDESHOW_INTERVAL_MAX_MS,
     SLIDESHOW_INTERVAL_MIN_MS,
@@ -161,8 +162,6 @@ from .viewer_render import (
 )
 _LOG = logging.getLogger(__name__)
 _DISPLAY_LOG = logging.getLogger("nivisviewer.viewer.display_unit")
-# Standalone Viewers must also outlive their hidden, asynchronous close.
-_CLOSING_VIEWERS: set[object] = set()
 _PDF_PREFETCH_IDLE_GRACE_MS = 120
 _PREPARED_DISPLAY_IDLE_GRACE_MS = 16
 _DISPLAY_DEMAND_IDLE_GRACE_MS = 16
@@ -267,11 +266,6 @@ class ViewerWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        # Qt disposal can bypass the final close event after an owner has
-        # completed shutdown. Never retain an already-destroyed Qt wrapper.
-        self.destroyed.connect(
-            lambda *_args, owner=weakref.ref(self): _CLOSING_VIEWERS.discard(owner())
-        )
         ensure_gui_garbage_collector()
         self.setWindowTitle("NivisViewer")
         install_window_icon(self)
@@ -358,17 +352,7 @@ class ViewerWindow(QMainWindow):
         self._clipboard_change_serial = 0
         self._auxiliary_image_pool: QThreadPool | None = None
         QApplication.clipboard().dataChanged.connect(self._clipboard_changed)
-        self._shutdown_cleanup_phase = 0
-        self._shutdown_cleanup_complete = False
-        self._close_pending = False
-        self._closing_source = None
-        self._closing_current_path = None
-        self._close_cleanup_error_reported = False
-        self._close_runtime_retired = False
-        self._close_retired_runtime = None
-        self._deferred_close_timer = QTimer(self)
-        self._deferred_close_timer.setSingleShot(True)
-        self._deferred_close_timer.timeout.connect(self._finish_deferred_close)
+        self._shutdown_lifecycle = ViewerShutdown(self)
         self._reload_page_index: int | None = None
         self._pending_display_demand: (
             tuple[
@@ -7933,132 +7917,28 @@ class ViewerWindow(QMainWindow):
             self._is_fullscreen_mode() and self.hide_cursor_in_fullscreen
         )
 
+    @property
+    def _close_pending(self) -> bool:
+        return self._shutdown_lifecycle.close_requested
+
+    @property
+    def _shutdown_cleanup_complete(self) -> bool:
+        return self._shutdown_lifecycle.complete
+
+    @property
+    def _closing_source(self):
+        return self._shutdown_lifecycle.closing_source
+
+    @property
+    def _closing_current_path(self):
+        return self._shutdown_lifecycle.closing_path
+
+    @property
+    def _close_runtime_retired(self) -> bool:
+        return self._shutdown_lifecycle.retired_runtime is not None
+
     def prepare_shutdown(self, *, wait_msecs: int = 250) -> bool:
-        from .raster_execution_budget import RASTER_EXECUTION_BUDGET
-        RASTER_EXECUTION_BUDGET.release_owner(self)
-        self._cancel_auxiliary_image_workers()
-        if self._shutdown_cleanup_complete:
-            return True
-        # This flag fences all new input/work on the first attempt and stays
-        # set while timed-out cleanup phases are retried.
-        self._shutdown_prepared = True
-        phase = self._shutdown_cleanup_phase
-        if phase == 0:
-            if not self._close_pending:
-                self._save_current_reading_position()
-            elif self.metadata_store is not None:
-                # The close request already staged its committed position.
-                # A later commit from a new Viewer must not be rolled back.
-                self.metadata_store.flush()
-            self._pending_book_open_projection = None
-            self.presentation_state.close()
-            self._project_presentation_surface()
-            self._zip_runtime_request_timer.stop()
-            self._pending_zip_runtime_request = None
-            self._presentation_side_effect_timer.stop()
-            self._pending_presentation_side_effect_token = None
-            self._raster_magnifier_cancel_timer.stop()
-            self._viewer_memory_pressure_timer.stop()
-            self._raster_zoom_warmup_timer.stop()
-            self._raster_zoom_warmup_context = None
-            self._page_list_filter_timer.stop()
-            self._page_list_viewport_timer.stop()
-            self._set_page_list_paused(True)
-            for runtime in {
-                self._page_list_runtime,
-                self._staged_page_list_runtime,
-            }:
-                if runtime is not None:
-                    runtime.set_visible(False)
-            self.page_list_model.clear()
-            self._path_probe_generation += 1
-            self._pending_path_probe = None
-            self.fullscreen_chrome.shutdown()
-            self._cancel_interactive_open()
-            self.viewer.cancel_mouse_gesture()
-            self.viewer.cancel_pending_canvas_click()
-            self._deactivate_zip_runtime(clear_artifacts=True)
-            self._shutdown_cleanup_phase = 1
-
-        if self._shutdown_cleanup_phase == 1:
-            render_wait = max(5000, wait_msecs) if wait_msecs > 0 else 0
-            if not self._pdf_loupe_cache.shutdown(render_wait):
-                return False
-            self._shutdown_cleanup_phase = 2
-
-        if self._shutdown_cleanup_phase == 2:
-            render_wait = max(5000, wait_msecs) if wait_msecs > 0 else 0
-            if not self.viewer.shutdown_rendering(render_wait):
-                return False
-            self._shutdown_cleanup_phase = 3
-
-        if self._shutdown_cleanup_phase == 3:
-            self.slideshow_timer.stop()
-            self._pdf_render_timer.stop()
-            self._prepared_display_timer.stop()
-            self._raster_viewport_timer.stop()
-            self._raster_paint_fallback_timer.stop()
-            self._raster_prefetch_after_paint = None
-            self._clear_raster_prefetch_pipeline()
-            self._release_raster_interactive_lane()
-            self._cancel_pending_display_demand()
-            self._cancel_pending_decode_demand()
-            self._cancel_deferred_pdf_prefetch()
-            self.book_session.shutdown(wait_msecs=wait_msecs)
-            if self._close_pending and not self.book_session.shutdown_complete:
-                return False
-            self._shutdown_cleanup_phase = 4
-
-        if self._shutdown_cleanup_phase == 4:
-            if self._auxiliary_image_pool is not None and not self._auxiliary_image_pool.waitForDone(0):
-                return False
-            if self._owns_archive_backend_registry:
-                self.archive_backend_registry.close()
-            self._shutdown_cleanup_phase = 5
-
-        if self._shutdown_cleanup_phase == 5:
-            if self._owns_pdfium_service and not self.pdfium_service.shutdown():
-                raise RuntimeError(
-                    self.pdfium_service.last_shutdown_error
-                    or "PDFium shutdown did not complete."
-                )
-            self._shutdown_cleanup_phase = 6
-
-        if self._shutdown_cleanup_phase == 6:
-            if self._owns_path_availability_service:
-                self.path_availability_service.close()
-            self._shutdown_cleanup_phase = 7
-
-        self._shutdown_cleanup_complete = self._shutdown_cleanup_phase == 7
-        return self._shutdown_cleanup_complete
-
-    def _finish_deferred_close(self) -> None:
-        if not self._close_pending:
-            return
-        try:
-            runtime = self._zip_runtime
-            if self._shutdown_cleanup_phase == 0 and runtime is not None:
-                if runtime is not self._close_retired_runtime:
-                    runtime.retire()
-                    self._close_runtime_retired = True
-                    self._close_retired_runtime = runtime
-                # QPixmaps stay on the GUI thread, in bounded retirement slices.
-                # Native workers finish asynchronously; no GUI wait is needed.
-                if not runtime.drain_retired_artifacts(max_items=1):
-                    # Give current-frame callbacks time between disposal slices.
-                    self._deferred_close_timer.start(10 if runtime.has_unfinished_tasks() else 8)
-                    return
-            complete = self.prepare_shutdown(wait_msecs=0)
-        except Exception:
-            if not self._close_cleanup_error_reported:
-                _LOG.exception("Hidden Viewer shutdown preparation did not complete")
-                self._close_cleanup_error_reported = True
-            self._deferred_close_timer.start(100)
-            return
-        if complete:
-            self.close()
-        else:
-            self._deferred_close_timer.start(10)
+        return self._shutdown_lifecycle.prepare(wait_msecs=wait_msecs)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
         guard = getattr(self, "_application_close_guard", None)
@@ -8067,49 +7947,14 @@ class ViewerWindow(QMainWindow):
             return
         if not self._shutdown_cleanup_complete:
             event.ignore()
-            if not self._close_pending:
-                self._close_pending = True
-                self._closing_source = self.book_session.source
-                self._closing_current_path = self.book_session.current_path
-                self._shutdown_prepared = True
-                _CLOSING_VIEWERS.add(self)
-                self._cancel_auxiliary_image_workers()
-                # Preserve active worker owners until the accepted close.
-                self.hide()
-                self._deferred_close_timer.start(0)
-                runtime = self._zip_runtime
-                if runtime is not None:
-                    # Cancel old decoding before constructing another Viewer.
-                    # Retain its artifacts/leases until asynchronous retirement;
-                    # neither worker completion nor cache disposal is awaited.
-                    try:
-                        runtime.retire()
-                    except Exception:
-                        if not self._close_cleanup_error_reported:
-                            _LOG.exception("Hidden Viewer shutdown preparation did not complete")
-                            self._close_cleanup_error_reported = True
-                    else:
-                        self._close_runtime_retired = True
-                        self._close_retired_runtime = runtime
-                # Closing this Viewer must not keep Browser admission paused
-                # while its cache/handles drain. Release only its own holds,
-                # keeping its hidden page list stopped throughout retirement.
-                self._cancel_interactive_open(resume_page_list=False)
-                self._release_raster_interactive_lane(resume_page_list=False)
-                application = QApplication.instance()
-                if application is not None:
-                    application.removeEventFilter(self)
-                    application.removeEventFilter(self.fullscreen_chrome)
-                self.book_session.cancel_pending_open(invalidate=True)
-                self._save_current_reading_position(flush_metadata=False)
-                self.close_started.emit(self)
+            self._shutdown_lifecycle.request_close()
             return
         application = QApplication.instance()
         if application is not None:
             application.removeEventFilter(self)
-        self._deferred_close_timer.stop()
+        self._shutdown_lifecycle.stop_timer()
         self.closing.emit(self)
         if self._owns_file_operation_coordinator:
             self.file_operation_coordinator.close()
         super().closeEvent(event)
-        _CLOSING_VIEWERS.discard(self)
+        self._shutdown_lifecycle.release_retention()

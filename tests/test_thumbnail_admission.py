@@ -211,7 +211,7 @@ def test_working_budget_serializes_under_pressure_and_cancels_waiter(tmp_path, m
 
 def test_viewer_reserved_lane_runs_during_browser_generation_and_pause_fences_reads(qapp):
     coordinator = ImageWorkCoordinator(max_workers=2)
-    first, second, viewer, release = Event(), Event(), Event(), Event()
+    first, second, viewer, saved, release = Event(), Event(), Event(), Event(), Event()
     class Job(QRunnable):
         def __init__(self, entered, block):
             super().__init__(); self.entered = entered; self.block = block
@@ -221,7 +221,10 @@ def test_viewer_reserved_lane_runs_during_browser_generation_and_pause_fences_re
     try:
         assert coordinator.start_browser_generation(Job(first, True), ImageWorkPriority.BROWSER_PREFETCH)
         assert coordinator.start_browser_generation(Job(second, True), ImageWorkPriority.BROWSER_PREFETCH)
-        assert first.wait(1) and second.wait(1)
+        assert first.wait(1)
+        assert not second.is_set()  # Heavy generation is serialized.
+        assert coordinator.start_browser_read(Job(saved, False), ImageWorkPriority.BROWSER_VISIBLE)
+        assert saved.wait(1)  # Saved thumbnails keep their independent lane.
         assert coordinator.start_viewer(Job(viewer, False), ImageWorkPriority.VIEWER_CURRENT)
         assert viewer.wait(1)
         coordinator.begin_viewer_interactive()
@@ -250,6 +253,7 @@ def test_duplicate_reuse_updates_page_count_without_writing_image(tmp_path, qapp
 def test_waiting_admission_rechecks_available_memory(monkeypatch):
     import app.browser_generation_budget as module
     budget = BrowserGenerationBudget()
+    budget.max_active = 2  # Exercise memory pressure independently of CPU policy.
     monkeypatch.setattr(budget, 'estimate', lambda _: 150*1024*1024)
     free = [2*1024**3+400*1024*1024]
     monkeypatch.setattr(module, 'read_physical_memory_snapshot', lambda: SimpleNamespace(
@@ -277,6 +281,40 @@ def test_waiting_admission_rechecks_available_memory(monkeypatch):
     finally:
         release.set(); a.join(3); b.join(3)
     assert budget.bytes == budget.active == 0
+
+
+def test_generation_capacity_is_shared_across_providers_and_resumes(tmp_path, qapp):
+    from app.browser_generation_budget import BROWSER_GENERATION_BUDGET as budget
+    from tests.test_application_controller import wait_until
+
+    items = [source(tmp_path / f'page-{i}.png') for i in range(2)]
+    entered = [Event(), Event()]
+    release = Event()
+
+    def loader(item, *_):
+        index = items.index(item)
+        entered[index].set()
+        if index == 0:
+            assert release.wait(5)
+        return pixels()
+
+    providers = [BrowserThumbnailProvider(loader=loader, disk_cache_enabled=False)
+                 for _ in items]
+    try:
+        for i, provider in enumerate(providers):
+            assert provider.request(items[i], 64, generation=provider.begin_generation())
+            if i == 0:
+                assert wait_until(qapp, entered[0].is_set)
+        assert wait_until(qapp, lambda: bool(providers[1]._waiting_generation))
+        assert budget.active == 1 and not entered[1].is_set()
+        release.set()
+        assert wait_until(qapp, lambda: all(provider._cache for provider in providers))
+        assert entered[1].is_set()
+        assert budget.active == budget.bytes == 0
+    finally:
+        release.set()
+        for provider in providers:
+            provider.close(5000)
 
 
 @pytest.mark.parametrize('action', ['generation', 'source', 'close'])
@@ -466,9 +504,13 @@ def test_completed_notification_does_not_release_native_worker_before_pool_retur
 @pytest.mark.parametrize('workers', [1, 2])
 @pytest.mark.parametrize('mode', ['thumbnail', 'metadata', 'adopt_thumbnail'])
 def test_priority_promotion_after_native_pool_becomes_idle(tmp_path, qapp, monkeypatch, workers, mode):
+    from app.browser_generation_budget import BROWSER_GENERATION_BUDGET
     from app.browser_thumbnail_scheduler import ThumbnailPriority
     from app.thumbnail_provider import ThumbnailLoadResult
     from shiboken6 import isValid
+    # Deliberately exercise both one- and two-worker completion races even
+    # though ordinary original-image generation now admits only one worker.
+    monkeypatch.setattr(BROWSER_GENERATION_BUDGET, 'max_active', workers)
 
     running = [source(tmp_path / f'running-{i}.png') for i in range(workers)]
     folder = tmp_path / 'queued'

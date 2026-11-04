@@ -9,7 +9,7 @@ import io
 import os
 import time
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import Event
 from types import SimpleNamespace
 
@@ -17,13 +17,14 @@ os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 import pytest
 pytest.importorskip('PySide6')
 from PIL import Image
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QApplication
 from app.image_source import ZipImageSource
 from app.raster_warmup_planner import RasterBookTopology, RasterWarmupPlan
 from app.zip_raster_book_runtime import (
     ZipRasterBookRuntime, ZipRasterPage, ZipRasterDisplayUnit,
     ZipRasterRenderSpec, ZipRasterRequest, ZipRasterFramePage, _CachedFrame,
+    _CachedSource, _SourceKey,
 )
 
 @pytest.fixture(scope='module')
@@ -189,17 +190,93 @@ def test_stop_after_preemption_never_publishes_old_current(scene,app):
     assert not r._inflight_reservations
 
 
-def test_sliding_spread_reuses_shared_started_source(scene,app):
-    s=scene;r=s.runtime;job=s.start()
-    paired=ZipRasterDisplayUnit(1,(s.units[1].pages[0],s.units[2].pages[0]),False)
+def paired_request(s, indexes=(1, 2), serial=2):
+    paired=ZipRasterDisplayUnit(indexes[0],tuple(s.units[i].pages[0] for i in indexes),False)
     topology=RasterBookTopology(s.units,identity_of=lambda u:u.identity,
         page_indexes_of=lambda u:(p.page_index for p in u.pages),page_count=len(s.units))
     plan=RasterWarmupPlan(topology,current=paired,identity_of=lambda u:u.identity,
         page_indexes_of=lambda u:(p.page_index for p in u.pages),direction=1,
         background_enabled=True)
-    request=ZipRasterRequest(1,2,paired,plan,s.spec,navigation_direction=1)
+    return ZipRasterRequest(1,serial,paired,plan,s.spec,navigation_direction=1)
+
+
+@pytest.mark.parametrize('completion_order', ['queued', 'before_request', 'before_dispatch'])
+@pytest.mark.parametrize('indexes', [(1, 2), (0, 1)])
+def test_sliding_spread_reuses_shared_started_source(scene,app,completion_order,indexes):
+    s=scene;r=s.runtime;job=s.start()
+    if completion_order == 'before_request':
+        s.gate.set()
+        assert job.finished.wait(3)
+    request=paired_request(s,indexes)
+    paired=request.current
     assert r.request(request,preserve_started_compatible=True)
     assert not job.cancelled.is_set()
     s.gate.set()
+    if completion_order != 'queued':
+        # Deliberately dispatch before Qt drains the finished worker's signal.
+        # Its old single-page key differs from the new overlapping spread key.
+        assert job.finished.wait(3)
+        r._drive()
+        assert s.decoded.count('1.png') == 1
+        assert not any(active.key.unit_identity == paired.identity for active in r._jobs)
     assert wait_until(app,lambda:any(f.unit.identity==paired.identity for f in s.published))
     assert s.decoded.count('1.png')==1
+
+
+@pytest.mark.parametrize('case', ['unrelated', 'cached_shared', 'cancelled', 'incompatible'])
+def test_pending_shared_source_does_not_delay_independent_work(scene,app,case):
+    s=scene;r=s.runtime;job=s.start()
+    s.gate.set()
+    assert job.finished.wait(3)
+    request=paired_request(s)
+    if case == 'unrelated':
+        request=s.request(4,2)
+    elif case == 'cached_shared':
+        image=QImage(24,36,QImage.Format.Format_RGB32);image.fill(0xff336699)
+        key=_SourceKey(r.source_epoch,r._source_identity,'1.png',s.spec.adjustments,(24,36),True)
+        r._source_store.put(_CachedSource(key,1,image,(24,36),False))
+    elif case == 'cancelled':
+        job.cancel()
+    else:
+        request=replace(request,render_spec=replace(s.spec,viewport_size=(48,64)))
+    assert r.request(request,preserve_started_compatible=True)
+    # No event processing yet: the old result has not reached the cache.
+    assert job in r._jobs
+    assert any(active.key.unit_identity == request.current.identity for active in r._jobs)
+    assert wait_until(app,lambda:any(f.unit.identity==request.current.identity for f in s.published))
+    if case == 'cached_shared':
+        assert s.decoded.count('1.png') == 1
+
+
+def test_pending_shared_source_reversal_publishes_only_latest_spread(scene,app):
+    s=scene;r=s.runtime;job=s.start()
+    s.gate.set()
+    assert job.finished.wait(3)
+    first=paired_request(s)
+    latest=paired_request(s,(0,1),3)
+    assert r.request(first,preserve_started_compatible=True)
+    assert r.request(latest,preserve_started_compatible=True)
+    assert wait_until(app,lambda:any(f.unit.identity==latest.current.identity for f in s.published))
+    assert not any(f.unit.identity==first.current.identity for f in s.published)
+    assert s.decoded.count('1.png') == 1
+
+
+def test_failed_shared_completion_retries_without_stalling(scene,app,monkeypatch):
+    s=scene;r=s.runtime;real_open=s.source.open_image
+    failed=[]
+    def fail_once(image_id):
+        image=real_open(image_id)
+        if image_id=='1.png' and not failed:
+            failed.append(image_id)
+            image.close()
+            raise OSError('controlled decode failure')
+        return image
+    monkeypatch.setattr(s.source,'open_image',fail_once)
+    job=s.start();s.gate.set()
+    assert job.finished.wait(3)
+    request=paired_request(s)
+    assert r.request(request,preserve_started_compatible=True)
+    assert wait_until(app,lambda:any(f.unit.identity==request.current.identity for f in s.published))
+    frame=next(f for f in s.published if f.unit.identity==request.current.identity)
+    assert all(page.error is None for page in frame.pages)
+    assert s.decoded.count('1.png') == 2  # One failure, one successful retry.

@@ -35,6 +35,89 @@ from app.zip_raster_book_runtime import (
 )
 
 
+def test_prefetch_estimates_follow_source_replacement_and_eviction(tmp_path, qapp):
+    source = ZipImageSource(_write_zip(tmp_path))
+    runtime = ZipRasterBookRuntime(source, 1)
+    page = ZipRasterPage(0, "0.png", (120, 180), False)
+    unit = ZipRasterDisplayUnit(0, (page,), True)
+    spec = ZipRasterRenderSpec((640, 480))
+    image = QImage(120, 180, QImage.Format.Format_ARGB32)
+    image.fill(0)
+    key = _SourceKey(1, id(source), page.image_id, spec.adjustments, (120, 180), True)
+    try:
+        missing = runtime._prefetch_retained_cost_hint(unit, spec)
+        runtime._source_store.put(_CachedSource(key, 0, image, (120, 180), False))
+        resident = runtime._prefetch_retained_cost_hint(unit, spec)
+        assert missing - resident == image.sizeInBytes()
+        # Same byte count and item count must not mean the same residency.
+        runtime._source_store._remove(key)
+        other_key = replace(key, image_id="1.png")
+        runtime._source_store.put(_CachedSource(other_key, 1, image, (120, 180), False))
+        assert runtime._prefetch_retained_cost_hint(unit, spec) == missing
+        runtime._source_store.put(_CachedSource(key, 0, image, (120, 180), False))
+        assert runtime._prefetch_retained_cost_hint(unit, spec) == resident
+        runtime._source_store.clear()
+        assert runtime._prefetch_retained_cost_hint(unit, spec) == missing
+    finally:
+        assert runtime.shutdown()
+        source.close()
+
+
+def test_prefetch_estimates_reuse_unchanged_state_but_accept_new_metadata(tmp_path, qapp, monkeypatch):
+    source = ZipImageSource(_write_zip(tmp_path))
+    runtime = ZipRasterBookRuntime(source, 1)
+    spec = ZipRasterRenderSpec((400, 600), decoder_maximum_size=(400, 600), decoder_layout_sized=True)
+    unit = ZipRasterDisplayUnit(0, (ZipRasterPage(0, "0.png"),), True)
+    calls = []
+    original = runtime._calculate_prefetch_retained_cost_hint
+
+    def calculate(*args):
+        calls.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(runtime, "_calculate_prefetch_retained_cost_hint", calculate)
+    try:
+        unknown = runtime._prefetch_retained_cost_hint(unit, spec)
+        for _ in range(50):
+            assert runtime._prefetch_retained_cost_hint(unit, spec) == unknown
+        assert len(calls) == 1
+        known = replace(unit, pages=(replace(unit.pages[0], known_size=(800, 1200), is_animated=False),))
+        assert runtime._prefetch_retained_cost_hint(known, spec) == 400 * 600 * 8
+        assert len(calls) == 2
+        high_dpi = replace(spec, device_pixel_ratio=2)
+        assert runtime._prefetch_retained_cost_hint(known, high_dpi) == 800 * 1200 * 8
+        assert len(calls) == 3
+        runtime.cancel()
+        assert not runtime._prefetch_cost_cache
+    finally:
+        assert runtime.shutdown()
+        source.close()
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+@pytest.mark.parametrize("fit", ["fit_window", "fit_width", "fit_height", "fit_no_upscale"])
+def test_geometry_cache_separates_metadata_dpi_and_spread(rotation, fit):
+    from app.zip_raster_book_runtime import _decoder_maximum_for_page
+
+    page = ZipRasterPage(0, "geometry.jpg", (800, 1200), False)
+    spec = ZipRasterRenderSpec((400, 600), decoder_maximum_size=(400, 600),
+                               decoder_layout_sized=True, rotation=rotation, fit_mode=fit)
+    units = (
+        ZipRasterDisplayUnit(0, (page,), True),
+        ZipRasterDisplayUnit(0, (page, ZipRasterPage(1, "partner.jpg", (1500, 700))), False),
+        ZipRasterDisplayUnit(0, (replace(page, known_size=None),), True),
+        ZipRasterDisplayUnit(0, (replace(page, known_size=(1200, 800)),), True),
+    )
+    for _ in range(2):
+        for unit in units:
+            for dpr in (1.0, 2.5):
+                settings = replace(spec, device_pixel_ratio=dpr)
+                candidate = unit.pages[0]
+                assert _decoder_maximum_for_page(settings, unit, candidate) == (
+                    _decoder_maximum_for_page.__wrapped__(settings, unit, candidate)
+                )
+
+
 def _write_zip(tmp_path: Path, *, pages: int = 3) -> Path:
     archive = tmp_path / "book.zip"
     with zipfile.ZipFile(archive, "w") as output:

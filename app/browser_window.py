@@ -6400,14 +6400,17 @@ class BrowserWindow(QMainWindow):
             batch.failures.append(tr('画像や書庫の読み込み終了を待機中です。少し待ってから再試行してください。'))
             return self._finalize_rating_batch(batch)
         # A selection-triggered Pillow header probe briefly owns a Windows
-        # file handle. Retire its stale pending work and drain only the active
-        # header read before the same-file rename, otherwise WinError 32 can
-        # turn a direct star click into a spurious failure.
+        # file handle. Allow a short header read to retire after selection,
+        # but bound the GUI wait: some codecs decode inside Image.open(),
+        # and slow storage has no bounded completion time. Keep the original
+        # paths intact if the active probe still owns its handle.
         self._detail_generation += 1
         self._detail_request_identity = None
         if any(kind in {BrowserItemKind.IMAGE, BrowserItemKind.FOLDER}
                for _path, kind in existing_items):
-            self.image_detail_probe.close()
+            if not self.image_detail_probe.close(msecs=10):
+                batch.failures.append(tr('画像や書庫の読み込み終了を待機中です。少し待ってから再試行してください。'))
+                return self._finalize_rating_batch(batch)
         # Folder books retain immutable page identities for their lifetime.
         # Reuse the established safety contract instead of leaving an open
         # Viewer with a stale page path after the metadata rename.
@@ -7724,7 +7727,7 @@ class BrowserWindow(QMainWindow):
         )
         self._apply_sidebar_layout()
 
-        self.item_model = BrowserItemModel(self)
+        self.item_model = BrowserItemModel(self, defer_thumbnail_notifications=True)
         self._navigation_model_revision = 0
         for signal in (self.item_model.modelReset, self.item_model.layoutChanged,
                        self.item_model.rowsInserted, self.item_model.rowsRemoved):

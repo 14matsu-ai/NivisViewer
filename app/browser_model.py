@@ -10,7 +10,7 @@ from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractListModel, QModelIndex, Qt
+from PySide6.QtCore import QAbstractListModel, QModelIndex, Qt, QTimer
 from PySide6.QtGui import QIcon, QImage
 
 from .browser_sort import (
@@ -182,8 +182,15 @@ class BrowserItemModel(QAbstractListModel):
         BrowserItemKind.OTHER: "その他",
     }
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, defer_thumbnail_notifications: bool = False) -> None:
         super().__init__(parent)
+        self._thumbnail_changes: dict[str, set[int]] = {}
+        self._thumbnail_change_timer = None
+        if defer_thumbnail_notifications:
+            self._thumbnail_change_timer = QTimer(self)
+            self._thumbnail_change_timer.setSingleShot(True)
+            self._thumbnail_change_timer.timeout.connect(self._flush_thumbnail_changes)
+            self.modelAboutToBeReset.connect(self._clear_thumbnail_changes)
         self._source_items: list[BrowserItem] = []
         self._items: list[BrowserItem] = []
         self._sort_policy = BrowserSortPolicy()
@@ -203,6 +210,39 @@ class BrowserItemModel(QAbstractListModel):
         self._row_by_key: dict[str, int] = {}
         self._filter_restore_limit = 0
         self._unfiltered_view: tuple[list[BrowserItem], dict[str, int]] | None = None
+
+    def _notify_thumbnail_change(self, row: int, roles: list[int]) -> None:
+        if self._thumbnail_change_timer is None:
+            index = self.index(row, 0)
+            self.dataChanged.emit(index, index, roles)
+            return
+        # Pixels/state are available immediately. Coalesce only repaint
+        # receipts so a completion burst does not repeatedly re-layout the
+        # same fixed-size list or repeatedly cross the Qt/Python boundary.
+        key = self._key(self._items[row].path)
+        self._thumbnail_changes.setdefault(key, set()).update(roles)
+        if not self._thumbnail_change_timer.isActive():
+            self._thumbnail_change_timer.start(0)
+
+    def _clear_thumbnail_changes(self) -> None:
+        self._thumbnail_changes.clear()
+        if self._thumbnail_change_timer is not None:
+            self._thumbnail_change_timer.stop()
+
+    def _flush_thumbnail_changes(self) -> None:
+        changes = self._thumbnail_changes
+        self._thumbnail_changes = {}
+        rows = []
+        roles: set[int] = set()
+        for key, changed_roles in changes.items():
+            row = self._row_by_key.get(key, -1)
+            if row >= 0:
+                rows.append(row)
+                roles.update(changed_roles)
+        if rows:
+            self.dataChanged.emit(
+                self.index(min(rows), 0), self.index(max(rows), 0), sorted(roles),
+            )
 
     def configure_filter_restore_cache(self, *, enabled: bool, max_entries: int) -> None:
         """Keep at most one current-folder view, sharing immutable items."""
@@ -756,10 +796,8 @@ class BrowserItemModel(QAbstractListModel):
         if displayed and owner is not None:
             owner.mark_displayed_image(image, key)
         if notify:
-            index = self.index(row, 0)
-            self.dataChanged.emit(
-                index,
-                index,
+            self._notify_thumbnail_change(
+                row,
                 [self.ThumbnailImageRole, self.ThumbnailLowResolutionRole],
             )
         return True
@@ -875,8 +913,7 @@ class BrowserItemModel(QAbstractListModel):
         if self._preview_statuses.get(key) == normalized:
             return False
         self._preview_statuses[key] = normalized
-        index = self.index(row, 0)
-        self.dataChanged.emit(index, index, [self.PreviewStatusRole])
+        self._notify_thumbnail_change(row, [self.PreviewStatusRole])
         return True
 
     def set_rating_preview(

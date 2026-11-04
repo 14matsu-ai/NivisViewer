@@ -22,6 +22,7 @@ from .i18n import tr
 
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from heapq import heapify, heappop, heappush
 from math import ceil, isfinite
 from pathlib import Path
@@ -357,6 +358,7 @@ def _retained_source_size_for_page(
     return logical_size
 
 
+@lru_cache(maxsize=2048)
 def _pillow_preview_size(
     render_spec: "ZipRasterRenderSpec",
     unit: "ZipRasterDisplayUnit",
@@ -424,6 +426,7 @@ def _add_decoder_headroom(
     )
 
 
+@lru_cache(maxsize=2048)
 def _display_frame_bytes_for_sizes(
     unit: ZipRasterDisplayUnit,
     render_spec: ZipRasterRenderSpec,
@@ -529,6 +532,10 @@ def _vector_size_for_page(spec, unit, page, logical=None):
     return vector_target_size(logical, bounds)
 
 
+# These bounded caches retain immutable geometry and scalar results only,
+# never images or book owners. Page metadata, DPI and layout are part of the
+# value keys, so newly discovered sizes cannot reuse provisional geometry.
+@lru_cache(maxsize=2048)
 def _decoder_maximum_for_page(
     render_spec: ZipRasterRenderSpec,
     unit: ZipRasterDisplayUnit,
@@ -654,9 +661,6 @@ def _decoder_maximum_for_page(
 
 def _requires_exact_prefetch_admission(
     page: ZipRasterPage,
-    decoder_maximum: DecoderMaximumSize | None,
-    *,
-    has_cached_source: bool,
 ) -> bool:
     """Route every unknown logical geometry through worker confirmation.
 
@@ -665,7 +669,6 @@ def _requires_exact_prefetch_admission(
     resolves cached/known dimensions first and probes only when needed.
     """
 
-    del decoder_maximum, has_cached_source
     return page.known_size is None
 
 
@@ -935,6 +938,7 @@ class _ZipRasterSourceStore:
 
     def __init__(self) -> None:
         self._sources: OrderedDict[_SourceKey, _CachedSource] = OrderedDict()
+        self.revision = 0
         self._sources_by_identity: dict[
             tuple[str, tuple[float, float, float]],
             OrderedDict[_SourceKey, None],
@@ -970,6 +974,7 @@ class _ZipRasterSourceStore:
 
     def clear(self) -> None:
         self._sources.clear()
+        self.revision += 1
         self._sources_by_identity.clear()
         self._bytes.clear()
         self._eviction_order = None
@@ -1253,6 +1258,7 @@ class _ZipRasterSourceStore:
     def _store(self, source: _CachedSource) -> None:
         self._remove(source.key)
         self._sources[source.key] = source
+        self.revision += 1
         group = self._sources_by_identity.setdefault(
             self._identity_for(source.key),
             OrderedDict(),
@@ -1270,6 +1276,7 @@ class _ZipRasterSourceStore:
         source = self._sources.pop(key, None)
         if source is None:
             return None
+        self.revision += 1
         self._bytes.remove(source.qimage.sizeInBytes())
         identity = self._identity_for(key)
         group = self._sources_by_identity.get(identity)
@@ -2892,6 +2899,10 @@ class RasterBookRuntime(QObject):
         )
         self._frame_store = _ZipRasterFrameStore()
         self._source_store = _ZipRasterSourceStore()
+        self._prefetch_cost_context: tuple[int, int, int] | None = None
+        self._prefetch_cost_cache: OrderedDict[
+            tuple[ZipRasterDisplayUnit, ZipRasterRenderSpec], int | None
+        ] = OrderedDict()
         self._metrics = ZipRasterRuntimeMetrics()
         if self._current_extra or self._near_prefetch_parallel or self._full_prefetch:
             RASTER_EXECUTION_BUDGET.signals.capacity_available.connect(
@@ -3908,6 +3919,8 @@ class RasterBookRuntime(QObject):
         return True
 
     def cancel(self, *, clear_artifacts: bool = False) -> None:
+        self._prefetch_cost_cache.clear()
+        self._prefetch_cost_context = None
         if self._adaptive:
             self._adaptive_wait_started = self._adaptive_wait_serial = None
             RASTER_EXECUTION_BUDGET.set_auto_current_pending(self, False)
@@ -4390,16 +4403,34 @@ class RasterBookRuntime(QObject):
         render_spec: ZipRasterRenderSpec,
     ) -> int | None:
         """Per-unit estimate only; None must retain exact worker admission."""
-        if any(
-            _requires_exact_prefetch_admission(
-                page,
-                _decoder_maximum_for_page(render_spec, unit, page),
-                has_cached_source=self._source_store.find(
-                    page, render_spec, unit=unit, touch=False,
-                ) is not None,
-            )
-            for page in unit.pages
-        ):
+        # Live topology is intentionally not cached: metadata can change its
+        # boundaries in place. The immutable unit carries the observed sizes.
+        # Source replacement/eviction (even at equal byte size) and observed
+        # frame size invalidate estimates; reservations/admission stay live.
+        context = (
+            self._source_store.revision,
+            self._frame_store.largest_frame_bytes,
+            self._cache_byte_budget,
+        )
+        if context != self._prefetch_cost_context:
+            self._prefetch_cost_cache.clear()
+            self._prefetch_cost_context = context
+        key = (unit, render_spec)
+        if key in self._prefetch_cost_cache:
+            self._prefetch_cost_cache.move_to_end(key)
+            return self._prefetch_cost_cache[key]
+        estimate = self._calculate_prefetch_retained_cost_hint(unit, render_spec)
+        self._prefetch_cost_cache[key] = estimate
+        if len(self._prefetch_cost_cache) > 256:
+            self._prefetch_cost_cache.popitem(last=False)
+        return estimate
+
+    def _calculate_prefetch_retained_cost_hint(
+        self,
+        unit: ZipRasterDisplayUnit,
+        render_spec: ZipRasterRenderSpec,
+    ) -> int | None:
+        if any(_requires_exact_prefetch_admission(page) for page in unit.pages):
             return None
         source_bytes = self._estimated_missing_source_bytes(unit, render_spec)
         return source_bytes + self._estimated_frame_bytes(
@@ -4843,6 +4874,25 @@ class RasterBookRuntime(QObject):
             # including jobs already detached from their execution slots.
             if any(missing_ids.intersection(page.image_id for page in active.unit.pages)
                    for active in self._jobs):
+                return False
+        elif self._jobs and not metadata_pages and len(cached_sources) < len(unit.pages):
+            missing_ids = {
+                page.image_id for page in unit.pages
+                if page.image_id not in cached_sources
+            }
+            if any(
+                job.finished.is_set()
+                and not job.cancelled.is_set()
+                and not job.layout_metadata_pages
+                and self._active_job_is_artifact_compatible(job, request)
+                and any(page.image_id in missing_ids for page in job.unit.pages)
+                for job in self._jobs
+            ):
+                # A finished worker still owns its decoded sources until the
+                # queued completion publishes them. Different display units
+                # can share a page, so the exact-key ledger alone is not enough.
+                # Completion drives dispatch again; unrelated/cache-hit pages
+                # need no wait, and no native work is awaited on the GUI thread.
                 return False
         source_estimate = (
             0

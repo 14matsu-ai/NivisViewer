@@ -107,7 +107,7 @@ def test_mixed_list_skips_images_and_empty_folders_keeps_parent_anchor(shelf, qa
     finish_navigation(controller, qapp, viewer)
     assert viewer.book_session.current_path == root / 'd'
     assert browser.current_path != root / 'f'
-    assert controller._side_folder_contexts[id(viewer)][0] == str(root / 'd')
+    assert controller._side_folder_contexts[id(viewer)].path == str(root / 'd')
     viewer._on_extra_mouse_button('back')
     finish_navigation(controller, qapp, viewer)
     assert viewer.book_session.current_path == root / 'b'
@@ -161,12 +161,12 @@ def test_stale_empty_result_does_not_navigate(shelf, qapp):
     viewer = open_from(controller, browser, root / 'a.png', qapp)
     controller._open_side_folder_candidate(viewer, str(root / 'b'), browser.adjacent_book_snapshot(root))
     pending = controller._side_folder_pending[id(viewer)]
-    controller._finish_side_folder(viewer, SimpleNamespace(generation=pending[0] - 1,
+    controller._finish_side_folder(viewer, SimpleNamespace(generation=pending.open_generation - 1,
         cancelled=False, code='no_images'), success=False)
     assert browser.current_path == root
     viewer.open_path(root / 'c.png')
     finish_navigation(controller, qapp, viewer)
-    controller._finish_side_folder(viewer, SimpleNamespace(generation=pending[0],
+    controller._finish_side_folder(viewer, SimpleNamespace(generation=pending.open_generation,
         cancelled=False, code='no_images'), success=False)
     assert browser.current_path == root
     assert viewer.book_session.current_path == root / 'c.png'

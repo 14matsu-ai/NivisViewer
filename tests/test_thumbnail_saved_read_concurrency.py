@@ -12,9 +12,13 @@ from tests.test_thumbnail_admission import source, pixels
 
 
 @pytest.mark.parametrize('retire_generation', [False, True])
-def test_metadata_rename_waits_for_only_target_source_handles(tmp_path, qapp, retire_generation):
+def test_metadata_rename_waits_for_only_target_source_handles(tmp_path, qapp, monkeypatch, retire_generation):
+    from app.browser_generation_budget import BROWSER_GENERATION_BUDGET
     from app.thumbnail_provider import BrowserThumbnailProvider
     from threading import Timer
+    # Deliberately keep two source handles open to test path-scoped release,
+    # independently of the ordinary single-generator scheduling policy.
+    monkeypatch.setattr(BROWSER_GENERATION_BUDGET, 'max_active', 2)
     items = [source(tmp_path / name) for name in ('target.png', 'other.png')]
     entered = [Event(), Event()]
     release = [Event(), Event()]

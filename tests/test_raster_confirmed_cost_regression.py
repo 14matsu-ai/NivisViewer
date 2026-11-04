@@ -95,12 +95,7 @@ def make_job(sizes, budget, *, full=False, cached_sources=None):
 )
 def test_unknown_jpeg_budget_uses_confirmed_dimensions(app, size):
     source, unit, _spec, job = make_job((size, size), 100 * 1024**2)
-    assert _requires_exact_prefetch_admission(
-        unit.pages[0], (1914, 2160), has_cached_source=False
-    )
-    assert _requires_exact_prefetch_admission(
-        unit.pages[0], (1914, 2160), has_cached_source=True
-    )
+    assert _requires_exact_prefetch_admission(unit.pages[0])
     identity = job.unit.identity
     assert job._admit_unknown_prefetch_unit()
     assert source.probes == ["0.jpg", "1.jpg"]

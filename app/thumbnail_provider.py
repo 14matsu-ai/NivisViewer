@@ -54,6 +54,7 @@ from .supported_formats import (
     xcf_loading_enabled,
 )
 from .thumbnail_disk_cache import ThumbnailDiskCache, ThumbnailSourceIdentity
+from .thumbnail_requests import ThumbnailRequests, PendingThumbnail as _PendingThumbnail
 from .thumbnail_render import (
     SmartCropCache,
     ThumbnailEncodingPolicy,
@@ -148,12 +149,6 @@ class ThumbnailLoadResult:
             persist_to_disk=result.persist_to_disk,
             cache_in_memory=result.cache_in_memory,
         )
-
-
-@dataclass(frozen=True)
-class _PendingThumbnail:
-    worker: _ThumbnailWorker
-    priority: ThumbnailPriority
 
 
 @dataclass(frozen=True)
@@ -393,8 +388,9 @@ class BrowserThumbnailProvider(QObject):
                                      else max(1, int(max_workers)))
         self._read_pool = QThreadPool(self)
         self._read_pool.setMaxThreadCount(browser_read_workers())
-        self._owned_workers = set()
-        self._waiting_generation = {}
+        self._requests = ThumbnailRequests()
+        self._owned_workers = self._requests.owned_workers
+        self._waiting_generation = self._requests.waiting_generation
         self._admission_timer = QTimer(self)
         self._admission_timer.setInterval(100)
         self._admission_timer.timeout.connect(self._retry_generation_admission)
@@ -483,8 +479,8 @@ class BrowserThumbnailProvider(QObject):
             tuple[str, int, tuple[object, ...]], int | None
         ] = {}
         self._active_request_tokens: dict[str, set[int]] = {}
-        self._pending: dict[tuple[str, int, int], _PendingThumbnail] = {}
-        self._pending_lock = Lock()
+        self._pending = self._requests.pending
+        self._pending_lock = self._requests.lock
         self._failure_lock = Lock()
         self._stats_lock = Lock()
         self._stats: dict[str, int] = {
@@ -604,17 +600,13 @@ class BrowserThumbnailProvider(QObject):
             self._permanent_failures.intersection_update(self._failed)
             self._retrying_failures = {key for key in self._retrying_failures if key[0] not in changed}
             self._quiet_results = {key: value for key, value in self._quiet_results.items() if key[0] not in changed}
-        cancelled_requests = []
-        with self._pending_lock:
-            for key, pending in tuple(self._pending.items()):
-                if key[0] in changed:
-                    pending.worker.cancelled.set()
-                    if self._try_take(pending.worker):
-                        self._pending.pop(key, None)
-                        cancelled_requests.append((key, pending.worker))
+        cancelled = self._requests.cancel_where(
+            lambda key, _pending: key[0] in changed, self._try_take,
+            interrupt_running=True,
+        )
         # Queued workers removed from the pool never emit finished. Release
         # their workflow ownership without releasing a running worker early.
-        for key, worker in cancelled_requests:
+        for key, worker in cancelled.taken:
             self.work_settled.emit(str(worker.item.path), key[2], key[1],
                                    worker.item.thumbnail_revision, "cancelled")
         return changed
@@ -669,13 +661,11 @@ class BrowserThumbnailProvider(QObject):
             # Restore its memo so an unrelated refresh cannot bypass the budget.
             self._failed.update(self._retrying_failures)
             self._retrying_failures.clear()
-        with self._pending_lock:
-            had_pending = bool(self._pending)
-            for pending in self._pending.values():
-                pending.worker.cancelled.set()
-                self._try_take(pending.worker)
-            self._pending.clear()
-        if had_pending:
+        cancelled = self._requests.cancel_where(
+            lambda _key, _pending: True, self._try_take,
+            interrupt_running=True, forget_running=True,
+        )
+        if cancelled.matched:
             self.capacity_released.emit()
         if retry_failed:
             with self._failure_lock:
@@ -861,19 +851,11 @@ class BrowserThumbnailProvider(QObject):
             if keep_path is None
             else self._path_key(Path(keep_path))
         )
-        cancelled = 0
-        with self._pending_lock:
-            for key, pending in tuple(self._pending.items()):
-                if (
-                    key[1] != _PAGE_COUNT_REQUEST_TOKEN
-                    or key[2] != requested_generation
-                    or key[0] == keep_key
-                ):
-                    continue
-                pending.worker.cancelled.set()
-                cancelled += 1
-                if self._try_take(pending.worker):
-                    self._pending.pop(key, None)
+        cancelled = self._requests.cancel_where(
+            lambda key, _pending: (key[1] == _PAGE_COUNT_REQUEST_TOKEN
+                                  and key[2] == requested_generation and key[0] != keep_key),
+            self._try_take, interrupt_running=True,
+        ).matched
         if cancelled:
             self.capacity_released.emit()
         return cancelled
@@ -886,25 +868,9 @@ class BrowserThumbnailProvider(QObject):
             key = self._path_key(worker.item.path)
             return any(key == root or key.startswith(root + os.sep) for root in roots)
 
-        waiting = set()
-        with self._pending_lock:
-            for key, pending in tuple(self._pending.items()):
-                worker = pending.worker
-                if not affected(worker):
-                    continue
-                worker.cancelled.set()
-                if self._try_take(worker):
-                    self._pending.pop(key, None)
-                else:
-                    waiting.add(worker)
-            # Old generations can still own active source handles after their
-            # pending records have been removed.
-            for worker in self._owned_workers:
-                if affected(worker) and worker.run_started.is_set() and not worker.io_finished.is_set():
-                    worker.cancelled.set()
-                    waiting.add(worker)
-        deadline = monotonic() + max(0, wait_msecs) / 1000
-        return all(worker.io_finished.wait(max(0, deadline - monotonic())) for worker in waiting)
+        return self._requests.release_source_handles(
+            affected, self._try_take, wait_msecs=wait_msecs,
+        )
 
     def request_page_count(
         self,
@@ -1051,25 +1017,15 @@ class BrowserThumbnailProvider(QObject):
             if isinstance(size, ThumbnailRenderSpec)
             else int(size)
         )
-        cancelled = 0
-        with self._pending_lock:
-            candidates = tuple(self._pending.items())
-            for key, pending in candidates:
-                path_key, pending_size, pending_generation = key
-                if (
-                    pending_generation != generation
-                    or pending_size != size_token
-                    or pending.priority is not ThumbnailPriority.PREFETCH
-                    or path_key in keep
-                ):
-                    continue
-                if self._try_take(pending.worker):
-                    pending.worker.cancelled.set()
-                    self._pending.pop(key, None)
-                    cancelled += 1
-        if cancelled:
+        cancelled = self._requests.cancel_where(
+            lambda key, pending: (key[2] == generation and key[1] == size_token
+                                  and pending.priority is ThumbnailPriority.PREFETCH
+                                  and key[0] not in keep),
+            self._try_take,
+        )
+        if cancelled.taken:
             self.capacity_released.emit()
-        return cancelled
+        return len(cancelled.taken)
 
     def cancel_requests_except(
         self,
@@ -1090,27 +1046,18 @@ class BrowserThumbnailProvider(QObject):
             if isinstance(size, ThumbnailRenderSpec)
             else int(size)
         )
-        cancelled = 0
-        with self._pending_lock:
-            candidates = tuple(self._pending.items())
-            for key, pending in candidates:
-                path_key, pending_size, pending_generation = key
-                if (
-                    pending_generation != generation
-                    or pending_size != size_token
-                    or path_key in keep
-                    or (pending.priority is ThumbnailPriority.BACKGROUND
-                        and self._browser_memory_managed
-                        and (path_key, pending.worker.item.thumbnail_revision) in self._cache_retention_rank)
-                ):
-                    continue
-                if self._try_take(pending.worker):
-                    pending.worker.cancelled.set()
-                    self._pending.pop(key, None)
-                    cancelled += 1
-        if cancelled:
+        cancelled = self._requests.cancel_where(
+            lambda key, pending: (
+                key[2] == generation and key[1] == size_token and key[0] not in keep
+                and not (pending.priority is ThumbnailPriority.BACKGROUND
+                         and self._browser_memory_managed
+                         and (key[0], pending.worker.item.thumbnail_revision) in self._cache_retention_rank)
+            ),
+            self._try_take,
+        )
+        if cancelled.taken:
             self.capacity_released.emit()
-        return cancelled
+        return len(cancelled.taken)
 
     @Slot(bool)
     def set_paused(self, paused: bool) -> None:
@@ -1119,14 +1066,10 @@ class BrowserThumbnailProvider(QObject):
             return
         self._paused = normalized
         if normalized:
-            cancelled = 0
-            with self._pending_lock:
-                for key, pending in tuple(self._pending.items()):
-                    if self._try_take(pending.worker):
-                        pending.worker.cancelled.set()
-                        self._pending.pop(key, None)
-                        cancelled += 1
-            if cancelled:
+            cancelled = self._requests.cancel_where(
+                lambda _key, _pending: True, self._try_take,
+            )
+            if cancelled.taken:
                 self.capacity_released.emit()
         else:
             self.scheduling_resumed.emit()
@@ -2230,13 +2173,10 @@ class BrowserThumbnailProvider(QObject):
             self._deferred_save_bytes = 0
             self._retry_save_queue.clear()
             self._retry_save_bytes = 0
-        with self._pending_lock:
-            for key, pending in tuple(self._pending.items()):
-                pending.worker.cancelled.set()
-                if self._try_take(pending.worker):
-                    # Removed queued jobs never emit a completion. Keeping a
-                    # cache-read record here would prevent shutdown forever.
-                    self._pending.pop(key, None)
+        # Queued workers cannot emit completion; only running requests remain.
+        self._requests.cancel_where(
+            lambda _key, _pending: True, self._try_take, interrupt_running=True,
+        )
         self._cancel_queued_maintenance()
         if self._coordinator is None:
             self._pool.clear()
@@ -3135,17 +3075,9 @@ class BrowserThumbnailProvider(QObject):
             _PAGE_COUNT_REQUEST_TOKEN,
             generation,
         )
-        with self._pending_lock:
-            pending = self._pending.get(pending_key)
-            if pending is None:
-                return False
-            if self._try_take(pending.worker):
-                pending.worker.cancelled.set()
-                self._pending.pop(pending_key, None)
-                cancelled = True
-            else:
-                pending.worker.cancelled.set()
-                cancelled = False
+        cancelled = self._requests.cancel_one(
+            pending_key, self._try_take, interrupt_running=True,
+        )
         if cancelled:
             self.capacity_released.emit()
         return cancelled
@@ -3182,7 +3114,10 @@ class BrowserThumbnailProvider(QObject):
             if isinstance(size, ThumbnailRenderSpec)
             else getattr(disk_cache, "encoding_policy", ThumbnailEncodingPolicy())
         )
-        write_epoch = int(getattr(disk_cache, "write_epoch", 0))
+        write_epoch = getattr(disk_cache, "write_epoch_snapshot", None)
+        if write_epoch is None:
+            write_epoch = getattr(disk_cache, "write_epoch", 0)
+        write_epoch = int(write_epoch)
         queued = _ThumbnailSaveRequest(
             item=item,
             size=size,
@@ -4029,10 +3964,7 @@ class BrowserThumbnailProvider(QObject):
             worker.priority = priority
             self._pending[key] = _PendingThumbnail(worker, priority)
         if not self._start_worker(worker, priority):
-            with self._pending_lock:
-                current = self._pending.get(key)
-                removed = (self._pending.pop(key) if current is not None
-                           and current.worker is worker else None)
+            removed = self._requests.remove_owned_request(key, worker)
             if removed is not None:
                 self.submission_rejected.emit(str(worker.item.path), key[2], key[1],
                                               worker.item.thumbnail_revision)
@@ -4161,11 +4093,7 @@ class BrowserThumbnailProvider(QObject):
     def _handoff_worker(self, receipt):
         path, token, generation, nonce = receipt
         key = (self._path_key(Path(path)), token, generation)
-        with self._pending_lock:
-            pending = self._pending.get(key)
-            if pending is None or pending.worker.request_nonce is not nonce:
-                return None
-            return pending.worker
+        return self._requests.handoff_worker(key, nonce)
 
     @Slot(object)
     def _on_admission_deferred(self, receipt):
@@ -4213,10 +4141,7 @@ class BrowserThumbnailProvider(QObject):
             if not self._start_worker(worker, worker.priority):
                 BROWSER_GENERATION_BUDGET.release(worker.generation_cost)
                 worker.generation_reserved = False
-                with self._pending_lock:
-                    pending = self._pending.get(key)
-                    if pending is not None and pending.worker is worker:
-                        self._pending.pop(key)
+                self._requests.remove_owned_request(key, worker)
                 self.submission_rejected.emit(str(worker.item.path), key[2], key[1],
                                               worker.item.thumbnail_revision)
         if not self._waiting_generation:

@@ -14,6 +14,40 @@ from app.browser_model import (
 from app.browser_filter import BrowserFilterState, RatingFilterMode
 
 
+def test_deferred_thumbnail_notifications_keep_pixels_immediate_and_coalesce(tmp_path, qapp):
+    model = BrowserItemModel(defer_thumbnail_notifications=True)
+    items = [BrowserItem(f"画像{i}.jpg", tmp_path / f"画像{i}.jpg", BrowserItemKind.IMAGE, 1.) for i in range(3)]
+    model.set_items(items)
+    changes = []
+    model.dataChanged.connect(lambda first, last, roles: changes.append((first.row(), last.row(), set(roles))))
+    image = QImage(8, 12, QImage.Format.Format_RGB32)
+    image.fill(0xff2468ac)
+    for item in items:
+        assert model.set_thumbnail_image(item.path, image, request_token=64)
+        assert model.set_preview_status(item.path, "ready")
+    assert model.data(model.index(0, 0), model.ThumbnailImageRole).cacheKey() == image.cacheKey()
+    assert not changes
+    qapp.processEvents()
+    assert changes == [(0, 2, {model.ThumbnailImageRole, model.ThumbnailLowResolutionRole, model.PreviewStatusRole})]
+
+
+def test_model_reset_discards_pending_thumbnail_notifications(tmp_path, qapp):
+    model = BrowserItemModel(defer_thumbnail_notifications=True)
+    first = BrowserItem("old.jpg", tmp_path / "old.jpg", BrowserItemKind.IMAGE, 1.)
+    second = BrowserItem("new.jpg", tmp_path / "new.jpg", BrowserItemKind.IMAGE, 1.)
+    model.set_items([first])
+    changes = []
+    model.dataChanged.connect(lambda *args: changes.append(args))
+    model.set_preview_status(first.path, "ready")
+    model.set_items([second])
+    qapp.processEvents()
+    assert not changes
+    assert model.set_preview_status(second.path, "ready")
+    qapp.processEvents()
+    assert len(changes) == 1
+    assert changes[0][0].data(model.PathRole) == str(second.path)
+
+
 def test_discovery_lists_supported_items_in_stable_natural_order(tmp_path: Path) -> None:
     (tmp_path / "章2").mkdir()
     (tmp_path / "章10").mkdir()
