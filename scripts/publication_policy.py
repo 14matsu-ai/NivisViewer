@@ -42,6 +42,8 @@ PUBLIC_SCRIPTS = {
 
 def publishable(filename: str) -> bool:
     name = filename.replace("\\", "/")
+    if name.rsplit('/', 1)[-1].casefold().startswith('.nivisviewer-instance.lock'):
+        return False
     if name in PUBLIC_SCREENSHOTS:
         return True
     if name in PRIVATE_FILES or name.startswith(PRIVATE_PREFIXES):

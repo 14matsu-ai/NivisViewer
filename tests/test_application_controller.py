@@ -430,6 +430,10 @@ def test_hidden_zip_viewer_retains_handles_until_its_worker_drains(tmp_path, qap
         for page in range(3):
             output.writestr(f'{page}.png', payload.getvalue())
     controller = make_controller(tmp_path / 'profile', qapp)
+    # The rename assertion concerns the Viewer source. Keep the Browser open
+    # without starting an independent thumbnail/preparation read of this ZIP.
+    controller._restore_on_start = False
+    monkeypatch.setattr(controller, '_synchronize_browser_to_viewer_item', lambda *args, **kwargs: None)
     controller.config.apply({'view_mode': 'single', 'show_page_list': False})
     controller.create_browser_window()
     window = controller.create_viewer_window()
@@ -449,13 +453,18 @@ def test_hidden_zip_viewer_retains_handles_until_its_worker_drains(tmp_path, qap
         window.next_page()
         assert wait_until(qapp, entered.is_set)
         if hide_first:
-            jobs = tuple(session.viewer_runtime._jobs)
+            runtime = session.viewer_runtime
+            jobs = tuple(runtime._jobs)
+            assert runtime.cached_unit_count or runtime.decoded_source_count
             window.close()
             assert not window.isVisible()
             assert window._close_runtime_retired
             assert jobs and all(job.cancelled.is_set() for job in jobs)
             assert not session.shutdown_complete
             assert window in controller.viewers_using_paths((str(archive),))
+            assert wait_until(qapp, lambda: not runtime.cached_unit_count and not runtime.decoded_source_count)
+            assert runtime.has_unfinished_tasks()
+            assert not source._closed.is_set()
         assert controller.close_viewers((window,)) is False
         assert not window.isVisible()
         assert window in controller.viewers_using_paths((str(archive),))
@@ -467,6 +476,42 @@ def test_hidden_zip_viewer_retains_handles_until_its_worker_drains(tmp_path, qap
     finally:
         release.set()
         close_controller(controller, qapp)
+
+
+def test_application_exit_waits_for_detached_book_completion(tmp_path, qapp):
+    from app.book_session import BookSession, retired_book_sessions
+    from app.image_source import FolderImageSource
+    from app.single_instance import InstanceMessage
+    controller = make_controller(tmp_path / 'profile', qapp)
+    write_image(tmp_path / 'images' / 'page.png')
+    entered, release = Event(), Event()
+    exits = []
+    controller.application = SimpleNamespace(quit=lambda: exits.append(True))
+
+    def source_factory(path, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return FolderImageSource(path), None
+
+    session = BookSession(
+        parent=controller, source_factory=source_factory,
+        image_work_coordinator=controller.image_work_coordinator)
+    try:
+        session.open_book_async(tmp_path / 'images')
+        assert entered.wait(2)
+        session.shutdown(wait_msecs=0)
+        assert session in retired_book_sessions(controller.image_work_coordinator)
+        controller._request_application_exit()
+        assert controller.shutdown_coordinator.failed_step_name == 'viewer_sessions'
+        assert not exits
+        assert not controller.handle_open_request(InstanceMessage())
+        release.set()
+        assert wait_until(qapp, lambda: bool(exits))
+        assert exits == [True]
+        assert not retired_book_sessions(controller.image_work_coordinator)
+    finally:
+        release.set()
+        assert wait_until(qapp, controller.shutdown)
 
 
 def test_browser_is_singleton_and_coexists_with_viewers(

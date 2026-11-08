@@ -12,6 +12,7 @@ venv/
 
 # Application data
 config.json
+.nivisviewer-instance.lock*
 data/
 cache/
 logs/

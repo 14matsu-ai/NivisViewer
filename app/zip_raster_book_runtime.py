@@ -4003,6 +4003,22 @@ class RasterBookRuntime(QObject):
             self._zip_read_ahead_enabled and self.source.read_ahead_busy
         )
 
+    def retirement_snapshot(self) -> dict[str, int | bool]:
+        jobs = tuple(self._jobs)
+        finished = sum(job.finished.is_set() for job in jobs)
+        started = sum(job.started.is_set() and not job.finished.is_set() for job in jobs)
+        return {
+            'owner': id(self), 'accepting': self._accepting_requests,
+            'queued_jobs': len(jobs) - started - finished,
+            'running_jobs': started, 'awaiting_gui_completion': finished,
+            'read_ahead_busy': self._zip_read_ahead_enabled and self.source.read_ahead_busy,
+            'frame_count': self._frame_store.unit_count,
+            'frame_bytes': self._frame_store.byte_size,
+            'source_count': self._source_store.page_count,
+            'source_bytes': self._source_store.byte_size,
+            'encoded_bytes': self.source.read_ahead_reserved_bytes if self._zip_read_ahead_enabled else 0,
+        }
+
     def wait_for_done(self, msecs: int = 5000) -> bool:
         deadline = monotonic() + max(0, int(msecs)) / 1000
         for job in tuple(self._jobs):
@@ -4032,13 +4048,14 @@ class RasterBookRuntime(QObject):
 
     @trace_gui_phase
     def drain_retired_artifacts(self, *, max_items: int = 8) -> bool:
-        """Release a bounded GUI slice before finalizing an idle retired owner.
+        """Release a bounded GUI slice without finalizing the retired owner.
 
-        QPixmaps must stay on the GUI thread. A zero-wait shutdown still
-        destroys the whole cache synchronously, so waiting until first paint
-        alone does not prevent a long stall when replacing a warm book.
+        Workers own the QImage references copied into their job at submission.
+        Neither those references nor the source, jobs and leases are released
+        here. The GUI-only stores can therefore drain even when a job or an
+        encoded read is still waiting to complete.
         """
-        if self._accepting_requests or self.has_unfinished_tasks():
+        if self._accepting_requests:
             return False
         deadline = monotonic() + 0.004
         for _ in range(max(1, min(8, max_items))):

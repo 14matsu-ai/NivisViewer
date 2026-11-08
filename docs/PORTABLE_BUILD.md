@@ -72,3 +72,6 @@ NivisViewer.exe --browser-only "D:\Books"
 
 `--new-window` and `--reuse` cannot be combined. `--no-restore` suppresses
 restoration of the last location for that launch only.
+If an instance is still shutting down, wait for it to exit before opening the
+same profile again. `--no-single-instance` disables request forwarding; use a
+separate `--profile-dir` to run another writable instance alongside it.

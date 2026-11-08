@@ -179,7 +179,7 @@ def test_image_work_shutdown_timeout_is_retryable_and_logged_once(
         )
     assert worker.started.wait(1)
 
-    with caplog.at_level(logging.ERROR, logger="app.image_work_coordinator"):
+    with caplog.at_level(logging.ERROR, logger="nivisviewer.image_work_coordinator"):
         assert not coordinator.shutdown(wait_msecs=0)
         assert not coordinator.shutdown(wait_msecs=0)
 
@@ -189,7 +189,7 @@ def test_image_work_shutdown_timeout_is_retryable_and_logged_once(
     assert coordinator.last_shutdown_error is not None
     assert lane in coordinator.last_shutdown_error
     assert sum(
-        record.name == "app.image_work_coordinator"
+        record.name == "nivisviewer.image_work_coordinator"
         and "Image worker shutdown timed out" in record.getMessage()
         for record in caplog.records
     ) == 1

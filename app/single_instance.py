@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-from .i18n import tr
-
-
 import getpass
 import hashlib
 import json
 import os
 import struct
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from time import monotonic
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 
@@ -116,8 +115,11 @@ def validate_message(message: InstanceMessage) -> None:
         raise ValueError("Invalid sender PID")
 
 
+class InstanceUnavailableError(RuntimeError):
+    """An existing or unverified owner cannot accept a request right now."""
+
+
 class SingleInstanceBroker(QObject):
-    open_request_received = Signal(object)
 
     def __init__(
         self,
@@ -132,6 +134,7 @@ class SingleInstanceBroker(QObject):
         self.server = QLocalServer(self)
         self._buffers: dict[QLocalSocket, bytearray] = {}
         self._listening = False
+        self.request_handler: Callable[[InstanceMessage], bool] | None = None
         try:
             option = QLocalServer.SocketOption.UserAccessOption
             self.server.setSocketOptions(option)
@@ -143,23 +146,24 @@ class SingleInstanceBroker(QObject):
     def is_listening(self) -> bool:
         return self._listening and self.server.isListening()
 
-    def try_forward_or_listen(self, message: InstanceMessage) -> bool:
+    def try_forward_or_listen(self, message: InstanceMessage, *, allow_listen: bool = True) -> bool:
         validate_message(message)
         if self._forward(message):
             return False
+        if not allow_listen:
+            raise InstanceUnavailableError('profile_locked')
         if self._listen():
             return True
         if self._forward(message):
             return False
-        # Only remove a stale endpoint after two failed connection attempts.
+        # Only a missing/refused endpoint can reach here. A connected owner
+        # that rejects a request or fails to reply is never replaced.
         QLocalServer.removeServer(self.server_name)
         if self._listen():
             return True
         if self._forward(message):
             return False
-        raise RuntimeError(
-            tr('単一インスタンス用サーバーを開始できません: {p0}', p0=self.server.errorString())
-        )
+        raise InstanceUnavailableError('listen_failed')
 
     def close(self) -> None:
         for socket in tuple(self._buffers):
@@ -175,23 +179,55 @@ class SingleInstanceBroker(QObject):
             return True
         return False
 
+    def _connect_to_owner(self, socket: QLocalSocket) -> bool:
+        socket.connectToServer(self.server_name)
+        if socket.waitForConnected(self.timeout_msecs):
+            return True
+        absent = {QLocalSocket.LocalSocketError.ServerNotFoundError}
+        if os.name != 'nt':
+            absent.add(QLocalSocket.LocalSocketError.ConnectionRefusedError)
+        if socket.error() in absent:
+            return False
+        raise InstanceUnavailableError(f'connection_failed:{socket.error().name}')
+
+    def reject_existing_owner(self) -> None:
+        """Check the legacy endpoint without sending an open request."""
+        socket = QLocalSocket()
+        try:
+            if self._connect_to_owner(socket):
+                raise InstanceUnavailableError('existing_owner')
+        finally:
+            socket.disconnectFromServer()
+
     def _forward(self, message: InstanceMessage) -> bool:
         socket = QLocalSocket()
         try:
-            socket.connectToServer(self.server_name)
-            if not socket.waitForConnected(self.timeout_msecs):
+            if not self._connect_to_owner(socket):
                 return False
-            socket.write(encode_message(message))
-            if not socket.waitForBytesWritten(self.timeout_msecs):
-                return False
-            if not socket.waitForReadyRead(self.timeout_msecs):
-                return False
-            response = bytes(socket.readAll())
-            try:
-                decoded = json.loads(response.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                return False
-            return isinstance(decoded, dict) and decoded.get("status") == "ok"
+            frame = encode_message(message)
+            if socket.write(frame) != len(frame):
+                raise InstanceUnavailableError('request_not_delivered')
+            deadline = monotonic() + self.timeout_msecs / 1000
+            while socket.bytesToWrite():
+                remaining = int((deadline - monotonic()) * 1000)
+                if remaining <= 0 or (not socket.waitForBytesWritten(remaining) and socket.bytesToWrite()):
+                    raise InstanceUnavailableError('request_not_delivered')
+            response = bytearray()
+            while True:
+                if not socket.bytesAvailable():
+                    remaining = int((deadline - monotonic()) * 1000)
+                    if remaining <= 0 or not socket.waitForReadyRead(remaining):
+                        raise InstanceUnavailableError('no_acknowledgement')
+                response.extend(bytes(socket.read(4097 - len(response))))
+                if len(response) > 4096:
+                    raise InstanceUnavailableError('invalid_acknowledgement')
+                try:
+                    decoded = json.loads(response.decode('utf-8'))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(decoded, dict) and decoded.get('status') == 'ok':
+                    return True
+                raise InstanceUnavailableError('request_not_accepted')
         finally:
             socket.disconnectFromServer()
 
@@ -201,6 +237,7 @@ class SingleInstanceBroker(QObject):
             if socket is None:
                 continue
             self._buffers[socket] = bytearray()
+            socket.setReadBufferSize(HEADER_SIZE + MAX_MESSAGE_BYTES + 1)
             socket.readyRead.connect(
                 lambda socket=socket: self._read_from_socket(socket)
             )
@@ -210,6 +247,8 @@ class SingleInstanceBroker(QObject):
             # Accepted sockets are parented to the server. Removing their
             # buffer alone leaves every past Explorer request alive until exit.
             socket.disconnected.connect(socket.deleteLater)
+            if socket.bytesAvailable():
+                self._read_from_socket(socket)
 
     def _read_from_socket(self, socket: QLocalSocket) -> None:
         buffer = self._buffers.get(socket)
@@ -224,14 +263,22 @@ class SingleInstanceBroker(QObject):
             return
         if len(buffer) < HEADER_SIZE + expected:
             return
+        self._buffers.pop(socket, None)
         frame = bytes(buffer[: HEADER_SIZE + expected])
         try:
             message = decode_message(frame)
         except ValueError as exc:
             self._reply(socket, "error", str(exc))
             return
-        self.open_request_received.emit(message)
-        self._reply(socket, "ok")
+        try:
+            accepted = self.request_handler is not None and self.request_handler(message)
+        except Exception:
+            self._reply(socket, 'error', 'request_failed')
+            return
+        if accepted is True:
+            self._reply(socket, 'ok')
+        else:
+            self._reply(socket, 'busy', 'not_accepting_requests')
 
     def _reply(
         self,
@@ -248,7 +295,6 @@ class SingleInstanceBroker(QObject):
             )
         )
         socket.flush()
-        socket.waitForBytesWritten(min(250, self.timeout_msecs))
         socket.disconnectFromServer()
         self._buffers.pop(socket, None)
 

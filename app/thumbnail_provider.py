@@ -78,6 +78,11 @@ def drain_retired_thumbnail_providers(coordinator: ImageWorkCoordinator) -> bool
     return all(provider not in _RETIRED_THUMBNAIL_PROVIDERS for provider in retired)
 
 
+def retired_thumbnail_snapshots(coordinator: ImageWorkCoordinator) -> list[dict[str, int]]:
+    return [provider.shutdown_snapshot() for provider in tuple(_RETIRED_THUMBNAIL_PROVIDERS)
+            if provider._coordinator is coordinator]
+
+
 _THUMBNAIL_LOG = logging.getLogger("nivisviewer.thumbnail")
 _PAGE_COUNT_REQUEST_TOKEN = -1
 _DISPLAY_REQUEST_TOKEN = -2
@@ -2077,15 +2082,18 @@ class BrowserThumbnailProvider(QObject):
         if not self.cleanup_caches_async(force=False):
             QTimer.singleShot(500, self, self._continue_cache_maintenance)
 
-    def clear_memory_cache(self) -> None:
+    def clear_memory_cache(self, *, closing: bool = False) -> None:
         self._nonresident_saved_reads.clear()
-        for key in tuple(self._cache):
+        # At close only managed pixel references need individual release;
+        # the remaining lookup indexes are discarded as a whole below.
+        for key in tuple(self._cache_pixels if closing else self._cache):
             self._cache_index_remove(key)
         for path, pixel in tuple(self._orphan_model_images.items()):
             self.memory_image_released.emit(path, pixel)
         self._orphan_model_images.clear()
         self._cache.clear()
         self._cache_bytes = 0
+        self._read_cache_keys.clear()
         self._cache_page_counts.clear()
         self._cache_specs.clear()
         self._cache_entry_priority.clear()
@@ -2094,7 +2102,8 @@ class BrowserThumbnailProvider(QObject):
         self._cache_rank_values.clear()
         self._cache_rank_value_set.clear()
         self._cache_key_indexed_rank.clear()
-        self._preview_registry.shell_service.clear_memory_cache()
+        if not closing or self._owns_preview_registry:
+            self._preview_registry.shell_service.clear_memory_cache()
         with self._failure_lock:
             self._failed.clear()
             self._permanent_failures.clear()
@@ -2165,8 +2174,7 @@ class BrowserThumbnailProvider(QObject):
             return
         self._closed = True
         self._display_budget_callback = None
-        if self._retained_display_enabled:
-            self.clear_memory_cache()
+        self.clear_memory_cache(closing=True)
         self._generation += 1
         with self._save_lock:
             self._deferred_save_queue.clear()
@@ -2187,6 +2195,11 @@ class BrowserThumbnailProvider(QObject):
         self.setParent(None)
         _RETIRED_THUMBNAIL_PROVIDERS.add(self)
         QTimer.singleShot(100, self, self._release_retired_if_idle)
+
+    def shutdown_snapshot(self) -> dict[str, int]:
+        return {'owner': id(self), 'pending': self.pending_count,
+                'owned_workers': len(self._owned_workers), 'bytes': self.memory_cache_bytes,
+                'shell_pending': self.shell_preview_pending_count}
 
     @staticmethod
     def load_thumbnail(

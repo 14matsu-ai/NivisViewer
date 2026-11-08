@@ -4,6 +4,7 @@ from .i18n import initialize_ui_language, tr
 
 
 import inspect
+import logging
 import os
 import weakref
 from dataclasses import dataclass
@@ -33,7 +34,8 @@ from .adjacent_book_search import (
 )
 from .archive_backend_registry import ArchiveBackendRegistry
 from .browser_window import BrowserWindow
-from .thumbnail_provider import drain_retired_thumbnail_providers
+from .thumbnail_provider import drain_retired_thumbnail_providers, retired_thumbnail_snapshots
+from .book_session import retired_book_sessions
 from .browser_book_preparation import BrowserBookPreparation
 from .gui_garbage_collector import ensure_gui_garbage_collector
 from .browser_sort import (
@@ -72,11 +74,13 @@ from .navigation_state import (
     PendingSideNavigation, SideNavigationAnchor,
 )
 from .viewer_window import ViewerWindow
+from .viewer_memory_policy import read_physical_memory_snapshot
 
 
 WindowFactory = Callable[..., ViewerWindow]
 BrowserWindowFactory = Callable[..., BrowserWindow]
 VALID_OPEN_BEHAVIORS = {"reuse_active", "always_new", "reuse_or_create"}
+_SHUTDOWN_LOG = logging.getLogger('nivisviewer.application_shutdown')
 
 
 @dataclass(frozen=True)
@@ -174,6 +178,8 @@ class ApplicationController(QObject):
         ) = None
         self._shutdown = False
         self._shutdown_complete = False
+        self._shutdown_running = False
+        self._next_queue_shutdown_log = 0.0
         self.shutdown_coordinator = ApplicationShutdownCoordinator(self)
         self._shutdown_retry_timer = QTimer(self)
         self._shutdown_retry_timer.setSingleShot(True)
@@ -241,10 +247,10 @@ class ApplicationController(QObject):
                 self.startup_restore.start(last_path)
         return browser
 
-    def handle_open_request(self, message: InstanceMessage) -> None:
+    def handle_open_request(self, message: InstanceMessage) -> bool:
         """Apply one startup/IPC request without changing persistent behavior."""
-        if self._shutdown:
-            return
+        if self._shutdown or self._quit_requested:
+            return False
         self.startup_restore.cancel()
         self.show_browser_window()
         unique: dict[str, str] = {}
@@ -254,7 +260,7 @@ class ApplicationController(QObject):
         if message.browser_only:
             for path in paths:
                 self.select_path_in_browser(path)
-            return
+            return True
         for index, path in enumerate(paths):
             try:
                 self.select_path_in_browser(path)
@@ -267,6 +273,7 @@ class ApplicationController(QObject):
                 self.open_path(path, open_in_new_window=open_in_new_window)
             except (OSError, RuntimeError, ValueError):
                 continue
+        return True
 
     def create_browser_window(self) -> BrowserWindow:
         if self._shutdown:
@@ -788,6 +795,15 @@ class ApplicationController(QObject):
         QTimer.singleShot(0, activate_after_show)
 
     def shutdown(self) -> bool:
+        if self._shutdown_running:
+            return False
+        self._shutdown_running = True
+        try:
+            return self._shutdown_once()
+        finally:
+            self._shutdown_running = False
+
+    def _shutdown_once(self) -> bool:
         if self._shutdown_complete:
             return True
         if not self._shutdown:
@@ -844,6 +860,7 @@ class ApplicationController(QObject):
                     ("metadata_close", self.metadata_store.close),
                 ),
                 snapshot=snapshot,
+                diagnostics=self._shutdown_snapshot,
             )
         queue_shutdown_started = (
             self.file_operation_queue.lifecycle.value == "running"
@@ -851,14 +868,37 @@ class ApplicationController(QObject):
         if queue_shutdown_started:
             self.file_operation_queue.begin_shutdown(cancel_active=True)
         if not self.file_operation_queue.busy:
-            if (
-                queue_shutdown_started
-                and self.shutdown_coordinator.state
-                is ApplicationShutdownState.TIMED_OUT
-            ):
-                return False
             return self._continue_application_shutdown()
+        now = monotonic()
+        if now >= self._next_queue_shutdown_log and _SHUTDOWN_LOG.isEnabledFor(logging.INFO):
+            self._next_queue_shutdown_log = now + 5.0
+            try:
+                state = self._shutdown_snapshot()
+            except Exception as exc:
+                state = {'diagnostic_error': type(exc).__name__}
+            _SHUTDOWN_LOG.info('Application shutdown waiting step=file_operations state=%s', state)
         return False
+
+    def _shutdown_snapshot(self) -> dict[str, object]:
+        browser = self.get_browser_window()
+        memory = read_physical_memory_snapshot()
+        standby = self._standby_viewer
+        preparation = self.book_preparation.session or self.book_preparation._retiring
+        return {
+            'rss_bytes': memory.process_working_set_bytes if memory else None,
+            'private_commit_bytes': memory.process_private_commit_bytes if memory else None,
+            'viewers': [window._shutdown_lifecycle.snapshot() for window in self._viewer_windows],
+            'standby': standby._shutdown_lifecycle.snapshot() if standby else None,
+            'book_preparation': preparation.shutdown_snapshot() if preparation else None,
+            'detached_books': [s.shutdown_snapshot() for s in retired_book_sessions(self.image_work_coordinator)],
+            'browser': ({'owner': id(browser), 'phase': browser._shutdown_cleanup_phase,
+                         'thumbnail': browser.thumbnail_provider.shutdown_snapshot()}
+                        if browser is not None else None),
+            'retired_thumbnails': retired_thumbnail_snapshots(self.image_work_coordinator),
+            'pdf_jobs': self.pdfium_service.pending_count,
+            'file_operations_running': int(self.file_operation_queue.active_operation is not None),
+            'file_operations_queued': len(self.file_operation_queue.queued_requests),
+        }
 
     def _continue_application_shutdown(self) -> bool:
         if not self.shutdown_coordinator.begin_shutdown():
@@ -882,13 +922,16 @@ class ApplicationController(QObject):
         complete = self.book_preparation.shutdown()
         standby = self._standby_viewer
         if standby is not None:
-            if standby.prepare_shutdown() is False:
+            if standby.prepare_shutdown(wait_msecs=0) is False or not standby.book_session.drain_shutdown():
                 complete = False
             else:
                 self._standby_viewer = None
                 standby.deleteLater()
         for window in tuple(self._viewer_windows):
-            if window.prepare_shutdown() is False:
+            if window.prepare_shutdown(wait_msecs=0) is False or not window.book_session.drain_shutdown():
+                complete = False
+        for session in retired_book_sessions(self.image_work_coordinator):
+            if not session.drain_shutdown():
                 complete = False
         return complete
 
@@ -1513,7 +1556,7 @@ class ApplicationController(QObject):
         pending_ref = self._pending_close_window
         self._pending_close_window = None
         if self._shutdown:
-            self._continue_application_shutdown()
+            self.shutdown()
         if pending_ref is None:
             return
         window = pending_ref()
@@ -1564,6 +1607,7 @@ class ApplicationController(QObject):
         if not self._quit_requested or self._quit_committed:
             return
         self._quit_committed = True
+        _SHUTDOWN_LOG.info('Application quit requested after all cleanup phases')
         self.exit_requested.emit()
         self.application.quit()
 

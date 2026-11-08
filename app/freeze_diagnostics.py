@@ -13,6 +13,7 @@ from .app_paths import AppPaths
 
 
 _LOG = logging.getLogger("nivisviewer.freeze")
+_EXIT_WATCHDOG_FILE = None
 
 
 def trace_gui_phase(function):
@@ -74,7 +75,7 @@ class FreezeDiagnostics(QObject):
             self._file = path.open("a", encoding="utf-8")
             self._file.write(f"GUI watchdog pid={os.getpid()} timeout=5s\n")
             self._file.flush()
-            application.aboutToQuit.connect(self.close)
+            application.aboutToQuit.connect(self._begin_exit)
             self._heartbeat()
             self._timer.start()
             _LOG.info("GUI watchdog enabled: %s", path)
@@ -98,3 +99,26 @@ class FreezeDiagnostics(QObject):
             faulthandler.cancel_dump_traceback_later()
             self._file.close()
             self._file = None
+
+    def _begin_exit(self) -> None:
+        self._timer.stop()
+        self._mark_exit('Qt aboutToQuit')
+
+    def keep_during_exit(self) -> None:
+        """Keep the native one-shot armed while Python may still join workers."""
+        global _EXIT_WATCHDOG_FILE
+        self._timer.stop()
+        self._mark_exit('Qt event loop returned')
+        if self._file is not None:
+            # faulthandler uses the file descriptor, not QObject ownership.
+            _EXIT_WATCHDOG_FILE, self._file = self._file, None
+
+    def _mark_exit(self, phase: str) -> None:
+        if self._file is None:
+            return
+        try:
+            self._file.write(f'{phase}\n')
+            self._file.flush()
+            self._heartbeat()
+        except (OSError, RuntimeError):
+            self.close()

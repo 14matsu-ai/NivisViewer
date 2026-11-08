@@ -4,22 +4,26 @@ from __future__ import annotations
 
 from enum import StrEnum
 import logging
+from time import monotonic
 from typing import TYPE_CHECKING
 import weakref
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
+from .viewer_memory_policy import read_physical_memory_snapshot
+
 if TYPE_CHECKING:
     from .viewer_window import ViewerWindow
 
 
-_LOG = logging.getLogger(__name__)
+_LOG = logging.getLogger('nivisviewer.viewer_shutdown')
 # Hidden standalone Viewers must outlive their workers and queued completions.
 CLOSING_VIEWERS: set[object] = set()
 
 
 class ViewerShutdownPhase(StrEnum):
+    RASTER_ARTIFACTS = 'raster_artifacts'
     PRESENTATION = "presentation"
     PDF_LOUPE = "pdf_loupe"
     RENDERING = "rendering"
@@ -51,7 +55,11 @@ class ViewerShutdown:
         self._requesting_close = False
         self._error_reported = False
         self._next_step = 0
+        self._logged_phase = None
+        self._phase_started = 0.0
+        self._next_progress_log = 0.0
         self._steps = (
+            (ViewerShutdownPhase.RASTER_ARTIFACTS, self._drain_artifacts),
             (ViewerShutdownPhase.PRESENTATION, self._prepare_presentation),
             (ViewerShutdownPhase.PDF_LOUPE, self._drain_loupe),
             (ViewerShutdownPhase.RENDERING, self._drain_rendering),
@@ -90,10 +98,10 @@ class ViewerShutdown:
             self.closing_path = window.book_session.current_path
             window._shutdown_prepared = True
             CLOSING_VIEWERS.add(window)
-            window._cancel_auxiliary_image_workers()
             window.hide()
             self._timer.start(0)
             try:
+                window._cancel_auxiliary_image_workers()
                 self._retire_runtime()
             except Exception:
                 self._report_error()
@@ -126,9 +134,12 @@ class ViewerShutdown:
             RASTER_EXECUTION_BUDGET.release_owner(window)
             window._cancel_auxiliary_image_workers()
             while not self.complete:
-                _, step = self._steps[self._next_step]
+                phase, step = self._steps[self._next_step]
+                self._log_phase(window, phase)
                 if step(window, wait_msecs) is False:
                     return False
+                _LOG.info('Viewer shutdown phase complete owner=%x phase=%s elapsed_ms=%.1f',
+                          id(window), phase, (monotonic() - self._phase_started) * 1000)
                 self._next_step += 1
             return True
         finally:
@@ -148,22 +159,60 @@ class ViewerShutdown:
             return
         window = self._window()
         try:
-            if self.phase is ViewerShutdownPhase.PRESENTATION:
-                self._retire_runtime()
-                runtime = window._zip_runtime
-                if runtime is not None and not runtime.drain_retired_artifacts(max_items=1):
-                    # Keep GUI-owned pixmap disposal bounded between callbacks.
-                    self._timer.start(10 if runtime.has_unfinished_tasks() else 8)
-                    return
             complete = self.prepare(wait_msecs=0)
         except Exception:
             self._report_error()
             self._timer.start(100)
             return
         if complete:
+            if _LOG.isEnabledFor(logging.INFO):
+                _LOG.info('Viewer close ready state=%s', self.snapshot())
             window.close()
         else:
-            self._timer.start(10)
+            self._timer.start(8 if self.phase is ViewerShutdownPhase.RASTER_ARTIFACTS else 10)
+
+    def _log_phase(self, window: ViewerWindow, phase: ViewerShutdownPhase) -> None:
+        now = monotonic()
+        if self._logged_phase != phase:
+            self._logged_phase = phase
+            self._phase_started = now
+            self._next_progress_log = now + 2.0
+            _LOG.info('Viewer shutdown phase started owner=%x phase=%s', id(window), phase)
+        elif now >= self._next_progress_log and _LOG.isEnabledFor(logging.INFO):
+            self._next_progress_log = now + 5.0
+            _LOG.info('Viewer shutdown waiting elapsed_ms=%.1f state=%s',
+                      (now - self._phase_started) * 1000, self.snapshot())
+
+    def snapshot(self) -> dict[str, object]:
+        try:
+            return self._snapshot()
+        except Exception as exc:
+            # Diagnostics must never stop close, including after a Qt owner
+            # was destroyed while a completion was being delivered.
+            return {'owner': id(self._window()), 'phase': self.phase.value,
+                    'diagnostic_error': type(exc).__name__}
+
+    def _snapshot(self) -> dict[str, object]:
+        window = self._window()
+        memory = read_physical_memory_snapshot()
+        images = window.viewer._images
+        return {'owner': id(window), 'phase': self.phase.value, 'hidden_close': self.close_requested,
+                'rss_bytes': memory.process_working_set_bytes if memory else None,
+                'private_commit_bytes': memory.process_private_commit_bytes if memory else None,
+                'book': window.book_session.shutdown_snapshot(),
+                'canvas_cache_bytes': window.viewer.render_cache_bytes(),
+                'visible_qimage_bytes': sum(im.qimage.sizeInBytes() for im in images if im.qimage is not None),
+                'visible_qpixmap_estimated_bytes': sum(im.pixmap.width() * im.pixmap.height() * 4
+                                                       for im in images if im.pixmap is not None),
+                'canvas_jobs': len(window.viewer._render_tasks),
+                'auxiliary_jobs': (window._auxiliary_image_pool.activeThreadCount()
+                                   if window._auxiliary_image_pool is not None else 0)}
+
+    def _drain_artifacts(self, window: ViewerWindow, wait_msecs: int) -> bool:
+        if not self.close_requested or wait_msecs > 0:
+            return True
+        self._retire_runtime()
+        return window.book_session.drain_closing_raster_artifacts()
 
     def stop_timer(self) -> None:
         self._timer.stop()
@@ -233,7 +282,7 @@ class ViewerShutdown:
         # Preserve the owner-driven prepare contract: BookSession can retain
         # its own detached work. An accepted close must also release its source
         # before the window unregisters from file-operation ownership checks.
-        return not self.close_requested or window.book_session.shutdown_complete
+        return not self.close_requested or window.book_session.drain_shutdown()
 
     def _drain_auxiliary(self, window: ViewerWindow, wait_msecs: int) -> bool:
         return window._auxiliary_image_pool is None or window._auxiliary_image_pool.waitForDone(0)

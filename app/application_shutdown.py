@@ -3,12 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 import logging
+from time import monotonic
 from typing import Callable, Iterable
 
 from PySide6.QtCore import QObject, Signal
 
 
-_LOG = logging.getLogger(__name__)
+_LOG = logging.getLogger('nivisviewer.application_shutdown')
 
 
 class ApplicationShutdownState(StrEnum):
@@ -49,6 +50,10 @@ class ApplicationShutdownCoordinator(QObject):
         self._failed_step_index: int | None = None
         self._failed_step_name: str | None = None
         self._last_logged_failure: tuple[int, str] | None = None
+        self._logged_step = -1
+        self._phase_started = 0.0
+        self._next_wait_log = 0.0
+        self._diagnostics: Callable[[], object] | None = None
 
     @property
     def state(self) -> ApplicationShutdownState:
@@ -71,6 +76,7 @@ class ApplicationShutdownCoordinator(QObject):
         steps: Iterable[tuple[str, Callable[[], object]]],
         *,
         snapshot: ApplicationShutdownSnapshot | None = None,
+        diagnostics: Callable[[], object] | None = None,
     ) -> None:
         if self._state is not ApplicationShutdownState.RUNNING:
             return
@@ -79,6 +85,8 @@ class ApplicationShutdownCoordinator(QObject):
         self._failed_step_index = None
         self._failed_step_name = None
         self._last_logged_failure = None
+        self._logged_step = -1
+        self._diagnostics = diagnostics
         if snapshot is not None:
             self._snapshot = snapshot
 
@@ -91,11 +99,16 @@ class ApplicationShutdownCoordinator(QObject):
         while self._next_step_index < len(self._steps):
             step_index = self._next_step_index
             name, callback = self._steps[step_index]
+            now = monotonic()
+            if self._logged_step != step_index:
+                self._logged_step = step_index
+                self._phase_started = self._next_wait_log = now
+                _LOG.info('Application shutdown phase started step=%s owner=%x', name, id(self))
             self.phase_changed.emit(name)
             try:
                 result = callback()
             except Exception as exc:
-                self._record_failure(step_index, name, str(exc))
+                self._record_failure(step_index, name, str(exc), exc_info=True)
                 return False
             if result is False:
                 self._record_failure(
@@ -104,10 +117,13 @@ class ApplicationShutdownCoordinator(QObject):
                     f"Shutdown step '{name}' did not complete.",
                 )
                 return False
+            _LOG.info('Application shutdown phase complete step=%s elapsed_ms=%.1f',
+                      name, (monotonic() - self._phase_started) * 1000)
             self._next_step_index += 1
             self._failed_step_index = None
             self._failed_step_name = None
         self._state = ApplicationShutdownState.STOPPED
+        _LOG.info('Application shutdown all phases complete')
         self.shutdown_finished.emit()
         return True
 
@@ -116,6 +132,7 @@ class ApplicationShutdownCoordinator(QObject):
         step_index: int,
         step_name: str,
         message: str,
+        *, exc_info: bool = False,
     ) -> None:
         self._state = ApplicationShutdownState.TIMED_OUT
         self._failed_step_index = step_index
@@ -127,6 +144,17 @@ class ApplicationShutdownCoordinator(QObject):
                 step_name,
                 step_index,
                 message,
+                exc_info=exc_info,
             )
             self._last_logged_failure = failure
+        now = monotonic()
+        if self._diagnostics is not None and now >= self._next_wait_log:
+            self._next_wait_log = now + 5.0
+            try:
+                state = self._diagnostics()
+            except Exception:
+                _LOG.exception('Unable to collect application shutdown counters')
+            else:
+                _LOG.info('Application shutdown waiting step=%s elapsed_ms=%.1f state=%s',
+                          step_name, (now - self._phase_started) * 1000, state)
         self.shutdown_failed.emit(message)

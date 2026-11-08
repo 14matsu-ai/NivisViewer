@@ -37,7 +37,11 @@ def primary(server_name: str, ready: Path, result: Path) -> int:
         )
         application.quit()
 
-    broker.open_request_received.connect(received)
+    def accept(message):
+        received(message)
+        return True
+
+    broker.request_handler = accept
     if not broker.try_forward_or_listen(InstanceMessage(sender_pid=os.getpid())):
         return 2
     ready.write_text("ready", encoding="ascii")

@@ -802,7 +802,7 @@ def test_application_shutdown_exception_is_retryable_and_logged_once(
     )
     failures: list[str] = []
     coordinator.shutdown_failed.connect(failures.append)
-    with caplog.at_level(logging.ERROR, logger="app.application_shutdown"):
+    with caplog.at_level(logging.ERROR, logger="nivisviewer.application_shutdown"):
         assert not coordinator.begin_shutdown()
         assert not coordinator.begin_shutdown()
 
@@ -812,7 +812,7 @@ def test_application_shutdown_exception_is_retryable_and_logged_once(
     assert order == ["first", "fail", "fail"]
     assert failures == ["blocked", "blocked"]
     assert sum(
-        record.name == "app.application_shutdown"
+        record.name == "nivisviewer.application_shutdown"
         and "Application shutdown step failed" in record.getMessage()
         for record in caplog.records
     ) == 1

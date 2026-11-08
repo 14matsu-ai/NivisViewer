@@ -200,6 +200,11 @@ _RETIRED_BOOK_SESSIONS: set[BookSession] = set()
 _DEFAULT_PAGE_LIST_CACHE_BYTES = 32 * 1024 * 1024
 
 
+def retired_book_sessions(coordinator: ImageWorkCoordinator) -> tuple[BookSession, ...]:
+    return tuple(session for session in _RETIRED_BOOK_SESSIONS
+                 if session._image_work_coordinator is coordinator)
+
+
 class BookSession(QObject):
     book_opened = Signal(object)
     book_closed = Signal()
@@ -556,8 +561,36 @@ class BookSession(QObject):
 
     @property
     def shutdown_complete(self) -> bool:
-        # The retained set is released only after jobs and source handles drain.
-        return self._shutdown and self not in _RETIRED_BOOK_SESSIONS
+        return self._shutdown and self.source is None and not self._has_owned_async_work()
+
+    def drain_shutdown(self) -> bool:
+        if self._shutdown and not self.shutdown_complete:
+            self.release_retired_book_resources()
+        self._maybe_finalize_shutdown()
+        return self.shutdown_complete
+
+    def drain_closing_raster_artifacts(self) -> bool:
+        """One GUI artifact total per accepted close turn, including old books."""
+        owners = (self.viewer_runtime, *self._retired_viewer_runtimes.values())
+        pending = [runtime for runtime in owners if runtime is not None and
+                   (runtime.cached_unit_count or runtime.decoded_source_count)]
+        if not pending:
+            return True
+        done = pending[0].drain_retired_artifacts(max_items=1)
+        return done and len(pending) == 1
+
+    def shutdown_snapshot(self) -> dict[str, object]:
+        rasters = (self.viewer_runtime, *self._retired_viewer_runtimes.values())
+        page_lists = (self.page_list_runtime, *self._retired_page_list_runtimes.values())
+        return {
+            'owner': id(self), 'open_jobs': len(self._open_workers),
+            'prepared_opens': len(self._prepared_opens), 'retired_sources': len(self._retired_sources),
+            'legacy_image_bytes': self.image_cache.cache_bytes,
+            'legacy_image_requests': len(self.image_cache._in_flight),
+            'raster': [r.retirement_snapshot() for r in rasters if r is not None],
+            'page_lists': [{'owner': id(r), 'bytes': r.cache_bytes,
+                            'busy': r.has_unfinished_tasks()} for r in page_lists if r is not None],
+        }
 
     def shutdown(self, wait_msecs: int = 250) -> None:
         if self._shutdown:
@@ -913,9 +946,10 @@ class BookSession(QObject):
         self,
         runtime: RasterBookRuntime,
     ) -> None:
-        if not self._shutdown and not runtime.drain_retired_artifacts():
+        artifacts_left = (not self._shutdown and not runtime.drain_retired_artifacts())
+        if artifacts_left or runtime.has_unfinished_tasks():
             self._retired_viewer_runtimes[id(runtime)] = runtime
-            if not runtime.has_unfinished_tasks():
+            if artifacts_left:
                 self._retired_cleanup_timer.start()
             return
         self._retired_viewer_runtimes.pop(id(runtime), None)
@@ -929,12 +963,13 @@ class BookSession(QObject):
         if self._retired_cleanup_deferred or self._shutdown:
             return
         for runtime in tuple(self._retired_viewer_runtimes.values()):
-            if runtime.has_unfinished_tasks():
+            if (runtime.has_unfinished_tasks() and not runtime.cached_unit_count
+                    and not runtime.decoded_source_count):
                 continue
             source = runtime.source
             self._finalize_viewer_runtime(runtime)
             self._try_release_retired_source(source)
-            if any(not item.has_unfinished_tasks()
+            if any(not item.has_unfinished_tasks() or item.cached_unit_count or item.decoded_source_count
                    for item in self._retired_viewer_runtimes.values()):
                 self._retired_cleanup_timer.start()
             break
@@ -1069,28 +1104,23 @@ class BookSession(QObject):
 
         self._retired_cleanup_deferred = False
         for runtime in tuple(self._retired_viewer_runtimes.values()):
-            if not runtime.has_unfinished_tasks():
+            if not self._shutdown or not runtime.has_unfinished_tasks():
                 self._finalize_viewer_runtime(runtime)
         for runtime in tuple(self._retired_page_list_runtimes.values()):
             if not runtime.has_unfinished_tasks():
                 self._finalize_page_list_runtime(runtime)
         for source in tuple(self._retired_sources.values()):
             self._try_release_retired_source(source)
+        self._maybe_finalize_shutdown()
 
     def _has_owned_async_work(self) -> bool:
         return bool(
             self._open_workers
             or self._prepared_opens
             or self._retired_sources
-            or any(
-                runtime.has_unfinished_tasks()
-                for runtime in self._retired_viewer_runtimes.values()
-            )
-            or any(
-                runtime.has_unfinished_tasks()
-                for runtime in self._retired_page_list_runtimes.values()
-            )
-            or self.image_cache.has_unfinished_tasks()
+            or self._retired_viewer_runtimes
+            or self._retired_page_list_runtimes
+            or self.image_cache._in_flight
         )
 
     def _maybe_finalize_shutdown(self) -> None:

@@ -80,6 +80,7 @@ class PhysicalMemorySnapshot:
     process_working_set_bytes: int
     available_commit_bytes: int | None = None
     total_commit_bytes: int | None = None
+    process_private_commit_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,6 +307,7 @@ def _read_physical_memory_snapshot() -> PhysicalMemorySnapshot | None:
             process_working_set_bytes=max(0, int(counters.WorkingSetSize)),
             available_commit_bytes=max(0, int(status.ullAvailPageFile)),
             total_commit_bytes=max(0, int(status.ullTotalPageFile)),
+            process_private_commit_bytes=max(0, int(counters.PagefileUsage)),
         )
     except Exception:
         return None

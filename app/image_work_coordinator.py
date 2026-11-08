@@ -11,7 +11,7 @@ from weakref import WeakSet, WeakKeyDictionary
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal
 
 
-_LOG = logging.getLogger(__name__)
+_LOG = logging.getLogger('nivisviewer.image_work_coordinator')
 
 
 class ImageWorkPriority(IntEnum):
