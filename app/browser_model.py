@@ -60,6 +60,7 @@ class BrowserItem:
     created_time_ns: int | None = None
     accessed_time_ns: int | None = None
     online_only: bool = False
+    availability_known: bool = False
 
     @property
     def thumbnail_revision(self) -> tuple[object, ...]:
@@ -150,6 +151,7 @@ def browser_item_from_scan_entry(entry: BrowserScanEntry) -> BrowserItem:
         created_time_ns=entry.created_time_ns,
         accessed_time_ns=entry.accessed_time_ns,
         online_only=entry.online_only,
+        availability_known=entry.availability_known,
     )
 
 

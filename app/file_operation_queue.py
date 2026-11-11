@@ -3,11 +3,13 @@ from __future__ import annotations
 from .i18n import tr
 
 
+import logging
 import os
 from collections import deque
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from threading import Event, Lock
+from time import monotonic
 
 from PySide6.QtCore import (
     QEventLoop,
@@ -36,6 +38,9 @@ from .file_operation_service import (
 )
 
 
+_LOG = logging.getLogger("nivisviewer.file_operation")
+
+
 class FileOperationQueueState(StrEnum):
     RUNNING = "running"
     SHUTTING_DOWN = "shutting_down"
@@ -49,6 +54,7 @@ class _QueueEntry:
     state: FileOperationState = FileOperationState.PREPARING
     plan: FileOperationPlan | None = None
     cancelled: Event | None = None
+    gate_wait_started_at: float | None = None
 
 
 class _PreflightSignals(QObject):
@@ -70,9 +76,15 @@ class _PreflightWorker(QRunnable):
 
     @Slot()
     def run(self) -> None:
+        _LOG.info(
+            "file operation preflight request=%s kind=%s sources=%s",
+            self.request.request_id, self.request.operation.value,
+            len(self.request.source_paths),
+        )
         try:
             plan = self.planner.prepare(self.request, cancelled=self.cancelled)
         except BaseException as exc:
+            FileOperationService._log_io_failure("preflight", exc)
             plan = FileOperationPlan(
                 operation_id=self.request.operation_id,
                 request_id=self.request.request_id,
@@ -128,6 +140,10 @@ class _ExecutionWorker(QRunnable):
                 operation_id=self.request.operation_id,
             )
         self.signals.completed.emit(result)
+        _LOG.info(
+            "file operation worker result emitted request=%s kind=%s",
+            self.request.request_id, self.request.operation.value,
+        )
 
 
 class FileOperationQueue(QObject):
@@ -349,6 +365,7 @@ class FileOperationQueue(QObject):
                     request_id=target.request.request_id,
                     operation_id=target.operation_id,
                 )
+        self._finish_gate_wait(target, "cancelled")
         self._emit_state(target)
         if cancelled_result is not None:
             self._finish_result(cancelled_result)
@@ -388,6 +405,8 @@ class FileOperationQueue(QObject):
                 active = None
         if cancel_active and active is not None and active.cancelled is not None:
             active.cancelled.set()
+        if active is not None:
+            self._finish_gate_wait(active, "shutdown")
         for entry in pending:
             entry.state = FileOperationState.CANCELLED
         self.queue_changed.emit()
@@ -476,6 +495,11 @@ class FileOperationQueue(QObject):
                         (item.source_path, item.size_bytes) for item in plan.items
                     ),
                 )
+        _LOG.info(
+            "file operation plan request=%s state=%s inspected=%s conflicts=%s warnings=%s errors=%s",
+            request.request_id, entry.state.value, len(plan.items), len(plan.conflicts),
+            len(plan.warnings), len(plan.errors),
+        )
         self.plan_ready.emit(plan)
         self._emit_state(entry)
         if entry.state is FileOperationState.WAITING_FOR_CONFLICTS:
@@ -518,6 +542,18 @@ class FileOperationQueue(QObject):
         if entry is not None:
             self._start_execution(entry)
 
+    @staticmethod
+    def _finish_gate_wait(entry: _QueueEntry, outcome: str) -> None:
+        started = entry.gate_wait_started_at
+        if started is None:
+            return
+        entry.gate_wait_started_at = None
+        _LOG.info(
+            "file operation handle gate request=%s kind=%s state=%s elapsed_ms=%.1f",
+            entry.request.request_id, entry.request.operation.value, outcome,
+            (monotonic() - started) * 1000,
+        )
+
     def _start_execution(self, entry: _QueueEntry) -> None:
         with self._lock:
             if self._active is not entry:
@@ -526,8 +562,14 @@ class FileOperationQueue(QObject):
                              and not entry.cancelled.is_set())
         if needs_handles and self._execution_ready is not None and not self._execution_ready():
             # Optional selected-book reads must release Windows archive handles
-            # before a rename/move/delete starts. Drain asynchronously, keeping
+            # before publishing or mutating names. Drain asynchronously, keeping
             # the GUI and operation cancellation responsive.
+            if entry.gate_wait_started_at is None:
+                entry.gate_wait_started_at = monotonic()
+                _LOG.info(
+                    "file operation handle gate request=%s kind=%s state=waiting elapsed_ms=0.0",
+                    entry.request.request_id, entry.request.operation.value,
+                )
             self._gated_entry = entry
             self._execution_gate_timer.start(10)
             return
@@ -541,9 +583,11 @@ class FileOperationQueue(QObject):
                 stopped = False
                 entry.state = FileOperationState.RUNNING
         if stopped:
+            self._finish_gate_wait(entry, "shutdown")
             self._emit_state(entry)
             self._finish_shutdown()
             return
+        self._finish_gate_wait(entry, "cancelled" if entry.cancelled.is_set() else "released")
         self._emit_state(entry)
         self.operation_started.emit(entry.request)
         worker = _ExecutionWorker(self.service, entry.request, entry.cancelled or Event())

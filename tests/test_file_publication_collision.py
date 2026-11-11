@@ -16,12 +16,13 @@ from app.file_operation_service import (
 
 
 @pytest.mark.parametrize("move", [False, True])
+@pytest.mark.parametrize("name", ["日本語.txt", "a" * 180 + ".txt"])
 @pytest.mark.parametrize("policy", [
     FileCollisionPolicy.SKIP, FileCollisionPolicy.KEEP_BOTH,
     FileCollisionPolicy.REPLACE,
 ])
-def test_late_publication_collision_uses_policy(tmp_path, monkeypatch, move, policy):
-    source = tmp_path / "日本語.txt"
+def test_late_publication_collision_uses_policy(tmp_path, monkeypatch, move, name, policy):
+    source = tmp_path / name
     source.write_bytes(b"source")
     target = tmp_path / "target"
     target.mkdir()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import os
 import errno
 from pathlib import Path
@@ -161,14 +162,14 @@ def test_missing_and_permission_failure_are_item_scoped(
     blocked = tmp_path / "blocked.txt"
     good.write_text("good", encoding="utf-8")
     blocked.write_text("blocked", encoding="utf-8")
-    original_copy2 = __import__("shutil").copy2
+    original_open = builtins.open
 
-    def copy2(source, target, *args, **kwargs):
+    def open_file(source, *args, **kwargs):
         if os.path.normcase(os.fspath(source)) == os.path.normcase(str(blocked)):
             raise PermissionError("denied")
-        return original_copy2(source, target, *args, **kwargs)
+        return original_open(source, *args, **kwargs)
 
-    monkeypatch.setattr("app.file_operation_service.shutil.copy2", copy2)
+    monkeypatch.setattr("app.chunked_file_copier.open", open_file, raising=False)
 
     result = FileOperationService().copy(
         [tmp_path / "missing.txt", blocked, good],

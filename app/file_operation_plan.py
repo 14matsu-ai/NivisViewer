@@ -15,6 +15,7 @@ from typing import Iterable
 
 from .file_operation_service import FileOperationKind, FileOperationRequest
 from .file_operation_artifact import FileOperationArtifactPolicy
+from .file_operation_sources import SourcePreparationCancelled, prepare_source_paths
 from .windows_filename import validate_windows_filename
 
 
@@ -149,12 +150,17 @@ class FileOperationPlanner:
             )
         cancel = cancelled or Event()
         operation_id = request.operation_id or str(request.request_id or uuid.uuid4())
-        sources = self._prepare_sources(request.source_paths)
         destination_root = (
             self._absolute(request.destination_directory)
             if request.destination_directory
             else None
         )
+        try:
+            sources = self._prepare_sources(request.source_paths, cancelled=cancel)
+        except SourcePreparationCancelled:
+            return self._cancelled_plan(
+                request, operation_id, request.source_paths, destination_root,
+            )
         warnings: list[str] = []
         errors: list[str] = []
         conflicts: list[FileConflict] = []
@@ -731,20 +737,12 @@ class FileOperationPlanner:
             int(getattr(path_stat, "st_mtime_ns", 0)) or None,
         )
 
-    def _prepare_sources(self, paths: Iterable[str]) -> tuple[str, ...]:
-        unique: dict[str, str] = {}
-        for path in paths:
-            absolute = self._absolute(path)
-            unique.setdefault(self._path_key(absolute), absolute)
-        ordered = sorted(
-            unique.values(), key=lambda value: (len(Path(value).parts), self._path_key(value))
+    def _prepare_sources(
+        self, paths: Iterable[str], *, cancelled: Event | None = None,
+    ) -> tuple[str, ...]:
+        return prepare_source_paths(
+            paths, normalize=self._absolute, phase="planner", cancelled=cancelled,
         )
-        prepared: list[str] = []
-        for candidate in ordered:
-            if any(self._is_descendant(candidate, parent) for parent in prepared):
-                continue
-            prepared.append(candidate)
-        return tuple(prepared)
 
     @staticmethod
     def _absolute(path: str | Path | None) -> str:

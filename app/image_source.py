@@ -646,6 +646,9 @@ class FolderListingSnapshot:
     sort_identity: str = "name:ascending"
     selected_index: int | None = None
     filter_identity: str = "browser-visible-items"
+    # False is captured local, True captured online-only, None unknown.
+    # Admission evidence does not certify current bytes or permit a read.
+    image_availability: tuple[tuple[str, bool | None], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -925,22 +928,25 @@ class FolderImageSource(ImageSource):
         image_snapshot: tuple[str, ...] | None = None,
         file_size_snapshot: tuple[tuple[str, int | None], ...] | None = None,
         listing_snapshot: FolderListingSnapshot | None = None,
+        _admitted_image_snapshot: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__(folder_path)
         require_local(folder_path)
         self.recursive = recursive
         self.sort_descending = sort_descending
         self.use_zippla_cover = bool(use_zippla_cover)
-        self._image_snapshot = (
-            tuple(
+        # Only a thumbnail fork supplies this internal, already admitted list.
+        # Rechecking it could remove pages and desynchronize thumbnail indices.
+        self._image_snapshot = _admitted_image_snapshot
+        if self._image_snapshot is None and image_snapshot is not None:
+            known_local = self._known_local_snapshot_paths(image_snapshot, listing_snapshot)
+            self._image_snapshot = tuple(
                 path for path in image_snapshot
-                if local_image_candidate(path)
+                if (self._path_identity(path) in known_local or local_image_candidate(path))
                 and not is_cover_artifact_name(
                     Path(path).name, use_zippla_cover=self.use_zippla_cover,
                 )
             )
-            if image_snapshot is not None else None
-        )
         # Browser order is a book topology snapshot, not merely an open-time
         # directory-listing optimization.  Retain its identity for the whole
         # source lifetime so a plain Viewer reload can preserve the same page
@@ -963,6 +969,35 @@ class FolderImageSource(ImageSource):
         }
         if not self.source_path.is_dir():
             raise ImageSourceError(tr('フォルダが見つかりません: {p0}', p0=self.source_path))
+
+    def _known_local_snapshot_paths(
+        self,
+        images: tuple[str, ...] | None,
+        snapshot: FolderListingSnapshot | None,
+    ) -> set[str]:
+        """Build lexical admission evidence once; never authorize payload reads."""
+        if self.recursive or snapshot is None or images is None:
+            return set()
+        try:
+            if (snapshot.image_ids != images
+                    or self._path_identity(snapshot.folder) != self._path_identity(self.source_path)):
+                return set()
+            states: dict[str, bool | None] = {}
+            for evidence in getattr(snapshot, "image_availability", ()):
+                if not isinstance(evidence, tuple) or len(evidence) != 2:
+                    return set()
+                image_id, online_only = evidence
+                if not isinstance(image_id, str):
+                    return set()
+                state = online_only if type(online_only) is bool else None
+                key = self._path_identity(image_id)
+                if key in states and states[key] is not state:
+                    states[key] = None
+                else:
+                    states.setdefault(key, state)
+        except (TypeError, ValueError):
+            return set()
+        return {key for key, state in states.items() if state is False}
 
     def _remember_folder_metadata(
         self,
@@ -1334,7 +1369,7 @@ class FolderImageSource(ImageSource):
             recursive=self.recursive,
             sort_descending=self.sort_descending,
             use_zippla_cover=self.use_zippla_cover,
-            image_snapshot=tuple(self.list_images()),
+            _admitted_image_snapshot=tuple(self.list_images()),
             listing_snapshot=self.listing_snapshot,
         )
         source.vector_pdfium_service = self.vector_pdfium_service
@@ -2582,6 +2617,11 @@ def _create_image_source(
             ),
         )
         selected_image = selected_from_snapshot or str(target)
+        if snapshot_paths is not None and source.index_for_path(selected_image) < 0:
+            # Unknown/cloud admission can fail after the target guard passed.
+            # Do not let PageModel's missing-selection fallback open another page.
+            source.close()
+            raise ImageSourceError(tr('画像を読み込めません: {p0}', p0=selected_image))
         return source, selected_image
 
     raise ImageSourceError(tr('対応していない形式です: {p0}', p0=target))

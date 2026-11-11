@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import errno
+import logging
 from pathlib import Path
-from threading import Event
+from threading import Event, current_thread, main_thread
 from time import monotonic
 
-from PySide6.QtCore import QTimer
+import pytest
+from PySide6.QtCore import QThreadPool, QTimer
 from PySide6.QtWidgets import QApplication
 
 from app.file_operation_service import (
@@ -85,6 +88,71 @@ def test_executor_serializes_operations_and_reports_cancellation(
 
     assert completed and completed[0].cancelled
     executor.close()
+
+
+@pytest.mark.parametrize("worker_kind", ["queue", "executor"])
+@pytest.mark.parametrize("receipt_fails", [False, True])
+def test_undo_receipt_wait_is_between_service_result_and_worker_notification(
+    tmp_path, qapp, monkeypatch, caplog, worker_kind, receipt_fails,
+):
+    from app import file_operation_service as service_module
+    from app.file_operation_queue import _ExecutionWorker
+    from app.file_operation_worker import _FileOperationWorker
+
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"fixture payload")
+    destination = tmp_path / "target"
+    destination.mkdir()
+    entered = Event()
+    release = Event()
+    original_receipts = service_module.make_undo_entries
+
+    def delayed_receipts(result):
+        assert current_thread() is not main_thread()
+        entered.set()
+        assert release.wait(3)
+        if receipt_fails:
+            raise PermissionError(errno.EACCES, "private undo message", str(source), 5)
+        return original_receipts(result)
+
+    monkeypatch.setattr(service_module, "make_undo_entries", delayed_receipts)
+    operation = FileOperationRequest(52, FileOperationKind.COPY, (str(source),), str(destination))
+    worker_class = _ExecutionWorker if worker_kind == "queue" else _FileOperationWorker
+    worker = worker_class(FileOperationService(), operation, Event())
+    completed = []
+    worker.signals.completed.connect(completed.append)
+    pool = QThreadPool()
+    try:
+        with caplog.at_level(logging.INFO, logger="nivisviewer.file_operation"):
+            pool.start(worker)
+            assert entered.wait(2)
+            messages = [record.getMessage() for record in caplog.records]
+            assert any("file operation result request=52" in message for message in messages)
+            assert any("undo receipt start request=52" in message for message in messages)
+            assert not any("undo receipt complete" in message for message in messages)
+            assert not any("worker result emitted" in message for message in messages)
+            ticks = []
+            QTimer.singleShot(0, lambda: ticks.append(True))
+            qapp.processEvents()
+            assert ticks == [True]
+            assert not completed
+            release.set()
+            assert pool.waitForDone(3000)
+            qapp.processEvents()
+        messages = [record.getMessage() for record in caplog.records]
+        receipt_end = next(i for i, message in enumerate(messages) if "undo receipt complete" in message)
+        emitted = next(i for i, message in enumerate(messages) if "worker result emitted" in message)
+        assert receipt_end < emitted
+        assert f"failed={receipt_fails}" in messages[receipt_end]
+        assert len(completed) == 1 and completed[0].items[0].success
+        assert bool(completed[0].undo_entries) is not receipt_fails
+        assert (destination / source.name).read_bytes() == source.read_bytes()
+        assert str(tmp_path) not in caplog.text
+        assert "private undo message" not in caplog.text
+    finally:
+        release.set()
+        assert pool.waitForDone(3000)
+        qapp.processEvents()
 
 
 def test_close_does_not_wait_and_ignores_late_worker_result(

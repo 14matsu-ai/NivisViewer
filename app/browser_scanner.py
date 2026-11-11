@@ -111,6 +111,7 @@ class BrowserScanEntry:
     page_count: int | None = None
     created_time_ns: int | None = None
     accessed_time_ns: int | None = None
+    availability_known: bool = False
 
 
 @dataclass(frozen=True)
@@ -258,6 +259,9 @@ def scan_entry_from_dir_entry(
             entry_stat = entry.stat(follow_symlinks=False)
         except OSError:
             entry_stat = None
+    availability_attributes = (
+        getattr(entry_stat, "st_file_attributes", 0) if entry_stat is not None else 0
+    )
     # Only the filename is needed for display/rating metadata here. Keep the
     # absolute path once for the scan entry consumed by the model and cache.
     filename_metadata = ZipPlaFilenameMetadata.parse(name)
@@ -279,10 +283,11 @@ def scan_entry_from_dir_entry(
         openable_by_nivisviewer=supported,
         can_generate_preview=not transient_download,
         preview_kind=preview_kind,
-        online_only=requires_download(attributes),
+        online_only=requires_download(availability_attributes),
         rating=filename_metadata.rating,
         created_time_ns=creation_time_ns(entry_stat),
         accessed_time_ns=getattr(entry_stat, "st_atime_ns", None),
+        availability_known=entry_stat is not None,
     )
 
 

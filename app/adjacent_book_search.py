@@ -54,6 +54,8 @@ class AdjacentBookSnapshotEntry:
     openable_by_nivisviewer: bool = True
     created_time_ns: int | None = None
     accessed_time_ns: int | None = None
+    online_only: bool = False
+    availability_known: bool = False
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,9 @@ class AdjacentBookBrowserSnapshot:
     _image_fingerprints: tuple[tuple[str, int | None, int | None], ...] = field(
         init=False, repr=False, compare=False, hash=False,
     )
+    _image_availability: tuple[tuple[str, bool | None], ...] = field(
+        init=False, repr=False, compare=False, hash=False,
+    )
 
     def __post_init__(self) -> None:
         paths: list[str] = []
@@ -81,6 +86,7 @@ class AdjacentBookBrowserSnapshot:
         image_paths: list[str] = []
         image_indexes: dict[str, int] = {}
         fingerprints: list[tuple[str, int | None, int | None]] = []
+        availability: list[tuple[str, bool | None]] = []
         for entry in self.entries:
             if not entry.openable_by_nivisviewer or entry.item_kind == BrowserItemKind.OTHER.value:
                 continue
@@ -93,11 +99,13 @@ class AdjacentBookBrowserSnapshot:
                 image_indexes.setdefault(key, len(image_paths))
                 image_paths.append(path)
                 fingerprints.append((path, entry.file_size, entry.modified_time_ns))
+                availability.append((path, entry.online_only if entry.availability_known is True else None))
         object.__setattr__(self, "_viewer_paths", tuple(paths))
         object.__setattr__(self, "_viewer_indexes", MappingProxyType(indexes))
         object.__setattr__(self, "_image_paths", tuple(image_paths))
         object.__setattr__(self, "_image_indexes", MappingProxyType(image_indexes))
         object.__setattr__(self, "_image_fingerprints", tuple(fingerprints))
+        object.__setattr__(self, "_image_availability", tuple(availability))
 
     @property
     def viewer_paths(self) -> tuple[str, ...]:
@@ -115,6 +123,10 @@ class AdjacentBookBrowserSnapshot:
     @property
     def image_fingerprints(self) -> tuple[tuple[str, int | None, int | None], ...]:
         return self._image_fingerprints
+
+    @property
+    def image_availability(self) -> tuple[tuple[str, bool | None], ...]:
+        return self._image_availability
 
     def image_index_for_path(self, path: str | Path) -> int | None:
         """Index in the image-only projection (not the mixed Viewer order)."""

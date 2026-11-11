@@ -20,6 +20,7 @@ from threading import Event
 from typing import Callable, Iterable
 
 from .chunked_file_copier import ChunkedFileCopier, CopyCancelled
+from .file_operation_sources import SourcePreparationCancelled, prepare_source_paths
 from .file_operation_artifact import (
     ArtifactCleanupResult,
     FileOperationArtifactPolicy,
@@ -299,6 +300,10 @@ class FileOperationService:
         cancelled: Event | None = None,
         progress: ProgressCallback | None = None,
     ) -> FileOperationResult:
+        _LOG.info(
+            "file operation execute request=%s kind=%s sources=%s",
+            request.request_id, request.operation.value, len(request.source_paths),
+        )
         if _LOG.isEnabledFor(logging.DEBUG):
             _LOG.debug(
                 "service execute request=%s kind=%s sources=%r destination=%s",
@@ -313,7 +318,13 @@ class FileOperationService:
         if request.operation is FileOperationKind.CREATE_ZIP:
             return self._create_zip(request, cancel_event, progress)
 
-        sources = self._prepare_sources(request.source_paths)
+        try:
+            sources = self._prepare_sources(request.source_paths, cancelled=cancel_event)
+        except SourcePreparationCancelled:
+            return FileOperationResult(
+                request.operation, (), cancelled=True, request_id=request.request_id,
+                operation_id=request.operation_id,
+            )
         results: list[FileOperationItemResult] = []
         total = len(sources)
         was_cancelled = False
@@ -1115,7 +1126,7 @@ class FileOperationService:
             if not request.destination_directory or not os.path.isdir(parent):
                 raise NotADirectoryError(tr('作成先がフォルダではありません'))
             destination = os.path.join(parent, validation.normalized_name)
-            sources = self._prepare_sources(request.source_paths)
+            sources = self._prepare_sources(request.source_paths, cancelled=cancelled)
             if not sources:
                 raise ValueError(tr('圧縮する項目が選択されていません'))
             # Browser selections are direct children of the output folder.
@@ -1160,7 +1171,7 @@ class FileOperationService:
                 destination_exists_after=True, destination_published=True,
                 copied_bytes=copied_bytes, published_destination_paths=(destination,),
             )
-        except _OperationCancelled:
+        except (_OperationCancelled, SourcePreparationCancelled):
             item = self._failure(
                 None, destination, FileOperationErrorCode.CANCELLED,
                 tr('操作がキャンセルされました'), operation=request.operation,
@@ -1214,6 +1225,7 @@ class FileOperationService:
             uuid.uuid4().hex,
         )
         published = False
+        stage = "copy"
         try:
             if os.path.isdir(source):
                 self._copy_directory(source, temporary, cancelled)
@@ -1228,6 +1240,7 @@ class FileOperationService:
                 raise _OperationCancelled
             if not os.path.lexists(temporary):
                 raise OSError(tr('stagingの完成を確認できません'))
+            stage = "publish"
             if replace_existing:
                 os.replace(temporary, destination)
             else:
@@ -1238,6 +1251,7 @@ class FileOperationService:
                 except FileExistsError as exc:
                     raise _PublicationCollision(*exc.args) from exc
             published = True
+            stage = "verify_publish"
             if (
                 not os.path.lexists(destination)
                 or os.path.lexists(temporary)
@@ -1265,6 +1279,7 @@ class FileOperationService:
                 ) from exc
             raise
         except BaseException as exc:
+            self._log_io_failure(stage, exc)
             cleanup = FileOperationArtifactPolicy.cleanup_staging_path(temporary)
             if not cleanup.removed:
                 raise _ArtifactOperationError(
@@ -1760,6 +1775,7 @@ class FileOperationService:
             raise _PublicationCollision(*exc.args) from exc
         except OSError as exc:
             if exc.errno != errno.EXDEV:
+                self._log_io_failure("rename", exc)
                 raise
         source_receipt = self._capture_source_receipt(source)
         published = self._copy_atomic(source, destination, cancelled)
@@ -1783,13 +1799,7 @@ class FileOperationService:
                 )
             self._remove_source_receipt(source, source_receipt, cancelled)
         except OSError as exc:
-            if _LOG.isEnabledFor(logging.DEBUG):
-                _LOG.debug(
-                    "cross-volume source delete failed source=%s destination=%s error=%r",
-                    source,
-                    destination,
-                    exc,
-                )
+            self._log_io_failure("remove_source", exc)
             raise _SourceDeleteFailed(
                 tr('コピーは完了しましたがコピー元を削除できませんでした: {p0}', p0=exc)
             ) from exc
@@ -1824,6 +1834,7 @@ class FileOperationService:
                 return
             except OSError as exc:
                 if exc.errno != errno.EXDEV:
+                    self._log_io_failure("replace", exc)
                     raise
         source_receipt = self._capture_source_receipt(source)
         self._copy_atomic_replace(source, destination, cancelled)
@@ -1840,13 +1851,7 @@ class FileOperationService:
                 )
             self._remove_source_receipt(source, source_receipt, cancelled)
         except OSError as exc:
-            if _LOG.isEnabledFor(logging.DEBUG):
-                _LOG.debug(
-                    "replace source delete failed source=%s destination=%s error=%r",
-                    source,
-                    destination,
-                    exc,
-                )
+            self._log_io_failure("remove_source", exc)
             raise _SourceDeleteFailed(
                 tr('置換は完了しましたがコピー元を削除できませんでした: {p0}', p0=exc)
             ) from exc
@@ -1921,7 +1926,11 @@ class FileOperationService:
                     )
                     visit(os.path.join(path, name), child_relative)
 
-        visit(source, "")
+        try:
+            visit(source, "")
+        except OSError as exc:
+            cls._log_io_failure("capture_source", exc)
+            raise
         return tuple(sorted(receipt, key=lambda item: item.relative_path))
 
     @classmethod
@@ -2046,26 +2055,12 @@ class FileOperationService:
                 return str(resolution)
         return request.collision_policy.value
 
-    def _prepare_sources(self, paths: Iterable[str]) -> tuple[str, ...]:
-        unique: list[str] = []
-        seen: set[str] = set()
-        for raw_path in paths:
-            absolute = self._absolute(raw_path)
-            key = self._path_key(absolute)
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(absolute)
-        unique.sort(key=lambda path: (len(Path(path).parts), self._path_key(path)))
-        prepared: list[str] = []
-        for candidate in unique:
-            if any(
-                os.path.isdir(parent) and self._is_descendant(candidate, parent)
-                for parent in prepared
-            ):
-                continue
-            prepared.append(candidate)
-        return tuple(prepared)
+    def _prepare_sources(
+        self, paths: Iterable[str], *, cancelled: Event | None = None,
+    ) -> tuple[str, ...]:
+        return prepare_source_paths(
+            paths, normalize=self._absolute, phase="service", cancelled=cancelled,
+        )
 
     @staticmethod
     def _absolute(path: str | Path | None) -> str:
@@ -2340,6 +2335,7 @@ class FileOperationService:
         *,
         operation: FileOperationKind | None = None,
     ) -> FileOperationItemResult:
+        cls._log_io_failure("result", error)
         if isinstance(error, FileNotFoundError):
             code = FileOperationErrorCode.NOT_FOUND
         elif isinstance(error, PermissionError):
@@ -2402,13 +2398,58 @@ class FileOperationService:
             cleanup_errors=cleanup_errors,
         )
 
+    @staticmethod
+    def _log_io_failure(stage: str, error: BaseException) -> None:
+        cause = error
+        for _ in range(8):
+            if cause.__cause__ is None:
+                break
+            cause = cause.__cause__
+        # OSError text and filenames can contain private paths or server names.
+        _LOG.warning(
+            "file operation failure stage=%s error_type=%s cause_type=%s errno=%s winerror=%s",
+            stage, type(error).__name__, type(cause).__name__,
+            getattr(cause, "errno", None), getattr(cause, "winerror", None),
+        )
+
     def execute(self, request, *, cancelled=None, progress=None):
         if request.operation is FileOperationKind.UNDO:
-            return run_undo(self, request, cancelled, progress)
-        result = self._execute_request(request, cancelled=cancelled, progress=progress)
+            result = run_undo(self, request, cancelled, progress)
+        else:
+            result = self._execute_request(request, cancelled=cancelled, progress=progress)
+        _LOG.info(
+            "file operation result request=%s kind=%s completed=%s failed=%s partial=%s cancelled=%s",
+            request.request_id, request.operation.value, len(result.successes),
+            len(result.failures), sum(item.partial_success for item in result.items),
+            result.cancelled,
+        )
+        for item in result.effective_items:
+            if not item.success:
+                _LOG.warning(
+                    "file operation item request=%s kind=%s state=%s code=%s "
+                    "published=%s source_removed=%s artifacts=%s",
+                    request.request_id, request.operation.value, item.state.value,
+                    item.error_code, item.destination_published, item.source_removed,
+                    len(item.artifact_paths),
+                )
+        if request.operation is FileOperationKind.UNDO:
+            return result
+        receipt_started = time.monotonic()
+        _LOG.info(
+            "file operation undo receipt start request=%s kind=%s",
+            request.request_id, request.operation.value,
+        )
+        receipt_failed = False
         try:
             entries = make_undo_entries(result)
-        except Exception:
-            _LOG.exception("Undo receipt unavailable after completed operation")
+        except Exception as exc:
+            self._log_io_failure("undo_receipt", exc)
+            receipt_failed = True
             entries = ()
+        _LOG.info(
+            "file operation undo receipt complete request=%s kind=%s "
+            "entries=%s failed=%s elapsed_ms=%.1f",
+            request.request_id, request.operation.value, len(entries), receipt_failed,
+            (time.monotonic() - receipt_started) * 1000,
+        )
         return replace(result, undo_entries=entries)

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import logging
 import os
+import stat
 import uuid
 from pathlib import Path
 from threading import Event
@@ -67,6 +69,8 @@ def _nested_legacy_name(final_name: str = "image.png") -> str:
     [
         (_artifact_name(), True),
         (_nested_legacy_name(), True),
+        (f".nivisviewer-{uuid.uuid4().hex}.tmp", True),
+        (".nivisviewer-short.tmp", False),
         (".image.png.nivisviewer-not valid-item.tmp", False),
         (".image.png.nivisviewer-missingitem.tmp", False),
         ("ordinary.tmp", False),
@@ -491,12 +495,14 @@ def test_cancel_after_publish_keeps_final_and_source_as_partial(
     assert FileOperationArtifactPolicy.find_orphans(destination_folder) == ()
 
 
+@pytest.mark.parametrize("artifact_name", [_artifact_name(), f".nivisviewer-{uuid.uuid4().hex}.tmp"])
 def test_planner_and_service_reject_internal_artifact_source(
     tmp_path: Path,
+    artifact_name: str,
 ) -> None:
     destination = tmp_path / "destination"
     destination.mkdir()
-    artifact = tmp_path / _artifact_name()
+    artifact = tmp_path / artifact_name
     artifact.write_bytes(b"recoverable")
     request = FileOperationRequest(
         1,
@@ -518,10 +524,12 @@ def test_planner_and_service_reject_internal_artifact_source(
     assert not tuple(destination.iterdir())
 
 
+@pytest.mark.parametrize("artifact_name", [_artifact_name(), f".nivisviewer-{uuid.uuid4().hex}.tmp"])
 def test_artifact_never_enters_clipboard_drag_or_browser_model(
     tmp_path: Path,
+    artifact_name: str,
 ) -> None:
-    artifact = tmp_path / _artifact_name()
+    artifact = tmp_path / artifact_name
     normal = tmp_path / "README"
     artifact.write_bytes(b"artifact")
     normal.write_bytes(b"normal")
@@ -603,9 +611,11 @@ def test_internal_artifacts_are_hidden_with_all_visibility_flags(
     folder.mkdir()
     artifact = folder / _artifact_name()
     nested = folder / _nested_legacy_name()
+    compact = folder / f".nivisviewer-{uuid.uuid4().hex}.tmp"
     ordinary_tmp = folder / "ordinary.tmp"
     artifact.write_bytes(b"artifact")
     nested.write_bytes(b"nested")
+    compact.write_bytes(b"compact")
     ordinary_tmp.write_bytes(b"normal")
     batches = []
 
@@ -763,6 +773,238 @@ def test_real_conflict_dialog_updates_all_detail_labels(
     dialog._apply(plan.conflicts[1].allowed_resolutions[1])
     assert dialog.detail_labels["action"].text() == "keep_both"
     dialog.close()
+
+
+@pytest.mark.parametrize("name", ["a" * 180 + ".bin", "画像" * 90 + ".bin"])
+@pytest.mark.parametrize("move", [False, True])
+def test_long_name_transfer_uses_detectable_short_artifact(tmp_path, monkeypatch, name, move):
+    source = tmp_path / name
+    source.write_bytes(b"long name data")
+    target = tmp_path / "target"
+    target.mkdir()
+    staging = Path(FileOperationArtifactPolicy.create_staging_path(target / name))
+    assert len(staging.name) < 80
+    assert FileOperationArtifactPolicy.is_internal_operation_artifact(staging)
+    with pytest.raises(ValueError):
+        FileOperationArtifactPolicy.create_staging_path(staging)
+    # A compact orphan must not guess the original filename from a digest.
+    staging.write_bytes(b"unfinished")
+    description = OrphanArtifactScanner().scan(target)[0]
+    assert description.final_destination is None
+    assert description.final_destination_exists is None
+    assert FileOperationArtifactPolicy.cleanup_staging_path(staging).removed
+    original_rename = os.rename
+
+    def cross_volume(old, new):
+        if Path(old) == source:
+            raise OSError(errno.EXDEV, "cross volume")
+        return original_rename(old, new)
+
+    monkeypatch.setattr(os, "rename", cross_volume)
+    service = FileOperationService()
+    result = (service.move if move else service.copy)([source], target)
+    assert result.items[0].success
+    assert (target / name).read_bytes() == b"long name data"
+    assert source.exists() is not move
+    assert result.undo_entries
+    assert not FileOperationArtifactPolicy.find_orphans(target)
+    if move:
+        # The short artifact must not prevent a normal move undo receipt.
+        undo = service.execute(FileOperationRequest(
+            2, FileOperationKind.UNDO, undo_entries=result.undo_entries,
+        ))
+        assert undo.items[0].success
+        assert source.read_bytes() == b"long name data"
+        assert not (target / name).exists()
+
+
+@pytest.mark.parametrize("size", [0, 1024, 4 * 1024 * 1024, 4 * 1024 * 1024 + 1])
+@pytest.mark.parametrize("folder", [False, True])
+def test_readonly_copy_preserves_source_and_destination_attributes(tmp_path, size, folder):
+    source_folder = tmp_path / "source"
+    source_folder.mkdir()
+    source = source_folder / "読み取り専用.bin"
+    source.write_bytes(b"r" * size)
+    mode = source.stat().st_mode
+    source.chmod(stat.S_IREAD)
+    readonly_mode = source.stat().st_mode
+    target = tmp_path / "target"
+    target.mkdir()
+    destination = target / source_folder.name / source.name if folder else target / source.name
+    try:
+        result = FileOperationService().copy([source_folder if folder else source], target)
+        assert result.items[0].success
+        assert destination.read_bytes() == source.read_bytes()
+        assert source.stat().st_mode == readonly_mode
+        assert not destination.stat().st_mode & stat.S_IWRITE
+        assert not FileOperationArtifactPolicy.find_orphans(target)
+    finally:
+        source.chmod(mode)
+        if destination.exists():
+            destination.chmod(mode)
+
+
+@pytest.mark.parametrize("folder", [False, True])
+def test_readonly_staging_is_cleaned_after_publish_failure(tmp_path, monkeypatch, folder, caplog):
+    source_folder = tmp_path / "source"
+    source_folder.mkdir()
+    source = source_folder / "readonly.bin"
+    source.write_bytes(b"protected source")
+    mode = source.stat().st_mode
+    source.chmod(stat.S_IREAD)
+    readonly_mode = source.stat().st_mode
+    target = tmp_path / "target"
+    target.mkdir()
+
+    def fail_publish(old, new):
+        raise PermissionError(errno.EACCES, "private message", str(old), 5, str(new))
+
+    monkeypatch.setattr(os, "rename", fail_publish)
+    try:
+        with caplog.at_level(logging.INFO, logger="nivisviewer.file_operation"):
+            result = FileOperationService().copy([source_folder if folder else source], target)
+        item = result.items[0]
+        assert not item.success
+        assert item.error_code == FileOperationErrorCode.ACCESS_DENIED.value
+        assert not item.destination_published
+        assert not FileOperationArtifactPolicy.find_orphans(target)
+        assert source.read_bytes() == b"protected source"
+        assert source.stat().st_mode == readonly_mode
+        assert "stage=publish" in caplog.text
+        assert "winerror=5" in caplog.text
+        assert str(tmp_path) not in caplog.text
+        assert "private message" not in caplog.text
+    finally:
+        source.chmod(mode)
+
+
+@pytest.mark.parametrize("failure_stage", ["flush", "metadata"])
+@pytest.mark.parametrize("move", [False, True])
+def test_transfer_io_failure_preserves_source_and_existing_destination(
+    tmp_path, monkeypatch, caplog, failure_stage, move,
+):
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"source")
+    target = tmp_path / "target"
+    target.mkdir()
+    destination = target / source.name
+    destination.write_bytes(b"existing")
+    original_rename = os.rename
+    original_replace = os.replace
+
+    def cross_volume(old, new):
+        if Path(old) == source:
+            raise OSError(errno.EXDEV, "cross volume")
+        return original_rename(old, new)
+
+    def fail(*args, **kwargs):
+        raise OSError(errno.EIO, "simulated transfer failure")
+
+    def cross_volume_replace(old, new):
+        if Path(old) == source:
+            raise OSError(errno.EXDEV, "cross volume")
+        return original_replace(old, new)
+
+    monkeypatch.setattr(os, "rename", cross_volume)
+    monkeypatch.setattr(os, "replace", cross_volume_replace)
+    monkeypatch.setattr(
+        "app.chunked_file_copier.os.fsync" if failure_stage == "flush"
+        else "app.chunked_file_copier.shutil.copystat", fail,
+    )
+    service = FileOperationService()
+    with caplog.at_level(logging.INFO, logger="nivisviewer.file_operation"):
+        item = (service.move if move else service.copy)(
+            [source], target, collision_policy=FileCollisionPolicy.REPLACE,
+        ).items[0]
+    assert not item.success
+    assert not item.destination_published
+    assert source.read_bytes() == b"source"
+    assert destination.read_bytes() == b"existing"
+    assert not FileOperationArtifactPolicy.find_orphans(target)
+    assert f"file copy failure stage={failure_stage}" in caplog.text
+    assert "stage_ms=" in caplog.text
+    assert str(tmp_path) not in caplog.text
+    assert "simulated transfer failure" not in caplog.text
+
+
+def test_readonly_copy_cancelled_after_metadata_cleans_staging(tmp_path):
+    source = tmp_path / "readonly.bin"
+    source.write_bytes(b"source")
+    original_mode = source.stat().st_mode
+    source.chmod(stat.S_IREAD)
+    target = tmp_path / "target"
+    target.mkdir()
+    cancelled = Event()
+
+    class CancellingCopier(ChunkedFileCopier):
+        def copy_to_staging(self, *args, **kwargs):
+            copied = super().copy_to_staging(*args, **kwargs)
+            cancelled.set()
+            return copied
+
+    service = FileOperationService()
+    service.file_copier = CancellingCopier()
+    try:
+        result = service.copy([source], target, cancelled=cancelled)
+        assert result.cancelled
+        assert not result.items[0].success
+        assert source.read_bytes() == b"source"
+        assert not source.stat().st_mode & stat.S_IWRITE
+        assert not tuple(target.iterdir())
+    finally:
+        source.chmod(original_mode)
+
+
+def test_copy_to_staging_does_not_overwrite_existing_small_file(tmp_path):
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"source")
+    staging = tmp_path / "existing.bin"
+    staging.write_bytes(b"existing")
+    with pytest.raises(FileExistsError):
+        ChunkedFileCopier().copy_to_staging(source, staging)
+    assert staging.read_bytes() == b"existing"
+    assert source.read_bytes() == b"source"
+
+
+@pytest.mark.parametrize("identity_field", ["st_dev", "st_ino"])
+def test_cross_volume_move_without_source_identity_is_rejected_before_copy(
+    tmp_path, monkeypatch, identity_field,
+):
+    from types import SimpleNamespace
+
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"source")
+    target = tmp_path / "target"
+    target.mkdir()
+    original_lstat = os.lstat
+    original_rename = os.rename
+
+    def unavailable_identity(path, *args, **kwargs):
+        value = original_lstat(path, *args, **kwargs)
+        if Path(path) == source:
+            attributes = {name: getattr(value, name) for name in dir(value) if name.startswith("st_")}
+            attributes[identity_field] = 0
+            return SimpleNamespace(**attributes)
+        return value
+
+    def cross_volume(old, new):
+        if Path(old) == source:
+            raise OSError(errno.EXDEV, "cross volume")
+        return original_rename(old, new)
+
+    monkeypatch.setattr(os, "lstat", unavailable_identity)
+    monkeypatch.setattr(os, "rename", cross_volume)
+    item = FileOperationService().move([source], target).items[0]
+    assert not item.success
+    assert not item.destination_published
+    assert source.read_bytes() == b"source"
+    assert not tuple(target.iterdir())
+
+
+@pytest.mark.parametrize("source", [r"\\server\share\画像.bin", r"Z:\画像.bin"])
+def test_network_path_mime_round_trip_is_lexical(source):
+    mime = build_path_mime_data((source,))
+    assert paths_from_mime_data(mime) == (source,)
 
 
 def test_single_conflict_upper_table_renders_integer_roles_compactly(

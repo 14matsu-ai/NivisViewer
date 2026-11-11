@@ -7,9 +7,13 @@ import logging
 import os
 import re
 import shutil
+import stat
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+from .windows_filename import MAX_WINDOWS_FILENAME_UNITS
 
 
 _LOG = logging.getLogger("nivisviewer.file_operation")
@@ -24,6 +28,7 @@ _LEGACY_PATTERN = re.compile(
     r"^\.(?P<final>.+)\.nivisviewer-(?P<identifier>[0-9a-f]{32})\.tmp$",
     re.IGNORECASE,
 )
+_COMPACT_PATTERN = re.compile(r"^\.nivisviewer-[0-9a-f]{32}\.tmp$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -36,11 +41,11 @@ class ArtifactCleanupResult:
 @dataclass(frozen=True)
 class OperationArtifactDescription:
     path: str
-    final_destination: str
+    final_destination: str | None
     nested: bool
     size: int | None
     modified_time_ns: int | None
-    final_destination_exists: bool
+    final_destination_exists: bool | None
     source_known: bool = False
 
 
@@ -55,7 +60,11 @@ class FileOperationArtifactPolicy:
         item_id: str | None = None,
     ) -> str:
         requested = cls._absolute(final_destination)
-        final = cls.derive_final_destination(requested) or requested
+        final = cls.derive_final_destination(requested)
+        if final is None:
+            if cls.is_internal_operation_artifact(requested):
+                raise ValueError("staging path does not encode a final destination")
+            final = requested
         operation = cls._identifier(operation_id)
         item = cls._identifier(item_id)
         parent = os.path.dirname(final)
@@ -66,6 +75,14 @@ class FileOperationArtifactPolicy:
             parent,
             f".{name}.nivisviewer-{operation}-{item}.tmp",
         )
+        # Keep the historical recoverable name when it fits. A valid final
+        # name can already fill a filesystem component or the Win32 path limit.
+        if (
+            len(os.path.basename(candidate).encode("utf-16-le")) // 2 > MAX_WINDOWS_FILENAME_UNITS
+            or len(os.fsencode(os.path.basename(candidate))) > MAX_WINDOWS_FILENAME_UNITS
+            or (os.name == "nt" and len(candidate.encode("utf-16-le")) // 2 >= 260)
+        ):
+            candidate = os.path.join(parent, f".nivisviewer-{uuid.uuid4().hex}.tmp")
         if cls.is_internal_operation_artifact(candidate):
             if os.path.lexists(candidate):
                 raise FileExistsError(
@@ -86,7 +103,7 @@ class FileOperationArtifactPolicy:
     ) -> str | None:
         current = cls._absolute(staging_path)
         match = cls._match_name(os.path.basename(current))
-        if match is None:
+        if match is None or match.groupdict().get("final") is None:
             return None
         parent = os.path.dirname(current)
         final_name = match.group("final")
@@ -97,6 +114,8 @@ class FileOperationArtifactPolicy:
             nested_match = cls._match_name(os.path.basename(derived))
             if nested_match is None:
                 return derived
+            if nested_match.groupdict().get("final") is None:
+                return None
             derived = os.path.join(
                 os.path.dirname(derived),
                 nested_match.group("final"),
@@ -117,14 +136,39 @@ class FileOperationArtifactPolicy:
             )
         try:
             if os.path.isdir(target) and not os.path.islink(target):
-                shutil.rmtree(target)
+                shutil.rmtree(target, onexc=cls._remove_readonly_artifact)
             else:
-                os.unlink(target)
+                try:
+                    os.unlink(target)
+                except PermissionError as exc:
+                    cls._remove_readonly_artifact(os.unlink, target, exc)
         except FileNotFoundError:
             return ArtifactCleanupResult(target, True)
         except OSError as exc:
             return ArtifactCleanupResult(target, False, str(exc))
         return ArtifactCleanupResult(target, not os.path.lexists(target))
+
+    @staticmethod
+    def _remove_readonly_artifact(
+        function: Callable[[str], object], path: str, error: BaseException,
+    ) -> None:
+        # Only a failed removal inside the selected operation artifact may
+        # change attributes. Never follow a link to a user's original file.
+        if (
+            os.name != "nt"
+            or not isinstance(error, PermissionError)
+            or function not in {os.unlink, os.remove, os.rmdir}
+        ):
+            raise error
+        value = os.lstat(path)
+        if (
+            not (stat.S_ISREG(value.st_mode) or stat.S_ISDIR(value.st_mode))
+            or getattr(value, "st_file_attributes", 0) & 0x400
+            or value.st_mode & stat.S_IWRITE
+        ):
+            raise error
+        os.chmod(path, value.st_mode | stat.S_IWRITE, follow_symlinks=False)
+        function(path)
 
     @classmethod
     def describe_artifact(
@@ -132,9 +176,9 @@ class FileOperationArtifactPolicy:
         path: str | Path,
     ) -> OperationArtifactDescription | None:
         target = cls._absolute(path)
-        final = cls.derive_final_destination(target)
-        if final is None:
+        if not cls.is_internal_operation_artifact(target):
             return None
+        final = cls.derive_final_destination(target)
         nested = cls._nested_depth(target) > 1
         try:
             path_stat = os.lstat(target)
@@ -150,7 +194,7 @@ class FileOperationArtifactPolicy:
             nested=nested,
             size=size,
             modified_time_ns=modified_time_ns,
-            final_destination_exists=os.path.lexists(final),
+            final_destination_exists=os.path.lexists(final) if final else None,
         )
 
     @classmethod
@@ -190,12 +234,18 @@ class FileOperationArtifactPolicy:
             if match is None:
                 break
             depth += 1
+            if match.groupdict().get("final") is None:
+                break
             name = match.group("final")
         return depth
 
     @staticmethod
     def _match_name(name: str) -> re.Match[str] | None:
-        return _CANONICAL_PATTERN.fullmatch(name) or _LEGACY_PATTERN.fullmatch(name)
+        return (
+            _CANONICAL_PATTERN.fullmatch(name)
+            or _LEGACY_PATTERN.fullmatch(name)
+            or _COMPACT_PATTERN.fullmatch(name)
+        )
 
     @staticmethod
     def _identifier(value: str | None) -> str:

@@ -1252,6 +1252,8 @@ class BrowserWindow(QMainWindow):
                     openable_by_nivisviewer=item.openable_by_nivisviewer,
                     created_time_ns=item.created_time_ns,
                     accessed_time_ns=item.accessed_time_ns,
+                    online_only=item.online_only,
+                    availability_known=item.availability_known,
                 )
                 for item in (
                     self._visible_order_snapshot_items()
@@ -3012,6 +3014,10 @@ class BrowserWindow(QMainWindow):
                 + (f":seed={self.browser_random_seed}" if self.browser_sort_key is BrowserSortKey.RANDOM else "")
             ),
             selected_index=selected_index,
+            image_availability=tuple(
+                (str(candidate.path), candidate.online_only if candidate.availability_known is True else None)
+                for candidate in candidates if candidate.kind is BrowserItemKind.IMAGE
+            ),
             filter_identity=(
                 f"hidden={int(self.browser_show_hidden_items)}:"
                 f"unsupported={int(self.browser_show_unsupported_files)}:"
@@ -4300,6 +4306,11 @@ class BrowserWindow(QMainWindow):
         ) or (
             result.operation is FileOperationKind.COPY
             and destination_is_current
+        )
+        _FILE_OPERATION_LOG.info(
+            "file operation browser result request=%s kind=%s completed=%s failed=%s refresh=%s",
+            result.request_id, result.operation.value, success_count,
+            failure_count, should_refresh,
         )
         if not should_refresh:
             self._show_temporary_status(completion_message)

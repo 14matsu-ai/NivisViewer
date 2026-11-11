@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from threading import Event, Lock
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot
@@ -14,6 +15,7 @@ from .file_operation_service import (
 
 
 _RETIRED_EXECUTORS: set[FileOperationExecutor] = set()
+_LOG = logging.getLogger("nivisviewer.file_operation")
 
 
 class _FileOperationWorkerSignals(QObject):
@@ -59,6 +61,10 @@ class _FileOperationWorker(QRunnable):
                 operation_id=self.request.operation_id,
             )
         self.signals.completed.emit(result)
+        _LOG.info(
+            "file operation worker result emitted request=%s kind=%s",
+            self.request.request_id, self.request.operation.value,
+        )
 
 
 class FileOperationExecutor(QObject):

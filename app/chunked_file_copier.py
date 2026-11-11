@@ -3,14 +3,19 @@ from __future__ import annotations
 from .i18n import tr
 
 
+import logging
 import os
 import shutil
 import uuid
 from pathlib import Path
 from threading import Event
+from time import monotonic
 from typing import Callable
 
 from .file_operation_artifact import FileOperationArtifactPolicy
+
+
+_LOG = logging.getLogger("nivisviewer.file_operation")
 
 
 class CopyCancelled(Exception):
@@ -80,46 +85,51 @@ class ChunkedFileCopier:
         source_path = os.fspath(source)
         staging_path = os.fspath(staging)
         cancel = cancelled or Event()
-        expected = os.path.getsize(source_path)
-        copied = 0
-        if cancel.is_set():
-            raise CopyCancelled
-        if expected <= self.chunk_size:
-            shutil.copy2(source_path, staging_path, follow_symlinks=False)
-            copied = expected
-            with open(staging_path, "r+b", buffering=0) as staged_file:
-                staged_file.flush()
-                os.fsync(staged_file.fileno())
-            if progress is not None and copied:
-                progress(copied)
+        started = stage_started = monotonic()
+        stage = "source_size"
+        try:
+            expected = os.path.getsize(source_path)
+            copied = 0
             if cancel.is_set():
                 raise CopyCancelled
-            actual = os.path.getsize(staging_path)
-            if actual != expected:
+            stage = "read_write"
+            stage_started = monotonic()
+            with open(source_path, "rb", buffering=0) as input_file:
+                with open(staging_path, "xb") as output_file:
+                    while True:
+                        if cancel.is_set():
+                            raise CopyCancelled
+                        block = input_file.read(self.chunk_size)
+                        if not block:
+                            break
+                        output_file.write(block)
+                        copied += len(block)
+                        if progress is not None:
+                            progress(len(block))
+                    stage = "flush"
+                    stage_started = monotonic()
+                    output_file.flush()
+                    os.fsync(output_file.fileno())
+            stage = "size_verification"
+            stage_started = monotonic()
+            if copied != expected or os.path.getsize(staging_path) != expected:
                 raise OSError(
-                    tr('コピーサイズが一致しません: expected={p0}, copied={p1}', p0=expected, p1=actual)
+                    tr('コピーサイズが一致しません: expected={p0}, copied={p1}', p0=expected, p1=copied)
                 )
+            stage = "metadata"
+            stage_started = monotonic()
+            shutil.copystat(source_path, staging_path, follow_symlinks=False)
             return copied
-        with open(source_path, "rb", buffering=0) as input_file:
-            with open(staging_path, "xb", buffering=0) as output_file:
-                while True:
-                    if cancel.is_set():
-                        raise CopyCancelled
-                    block = input_file.read(self.chunk_size)
-                    if not block:
-                        break
-                    output_file.write(block)
-                    copied += len(block)
-                    if progress is not None:
-                        progress(len(block))
-                output_file.flush()
-                os.fsync(output_file.fileno())
-        if copied != expected or os.path.getsize(staging_path) != expected:
-            raise OSError(
-                tr('コピーサイズが一致しません: expected={p0}, copied={p1}', p0=expected, p1=copied)
+        except OSError as exc:
+            now = monotonic()
+            # Keep file/server names and the exception message out of normal logs.
+            _LOG.warning(
+                "file copy failure stage=%s stage_ms=%.1f elapsed_ms=%.1f "
+                "error_type=%s errno=%s winerror=%s",
+                stage, (now - stage_started) * 1000, (now - started) * 1000,
+                type(exc).__name__, exc.errno, getattr(exc, "winerror", None),
             )
-        shutil.copystat(source_path, staging_path, follow_symlinks=False)
-        return copied
+            raise
 
     @classmethod
     def find_temporary_files(

@@ -1737,6 +1737,7 @@ class ApplicationController(QObject):
             sort_identity=snapshot.sort_identity,
             selected_index=selected_index,
             filter_identity=snapshot.filter_identity,
+            image_availability=snapshot.image_availability,
         )
 
     def _cancel_adjacent_search(
