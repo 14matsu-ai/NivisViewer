@@ -17,8 +17,9 @@ from app.application_controller import ApplicationController
 from app.command_line import parse_command_line, version_text
 from app.config_manager import ConfigManager
 from app.frozen_smoke import run_frozen_smoke
-from app.freeze_diagnostics import FreezeDiagnostics
+from app.freeze_diagnostics import FreezeDiagnostics, mark_exit_phase
 from app.logging_setup import install_exception_hook, setup_logging
+from app.memory_trace import MemoryTrace
 from app.metadata_store import MetadataStore
 from app.single_instance import (
     InstanceMessage,
@@ -115,6 +116,8 @@ def _run_application(application, paths, options, message, broker) -> int:
         return 0 if success else 1
 
     freeze_diagnostics = FreezeDiagnostics(paths, application)
+    memory_trace = MemoryTrace(application)
+    memory_trace.start()
     config = ConfigManager(paths.config_path, writable=paths.writable)
     metadata = MetadataStore(paths.metadata_path, initialize=paths.writable)
     controller = ApplicationController(
@@ -142,10 +145,18 @@ def _run_application(application, paths, options, message, broker) -> int:
         return application.exec()
     finally:
         freeze_diagnostics.keep_during_exit()
+        memory_trace.stop('event_loop_returned')
         logger.info('Application event loop returned; checking shutdown owners')
         complete = controller.shutdown()
         logger.info('Application final shutdown returned complete=%s', complete)
+        memory_trace.record('final_shutdown_returned')
+        mark_exit_phase(f'Application final shutdown returned complete={complete}')
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+    # main() has released the single-instance server and dropped its locals
+    # (normally including the QApplication); the profile lock is still held
+    # until the process ends.
+    mark_exit_phase('main returned')
+    raise SystemExit(exit_code)

@@ -1,6 +1,8 @@
 """Bounded local evidence for intermittent GUI stalls; no image contents."""
 from __future__ import annotations
 
+import atexit
+from datetime import datetime
 import faulthandler
 from functools import wraps
 import logging
@@ -14,6 +16,38 @@ from .app_paths import AppPaths
 
 _LOG = logging.getLogger("nivisviewer.freeze")
 _EXIT_WATCHDOG_FILE = None
+# During exit the watchdog repeats, so the number of "Timeout" dumps after the
+# last marker bounds how long native/interpreter teardown kept the process
+# (and its profile lock) alive.
+EXIT_DUMP_INTERVAL_SECONDS = 5
+
+
+def _exit_marker(phase: str) -> str:
+    stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    try:
+        from .memory_trace import describe_memory
+        memory = describe_memory()
+    except Exception:
+        memory = 'commit_gib=n/a working_set_gib=n/a'
+    return f'{phase} at={stamp} {memory}\n'
+
+
+def mark_exit_phase(phase: str) -> None:
+    """Append a timestamped teardown boundary to the retained exit watchdog file.
+
+    Used after the Qt event loop returned, when the logging module may already
+    be finalizing. Never raises.
+    """
+    handle = _EXIT_WATCHDOG_FILE
+    if handle is None:
+        return
+    try:
+        if handle.closed:
+            return
+        handle.write(_exit_marker(phase))
+        handle.flush()
+    except Exception:
+        pass
 
 
 def trace_gui_phase(function):
@@ -83,7 +117,7 @@ class FreezeDiagnostics(QObject):
             self.close()
             _LOG.warning("GUI watchdog unavailable", exc_info=True)
 
-    def _heartbeat(self) -> None:
+    def _heartbeat(self, *, repeat: bool = False) -> None:
         if self._file is None:
             return
         if os.fstat(self._file.fileno()).st_size >= 2 * 1024 * 1024:
@@ -91,7 +125,8 @@ class FreezeDiagnostics(QObject):
             return
         # Implemented by CPython's native watchdog, so a decoder holding the
         # GIL cannot prevent the stack dump (unlike a Python daemon thread).
-        faulthandler.dump_traceback_later(5, repeat=False, file=self._file)
+        timeout = EXIT_DUMP_INTERVAL_SECONDS if repeat else 5
+        faulthandler.dump_traceback_later(timeout, repeat=repeat, file=self._file)
 
     def close(self) -> None:
         self._timer.stop()
@@ -105,20 +140,28 @@ class FreezeDiagnostics(QObject):
         self._mark_exit('Qt aboutToQuit')
 
     def keep_during_exit(self) -> None:
-        """Keep the native one-shot armed while Python may still join workers."""
+        """Keep the native watchdog armed while Python and Qt tear down.
+
+        After the event loop returned it repeats every few seconds until the
+        interpreter finalizes, so a slow teardown leaves one dump per interval
+        instead of a single one; timestamped markers bracket each phase.
+        """
         global _EXIT_WATCHDOG_FILE
         self._timer.stop()
-        self._mark_exit('Qt event loop returned')
+        self._mark_exit('Qt event loop returned', repeat=True)
         if self._file is not None:
             # faulthandler uses the file descriptor, not QObject ownership.
             _EXIT_WATCHDOG_FILE, self._file = self._file, None
+            # Runs at the start of Py_FinalizeEx, before module teardown and
+            # the final cycle collection.
+            atexit.register(mark_exit_phase, 'Python atexit')
 
-    def _mark_exit(self, phase: str) -> None:
+    def _mark_exit(self, phase: str, *, repeat: bool = False) -> None:
         if self._file is None:
             return
         try:
-            self._file.write(f'{phase}\n')
+            self._file.write(_exit_marker(phase))
             self._file.flush()
-            self._heartbeat()
+            self._heartbeat(repeat=repeat)
         except (OSError, RuntimeError):
             self.close()
