@@ -66,6 +66,12 @@ from .thumbnail_render import (
 
 
 _RETIRED_THUMBNAIL_PROVIDERS: set[BrowserThumbnailProvider] = set()
+# A closed provider whose native pools have all been idle this long can no
+# longer receive a completion for its remaining Python-only request records
+# (generation queue, handoff or pending entries). Release them instead of
+# waiting forever: that wait blocked application exit for hours.
+RETIRED_STRANDED_GRACE_SECONDS = 5.0
+_RETIRED_SNAPSHOT_RECORD_LIMIT = 4
 
 
 def drain_retired_thumbnail_providers(coordinator: ImageWorkCoordinator) -> bool:
@@ -73,8 +79,7 @@ def drain_retired_thumbnail_providers(coordinator: ImageWorkCoordinator) -> bool
     retired = tuple(provider for provider in _RETIRED_THUMBNAIL_PROVIDERS
                     if provider._coordinator is coordinator)
     for provider in retired:
-        if provider.wait_for_done(0):
-            provider._finalize_close()
+        provider._try_finalize_retired()
     return all(provider not in _RETIRED_THUMBNAIL_PROVIDERS for provider in retired)
 
 
@@ -396,6 +401,7 @@ class BrowserThumbnailProvider(QObject):
         self._requests = ThumbnailRequests()
         self._owned_workers = self._requests.owned_workers
         self._waiting_generation = self._requests.waiting_generation
+        self._stranded_since: float | None = None
         self._admission_timer = QTimer(self)
         self._admission_timer.setInterval(100)
         self._admission_timer.timeout.connect(self._retry_generation_admission)
@@ -2196,10 +2202,78 @@ class BrowserThumbnailProvider(QObject):
         _RETIRED_THUMBNAIL_PROVIDERS.add(self)
         QTimer.singleShot(100, self, self._release_retired_if_idle)
 
-    def shutdown_snapshot(self) -> dict[str, int]:
-        return {'owner': id(self), 'pending': self.pending_count,
+    def shutdown_snapshot(self) -> dict[str, object]:
+        """Counters and request states only; never paths or file names."""
+        with self._pending_lock:
+            workers = [pending.worker for pending in self._pending.values()]
+        waiting = set(self._waiting_generation)
+        records = [self._worker_state(worker, worker in waiting)
+                   for worker in workers[:_RETIRED_SNAPSHOT_RECORD_LIMIT]]
+        return {'owner': id(self), 'pending': len(workers),
                 'owned_workers': len(self._owned_workers), 'bytes': self.memory_cache_bytes,
-                'shell_pending': self.shell_preview_pending_count}
+                'shell_pending': self.shell_preview_pending_count,
+                'waiting_generation': len(waiting),
+                'handoff': sum(1 for worker in workers if worker.cache_probe),
+                'maintenance': self._maintenance_worker is not None,
+                'native_idle': self._native_work_idle(),
+                'records': records}
+
+    @staticmethod
+    def _worker_state(worker: _ThumbnailWorker, waiting: bool) -> dict[str, object]:
+        kinds = [name for name, flag in (
+            ('probe', worker.cache_probe), ('generate', worker.generation_work),
+            ('xcf', worker.xcf_lane), ('display', worker.display_only),
+            ('disk', worker.disk_only)) if flag]
+        return {'kind': '+'.join(kinds) or 'load',
+                'priority': ThumbnailPriority(worker.priority).name.lower(),
+                'started': worker.run_started.is_set(), 'io_done': worker.io_finished.is_set(),
+                'cancelled': worker.cancelled.is_set(), 'waiting': waiting,
+                'reserved': bool(worker.generation_reserved)}
+
+    def _native_work_idle(self) -> bool:
+        """True when no pool this provider uses holds a queued or running runnable."""
+        try:
+            decode = (self._coordinator.wait_for_browser(0) if self._coordinator is not None
+                      else self._pool.waitForDone(0))
+            return bool(decode and self._read_pool.waitForDone(0) and self._xcf_pool.waitForDone(0)
+                        and self._save_pool.waitForDone(0))
+        except RuntimeError:
+            return True  # The native pools are already gone.
+
+    def _try_finalize_retired(self) -> bool:
+        """Finalize a retired provider; True once it is no longer retired."""
+        if self not in _RETIRED_THUMBNAIL_PROVIDERS:
+            return True
+        if self.wait_for_done(0):
+            self._stranded_since = None
+            self._finalize_close()
+            return True
+        if not self._native_work_idle():
+            self._stranded_since = None
+            return False
+        now = monotonic()
+        if self._stranded_since is None:
+            # Allow queued completion/handoff signals to be delivered first.
+            self._stranded_since = now
+            return False
+        idle_seconds = now - self._stranded_since
+        if idle_seconds < RETIRED_STRANDED_GRACE_SECONDS:
+            return False
+        _THUMBNAIL_LOG.warning(
+            'Retired thumbnail provider released stranded requests owner=%x idle_s=%.1f state=%s',
+            id(self), idle_seconds, self.shutdown_snapshot())
+        with self._pending_lock:
+            workers = {pending.worker for pending in self._pending.values()}
+        workers.update(self._waiting_generation)
+        for worker in workers:
+            # Never-started workers cannot run their own release epilogue.
+            if (worker.generation_reserved and not worker.run_started.is_set()
+                    and worker.generation_cost is not None):
+                worker.generation_reserved = False
+                BROWSER_GENERATION_BUDGET.release(worker.generation_cost)
+            worker.cancelled.set()
+        self._finalize_close()
+        return True
 
     @staticmethod
     def load_thumbnail(
@@ -4219,12 +4293,9 @@ class BrowserThumbnailProvider(QObject):
                                          persist_to_disk=False))
 
     def _release_retired_if_idle(self) -> None:
-        if self not in _RETIRED_THUMBNAIL_PROVIDERS:
+        if self._try_finalize_retired():
             return
-        if not self.wait_for_done(0):
-            QTimer.singleShot(100, self, self._release_retired_if_idle)
-            return
-        self._finalize_close()
+        QTimer.singleShot(100, self, self._release_retired_if_idle)
 
     def _finalize_close(self) -> None:
         self._admission_timer.stop()

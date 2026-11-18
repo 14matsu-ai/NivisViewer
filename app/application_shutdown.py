@@ -10,6 +10,9 @@ from PySide6.QtCore import QObject, Signal
 
 
 _LOG = logging.getLogger('nivisviewer.application_shutdown')
+# A stuck step is retried continuously, but its diagnostics are logged with a
+# widening interval so an hours-long wait cannot rotate earlier logs away.
+WAIT_LOG_INTERVALS_SECONDS = (5.0, 30.0, 300.0)
 
 
 class ApplicationShutdownState(StrEnum):
@@ -53,6 +56,7 @@ class ApplicationShutdownCoordinator(QObject):
         self._logged_step = -1
         self._phase_started = 0.0
         self._next_wait_log = 0.0
+        self._wait_logs = 0
         self._diagnostics: Callable[[], object] | None = None
 
     @property
@@ -103,6 +107,7 @@ class ApplicationShutdownCoordinator(QObject):
             if self._logged_step != step_index:
                 self._logged_step = step_index
                 self._phase_started = self._next_wait_log = now
+                self._wait_logs = 0
                 _LOG.info('Application shutdown phase started step=%s owner=%x', name, id(self))
             self.phase_changed.emit(name)
             try:
@@ -149,7 +154,10 @@ class ApplicationShutdownCoordinator(QObject):
             self._last_logged_failure = failure
         now = monotonic()
         if self._diagnostics is not None and now >= self._next_wait_log:
-            self._next_wait_log = now + 5.0
+            interval = WAIT_LOG_INTERVALS_SECONDS[
+                min(self._wait_logs, len(WAIT_LOG_INTERVALS_SECONDS) - 1)]
+            self._wait_logs += 1
+            self._next_wait_log = now + interval
             try:
                 state = self._diagnostics()
             except Exception:
