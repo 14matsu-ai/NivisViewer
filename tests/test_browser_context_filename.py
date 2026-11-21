@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QApplication, QLineEdit, QMenu, QWidgetAction
 
 from app.browser_filter import BrowserFilterState, RatingFilterMode
 from app.browser_model import BrowserItem, BrowserItemKind
-from app.browser_window import BrowserWindow
+from app.browser_window import BrowserWindow, _BrowserContextFilenameEdit
 from app.config_manager import ConfigManager
 from app.thumbnail_provider import BrowserThumbnailProvider
 
@@ -70,10 +70,10 @@ def invoke(window, monkeypatch, qapp, callback, row=0, keyboard=False):
     window._show_context_menu(point, keyboard=keyboard)
 
 
-@pytest.mark.parametrize("kind,name", [(BrowserItemKind.IMAGE, "日本語 file.jpg"),
-                                      (BrowserItemKind.ARCHIVE, "book.cbz"),
-                                      (BrowserItemKind.FOLDER, "Folder.Name")])
-def test_single_filename_is_canonical_readonly_and_partial_copy(browser, tmp_path, qapp, monkeypatch, kind, name):
+@pytest.mark.parametrize("kind,name,initial", [(BrowserItemKind.IMAGE, "日本語 file.jpg", "日本語 file"),
+                                              (BrowserItemKind.ARCHIVE, "book.cbz", "book"),
+                                              (BrowserItemKind.FOLDER, "Folder.Name", "Folder.Name")])
+def test_single_filename_is_canonical_readonly_and_partial_copy(browser, tmp_path, qapp, monkeypatch, kind, name, initial):
     items = populate(browser, tmp_path, [name], kind)
     browser.item_model.set_items([replace(items[0], display_name="rendered alias")])
     browser.list_view.setCurrentIndex(browser.item_model.index(0, 0))
@@ -83,11 +83,11 @@ def test_single_filename_is_canonical_readonly_and_partial_copy(browser, tmp_pat
         assert edit.text() == name and edit.isReadOnly()
         assert qapp.clipboard().text() == "untouched"
         choices = actions(menu)
-        assert edit.selectedText() == name
+        assert edit.selectedText() == initial
         assert choices["選択文字をコピー"].isEnabled()
         assert choices["選択文字でフィルタリング"].isEnabled()
-        assert choices["選択文字をコピー"].text() == f'"{name}"をコピー'
-        assert choices["選択文字でフィルタリング"].text() == f'"{name}"でフィルタリング'
+        assert choices["選択文字をコピー"].text() == f'"{initial}"をコピー'
+        assert choices["選択文字でフィルタリング"].text() == f'"{initial}"でフィルタリング'
         edit.setFocus()
         assert edit.selectedText() == ''
         assert not choices["選択文字をコピー"].isEnabled()
@@ -117,21 +117,32 @@ def test_single_filename_is_canonical_readonly_and_partial_copy(browser, tmp_pat
 
 
 @pytest.mark.parametrize('action_name', ['選択文字をコピー', '選択文字でフィルタリング'])
-def test_initial_whole_filename_action(browser, tmp_path, qapp, monkeypatch, action_name):
-    name = '全体 test.zip'
-    populate(browser, tmp_path, [name])
+@pytest.mark.parametrize('kind,name,initial', [
+    (BrowserItemKind.ARCHIVE, '作品.zip', '作品'),
+    (BrowserItemKind.ARCHIVE, 'foo.bar.zip', 'foo.bar'),
+    (BrowserItemKind.IMAGE, '日本語😀.png', '日本語😀'),
+    (BrowserItemKind.PDF, 'Report.PDF', 'Report'),
+    (BrowserItemKind.OTHER, 'README', 'README'),
+    (BrowserItemKind.OTHER, '.hidden', '.hidden'),
+    (BrowserItemKind.OTHER, '.hidden.zip', '.hidden'),
+    (BrowserItemKind.FOLDER, 'Folder.Name', 'Folder.Name'),
+    (BrowserItemKind.FOLDER, '資料😀.zip', '資料😀.zip'),
+])
+def test_initial_filename_selection_action(browser, tmp_path, qapp, monkeypatch, action_name, kind, name, initial):
+    populate(browser, tmp_path, [name], kind)
 
     def choose(menu, edit):
-        assert edit.selectedText() == name
+        assert edit.text() == name and edit.isReadOnly()
+        assert edit.selectedText() == initial
         action = actions(menu)[action_name]
         assert action.isEnabled()
         return action
 
     invoke(browser, monkeypatch, qapp, choose)
     if action_name == '選択文字をコピー':
-        assert qapp.clipboard().text() == name
+        assert qapp.clipboard().text() == initial
     else:
-        assert browser.active_search_query == name
+        assert browser.active_search_query == initial
 
 
 @pytest.mark.parametrize("literal", ['+r=3', '[abc]*?', '"quoted"', 'A OR B', '名前😀'])
@@ -230,6 +241,7 @@ def test_long_unicode_filename_is_bounded_and_fully_selectable(browser, tmp_path
     populate(browser, tmp_path, [name])
     def inspect(menu, edit):
         assert edit.text() == name
+        assert edit.selectedText() == name[:-4]
         assert edit.width() <= 480 and menu.width() <= 540
         edit.setFocus()
         QTest.keyClick(edit, Qt.Key.Key_End)
@@ -240,6 +252,54 @@ def test_long_unicode_filename_is_bounded_and_fully_selectable(browser, tmp_path
         QTest.keyClick(edit, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
         assert qapp.clipboard().text() == name
     invoke(browser, monkeypatch, qapp, inspect)
+
+
+def test_independent_name_copy_keeps_full_filename(browser, tmp_path, qapp, monkeypatch):
+    name = '作品😀.zip'
+    populate(browser, tmp_path, [name], BrowserItemKind.ARCHIVE)
+
+    def choose(menu, edit):
+        assert edit.selectedText() == '作品😀'
+        return actions(menu)['名前をコピー']
+
+    invoke(browser, monkeypatch, qapp, choose)
+    assert qapp.clipboard().text() == name
+
+
+@pytest.mark.parametrize('action_name', ['選択文字をコピー', '選択文字でフィルタリング'])
+def test_ctrl_a_explicit_action_uses_full_filename(browser, tmp_path, qapp, monkeypatch, action_name):
+    name = '作品😀.zip'
+    populate(browser, tmp_path, [name], BrowserItemKind.ARCHIVE)
+
+    def choose(menu, edit):
+        assert edit.selectedText() == '作品😀'
+        edit.setFocus()
+        QTest.keyClick(edit, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+        assert edit.selectedText() == name
+        return actions(menu)[action_name]
+
+    invoke(browser, monkeypatch, qapp, choose)
+    if action_name == '選択文字をコピー':
+        assert qapp.clipboard().text() == name
+    else:
+        assert browser.active_search_query == name
+
+
+def test_initial_selection_is_lexical_without_filesystem_probes(browser, monkeypatch):
+    from pathlib import Path
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('initial filename selection must not probe the filesystem')
+
+    menu = QMenu(browser)
+    with monkeypatch.context() as patch:
+        for method in ('stat', 'is_file', 'is_dir', 'resolve'):
+            patch.setattr(Path, method, forbidden)
+        edit = _BrowserContextFilenameEdit('名前😀.zip', menu)
+        assert edit.selectedText() == '名前😀'
+        edit.selectAll()
+        assert edit.selectedText() == '名前😀.zip'
+    menu.close()
 
 
 def test_rightclick_retargets_but_multi_selection_keeps_whole_name_copy(browser, tmp_path, qapp, monkeypatch):

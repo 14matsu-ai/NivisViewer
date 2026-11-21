@@ -383,6 +383,9 @@ ENGLISH: dict[str, str] = {
     "閲覧履歴をすべて消去しますか？": "Clear all browsing history?",
     "検索履歴を表示（{p0}件）": "Show search history ({p0} entries)",
     "検索履歴を消去": "Clear search history",
+    "検索履歴をすべて消去": "Clear all search history",
+    '前のNivisViewerが終了処理中か、このプロファイルを使用しています。終了を待ってから、もう一度開いてください。':
+        'Another NivisViewer instance is shutting down or using this profile. Wait for it to exit, then open NivisViewer again.',
     "変更できません": "Cannot change",
     "{p0}: 名前変更を開始できませんでした": "{p0}: Could not start rename",
     "フォルダ": "Folder",

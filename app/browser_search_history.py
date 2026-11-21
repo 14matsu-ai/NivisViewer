@@ -79,6 +79,16 @@ class BrowserSearchHistory:
         self._entries.clear()
         return True
 
+    def remove(self, query: object) -> bool:
+        key = self._normalize_query(query).casefold()
+        if not key:
+            return False
+        updated = [entry for entry in self._entries if entry.casefold() != key]
+        if updated == self._entries:
+            return False
+        self._entries = updated
+        return True
+
     @classmethod
     def _normalize_limit(cls, limit: object) -> int:
         if isinstance(limit, bool):

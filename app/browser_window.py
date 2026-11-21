@@ -351,7 +351,7 @@ class _PendingSystemOpen:
 class _BrowserContextFilenameEdit(QLineEdit):
     """Read-only menu text selection; never a filename mutation surface."""
 
-    def __init__(self, name: str, menu: QMenu) -> None:
+    def __init__(self, name: str, menu: QMenu, *, is_directory: bool = False) -> None:
         super().__init__(menu)
         self._menu = menu
         self.setObjectName("browser_context_filename")
@@ -369,7 +369,10 @@ class _BrowserContextFilenameEdit(QLineEdit):
         )
         text_width = self.fontMetrics().horizontalAdvance(name) + 24
         self.setFixedWidth(min(maximum, max(240, text_width)))
-        self.selectAll()
+        initial_selection = name if is_directory else Path(name).stem
+        self.setSelection(
+            0, len(initial_selection.encode("utf-16-le", errors="surrogatepass")) // 2,
+        )
 
     def focusInEvent(self, event) -> None:
         super().focusInEvent(event)
@@ -801,6 +804,10 @@ class BrowserWindow(QMainWindow):
         self._search_wheel_query: str | None = None
         self._search_wheel_view_state: tuple[str, int, _ListViewState] | None = None
         self._selecting_wheel_history = False
+        # Session-only tombstones prevent passive popup/roundtrip saves from
+        # immediately restoring queries the user deliberately removed.
+        self._removed_search_history_queries: set[str] = set()
+        self._search_history_delete_held = False
         self._status_message_token = 0
         self._temporary_status_message: str | None = None
         self._screen_tracking_window = None
@@ -5105,8 +5112,12 @@ class BrowserWindow(QMainWindow):
         if "browser_search_history" in changed:
             value = changed["browser_search_history"]
             if isinstance(value, list):
+                old_queries = {query.casefold() for query in self.search_history.entries}
                 search_history_changed = (
                     self.search_history.replace(value) or search_history_changed
+                )
+                self._removed_search_history_queries.update(
+                    old_queries - {query.casefold() for query in self.search_history.entries}
                 )
         if search_history_changed:
             if not self._selecting_wheel_history:
@@ -5710,11 +5721,19 @@ class BrowserWindow(QMainWindow):
             self._schedule_thumbnail_requests()
         return changed
 
-    def _commit_browser_search_history(self) -> bool:
+    def _on_browser_search_text_edited(self, text: str) -> None:
+        self._removed_search_history_queries.discard(text.strip().casefold())
+
+    def _commit_browser_search_history(self, *, explicit: bool = False) -> bool:
         if self._shutdown_prepared:
             return False
         self._browser_search_timer.stop()
         self._apply_pending_browser_search()
+        key = self.browser_search_edit.text().strip().casefold()
+        if explicit:
+            self._removed_search_history_queries.discard(key)
+        elif key in self._removed_search_history_queries:
+            return False
         if self._search_wheel_query == self.browser_search_edit.text():
             return False
         if not self.search_history.record(self.browser_search_edit.text()):
@@ -5722,6 +5741,38 @@ class BrowserWindow(QMainWindow):
         self._persist_browser_search_history()
         self._sync_search_history_control()
         return True
+
+    def _reset_search_history_wheel(self) -> None:
+        self._search_wheel_entries = ()
+        self._search_wheel_index = -1
+        self._search_wheel_delta = 0
+        self._search_wheel_query = None
+        self._search_wheel_view_state = None
+
+    def _remove_search_history_entry(self, entry: LocationPopupEntry) -> None:
+        if not entry.removable or not isinstance(entry.value, str):
+            return
+        if not self.search_history.remove(entry.value):
+            return
+        self._removed_search_history_queries.add(entry.value.strip().casefold())
+        self._reset_search_history_wheel()
+        self._persist_browser_search_history()
+        self._sync_search_history_control()
+        if not self.search_history.entries:
+            self._search_history_delete_held = True
+
+    def clear_search_history(self) -> bool:
+        self._removed_search_history_queries.update(query.casefold() for query in self.search_history.entries)
+        current = self.browser_search_edit.text().strip().casefold()
+        if current:
+            self._removed_search_history_queries.add(current)
+        self._reset_search_history_wheel()
+        changed = self.search_history.clear()
+        if changed:
+            self._persist_browser_search_history()
+        self._close_owned_popup("_search_history_popup")
+        self._sync_search_history_control()
+        return changed
 
     def _persist_browser_search_history(self) -> None:
         self.config.apply(
@@ -5755,7 +5806,7 @@ class BrowserWindow(QMainWindow):
             return None
         self._close_owned_popup("_search_history_popup")
         popup_entries = [
-            LocationPopupEntry(query, query, query)
+            LocationPopupEntry(query, query, query, removable=True)
             for query in entries
         ]
         popup_entries.extend(
@@ -5771,9 +5822,11 @@ class BrowserWindow(QMainWindow):
             tuple(popup_entries),
             self,
             compact_rows=True,
+            allow_removal=True,
         )
         self._search_history_popup = popup
         popup.entryActivated.connect(self._activate_search_history_entry)
+        popup.entryRemoved.connect(self._remove_search_history_entry)
         popup.closed.connect(
             lambda value=popup: self._release_owned_popup(
                 "_search_history_popup",
@@ -5793,13 +5846,13 @@ class BrowserWindow(QMainWindow):
             self._search_wheel_entries = ()
             self._search_wheel_delta = 0
         if entry.value is _CLEAR_SEARCH_HISTORY:
-            if self.search_history.clear():
-                self._persist_browser_search_history()
-                self._sync_search_history_control()
+            self.clear_search_history()
             return
         query = str(entry.value).strip()
         if not query:
             return
+        if not self._selecting_wheel_history:
+            self._removed_search_history_queries.discard(query.casefold())
         if not self._selecting_wheel_history and self.search_history.record(query):
             self._persist_browser_search_history()
         self.browser_search_edit.setText(query)
@@ -7393,6 +7446,17 @@ class BrowserWindow(QMainWindow):
         return True
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # type: ignore[override]
+        if (self._search_history_delete_held and isinstance(event, QKeyEvent)
+                and event.key() == Qt.Key.Key_Delete):
+            if event.type() == QEvent.Type.KeyRelease and not event.isAutoRepeat():
+                self._search_history_delete_held = False
+            elif (event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress)
+                    and event.isAutoRepeat() and isinstance(watched, QWidget)
+                    and (watched.window() is self or self.isAncestorOf(watched))):
+                # The last row closes the popup and restores file-list focus.
+                # Consume only repeats of that held Delete, until its release.
+                event.accept()
+                return True
         if isinstance(event, QWheelEvent) and self._is_search_history_wheel_surface(watched, event):
             self._step_search_history_wheel(event)
             event.accept()
@@ -8068,8 +8132,9 @@ class BrowserWindow(QMainWindow):
             self._on_browser_search_text_changed
         )
         self.browser_search_edit.returnPressed.connect(
-            self._commit_browser_search_history
+            lambda: self._commit_browser_search_history(explicit=True)
         )
+        self.browser_search_edit.textEdited.connect(self._on_browser_search_text_edited)
         self.browser_search_container = _BrowserDropDownShell(
             self.browser_sort_row
         )
@@ -8353,6 +8418,11 @@ class BrowserWindow(QMainWindow):
             lambda _checked=False: self.clear_history()
         )
         history_menu.addAction(clear_history_action)
+        self.clear_search_history_action = QAction(tr('検索履歴をすべて消去'), self)
+        self.clear_search_history_action.triggered.connect(
+            lambda _checked=False: self.clear_search_history()
+        )
+        history_menu.addAction(self.clear_search_history_action)
 
         self.settings_action = QAction(tr('設定'), self)
         self.settings_action.setIcon(settings_icon())
@@ -10163,7 +10233,10 @@ class BrowserWindow(QMainWindow):
         filename_edit = None
         selected_text_copy = selected_text_search = None
         if selection_count == 1 and item is not None:
-            filename_edit = _BrowserContextFilenameEdit(Path(selected_paths[0]).name, menu)
+            filename_edit = _BrowserContextFilenameEdit(
+                Path(selected_paths[0]).name, menu,
+                is_directory=item.kind is BrowserItemKind.FOLDER,
+            )
             filename_action = QWidgetAction(menu)
             filename_action.setDefaultWidget(filename_edit)
             menu.addAction(filename_action)
@@ -10287,7 +10360,7 @@ class BrowserWindow(QMainWindow):
                 # BrowserSearchPredicate is literal, case-folded substring
                 # matching. Quoting/escaping would add unwanted literal text.
                 self.browser_search_edit.setText(text)
-                self._commit_browser_search_history()
+                self._commit_browser_search_history(explicit=True)
         elif selected == open_action and item is not None:
             self.open_item(index)
         elif selected == open_with_action and item is not None:

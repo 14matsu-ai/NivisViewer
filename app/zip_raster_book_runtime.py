@@ -1803,6 +1803,7 @@ class _ZipRasterUnitJob(QRunnable):
         self._helper_future = None
         self._helper_operation = None
         self._helper_page = None
+        self._helper_promotion_closed = False
         self._page_started = set()
         self.current_priority = bool(is_current)
         self.layout_metadata_pages = tuple(layout_metadata_pages)
@@ -1855,7 +1856,7 @@ class _ZipRasterUnitJob(QRunnable):
         if not self.emergency_allowed or not self.helper_decided.is_set():
             return
         with self._token_lock:
-            if (self.cancelled.is_set() or self._helper_future is not None
+            if (self._helper_promotion_closed or self.cancelled.is_set() or self._helper_future is not None
                     or self._helper_operation is None or self._helper_page.image_id in self._page_started):
                 return
             self._helper_future = RASTER_EXECUTION_BUDGET.helper(
@@ -1863,6 +1864,27 @@ class _ZipRasterUnitJob(QRunnable):
                 is_current=lambda: self.current_priority and not self.cancelled.is_set(),
                 emergency=True,
             )
+
+    def _drain_helper(self, *, raise_error: bool = False) -> None:
+        with self._token_lock:
+            if (self._helper_promotion_closed and self._helper_future is None
+                    and self._helper_operation is None and self._helper_page is None):
+                return
+            # Promotion and this snapshot share a lock: no child can be
+            # accepted after we choose the Future whose native work must end.
+            self._helper_promotion_closed = True
+            helper = self._helper_future
+        try:
+            if helper is not None:
+                helper.result()
+        except Exception:
+            if raise_error:
+                raise
+        finally:
+            with self._token_lock:
+                self._helper_future = None
+                self._helper_operation = None
+                self._helper_page = None
 
     def expand_prefetch_budget(self, byte_budget: int) -> bool:
         """Expand a running background job's snapshot atomically.
@@ -1906,6 +1928,8 @@ class _ZipRasterUnitJob(QRunnable):
 
     def mark_removed_before_start(self) -> None:
         self.cancelled.set()
+        self._drain_helper()
+        self.cached_sources.clear()
         if getattr(self, 'auto_memory_reserved', False):
             RASTER_EXECUTION_BUDGET.release_auto_memory(self)
             self.auto_memory_reserved = False
@@ -1926,37 +1950,51 @@ class _ZipRasterUnitJob(QRunnable):
         )
         try:
             with execution:
-                adaptive = getattr(self, 'auto_memory_reserved', False)
-                started_at = monotonic() if adaptive else 0.
-                # Compare configured admission levels, not transient occupancy
-                # as a batch ramps up. A constant four-slot batch must not be
-                # mistaken for a concurrency increase from two to four.
-                concurrency = RASTER_EXECUTION_BUDGET.limit if adaptive else 0
-                with source_request_scope(self.cancelled), vector_context(
-                    getattr(self.source, 'vector_pdfium_service', None), self.cancelled, priority,
-                ):
-                    result = self._run_owned()
-                if (adaptive and not self.layout_metadata_pages
-                        and not self.cancelled.is_set() and self.source_decode_started.is_set()
-                        and result.pages and all(page.error is None for page in result.pages)):
-                    try:
-                        missing = dict((page.logical_image_id, page.source_original_size)
-                            for page in result.pages if page.logical_image_id not in self.cached_sources)
-                        RASTER_EXECUTION_BUDGET.observe_auto_job(
-                            ('job', _adaptive_work_signature(self.source, missing.items(), self.key.render_spec)),
-                            monotonic() - started_at, max(1, concurrency),
-                        )
-                    except Exception:
-                        # Optional telemetry must never strand a completed
-                        # frame, native lane, or its callback-drained owner.
-                        pass
+                try:
+                    adaptive = getattr(self, 'auto_memory_reserved', False)
+                    started_at = monotonic() if adaptive else 0.
+                    # Compare configured admission levels, not transient occupancy
+                    # as a batch ramps up. A constant four-slot batch must not be
+                    # mistaken for a concurrency increase from two to four.
+                    concurrency = RASTER_EXECUTION_BUDGET.limit if adaptive else 0
+                    with source_request_scope(self.cancelled), vector_context(
+                        getattr(self.source, 'vector_pdfium_service', None), self.cancelled, priority,
+                    ):
+                        result = self._run_owned()
+                    if (adaptive and not self.layout_metadata_pages
+                            and not self.cancelled.is_set() and self.source_decode_started.is_set()
+                            and result.pages and all(page.error is None for page in result.pages)):
+                        try:
+                            missing = dict((page.logical_image_id, page.source_original_size)
+                                for page in result.pages if page.logical_image_id not in self.cached_sources)
+                            RASTER_EXECUTION_BUDGET.observe_auto_job(
+                                ('job', _adaptive_work_signature(self.source, missing.items(), self.key.render_spec)),
+                                monotonic() - started_at, max(1, concurrency),
+                            )
+                        except Exception:
+                            # Optional telemetry must never strand a completed
+                            # frame, native lane, or its callback-drained owner.
+                            pass
+                finally:
+                    # The decode loop normally drained its helper already.
+                    # This fallback covers submission/dispatch/context failures,
+                    # still inside the parent execution lease's native fence.
+                    self._drain_helper()
+        except Exception as exc:  # Defensive execution/context wall, like _run_owned.
+            self._drain_helper()
+            result = self._make_result(self._error_pages(exc))
         finally:
-            if getattr(self, 'auto_memory_reserved', False):
-                RASTER_EXECUTION_BUDGET.release_auto_memory(self)
-                self.auto_memory_reserved = False
-        if self.native_lane_release is not None:
-            release, self.native_lane_release = self.native_lane_release, None
-            release()
+            # Adaptive telemetry above still needs cache membership. Drop
+            # only this worker's copies after that final use, on all exits.
+            self.cached_sources.clear()
+            try:
+                if getattr(self, 'auto_memory_reserved', False):
+                    RASTER_EXECUTION_BUDGET.release_auto_memory(self)
+                    self.auto_memory_reserved = False
+            finally:
+                if self.native_lane_release is not None:
+                    release, self.native_lane_release = self.native_lane_release, None
+                    release()
         # No source/native access or child remains after the permits leave.
         # Keep artifact reservations until the queued result is consumed.
         self.finished.set()
@@ -1990,24 +2028,26 @@ class _ZipRasterUnitJob(QRunnable):
                 else:
                     pages = self._render_unit()
         except Exception as exc:  # pragma: no cover - defensive worker wall
-            if not self.cancelled.is_set():
-                message = str(exc) or exc.__class__.__name__
-                pages = tuple(
-                    _RenderedPage(
-                        page.page_index,
-                        page.image_id,
-                        page.image_id,
-                        page.known_size or (360, 520),
-                        None,
-                        None,
-                        message,
-                        None,
-                        False,
-                        None,
-                        page.known_size or (360, 520),
-                    )
-                    for page in self.unit.pages
-                )
+            pages = self._error_pages(exc)
+        return self._make_result(pages, metadata)
+
+    def _error_pages(self, error: Exception) -> tuple[_RenderedPage, ...]:
+        if self.cancelled.is_set() or self.layout_metadata_pages:
+            return ()
+        message = str(error) or error.__class__.__name__
+        return tuple(
+            _RenderedPage(
+                page.page_index, page.image_id, page.image_id,
+                page.known_size or (360, 520), None, None, message,
+                None, False, None, page.known_size or (360, 520),
+            )
+            for page in self.unit.pages
+        )
+
+    def _make_result(self, pages, metadata=None) -> _JobResult:
+        if metadata is None and self.layout_metadata_pages:
+            # Header-only failure is an empty observation, not an image error.
+            metadata = RasterLayoutMetadata(self.key.source_epoch, self.key.source_identity, ())
         with self._token_lock:
             request_id = self._request_id
         result = _JobResult(
@@ -2033,7 +2073,6 @@ class _ZipRasterUnitJob(QRunnable):
             return ()
         decoded_pages: list[_DecodedPage] = []
         missing = [page for page in self.unit.pages if page.image_id not in self.cached_sources]
-        helper = None
         helper_page = None
         if (self.spread_parallel and (self.prefetch_budget_bytes is None or self.near_parallel) and len(missing) == 2
                 and missing[0].image_id != missing[1].image_id and not self.cancelled.is_set()):
@@ -2045,17 +2084,16 @@ class _ZipRasterUnitJob(QRunnable):
                     0 if self.current_priority else 20,
                 ):
                     return self._decode_page(helper_page)
-            if (self.prefetch_budget_bytes is None or
-                    (self.confirmed_required_bytes or 0) * 2 <= self.prefetch_budget_bytes):
-                helper = RASTER_EXECUTION_BUDGET.helper(
-                    decode_helper, is_current=lambda: self.current_priority and not self.cancelled.is_set(),
-                    near=self.near_parallel and not self.current_priority,
-                    emergency=self.emergency_allowed,
-                )
             with self._token_lock:
                 self._helper_operation = decode_helper
                 self._helper_page = helper_page
-                self._helper_future = helper
+                if (not self._helper_promotion_closed and (self.prefetch_budget_bytes is None or
+                        (self.confirmed_required_bytes or 0) * 2 <= self.prefetch_budget_bytes)):
+                    self._helper_future = RASTER_EXECUTION_BUDGET.helper(
+                        decode_helper, is_current=lambda: self.current_priority and not self.cancelled.is_set(),
+                        near=self.near_parallel and not self.current_priority,
+                        emergency=self.emergency_allowed,
+                    )
         self.helper_decided.set()
         self.signals.dispatchReady.emit()
         try:
@@ -2068,12 +2106,7 @@ class _ZipRasterUnitJob(QRunnable):
                 if self.cancelled.is_set() or self.admission_declined:
                     return ()
         finally:
-            with self._token_lock:
-                helper = self._helper_future
-            if helper is not None:
-                # Own the helper until native access has actually ended, even
-                # when the other half fails or cancellation discards the unit.
-                helper.result()
+            self._drain_helper(raise_error=True)
         decoded = tuple(decoded_pages)
         if self.cancelled.is_set() or self.admission_declined:
             return ()

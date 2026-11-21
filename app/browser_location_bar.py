@@ -24,7 +24,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QFont, QGuiApplication, QHideEvent, QKeyEvent, QPainter, QPalette, QResizeEvent
+from PySide6.QtGui import QFont, QGuiApplication, QHideEvent, QKeyEvent, QMouseEvent, QPainter, QPalette, QResizeEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFrame,
@@ -67,6 +67,7 @@ class LocationPopupEntry:
     tool_tip: str = ""
     enabled: bool = True
     current: bool = False
+    removable: bool = False
 
 
 class _CompactPopupItemDelegate(QStyledItemDelegate):
@@ -129,6 +130,7 @@ class BrowserLocationListPopup(QFrame):
     """Finite-height, non-modal projection for location and history entries."""
 
     entryActivated = Signal(object)
+    entryRemoved = Signal(object)
     closed = Signal(object)
     DEFAULT_VISIBLE_ROWS = 14
 
@@ -139,6 +141,7 @@ class BrowserLocationListPopup(QFrame):
         *,
         maximum_visible_rows: int = DEFAULT_VISIBLE_ROWS,
         compact_rows: bool = False,
+        allow_removal: bool = False,
     ) -> None:
         super().__init__(parent, Qt.WindowType.Popup)
         self.setObjectName("browser_location_list_popup")
@@ -146,6 +149,7 @@ class BrowserLocationListPopup(QFrame):
         self.setFrameShadow(QFrame.Shadow.Raised)
         self.maximum_visible_rows = max(1, int(maximum_visible_rows))
         self.compact_rows = bool(compact_rows)
+        self.allow_removal = bool(allow_removal)
         self._closed_emitted = False
         self.list_widget = QListWidget(self)
         self._native_item_delegate = self.list_widget.itemDelegate()
@@ -163,6 +167,9 @@ class BrowserLocationListPopup(QFrame):
         )
         self.list_widget.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.list_widget.installEventFilter(self)
+        if self.allow_removal:
+            self.installEventFilter(self)
+            self.list_widget.viewport().installEventFilter(self)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(1, 1, 1, 1)
         layout.setSpacing(0)
@@ -209,6 +216,30 @@ class BrowserLocationListPopup(QFrame):
         self._show_at(position, position.y(), screen)
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:  # noqa: N802
+        if self.allow_removal:
+            if (watched is self.list_widget.viewport()
+                    and isinstance(event, QMouseEvent)
+                    and event.button() == Qt.MouseButton.RightButton):
+                if event.type() == QEvent.Type.MouseButtonPress:
+                    item = self.list_widget.itemAt(event.position().toPoint())
+                    if item is None or not item.flags() & Qt.ItemFlag.ItemIsEnabled:
+                        self.list_widget.clearSelection()
+                        self.list_widget.setCurrentRow(-1)
+                    else:
+                        self.list_widget.setCurrentItem(item)
+                    event.accept()
+                    return True
+                if event.type() == QEvent.Type.MouseButtonRelease:
+                    event.accept()
+                    return True
+            if (event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress)
+                    and isinstance(event, QKeyEvent) and event.key() == Qt.Key.Key_Delete):
+                # Own Delete even on a command/empty row; never reach file shortcuts.
+                if (event.type() == QEvent.Type.KeyPress
+                        and not event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier):
+                    self._remove_current_entry()
+                event.accept()
+                return True
         if watched is self.list_widget and event.type() == QEvent.Type.KeyPress:
             key_event = event
             if isinstance(key_event, QKeyEvent):
@@ -221,6 +252,31 @@ class BrowserLocationListPopup(QFrame):
                         self._activate_item(item)
                     return True
         return super().eventFilter(watched, event)
+
+    @staticmethod
+    def _removable_entry(item: QListWidgetItem | None) -> LocationPopupEntry | None:
+        if item is None or not item.flags() & Qt.ItemFlag.ItemIsEnabled:
+            return None
+        entry = item.data(Qt.ItemDataRole.UserRole)
+        if (isinstance(entry, LocationPopupEntry) and entry.removable
+                and isinstance(entry.value, str) and entry.value.strip()):
+            return entry
+        return None
+
+    def _remove_current_entry(self) -> None:
+        item = self.list_widget.currentItem()
+        entry = self._removable_entry(item)
+        if entry is None:
+            return
+        row = self.list_widget.row(item)
+        self.list_widget.takeItem(row)
+        remaining = [index for index in range(self.entry_count)
+                     if self._removable_entry(self.list_widget.item(index)) is not None]
+        if remaining:
+            self.list_widget.setCurrentRow(next((index for index in remaining if index >= row), remaining[-1]))
+        self.entryRemoved.emit(entry)
+        if not remaining:
+            self.close()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         if event.key() == Qt.Key.Key_Escape:
