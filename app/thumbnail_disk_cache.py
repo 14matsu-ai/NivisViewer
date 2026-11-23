@@ -1869,16 +1869,24 @@ class ThumbnailDiskCache:
             # Keep the leased handle: reopening its path would lose the lifetime
             # guarantee if cleanup/replacement ran concurrently.
             data = path.read() if hasattr(path, 'read') else Path(path).read_bytes()
+            if data.startswith(b'\x89PNG\r\n\x1a\n'):
+                image_format = 'PNG'
+            elif data.startswith(b'RIFF') and data[8:12] == b'WEBP':
+                image_format = 'WEBP'
+            else:
+                return None
             buffer = QBuffer()
             buffer.setData(data)
             buffer.open(QIODevice.OpenModeFlag.ReadOnly)
-            # Initialize the handler before read releases the GIL, preserving
-            # native parallel pixel reads without GUI/plugin lock inversion.
-            image = read_qimage(QImageReader(buffer))
+            # Cache blobs are PNG or WebP. Probing other codecs in canRead()
+            # can reach SVG's QObject locks while the worker holds the GIL.
+            reader = QImageReader(buffer, image_format.lower().encode('ascii'))
+            reader.setAutoDetectImageFormat(False)
+            image = read_qimage(reader)
             if not image.isNull():
                 return image
             import io
-            with Image.open(io.BytesIO(data), formats=('PNG', 'WEBP')) as image:
+            with Image.open(io.BytesIO(data), formats=(image_format,)) as image:
                 return pil_to_qimage(image)
         except Exception:
             return None

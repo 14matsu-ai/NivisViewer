@@ -153,12 +153,23 @@ def test_saved_pixels_decode_directly_and_preserve_color_alpha_and_storage(tmp_p
         image.save(path, format=format, lossless=True)
     def no_python_image(*_args, **_kwargs):
         pytest.fail('Saved-image decoding must not round-trip through Pillow')
+    can_read = QImageReader.canRead
+    readers = []
+
+    def check_handler(reader):
+        assert not reader.autoDetectImageFormat()
+        assert bytes(reader.format()) == format.lower().encode('ascii')
+        readers.append(True)
+        return can_read(reader)
+
     monkeypatch.setattr(Image, 'open', no_python_image)
     monkeypatch.setattr(QImage, 'fromData', no_python_image)
+    monkeypatch.setattr(QImageReader, 'canRead', check_handler)
     with path.open('rb') as handle:
         result = ThumbnailDiskCache._read_qimage(handle)
         assert not handle.closed
     assert result is not None and result.size().toTuple() == (64, 48)
+    assert readers == [True]
     assert result.pixelColor(17, 23).getRgb() == (color if alpha else (*color, 255))
     # The result remains usable after its decoder and leased input are closed.
     path.unlink()
@@ -166,14 +177,20 @@ def test_saved_pixels_decode_directly_and_preserve_color_alpha_and_storage(tmp_p
     assert result.pixelColor(17, 23).getRgb() == (color if alpha else (*color, 255))
 
 
-def test_saved_read_without_qt_codec_and_corrupt_read_is_miss(tmp_path, monkeypatch):
+@pytest.mark.parametrize('format', ['PNG', 'WEBP'])
+def test_saved_read_without_qt_codec_uses_pillow(tmp_path, monkeypatch, format):
     path = tmp_path/'saved.png'
-    with Image.new('RGB', (32, 32), 'navy') as image:
-        image.save(path)
-    monkeypatch.setattr(QImageReader, 'read', lambda *_: QImage())
-    assert ThumbnailDiskCache._read_qimage(path).pixelColor(0, 0).blue() == 128
-    path.write_bytes(b'not an image')
-    assert ThumbnailDiskCache._read_qimage(path) is None
+    with Image.new('RGBA', (32, 32), (39, 95, 143, 101)) as image:
+        image.save(path, format=format, lossless=True)
+
+    def unavailable(reader):
+        assert not reader.autoDetectImageFormat()
+        assert bytes(reader.format()) == format.lower().encode('ascii')
+        return False
+
+    monkeypatch.setattr(QImageReader, 'canRead', unavailable)
+    image = ThumbnailDiskCache._read_qimage(path)
+    assert image is not None and image.pixelColor(0, 0).getRgb() == (39, 95, 143, 101)
 
 
 def test_saved_read_queue_covers_one_viewport_with_bounded_worker_waves(qapp):

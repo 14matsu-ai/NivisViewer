@@ -64,12 +64,15 @@ def test_enqueue_epoch_snapshot_does_not_wait_for_disk_lock(tmp_path):
         cache.close()
 
 
-def test_save_reload_no_duplicate_and_unicode_path(tmp_path: Path) -> None:
+@pytest.mark.parametrize('format', ['PNG', 'WEBP'])
+def test_save_reload_no_duplicate_and_unicode_path(tmp_path: Path, monkeypatch, format) -> None:
+    monkeypatch.setattr(ThumbnailDiskCache, '_select_encoder', staticmethod(lambda: (format, format.lower())))
     source = tmp_path / "日本語画像.jpg"
     write_image(source)
     cache_path = tmp_path / "data" / "thumbnail_cache"
     cache = ThumbnailDiskCache(cache_path)
-    item = make_item(source)
+    info = source.stat()
+    item = replace(make_item(source), file_size=info.st_size, modified_time_ns=info.st_mtime_ns)
 
     assert cache.put(item, 180, thumbnail())
     assert not cache.put(item, 180, thumbnail())
@@ -77,10 +80,45 @@ def test_save_reload_no_duplicate_and_unicode_path(tmp_path: Path) -> None:
     cache.close()
 
     reopened = ThumbnailDiskCache(cache_path)
-    loaded = reopened.get(item, 180)
-    assert loaded is not None and not loaded.isNull()
-    assert reopened.usage_bytes() > 0
-    reopened.close()
+    try:
+        loaded = reopened.get(item, 180)
+        assert loaded is not None and not loaded.isNull()
+        assert reopened.get_offline_preview(item) is not None
+        assert reopened.usage_bytes() > 0
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize('payload, supported', [
+    (b'<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8"/></svg>', False),
+    (b'RIFF\x04\x00\x00\x00WAVE', False),
+    (b'RIFF\x04\x00\x00\x00WEBP', True),
+    (b'\x89PNG\r\n\x1a\n', True),
+], ids=['svg', 'non-webp-riff', 'corrupt-webp', 'corrupt-png'])
+def test_unreadable_saved_blob_is_removed_and_can_be_regenerated(tmp_path, monkeypatch, payload, supported):
+    source = tmp_path / 'source.png'
+    write_image(source)
+    info = source.stat()
+    item = replace(make_item(source), file_size=info.st_size, modified_time_ns=info.st_mtime_ns)
+    cache = ThumbnailDiskCache(tmp_path / 'cache')
+    try:
+        assert cache.put(item, 180, thumbnail())
+        blob, = cache.files_dir.iterdir()
+        blob.write_bytes(payload)
+        with monkeypatch.context() as patch:
+            if not supported:
+                def unexpected_reader(*_args, **_kwargs):
+                    pytest.fail('Unknown saved format should be rejected before creating a reader')
+
+                patch.setattr(disk_cache_module, 'QImageReader', unexpected_reader)
+                patch.setattr(Image, 'open', unexpected_reader)
+            assert cache.get_offline_preview(item) is None
+            assert cache.get(item, 180) is None
+        assert not blob.exists() and not cache._read_leases
+        assert cache.put(item, 180, thumbnail())
+        assert cache.get(item, 180) is not None
+    finally:
+        cache.close()
 
 
 def test_video_disk_cache_revisits_without_reading_source(tmp_path: Path, monkeypatch) -> None:
