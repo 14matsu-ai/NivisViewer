@@ -398,6 +398,15 @@ def _pillow_preview_size(
     return bounded
 
 
+def _pillow_preview_resampling(
+    spec: ZipRasterRenderSpec,
+    original_size: tuple[int, int],
+    preview_size: tuple[int, int],
+) -> Image.Resampling:
+    policy = ResamplingPolicy(spec.downscale_algorithm, spec.upscale_algorithm)
+    return pillow_resampling_for_policy(policy, original_size, preview_size)
+
+
 def _qimage_satisfies_source_requirement(
     qimage: QImage,
     original_size: tuple[int, int],
@@ -788,6 +797,7 @@ class _SourceKey:
     pixel_size: tuple[int, int]
     full_resolution: bool
     renderer_version: int = 0
+    preview_resampling: Image.Resampling | None = None
 
 
 @dataclass(frozen=True)
@@ -797,6 +807,14 @@ class _CachedSource:
     qimage: QImage
     original_size: tuple[int, int]
     source_is_preview: bool
+
+    def matches_resampling(self, render_spec: ZipRasterRenderSpec) -> bool:
+        # JPEG decoder tiers and full sources have no display filter baked in.
+        # Resolve auto at the size used to create this cached preview.
+        applied = self.key.preview_resampling
+        return applied is None or applied == _pillow_preview_resampling(
+            render_spec, self.original_size, self.key.pixel_size,
+        )
 
 
 @dataclass(frozen=True)
@@ -1039,7 +1057,8 @@ class _ZipRasterSourceStore:
         candidates = tuple(
             self._sources[key]
             for key in group or ()
-            if self._satisfies(self._sources[key],
+            if self._sources[key].matches_resampling(render_spec)
+            and self._satisfies(self._sources[key],
                 _vector_size_for_page(render_spec, display_unit, page, self._sources[key].original_size)
                 if Path(page.image_id).suffix.casefold() in VECTOR_SUFFIXES else required_size,
                 required_pixels=(
@@ -1393,6 +1412,7 @@ class _ZipRasterSourceStore:
                 self._sources[key]
                 for key in group or ()
                 if self._sources[key].source_is_preview
+                and self._sources[key].matches_resampling(render_spec)
             )
             if previews:
                 protected.add(
@@ -1439,21 +1459,22 @@ class _ZipRasterSourceStore:
         # full-source request, evict them before the smaller navigation preview
         # at the same locality so a magnifier session cannot poison page turns.
         render_spec = self._current_render_spec
-        adjustments_match = bool(
+        policy_matches = bool(
             render_spec is not None
             and source.key.adjustments == render_spec.adjustments
+            and source.matches_resampling(render_spec)
         )
         plan = self._retention_plan
         active_rank = (
             plan.rank_for_page(source.page_index)
-            if plan is not None and adjustments_match
+            if plan is not None and policy_matches
             else None
         )
         if active_rank is not None:
             scope = 0
             locality = active_rank
         else:
-            scope = 1 if adjustments_match else 2
+            scope = 1 if policy_matches else 2
             locality = self._fallback_distance(source.page_index)
         return (
             scope,
@@ -1500,7 +1521,8 @@ class _ZipRasterSourceStore:
 
     @staticmethod
     def _dominates(candidate: _CachedSource, existing: _CachedSource) -> bool:
-        if candidate.source_is_preview != existing.source_is_preview:
+        if (candidate.source_is_preview != existing.source_is_preview
+                or candidate.key.preview_resampling != existing.key.preview_resampling):
             return False
         return (
             candidate.qimage.width() >= existing.qimage.width()
@@ -2247,6 +2269,7 @@ class _ZipRasterUnitJob(QRunnable):
         try:
             qimage: QImage | None = None
             original_size: tuple[int, int] | None = None
+            preview_resampling = None
             decoder_maximum = _decoder_maximum_for_page(spec, self.unit, page)
             suffix = Path(page.image_id).suffix.casefold()
             if self.cancelled.is_set():
@@ -2336,15 +2359,10 @@ class _ZipRasterUnitJob(QRunnable):
                             preview: Image.Image | None = None
                             try:
                                 if not self.cancelled.is_set():
-                                    policy = ResamplingPolicy(
-                                        spec.downscale_algorithm, spec.upscale_algorithm,
+                                    preview_resampling = _pillow_preview_resampling(
+                                        spec, image.size, preview_size,
                                     )
-                                    preview = image.resize(
-                                        preview_size,
-                                        pillow_resampling_for_policy(
-                                            policy, image.size, preview_size,
-                                        ),
-                                    )
+                                    preview = image.resize(preview_size, preview_resampling)
                                     qimage = pil_to_qimage(preview)
                             finally:
                                 if preview is not None:
@@ -2426,19 +2444,18 @@ class _ZipRasterUnitJob(QRunnable):
                             spec, self.unit, page, original_size, decoder_maximum,
                         )
                         if preview_size != adjusted.size:
-                            policy = ResamplingPolicy(
-                                spec.downscale_algorithm,
-                                spec.upscale_algorithm,
+                            preview_resampling = _pillow_preview_resampling(
+                                spec, adjusted.size, preview_size,
                             )
-                            resampling = pillow_resampling_for_policy(
-                                policy,
-                                adjusted.size,
-                                preview_size,
-                            )
-                            preview = adjusted.resize(
-                                preview_size,
-                                resampling,
-                            )
+                            # Pillow forces nearest for palette and 1-bit input.
+                            # Expand those pixels for filters that blend samples.
+                            if (adjusted.mode in {"P", "1"}
+                                    and preview_resampling != Image.Resampling.NEAREST):
+                                mode = "RGBA" if "transparency" in adjusted.info else "RGB"
+                                with adjusted.convert(mode) as pixels:
+                                    preview = pixels.resize(preview_size, preview_resampling)
+                            else:
+                                preview = adjusted.resize(preview_size, preview_resampling)
                             if adjusted is not image:
                                 adjusted.close()
                             adjusted = preview
@@ -2467,6 +2484,7 @@ class _ZipRasterUnitJob(QRunnable):
                 (qimage.width(), qimage.height()),
                 not source_is_preview,
                 RENDERER_VERSION if suffix in VECTOR_SUFFIXES else 0,
+                preview_resampling=preview_resampling,
             )
             return _DecodedPage(
                 page,
@@ -4007,9 +4025,8 @@ class RasterBookRuntime(QObject):
             self._adaptive_wait_started = self._adaptive_wait_serial = None
             RASTER_EXECUTION_BUDGET.set_auto_current_pending(self, False)
         self._warmup_continue_timer.stop()
-        # Layout-dependent QPixmaps are invalid, but decoded archive content
-        # remains valid.  Keeping this boundary is what prevents resize, DPI,
-        # rotation, and magnifier transitions from reopening the same entry.
+        # Invalidate layout-dependent frames. Source lookup retains decoded
+        # pixels that are large enough and compatible with the next render.
         self._restore_source_hydration_frame()
         self._current_request = None
         self._current_key = None
