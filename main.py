@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-from app.i18n import tr
-
-
 import os
 import sys
 from dataclasses import replace
 from pathlib import Path
 
+from app.recycle_jobs import WORKER_ARGUMENT, RecycleJobs, SPOOL_NAME, run_job
+
+# Dispatch the helper before importing Qt or acquiring the GUI's profile lease.
+if __name__ == '__main__' and sys.argv[1:2] == [WORKER_ARGUMENT]:
+    raise SystemExit(run_job(sys.argv[2]) if len(sys.argv) == 3 else 2)
+
+from app.i18n import tr
 from PySide6.QtCore import QLockFile
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -18,6 +22,7 @@ from app.command_line import parse_command_line, version_text
 from app.config_manager import ConfigManager
 from app.frozen_smoke import run_frozen_smoke
 from app.freeze_diagnostics import FreezeDiagnostics, mark_exit_phase
+from app.file_operation_service import FileOperationService
 from app.logging_setup import install_exception_hook, setup_logging
 from app.memory_trace import MemoryTrace
 from app.metadata_store import MetadataStore
@@ -29,6 +34,7 @@ from app.single_instance import (
 )
 from app.windows_app_id import set_windows_app_user_model_id
 from app.windows_file_registration import WindowsFileRegistrationService
+from app.windows_file_operations import perform_moves
 
 
 # Primary GUI processes keep the write lease through Qt/Python teardown.
@@ -124,6 +130,9 @@ def _run_application(application, paths, options, message, broker) -> int:
         application,
         config_manager=config,
         metadata_store=metadata,
+        file_operation_service=(FileOperationService(
+            shell_move=perform_moves, recycle_jobs=RecycleJobs(paths.profile_dir / SPOOL_NAME),
+        ) if os.name == 'nt' else None),
         file_registration_service=(
             WindowsFileRegistrationService(paths.executable_path)
             if paths.frozen

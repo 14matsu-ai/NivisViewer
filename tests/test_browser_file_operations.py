@@ -5,6 +5,7 @@ import errno
 import os
 import time
 from pathlib import Path
+from time import monotonic
 from threading import Event
 
 import pytest
@@ -126,11 +127,30 @@ def select_paths(window: BrowserWindow, paths: list[Path]) -> None:
             window.list_view.setCurrentIndex(index)
 
 
+def wait_for_recycle_selection(window, qapp):
+    deadline = monotonic() + 4
+    while window._recycle_selection.pending and monotonic() < deadline:
+        qapp.processEvents()
+        QTest.qWait(5)
+    assert not window._recycle_selection.pending
+
+
+def when_recycle_question_opens(monkeypatch, callback):
+    original = QMessageBox.question
+
+    def question(*args, **kwargs):
+        QTimer.singleShot(0, callback)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(QMessageBox, 'question', question)
+
+
 def finish_operation(
     window: BrowserWindow,
     coordinator: FileOperationCoordinator,
     qapp: QApplication,
 ) -> None:
+    wait_for_recycle_selection(window, qapp)
     assert coordinator.wait_for_done(3000)
     for _ in range(5):
         qapp.processEvents()
@@ -702,7 +722,8 @@ def test_delete_confirmation_cancel_and_viewer_refusal_do_not_call_adapter(
         lambda *_args, **_kwargs: QMessageBox.StandardButton.No,
     )
 
-    assert not window.move_selected_to_recycle_bin()
+    assert window.move_selected_to_recycle_bin()
+    wait_for_recycle_selection(window, qapp)
     assert recycle.paths == []
     assert source.exists()
 
@@ -716,7 +737,8 @@ def test_delete_confirmation_cancel_and_viewer_refusal_do_not_call_adapter(
         "_confirm_and_close_affected_viewers",
         lambda _paths: False,
     )
-    assert not window.move_selected_to_recycle_bin()
+    assert window.move_selected_to_recycle_bin()
+    wait_for_recycle_selection(window, qapp)
     assert recycle.paths == []
     assert source.exists()
     close_window(window, coordinator, qapp)
@@ -725,6 +747,7 @@ def test_delete_confirmation_cancel_and_viewer_refusal_do_not_call_adapter(
 def test_delete_default_dialog_focuses_no_and_escape_cancels(
     tmp_path: Path,
     qapp: QApplication,
+    monkeypatch,
 ) -> None:
     folder = tmp_path / "books"
     source = folder / "source.cbz"
@@ -750,8 +773,9 @@ def test_delete_default_dialog_focuses_no_and_escape_cancels(
         observed["no_button"] = no_button
         QTest.keyClick(box, Qt.Key.Key_Escape)
 
-    QTimer.singleShot(0, inspect_and_escape)
-    assert not window.move_selected_to_recycle_bin()
+    when_recycle_question_opens(monkeypatch, inspect_and_escape)
+    assert window.move_selected_to_recycle_bin()
+    wait_for_recycle_selection(window, qapp)
 
     assert observed["default"] is observed["no_button"]
     assert observed["focused"] is observed["no_button"]
@@ -764,6 +788,7 @@ def test_delete_default_dialog_focuses_no_and_escape_cancels(
 def test_delete_focus_yes_requires_acceptance_before_recycle(
     tmp_path: Path,
     qapp: QApplication,
+    monkeypatch,
 ) -> None:
     folder = tmp_path / "books"
     source = folder / "source.cbz"
@@ -791,7 +816,7 @@ def test_delete_focus_yes_requires_acceptance_before_recycle(
         observed["started_before_accept"] = list(started)
         QTest.keyClick(box, Qt.Key.Key_Return)
 
-    QTimer.singleShot(0, inspect_and_accept)
+    when_recycle_question_opens(monkeypatch, inspect_and_accept)
     assert window.move_selected_to_recycle_bin()
     finish_operation(window, coordinator, qapp)
 
@@ -808,6 +833,7 @@ def test_delete_focus_yes_requires_acceptance_before_recycle(
 def test_delete_focus_yes_escape_still_cancels(
     tmp_path: Path,
     qapp: QApplication,
+    monkeypatch,
 ) -> None:
     folder = tmp_path / "books"
     source = folder / "source.cbz"
@@ -828,8 +854,9 @@ def test_delete_focus_yes_escape_still_cancels(
         assert box.focusWidget() is box.button(QMessageBox.StandardButton.Yes)
         QTest.keyClick(box, Qt.Key.Key_Escape)
 
-    QTimer.singleShot(0, escape)
-    assert not window.move_selected_to_recycle_bin()
+    when_recycle_question_opens(monkeypatch, escape)
+    assert window.move_selected_to_recycle_bin()
+    wait_for_recycle_selection(window, qapp)
 
     assert recycle.paths == []
     assert source.exists()

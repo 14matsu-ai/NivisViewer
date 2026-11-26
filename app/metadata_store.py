@@ -895,9 +895,13 @@ class MetadataStore(QObject):
     def relocate_tree(
         self, old_root: str, new_root: str, *, include_descendants: bool = True,
     ) -> bool:
-        old_display = self.display_path(old_root)
-        new_display = self.display_path(new_root)
-        old_key = self.normalize_path(old_display)
+        return self._relocate_paths(((old_root, new_root, include_descendants),))
+
+    def relocate_items(self, moves: Iterable[tuple[str, str]]) -> bool:
+        """Relocate exact file paths in one transaction, preserving metadata merges."""
+        return self._relocate_paths((old, new, False) for old, new in moves)
+
+    def _relocate_paths(self, moves: Iterable[tuple[str, str, bool]]) -> bool:
         changed_paths: list[str] = []
         with self._lock:
             if not self._available:
@@ -907,65 +911,9 @@ class MetadataStore(QObject):
                 self._flush_pending_locked()
                 self._connection.commit()
                 self._ack_pending_progress_locked()
-                if include_descendants:
-                    rows = self._connection.execute(
-                        """
-                        SELECT id, normalized_path, display_path
-                          FROM library_items
-                         ORDER BY LENGTH(normalized_path)
-                        """
-                    ).fetchall()
-                    affected = [
-                        (int(row[0]), str(row[1]), str(row[2]))
-                        for row in rows
-                        if self._path_is_within(str(row[1]), old_key)
-                    ]
-                else:
-                    row = self._connection.execute(
-                        """
-                        SELECT id, normalized_path, display_path
-                          FROM library_items
-                         WHERE normalized_path = ?
-                        """,
-                        (old_key,),
-                    ).fetchone()
-                    affected = [] if row is None else [
-                        (int(row[0]), str(row[1]), str(row[2]))
-                    ]
-                if not affected:
-                    return True
                 with self._connection:
-                    for item_id, _normalized, display_path in affected:
-                        relocated = self._replace_path_prefix(
-                            display_path,
-                            old_display,
-                            new_display,
-                        )
-                        relocated_key = self.normalize_path(relocated)
-                        collision = self._connection.execute(
-                            """
-                            SELECT id FROM library_items
-                             WHERE normalized_path = ? AND id != ?
-                            """,
-                            (relocated_key, item_id),
-                        ).fetchone()
-                        if collision is not None:
-                            self._merge_library_items(
-                                source_id=item_id,
-                                destination_id=int(collision[0]),
-                                destination_path=relocated,
-                            )
-                        else:
-                            self._connection.execute(
-                                """
-                                UPDATE library_items
-                                   SET normalized_path = ?, display_path = ?,
-                                       last_verified_at = ?
-                                 WHERE id = ?
-                                """,
-                                (relocated_key, relocated, time.time(), item_id),
-                            )
-                        changed_paths.append(relocated)
+                    for old, new, descendants in moves:
+                        changed_paths.extend(self._relocate_path_locked(old, new, descendants))
             except (OSError, sqlite3.DatabaseError, ValueError) as exc:
                 self.last_error = str(exc)
                 try:
@@ -975,11 +923,49 @@ class MetadataStore(QObject):
                 if self._is_retryable_database_lock(exc):
                     self._disable(exc)
                 return False
+        if not changed_paths:
+            return True
         self.history_changed.emit()
         self.bookmarks_changed.emit()
         for path in changed_paths:
             self.metadata_changed.emit(path)
         return True
+
+    def _relocate_path_locked(self, old: str, new: str, descendants: bool) -> list[str]:
+        assert self._connection is not None
+        old_display, new_display = self.display_path(old), self.display_path(new)
+        old_key = self.normalize_path(old_display)
+        if descendants:
+            stem = old_key.rstrip("\\/")
+            # The next character after the separator bounds the indexed path
+            # prefix, including Unicode names without matching sibling stems.
+            rows = self._connection.execute(
+                """SELECT id, display_path FROM library_items
+                    WHERE normalized_path = ? OR (normalized_path >= ? AND normalized_path < ?)
+                    ORDER BY LENGTH(normalized_path)""",
+                (old_key, stem + os.sep, stem + chr(ord(os.sep) + 1)),
+            ).fetchall()
+        else:
+            rows = self._connection.execute(
+                "SELECT id, display_path FROM library_items WHERE normalized_path = ?", (old_key,),
+            ).fetchall()
+        changed = []
+        for item_id, display_path in rows:
+            relocated = self._replace_path_prefix(display_path, old_display, new_display)
+            relocated_key = self.normalize_path(relocated)
+            collision = self._connection.execute(
+                "SELECT id FROM library_items WHERE normalized_path = ? AND id != ?",
+                (relocated_key, item_id),
+            ).fetchone()
+            if collision is not None:
+                self._merge_library_items(source_id=item_id, destination_id=int(collision[0]), destination_path=relocated)
+            else:
+                self._connection.execute(
+                    "UPDATE library_items SET normalized_path = ?, display_path = ?, last_verified_at = ? WHERE id = ?",
+                    (relocated_key, relocated, time.time(), item_id),
+                )
+            changed.append(relocated)
+        return changed
 
     def flush(self) -> bool:
         changed = False

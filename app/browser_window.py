@@ -194,10 +194,12 @@ from .file_conflict_dialog import ConflictResolutionDialog
 from .file_properties_dialog import FilePropertiesDialog, FilenameSelectionLeftFilter
 from .file_operation_artifact import FileOperationArtifactPolicy
 from .file_operation_coordinator import FileOperationCoordinator
+from .recycle_selection import RecycleSelection
 from .file_operation_panel import FileOperationPanel
 from .file_operation_plan import ConflictResolution, FileOperationPlan, FileConflictKind
 from .file_operation_service import (
     FileCollisionPolicy,
+    FileOperationErrorCode,
     FileOperationKind,
     FileOperationProgress,
     FileOperationRequest,
@@ -822,6 +824,10 @@ class BrowserWindow(QMainWindow):
         self._last_scroll_value = 0
         self._last_scroll_time = 0.0
         self._file_operation_request_id = 0
+        self._recycle_selection = RecycleSelection(self)
+        self._recycle_selection.captured.connect(self._confirm_recycle_selection)
+        self._recycle_context = None
+        self._recycle_scan_generations = {}
         self._active_file_operation_id: int | None = None
         self._close_after_operation = False
         self._close_after_cancel = False
@@ -3361,10 +3367,27 @@ class BrowserWindow(QMainWindow):
         )
 
     def move_selected_to_recycle_bin(self) -> bool:
-        paths = self.selected_file_operation_paths()
-        if not paths:
+        return self._capture_recycle_selection(self.selected_file_operation_paths(), confirm=True)
+
+    def _capture_recycle_selection(self, paths, *, confirm):
+        paths = tuple(str(self._absolute_browser_path(path)) for path in paths
+                      if not FileOperationArtifactPolicy.is_internal_operation_artifact(path))
+        if self._shutdown_prepared or not self._recycle_selection.start(paths):
             return False
-        if not bool(
+        self._recycle_context = (self._scan_generation, self._list_selection_epoch, confirm)
+        return True
+
+    def _confirm_recycle_selection(self, token, captured):
+        generation, selection_epoch, confirm = self._recycle_context
+
+        def valid():
+            return (self._recycle_selection.is_current(token) and not self._shutdown_prepared
+                    and self._scan_generation == generation and self._list_selection_epoch == selection_epoch)
+
+        if not valid():
+            return
+        paths = tuple(path for path, identity in captured if identity is not None)
+        if paths and confirm and not bool(
             self.config.get(
                 "file_operation_delete_skip_confirmation",
                 False,
@@ -3392,11 +3415,10 @@ class BrowserWindow(QMainWindow):
                 default_button,
             )
             if answer != QMessageBox.StandardButton.Yes:
-                return False
-        return self._start_file_operation(
-            FileOperationKind.RECYCLE,
-            sources=paths,
-        )
+                return
+        if valid():
+            self._start_file_operation(FileOperationKind.RECYCLE, sources=tuple(path for path, _ in captured),
+                                       recycle_sources=captured, recycle_valid=valid)
 
     def show_selected_properties(self) -> bool:
         paths = self.selected_file_operation_paths()
@@ -3532,6 +3554,7 @@ class BrowserWindow(QMainWindow):
         )
 
     def cancel_file_operation(self) -> None:
+        self._recycle_selection.cancel()
         if self.file_operation_coordinator.busy:
             self.file_operation_coordinator.cancel()
             self.statusBar().showMessage(tr('安全な境界でキャンセルしています…'))
@@ -3544,7 +3567,11 @@ class BrowserWindow(QMainWindow):
         destination: str | Path | None = None,
         new_name: str | None = None,
         clipboard_receipt: ClipboardPasteReceipt | None = None,
+        recycle_sources=None,
+        recycle_valid=None,
     ) -> bool:
+        if operation is FileOperationKind.RECYCLE and recycle_sources is None:
+            return self._capture_recycle_selection(sources, confirm=False)
         if (
             self._snapshot_reconcile_pending
             and not self._snapshot_reconcile_has_committed_destination()
@@ -3570,11 +3597,15 @@ class BrowserWindow(QMainWindow):
         ):
             self._show_temporary_status(tr('別のファイル操作を実行中です'))
             return False
+        affected_sources = (tuple(path for path, identity in recycle_sources if identity is not None)
+                            if recycle_sources is not None else sources)
         if operation in {
             FileOperationKind.RENAME,
             FileOperationKind.MOVE,
             FileOperationKind.RECYCLE,
-        FileOperationKind.UNDO} and not self._confirm_and_close_affected_viewers(sources):
+        FileOperationKind.UNDO} and affected_sources and not self._confirm_and_close_affected_viewers(affected_sources):
+            return False
+        if recycle_valid is not None and not recycle_valid():
             return False
         self._file_operation_request_id += 1
         request = FileOperationRequest(
@@ -3588,6 +3619,7 @@ class BrowserWindow(QMainWindow):
             ),
             new_name,
             FileCollisionPolicy.SKIP,
+            planned_sources=recycle_sources,
         )
         if _FILE_OPERATION_LOG.isEnabledFor(logging.DEBUG):
             _FILE_OPERATION_LOG.debug(
@@ -3619,6 +3651,8 @@ class BrowserWindow(QMainWindow):
             else None
         )
         self._file_operation_requests[request.request_id] = request
+        if operation is FileOperationKind.RECYCLE:
+            self._recycle_scan_generations[request.request_id] = self._scan_generation
         self._operation_start_epochs[request.request_id] = self._list_selection_epoch
         if clipboard_receipt is not None:
             self._clipboard_paste_receipts[request.request_id] = clipboard_receipt
@@ -3638,6 +3672,7 @@ class BrowserWindow(QMainWindow):
                 )
             ):
                 self._file_operation_requests.pop(request.request_id, None)
+                self._recycle_scan_generations.pop(request.request_id, None)
                 self._clipboard_paste_receipts.pop(request.request_id, None)
                 self._file_operation_selection_before.pop(request.request_id, None)
                 self._operation_start_epochs.pop(request.request_id, None)
@@ -3645,6 +3680,7 @@ class BrowserWindow(QMainWindow):
                 return False
         if not self.file_operation_coordinator.execute(request):
             self._file_operation_requests.pop(request.request_id, None)
+            self._recycle_scan_generations.pop(request.request_id, None)
             self._clipboard_paste_receipts.pop(request.request_id, None)
             self._file_operation_selection_before.pop(request.request_id, None)
             self._operation_start_epochs.pop(request.request_id, None)
@@ -4091,6 +4127,9 @@ class BrowserWindow(QMainWindow):
             or progress.request_id != self._active_file_operation_id
         ):
             return
+        if (progress.operation is FileOperationKind.RECYCLE and progress.removed_sources
+                and self._recycle_scan_generations.get(progress.request_id, self._scan_generation) == self._scan_generation):
+            self._show_recycled_items_removed(progress.removed_sources)
         if self._close_after_cancel:
             self.statusBar().showMessage(tr('ファイル操作を中止しています…'))
             return
@@ -4119,6 +4158,7 @@ class BrowserWindow(QMainWindow):
         if result.request_id == self._zip_progress_request_id:
             self._close_zip_progress_dialog()
         request = self._file_operation_requests.pop(result.request_id, None)
+        recycle_generation = self._recycle_scan_generations.pop(result.request_id, self._scan_generation)
         clipboard_receipt = self._clipboard_paste_receipts.pop(
             result.request_id,
             None,
@@ -4177,6 +4217,11 @@ class BrowserWindow(QMainWindow):
                 )
 
         effective_items = result.effective_items
+        if result.operation is FileOperationKind.RECYCLE and recycle_generation == self._scan_generation:
+            self._show_recycled_items_removed(tuple(
+                item.source_path for item in effective_items
+                if item.success and item.source_removed and item.source_path
+            ))
         success_count = sum(item.success for item in effective_items)
         failure_count = sum(not item.success for item in effective_items)
         root_cleanup_failures = sum(
@@ -4189,7 +4234,12 @@ class BrowserWindow(QMainWindow):
             for item in result.items
         )
         failure_count += root_cleanup_failures
-        if result.cancelled:
+        if result.recycle_unconfirmed:
+            unconfirmed = sum(item.error_code == FileOperationErrorCode.RECYCLE_RESULT_UNCONFIRMED.value
+                              for item in effective_items)
+            completion_message = tr('ごみ箱への移動: 成功{p0}件、失敗{p1}件、結果未確認{p2}件',
+                                    p0=success_count, p1=failure_count - unconfirmed, p2=unconfirmed)
+        elif result.cancelled:
             completion_message = (
                 tr('{p0}をキャンセルしました', p0=self._operation_label(result.operation))
             )
@@ -4344,6 +4394,32 @@ class BrowserWindow(QMainWindow):
             self._operation_restore_folder = self.current_path
         else:
             self._show_temporary_status(completion_message)
+
+    def _show_recycled_items_removed(self, paths: tuple[str, ...]) -> None:
+        removed = {self._path_key(path) for path in paths}
+        displayed = self.item_model.source_items
+        remaining = [item for item in displayed if self._path_key(item.path) not in removed]
+        if len(remaining) == len(displayed):
+            return
+        selected = [path for path in self.selected_file_operation_paths() if self._path_key(path) not in removed]
+        current = self.list_view.currentIndex()
+        current_item = self.item_model.item_at(current)
+        row_before = current.row()
+        self._begin_model_selection_change()
+        try:
+            self.item_model.set_sorted_items(remaining, preserve_thumbnails=True)
+            selection = self.list_view.selectionModel()
+            for path in selected:
+                row = self.item_model.row_for_path(path)
+                if row >= 0:
+                    selection.select(self.item_model.index(row, 0), QItemSelectionModel.SelectionFlag.Select)
+            row = self.item_model.row_for_path(current_item.path) if current_item is not None else -1
+            if row < 0 and row_before >= 0:
+                row = min(row_before, self.item_model.rowCount() - 1)
+            if row >= 0:
+                selection.setCurrentIndex(self.item_model.index(row, 0), QItemSelectionModel.SelectionFlag.NoUpdate)
+        finally:
+            self._end_model_selection_change()
 
     def _restore_file_operation_selection(self, token: int | None = None) -> None:
         if token is not None and token != self._operation_restore_token:
@@ -4746,6 +4822,7 @@ class BrowserWindow(QMainWindow):
         if self._shutdown_cleanup_complete:
             return True
         self._shutdown_prepared = True
+        self._recycle_selection.cancel()
         self._pending_system_open = None
         if self._shutdown_cleanup_phase == 0:
             self.folder_tree_sync.cancel()
@@ -6275,6 +6352,7 @@ class BrowserWindow(QMainWindow):
         if self._restoring_list_view_state or self._model_selection_depth:
             return
         self._list_selection_epoch += 1
+        self._recycle_selection.cancel()
         self._pending_sidebar_focus = None
 
     def _on_list_selection_changed(self, selected, deselected) -> None:

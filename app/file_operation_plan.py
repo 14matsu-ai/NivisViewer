@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .file_operation_identity import FileIdentity
+
 from .i18n import tr
 
 
@@ -65,6 +67,7 @@ class PlannedFileItem:
     requires_copy: bool = True
     requires_source_removal: bool = False
     conflict_kind: FileConflictKind | None = None
+    source_identity: FileIdentity | None = None
 
     @property
     def item_kind(self) -> str:
@@ -103,6 +106,7 @@ class FileOperationPlan:
     source_paths: tuple[str, ...]
     destination_directory: str | None
     items: tuple[PlannedFileItem, ...] = ()
+    destination_identity: FileIdentity | None = None
     conflicts: tuple[FileConflict, ...] = ()
     total_bytes: int = 0
     total_items: int = 0
@@ -139,6 +143,15 @@ class FileOperationPlanner:
         *,
         cancelled: Event | None = None,
     ) -> FileOperationPlan:
+        if request.operation is FileOperationKind.RECYCLE and request.planned_sources is not None:
+            # These identities were captured before confirmation. A later
+            # scan of the same path cannot authorize a different object.
+            return FileOperationPlan(
+                operation_id=request.operation_id or str(request.request_id), request_id=request.request_id,
+                operation=request.operation, source_paths=request.source_paths, destination_directory=None,
+                total_items=len(request.planned_sources),
+                state=FileOperationState.CANCELLED if cancelled is not None and cancelled.is_set() else FileOperationState.READY,
+            )
         if request.operation is FileOperationKind.UNDO:
             stopped = bool(cancelled is not None and cancelled.is_set())
             return FileOperationPlan(
@@ -169,8 +182,9 @@ class FileOperationPlanner:
         if cancel.is_set():
             return self._cancelled_plan(request, operation_id, sources, destination_root)
 
+        destination_info = None
         if request.operation in {FileOperationKind.COPY, FileOperationKind.MOVE}:
-            self._validate_destination(
+            destination_info = self._validate_destination(
                 destination_root,
                 conflicts,
             )
@@ -191,6 +205,7 @@ class FileOperationPlanner:
                     destination_root,
                     cancel,
                     warnings,
+                    destination_device=destination_info.st_dev if destination_info is not None else None,
                     measure=request.operation in {
                         FileOperationKind.COPY,
                         FileOperationKind.MOVE,
@@ -291,6 +306,7 @@ class FileOperationPlanner:
             source_paths=sources,
             destination_directory=destination_root,
             items=tuple(items),
+            destination_identity=FileIdentity.from_stat(destination_info) if destination_info is not None else None,
             conflicts=tuple(conflicts),
             total_bytes=total_bytes,
             total_items=total_files + total_directories,
@@ -310,14 +326,18 @@ class FileOperationPlanner:
         warnings: list[str],
         *,
         measure: bool = True,
+        destination_device: int | None = None,
     ) -> PlannedFileItem:
         source_stat = os.lstat(source)
         is_directory = stat.S_ISDIR(source_stat.st_mode)
         reparse = self._is_reparse(source_stat)
         if measure:
-            size, files, directories = self._measure(
-                source, is_directory, reparse, cancelled, warnings
-            )
+            if not is_directory and not reparse:
+                size, files, directories = int(source_stat.st_size), 1, 0
+            else:
+                size, files, directories = self._measure(
+                    source, is_directory, reparse, cancelled, warnings
+                )
         else:
             size = 0
             files = 0 if is_directory else 1
@@ -328,11 +348,8 @@ class FileOperationPlanner:
             else None
         )
         same_volume: bool | None = None
-        if destination_root is not None:
-            try:
-                same_volume = source_stat.st_dev == os.stat(destination_root).st_dev
-            except OSError:
-                same_volume = None
+        if destination_device is not None:
+            same_volume = source_stat.st_dev == destination_device
         return PlannedFileItem(
             source,
             destination,
@@ -348,6 +365,7 @@ class FileOperationPlanner:
                 and destination_root is not None
             ),
             requires_source_removal=False,
+            source_identity=FileIdentity.from_stat(source_stat),
         )
 
     def _plan_rename(
@@ -462,8 +480,12 @@ class FileOperationPlanner:
         self,
         destination: str | None,
         conflicts: list[FileConflict],
-    ) -> None:
-        if not destination or not os.path.isdir(destination):
+    ) -> os.stat_result | None:
+        try:
+            info = os.stat(destination) if destination else None
+        except OSError:
+            info = None
+        if info is None or not stat.S_ISDIR(info.st_mode):
             self._add_conflict(
                 conflicts,
                 FileConflictKind.DESTINATION_PARENT_MISSING,
@@ -472,7 +494,7 @@ class FileOperationPlanner:
                 tr('移動先フォルダが存在しません'),
                 (ConflictResolution.CANCEL,),
             )
-            return
+            return None
         if not os.access(destination, os.W_OK):
             self._add_conflict(
                 conflicts,
@@ -482,6 +504,7 @@ class FileOperationPlanner:
                 tr('移動先へ書き込めません'),
                 (ConflictResolution.CANCEL,),
             )
+        return info
 
     def _classify_transfer_conflict(
         self,

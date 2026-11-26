@@ -179,11 +179,15 @@ def test_late_delete_completion_does_not_replace_new_book(
             qapp.processEvents()
             sleep(0.01)
         assert window.delete_current_image_to_recycle_bin()
-        assert recycle.started.wait(2)
+        deadline = monotonic() + 2
+        while not recycle.started.is_set() and monotonic() < deadline:
+            qapp.processEvents()
+            QTest.qWait(5)
+        assert recycle.started.is_set()
         assert window._finish_opened_book(session.open_book(folders[1]), modal_on_empty=False)
         recycle.release.set()
         deadline = monotonic() + 5
-        while window._pending_viewer_delete and monotonic() < deadline:
+        while (window._recycle_selection.pending or window._pending_viewer_delete) and monotonic() < deadline:
             qapp.processEvents()
             sleep(0.01)
         assert not window._pending_viewer_delete
@@ -229,12 +233,16 @@ def test_delete_completion_keeps_page_navigated_to_while_recycle_was_running(
             qapp.processEvents()
             sleep(0.01)
         assert window.delete_current_image_to_recycle_bin()
-        assert recycle.started.wait(2)
+        deadline = monotonic() + 2
+        while not recycle.started.is_set() and monotonic() < deadline:
+            qapp.processEvents()
+            QTest.qWait(5)
+        assert recycle.started.is_set()
         window.next_page()
         assert window.model.image_id_at(window.model.focused_index) == str(paths[1])
         recycle.release.set()
         deadline = monotonic() + 5
-        while (window._pending_viewer_delete is not None
+        while (window._recycle_selection.pending or window._pending_viewer_delete is not None
                or window.model.total_pages != 2) and monotonic() < deadline:
             qapp.processEvents()
             sleep(0.01)
@@ -269,7 +277,7 @@ def test_failed_recycle_keeps_current_page_and_file(tmp_path: Path, qapp) -> Non
             sleep(0.01)
         assert window.delete_current_image_to_recycle_bin()
         deadline = monotonic() + 5
-        while window._pending_viewer_delete and monotonic() < deadline:
+        while (window._recycle_selection.pending or window._pending_viewer_delete) and monotonic() < deadline:
             qapp.processEvents()
             sleep(0.01)
         assert window._pending_viewer_delete is None

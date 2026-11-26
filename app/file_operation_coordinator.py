@@ -62,6 +62,8 @@ class FileOperationCoordinator(QObject):
 
     def execute(self, request: FileOperationRequest) -> bool:
         backend = self.queue or self.executor
+        if request.operation is FileOperationKind.RECYCLE and not request.has_confirmed_recycle_sources:
+            return False
         if request.operation is FileOperationKind.UNDO:
             entries = self._undo_entries
             if (self.busy or not entries
@@ -95,23 +97,31 @@ class FileOperationCoordinator(QObject):
         self._undo_entries = result.undo_entries if result.operation is not FileOperationKind.UNDO else ()
         metadata_warnings: list[str] = []
 
-        def sync_metadata(method_name: str, *paths: str) -> None:
+        def sync_metadata(method_name: str, *arguments) -> None:
             if self.metadata_store is None:
                 return
             method = getattr(self.metadata_store, method_name, None)
             try:
-                completed = bool(callable(method) and method(*paths))
+                completed = bool(callable(method) and method(*arguments))
             except Exception as exc:
                 completed = False
                 error = str(exc)
             else:
                 error = str(getattr(self.metadata_store, "last_error", "") or "")
             if not completed:
-                label = ", ".join(paths)
+                label = (f"{len(arguments[0])} items" if method_name == "relocate_items"
+                         else ", ".join(arguments))
                 detail = f": {error}" if error else ""
                 metadata_warnings.append(
                     f"{method_name} ({label}){detail}"
                 )
+
+        exact_moves: list[tuple[str, str]] = []
+
+        def flush_exact_moves() -> None:
+            if exact_moves:
+                sync_metadata("relocate_items", tuple(exact_moves))
+                exact_moves.clear()
 
         if self.metadata_store is not None:
             for item in result.effective_items:
@@ -119,6 +129,7 @@ class FileOperationCoordinator(QObject):
                 if not item.destination_path:
                     continue
                 if item.replaced_existing and item.destination_published:
+                    flush_exact_moves()
                     if operation is FileOperationKind.COPY:
                         sync_metadata(
                             "apply_copy_replace_metadata", item.destination_path
@@ -147,11 +158,13 @@ class FileOperationCoordinator(QObject):
                     and item.success
                     and item.source_path
                 ):
-                    sync_metadata(
-                        "relocate_tree",
-                        item.source_path,
-                        item.destination_path,
-                    )
+                    if (operation is FileOperationKind.MOVE and item.source_is_directory is False
+                            and callable(getattr(self.metadata_store, "relocate_items", None))):
+                        exact_moves.append((item.source_path, item.destination_path))
+                    else:
+                        flush_exact_moves()
+                        sync_metadata("relocate_tree", item.source_path, item.destination_path)
+            flush_exact_moves()
         if metadata_warnings:
             result = replace(
                 result,

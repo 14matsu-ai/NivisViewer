@@ -45,7 +45,7 @@ def normalize_local_paths(
 
 
 def build_path_mime_data(paths: tuple[str, ...], *, source: str = "browser") -> QMimeData:
-    normalized = normalize_local_paths(paths)
+    normalized = normalize_local_paths(paths, maximum=len(paths))
     mime = QMimeData()
     mime.setUrls([QUrl.fromLocalFile(path) for path in normalized])
     payload = json.dumps(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -16,6 +17,7 @@ from app.config_manager import ConfigManager
 from app.drag_drop import (
     NIVIS_PATHS_MIME,
     ExplorerSelectionController,
+    FileDragController,
     build_path_mime_data,
     choose_drop_operation,
     paths_from_mime_data,
@@ -160,6 +162,15 @@ def test_path_mime_is_json_uri_list_deduplicated_and_local(tmp_path: Path) -> No
     assert mime.hasUrls()
     assert mime.hasFormat(NIVIS_PATHS_MIME)
     assert paths_from_mime_data(mime) == (first, second)
+
+
+def test_outgoing_file_drag_includes_all_selected_paths(tmp_path: Path) -> None:
+    paths = tuple(str(tmp_path / f"画像-{index:04}.png") for index in range(600))
+    mime = FileDragController.mime_data(paths)
+
+    assert tuple(str(Path(url.toLocalFile())) for url in mime.urls()) == paths
+    payload = json.loads(bytes(mime.data(NIVIS_PATHS_MIME)))
+    assert tuple(payload["paths"]) == paths
 
 
 def test_drop_action_matches_explorer_volume_and_modifiers() -> None:

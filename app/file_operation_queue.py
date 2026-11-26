@@ -7,6 +7,7 @@ import logging
 import os
 from collections import deque
 from dataclasses import dataclass, replace
+from pathlib import Path
 from enum import StrEnum
 from threading import Event, Lock
 from time import monotonic
@@ -55,6 +56,8 @@ class _QueueEntry:
     plan: FileOperationPlan | None = None
     cancelled: Event | None = None
     gate_wait_started_at: float | None = None
+    recycle_detach: Event | None = None
+    recycle_accepted: Event | None = None
 
 
 class _PreflightSignals(QObject):
@@ -100,6 +103,7 @@ class _PreflightWorker(QRunnable):
 class _ExecutionSignals(QObject):
     progress = Signal(object)
     completed = Signal(object)
+    recycle_accepted = Signal(str)
 
 
 class _ExecutionWorker(QRunnable):
@@ -108,21 +112,45 @@ class _ExecutionWorker(QRunnable):
         service: FileOperationService,
         request: FileOperationRequest,
         cancelled: Event,
+        recycle_detach: Event | None = None,
+        recycle_accepted: Event | None = None,
     ) -> None:
         super().__init__()
         self.service = service
         self.request = request
         self.cancelled = cancelled
+        self.recycle_detach = recycle_detach
+        self.recycle_accepted = recycle_accepted
         self.signals = _ExecutionSignals()
 
     @Slot()
     def run(self) -> None:
         try:
-            result = self.service.execute(
-                self.request,
-                cancelled=self.cancelled,
-                progress=self.signals.progress.emit,
-            )
+            jobs = getattr(self.service, 'recycle_jobs', None)
+            if jobs is not None and FileOperationQueue._paths_overlap(
+                sum(FileOperationQueue._request_footprint(self.request), ()),
+                tuple(os.path.normcase(os.path.abspath(path)).casefold() for path in jobs.owned_paths()),
+            ):
+                result = FileOperationResult(
+                    self.request.operation, tuple(FileOperationItemResult(
+                        source, self.request.destination_directory, False, FileOperationErrorCode.IN_USE.value,
+                        tr('ごみ箱処理の応答または結果を確認できません'),
+                    ) for source in self.request.source_paths or (None,)),
+                    request_id=self.request.request_id, operation_id=self.request.operation_id,
+                )
+            elif self.recycle_detach is not None:
+                assert self.recycle_accepted is not None
+                result = self.service.execute_detached_recycle(
+                    self.request, self.cancelled, self.recycle_detach, self.recycle_accepted,
+                    self.signals.progress.emit,
+                    on_accepted=self.signals.recycle_accepted.emit,
+                )
+            else:
+                result = self.service.execute(
+                    self.request,
+                    cancelled=self.cancelled,
+                    progress=self.signals.progress.emit,
+                )
         except BaseException as exc:
             result = FileOperationResult(
                 self.request.operation,
@@ -161,6 +189,7 @@ class FileOperationQueue(QObject):
     shutdown_progress = Signal(object)
     shutdown_finished = Signal()
     shutdown_failed = Signal(str)
+    recycle_accepted = Signal(str)
 
     def __init__(
         self,
@@ -224,11 +253,19 @@ class FileOperationQueue(QObject):
             return tuple(entry.request for entry in self._pending)
 
     @property
+    def accepted_recycle(self) -> bool:
+        with self._lock:
+            accepted = self._active.recycle_accepted if self._active is not None else None
+            return accepted is not None and accepted.is_set()
+
+    @property
     def history(self) -> tuple[FileOperationResult, ...]:
         with self._lock:
             return tuple(self._history)
 
     def enqueue(self, request: FileOperationRequest) -> bool:
+        if request.operation is FileOperationKind.RECYCLE and not request.has_confirmed_recycle_sources:
+            return False
         operation_id = request.operation_id or str(request.request_id)
         request = replace(request, operation_id=operation_id)
         with self._lock:
@@ -403,8 +440,11 @@ class FileOperationQueue(QObject):
                 active.state = FileOperationState.CANCELLED
                 self._active = None
                 active = None
-        if cancel_active and active is not None and active.cancelled is not None:
-            active.cancelled.set()
+        if active is not None:
+            if active.recycle_detach is not None:
+                active.recycle_detach.set()
+            elif cancel_active and active.cancelled is not None:
+                active.cancelled.set()
         if active is not None:
             self._finish_gate_wait(active, "shutdown")
         for entry in pending:
@@ -480,6 +520,13 @@ class FileOperationQueue(QObject):
                     plan, state=FileOperationState.CANCELLED, conflicts=(), errors=(),
                 )
             entry.plan = plan
+            if request.operation is FileOperationKind.MOVE:
+                identities = {item.source_path: item.source_identity for item in plan.items}
+                entry.request = replace(
+                    entry.request,
+                    planned_sources=tuple((path, identities.get(path)) for path in plan.source_paths),
+                    planned_destination=plan.destination_identity,
+                )
             if plan.state is FileOperationState.CANCELLED:
                 entry.state = FileOperationState.CANCELLED
             elif plan.errors:
@@ -582,6 +629,10 @@ class FileOperationQueue(QObject):
             else:
                 stopped = False
                 entry.state = FileOperationState.RUNNING
+                if (entry.request.operation is FileOperationKind.RECYCLE
+                        and getattr(self.service, 'recycle_jobs', None) is not None):
+                    entry.recycle_detach = Event()
+                    entry.recycle_accepted = Event()
         if stopped:
             self._finish_gate_wait(entry, "shutdown")
             self._emit_state(entry)
@@ -590,8 +641,11 @@ class FileOperationQueue(QObject):
         self._finish_gate_wait(entry, "cancelled" if entry.cancelled.is_set() else "released")
         self._emit_state(entry)
         self.operation_started.emit(entry.request)
-        worker = _ExecutionWorker(self.service, entry.request, entry.cancelled or Event())
+        worker = _ExecutionWorker(
+            self.service, entry.request, entry.cancelled or Event(), entry.recycle_detach, entry.recycle_accepted,
+        )
         worker.signals.progress.connect(self.operation_progress)
+        worker.signals.recycle_accepted.connect(self.recycle_accepted)
         worker.signals.completed.connect(self._on_execution_completed)
         self._pool.start(worker)
 
@@ -623,6 +677,11 @@ class FileOperationQueue(QObject):
             self._history.append(result)
         if not self._closed:
             self.operation_completed.emit(result)
+            if result.recycle_job_directory is not None and not result.recycle_unconfirmed:
+                try:
+                    (Path(result.recycle_job_directory) / 'observed').touch()
+                except OSError:
+                    _LOG.warning('Could not acknowledge recycle results', exc_info=True)
 
     def _emit_state(self, entry: _QueueEntry) -> None:
         if not self._closed:
@@ -684,6 +743,9 @@ class FileOperationQueue(QObject):
             for path in request.source_paths
         )
         targets: list[str] = []
+        if request.operation is FileOperationKind.UNDO:
+            targets.extend(os.path.normcase(os.path.abspath(entry.original_path)).casefold()
+                           for entry in request.undo_entries if entry.original_path)
         if request.destination_directory:
             destination = os.path.abspath(
                 os.path.normpath(request.destination_directory)

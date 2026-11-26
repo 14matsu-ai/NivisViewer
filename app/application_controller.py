@@ -10,8 +10,12 @@ import weakref
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from time import monotonic
+from queue import Empty, SimpleQueue
+from threading import Thread
+from time import monotonic, time_ns
 from typing import Callable
+
+from .recycle_jobs import read_recovery
 
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -117,6 +121,7 @@ class ApplicationController(QObject):
         adjacent_book_search_service: AdjacentBookSearchService | None = None,
         path_availability_service: PathAvailabilityService | None = None,
         file_registration_service=None,
+        file_operation_service=None,
     ) -> None:
         super().__init__(parent if parent is not None else application)
         ensure_gui_garbage_collector()
@@ -154,7 +159,17 @@ class ApplicationController(QObject):
         self.image_work_coordinator = ImageWorkCoordinator(self, max_workers=2)
         self.file_registration_service = file_registration_service
         self.config.settings_changed.connect(self._on_controller_settings_changed)
-        self.file_operation_queue = FileOperationQueue(self, execution_ready=self._release_prepared_file_handles)
+        self.file_operation_queue = FileOperationQueue(
+            self, service=file_operation_service, execution_ready=self._release_prepared_file_handles,
+        )
+        self._recycle_jobs = getattr(file_operation_service, 'recycle_jobs', None)
+        self._recycle_startup_boundary = time_ns()
+        self._recycle_follow = set()
+        self._recycle_recovery_mailbox = None
+        self._recycle_recovery = QTimer(self)
+        self._recycle_recovery.setSingleShot(True)
+        self._recycle_recovery.timeout.connect(self._recover_recycle_results)
+        self.file_operation_queue.recycle_accepted.connect(self._on_recycle_accepted)
         self.file_operation_coordinator = FileOperationCoordinator(
             self.metadata_store,
             self,
@@ -232,6 +247,8 @@ class ApplicationController(QObject):
             raise RuntimeError("application is shutting down")
         self._restore_on_start = restore
         browser = self.show_browser_window()
+        if self._recycle_jobs is not None:
+            self._recycle_recovery.start(1000)
         if initial_path:
             self.startup_restore.cancel()
             self.select_path_in_browser(initial_path)
@@ -1277,6 +1294,7 @@ class ApplicationController(QObject):
             if (
                 self.file_operation_queue.busy
                 and self._continue_operations_without_main_window
+                and not self.file_operation_queue.accepted_recycle
             ):
                 self._show_operation_fallback()
 
@@ -1306,6 +1324,8 @@ class ApplicationController(QObject):
                 self.select_path_in_browser(self._active_viewer.book_session.current_path)
         self.viewer_closed.emit(window)
         self.config.save()
+        if self._browser_window is not None:
+            self._maybe_queue_browser_close(self._browser_window)
         self._evaluate_application_exit()
 
         if not self._shutdown:
@@ -1345,6 +1365,8 @@ class ApplicationController(QObject):
         )
         if not is_last:
             return True
+        if self.file_operation_queue.accepted_recycle:
+            return True
         answer = QMessageBox.question(
             window,
             tr('ファイル操作を実行中'),
@@ -1363,6 +1385,7 @@ class ApplicationController(QObject):
             status_bar = getattr(window, "statusBar", None)
             if callable(status_bar):
                 status_bar().showMessage(tr('ファイル操作をキャンセルして終了しています…'))
+            self.file_operation_queue.cancel()
             self.file_operation_queue.begin_shutdown(cancel_active=True)
             return False
         self._continue_operations_without_main_window = True
@@ -1376,6 +1399,8 @@ class ApplicationController(QObject):
         if window._close_after_operation or window._close_after_cancel:
             return False
         if not self.file_operation_queue.busy:
+            return True
+        if self.file_operation_queue.accepted_recycle:
             return True
         if window._close_dialog_visible:
             return False
@@ -1469,7 +1494,7 @@ class ApplicationController(QObject):
     def _maybe_queue_browser_close(self, window: BrowserWindow) -> None:
         if not (window._close_after_operation or window._close_after_cancel):
             return
-        if self.file_operation_queue.busy or window._deferred_close_queued:
+        if not self._can_finish_browser_close(window) or window._deferred_close_queued:
             return
         window._deferred_close_queued = True
         window_ref = weakref.ref(window)
@@ -1486,7 +1511,7 @@ class ApplicationController(QObject):
         if window is None:
             return
         window._deferred_close_queued = False
-        if self.file_operation_queue.busy:
+        if not self._can_finish_browser_close(window):
             return
         if not (window._close_after_operation or window._close_after_cancel):
             return
@@ -1497,6 +1522,25 @@ class ApplicationController(QObject):
         window._close_authorized = True
         window.cancel_operation_button.setEnabled(False)
         window.close()
+
+    def _can_finish_browser_close(self, window: BrowserWindow) -> bool:
+        queue = self.file_operation_queue
+        if not queue.busy:
+            return True
+        active = queue.active_operation
+        return bool(window._close_after_operation and not window._close_after_cancel
+                    and not self._viewer_windows and queue.accepted_recycle
+                    and active is not None and window._close_operation_id == str(active.operation_id))
+
+    def _on_recycle_accepted(self, operation_id: str) -> None:
+        active = self.file_operation_queue.active_operation
+        if active is None or str(active.operation_id) != operation_id or not self.file_operation_queue.accepted_recycle:
+            return
+        browser = self._browser_window
+        if browser is not None:
+            self._maybe_queue_browser_close(browser)
+        elif not self._viewer_windows:
+            self._evaluate_application_exit()
 
     def _show_operation_fallback(self) -> None:
         if self._operation_fallback_panel is None:
@@ -1526,7 +1570,17 @@ class ApplicationController(QObject):
 
     def _on_background_file_operation_completed(self, result: object) -> None:
         self.adjacent_book_search.invalidate()
+        if getattr(result, 'recycle_unconfirmed', False):
+            self._recycle_follow.add(result.recycle_job_directory)
+            self._recycle_recovery.start(2000)
         browser = self._browser_window
+        if browser is None and getattr(result, 'recycle_job_directory', None):
+            viewer = self.get_active_viewer()
+            if viewer is not None:
+                viewer.statusBar().showMessage(tr(
+                    'ごみ箱への移動: 成功{p0}件、失敗{p1}件',
+                    p0=len(result.successes), p1=len(result.failures),
+                ), 5000)
         if browser is not None and (
             browser._close_after_operation or browser._close_after_cancel
         ):
@@ -1707,6 +1761,36 @@ class ApplicationController(QObject):
         browser = self.get_browser_window()
         if browser is not None and not self._shutdown:
             browser.statusBar().showMessage(message, 3000)
+
+    def _recover_recycle_results(self) -> None:
+        if self._shutdown or self._recycle_jobs is None:
+            return
+        if self._recycle_recovery_mailbox is None:
+            self._recycle_recovery_mailbox = SimpleQueue()
+            Thread(target=read_recovery, name='recycle-recovery', daemon=True,
+                   args=(self._recycle_jobs, self._recycle_startup_boundary,
+                         frozenset(self._recycle_follow), self._recycle_recovery_mailbox)).start()
+            self._recycle_recovery.start(50)
+            return
+        try:
+            included, completed, pending, follow, unconfirmed, failed = self._recycle_recovery_mailbox.get_nowait()
+        except Empty:
+            self._recycle_recovery.start(100)
+            return
+        self._recycle_recovery_mailbox = None
+        self._recycle_follow.difference_update(included)
+        self._recycle_follow.update(follow)
+        window = self.get_browser_window() or self.get_active_viewer()
+        if window is not None and (unconfirmed or failed):
+            window.statusBar().showMessage(tr('ごみ箱処理の応答または結果を確認できません'), 5000)
+        if completed:
+            if window is not None:
+                window.statusBar().showMessage(tr(
+                    '前回のごみ箱への移動: 成功{p0}件、未完了{p1}件',
+                    p0=sum(done for done, _ in completed), p1=sum(missed for _, missed in completed),
+                ), 5000)
+        if pending or self._recycle_follow:
+            self._recycle_recovery.start(2000)
 
     @staticmethod
     def _book_navigation_path_lexical(window: ViewerWindow) -> str | None:

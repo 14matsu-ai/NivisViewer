@@ -96,6 +96,7 @@ from .path_availability import (
 from .performance_trace import performance_trace
 from .freeze_diagnostics import trace_gui_phase
 from .file_operation_coordinator import FileOperationCoordinator
+from .recycle_selection import RecycleSelection
 from .file_operation_artifact import FileOperationArtifactPolicy
 from .file_operation_service import FileOperationKind, FileOperationRequest
 from .raster_book_runtime import (
@@ -280,6 +281,9 @@ class ViewerWindow(QMainWindow):
         )
         self._viewer_delete_request_id = 0
         self._pending_viewer_delete: _PendingViewerDelete | None = None
+        self._recycle_selection = RecycleSelection(self)
+        self._recycle_selection.captured.connect(self._confirm_viewer_recycle)
+        self._recycle_context = None
         self.file_operation_coordinator.operation_completed.connect(
             self._on_viewer_delete_completed
         )
@@ -794,7 +798,7 @@ class ViewerWindow(QMainWindow):
 
     def delete_current_image_to_recycle_bin(self) -> bool:
         mode = str(self.config.get("viewer_delete_mode", "disabled"))
-        if mode == "disabled" or self._shutdown_prepared or self._pending_viewer_delete:
+        if mode == "disabled" or self._shutdown_prepared or self._pending_viewer_delete or self._recycle_selection.pending:
             return False
         source = self.book_session.source
         if isinstance(source, PdfImageSource):
@@ -816,6 +820,32 @@ class ViewerWindow(QMainWindow):
         path = str(Path(image_id).absolute())
         if FileOperationArtifactPolicy.is_internal_operation_artifact(path):
             return False
+        if not self._recycle_selection.start((path,)):
+            return False
+        self._recycle_context = (id(source), self.book_session.generation, self._opened_path,
+                                 self.model.focused_index, self.presentation_state.displayed,
+                                 self._active_request_id, page_index)
+        return True
+
+    def _confirm_viewer_recycle(self, token, captured):
+        source_identity, generation, opened_path, focused, displayed, request_id, page_index = self._recycle_context
+        self._recycle_context = None
+
+        def valid():
+            return (self._recycle_selection.is_current(token) and not self._shutdown_prepared
+                    and id(self.book_session.source) == source_identity and self.book_session.generation == generation
+                    and self._opened_path == opened_path and self.model.focused_index == focused
+                    and not self.presentation_state.replacement_open_pending
+                    and self._active_request_id == request_id
+                    and self.presentation_state.displayed is displayed
+                    and self.config.get('viewer_delete_mode', 'disabled') != 'disabled')
+
+        if not valid():
+            return
+        (path, identity), = captured
+        if identity is None:
+            self.statusBar().showMessage(tr('ごみ箱への移動: 成功{p0}件、失敗{p1}件', p0=0, p1=1), 5000)
+            return
         if not bool(self.config.get("viewer_delete_skip_confirmation", False)):
             default = (QMessageBox.StandardButton.Yes
                 if self.config.get("viewer_delete_confirm_focus_yes", False)
@@ -825,19 +855,20 @@ class ViewerWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, default,
             )
             if answer != QMessageBox.StandardButton.Yes:
-                return False
+                return
+        if not valid():
+            return
         self._viewer_delete_request_id += 1
         request_id = (id(self) << 32) | self._viewer_delete_request_id
-        request = FileOperationRequest(request_id, FileOperationKind.RECYCLE, (path,))
+        request = FileOperationRequest(request_id, FileOperationKind.RECYCLE, (path,), planned_sources=captured)
         self._pending_viewer_delete = _PendingViewerDelete(
-            request_id, id(source), self.book_session.generation,
+            request_id, source_identity, self.book_session.generation,
             self._opened_path, page_index, path,
             tuple(self.model.image_ids), self.book_session.folder_listing_snapshot,
         )
         if not self.file_operation_coordinator.execute(request):
             self._pending_viewer_delete = None
-            return False
-        return True
+            self.statusBar().showMessage(tr('ごみ箱へ移動できません'), 5000)
 
     def _on_viewer_delete_completed(self, result: object) -> None:
         pending = self._pending_viewer_delete
@@ -854,7 +885,10 @@ class ViewerWindow(QMainWindow):
                 or self._opened_path != pending.opened_path):
             return
         if not removed:
-            self.statusBar().showMessage(tr('ごみ箱へ移動できません'), 5000)
+            message = (tr('ごみ箱処理の応答または結果を確認できません') if result.recycle_unconfirmed
+                       else tr('ごみ箱への移動: 成功{p0}件、失敗{p1}件',
+                               p0=len(result.successes), p1=len(result.failures)))
+            self.statusBar().showMessage(message, 5000)
             return
         source = self.book_session.source
         if not isinstance(source, FolderImageSource):
@@ -2343,6 +2377,7 @@ class ViewerWindow(QMainWindow):
     ) -> bool:
         if self._shutdown_prepared:
             return False
+        self._recycle_selection.cancel()
         if slideshow_transition and self._slideshow_waiting_for_next:
             self._slideshow_opening_next = True
         else:
@@ -7938,6 +7973,7 @@ class ViewerWindow(QMainWindow):
         return self._shutdown_lifecycle.retired_runtime is not None
 
     def prepare_shutdown(self, *, wait_msecs: int = 250) -> bool:
+        self._recycle_selection.cancel()
         return self._shutdown_lifecycle.prepare(wait_msecs=wait_msecs)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]

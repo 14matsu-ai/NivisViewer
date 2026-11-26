@@ -12,6 +12,16 @@ retain the upstream AGPL provenance. Qt/Python resource ownership, cancellation,
 generation checks and display integration adapt those structures to NivisViewer.
 See `THIRD_PARTY_NOTICES.md` for the retained notices and port boundaries.
 
+Browser drag/drop and paste in `source/ZipPla/CatalogForm.cs` (lines
+27047–27108 and 27290–27331) register items with the `IFileOperation`
+wrapper in `FileOperation/FileOperation.cs` and then perform the batch.
+`app/windows_file_operations.py` and `app/file_operation_service.py` adopt
+that ordering for ordinary Browser moves. The Windows SDK COM declarations,
+per-item result validation, conflict policy and undo integration are local
+implementations. Recycling uses a separate, independently launched worker
+and the Shell's recycle verb. No ZipPlaFork source text is copied for these
+operations. The upstream revision, copyright and notices are listed above.
+
 | Reference structure | NivisViewer mapping |
 | --- | --- |
 | `CatalogForm.Designer.cs`, `CatalogForm`: distinct distance presets and line-count presets | `app/browser_wheel_scroll.py`, `BrowserWheelScrollAccumulator`; `app/explorer_list_view.py`, `ExplorerListView.wheelEvent`: preserve system and row modes, add independent logical-pixel and viewport-percentage modes |

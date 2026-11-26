@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from .i18n import tr
+from .file_operation_identity import FileIdentity
+from .windows_file_operations import RecycleOnly
 
 
 import ctypes
@@ -45,31 +47,31 @@ class _SHFILEOPSTRUCTW(ctypes.Structure):
 
 
 class WindowsRecycleBin:
-    """Small, mockable adapter around the Windows Shell recycle operation."""
+    """Synchronous recycle-only adapter for callers outside the Browser queue."""
 
     def __init__(self, shell_operation=None) -> None:
-        if shell_operation is not None:
-            self._shell_operation = shell_operation
-        elif os.name == "nt":
-            operation = ctypes.windll.shell32.SHFileOperationW
-            operation.argtypes = [ctypes.POINTER(_SHFILEOPSTRUCTW)]
-            operation.restype = ctypes.c_int
-            self._shell_operation = operation
-        else:
-            self._shell_operation = None
+        # Keep the injected compatibility seam for the legacy adapter tests.
+        # Production never uses SHFileOperation's delete verb.
+        self._shell_operation = shell_operation
 
     @property
     def available(self) -> bool:
-        return self._shell_operation is not None
+        return self._shell_operation is not None or os.name == "nt"
 
     def recycle(self, path: str | Path) -> RecycleBinResult:
         target = os.path.abspath(os.path.normpath(os.fspath(path)))
-        if self._shell_operation is None:
+        if not self.available:
             return RecycleBinResult(
                 False,
                 error_code="api_unavailable",
                 error_message=tr('Windowsのごみ箱APIを利用できません'),
             )
+        if self._shell_operation is None:
+            try:
+                identity = FileIdentity.from_stat(os.lstat(target))
+            except OSError as exc:
+                return RecycleBinResult(False, error_code="shell_error", error_message=str(exc))
+            return self.recycle_confirmed(target, identity)
         operation = _SHFILEOPSTRUCTW()
         source_list = ctypes.create_unicode_buffer(f"{target}\0")
         operation.wFunc = FO_DELETE
@@ -111,4 +113,16 @@ class WindowsRecycleBin:
                 error_code="source_remains",
                 error_message=tr('ごみ箱への移動後も元の項目が残っています'),
             )
+        return RecycleBinResult(True)
+
+    def recycle_confirmed(self, path: str, identity: FileIdentity) -> RecycleBinResult:
+        try:
+            if not self.available or not identity.is_normal or not identity.still_at(path):
+                raise OSError('source_changed_or_unsupported')
+            if self._shell_operation is not None:
+                return self.recycle(path)
+            with RecycleOnly() as shell:
+                shell.recycle(path, identity)
+        except OSError as exc:
+            return RecycleBinResult(False, error_code="shell_error", error_message=str(exc))
         return RecycleBinResult(True)
