@@ -10,12 +10,8 @@ import weakref
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from queue import Empty, SimpleQueue
-from threading import Thread
-from time import monotonic, time_ns
+from time import monotonic
 from typing import Callable
-
-from .recycle_jobs import read_recovery
 
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -54,6 +50,7 @@ from .file_operation_coordinator import FileOperationCoordinator
 from .file_conflict_dialog import ConflictResolutionDialog
 from .file_operation_panel import FileOperationPanel
 from .file_operation_queue import FileOperationQueue
+from .file_operation_service import FileOperationKind
 from .image_source import (
     ARCHIVE_EXTENSIONS,
     FolderImageSource,
@@ -162,14 +159,6 @@ class ApplicationController(QObject):
         self.file_operation_queue = FileOperationQueue(
             self, service=file_operation_service, execution_ready=self._release_prepared_file_handles,
         )
-        self._recycle_jobs = getattr(file_operation_service, 'recycle_jobs', None)
-        self._recycle_startup_boundary = time_ns()
-        self._recycle_follow = set()
-        self._recycle_recovery_mailbox = None
-        self._recycle_recovery = QTimer(self)
-        self._recycle_recovery.setSingleShot(True)
-        self._recycle_recovery.timeout.connect(self._recover_recycle_results)
-        self.file_operation_queue.recycle_accepted.connect(self._on_recycle_accepted)
         self.file_operation_coordinator = FileOperationCoordinator(
             self.metadata_store,
             self,
@@ -208,6 +197,7 @@ class ApplicationController(QObject):
         self._operation_conflict_dialog: ConflictResolutionDialog | None = None
         self._continue_operations_without_main_window = False
         self._pending_close_window: weakref.ReferenceType[QWidget] | None = None
+        self._recycle_exit_dialog_visible = False
         self._quit_requested = False
         self._quit_committed = False
         self._exit_evaluation_suspended = 0
@@ -247,8 +237,6 @@ class ApplicationController(QObject):
             raise RuntimeError("application is shutting down")
         self._restore_on_start = restore
         browser = self.show_browser_window()
-        if self._recycle_jobs is not None:
-            self._recycle_recovery.start(1000)
         if initial_path:
             self.startup_restore.cancel()
             self.select_path_in_browser(initial_path)
@@ -1294,7 +1282,6 @@ class ApplicationController(QObject):
             if (
                 self.file_operation_queue.busy
                 and self._continue_operations_without_main_window
-                and not self.file_operation_queue.accepted_recycle
             ):
                 self._show_operation_fallback()
 
@@ -1352,6 +1339,27 @@ class ApplicationController(QObject):
             self._request_application_exit()
 
     def _allow_window_close(self, window: QWidget) -> bool:
+        active = self.file_operation_queue.active_operation
+        if active is not None and active.operation is FileOperationKind.RECYCLE:
+            is_last = (
+                (window is self._browser_window and not self._viewer_windows)
+                or (self._browser_window is None and self._viewer_windows == [window])
+            )
+            if not is_last:
+                return True
+            if self._quit_requested or self._recycle_exit_dialog_visible:
+                return False
+            self._recycle_exit_dialog_visible = True
+            try:
+                choice = self._ask_file_operation_close_choice(window, allow_finish=False)
+            finally:
+                self._recycle_exit_dialog_visible = False
+            if choice is FileOperationCloseChoice.CANCEL_AND_CLOSE:
+                current = self.file_operation_queue.active_operation
+                if current is None or current.operation_id == active.operation_id:
+                    window.statusBar().showMessage(tr('ファイル操作をキャンセルして終了しています…'))
+                    self._request_application_exit()
+            return False
         if isinstance(window, BrowserWindow):
             return self._allow_browser_window_close(window)
         if not self.file_operation_queue.busy:
@@ -1364,8 +1372,6 @@ class ApplicationController(QObject):
             and len(self._viewer_windows) == 1
         )
         if not is_last:
-            return True
-        if self.file_operation_queue.accepted_recycle:
             return True
         answer = QMessageBox.question(
             window,
@@ -1399,8 +1405,6 @@ class ApplicationController(QObject):
         if window._close_after_operation or window._close_after_cancel:
             return False
         if not self.file_operation_queue.busy:
-            return True
-        if self.file_operation_queue.accepted_recycle:
             return True
         if window._close_dialog_visible:
             return False
@@ -1451,7 +1455,9 @@ class ApplicationController(QObject):
 
     @staticmethod
     def _build_file_operation_close_dialog(
-        window: BrowserWindow,
+        window: QWidget,
+        *,
+        allow_finish: bool = True,
     ) -> tuple[
         QMessageBox,
         dict[FileOperationCloseChoice, QAbstractButton],
@@ -1460,30 +1466,29 @@ class ApplicationController(QObject):
         dialog.setIcon(QMessageBox.Icon.Question)
         dialog.setWindowTitle(tr('ファイル操作を実行中'))
         dialog.setText(tr('ファイル操作が完了していません。どうしますか？'))
-        buttons = {
-            FileOperationCloseChoice.CLOSE_AFTER_OPERATION: dialog.addButton(
+        buttons: dict[FileOperationCloseChoice, QAbstractButton] = {}
+        if allow_finish:
+            buttons[FileOperationCloseChoice.CLOSE_AFTER_OPERATION] = dialog.addButton(
                 tr('完了後に閉じる'),
                 QMessageBox.ButtonRole.AcceptRole,
-            ),
-            FileOperationCloseChoice.CANCEL_AND_CLOSE: dialog.addButton(
-                tr('操作を中止して閉じる'),
-                QMessageBox.ButtonRole.DestructiveRole,
-            ),
-            FileOperationCloseChoice.KEEP_OPEN: dialog.addButton(
-                tr('閉じない'),
-                QMessageBox.ButtonRole.RejectRole,
-            ),
-        }
-        keep_open_button = buttons[FileOperationCloseChoice.KEEP_OPEN]
+            )
+        buttons[FileOperationCloseChoice.CANCEL_AND_CLOSE] = dialog.addButton(
+            tr('操作を中止して閉じる'),
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
+        keep_open_button = dialog.addButton(tr('閉じない'), QMessageBox.ButtonRole.RejectRole)
+        buttons[FileOperationCloseChoice.KEEP_OPEN] = keep_open_button
         dialog.setDefaultButton(keep_open_button)
         dialog.setEscapeButton(keep_open_button)
         return dialog, buttons
 
     def _ask_file_operation_close_choice(
         self,
-        window: BrowserWindow,
+        window: QWidget,
+        *,
+        allow_finish: bool = True,
     ) -> FileOperationCloseChoice:
-        dialog, buttons = self._build_file_operation_close_dialog(window)
+        dialog, buttons = self._build_file_operation_close_dialog(window, allow_finish=allow_finish)
         dialog.exec()
         clicked = dialog.clickedButton()
         for choice, button in buttons.items():
@@ -1494,7 +1499,7 @@ class ApplicationController(QObject):
     def _maybe_queue_browser_close(self, window: BrowserWindow) -> None:
         if not (window._close_after_operation or window._close_after_cancel):
             return
-        if not self._can_finish_browser_close(window) or window._deferred_close_queued:
+        if self.file_operation_queue.busy or window._deferred_close_queued:
             return
         window._deferred_close_queued = True
         window_ref = weakref.ref(window)
@@ -1511,7 +1516,7 @@ class ApplicationController(QObject):
         if window is None:
             return
         window._deferred_close_queued = False
-        if not self._can_finish_browser_close(window):
+        if self.file_operation_queue.busy:
             return
         if not (window._close_after_operation or window._close_after_cancel):
             return
@@ -1522,25 +1527,6 @@ class ApplicationController(QObject):
         window._close_authorized = True
         window.cancel_operation_button.setEnabled(False)
         window.close()
-
-    def _can_finish_browser_close(self, window: BrowserWindow) -> bool:
-        queue = self.file_operation_queue
-        if not queue.busy:
-            return True
-        active = queue.active_operation
-        return bool(window._close_after_operation and not window._close_after_cancel
-                    and not self._viewer_windows and queue.accepted_recycle
-                    and active is not None and window._close_operation_id == str(active.operation_id))
-
-    def _on_recycle_accepted(self, operation_id: str) -> None:
-        active = self.file_operation_queue.active_operation
-        if active is None or str(active.operation_id) != operation_id or not self.file_operation_queue.accepted_recycle:
-            return
-        browser = self._browser_window
-        if browser is not None:
-            self._maybe_queue_browser_close(browser)
-        elif not self._viewer_windows:
-            self._evaluate_application_exit()
 
     def _show_operation_fallback(self) -> None:
         if self._operation_fallback_panel is None:
@@ -1570,11 +1556,8 @@ class ApplicationController(QObject):
 
     def _on_background_file_operation_completed(self, result: object) -> None:
         self.adjacent_book_search.invalidate()
-        if getattr(result, 'recycle_unconfirmed', False):
-            self._recycle_follow.add(result.recycle_job_directory)
-            self._recycle_recovery.start(2000)
         browser = self._browser_window
-        if browser is None and getattr(result, 'recycle_job_directory', None):
+        if browser is None and getattr(result, 'operation', None) is FileOperationKind.RECYCLE:
             viewer = self.get_active_viewer()
             if viewer is not None:
                 viewer.statusBar().showMessage(tr(
@@ -1761,36 +1744,6 @@ class ApplicationController(QObject):
         browser = self.get_browser_window()
         if browser is not None and not self._shutdown:
             browser.statusBar().showMessage(message, 3000)
-
-    def _recover_recycle_results(self) -> None:
-        if self._shutdown or self._recycle_jobs is None:
-            return
-        if self._recycle_recovery_mailbox is None:
-            self._recycle_recovery_mailbox = SimpleQueue()
-            Thread(target=read_recovery, name='recycle-recovery', daemon=True,
-                   args=(self._recycle_jobs, self._recycle_startup_boundary,
-                         frozenset(self._recycle_follow), self._recycle_recovery_mailbox)).start()
-            self._recycle_recovery.start(50)
-            return
-        try:
-            included, completed, pending, follow, unconfirmed, failed = self._recycle_recovery_mailbox.get_nowait()
-        except Empty:
-            self._recycle_recovery.start(100)
-            return
-        self._recycle_recovery_mailbox = None
-        self._recycle_follow.difference_update(included)
-        self._recycle_follow.update(follow)
-        window = self.get_browser_window() or self.get_active_viewer()
-        if window is not None and (unconfirmed or failed):
-            window.statusBar().showMessage(tr('ごみ箱処理の応答または結果を確認できません'), 5000)
-        if completed:
-            if window is not None:
-                window.statusBar().showMessage(tr(
-                    '前回のごみ箱への移動: 成功{p0}件、未完了{p1}件',
-                    p0=sum(done for done, _ in completed), p1=sum(missed for _, missed in completed),
-                ), 5000)
-        if pending or self._recycle_follow:
-            self._recycle_recovery.start(2000)
 
     @staticmethod
     def _book_navigation_path_lexical(window: ViewerWindow) -> str | None:

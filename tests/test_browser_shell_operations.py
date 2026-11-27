@@ -1,23 +1,15 @@
-"""Exercise the Browser operation boundaries with a fake Shell and helper."""
+"""Exercise Browser moves and progress with a fake Windows Shell."""
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 import ctypes
-import json
-import os
-import runpy
-import sys
-from threading import Event, Thread
-from time import time_ns
+from threading import Event
 
 import pytest
 
-from app import recycle_jobs, windows_file_operations as shell
-from app.application_controller import ApplicationController, FileOperationCloseChoice
-from app.config_manager import ConfigManager
+from app import windows_file_operations as shell
 from app.file_operation_identity import FileIdentity
 from app.file_operation_plan import FileOperationPlanner
-from app.file_operation_queue import FileOperationQueue
 from app.file_operation_service import (
     FileCollisionPolicy,
     FileOperationKind,
@@ -27,7 +19,6 @@ from app.file_operation_service import (
 )
 from app.metadata_store import MetadataStore
 from tests.test_browser_file_operations import close_window, make_window, select_paths
-from tests.test_zip_raster_viewer_integration import _wait_until
 
 
 def _create(directory, *names):
@@ -185,6 +176,46 @@ def test_com_adapter_registers_all_items_queries_aborted_even_if_perform_fails(t
     assert calls.count(21) == calls.count(22) == 1 and 4 in calls
 
 
+@pytest.mark.parametrize('change', ['replacement', 'cancel', 'shell_cancel'])
+def test_recycle_only_checks_path_and_cancel_before_the_native_verb(tmp_path, monkeypatch, change):
+    source, = _create(tmp_path / 'from', '日本語.txt')
+    _, identity = _confirmed((source,))[0]
+    cancelled = Event()
+    calls = []
+
+    def volume_path(_path, out, _length):
+        out.value = source.anchor
+        return True
+
+    def drive_type(_root):
+        return 3
+
+    def invoke(_pointer, slot, types=(), args=(), **_kw):
+        calls.append(slot)
+        if slot == 3:
+            args[-1]._obj.value = 3
+            if change == 'replacement':
+                source.rename(source.with_suffix('.original'))
+                source.write_text('different item', encoding='utf-8')
+            elif change == 'cancel':
+                cancelled.set()
+        if slot == 8:
+            return shell._COPYENGINE_E_USER_CANCELLED
+        return 0
+
+    monkeypatch.setattr(shell.C.windll.kernel32, 'GetVolumePathNameW', volume_path)
+    monkeypatch.setattr(shell.C.windll.kernel32, 'GetDriveTypeW', drive_type)
+    monkeypatch.setattr(shell, '_shell_item', lambda _path: 4)
+    monkeypatch.setattr(shell, '_call', invoke)
+    adapter = shell.RecycleOnly()
+    adapter._bin = 7
+    expected = OSError if change == 'replacement' else InterruptedError
+    with pytest.raises(expected, match='source_changed' if change == 'replacement' else 'recycle_cancelled'):
+        adapter.recycle(str(source), identity, cancelled=cancelled)
+    assert calls.count(8) == int(change == 'shell_cancel')
+    assert source.exists()
+
+
 def test_conflict_resolution_stays_with_safe_existing_path(tmp_path):
     source, = _create(tmp_path / 'from', 'same.txt')
     existing, = _create(tmp_path / 'to', 'same.txt')
@@ -221,170 +252,6 @@ def test_metadata_batch_uses_exact_path_and_folder_uses_indexed_prefix(tmp_path,
         store.close()
 
 
-class _Process:
-    pid = 1234
-
-    def __init__(self):
-        self.code = None
-
-    def poll(self):
-        return self.code
-
-
-def _fake_bin(directory, *, fail=(), entered=None, release=None):
-    class Backend:
-        def recycle(self, path, _identity):
-            if entered is not None:
-                entered.set()
-                assert release.wait(6)
-            item = Path(path)
-            if item.name in fail:
-                raise OSError('recycle_not_supported')
-            item.rename(directory / item.name)
-    return lambda: nullcontext(Backend())
-
-
-def test_unobserved_job_finishes_without_parent_and_cannot_replay(tmp_path):
-    paths = _create(tmp_path / 'from', '1 日本語.txt', '2.txt', '3.txt')
-    target = tmp_path / 'fake-bin'
-    target.mkdir()
-    spool = tmp_path / recycle_jobs.SPOOL_NAME
-    jobs = recycle_jobs.RecycleJobs(spool, launch=lambda _: _Process())
-    directory = jobs.submit(_confirmed(paths)).directory  # The GUI observer is gone.
-    paths[1].rename(paths[1].with_suffix('.old'))
-    paths[1].write_text('new file', encoding='utf-8')
-    fake = _fake_bin(target, fail={'3.txt'})
-    assert recycle_jobs.run_job(directory, backend=fake) == 0
-    assert (target / paths[0].name).exists() and paths[2].exists()
-    paths[0].write_text('new file after successful recycle', encoding='utf-8')
-    assert recycle_jobs.run_job(directory, backend=fake) == 2
-    assert paths[0].exists() and paths[1].read_text(encoding='utf-8') == 'new file'
-    assert jobs.recover(created_before=time_ns()) == (((1, 2),), False)
-    assert jobs.recover(created_before=time_ns()) == ((), False)
-
-
-@pytest.mark.parametrize('fail_launch', [True, False])
-def test_recycle_launch_or_helper_exit_reports_failure_without_retry(tmp_path, fail_launch):
-    paths = _create(tmp_path / 'from', '1.txt', '2.txt')
-    launched = []
-
-    def launch(directory):
-        launched.append(directory)
-        if fail_launch:
-            raise OSError('cannot start process')
-        process = _Process()
-        process.code = 9
-        return process
-
-    service = FileOperationService(recycle_jobs=recycle_jobs.RecycleJobs(tmp_path / recycle_jobs.SPOOL_NAME, launch=launch))
-    request = FileOperationRequest(1, FileOperationKind.RECYCLE, tuple(map(str, paths)), planned_sources=_confirmed(paths))
-    result = service.execute_detached_recycle(request, Event(), Event(), Event(), None)
-    assert len(launched) == 1 and len(result.failures) == 2 and all(path.exists() for path in paths)
-    error = 'recycle_launch_failed' if fail_launch else 'recycle_worker_exit'
-    assert all(error in item.error_message for item in result.failures)
-
-
-def test_killed_helper_reports_journalled_success_once_and_unfinished_items(tmp_path):
-    paths = _create(tmp_path / 'from', '1.txt', '2.txt')
-    target = tmp_path / 'recycled.txt'
-    launch_count = []
-
-    def launch(directory):
-        launch_count.append(directory)
-        (directory / 'claimed').mkdir()
-        paths[0].rename(target)
-        row = json.dumps({'index': 0, 'success': True}) + '\n'
-        (directory / 'outcomes.jsonl').write_text(row * 2 + '{', encoding='ascii')
-        process = _Process()
-        process.code = 9
-        return process
-
-    updates = []
-    jobs = recycle_jobs.RecycleJobs(tmp_path / recycle_jobs.SPOOL_NAME, launch=launch)
-    request = FileOperationRequest(1, FileOperationKind.RECYCLE, tuple(map(str, paths)), planned_sources=_confirmed(paths))
-    result = FileOperationService(recycle_jobs=jobs).execute_detached_recycle(
-        request, Event(), Event(), Event(), updates.append,
-    )
-    assert len(launch_count) == 1 and len(result.successes) == len(result.failures) == 1
-    assert len(updates) == 1 and updates[0].removed_sources == (str(paths[0]),)
-    assert target.exists() and paths[1].exists()
-
-
-def test_expired_unaccepted_job_cannot_execute_after_late_launch(tmp_path, monkeypatch):
-    paths = _create(tmp_path / 'from', '1.txt')
-    jobs = recycle_jobs.RecycleJobs(tmp_path / recycle_jobs.SPOOL_NAME, launch=lambda _: _Process())
-    receipt = jobs.submit(_confirmed(paths))
-    monkeypatch.setattr(recycle_jobs, '_START_WINDOW_NS', 0)
-    assert receipt.terminal()['error'] == 'recycle_acceptance_expired'
-    assert recycle_jobs.run_job(receipt.directory, backend=lambda: pytest.fail('Revoked job was run')) == 2
-    assert paths[0].exists()
-
-
-@pytest.mark.parametrize('accepted', [True, False])
-def test_queue_shutdown_does_not_wait_for_helper_and_revokes_only_unaccepted(tmp_path, qapp, accepted):
-    paths = _create(tmp_path / 'from', '1.txt', '2.txt')
-    target = tmp_path / 'fake-bin'
-    target.mkdir()
-    entered, release, launch_entered = Event(), Event(), Event()
-    process = _Process()
-    launched = []
-    spawned = []
-    backend = _fake_bin(target, entered=entered, release=release)
-
-    def launch(directory):
-        launched.append(directory)
-        if accepted:
-            def run():
-                process.code = recycle_jobs.run_job(directory, backend=backend)
-            worker = Thread(target=run)
-            spawned.append(worker)
-            worker.start()
-        launch_entered.set()
-        return process
-
-    service = FileOperationService(recycle_jobs=recycle_jobs.RecycleJobs(tmp_path / recycle_jobs.SPOOL_NAME, launch=launch))
-    queue = FileOperationQueue(service=service)
-    try:
-        assert queue.enqueue(FileOperationRequest(1, FileOperationKind.RECYCLE, tuple(map(str, paths)),
-                                                  planned_sources=_confirmed(paths)))
-        _wait_until(qapp, launch_entered.is_set)
-        if accepted:
-            _wait_until(qapp, lambda: queue.accepted_recycle and entered.is_set())
-        assert queue.accepted_recycle is accepted
-        queue.begin_shutdown(cancel_active=True)
-        assert queue.wait_for_done(1000)
-        directory, = launched
-        assert not (directory / 'cancel').exists() and process.poll() is None
-        if not accepted:
-            assert recycle_jobs.run_job(directory, backend=backend) == 2
-    finally:
-        release.set()
-        queue.close()
-        for worker in spawned:
-            worker.join(6)
-            assert not worker.is_alive()
-    assert all(path.exists() is not accepted for path in paths)
-
-
-def test_explicit_recycle_cancel_preserves_completed_item(tmp_path):
-    paths = _create(tmp_path / 'from', '1.txt', '2.txt')
-    target = tmp_path / 'fake-bin'
-    target.mkdir()
-    jobs = recycle_jobs.RecycleJobs(tmp_path / recycle_jobs.SPOOL_NAME, launch=lambda _: _Process())
-    receipt = jobs.submit(_confirmed(paths))
-
-    class Backend:
-        def recycle(self, path, _identity):
-            item = Path(path)
-            item.rename(target / item.name)
-            receipt.cancel()
-
-    assert recycle_jobs.run_job(receipt.directory, backend=lambda: nullcontext(Backend())) == 0
-    assert receipt.terminal()['cancelled']
-    assert [(item.index, item.success) for item in receipt.updates()] == [(0, True)]
-    assert paths[1].exists() and not paths[0].exists()
-
-
 def test_browser_removes_recycled_row_on_progress_without_scan(tmp_path, qapp, monkeypatch):
     first, second = _create(tmp_path / 'books', '1.txt', '2.txt')
     window, coordinator = make_window(tmp_path, qapp, first.parent)
@@ -400,109 +267,3 @@ def test_browser_removes_recycled_row_on_progress_without_scan(tmp_path, qapp, m
     finally:
         window._active_file_operation_id = None
         close_window(window, coordinator, qapp)
-
-
-@pytest.mark.parametrize('with_viewer', [True, False])
-def test_real_window_close_route_leaves_accepted_recycle_in_helper(tmp_path, qapp, monkeypatch, with_viewer):
-    source, queued = _create(tmp_path / 'books', '1.txt', '2.txt')
-    target = tmp_path / 'fake-bin'
-    target.mkdir()
-    entered, release = Event(), Event()
-    process = _Process()
-    workers = []
-    backend = _fake_bin(target, entered=entered, release=release)
-
-    def launch(directory):
-        def run():
-            process.code = recycle_jobs.run_job(directory, backend=backend)
-        worker = Thread(target=run)
-        workers.append(worker)
-        worker.start()
-        return process
-
-    service = FileOperationService(recycle_jobs=recycle_jobs.RecycleJobs(tmp_path / recycle_jobs.SPOOL_NAME, launch=launch))
-    config = ConfigManager(tmp_path / 'config.json')
-    config.load()
-    config.set('last_browser_path', str(source.parent))
-    controller = ApplicationController(qapp, config_manager=config, file_operation_service=service)
-    exits = []
-    monkeypatch.setattr(controller, '_commit_application_exit', lambda: exits.append(True))
-    monkeypatch.setattr(controller, '_ask_file_operation_close_choice',
-                        lambda _: pytest.fail('Accepted recycle should not wait for the close dialog'))
-    browser = controller.start(restore=False)
-    viewer = controller.create_viewer_window() if with_viewer else None
-    try:
-        assert browser.wait_for_scan()
-        assert browser._start_file_operation(FileOperationKind.RECYCLE, sources=(str(source),))
-        _wait_until(qapp, lambda: entered.is_set() and controller.file_operation_queue.accepted_recycle)
-        assert controller.file_operation_queue.enqueue(FileOperationRequest(
-            99, FileOperationKind.RENAME, (str(queued),), new_name='queued.txt',
-        ))
-        assert browser.close()
-        _wait_until(qapp, lambda: controller.get_browser_window() is None)
-        if viewer is not None:
-            assert not exits and controller.file_operation_queue.busy
-            assert controller.file_operation_queue.accepted_recycle
-            assert controller.file_operation_queue.queued_requests
-            viewer.close()
-        _wait_until(qapp, lambda: bool(exits), timeout_ms=5000)
-        assert process.poll() is None and source.exists()
-    finally:
-        release.set()
-        for worker in workers:
-            worker.join(6)
-        controller.shutdown()
-    assert process.poll() == 0 and (target / source.name).is_file()
-    assert queued.is_file()
-
-
-def test_browser_close_before_helper_claim_uses_normal_close_choice(tmp_path, qapp, monkeypatch):
-    source, = _create(tmp_path / 'books', '1.txt')
-    launched = []
-
-    def launch(directory):
-        launched.append(directory)
-        return _Process()
-
-    service = FileOperationService(recycle_jobs=recycle_jobs.RecycleJobs(tmp_path / recycle_jobs.SPOOL_NAME, launch=launch))
-    config = ConfigManager(tmp_path / 'config.json')
-    config.load()
-    config.set('last_browser_path', str(source.parent))
-    controller = ApplicationController(qapp, config_manager=config, file_operation_service=service)
-    controller._exit_evaluation_suspended += 1
-    browser = controller.start(restore=False)
-    monkeypatch.setattr(controller, '_ask_file_operation_close_choice', lambda _: FileOperationCloseChoice.KEEP_OPEN)
-    try:
-        assert browser.wait_for_scan()
-        assert browser._start_file_operation(FileOperationKind.RECYCLE, sources=(str(source),))
-        _wait_until(qapp, lambda: bool(launched))
-        assert not browser.close()
-        assert source.exists() and not controller.file_operation_queue.accepted_recycle
-        controller.file_operation_queue.cancel()
-        assert controller.file_operation_queue.wait_for_done(1000)
-        assert recycle_jobs.run_job(launched[0], backend=lambda: pytest.fail('Revoked job was run')) == 2
-    finally:
-        controller.shutdown()
-
-
-def test_frozen_launcher_passes_reset_only_to_detached_child(tmp_path, monkeypatch):
-    captured = []
-    monkeypatch.setattr(sys, 'frozen', True, raising=False)
-    monkeypatch.delenv('PYINSTALLER_RESET_ENVIRONMENT', raising=False)
-    monkeypatch.setattr(recycle_jobs.subprocess, 'Popen', lambda *a, **k: captured.append((a, k)))
-    recycle_jobs._launch(tmp_path)
-    (command,), options = captured[0]
-    assert command == [sys.executable, recycle_jobs.WORKER_ARGUMENT, str(tmp_path)]
-    assert options['env']['PYINSTALLER_RESET_ENVIRONMENT'] == '1'
-    assert 'PYINSTALLER_RESET_ENVIRONMENT' not in os.environ
-    assert options['close_fds'] and options['stdin'] == options['stdout'] == options['stderr'] == -3
-
-
-def test_worker_entry_terminates_before_application_startup(tmp_path, monkeypatch):
-    calls = []
-    monkeypatch.setattr(recycle_jobs, 'run_job', lambda directory: calls.append(directory) or 27)
-    main = Path(__file__).resolve().parents[1] / 'main.py'
-    monkeypatch.setattr(sys, 'argv', [str(main), recycle_jobs.WORKER_ARGUMENT, str(tmp_path)])
-    with pytest.raises(SystemExit) as exit:
-        runpy.run_path(str(main), run_name='__main__')
-    assert exit.value.code == 27 and calls == [str(tmp_path)]

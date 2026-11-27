@@ -885,9 +885,8 @@ class ViewerWindow(QMainWindow):
                 or self._opened_path != pending.opened_path):
             return
         if not removed:
-            message = (tr('ごみ箱処理の応答または結果を確認できません') if result.recycle_unconfirmed
-                       else tr('ごみ箱への移動: 成功{p0}件、失敗{p1}件',
-                               p0=len(result.successes), p1=len(result.failures)))
+            message = tr('ごみ箱への移動: 成功{p0}件、失敗{p1}件',
+                         p0=len(result.successes), p1=len(result.failures))
             self.statusBar().showMessage(message, 5000)
             return
         source = self.book_session.source

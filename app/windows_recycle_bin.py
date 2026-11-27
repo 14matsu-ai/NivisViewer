@@ -47,7 +47,7 @@ class _SHFILEOPSTRUCTW(ctypes.Structure):
 
 
 class WindowsRecycleBin:
-    """Synchronous recycle-only adapter for callers outside the Browser queue."""
+    """Synchronous recycle-only adapter for one item at a time."""
 
     def __init__(self, shell_operation=None) -> None:
         # Keep the injected compatibility seam for the legacy adapter tests.
@@ -115,14 +115,24 @@ class WindowsRecycleBin:
             )
         return RecycleBinResult(True)
 
-    def recycle_confirmed(self, path: str, identity: FileIdentity) -> RecycleBinResult:
+    def recycle_confirmed(self, path: str, identity: FileIdentity, *, cancelled=None) -> RecycleBinResult:
+        if not self.available:
+            return RecycleBinResult(
+                False, error_code="api_unavailable",
+                error_message=tr('Windowsのごみ箱APIを利用できません'),
+            )
         try:
-            if not self.available or not identity.is_normal or not identity.still_at(path):
+            if not identity.is_normal or not identity.still_at(path):
                 raise OSError('source_changed_or_unsupported')
-            if self._shell_operation is not None:
-                return self.recycle(path)
+            if cancelled is not None and cancelled.is_set():
+                raise InterruptedError('recycle_cancelled')
             with RecycleOnly() as shell:
-                shell.recycle(path, identity)
+                shell.recycle(path, identity, cancelled=cancelled)
+        except InterruptedError:
+            return RecycleBinResult(
+                False, cancelled=True, error_code="cancelled",
+                error_message=tr('ごみ箱への移動がキャンセルされました'),
+            )
         except OSError as exc:
             return RecycleBinResult(False, error_code="shell_error", error_message=str(exc))
         return RecycleBinResult(True)

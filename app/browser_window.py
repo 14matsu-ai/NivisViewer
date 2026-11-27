@@ -199,7 +199,6 @@ from .file_operation_panel import FileOperationPanel
 from .file_operation_plan import ConflictResolution, FileOperationPlan, FileConflictKind
 from .file_operation_service import (
     FileCollisionPolicy,
-    FileOperationErrorCode,
     FileOperationKind,
     FileOperationProgress,
     FileOperationRequest,
@@ -3621,7 +3620,7 @@ class BrowserWindow(QMainWindow):
             FileCollisionPolicy.SKIP,
             planned_sources=recycle_sources,
         )
-        if _FILE_OPERATION_LOG.isEnabledFor(logging.DEBUG):
+        if operation is not FileOperationKind.RECYCLE and _FILE_OPERATION_LOG.isEnabledFor(logging.DEBUG):
             _FILE_OPERATION_LOG.debug(
                 "operation boundary browser->coordinator request=%s kind=%s "
                 "sources=%r destination=%s internal_cut=%s",
@@ -4199,7 +4198,7 @@ class BrowserWindow(QMainWindow):
         if result.operation is FileOperationKind.MOVE and clipboard_receipt is not None:
             self._finish_paste_clipboard(result, clipboard_receipt)
 
-        if _FILE_OPERATION_LOG.isEnabledFor(logging.DEBUG):
+        if result.operation is not FileOperationKind.RECYCLE and _FILE_OPERATION_LOG.isEnabledFor(logging.DEBUG):
             for item in result.effective_items:
                 _FILE_OPERATION_LOG.debug(
                     "operation result request=%s kind=%s source=%s destination=%s "
@@ -4234,12 +4233,7 @@ class BrowserWindow(QMainWindow):
             for item in result.items
         )
         failure_count += root_cleanup_failures
-        if result.recycle_unconfirmed:
-            unconfirmed = sum(item.error_code == FileOperationErrorCode.RECYCLE_RESULT_UNCONFIRMED.value
-                              for item in effective_items)
-            completion_message = tr('ごみ箱への移動: 成功{p0}件、失敗{p1}件、結果未確認{p2}件',
-                                    p0=success_count, p1=failure_count - unconfirmed, p2=unconfirmed)
-        elif result.cancelled:
+        if result.cancelled:
             completion_message = (
                 tr('{p0}をキャンセルしました', p0=self._operation_label(result.operation))
             )

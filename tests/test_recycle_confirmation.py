@@ -1,22 +1,21 @@
 from pathlib import Path
-import os
-from threading import Event
-from time import time_ns
+from threading import Event, current_thread
 
 from PIL import Image
 from PySide6.QtWidgets import QMessageBox
 import pytest
 from shiboken6 import isValid
 
-from app import recycle_jobs, recycle_selection
+from app import recycle_selection, windows_recycle_bin
 from app.application_controller import ApplicationController, FileOperationCloseChoice
 from app.config_manager import ConfigManager
+from app.file_operation_queue import FileOperationQueue, FileOperationQueueState
 from app.file_operation_service import FileOperationKind, FileOperationRequest, FileOperationService
 from tests.test_browser_file_operations import (
     MovingRecycleBin, close_window, finish_operation, make_window,
-    select_paths, wait_for_recycle_selection,
+    select_paths,
 )
-from tests.test_browser_shell_operations import _Process, _confirmed, _create, _fake_bin
+from tests.test_browser_shell_operations import _confirmed, _create
 from tests.test_zip_raster_viewer_integration import _wait_until
 
 
@@ -30,6 +29,16 @@ def _finish_controller_shutdown(controller, qapp):
     # still needs Qt events. Let those owners drain before the test gives up
     # the event loop; PDFium is stopped in a later shutdown phase.
     _wait_until(qapp, controller.shutdown, timeout_ms=5000)
+    # The offscreen tests shut down the controller without exiting the shared
+    # QApplication. Close its windows so they cannot intercept later input.
+    controller._exit_evaluation_suspended += 1
+    try:
+        for window in (*controller.viewer_windows, controller.get_browser_window()):
+            if window is not None and isValid(window):
+                assert window.close()
+    finally:
+        controller._exit_evaluation_suspended -= 1
+    qapp.processEvents()
 
 
 def _controller(tmp_path, qapp, service, folder, *, viewer=False):
@@ -71,17 +80,8 @@ def test_confirmed_identity_survives_dialog_and_delayed_queue(tmp_path, qapp, mo
     else:
         source.write_text('original file', encoding='utf-8')
     target = tmp_path / 'fake-bin'
-    target.mkdir()
-    handled = []
-
-    def launch(directory):
-        process = _Process()
-        handled.append(directory)
-        process.code = recycle_jobs.run_job(directory, backend=_fake_bin(target))
-        return process
-
-    jobs = recycle_jobs.RecycleJobs(tmp_path / recycle_jobs.SPOOL_NAME, launch=launch)
-    controller, window = _controller(tmp_path, qapp, FileOperationService(recycle_jobs=jobs), folder, viewer=viewer)
+    adapter = MovingRecycleBin(target)
+    controller, window = _controller(tmp_path, qapp, FileOperationService(adapter), folder, viewer=viewer)
     queue = controller.file_operation_queue
     ready = Event()
     monkeypatch.setattr(queue, '_execution_ready', ready.is_set)
@@ -102,6 +102,7 @@ def test_confirmed_identity_survives_dialog_and_delayed_queue(tmp_path, qapp, mo
 
     monkeypatch.setattr(recycle_selection, 'capture_recycle_sources', record)
     monkeypatch.setattr(QMessageBox, 'question', confirm)
+    monkeypatch.setattr(QMessageBox, 'warning', lambda *_: QMessageBox.StandardButton.Ok)
     try:
         if viewer:
             assert window.delete_current_image_to_recycle_bin()
@@ -116,8 +117,9 @@ def test_confirmed_identity_survives_dialog_and_delayed_queue(tmp_path, qapp, mo
         assert queue.wait_for_done(3000)
         outcome = queue.history[-1]
         assert len(outcome.failures) == 1 and not outcome.successes
-        assert len(handled) == 1 and not list(target.iterdir())
+        assert not adapter.paths and not list(target.iterdir())
         assert source.read_text(encoding='utf-8') == 'different file at the same path'
+        assert not (tmp_path / 'recycle-jobs').exists()
     finally:
         _finish_controller_shutdown(controller, qapp)
 
@@ -174,7 +176,6 @@ def test_capture_blocked_on_io_is_disowned_without_a_prompt(tmp_path, qapp, monk
     questions = []
 
     def blocked(paths, cancelled):
-        from threading import current_thread
         assert current_thread().daemon
         entered.set()
         assert release.wait(5)
@@ -240,131 +241,196 @@ def test_viewer_book_switch_discards_capture_that_has_not_returned(tmp_path, qap
         _finish_controller_shutdown(controller, qapp)
 
 
-def test_inactivity_releases_monitor_keeps_success_and_blocks_parent_until_late_result(tmp_path, qapp, monkeypatch):
-    paths = _create(tmp_path / 'books', '1.txt', '2.txt')
-    clock = [100]
-    alive = [True]
-    monkeypatch.setattr(recycle_jobs.time, 'monotonic_ns', lambda: clock[0])
-    monkeypatch.setattr(recycle_jobs, '_process_stamp', lambda _: 99 if alive[0] else None)
-    receipts = []
+class _ControlledRecycleBin(MovingRecycleBin):
+    def __init__(self, trash, blocked_source):
+        super().__init__(trash)
+        self.blocked_source = str(blocked_source)
+        self.entered = Event()
+        self.release = Event()
+        self.thread = None
 
-    def launch(directory):
-        receipts.append(directory)
-        (directory / 'claimed').mkdir()
-        recycle_jobs._write(directory, 'accepted.json', {'pid': 1234, 'stamp': 99})
-        paths[0].rename(tmp_path / 'recycled-first')
-        (directory / 'outcomes.jsonl').write_text('{"index":0,"success":true}\n', encoding='ascii')
-        return _Process()
+    def recycle(self, path):
+        if path == self.blocked_source:
+            self.thread = current_thread()
+            self.entered.set()
+            assert self.release.wait(5)
+        return super().recycle(path)
 
-    def progress(observation):
-        assert observation.removed_sources == (str(paths[0]),)
-        # A new file appears after the progress receipt but before completion.
-        paths[0].write_text('replacement', encoding='utf-8')
-        clock[0] += recycle_jobs._NO_PROGRESS_NS
+    def finish(self):
+        self.release.set()
+        if self.thread is not None:
+            self.thread.join(timeout=3)
+            assert not self.thread.is_alive()
 
-    jobs = recycle_jobs.RecycleJobs(tmp_path / recycle_jobs.SPOOL_NAME, launch=launch)
-    service = FileOperationService(recycle_jobs=jobs)
-    request = FileOperationRequest(1, FileOperationKind.RECYCLE, tuple(map(str, paths)), planned_sources=_confirmed(paths))
-    lexists = os.path.lexists
 
-    def reject_stalled_path(path):
-        if clock[0] > 100 and Path(path) in paths:
-            pytest.fail('The monitor probed a filesystem path after the deadline')
-        return lexists(path)
+def _recycle_request(paths):
+    return FileOperationRequest(1, FileOperationKind.RECYCLE, tuple(map(str, paths)),
+                                planned_sources=_confirmed(paths))
 
-    with monkeypatch.context() as patch:
-        patch.setattr(os.path, 'lexists', reject_stalled_path)
-        result = service.execute_detached_recycle(request, Event(), Event(), Event(), progress)
-    directory, = receipts
-    assert result.recycle_unconfirmed and len(result.successes) == len(result.failures) == 1
-    assert result.failures[0].error_code == 'recycle_result_unconfirmed'
-    assert not result.successes[0].source_removed and paths[0].read_text(encoding='utf-8') == 'replacement'
-    assert not (directory / 'cancel').exists() and not (directory / 'observed').exists()
-    from app.file_operation_queue import FileOperationQueue
-    queue = FileOperationQueue(service=service)
+
+def test_cancel_preserves_progress_and_stops_before_the_next_shell_call(tmp_path, qapp, monkeypatch):
+    paths = _create(tmp_path / 'books', '1.txt', '2.txt', '3.txt')
+    adapter = _ControlledRecycleBin(tmp_path / 'bin', paths[1])
+    controller, browser = _controller(tmp_path, qapp, FileOperationService(adapter), paths[0].parent)
+    queue = controller.file_operation_queue
+    monkeypatch.setattr(QMessageBox, 'question', lambda *_: QMessageBox.StandardButton.Yes)
     try:
-        assert queue.enqueue(FileOperationRequest(2, FileOperationKind.RENAME, (str(paths[0].parent),), new_name='other'))
-        assert queue.wait_for_done(2000)
-        assert queue.history[-1].failures[0].error_code == 'in_use'
-        assert paths[0].parent.is_dir()
+        select_paths(browser, paths)
+        assert browser.move_selected_to_recycle_bin()
+        _wait_until(qapp, adapter.entered.is_set)
+        _wait_until(qapp, lambda: browser.item_model.row_for_path(paths[0]) == -1)
+        assert browser.item_model.row_for_path(paths[1]) != -1
+        paths[0].write_text('replacement after progress', encoding='utf-8')
+        browser.cancel_file_operation()
+        assert not queue.wait_for_done(50)
+        conflicting_move = FileOperationRequest(
+            2, FileOperationKind.MOVE, (str(paths[1]),), str(tmp_path),
+        )
+        assert not queue.enqueue(conflicting_move)
+        adapter.release.set()
+        assert queue.wait_for_done(3000)
+        result = queue.history[-1]
+        assert result.cancelled and len(result.successes) == 2
+        assert not result.successes[0].source_removed
+        assert paths[0].read_text(encoding='utf-8') == 'replacement after progress'
+        assert adapter.paths == list(map(str, paths[:2]))
+        assert paths[2].exists()
+        assert not (tmp_path / 'recycle-jobs').exists()
     finally:
-        queue.close()
-
-    # The same accepted helper finishes later. Recovery reads the receipts once.
-    paths[1].rename(tmp_path / 'recycled-second')
-    with (directory / 'outcomes.jsonl').open('a', encoding='ascii') as journal:
-        journal.write('{"index":1,"success":true}\n')
-    recycle_jobs._write(directory, 'terminal.json', {'cancelled': False, 'error': None})
-    alive[0] = False
-    assert jobs.recover(created_before=0, include={str(directory)}) == (((2, 0),), False)
-    assert jobs.recover(created_before=time_ns()) == ((), False)
-    assert jobs.owned_paths() == () and len(receipts) == 1
+        adapter.finish()
+        _finish_controller_shutdown(controller, qapp)
 
 
-def test_recovery_deadline_uses_persisted_progress_without_stopping_owner(tmp_path, monkeypatch):
-    source, = _create(tmp_path / 'books', '1.txt')
-    clock = [1000 * 10**9]
-    monkeypatch.setattr(recycle_jobs.time, 'time_ns', lambda: clock[0])
-    monkeypatch.setattr(recycle_jobs, '_process_stamp', lambda _pid: 123)
-    jobs = recycle_jobs.RecycleJobs(tmp_path / recycle_jobs.SPOOL_NAME, launch=lambda _: _Process())
-    directory = jobs.submit(_confirmed((source,))).directory
-    created_before = clock[0] + 1
-    (directory / 'claimed').mkdir()
-    recycle_jobs._write(directory, 'accepted.json', {'pid': 1234, 'stamp': 123, 'accepted_ns': clock[0]})
-    clock[0] += recycle_jobs._NO_PROGRESS_NS
-    follow, notices = set(), []
-    assert jobs.recover(created_before=created_before, follow=follow,
-                        unconfirmed=lambda: notices.append(True)) == ((), False)
-    assert follow == {str(directory)} and notices == [True]
-    assert jobs.owned_paths() == (str(source),) and not (directory / 'cancel').exists()
-    completed = '{"index":0,"success":true,"completed_ns":%d}\n' % clock[0]
-    (directory / 'outcomes.jsonl').write_text(completed, encoding='ascii')
-    assert jobs.recover(created_before=0, include=follow, follow=set()) == ((), True)
-
-
-@pytest.mark.parametrize('choice, with_viewer, closes', [
-    (FileOperationCloseChoice.CLOSE_AFTER_OPERATION, False, True),
-    (FileOperationCloseChoice.CLOSE_AFTER_OPERATION, True, False),
-    (FileOperationCloseChoice.KEEP_OPEN, False, False),
-    (FileOperationCloseChoice.CANCEL_AND_CLOSE, False, False),
-])
-def test_close_choice_rechecks_matching_late_acceptance(tmp_path, qapp, monkeypatch, choice, with_viewer, closes):
-    source, = _create(tmp_path / 'books', '1.txt')
-    receipt = []
-
-    def launch(directory):
-        receipt.append(directory)
-        return _Process()
-
-    jobs = recycle_jobs.RecycleJobs(tmp_path / recycle_jobs.SPOOL_NAME, launch=launch)
-    controller, browser = _controller(tmp_path, qapp, FileOperationService(recycle_jobs=jobs), source.parent)
+@pytest.mark.parametrize('last_window', ['browser', 'viewer'])
+def test_last_window_close_waits_at_most_the_shutdown_grace(
+    tmp_path, qapp, monkeypatch, last_window,
+):
+    folder = tmp_path / 'books'
+    folder.mkdir()
+    first, second = (folder / name for name in ('1.png', '2.png'))
+    for path in (first, second):
+        Image.new('RGB', (24, 36), 'navy').save(path)
+    adapter = _ControlledRecycleBin(tmp_path / 'bin', first)
+    viewer = last_window == 'viewer'
+    controller, window = _controller(tmp_path, qapp, FileOperationService(adapter), folder, viewer=viewer)
+    queue = controller.file_operation_queue
+    begin_shutdown = queue.begin_shutdown
+    monkeypatch.setattr(queue, 'begin_shutdown', lambda **kw: begin_shutdown(timeout_msecs=60, **kw))
     exit_requested = []
     monkeypatch.setattr(controller, '_commit_application_exit', lambda: exit_requested.append(True))
-    monkeypatch.setattr(controller, '_ask_file_operation_close_choice', lambda _: choice)
-    queue = controller.file_operation_queue
+    choices = []
+
+    def choose(owner, *, allow_finish):
+        assert owner is window and not allow_finish
+        choices.append(True)
+        return (FileOperationCloseChoice.KEEP_OPEN if len(choices) == 1
+                else FileOperationCloseChoice.CANCEL_AND_CLOSE)
+
+    monkeypatch.setattr(controller, '_ask_file_operation_close_choice', choose)
     try:
-        if with_viewer:
-            controller.create_viewer_window()
-        assert browser._start_file_operation(FileOperationKind.RECYCLE, sources=(str(source),))
-        _wait_until(qapp, lambda: bool(receipt))
-        directory, = receipt
-        # The child claimed but has not delivered the acceptance record. This
-        # lets explicit cancel request the next safe boundary without revoking it.
-        (directory / 'claimed').mkdir()
-        assert not browser.close()
-        controller._on_recycle_accepted('different-operation')
+        if viewer:
+            assert controller.get_browser_window().close()
+        assert queue.enqueue(_recycle_request((first, second)))
+        _wait_until(qapp, adapter.entered.is_set)
+        assert not window.close()
+        assert not controller._quit_requested and queue.lifecycle is FileOperationQueueState.RUNNING
+        assert not window.close()
+        _wait_until(qapp, lambda: controller._shutdown_complete and exit_requested)
+        assert choices == [True, True]
+        assert queue.lifecycle is FileOperationQueueState.STOPPED
+        assert adapter.thread.daemon and adapter.thread.is_alive()
+        assert not queue.enqueue(FileOperationRequest(2, FileOperationKind.RENAME, (str(second),), new_name='other'))
+        adapter.finish()
         qapp.processEvents()
-        assert controller.get_browser_window() is browser
-        recycle_jobs._write(directory, 'accepted.json', {'pid': 1234, 'stamp': None})
-        if closes:
-            _wait_until(qapp, lambda: bool(exit_requested), timeout_ms=3000)
-            assert controller._shutdown_complete
-            assert not (directory / 'cancel').exists()
-        else:
-            _wait_until(qapp, lambda: queue.accepted_recycle)
-            qapp.processEvents()
-            assert controller.get_browser_window() is browser and queue.busy
-            assert (directory / 'cancel').exists() is (choice is FileOperationCloseChoice.CANCEL_AND_CLOSE)
-        assert source.exists()
+        assert adapter.paths == [str(first)] and second.exists()
+        assert not queue.history
+        assert not (tmp_path / 'recycle-jobs').exists()
     finally:
+        adapter.finish()
         _finish_controller_shutdown(controller, qapp)
+
+
+def test_other_window_keeps_queue_running_and_old_records_untouched(tmp_path, qapp, monkeypatch):
+    paths = _create(tmp_path / 'books', '1.txt', '2.txt')
+    old_record, = _create(tmp_path / 'recycle-jobs' / 'old', 'request.json')
+    adapter = _ControlledRecycleBin(tmp_path / 'bin', paths[0])
+    controller, browser = _controller(tmp_path, qapp, FileOperationService(adapter), paths[0].parent)
+    queue = controller.file_operation_queue
+    monkeypatch.setattr(
+        controller, '_ask_file_operation_close_choice',
+        lambda *_args, **_kwargs: pytest.fail('An open Viewer can keep the recycle queue active'),
+    )
+    try:
+        viewer = controller.create_viewer_window()
+        assert queue.enqueue(_recycle_request(paths))
+        _wait_until(qapp, adapter.entered.is_set)
+        assert browser.close()
+        assert controller.get_active_viewer() is viewer
+        assert queue.lifecycle is FileOperationQueueState.RUNNING
+        adapter.release.set()
+        assert queue.wait_for_done(3000)
+        assert len(queue.history[-1].successes) == 2
+        assert old_record.read_text(encoding='utf-8') == 'request.json'
+        assert list((tmp_path / 'recycle-jobs').glob('**/*')) == [old_record.parent, old_record]
+    finally:
+        adapter.finish()
+        _finish_controller_shutdown(controller, qapp)
+
+
+@pytest.mark.parametrize('failure', ['unsupported', 'shell_cancelled', 'replacement_after_call'])
+def test_queue_uses_recycle_only_and_reports_actual_outcomes(tmp_path, qapp, monkeypatch, failure):
+    paths = _create(tmp_path / 'books', '1 日本語.txt', '2.txt')
+    trash = tmp_path / 'bin'
+    trash.mkdir()
+    calls = []
+
+    class WindowsAdapter(windows_recycle_bin.WindowsRecycleBin):
+        available = True
+
+        def recycle(self, _path):
+            pytest.fail('Confirmed recycle must use the recycle-only adapter')
+
+    class Shell:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            pass
+
+        def recycle(self, path, identity, *, cancelled):
+            assert identity.still_at(path) and not cancelled.is_set()
+            source = Path(path)
+            calls.append(source)
+            if source == paths[0]:
+                if failure == 'unsupported':
+                    raise OSError('recycle_not_supported')
+                if failure == 'shell_cancelled':
+                    raise InterruptedError('recycle_cancelled')
+            source.rename(trash / source.name)
+            if source == paths[0]:
+                source.write_text('replacement', encoding='utf-8')
+
+    monkeypatch.setattr(windows_recycle_bin, 'RecycleOnly', Shell)
+    queue = FileOperationQueue(service=FileOperationService(WindowsAdapter()))
+    try:
+        progress = []
+        queue.operation_progress.connect(progress.append)
+        assert queue.enqueue(_recycle_request(paths))
+        assert queue.wait_for_done()
+        result = queue.history[-1]
+        assert result.cancelled is (failure == 'shell_cancelled')
+        assert paths[0].exists()
+        if failure == 'shell_cancelled':
+            assert calls == [paths[0]] and paths[1].exists()
+        else:
+            assert calls == list(paths) and not paths[1].exists()
+            assert progress[-1].removed_sources == (str(paths[1]),)
+        assert not progress[0].removed_sources
+        if failure == 'replacement_after_call':
+            assert paths[0].read_text(encoding='utf-8') == 'replacement'
+            assert result.items[0].success and not result.items[0].source_removed
+        else:
+            assert len(result.failures) == 1
+        assert not (tmp_path / 'recycle-jobs').exists()
+    finally:
+        queue.close()

@@ -7,9 +7,9 @@ import logging
 import os
 from collections import deque
 from dataclasses import dataclass, replace
-from pathlib import Path
 from enum import StrEnum
-from threading import Event, Lock
+from queue import Empty, SimpleQueue
+from threading import Event, Lock, Thread
 from time import monotonic
 
 from PySide6.QtCore import (
@@ -56,8 +56,6 @@ class _QueueEntry:
     plan: FileOperationPlan | None = None
     cancelled: Event | None = None
     gate_wait_started_at: float | None = None
-    recycle_detach: Event | None = None
-    recycle_accepted: Event | None = None
 
 
 class _PreflightSignals(QObject):
@@ -103,7 +101,34 @@ class _PreflightWorker(QRunnable):
 class _ExecutionSignals(QObject):
     progress = Signal(object)
     completed = Signal(object)
-    recycle_accepted = Signal(str)
+
+
+def _execute_request(service, request, cancelled, progress):
+    try:
+        return service.execute(request, cancelled=cancelled, progress=progress)
+    except BaseException as exc:
+        return _execution_failure(request, exc)
+
+
+def _execution_failure(request, error):
+    return FileOperationResult(
+        request.operation,
+        tuple(
+            FileOperationItemResult(
+                source, request.destination_directory, False, FileOperationErrorCode.IO_ERROR.value, str(error),
+            )
+            for source in request.source_paths or (None,)
+        ),
+        request_id=request.request_id,
+        operation_id=request.operation_id,
+    )
+
+
+def _run_recycle(service, request, cancelled, mailbox):
+    # A synchronous Shell call can stall. The worker owns no GUI objects
+    # and only sends in-memory messages back to the serial queue.
+    result = _execute_request(service, request, cancelled, mailbox.put)
+    mailbox.put(result)
 
 
 class _ExecutionWorker(QRunnable):
@@ -112,61 +137,16 @@ class _ExecutionWorker(QRunnable):
         service: FileOperationService,
         request: FileOperationRequest,
         cancelled: Event,
-        recycle_detach: Event | None = None,
-        recycle_accepted: Event | None = None,
     ) -> None:
         super().__init__()
         self.service = service
         self.request = request
         self.cancelled = cancelled
-        self.recycle_detach = recycle_detach
-        self.recycle_accepted = recycle_accepted
         self.signals = _ExecutionSignals()
 
     @Slot()
     def run(self) -> None:
-        try:
-            jobs = getattr(self.service, 'recycle_jobs', None)
-            if jobs is not None and FileOperationQueue._paths_overlap(
-                sum(FileOperationQueue._request_footprint(self.request), ()),
-                tuple(os.path.normcase(os.path.abspath(path)).casefold() for path in jobs.owned_paths()),
-            ):
-                result = FileOperationResult(
-                    self.request.operation, tuple(FileOperationItemResult(
-                        source, self.request.destination_directory, False, FileOperationErrorCode.IN_USE.value,
-                        tr('ごみ箱処理の応答または結果を確認できません'),
-                    ) for source in self.request.source_paths or (None,)),
-                    request_id=self.request.request_id, operation_id=self.request.operation_id,
-                )
-            elif self.recycle_detach is not None:
-                assert self.recycle_accepted is not None
-                result = self.service.execute_detached_recycle(
-                    self.request, self.cancelled, self.recycle_detach, self.recycle_accepted,
-                    self.signals.progress.emit,
-                    on_accepted=self.signals.recycle_accepted.emit,
-                )
-            else:
-                result = self.service.execute(
-                    self.request,
-                    cancelled=self.cancelled,
-                    progress=self.signals.progress.emit,
-                )
-        except BaseException as exc:
-            result = FileOperationResult(
-                self.request.operation,
-                tuple(
-                    FileOperationItemResult(
-                        source,
-                        self.request.destination_directory,
-                        False,
-                        FileOperationErrorCode.IO_ERROR.value,
-                        str(exc),
-                    )
-                    for source in (self.request.source_paths or (None,))
-                ),
-                request_id=self.request.request_id,
-                operation_id=self.request.operation_id,
-            )
+        result = _execute_request(self.service, self.request, self.cancelled, self.signals.progress.emit)
         self.signals.completed.emit(result)
         _LOG.info(
             "file operation worker result emitted request=%s kind=%s",
@@ -189,7 +169,6 @@ class FileOperationQueue(QObject):
     shutdown_progress = Signal(object)
     shutdown_finished = Signal()
     shutdown_failed = Signal(str)
-    recycle_accepted = Signal(str)
 
     def __init__(
         self,
@@ -217,6 +196,10 @@ class FileOperationQueue(QObject):
         self._shutdown_timer = QTimer(self)
         self._shutdown_timer.setSingleShot(True)
         self._shutdown_timer.timeout.connect(self._on_shutdown_timeout)
+        self._recycle_mailbox = None
+        self._recycle_timer = QTimer(self)
+        self._recycle_timer.setInterval(20)
+        self._recycle_timer.timeout.connect(self._poll_recycle)
         self._execution_ready = execution_ready
         self._gated_entry = None
         self._execution_gate_timer = QTimer(self)
@@ -251,12 +234,6 @@ class FileOperationQueue(QObject):
     def queued_requests(self) -> tuple[FileOperationRequest, ...]:
         with self._lock:
             return tuple(entry.request for entry in self._pending)
-
-    @property
-    def accepted_recycle(self) -> bool:
-        with self._lock:
-            accepted = self._active.recycle_accepted if self._active is not None else None
-            return accepted is not None and accepted.is_set()
 
     @property
     def history(self) -> tuple[FileOperationResult, ...]:
@@ -440,10 +417,8 @@ class FileOperationQueue(QObject):
                 active.state = FileOperationState.CANCELLED
                 self._active = None
                 active = None
-        if active is not None:
-            if active.recycle_detach is not None:
-                active.recycle_detach.set()
-            elif cancel_active and active.cancelled is not None:
+        if active is not None and active.cancelled is not None:
+            if cancel_active or active.request.operation is FileOperationKind.RECYCLE:
                 active.cancelled.set()
         if active is not None:
             self._finish_gate_wait(active, "shutdown")
@@ -629,10 +604,6 @@ class FileOperationQueue(QObject):
             else:
                 stopped = False
                 entry.state = FileOperationState.RUNNING
-                if (entry.request.operation is FileOperationKind.RECYCLE
-                        and getattr(self.service, 'recycle_jobs', None) is not None):
-                    entry.recycle_detach = Event()
-                    entry.recycle_accepted = Event()
         if stopped:
             self._finish_gate_wait(entry, "shutdown")
             self._emit_state(entry)
@@ -641,13 +612,39 @@ class FileOperationQueue(QObject):
         self._finish_gate_wait(entry, "cancelled" if entry.cancelled.is_set() else "released")
         self._emit_state(entry)
         self.operation_started.emit(entry.request)
-        worker = _ExecutionWorker(
-            self.service, entry.request, entry.cancelled or Event(), entry.recycle_detach, entry.recycle_accepted,
-        )
+        if entry.request.operation is FileOperationKind.RECYCLE:
+            mailbox = SimpleQueue()
+            self._recycle_mailbox = mailbox
+            try:
+                Thread(target=_run_recycle, args=(self.service, entry.request, entry.cancelled, mailbox),
+                       daemon=True, name="NivisViewer-Recycle").start()
+            except RuntimeError as exc:
+                self._recycle_mailbox = None
+                self._on_execution_completed(_execution_failure(entry.request, exc))
+                return
+            self._recycle_timer.start()
+            return
+        worker = _ExecutionWorker(self.service, entry.request, entry.cancelled)
         worker.signals.progress.connect(self.operation_progress)
-        worker.signals.recycle_accepted.connect(self.recycle_accepted)
         worker.signals.completed.connect(self._on_execution_completed)
         self._pool.start(worker)
+
+    def _poll_recycle(self) -> None:
+        mailbox = self._recycle_mailbox
+        for _ in range(128):
+            if mailbox is None or mailbox is not self._recycle_mailbox:
+                return
+            try:
+                update = mailbox.get_nowait()
+            except Empty:
+                return
+            if isinstance(update, FileOperationResult):
+                self._recycle_timer.stop()
+                self._recycle_mailbox = None
+                self._on_execution_completed(update)
+                return
+            if not self._closed:
+                self.operation_progress.emit(update)
 
     @Slot(object)
     def _on_execution_completed(self, result: FileOperationResult) -> None:
@@ -677,11 +674,6 @@ class FileOperationQueue(QObject):
             self._history.append(result)
         if not self._closed:
             self.operation_completed.emit(result)
-            if result.recycle_job_directory is not None and not result.recycle_unconfirmed:
-                try:
-                    (Path(result.recycle_job_directory) / 'observed').touch()
-                except OSError:
-                    _LOG.warning('Could not acknowledge recycle results', exc_info=True)
 
     def _emit_state(self, entry: _QueueEntry) -> None:
         if not self._closed:
@@ -702,10 +694,21 @@ class FileOperationQueue(QObject):
             self.shutdown_finished.emit()
 
     def _on_shutdown_timeout(self) -> None:
+        self._poll_recycle()
         with self._lock:
             if self._lifecycle is not FileOperationQueueState.SHUTTING_DOWN:
                 return
             active = self._active
+            if self._recycle_mailbox is not None:
+                self._active = None
+        if self._recycle_mailbox is not None:
+            # Only application shutdown may release the lane before the
+            # Shell call returns. No new operation can enter a closed queue.
+            self._recycle_timer.stop()
+            self._recycle_mailbox = None
+            _LOG.warning("File operation shutdown timed out waiting for Recycle Bin")
+            self._finish_shutdown()
+            return
         operation_id = active.operation_id if active is not None else ""
         self.shutdown_failed.emit(
             tr('ファイル操作の終了を待機中です: {p0}', p0=operation_id)

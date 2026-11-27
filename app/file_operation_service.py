@@ -68,7 +68,6 @@ class FileOperationErrorCode(str, Enum):
     PARTIAL_SUCCESS = "partial_success"
     INTERNAL_STAGING_ARTIFACT = "internal_staging_artifact"
     ARTIFACT_CLEANUP_FAILED = "artifact_cleanup_failed"
-    RECYCLE_RESULT_UNCONFIRMED = "recycle_result_unconfirmed"
     IO_ERROR = "io_error"
 
 
@@ -191,8 +190,6 @@ class FileOperationResult:
 
     undo_entries: tuple[FileUndoEntry, ...] = ()
     metadata_sync_warnings: tuple[str, ...] = ()
-    recycle_job_directory: str | None = None
-    recycle_unconfirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -302,10 +299,9 @@ class _SourceReceiptEntry:
 
 
 class FileOperationService:
-    def __init__(self, recycle_bin: RecycleBinAdapter | None = None, *, shell_move=None, recycle_jobs=None) -> None:
+    def __init__(self, recycle_bin: RecycleBinAdapter | None = None, *, shell_move=None) -> None:
         self.recycle_bin = recycle_bin or WindowsRecycleBin()
         self.shell_move = shell_move
-        self.recycle_jobs = recycle_jobs
         self.file_copier = ChunkedFileCopier()
         self._byte_progress: Callable[[int], None] | None = None
 
@@ -320,7 +316,7 @@ class FileOperationService:
             "file operation execute request=%s kind=%s sources=%s",
             request.request_id, request.operation.value, len(request.source_paths),
         )
-        if _LOG.isEnabledFor(logging.DEBUG):
+        if request.operation is not FileOperationKind.RECYCLE and _LOG.isEnabledFor(logging.DEBUG):
             _LOG.debug(
                 "service execute request=%s kind=%s sources=%r destination=%s",
                 request.request_id,
@@ -345,6 +341,11 @@ class FileOperationService:
             return self._execute_shell_move(request, cancel_event, progress)
 
         approved_recycle = request.operation is FileOperationKind.RECYCLE and request.planned_sources is not None
+        if approved_recycle and not request.has_confirmed_recycle_sources:
+            return FileOperationResult(
+                request.operation, tuple(self._source_changed(path, request.operation) for path in request.source_paths),
+                request_id=request.request_id, operation_id=request.operation_id,
+            )
         try:
             sources = (request.source_paths if approved_recycle
                        else self._prepare_sources(request.source_paths, cancelled=cancel_event))
@@ -378,6 +379,7 @@ class FileOperationService:
             force: bool = False,
             item_start_bytes: int = 0,
             item_total_bytes: int | None = None,
+            removed_sources: tuple[str, ...] = (),
         ) -> None:
             nonlocal bytes_completed, last_emit
             nonlocal last_speed_sample_at, last_speed_sample_bytes, ewma_speed
@@ -451,6 +453,7 @@ class FileOperationService:
                         0,
                         bytes_completed - item_start_bytes,
                     ),
+                    removed_sources=removed_sources,
                 )
             )
             last_emit = now
@@ -481,7 +484,7 @@ class FileOperationService:
                 )
                 if approved_recycle:
                     identity = planned_sources.get(source)
-                    item = (self._recycle_item(source, identity)
+                    item = (self._recycle_item(source, identity, cancelled=cancel_event)
                             if identity is not None and identity.is_normal and identity.still_at(source)
                             and not FileOperationArtifactPolicy.is_internal_operation_artifact(source)
                             else self._source_changed(source, request.operation))
@@ -526,6 +529,8 @@ class FileOperationService:
                 bytes_completed += item_total_bytes
             results.append(item)
             self._byte_progress = None
+            if approved_recycle and item.error_code == FileOperationErrorCode.CANCELLED.value:
+                was_cancelled = True
             if progress is not None:
                 emit_byte_progress(
                     0,
@@ -535,9 +540,18 @@ class FileOperationService:
                     force=True,
                     item_start_bytes=item_start_bytes,
                     item_total_bytes=item_total_bytes,
+                    removed_sources=(source,) if approved_recycle and item.success and item.source_removed else (),
                 )
             if was_cancelled:
                 break
+        if approved_recycle:
+            # A later item can take time. A path taken out of the Browser
+            # during progress may have been reused by completion.
+            for index, item in enumerate(results):
+                if item.source_removed and item.source_path:
+                    exists = self._recycle_source_exists(item.source_path)
+                    if exists is not False:
+                        results[index] = replace(item, source_exists_after=exists, source_removed=False)
         return FileOperationResult(
             request.operation,
             tuple(results),
@@ -617,91 +631,6 @@ class FileOperationService:
                 record(path, ShellMoveResult(error=error))
         return FileOperationResult(request.operation, tuple(results[path] for path, _ in sources),
                                    aborted or cancelled.is_set(), request.request_id, request.operation_id)
-
-    def execute_detached_recycle(self, request, cancelled, detach, accepted, progress, *, on_accepted=None):
-        sources = request.planned_sources or ()
-        if not sources or cancelled.is_set() or detach.is_set():
-            return FileOperationResult(request.operation, (), True, request.request_id, request.operation_id)
-        if not request.has_confirmed_recycle_sources or not any(identity is not None for _, identity in sources):
-            return FileOperationResult(request.operation, tuple(self._source_changed(path, request.operation)
-                                       for path in request.source_paths),
-                                       request_id=request.request_id, operation_id=request.operation_id)
-        receipt = self.recycle_jobs.submit(sources)
-        results = {}
-        failures = 0
-        cancel_sent = False
-
-        def consume_updates():
-            nonlocal failures
-            removed = []
-            last_path = None
-            for row in receipt.updates():
-                if not 0 <= row.index < len(sources) or row.index in results:
-                    continue
-                receipt.note_progress()
-                path, _ = sources[row.index]
-                last_path = path
-                if row.success:
-                    exists = os.path.lexists(path)
-                    results[row.index] = FileOperationItemResult(
-                        path, None, True, state=FileOperationItemState.MOVED,
-                        source_exists_after=exists, source_removed=not exists,
-                    )
-                    if not exists:
-                        removed.append(path)
-                else:
-                    failures += 1
-                    results[row.index] = self._failure(path, None, FileOperationErrorCode.IO_ERROR,
-                                                       row.error or tr('ごみ箱へ移動できません'))
-            if last_path is not None and progress is not None:
-                progress(FileOperationProgress(request.request_id, request.operation, len(results),
-                                              len(sources), last_path, failed=failures,
-                                              operation_id=request.operation_id, removed_sources=tuple(removed)))
-
-        while not detach.is_set():
-            if not accepted.is_set() and receipt.accepted():
-                accepted.set()
-                receipt.note_progress()
-                if on_accepted is not None:
-                    on_accepted(request.operation_id)
-            if cancelled.is_set() and not cancel_sent:
-                receipt.cancel()
-                cancel_sent = True
-            consume_updates()
-            terminal = receipt.terminal()
-            unconfirmed = terminal is None and receipt.unresponsive()
-            if unconfirmed:
-                terminal = {'cancelled': False, 'error': tr('ごみ箱処理の応答または結果を確認できません')}
-            if terminal is not None:
-                consume_updates()  # Outcome files can advance before the terminal marker.
-                if not terminal['cancelled']:
-                    for index, (path, _) in enumerate(sources):
-                        if index not in results:
-                            message = terminal['error'] or tr('ごみ箱へ移動できません')
-                            if unconfirmed:
-                                # Its filesystem call may be stalled. Do not
-                                # probe the same path while releasing the lane.
-                                results[index] = FileOperationItemResult(
-                                    path, None, False, FileOperationErrorCode.RECYCLE_RESULT_UNCONFIRMED.value, message,
-                                    state=FileOperationItemState.FAILED,
-                                    lifecycle_state=FileOperationLifecycleState.FAILED,
-                                )
-                            else:
-                                results[index] = self._failure(path, None, FileOperationErrorCode.IO_ERROR, message)
-                for index, item in tuple(results.items()):
-                    if item.success:
-                        exists = None if unconfirmed else os.path.lexists(sources[index][0])
-                        results[index] = replace(item, source_exists_after=exists, source_removed=exists is False)
-                return FileOperationResult(request.operation, tuple(results[i] for i in sorted(results)),
-                                           terminal['cancelled'], request.request_id, request.operation_id,
-                                           recycle_job_directory=str(receipt.directory), recycle_unconfirmed=unconfirmed)
-            detach.wait(0.075)
-        # The GUI's shutdown owns only the polling worker. The accepted helper
-        # continues and leaves its completion available at the next startup.
-        if cancelled.is_set() and not cancel_sent:
-            receipt.cancel()
-        receipt.revoke_before_acceptance()
-        return FileOperationResult(request.operation, (), False, request.request_id, request.operation_id)
 
     def rename(
         self,
@@ -1164,19 +1093,24 @@ class FileOperationService:
             root_remove_error=root_remove_error,
         )
 
-    def _recycle_item(self, source: str, identity: FileIdentity | None = None) -> FileOperationItemResult:
+    def _recycle_item(
+        self, source: str, identity: FileIdentity | None = None, *, cancelled: Event | None = None,
+    ) -> FileOperationItemResult:
+        if cancelled is not None and cancelled.is_set():
+            raise _OperationCancelled
         recycle_confirmed = getattr(self.recycle_bin, 'recycle_confirmed', None)
-        result = (recycle_confirmed(source, identity) if identity is not None and callable(recycle_confirmed)
+        result = (recycle_confirmed(source, identity, cancelled=cancelled)
+                  if identity is not None and callable(recycle_confirmed)
                   else self.recycle_bin.recycle(source))
         if result.success:
-            exists = os.path.lexists(source)
+            exists = self._recycle_source_exists(source)
             return FileOperationItemResult(
                 source,
                 None,
                 True,
                 state=FileOperationItemState.MOVED,
                 source_exists_after=exists,
-                source_removed=not exists,
+                source_removed=exists is False,
             )
         if result.cancelled:
             code = FileOperationErrorCode.CANCELLED
@@ -1190,6 +1124,16 @@ class FileOperationService:
             code,
             result.error_message or tr('ごみ箱へ移動できません'),
         )
+
+    @staticmethod
+    def _recycle_source_exists(path: str) -> bool | None:
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return None
+        return True
 
     def _create_directory(
         self,

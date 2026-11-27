@@ -18,9 +18,13 @@ wrapper in `FileOperation/FileOperation.cs` and then perform the batch.
 `app/windows_file_operations.py` and `app/file_operation_service.py` adopt
 that ordering for ordinary Browser moves. The Windows SDK COM declarations,
 per-item result validation, conflict policy and undo integration are local
-implementations. Recycling uses a separate, independently launched worker
-and the Shell's recycle verb. No ZipPlaFork source text is copied for these
-operations. The upstream revision, copyright and notices are listed above.
+implementations. Browser and Viewer recycling uses the application's file
+operation queue. It checks each confirmed item and calls the Shell's
+`ITransferSource::RecycleItem` synchronously for that item before continuing.
+Cancellation and application shutdown stop subsequent calls. At application
+shutdown the queue waits up to ten seconds for a running recycle call.
+No ZipPlaFork source text is copied for these operations. The upstream
+revision, copyright and notices are listed above.
 
 | Reference structure | NivisViewer mapping |
 | --- | --- |

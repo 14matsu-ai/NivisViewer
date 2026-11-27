@@ -1,8 +1,4 @@
-"""The small Windows Shell COM surface used by Browser moves and recycling.
-
-This module is also used by the independent recycle worker. Keep it free of Qt,
-the GUI profile and application state.
-"""
+"""Windows Shell COM operations for Browser moves and recycling."""
 from __future__ import annotations
 
 import ctypes as C
@@ -27,6 +23,7 @@ _BHID_TRANSFER = 'd5e346a1-f753-4932-b403-4574800e2498'
 _IID_TRANSFER_SOURCE = '00adb003-bde9-45c6-8e29-d09f9353e108'
 _RECYCLE_FOLDER = 'b7534046-3ecb-4c18-be4e-64cd4cb7d6ac'
 _CANCELLED = _HRESULT(0x800704C7).value
+_COPYENGINE_E_USER_CANCELLED = _HRESULT(0x80270000).value
 _FAIL = _HRESULT(0x80004005).value
 _FOF_SILENT = 0x0004
 _FOF_RENAMEONCOLLISION = 0x0008
@@ -285,7 +282,7 @@ class RecycleOnly:
     def __exit__(self, *_exc):
         self._owned.close()
 
-    def recycle(self, path, identity):
+    def recycle(self, path, identity, *, cancelled=None):
         with ExitStack() as owned:
             root = C.create_unicode_buffer(32768)
             volume = C.windll.kernel32.GetVolumePathNameW
@@ -304,10 +301,14 @@ class RecycleOnly:
             owned.callback(_release, transfer)
             if not identity.still_at(path):
                 raise OSError('source_changed')
+            if cancelled is not None and cancelled.is_set():
+                raise InterruptedError('recycle_cancelled')
             recycled = _P()
             try:
                 hr = _call(transfer, 8, (_P, _P, W.DWORD, C.POINTER(_P)),
                            (item, self._bin, 0, C.byref(recycled)))
+                if hr in (_CANCELLED, _COPYENGINE_E_USER_CANCELLED):
+                    raise InterruptedError('recycle_cancelled')
                 _check(hr, 'RecycleItem')
                 if not recycled:
                     raise OSError('recycle_not_confirmed')
